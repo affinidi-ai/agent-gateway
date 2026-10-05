@@ -1,0 +1,321 @@
+[package]
+name = "agent-gateway"
+version = "1.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.95.0"
+authors = ["adam@affinidi.com"]
+description = "An intercepting proxy gateway for the Internet of AI Agents"
+license = "Apache-2.0"
+repository = "https://github.com/affinidi-ai/agent-gateway"
+homepage = "https://github.com/affinidi-ai/agent-gateway"
+readme = "README.md"
+keywords = ["agents", "gateway", "identity", "mcp", "security"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.49.0", features = ["full"] }
+
+# HTTP server and client
+hyper = { version = "1.8.1", features = ["full"] }
+http-body-util = "0.1.3"
+
+# TLS support - using ring instead of aws-lc for faster builds
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+    "ring",
+] }
+rustls = { version = "0.23.45", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+rustls-pemfile = "2.2.0"
+rustls-native-certs = "0.8.3"
+
+# Serialization
+strum = { version = "0.27", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_json_canonicalizer = "0.3.2"
+serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+1"] }
+serde_urlencoded = "0.7"
+serde_yaml = "0.9.33"
+toml = "0.9.8"
+json-patch = { version = "4.2", default-features = false }
+
+# CLI and configuration
+clap = { version = "4.5.54", features = ["derive", "env"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+
+# OpenTelemetry for distributed tracing and observability
+opentelemetry = { version = "0.31", features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.31", features = [
+    "rt-tokio",
+    "trace",
+    "metrics",
+    "logs",
+] }
+opentelemetry-otlp = { version = "0.31", features = [
+    "trace",
+    "metrics",
+    "logs",
+    "grpc-tonic",
+    "http-proto",
+] }
+opentelemetry-appender-tracing = "0.31"
+tracing-opentelemetry = "0.32.1"
+# gRPC metadata (auth headers) for OTLP/gRPC export; version tracks opentelemetry-otlp 0.31
+tonic = { version = "0.14", default-features = false }
+
+# Error handling
+anyhow = "1.0.100"
+thiserror = "2.0"
+libc = "0.2"
+
+# Additional utilities
+bytes = "1.5"
+futures = "0.3.31"
+tower = { version = "0.5.3", features = ["util"] }
+tracing-appender = "0.2"
+notify = "8.2.0"
+
+# Axum web framework
+axum = { version = "0.8.8", features = ["json", "tokio", "ws", "multipart"] }
+tower-http = { version = "0.6.8", features = [
+    "trace",
+    "cors",
+    "compression-gzip",
+    "fs",
+    "set-header",
+] }
+reqwest = { version = "0.13.1", features = ["json", "multipart", "stream"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+
+# AWS SDK - using default-https-client to avoid legacy rustls connector
+aws-config = { version = "1.8.17", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "sso",
+] }
+aws-sdk-dynamodb = { version = "1.112.0", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+] }
+aws-sdk-cloudwatch = { version = "1.112.0", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+] }
+aws-sdk-kms = { version = "1.104.0", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+] }
+aws-smithy-async = { version = "1.2.7", features = ["rt-tokio"] }
+async-trait = "0.1"
+sha2 = "0.10.9"
+sha256 = "1.6"
+hmac = "0.12"
+hex = "0.4"
+zeroize = { version = "1.8", features = ["derive"] }
+affinidi-did-resolver-cache-sdk = "0.8.22"
+affinidi-messaging-sdk = "0.19"
+trust-tasks-rs = "0.9"
+
+# Cryptography for x402 payment signing
+alloy-signer = "1.7"
+alloy-signer-local = "1.7"
+affinidi-messaging-didcomm = "0.15.8"
+affinidi-tdk-common = "0.6.7"
+affinidi-did-common = "0.4.1"
+ssi = "0.16.0"
+ssi-json-ld = "0.3.3"
+ssi-claims-core = "0.2.0"
+did-peer = "0.7.5"
+uuid = { version = "1.18.1", features = ["v4"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+cookie = { version = "0.18.1", features = ["percent-encode"] }
+base64 = "0.22.1"
+bcrypt = "0.17"
+bs58 = "0.5.1"
+urlencoding = "2.1"
+regex = "1.12.3"
+# Direct dep for HIR literal extraction (exact-vs-broad PAT tenant-selector
+# classification). Already present transitively via `regex`; pinned to the
+# same resolved version.
+regex-syntax = "0.8.11"
+ed25519-dalek = "2.2.0"
+p256 = { version = "0.13", features = ["ecdsa"] }
+jsonschema = "0.41.0"
+# providing a very fast, keyed, and strong hash function that utilizes SIMD
+# instructions (SSE 4.1, AVX2) for high performance
+highway = "1.3.0"
+
+# did:webvh support
+didwebvh-rs = { version = "0.6.0", optional = true }
+serde_jcs = { version = "0.1", optional = true }
+
+# WebAuthn for passkey authentication
+webauthn-rs = "0.5"
+url = "2.5.8"
+
+# SAML authentication
+samael = "0.0.21"
+flate2 = "1.1.9"
+openssl = "0.10"
+quick-xml = { version = "0.39", features = ["serialize"] }
+
+# JWT / OIDC
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+
+# Metrics
+prometheus = "0.14.0"
+lazy_static = "1.4"
+
+# System metrics (CPU/memory monitoring)
+sysinfo = "0.35"
+
+# Policy engine (OPA)
+regorus = "0.5.0"
+
+# Rate limiting
+governor = "0.10.4"
+
+# Random number generation for traffic mirroring
+rand = "0.9.2"
+
+# Cryptography for encryption at rest
+ring = "0.17"
+
+# RAII scope guard for cleanup
+scopeguard = "1.2"
+
+# x402 protocol implementation
+x402-types = "1.1"
+x402-facilitator-local = { version = "1.1.2", features = ["telemetry"] }
+x402-chain-eip155 = { version = "1.1.1", features = [
+    "facilitator",
+    "telemetry",
+] }
+x402-chain-solana = { version = "1.1.3", features = [
+    "facilitator",
+    "telemetry",
+] }
+
+# Blockchain verification for x402 payments
+alloy = { version = "1.6.3", features = [
+    "provider-http",
+    "rpc-types-eth",
+    "transports",
+] }
+solana-client = "3.1.8"
+solana-sdk = "3.0.0"
+solana-transaction-status = "3.1.8"
+
+rmcp = { version = "1.0", features = [
+    "client",
+    "client-side-sse",
+    "transport-streamable-http-client",
+] }
+rmcp-openapi = "0.28.0"
+rust_decimal = { version = "1.42", default-features = false, features = ["std"] }
+
+# Stream helpers for MCP Streamable HTTP transport
+eventsource-stream = "0.2.3"
+tokio-stream = "0.1"
+
+# Email support for integrations
+lettre = "0.11"
+mime = "0.3"
+once_cell = "1.21.3"
+parking_lot = "0.12"
+
+# Kafka support for stream integrations
+rdkafka = { version = "0.39.0", features = ["cmake-build", "ssl", "sasl"] }
+
+# AWS Kinesis support for stream integrations
+aws-sdk-kinesis = { version = "1.99", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+] }
+
+# configs
+aws-sdk-ssm = { version = "1.110", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+] }
+aws-sdk-secretsmanager = { version = "1.101", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+] }
+
+# Apache Pulsar support for stream integrations
+pulsar = "6.4"
+
+# Redis support for stream integrations
+redis = { version = "1.0.3", features = ["tokio-comp", "streams"] }
+
+# Performance optimizations
+dashmap = "6.0"
+moka = { version = "0.12", features = ["future"] }
+tokio-retry = "0.3"
+subtle = "2.5"
+multibase = "0.9.2"
+
+# Memory allocator - jemalloc reduces fragmentation and returns memory to the OS
+tikv-jemallocator = "0.6"
+
+# Storage export with PII redaction and public-key encryption
+zip = { version = "8.2", default-features = false, features = ["deflate"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+curve25519-dalek = "4.1"
+pem = "3.0"
+hkdf = "0.12"
+
+# mTLS source authentication
+x509-parser = "0.18"
+ipnet = { version = "2.11", features = ["serde"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = [
+    "ring",
+    "std",
+] }
+rustls-pki-types = "1"
+
+[dev-dependencies]
+tempfile = "3.24.0"
+ts-rs = "11.0"
+cucumber = { version = "0.23", features = ["macros"] }
+tokio = { version = "1.49.0", features = ["full"] }
+rcgen = "0.14"
+time = "0.3"
+rsa = { version = "0.9", features = ["pem", "getrandom"] }
+
+[[test]]
+name = "surface_bdd"
+harness = false
+
+[[test]]
+name = "g2g_bdd"
+harness = false
+
+[features]
+default = ["didwebvh"]
+didwebvh = ["didwebvh-rs", "serde_jcs"]
+
+[profile.dev]
+# Skip dsymutil pass on macOS - major time saver
+split-debuginfo = "unpacked"
+# Line tables only: still get backtraces, but much less debuginfo to generate
+debug = "line-tables-only"
+lto = false
+codegen-units = 16
+
+[profile.dev.package."*"]
+# Optimize dependencies in dev builds - they rarely change and compile once.
+# Also makes debug runtime faster (e.g. serde deserialization).
+opt-level = 1
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

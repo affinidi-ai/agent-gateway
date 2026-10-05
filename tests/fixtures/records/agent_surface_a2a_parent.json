@@ -1,0 +1,41 @@
+{
+  "surface_id": "1b68e98a-ecfe-4dc5-9518-7ce95d237aa6",
+  "name": "sales-agent",
+  "status": "active",
+  "access_point": {
+    "listen_address": "0.0.0.0:8443",
+    "route": "/sales",
+    "protocol": "a2a",
+    "publish_to_did_document": false,
+    "terminate_trace_id": false
+  },
+  "target": {
+    "endpoint": "http://127.0.0.1:9000",
+    "mcp_tool_policies_enabled": false,
+    "identity_injection": {
+      "inject_vp": false
+    },
+    "mpp_auto_pay": false
+  },
+  "transit": {
+    "points": [
+      {
+        "id": "e24a8e1e-c932-42e7-8c71-adb1780268ce",
+        "name": "CRM tools",
+        "alias": "crm",
+        "target_endpoint": "https://crm.example.com/mcp",
+        "protocol": "mcp",
+        "identity_injection": {
+          "inject_vp": false
+        },
+        "require_transit_token": true,
+        "extension_inspection": {
+          "enabled": true,
+          "watch_extensions": []
+        }
+      }
+    ],
+    "transit_token_mode": "embedded",
+    "sign_requests": true
+  }
+}

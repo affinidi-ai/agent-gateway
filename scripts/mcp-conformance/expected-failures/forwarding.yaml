@@ -1,0 +1,11 @@
+# Expected failures for the Access Point and Transit Point that forward to the
+# pinned reference server (targets "access-point" and "transit"). Entries are
+# <scenario>:<check-id>. The CLI fails the run on any failure or warning not
+# listed here and on a listed check that now passes.
+#
+# The forwarding targets reach the reference server through shim.mjs, which
+# corrects the reference server's two `subscriptions/listen` deviations (see
+# README.md), so the subscription checks exercise the gateway itself.
+server:
+  # Reference server: accepts inputResponses that is not an object; forwarded unchanged.
+  - input-required-result-validate-input:sep-2322-validate-input-responses

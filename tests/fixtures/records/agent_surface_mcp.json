@@ -1,0 +1,93 @@
+{
+  "surface_id": "01227761-9eb1-4362-aba6-039667d0c256",
+  "name": "research-tools",
+  "description": "Research MCP tools",
+  "status": "active",
+  "tags": [
+    "mcp"
+  ],
+  "access_point": {
+    "listen_address": "0.0.0.0:8443",
+    "route": "/research/mcp",
+    "protocol": "mcp",
+    "publish_to_did_document": false,
+    "terminate_trace_id": false
+  },
+  "target": {
+    "endpoint": "https://tools.example.com/mcp",
+    "mcp_tool_policies_enabled": false,
+    "identity_injection": {
+      "inject_vp": false
+    },
+    "mpp_auto_pay": false
+  },
+  "transit": {
+    "points": [
+      {
+        "id": "e4603896-5a89-4332-9fbb-c7b7d6710a21",
+        "name": "Search",
+        "alias": "search",
+        "target_endpoint": "https://search.example.com/mcp",
+        "protocol": "mcp",
+        "identity_injection": {
+          "inject_vp": false
+        },
+        "require_transit_token": true,
+        "extension_inspection": {
+          "enabled": true,
+          "watch_extensions": []
+        }
+      },
+      {
+        "id": "c81d0790-e281-4ade-8006-f3ac038b5f77",
+        "name": "Partner",
+        "alias": "partner",
+        "target_endpoint": "fabric://gw2/partner",
+        "protocol": "mcp",
+        "identity_injection": {
+          "inject_vp": false
+        },
+        "require_transit_token": true,
+        "extension_inspection": {
+          "enabled": true,
+          "watch_extensions": []
+        }
+      }
+    ],
+    "transit_token_mode": "embedded",
+    "sign_requests": true
+  },
+  "variants": [
+    {
+      "id": "6a35caf4-ca4b-441b-8786-373539b7af24",
+      "alias": "staging",
+      "name": "Staging",
+      "enabled": true,
+      "overrides": {
+        "target": {
+          "endpoint": "https://staging-tools.example.com/mcp"
+        },
+        "transit": {
+          "points": [
+            {
+              "id": "8de13b12-8fea-4d20-8f79-455fe082cc75",
+              "name": "Search (staging)",
+              "alias": "search",
+              "target_endpoint": "https://staging-search.example.com/mcp",
+              "protocol": "mcp",
+              "identity_injection": {
+                "inject_vp": false
+              },
+              "require_transit_token": true,
+              "extension_inspection": {
+                "enabled": true,
+                "watch_extensions": []
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "mcp_legacy_metadata_output": "canonical"
+}

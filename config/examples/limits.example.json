@@ -1,0 +1,119 @@
+{
+  "limits": {
+    "secrets": {
+      "name": "Secrets (total)",
+      "description": "Total across vault secrets, API keys, and certificates",
+      "limit": 20
+    },
+    "secrets.secret": {
+      "name": "Vault Secrets",
+      "description": "Secrets stored in the secrets vault",
+      "limit": 5
+    },
+    "secrets.apikeys": {
+      "name": "API Keys",
+      "description": "API keys issued for source authentication",
+      "limit": 5
+    },
+    "secrets.certificates": {
+      "name": "Certificates",
+      "description": "mTLS / signing certificates",
+      "limit": 5
+    },
+    "surfaces": {
+      "name": "Surfaces (total)",
+      "description": "Total number of agent surfaces",
+      "limit": 10
+    },
+    "surfaces.agent": {
+      "name": "Agent Surfaces",
+      "description": "Agent surfaces routing to managed agents",
+      "limit": 5
+    },
+    "users": {
+      "name": "Users",
+      "description": "Dashboard user accounts",
+      "limit": 10
+    },
+    "credentials": {
+      "name": "Credentials (total)",
+      "description": "Total across JWT strategies, providers, and delegation tokens",
+      "limit": 10
+    },
+    "credentials.jwt": {
+      "name": "JWT Verification Strategies",
+      "description": "JWT bearer verification strategies",
+      "limit": 2
+    },
+    "credentials.providers": {
+      "name": "Credential Providers",
+      "description": "OAuth 2.0 / OIDC credential providers",
+      "limit": 2
+    },
+    "credentials.tokens": {
+      "name": "Delegation Tokens",
+      "description": "Stored delegation-vault tokens",
+      "limit": 2
+    },
+    "policies": {
+      "name": "Policies (total)",
+      "description": "Total number of policy definitions",
+      "limit": 10
+    },
+    "policies.fabric": {
+      "name": "Gateway Policies",
+      "description": "Gateway-level (fabric) policy definitions",
+      "limit": 2
+    },
+    "policies.agent-surface": {
+      "name": "Agent Surface Policies",
+      "description": "Agent-surface-level policy definitions",
+      "limit": 2
+    },
+    "connections": {
+      "name": "Connections (total)",
+      "description": "Total across gateways, mediators, connection points, and trust registries",
+      "limit": 8
+    },
+    "connections.gateways": {
+      "name": "Remote Gateways",
+      "description": "Connected remote gateways; the Local Gateway is excluded",
+      "limit": 1
+    },
+    "connections.mediators": {
+      "name": "Mediators",
+      "description": "Configured DIDComm mediators",
+      "limit": 1
+    },
+    "connections.connectionpoints": {
+      "name": "Connection Points",
+      "description": "Gateway connection points",
+      "limit": 1
+    },
+    "connections.trustregistries": {
+      "name": "Trust Registries",
+      "description": "Connected trust registry definitions",
+      "limit": 1
+    },
+    "integrations": {
+      "name": "Integrations",
+      "description": "Notifier / integration definitions",
+      "limit": 5
+    },
+    "proxies": {
+      "name": "Proxies (total)",
+      "description": "Total across MCP and A2A proxies",
+      "limit": 10
+    },
+    "proxies.mcp": {
+      "name": "MCP Proxies",
+      "description": "Model Context Protocol proxies",
+      "limit": 3
+    },
+    "proxies.a2a": {
+      "name": "A2A Proxies",
+      "description": "Agent-to-Agent proxies",
+      "limit": 3
+    }
+  }
+}

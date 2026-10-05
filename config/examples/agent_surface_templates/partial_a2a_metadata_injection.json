@@ -1,0 +1,23 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "a2a-metadata-injection",
+  "name": "A2A Metadata Injection",
+  "kind": "partial",
+  "description": "Add key/value metadata to every A2A request.",
+  "details": "Drops a Metadata Injection element onto the inbound A2A request path. After applying this template, add the headers, extensions, or body fields that should be attached to each request before it reaches the managed agent.",
+  "icon": "tags",
+  "tags": ["a2a", "metadata", "injection"],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1001,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "custom-metadata",
+      "address": "ap-ma/request",
+      "config": {
+        "entries": []
+      }
+    }
+  ]
+}

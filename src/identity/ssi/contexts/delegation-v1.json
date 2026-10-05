@@ -1,0 +1,27 @@
+{
+  "@context": {
+    "DelegationCredential": {
+      "@id": "https://fabric.affinidi.io/credentials/delegation/v1",
+      "@context": {
+        "@version": 1.1,
+        "@protected": true
+      }
+    },
+    "delegationType": {
+      "@id": "schema-id:delegationType",
+      "@type": "https://schema.org/Text"
+    },
+    "delegatedBy": {
+      "@id": "schema-id:delegatedBy",
+      "@type": "@json"
+    },
+    "resource": {
+      "@id": "schema-id:resource",
+      "@type": "@json"
+    },
+    "consentedAt": {
+      "@id": "schema-id:consentedAt",
+      "@type": "http://www.w3.org/2001/XMLSchema#dateTime"
+    }
+  }
+}

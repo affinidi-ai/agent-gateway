@@ -1,0 +1,65 @@
+{
+  "_comment": "Example MPP (Machine Payments Protocol) configuration. MPP is configured at two levels: (1) server-side mpp_policy on channels to require payment, and (2) client-side mpp_proxy pipes to automatically pay upstream servers.",
+  "server_side_channel_example": {
+    "_comment": "Add 'mpp_policy' to a channel definition in your gateway config to require MPP payments for incoming requests.",
+    "mpp_policy": {
+      "enabled": true,
+      "realm": "my-agent.example.com",
+      "secret_key": "$MPP_HMAC_SECRET",
+      "stripe_secret_key": "$STRIPE_SECRET_KEY",
+      "challenge_ttl_seconds": 300,
+      "verification_timeout_ms": 10000,
+      "payment_methods": [
+        {
+          "method": "tempo",
+          "intent": "charge",
+          "currency": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "recipient": "0xYourWalletAddress",
+          "amount": "0.01",
+          "network": "eip155:84532"
+        },
+        {
+          "method": "card",
+          "intent": "charge",
+          "currency": "usd",
+          "recipient": "acct_YourStripeAccountId",
+          "amount": "0.10"
+        }
+      ],
+      "mcp_payment_triggers": {
+        "mode": "match",
+        "patterns": [
+          "^expensive_tool$",
+          "^premium_search$"
+        ]
+      },
+      "a2a_method_filters": null
+    }
+  },
+  "client_side_pipe_example": {
+    "_comment": "Add an mpp_proxy pipe to automatically pay upstream MPP-enabled services. Uses the same wallet/network config as x402_proxy (x402-proxy.json).",
+    "pipe": {
+      "id": "mpp-payment-pipe",
+      "name": "MPP Payment Proxy",
+      "type": "mpp_proxy",
+      "server_endpoint": "https://upstream-agent.example.com",
+      "max_amount": "1.00",
+      "max_retries": 2,
+      "zen_fallback_mode": "first_compatible"
+    }
+  },
+  "stripe_payment_methods_example": {
+    "_comment": "Add 'stripe_payment_methods' to your x402-proxy.json config alongside wallets/networks. These are used by mpp_proxy pipes to fulfil card/stripe challenges.",
+    "stripe_payment_methods": [
+      {
+        "payment_method_id": "pm_1234567890abcdef",
+        "currencies": [
+          "usd",
+          "eur"
+        ],
+        "priority": 100,
+        "label": "Visa ending 4242"
+      }
+    ]
+  }
+}

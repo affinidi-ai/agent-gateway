@@ -1,0 +1,117 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "75c89fd7-d83f-4213-be48-a3777dacf2dc",
+  "name": "A2A Surface Starter",
+  "description": "A simple starter template for a single A2A agent configuration.",
+  "details": "Simply connects the caller to the target, using the A2A protocol.",
+  "starter_hint": "We've pre-configured an Access Point for an A2A agent. Fill in the highlighted Target node with the endpoint details — either a direct network URL or an Affinidi Trust Fabric connected Gateway endpoint, then click Save.",
+  "icon": "rocket",
+  "tags": [
+    "a2a",
+    "starter",
+    "full"
+  ],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 10,
+  "kind": "full",
+  "surface": {
+    "status": "active",
+    "tags": [],
+    "access_point": {
+      "listen_address": "$HOST",
+      "route": "$ROUTE",
+      "protocol": "a2a",
+      "caller_context": {
+        "mode": "anonymous"
+      },
+      "publish_to_did_document": false
+    },
+    "target": {
+      "endpoint": ""
+    },
+    "canvas": {
+      "version": 1,
+      "surface": {
+        "width": 478,
+        "height": 294
+      },
+      "view": {
+        "x": 0,
+        "y": 6,
+        "k": 1
+      },
+      "nodes": [
+        {
+          "id": "__human__",
+          "type": "human",
+          "label": "Human",
+          "parentId": null,
+          "position": {
+            "x": -461,
+            "y": 0
+          },
+          "config": {}
+        },
+        {
+          "id": "__caller__",
+          "type": "caller",
+          "label": "Caller",
+          "parentId": null,
+          "position": {
+            "x": -355,
+            "y": 0
+          },
+          "config": {}
+        },
+        {
+          "id": "access-point",
+          "type": "access-point",
+          "label": "",
+          "parentId": null,
+          "position": {
+            "x": -239,
+            "y": 0
+          },
+          "config": {}
+        },
+        {
+          "id": "target",
+          "type": "target",
+          "label": "",
+          "parentId": "access-point",
+          "position": {
+            "x": 71,
+            "y": 0
+          },
+          "config": {}
+        },
+        {
+          "id": "__managed-agent-npc__",
+          "type": "npc-endpoint",
+          "label": "External Target",
+          "parentId": "target",
+          "position": {
+            "x": 359,
+            "y": 0
+          },
+          "config": {
+            "name": "External Target",
+            "npc_description": "External agent endpoint",
+            "connection_direction": "outbound",
+            "connected_to": "target"
+          }
+        },
+        {
+          "id": "target-variant",
+          "type": "target-variant",
+          "label": "Variants",
+          "parentId": null,
+          "config": {
+            "variants": []
+          }
+        }
+      ]
+    }
+  }
+}

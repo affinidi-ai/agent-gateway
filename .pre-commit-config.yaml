@@ -1,0 +1,62 @@
+default_install_hook_types:
+  # commit-msg, post-checkout, post-commit, post-merge, post-rewrite, pre-commit, pre-merge-commit, pre-push, pre-rebase, prepare-commit-msg
+  - commit-msg
+  - pre-commit
+  - pre-push
+  - post-merge
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.13.9
+    hooks:
+      - id: commitizen
+  - repo: local
+    hooks:
+      - id: make-pre-commit-rust
+        name: Run make pre-commit-rust
+        description: Runs cargo fmt and clippy (-D warnings); tests run in CI
+        stages:
+          - pre-push
+        language: system
+        entry: make pre-commit-rust
+        files: \.rs$|Cargo\.(toml|lock)$
+        pass_filenames: false
+        verbose: true
+      - id: make-pre-commit-node
+        name: Run make pre-commit-node
+        description: Runs npm format and lint
+        stages:
+          - pre-push
+        language: system
+        entry: make pre-commit-node
+        files: ^www/
+        pass_filenames: false
+        verbose: true
+      - id: npm-lint
+        name: Lint frontend apps
+        description: >-
+          Runs ESLint with --fix across every frontend app in scripts/githooks/npm-lint.
+          Non-blocking on its own; make-pre-commit-node is what fails the push when an
+          autofix changed a tracked file.
+        stages:
+          - pre-push
+        language: system
+        entry: scripts/githooks/npm-lint
+        files: ^www/
+        pass_filenames: false
+        verbose: true
+      - id: npm-audit
+        name: Audit frontend dependencies
+        description: >-
+          Reports runtime npm advisories for www/default. Informational only — the
+          audit:node CI job is what fails the pipeline on high or critical findings.
+        stages:
+          - pre-push
+        language: system
+        entry: scripts/githooks/npm-audit
+        files: ^www/.*/package(-lock)?\.json$
+        pass_filenames: false
+        verbose: true

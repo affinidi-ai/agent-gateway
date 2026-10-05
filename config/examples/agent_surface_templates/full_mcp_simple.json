@@ -1,0 +1,92 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "402d0d33-dd3d-4fc8-a52a-70ee8340d7d3",
+  "name": "MCP Surface Starter",
+  "description": "A simple starter template for a single MCP agent configuration.",
+  "details": "Simply connects the caller to the target, using the MCP protocol.",
+  "starter_hint": "We've pre-configured an Access Point for an MCP agent. Fill in the highlighted Target node with the MCP endpoint — either a direct URL or an Affinidi Trust Fabric connected Gateway endpoint, then click Save.",
+  "icon": "rocket",
+  "tags": [
+    "mcp",
+    "starter",
+    "full"
+  ],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 10,
+  "kind": "full",
+  "surface": {
+    "status": "active",
+    "tags": [],
+    "access_point": {
+      "listen_address": "$HOST",
+      "route": "$ROUTE",
+      "protocol": "mcp",
+      "caller_context": {
+        "mode": "anonymous"
+      },
+      "publish_to_did_document": false
+    },
+    "target": {
+      "endpoint": ""
+    },
+    "canvas": {
+      "version": 1,
+      "surface": {
+        "width": 336,
+        "height": 294
+      },
+      "nodes": [
+        {
+          "id": "__human__",
+          "type": "human",
+          "label": "Human",
+          "parentId": null,
+          "config": {}
+        },
+        {
+          "id": "__caller__",
+          "type": "caller",
+          "label": "Caller",
+          "parentId": null,
+          "config": {}
+        },
+        {
+          "id": "access-point",
+          "type": "access-point",
+          "label": "",
+          "parentId": null,
+          "config": {}
+        },
+        {
+          "id": "target",
+          "type": "target",
+          "label": "",
+          "parentId": null,
+          "config": {}
+        },
+        {
+          "id": "__managed-agent-npc__",
+          "type": "npc-endpoint",
+          "label": "External Target",
+          "parentId": "target",
+          "config": {
+            "name": "External Target",
+            "npc_description": "External agent endpoint",
+            "connection_direction": "outbound",
+            "connected_to": "target"
+          }
+        },
+        {
+          "id": "target-variant",
+          "type": "target-variant",
+          "label": "Variants",
+          "parentId": null,
+          "config": {
+            "variants": []
+          }
+        }
+      ]
+    }
+  }
+}

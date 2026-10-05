@@ -1,0 +1,28 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "5c8669ad-f480-4397-8a2e-203f4cd5e1bb",
+  "name": "Trust Registry Verification",
+  "description": "Wires a trust registry lookup so inbound caller identities are verified against an authoritative registry before being trusted.",
+  "details": "Adds a Trust Check to the inbound caller leg. Select a trust registry and configure the recognition query; its result is added to policy input so the gateway and surface policies can decide whether to allow the request.",
+  "icon": "stamp",
+  "tags": ["identity", "trust", "verification"],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1005,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "trust-check",
+      "address": "ap-ma/request",
+      "config": {
+        "queries": [
+          {
+            "trust_registry_id": "",
+            "query_type": "recognition",
+            "query": {}
+          }
+        ]
+      }
+    }
+  ]
+}

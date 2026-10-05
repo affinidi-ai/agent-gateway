@@ -1,0 +1,21 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "trust-registry-recording",
+  "name": "Trust Registry Recording",
+  "kind": "partial",
+  "description": "Sole runtime writer for agent records in Trust Registries",
+  "details": "Places Trust Recorder on the managed-agent to Access Point response edge. Configure the target Trust Registry entries after applying the template.",
+  "icon": "stamp",
+  "tags": ["identity", "trust", "recording"],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1006,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "trust-recorder",
+      "address": "ap-ma/response",
+      "config": {}
+    }
+  ]
+}

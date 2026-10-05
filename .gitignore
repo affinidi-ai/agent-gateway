@@ -1,0 +1,96 @@
+/envs/
+_storage
+target/
+ngrok.yml
+
+docs/graphify-out
+graphify-out
+# TLS certificates (don't commit these!)
+*.pem
+*.key
+*.crt
+*.cer
+
+# Configuration files with sensitive data
+config.toml
+saml.json
+pipes.json
+.env
+# Allow committed env templates / non-secret build configs for the dashboard.
+!www/default/.env.example
+!www/default/.env.development
+!www/default/.env.production
+# But never commit local overrides (CRA loads .env*.local for secrets).
+www/default/.env.local
+www/default/.env.*.local
+gateway.json
+metrics.json
+x402.json
+x402_addresses.txt
+rbac.json
+config/*/config/x402.json
+x402-proxy.json
+pipe-x402.json
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# OS
+.DS_Store
+**/.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node.js and React build artifacts
+node_modules/
+build/
+dist/
+*.tsbuildinfo
+.npm
+.yarn-integrity
+yarn-error.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local / temp
+.aaf/
+.agent/
+
+tmp/
+tmp/
+!.github/
+.github/*
+!.github/dependabot.yml
+!.github/workflows/
+!.github/workflows/**
+!.github/scripts/
+!.github/scripts/**
+proxy/data
+local*
+!www/default/src/**/local-*/
+envs*
+docker
+itest/_storage
+temp
+.vscode/
+.docker-local
+.docker-local-dev
+coverage.xml
+test_results/
+test-results.xml
+
+# AI generated files
+**/*.implementation.md
+
+# BDD/Gherkin generated tool output
+.bdd-gherkin/
+
+# Generated development certificate configuration
+config/certs/openssl.cnf

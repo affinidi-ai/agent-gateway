@@ -1,0 +1,53 @@
+[advisories]
+# Advisories to ignore (assessed as acceptable risk for this project).
+# Each entry requires a reason comment above it.
+ignore = [
+    # owning_ref 0.4.1 — Multiple soundness issues (no fix available)
+    # Transitive via: json-ld-context-processing → json-ld → ssi
+    "RUSTSEC-2022-0040",
+
+    # rsa 0.6.1 / 0.9.10 — Marvin Attack timing sidechannel (no fix available)
+    # 0.6.1 transitive via: ssi-jwk → ssi
+    # 0.9.10 transitive via: jsonwebtoken, openidconnect, reqsign
+    "RUSTSEC-2023-0071",
+
+    # rustls-webpki 0.101.7 — CRL parsing panic (fix requires ≥0.103.13)
+    # Locked by: rustls 0.21.12 ← reqwest 0.11.27 / aws-smithy-http-client
+    "RUSTSEC-2026-0104",
+
+    # rustls-webpki 0.101.7 — URI name constraints incorrect (fix requires ≥0.103.12)
+    "RUSTSEC-2026-0098",
+
+    # rustls-webpki 0.101.7 — Wildcard name constraints (fix requires ≥0.103.12)
+    "RUSTSEC-2026-0099",
+
+    # quick-xml ≤0.40 — Quadratic run time when checking a start tag for duplicate
+    # attribute names. Severity 7.5 (high). Fix requires ≥0.41.0, but samael
+    # (SAML auth dependency) pins quick-xml <0.40 and reqsign-aws-v4 pins <0.39.
+    # Tracked for resolution when samael/reqsign release compatible versions.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0194
+    "RUSTSEC-2026-0194",
+
+    # quick-xml ≤0.40 — Unbounded namespace-declaration allocation in NsReader
+    # enables memory-exhaustion denial of service. Severity 7.5 (high).
+    # Same root cause as RUSTSEC-2026-0194; blocked on same samael/reqsign pins.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0195
+    "RUSTSEC-2026-0195",
+
+    # rkyv 0.7.46 — Insufficient archive validation can cause out-of-bounds
+    # reads in archives containing Rc/Arc. Fix requires ≥0.8.17, but
+    # rust_decimal 1.42.1 (latest) still depends on rkyv 0.7.
+    # Transitive via: x402-types, zen-engine/zen-expression/zen-types → rust_decimal
+    # https://rustsec.org/advisories/RUSTSEC-2026-0235
+    "RUSTSEC-2026-0235",
+
+    # h2 0.3.27 — Unbounded empty DATA frames can exhaust memory or panic on
+    # length overflow (low-severity DoS). Fix requires ≥0.4.16 and there is no
+    # 0.3.x backport (0.3.27 is the final 0.3 release). The 0.4.x tree is already
+    # bumped to 0.4.16; only the 0.3.27 instance remains, locked by reqwest
+    # 0.11.27 (same pin as the rustls-webpki 0.101.7 advisories above) via the
+    # ssi / affinidi did-resolver dependency chain.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0258
+    "RUSTSEC-2026-0258",
+]
+informational_warnings = ["unmaintained", "unsound", "notice"]

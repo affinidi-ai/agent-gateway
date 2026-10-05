@@ -1,0 +1,6 @@
+[profile.ci]
+junit = { path = "test-results.xml" }
+# cucumber-rs (harness = false) doesn't implement --list --format terse,
+# so nextest cannot enumerate its tests. Run separately: cargo test --test surface_bdd
+# and cargo test --test g2g_bdd (via make gw-e2e when the mediator is needed).
+default-filter = "not binary(surface_bdd) and not binary(g2g_bdd)"

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "c5b49ac3-3c89-45b8-84df-7cb22cf0c85f",
+  "name": "Caller Context Policy Enforcement",
+  "description": "Adds a surface policy that allows only JWT callers in the PowerUser group.",
+  "details": "Installs a surface-level OPA policy evaluated on inbound requests. The starter rule requires JWT source authentication and PowerUser group membership; edit the Rego to add group, claim, identity, or time-based rules as needed. Surface policies run after gateway-level policy and can be stacked.",
+  "icon": "shield-alt",
+  "tags": ["policy", "rbac"],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1002,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "policy",
+      "address": "access-point->target/request",
+      "config": {
+        "name": "caller_context",
+        "rego": "package surface.policy\n\ndefault allow := false\n\nallow if {\n    input.source_auth.method == \"jwt_bearer\"\n    input.source_auth.claims.groups[_] == \"PowerUser\"\n}\n\ndeny_reason := \"Caller must belong to the PowerUser group\" if not allow\n"
+      }
+    }
+  ]
+}

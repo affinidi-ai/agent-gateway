@@ -1,0 +1,13 @@
+{
+  "name": "trust-gateway-mcp-conformance",
+  "version": "1.0.0",
+  "description": "Runs the published MCP conformance suite against Agent Trust Gateway",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.11"
+  },
+  "engines": {
+    "node": ">=20.18.1"
+  }
+}

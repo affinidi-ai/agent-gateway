@@ -1,0 +1,263 @@
+/* Wizard Progress Styles */
+.wizard-progress {
+  padding: 10px 0;
+}
+
+.wizard-steps {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  position: relative;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.wizard-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  flex: 1;
+  z-index: 1;
+}
+
+.wizard-step-circle {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background-color: var(--gray-200);
+  color: var(--gray-500);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: bold;
+  font-size: 14px;
+  border: 2px solid var(--gray-200);
+  transition: all 0.3s ease;
+  position: relative;
+  z-index: 2;
+}
+
+.wizard-step.active .wizard-step-circle {
+  background-color: var(--accent-blue);
+  color: white;
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.2);
+}
+
+.wizard-step.completed .wizard-step-circle {
+  background-color: var(--success);
+  color: white;
+  border-color: var(--success);
+}
+
+.wizard-step-label {
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--gray-500);
+  text-align: center;
+}
+
+.wizard-step.active .wizard-step-label {
+  color: var(--accent-blue);
+}
+
+.wizard-step.completed .wizard-step-label {
+  color: var(--success);
+}
+
+.wizard-step-line {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  width: 100%;
+  height: 2px;
+  background-color: var(--gray-200);
+  z-index: 0;
+  transition: background-color 0.3s ease;
+}
+
+.wizard-step.completed .wizard-step-line {
+  background-color: var(--success);
+}
+
+/* Wizard Content */
+.wizard-content {
+  min-height: 300px;
+}
+
+/* Protocol-card row styles live in the shared selector module so the
+   create-surface flow can also use them without reaching into pages/. */
+@import '../styles/protocol-selector.css';
+
+/* Protocol Selection Buttons */
+.protocol-selection {
+  display: flex;
+  gap: 20px;
+  justify-content: center;
+  margin: 20px 0;
+  flex-wrap: wrap;
+}
+
+.protocol-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 25px 40px;
+  border: 3px solid var(--gray-200);
+  border-radius: 12px;
+  background-color: white;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  min-width: 220px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.protocol-button:hover {
+  border-color: var(--accent-blue);
+  box-shadow: 0 4px 12px rgba(74, 144, 226, 0.28);
+  transform: translateY(-2px);
+}
+
+.protocol-button.selected {
+  border-color: var(--accent-blue);
+  background-color: rgba(74, 144, 226, 0.08);
+}
+
+.protocol-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+  color: var(--accent-blue);
+}
+
+.protocol-button:hover .protocol-icon {
+  transform: scale(1.1);
+  transition: transform 0.2s ease;
+}
+
+.protocol-name {
+  font-size: 20px;
+  font-weight: bold;
+  color: var(--gray-700);
+  margin-bottom: 6px;
+}
+
+.protocol-description {
+  font-size: 13px;
+  color: var(--gray-500);
+  text-align: center;
+  max-width: 250px;
+}
+
+/* Welcome Screen */
+.welcome-screen {
+  text-align: center;
+  padding: 20px 20px;
+}
+
+.welcome-screen h2 {
+  color: var(--gray-700);
+  margin-bottom: 12px;
+  font-size: 24px;
+}
+
+.welcome-screen p {
+  color: var(--gray-500);
+  font-size: 14px;
+  max-width: 600px;
+  margin: 0 auto 20px;
+  line-height: 1.5;
+}
+
+/* Step Navigation */
+.step-navigation {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 20px;
+  padding-top: 15px;
+  border-top: 1px solid var(--gray-200);
+}
+
+/* Commit Screen */
+.commit-screen {
+  text-align: center;
+  padding: 20px 20px;
+}
+
+.commit-screen .success-icon {
+  font-size: 60px;
+  color: var(--success);
+  margin-bottom: 15px;
+}
+
+.commit-screen h2 {
+  color: var(--gray-700);
+  margin-bottom: 12px;
+  font-size: 24px;
+}
+
+.commit-screen p {
+  color: var(--gray-500);
+  font-size: 14px;
+  max-width: 600px;
+  margin: 0 auto 20px;
+  line-height: 1.5;
+}
+
+.commit-screen .summary-box {
+  max-width: 600px;
+  margin: 20px auto;
+  padding: 15px;
+  background-color: rgba(74, 144, 226, 0.06);
+  border-radius: 8px;
+  text-align: left;
+}
+
+.commit-screen .summary-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--gray-200);
+  font-size: 14px;
+}
+
+.commit-screen .summary-item:last-child {
+  border-bottom: none;
+}
+
+.commit-screen .summary-label {
+  font-weight: 600;
+  color: var(--gray-700);
+}
+
+.commit-screen .summary-value {
+  color: var(--gray-500);
+}
+
+/* Utility Classes */
+.cursor-pointer {
+  cursor: pointer;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .wizard-steps {
+    padding: 0 10px;
+  }
+
+  .wizard-step-circle {
+    width: 32px;
+    height: 32px;
+    font-size: 13px;
+  }
+
+  .wizard-step-label {
+    font-size: 11px;
+  }
+
+  .wizard-step-line {
+    top: 16px;
+  }
+}

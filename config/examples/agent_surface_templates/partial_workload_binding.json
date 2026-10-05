@@ -1,0 +1,22 @@
+{
+  "id": "workload-binding",
+  "name": "Workload Binding",
+  "kind": "partial",
+  "description": "Creates a signed identity VP extension",
+  "details": "Places a Workload Binding element on the managed-agent to Target request edge. Configure the caller source and allowlisted fields after applying the template.",
+  "icon": "link",
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1004,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "workload-binding",
+      "address": "ma-external/request",
+      "config": {
+        "enabled": true,
+        "caller_source": "transit_token"
+      }
+    }
+  ]
+}

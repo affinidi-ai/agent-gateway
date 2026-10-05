@@ -1,0 +1,19 @@
+{
+  "id": "e18d7148-b712-4731-9792-f57add45a863",
+  "agent_did": "did:web:gw.example.com:agent:42",
+  "user_identity_hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "credential_provider_id": "provider-github",
+  "provider_id": "github",
+  "access_token": "example-access-token",
+  "refresh_token": "example-refresh-token",
+  "token_type": "Bearer",
+  "scopes": [
+    "repo",
+    "read:user"
+  ],
+  "expires_at": "2026-09-01T11:00:00Z",
+  "consent_granted_at": "2026-09-01T10:00:00Z",
+  "last_used_at": "2026-09-01T10:30:00Z",
+  "created_at": "2026-09-01T10:00:00Z",
+  "updated_at": "2026-09-01T10:30:00Z"
+}

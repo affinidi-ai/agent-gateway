@@ -1,0 +1,41 @@
+[
+  {
+    "id": "agent-policy-q1",
+    "name": "Agent recognised by Provider",
+    "description": "Does the Provider/Issuer that issued this agent's identity still recognise it as one of its owned agents?",
+    "query_type": "recognition",
+    "query": {
+      "authority_id": "{{ input.agent.provider_did }}",
+      "entity_id": "{{ input.agent.did }}",
+      "action": "is",
+      "resource": "ownedAgent"
+    },
+    "origin": "builtin"
+  },
+  {
+    "id": "agent-policy-q2",
+    "name": "Provider authorised to register agents",
+    "description": "Is the Provider/Issuer authorised by its higher Authority to register new agents?",
+    "query_type": "authorization",
+    "query": {
+      "authority_id": "{{ input.agent.authority_did }}",
+      "entity_id": "{{ input.agent.provider_did }}",
+      "action": "register",
+      "resource": "agents"
+    },
+    "origin": "builtin"
+  },
+  {
+    "id": "agent-policy-q3",
+    "name": "Provider recognised by Authority",
+    "description": "Does the higher Authority recognise the Provider/Issuer as a registered issuer?",
+    "query_type": "recognition",
+    "query": {
+      "authority_id": "{{ input.agent.authority_did }}",
+      "entity_id": "{{ input.agent.provider_did }}",
+      "action": "is",
+      "resource": "registeredDepartment"
+    },
+    "origin": "builtin"
+  }
+]

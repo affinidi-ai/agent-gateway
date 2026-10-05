@@ -1,0 +1,55 @@
+{
+  "networks": [
+    {
+      "id": "eip155:84532",
+      "name": "Base Sepolia Testnet",
+      "chain_type": "evm",
+      "chain_id": 84532,
+      "rpc_endpoint": "https://sepolia.base.org",
+      "description": "Base Layer 2 testnet"
+    },
+    {
+      "id": "eip155:11155111",
+      "name": "Ethereum Sepolia Testnet",
+      "chain_type": "evm",
+      "chain_id": 11155111,
+      "rpc_endpoint": "https://rpc.sepolia.org",
+      "description": "Ethereum testnet"
+    },
+    {
+      "id": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+      "name": "Solana Devnet",
+      "chain_type": "solana",
+      "rpc_endpoint": "https://api.devnet.solana.com",
+      "description": "Solana development network"
+    }
+  ],
+  "wallets": [
+    {
+      "id": "dev-wallet-1",
+      "name": "Development Wallet",
+      "description": "Test wallet for development",
+      "bindings": [
+        {
+          "network": "eip155:84532",
+          "address": "0xC8577be191cfA89Be69D8DD2Df93fa8f51Fc238a",
+          "private_key": "$SECRET:<wallet-private-key-secret-id>",
+          "symbols": [
+            {
+              "symbol": "USDC",
+              "priority": 100,
+              "token_address": "0x<USDC_TOKEN_CONTRACT_ADDRESS>",
+              "decimals": 6,
+              "usd_price": 1.0
+            },
+            {
+              "symbol": "ETH",
+              "priority": 90,
+              "token_address": "native"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

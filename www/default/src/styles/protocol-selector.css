@@ -1,0 +1,157 @@
+/* ============================================
+   Shared protocol selector
+   Base styles for the protocol-card row used across
+   wizards (Add Channel, Onboard, Create Surface).
+   ============================================ */
+
+.protocol-selection {
+  display: flex;
+  gap: 20px;
+  justify-content: center;
+  margin: 20px 0;
+  flex-wrap: wrap;
+}
+
+.protocol-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 25px 40px;
+  border: 3px solid #e9ecef;
+  border-radius: 12px;
+  background-color: white;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  min-width: 220px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.protocol-button:hover {
+  border-color: #4e73df;
+  box-shadow: 0 4px 12px rgba(78, 115, 223, 0.3);
+  transform: translateY(-2px);
+}
+
+.protocol-button.selected {
+  border-color: #4e73df;
+  background-color: #f8f9fc;
+}
+
+.protocol-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+  color: #4e73df;
+}
+
+.protocol-button:hover .protocol-icon {
+  transform: scale(1.1);
+  transition: transform 0.2s ease;
+}
+
+.protocol-name {
+  font-size: 20px;
+  font-weight: bold;
+  color: #5a5c69;
+  margin-bottom: 6px;
+}
+
+.protocol-description {
+  font-size: 13px;
+  color: #858796;
+  text-align: center;
+  max-width: 250px;
+}
+
+/* --- Compact modifier (~60% size) ----------------------------------- */
+/* Used in places where the cards are a sub-element of a larger form, */
+/* not the wizard's primary action (e.g. Surface overview tab).        */
+
+.protocol-selection--compact {
+  gap: 12px;
+  margin: 8px 0;
+}
+
+.protocol-button--compact {
+  padding: 15px 24px;
+  min-width: 132px;
+}
+
+.protocol-button--compact .protocol-icon {
+  font-size: 29px;
+  margin-bottom: 7px;
+}
+
+.protocol-button--compact .protocol-name {
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.protocol-button--compact .protocol-description {
+  font-size: 9px;
+  max-width: 150px;
+}
+
+/* --- Disabled / locked state --------------------------------------- */
+
+.protocol-button:disabled,
+.protocol-button[aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.4;
+  transform: none;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+}
+
+.protocol-button:disabled:hover,
+.protocol-button[aria-disabled='true']:hover {
+  border-color: #e9ecef;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+  transform: none;
+}
+
+.protocol-button:disabled:hover .protocol-icon,
+.protocol-button[aria-disabled='true']:hover .protocol-icon {
+  transform: none;
+}
+
+.protocol-button.selected:disabled,
+.protocol-button.selected[aria-disabled='true'] {
+  opacity: 0.9;
+  border-color: #4e73df;
+}
+
+/* --- Responsive (mirrors prior OnboardWizard.css behaviour) -------- */
+
+@media (max-width: 768px) {
+  .protocol-selection:not(.protocol-selection--compact) {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .protocol-button:not(.protocol-button--compact) {
+    min-width: 100%;
+    max-width: 350px;
+  }
+}
+
+/* --- Dark theme ----------------------------------------------------- */
+
+body.dark-theme .protocol-button {
+  background-color: rgba(30, 41, 59, 0.6);
+  border-color: var(--dark-border);
+  color: var(--dark-text);
+}
+
+body.dark-theme .protocol-button:hover {
+  background-color: rgba(30, 41, 59, 0.85);
+  border-color: var(--accent-teal);
+  box-shadow: 0 4px 16px rgba(0, 188, 212, 0.25);
+}
+
+body.dark-theme .protocol-name {
+  color: var(--dark-text-heading);
+}
+
+body.dark-theme .protocol-description {
+  color: var(--dark-text-muted);
+}

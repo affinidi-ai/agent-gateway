@@ -1,0 +1,132 @@
+[advisories]
+version = 2
+ignore = []
+
+[bans]
+multiple-versions = "allow"
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "BSL-1.0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "CC0-1.0",
+    "ISC",
+    "MIT-0",
+    "MIT",
+    "Unlicense",
+    "Zlib",
+]
+
+exceptions = [
+    # BlueOak-1.0.0 — via aws-smithy-cbor → aws-sdk-cloudwatch
+    { allow = [
+        "BlueOak-1.0.0",
+    ], crate = "minicbor" },
+    # MPL-2.0 copyleft deps
+    { allow = [
+        "MPL-2.0",
+    ], crate = "base64urlsafedata" },
+    { allow = [
+        "MPL-2.0",
+    ], crate = "bitmaps" },
+    { allow = [
+        "MPL-2.0",
+    ], crate = "im" },
+    { allow = [
+        "CC-BY-SA-3.0",
+        "MPL-2.0",
+    ], crate = "sized-chunks" },
+    { allow = [
+        "MPL-2.0",
+        "CDLA-Permissive-2.0",
+    ], crate = "webpki-roots" },
+    { allow = [
+        "CDLA-Permissive-2.0",
+    ], crate = "webpki-root-certs" },
+    { allow = [
+        "MPL-2.0",
+    ], crate = "webauthn-attestation-ca" },
+    { allow = [
+        "MPL-2.0",
+    ], crate = "webauthn-rs" },
+    { allow = [
+        "MPL-2.0",
+    ], crate = "webauthn-rs-core" },
+    { allow = [
+        "MPL-2.0",
+    ], crate = "webauthn-rs-proto" },
+    # Unicode-3.0 — ICU / yoke / zerovec family (transitive via idna → url/jsonschema)
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "icu_collections" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "icu_locale_core" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "icu_normalizer" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "icu_normalizer_data" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "icu_properties" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "icu_properties_data" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "icu_provider" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "litemap" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "potential_utf" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "tinystr" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "unicode-ident" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "writeable" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "yoke" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "yoke-derive" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "zerofrom" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "zerofrom-derive" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "zerotrie" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "zerovec" },
+    { allow = [
+        "Unicode-3.0",
+    ], crate = "zerovec-derive" },
+]
+
+[[licenses.clarify]]
+crate = "ring"
+# ring's license file is a mix of ISC, MIT, and OpenSSL — not a simple SPDX expression
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

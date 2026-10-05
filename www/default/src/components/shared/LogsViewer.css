@@ -1,0 +1,192 @@
+/* Enhanced Log Viewer */
+.log-viewer {
+  max-height: calc(100vh - 50px);
+  overflow-y: auto;
+  margin: 0;
+  padding: 1.25rem;
+  background: linear-gradient(135deg, rgb(14, 14, 32) 0%, rgba(11, 16, 31, 0.85) 100%);
+  color: #6bcf7f;
+  font-family: 'Monaco', 'Consolas', 'Courier New', monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  border-radius: 0.375rem;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.log-viewer::-webkit-scrollbar {
+  width: 12px;
+}
+
+.log-viewer::-webkit-scrollbar-track {
+  background: var(--primary-main);
+  border-radius: 0.25rem;
+}
+
+.log-viewer::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--accent-blue), var(--accent-teal));
+  border-radius: 0.25rem;
+}
+
+.log-viewer::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, var(--accent-teal), var(--accent-blue));
+}
+
+/* Persistent Audit call-to-action banner (shown when the buffer has errors/warnings) */
+.logs-audit-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: rgba(255, 171, 64, 0.12);
+  border-bottom: 1px solid rgba(255, 171, 64, 0.35);
+  color: var(--gray-800, #2d3748);
+  font-size: 0.85rem;
+}
+
+.logs-audit-banner__icon {
+  color: #f59e0b;
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.logs-audit-banner__text {
+  flex: 1;
+  line-height: 1.4;
+}
+
+.logs-audit-banner__text code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 0 0.25rem;
+  border-radius: 3px;
+  font-size: 0.8em;
+}
+
+.logs-audit-banner__cta {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.9rem;
+  border: none;
+  border-radius: var(--radius-sm, 0.375rem);
+  background: #f59e0b;
+  color: #1a1a2e;
+  font-weight: 600;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.logs-audit-banner__cta:hover {
+  background: #d97706;
+  color: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  .logs-audit-banner {
+    color: var(--dark-text, #e2e8f0);
+  }
+  .logs-audit-banner__text code {
+    background: rgba(255, 255, 255, 0.12);
+  }
+}
+
+/* Per-line rows (enables match highlighting + scroll-to-match) */
+.log-viewer .log-line {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  scroll-margin: 1.5rem;
+  border-radius: 2px;
+}
+
+/* Highlight the whole line faintly on problem rows so errors/warnings stand out */
+.log-viewer .log-line--problem {
+  background: rgba(255, 85, 85, 0.06);
+}
+
+/* Empty-state Audit link */
+.log-audit-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid rgba(139, 233, 253, 0.6);
+  border-radius: var(--radius-sm, 0.375rem);
+  background: transparent;
+  color: #8be9fd;
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+}
+
+.log-audit-link:hover {
+  background: rgba(139, 233, 253, 0.15);
+}
+
+/* The match the stepper is currently focused on */
+.log-viewer .log-line--current {
+  background: rgba(139, 233, 253, 0.16);
+  box-shadow: inset 3px 0 0 var(--accent-teal, #8be9fd);
+}
+
+/* Search matches within a line */
+.log-viewer mark.log-highlight {
+  background: #ffd54f;
+  color: #1a1a2e;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.log-viewer .log-line--current mark.log-highlight {
+  background: #ffab40;
+}
+
+/* Enhanced log level colors */
+.log-viewer .log-error {
+  color: var(--danger);
+  font-weight: 600;
+  text-shadow: 0 0 5px rgba(239, 68, 68, 0.3);
+}
+
+.log-viewer .log-warn {
+  color: var(--warning);
+  font-weight: 500;
+}
+
+.log-viewer .log-info {
+  color: var(--primary-light);
+}
+
+.log-viewer .log-debug {
+  color: var(--accent-teal);
+}
+
+.log-viewer .log-trace {
+  color: var(--dark-text-muted);
+}
+
+/* Dark theme - Log Viewer */
+@media (prefers-color-scheme: dark) {
+  .log-viewer {
+    background: linear-gradient(135deg, rgba(26, 26, 46, 0.814) 0%, rgba(22, 33, 62, 0.6) 100%);
+  }
+}
+
+/* Auto-scroll indicator */
+.logs-controls {
+  gap: 0.5rem;
+}
+
+.logs-controls .form-check {
+  margin-bottom: 0;
+  padding-left: 1.25rem;
+}
+
+.logs-controls .form-check-label {
+  font-size: 0.875rem;
+  color: var(--gray-500);
+  cursor: pointer;
+}

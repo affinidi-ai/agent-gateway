@@ -1,0 +1,342 @@
+/* ── Page shell ── */
+.loginPage {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+/* ── Left column — marketing panel ── */
+/* Background image is applied inline in the component using the runtime
+ * `/dashboard/...` public path (matching the <img> tags), so webpack's
+ * css-loader doesn't try to resolve an absolute url() at build time. */
+.leftCol {
+  background-color: #2a1a4a;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 5.5rem;
+  padding-bottom: 7rem;
+  overflow-y: auto;
+  position: relative;
+}
+
+.leftHeadline {
+  font-size: 2.25rem;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-bottom: 1rem;
+  letter-spacing: -0.02em;
+}
+
+.leftSubheading {
+  font-size: 1rem;
+  opacity: 0.85;
+  line-height: 1.6;
+  margin-bottom: 2.5rem;
+  max-width: 400px;
+}
+
+.featureList {
+  display: flex;
+  flex-direction: column;
+  gap: 1.75rem;
+}
+
+.featureRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.featureIcon {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.625rem;
+  background: rgba(255, 255, 255, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  flex-shrink: 0;
+  margin-top: 0.1rem;
+}
+
+.featureText {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.featureLabel {
+  font-weight: 600;
+  font-size: 0.9375rem;
+  line-height: 1.3;
+}
+
+.featureDesc {
+  font-size: 0.8125rem;
+  opacity: 0.75;
+  line-height: 1.5;
+}
+
+.wordmark {
+  position: absolute;
+  bottom: 5rem;
+  left: 5.5rem;
+}
+
+.wordmark img {
+  height: 28px;
+  opacity: 0.85;
+}
+
+/* ── Right column — form panel ── */
+.rightCol {
+  background: #f8f9fa;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 2rem;
+  overflow-y: auto;
+  position: relative;
+}
+
+.formPanel {
+  width: 100%;
+  max-width: 400px;
+  animation: slideUp 0.3s ease-out;
+}
+
+.formLogo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 2rem;
+}
+
+.formLogo img {
+  height: 100px;
+}
+
+.formLogoWordmark {
+  height: 28px;
+  opacity: 0.85;
+}
+
+.formSubtitle {
+  font-size: 0.875rem;
+  color: #6c757d;
+  text-align: center;
+  margin-bottom: 1.5rem;
+  line-height: 1.5;
+}
+
+/* ── New right-panel styles — dark mode aware ── */
+
+.formHeading {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #1f2937;
+  margin-bottom: 0.5rem;
+  line-height: 1.3;
+}
+
+.formSubtext {
+  font-size: 0.875rem;
+  color: #6b7280;
+  margin-bottom: 1.5rem;
+  line-height: 1.5;
+}
+
+/* Gradient submit button with accessibility-friendly focus states */
+.submitBtnGradient {
+  background: linear-gradient(135deg, rgb(174, 68, 213) 0%, rgb(52, 100, 253) 100%);
+  background-color: transparent;
+  background-image: linear-gradient(135deg, rgb(174, 68, 213) 0%, rgb(52, 100, 253) 100%);
+  border: none;
+  box-shadow: none;
+  color: #fff;
+  font-weight: 500;
+  transition:
+    opacity 150ms ease,
+    box-shadow 150ms ease;
+  position: relative;
+  height: auto;
+  min-height: 44px;
+}
+
+.submitBtnGradient:hover:not(:disabled) {
+  opacity: 0.9;
+  box-shadow: 0 4px 12px rgba(174, 68, 213, 0.4);
+}
+
+.submitBtnGradient:focus-visible {
+  outline: 2px solid rgb(174, 68, 213);
+  outline-offset: 2px;
+}
+
+.submitBtnGradient:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Divider section — visual break between primary action and secondary action */
+.dividerSection {
+  margin-top: 1.5rem;
+  padding-top: 0;
+}
+
+.divider {
+  border: none;
+  height: 1px;
+  background-color: #e5e7eb;
+  margin: 0;
+}
+
+/* Secondary text — subtle, same size as surrounding content */
+.secondaryText {
+  font-size: 0.875rem;
+  color: #6b7280;
+  text-align: center;
+  margin: 1rem 0 0 0;
+  line-height: 1.5;
+}
+
+/* Secondary link — mode-toggle button styled as inline link */
+.secondaryLink {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.875rem; /* matches surrounding text */
+  color: var(--gateway-glow-color);
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    text-decoration 150ms ease,
+    opacity 150ms ease;
+  line-height: inherit;
+}
+
+.secondaryLink:hover:not(:disabled) {
+  text-decoration: underline;
+  opacity: 0.85;
+}
+
+.secondaryLink:focus-visible {
+  outline: 2px solid var(--gateway-glow-color);
+  outline-offset: 2px;
+}
+
+.secondaryLink:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Footer — contact link with minimal visual weight */
+.formFooter {
+  margin-top: 2rem;
+  text-align: center;
+}
+
+/* Footer positioned at bottom of right column, aligned with left panel wordmark */
+.formFooterBottom {
+  position: absolute;
+  bottom: 5rem;
+  left: 0;
+  right: 0;
+  text-align: center;
+  margin: 0;
+  padding: 0 2rem;
+}
+
+.formFooterText {
+  font-size: 0.75rem;
+  color: #9ca3af;
+  margin: 0;
+  line-height: 1.5;
+}
+
+.footerLink {
+  color: var(--gateway-glow-color);
+  text-decoration: none;
+  font-weight: 500;
+  transition:
+    text-decoration 150ms ease,
+    opacity 150ms ease;
+}
+
+.footerLink:hover:not(:disabled) {
+  text-decoration: underline;
+  opacity: 0.85;
+}
+
+.footerLink:focus-visible {
+  outline: 2px solid var(--gateway-glow-color);
+  outline-offset: 2px;
+}
+
+/* Biometric availability notice — very de-emphasized */
+.biometricCaption {
+  font-size: 0.65rem;
+  color: #9ca3af;
+  text-align: center;
+  margin-top: 2rem;
+  margin-bottom: 0;
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── Submit button — unchanged ── */
+.submitBtn {
+  padding: 0.75rem 1rem;
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border-radius: 0.75rem;
+  background: linear-gradient(135deg, #5f6fd4 0%, #7c5dc0 100%);
+  border: none;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(95, 111, 212, 0.5);
+  transition:
+    background 0.2s ease,
+    box-shadow 0.2s ease,
+    transform 0.1s ease;
+}
+
+.submitBtn:hover:not(:disabled) {
+  background: linear-gradient(135deg, #4f5fc2 0%, #6c4dae 100%);
+  box-shadow: 0 6px 20px rgba(95, 111, 212, 0.65);
+  transform: translateY(-1px);
+}
+
+/* ── Responsive: single column on mobile ── */
+@media (max-width: 768px) {
+  .loginPage {
+    grid-template-columns: 1fr;
+  }
+
+  .leftCol {
+    display: none;
+  }
+
+  .rightCol {
+    padding: 2rem 1.25rem;
+  }
+}

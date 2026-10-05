@@ -1,0 +1,6 @@
+# Expected failures for the pinned reference server run directly (target
+# "direct"). Entries are <scenario>:<check-id>. The CLI fails the run on any
+# failure or warning not listed here and on a listed check that now passes.
+server:
+  # Reference server: accepts inputResponses that is not an object (SHOULD-level warning).
+  - input-required-result-validate-input:sep-2322-validate-input-responses

@@ -1,0 +1,430 @@
+{
+  "networks": [
+    {
+      "id": "eip155:8453",
+      "name": "Base",
+      "description": "Base L2 network (Ethereum) - CAIP-2: eip155:8453",
+      "rpc_endpoint": "https://mainnet.base.org",
+      "chain_id": 8453,
+      "native_currency": "ETH",
+      "native_denomination": "wei",
+      "block_explorer": "https://basescan.org/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "eip155:1",
+      "name": "Ethereum Mainnet",
+      "description": "Ethereum Layer 1 - CAIP-2: eip155:1",
+      "rpc_endpoint": "https://eth.llamarpc.com",
+      "chain_id": 1,
+      "native_currency": "ETH",
+      "native_denomination": "wei",
+      "block_explorer": "https://etherscan.io/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "eip155:10",
+      "name": "Optimism",
+      "description": "Optimism L2 network - CAIP-2: eip155:10",
+      "rpc_endpoint": "https://mainnet.optimism.io",
+      "chain_id": 10,
+      "native_currency": "ETH",
+      "native_denomination": "wei",
+      "block_explorer": "https://optimistic.etherscan.io/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "eip155:42161",
+      "name": "Arbitrum One",
+      "description": "Arbitrum L2 network - CAIP-2: eip155:42161",
+      "rpc_endpoint": "https://arb1.arbitrum.io/rpc",
+      "chain_id": 42161,
+      "native_currency": "ETH",
+      "native_denomination": "wei",
+      "block_explorer": "https://arbiscan.io/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "eip155:137",
+      "name": "Polygon",
+      "description": "Polygon PoS network - CAIP-2: eip155:137",
+      "rpc_endpoint": "https://polygon-rpc.com",
+      "chain_id": 137,
+      "native_currency": "MATIC",
+      "native_denomination": "wei",
+      "block_explorer": "https://polygonscan.com/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+      "name": "Solana",
+      "description": "Solana mainnet-beta - CAIP-2: solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+      "rpc_endpoint": "https://api.mainnet-beta.solana.com",
+      "native_currency": "SOL",
+      "native_denomination": "lamports",
+      "block_explorer": "https://explorer.solana.com/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          "asset_transfer_method": "spl_transfer"
+        }
+      ]
+    },
+    {
+      "id": "eip155:84532",
+      "name": "Base Sepolia",
+      "description": "Base L2 testnet (Sepolia) - CAIP-2: eip155:84532",
+      "rpc_endpoint": "https://sepolia.base.org",
+      "chain_id": 84532,
+      "native_currency": "ETH",
+      "native_denomination": "wei",
+      "block_explorer": "https://sepolia.basescan.org/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "eip155:11155111",
+      "name": "Ethereum Sepolia",
+      "description": "Ethereum testnet - CAIP-2: eip155:11155111",
+      "rpc_endpoint": "https://ethereum-sepolia-rpc.publicnode.com",
+      "chain_id": 11155111,
+      "native_currency": "ETH",
+      "native_denomination": "wei",
+      "block_explorer": "https://sepolia.etherscan.io/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "eip155:11155420",
+      "name": "Optimism Sepolia",
+      "description": "Optimism L2 testnet - CAIP-2: eip155:11155420",
+      "rpc_endpoint": "https://sepolia.optimism.io",
+      "chain_id": 11155420,
+      "native_currency": "ETH",
+      "native_denomination": "wei",
+      "block_explorer": "https://sepolia-optimistic.etherscan.io/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0x5fd84259d66Cd46123540766Be93DFE6D43130D7",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "eip155:421614",
+      "name": "Arbitrum Sepolia",
+      "description": "Arbitrum L2 testnet - CAIP-2: eip155:421614",
+      "rpc_endpoint": "https://sepolia-rollup.arbitrum.io/rpc",
+      "chain_id": 421614,
+      "native_currency": "ETH",
+      "native_denomination": "wei",
+      "block_explorer": "https://sepolia.arbiscan.io/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "eip155:80002",
+      "name": "Polygon Amoy",
+      "description": "Polygon testnet (Amoy) - CAIP-2: eip155:80002",
+      "rpc_endpoint": "https://rpc-amoy.polygon.technology",
+      "chain_id": 80002,
+      "native_currency": "MATIC",
+      "native_denomination": "wei",
+      "block_explorer": "https://amoy.polygonscan.com/tx/${TX_HASH}",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582",
+          "asset_transfer_method": "eip3009",
+          "version": "2"
+        }
+      ]
+    },
+    {
+      "id": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+      "name": "Solana Devnet",
+      "description": "Solana devnet - CAIP-2: solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+      "rpc_endpoint": "https://api.devnet.solana.com",
+      "native_currency": "SOL",
+      "native_denomination": "lamports",
+      "block_explorer": "https://explorer.solana.com/tx/${TX_HASH}?cluster=devnet",
+      "x402_tokens": [
+        {
+          "symbol": "USDC",
+          "denomination": "USD",
+          "decimals": 6,
+          "description": "$1.00 USD = 1000000 units",
+          "contract_address": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+          "asset_transfer_method": "spl_transfer"
+        },
+        {
+          "symbol": "KTTY",
+          "denomination": "KTTY",
+          "decimals": 9,
+          "description": "$1.00 USD = 1000000 KTTYs",
+          "contract_address": "mntesgFtKuANB6L6LoVHetXvAsh24T4LA9Fnz3BQW9m",
+          "asset_transfer_method": "spl_transfer"
+        },
+        {
+          "symbol": "ECPC",
+          "denomination": "ECPC",
+          "decimals": 9,
+          "description": "$1.00 USD = 1000000 ECPCs",
+          "contract_address": "AsiomnPHsYPFwg9qcrZiNboBqJTyaP6fwjAApXkApJqM",
+          "asset_transfer_method": "spl_transfer"
+        }
+      ]
+    }
+  ],
+  "payment_schemes": [
+    {
+      "id": "exact",
+      "name": "Exact Amount",
+      "description": "Payment must match exact amount"
+    },
+    {
+      "id": "upto",
+      "name": "At Least",
+      "description": "Payment must be at least the specified amount"
+    }
+  ],
+  "verification_modes": [
+    {
+      "id": "mock",
+      "name": "Level 0 - No verification (For testing only)",
+      "description": "Accepts any payment without verification - for testing only"
+    },
+    {
+      "id": "signature",
+      "name": "Level 1 - Verify cryptographic signature",
+      "description": "Verifies EIP-3009 or Permit2 signatures cryptographically but does not check on-chain state (suitable for low-value payments or when on-chain verification is not possible)"
+    },
+    {
+      "id": "local",
+      "name": "Level 2 - Gateway verifies on-chain",
+      "description": "Verifies payment directly on blockchain via RPC from Gateway"
+    },
+    {
+      "id": "fabric_gateway",
+      "name": "Level 3 - Facilitator via Fabric Gateway",
+      "description": "Delegates payment verification to another connected gateway via DIDComm messages"
+    },
+    {
+      "id": "external_facilitator",
+      "name": "Level 4 - Facilitator via external provider",
+      "description": "Uses external HTTP payment verification service (x402 v2 spec)"
+    }
+  ],
+  "settlement_modes": [
+    {
+      "id": "none",
+      "name": "None",
+      "description": "No settlement action - verification only"
+    },
+    {
+      "id": "deferred",
+      "name": "Deferred",
+      "description": "Records payment for batch settlement later. Settlement location depends on verification mode: Local (this gateway), Fabric Gateway (both gateways with signaling), or External Facilitator (external service)"
+    },
+    {
+      "id": "immediate",
+      "name": "Immediate",
+      "description": "Executes settlement immediately after verification. Settlement method depends on verification mode: Local (embedded facilitator executes on-chain), Fabric Gateway (delegates to other gateway), or External Facilitator (delegates to external service)"
+    }
+  ],
+  "recipient_addresses": [
+    {
+      "id": "demo-recipient",
+      "name": "Demo Recipient",
+      "description": "Main demo wallet",
+      "addresses": {
+        "eip155:8453": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "eip155:1": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "eip155:10": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "eip155:42161": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "eip155:137": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp": "GatewayTreasury11111111111111111111111111111",
+        "eip155:84532": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "eip155:11155111": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "eip155:11155420": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "eip155:421614": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "eip155:80002": "0xbd618655985202cba64c19bc95818257f2e83f90",
+        "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1": "8CG2Loqk8GeSsCDArrkeA32ZXx5Da7nJHXJZizDRKFnx"
+      }
+    }
+  ],
+  "headers": {
+    "payment_required": "PAYMENT-REQUIRED",
+    "payment_signature": "PAYMENT-SIGNATURE",
+    "payment_response": "PAYMENT-RESPONSE"
+  },
+  "defaults": {
+    "verification_mode": "local",
+    "verification_async": "sync",
+    "settlement_mode": "none",
+    "min_confirmations": 0,
+    "accept_mempool_tx": true,
+    "facilitator_timeout_secs": 10,
+    "enable_facilitator_server": true,
+    "settlement_timeout_ms": 60000
+  },
+  "rpc_endpoints": {
+    "eip155:84532": "https://sepolia.base.org",
+    "eip155:8453": "https://mainnet.base.org",
+    "eip155:1": "https://eth.llamarpc.com",
+    "eip155:11155111": "https://ethereum-sepolia-rpc.publicnode.com",
+    "eip155:10": "https://mainnet.optimism.io",
+    "eip155:11155420": "https://sepolia.optimism.io",
+    "eip155:42161": "https://arb1.arbitrum.io/rpc",
+    "eip155:421614": "https://sepolia-rollup.arbitrum.io/rpc",
+    "eip155:137": "https://polygon-rpc.com",
+    "eip155:80002": "https://rpc-amoy.polygon.technology",
+    "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1": "https://api.devnet.solana.com"
+  },
+  "facilitator_private_keys": {
+    "eip155:84532": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:8453": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:1": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:11155111": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:10": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:11155420": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:42161": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:421614": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:137": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "eip155:80002": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    },
+    "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1": {
+      "private_key": "--- REPLACE WITH ACTUAL PRIVATE KEY ---",
+      "address": "--- REPLACE WITH ACTUAL ADDRESS ---"
+    }
+  },
+  "settlement_storage": {
+    "batch_size": 100,
+    "settlement_interval_seconds": 60,
+    "max_retries": 3
+  },
+  "facilitator": {
+    "url": "https://x402.example.com",
+    "timeout_seconds": 30,
+    "max_retries": 3,
+    "retry_backoff_ms": 1000
+  }
+}

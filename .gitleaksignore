@@ -1,0 +1,20 @@
+# .gitleaksignore — verified false-positive suppressions
+#
+# Every entry below was reviewed and is test material, never a production
+# secret. Fingerprints match `gitleaks dir` output, run from the repository
+# root. Format is <file>:<rule>:<line>; re-verify after code moves.
+
+# --- Test key pairs (generated for unit/BDD tests, not production keys) ---
+# The JWKS fixtures depend on each key's fixed public component, so the keys
+# are kept in source rather than generated at runtime.
+src/component_tests/helpers/jwt.rs:private-key:9
+src/jwt_bearer/validator.rs:private-key:256
+src/source_auth/middleware.rs:private-key:1309
+tests/bdd_support/jwt.rs:private-key:7
+
+# --- Redaction test fixtures: inputs must look like secrets ---
+# The log redactor tests feed secret-shaped strings through the JWT and PEM
+# private-key rules to prove they are masked. The PEM finding starts at the
+# RSA fixture and runs through the EC fixture, so one entry covers both.
+src/observability/log_redact.rs:jwt:532
+src/observability/log_redact.rs:private-key:630

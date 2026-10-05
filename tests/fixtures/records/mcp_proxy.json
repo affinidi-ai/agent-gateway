@@ -1,0 +1,14 @@
+{
+  "id": "bef26c6c-af42-4511-b003-920e02db5dda",
+  "name": "weather",
+  "description": "Weather REST API",
+  "base_url": "https://api.weather.example.com",
+  "openapi_spec": "openapi: 3.0.0\ninfo:\n  title: Weather\n  version: 1.0.0\npaths: {}\n",
+  "status": "active",
+  "channel_prefix": "/mcp",
+  "endpoint_path": "/weather",
+  "flatten_post_params": false,
+  "direct_access": true,
+  "created_at": "2026-09-01T10:00:00Z",
+  "updated_at": "2026-09-01T10:00:00Z"
+}

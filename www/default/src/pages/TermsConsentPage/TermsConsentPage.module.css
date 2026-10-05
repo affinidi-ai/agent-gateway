@@ -1,0 +1,24 @@
+.page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+}
+
+.card {
+  width: min(100%, 640px);
+}
+
+.term {
+  padding: 1rem;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--gray-50) 75%, transparent);
+}
+
+body.dark-theme .term {
+  border-color: var(--dark-border);
+  background: color-mix(in srgb, var(--dark-card) 85%, transparent);
+  color: var(--dark-text);
+}

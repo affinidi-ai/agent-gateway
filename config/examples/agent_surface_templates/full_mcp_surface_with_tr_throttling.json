@@ -1,0 +1,264 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "f94dc340-bb60-4bbc-8248-0a19a4f642ce",
+  "name": "MCP Surface with Trust Check & Trust Recording & Throttling",
+  "description": "An MCP surface configured with Trust Check, Trust Recording, and Network components.",
+  "details": "Quick-start template for an MCP agent surface with integrated Trust Check, Trust Recording, and networking policies.",
+  "starter_hint": "We've pre-configured an Access Point with Trust Check verification, Trust Recording, and rate limiting. Provide the MCP Target endpoint to finish setup, then review the Trust Check, Trust Recording, and Network policy nodes on the canvas before saving.",
+  "icon": "rocket",
+  "tags": [
+    "mcp",
+    "starter",
+    "full"
+  ],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 50,
+  "kind": "full",
+  "surface": {
+    "name": "MCP Surface Templated",
+    "status": "active",
+    "tags": [],
+    "access_point": {
+      "listen_address": "$HOST",
+      "route": "$ROUTE",
+      "protocol": "mcp",
+      "publish_to_did_document": false,
+      "terminate_trace_id": false
+    },
+    "target": {
+      "endpoint": "",
+      "identity_injection": {
+        "inject_vp": true
+      },
+      "networking": {
+        "timeout": {
+          "request_secs": 30,
+          "connect_secs": 5,
+          "idle_secs": 90
+        }
+      }
+    },
+    "transit": {
+      "sign_requests": true,
+      "transit_token_mode": "embedded",
+      "points": [
+        {
+          "id": "",
+          "alias": "",
+          "target_endpoint": "",
+          "protocol": "mcp",
+          "require_transit_token": true
+        }
+      ]
+    },
+    "identity_slots": {
+      "protected": {
+        "meta_field": "serverIdentity",
+        "json_schema": {
+          "type": "object",
+          "required": [],
+          "properties": {
+            "serverIdentity": {
+              "type": "object",
+              "required": [],
+              "properties": {}
+            }
+          }
+        }
+      }
+    },
+    "canvas": {
+      "version": 1,
+      "surface": {
+        "width": 653,
+        "height": 352
+      },
+      "view": {
+        "x": -77.77635580352683,
+        "y": 136.758402171444,
+        "k": 1.1164923674577973
+      },
+      "nodes": [
+        {
+          "id": "access-point",
+          "type": "access-point",
+          "label": "Access Point",
+          "parentId": null,
+          "position": {
+            "x": -326.5,
+            "y": 29
+          },
+          "config": {}
+        },
+        {
+          "id": "target",
+          "type": "target",
+          "label": "Managed Agent",
+          "parentId": "trust-check-caller",
+          "position": {
+            "x": 70.5,
+            "y": 29
+          },
+          "config": {
+            "endpoint": "",
+            "endpoint_type": "url",
+            "inject_vp": true
+          }
+        },
+        {
+          "id": "target-variant",
+          "type": "target-variant",
+          "label": "Variants",
+          "parentId": null,
+          "config": {
+            "variants": []
+          }
+        },
+        {
+          "id": "__human__",
+          "type": "human",
+          "label": "Human",
+          "parentId": null,
+          "position": {
+            "x": -562.5,
+            "y": 29
+          },
+          "config": {}
+        },
+        {
+          "id": "__caller__",
+          "type": "caller",
+          "label": "Caller",
+          "parentId": null,
+          "position": {
+            "x": -456.5,
+            "y": 29
+          },
+          "config": {}
+        },
+        {
+          "id": "__managed-agent-npc__",
+          "type": "npc-endpoint",
+          "label": "External Target",
+          "parentId": "target",
+          "position": {
+            "x": 362.5,
+            "y": 29
+          },
+          "config": {
+            "name": "External Target",
+            "npc_description": "External agent endpoint",
+            "connection_direction": "outbound",
+            "connected_to": "target"
+          }
+        },
+        {
+          "id": "transit-point-mcp-1",
+          "type": "transit-point-mcp",
+          "label": "Transit Point (MCP)",
+          "parentId": null,
+          "position": {
+            "x": 73,
+            "y": -176
+          },
+          "config": {}
+        },
+        {
+          "id": "npc-endpoint-1",
+          "type": "npc-endpoint",
+          "label": "External Target",
+          "parentId": "transit-point-mcp-1",
+          "position": {
+            "x": 82.01956744545441,
+            "y": -356.8797493972243
+          },
+          "config": {
+            "npc_name": "External Target",
+            "npc_description": "Destination service",
+            "connection_direction": "outbound",
+            "connected_to": "transit-point-mcp-1"
+          }
+        },
+        {
+          "id": "networking-target",
+          "type": "networking",
+          "label": "",
+          "parentId": "target",
+          "position": {
+            "x": 217,
+            "y": 57
+          },
+          "config": {
+            "timeout_secs": "30",
+            "connect_timeout_secs": "5",
+            "idle_timeout_secs": "90",
+            "retry_max": "3",
+            "retry_backoff_multiplier": "2",
+            "retry_initial_backoff_ms": "100",
+            "retry_max_backoff_ms": "5000",
+            "cb_threshold": "5",
+            "cb_success_threshold": "3",
+            "cb_recovery_secs": "30",
+            "cb_window_secs": "60",
+            "mirror_percentage": "100",
+            "mirror_timeout_secs": "5"
+          },
+          "slotId": "request:networking"
+        },
+        {
+          "id": "trust-recorder-target-response",
+          "type": "trust-recorder",
+          "label": "Trust Recorder",
+          "parentId": "target",
+          "position": {
+            "x": -164.5,
+            "y": -3
+          },
+          "config": {
+            "entries": []
+          },
+          "slotId": "response:trust-recorder"
+        },
+        {
+          "id": "identity-protected",
+          "type": "identity",
+          "label": "",
+          "parentId": "target",
+          "position": {
+            "x": -61.5,
+            "y": -3
+          },
+          "config": {
+            "meta_field": "serverIdentity",
+            "json_schema": {
+              "type": "object",
+              "required": [],
+              "properties": {
+                "serverIdentity": {
+                  "type": "object",
+                  "required": [],
+                  "properties": {}
+                }
+              }
+            },
+            "fields": []
+          },
+          "slotId": "response:identity-protected"
+        },
+        {
+          "id": "trust-check-caller",
+          "type": "trust-check",
+          "label": "Trust Check",
+          "parentId": "access-point",
+          "position": {
+            "x": -69.5,
+            "y": 61
+          },
+          "config": {},
+          "slotId": "request:trust-check-access_point_trust_check_list"
+        }
+      ]
+    }
+  }
+}

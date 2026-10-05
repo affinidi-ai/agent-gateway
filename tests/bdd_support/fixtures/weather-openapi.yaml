@@ -1,0 +1,61 @@
+openapi: 3.0.0
+info:
+  title: Weather REST API
+  description: Minimal REST API used by BDD scenarios to verify that MCP-proxy targets translate JSON-RPC tools/call into REST calls.
+  version: 1.0.0
+paths:
+  /weather/{city}:
+    get:
+      operationId: get_weather
+      summary: Get current weather for a city
+      parameters:
+        - name: city
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current weather report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  city:
+                    type: string
+                  temperature:
+                    type: number
+                  conditions:
+                    type: string
+  /forecast/{city}:
+    get:
+      operationId: get_forecast
+      summary: Get five-day forecast for a city
+      parameters:
+        - name: city
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Five-day forecast
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  city:
+                    type: string
+                  days:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day:
+                          type: integer
+                        high:
+                          type: number
+                        low:
+                          type: number

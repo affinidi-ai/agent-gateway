@@ -1,0 +1,63 @@
+{
+  "opentelemetry": {
+    "enabled": false,
+    "endpoint": "http://localhost:4317",
+    "service_name": "agent-gateway",
+    "environment": "demo",
+    "traces": {
+      "enabled": true,
+      "sample_rate": 0.1,
+      "target_crates": [
+        "agent_gateway"
+      ],
+      "record_caller_identity": false
+    },
+    "metrics": {
+      "enabled": true,
+      "export_interval_seconds": 30
+    },
+    "logs": {
+      "enabled": true
+    }
+  },
+  "cloudwatch": {
+    "enabled": false,
+    "region": "${CW_AWS_REGION}",
+    "namespace": "Fabric/AgentGateway",
+    "dimensions": [
+      {
+        "name": "project_id",
+        "value": "${PROJECT_ID}"
+      },
+      {
+        "name": "service_id",
+        "value": "${SERVICE_ID}"
+      }
+    ]
+  },
+  "retention": {
+    "local_logs_hours": 12,
+    "collector_log_mb": 100,
+    "collector_log_backups": 3,
+    "trace_retention_days": 7,
+    "metrics_retention_days": 14
+  },
+  "advanced": {
+    "batch_queue_size": 2048,
+    "batch_delay_ms": 2000,
+    "batch_size": 512,
+    "export_timeout_sec": 30,
+    "host_metrics": {
+      "enabled": true,
+      "collection_interval_seconds": 15,
+      "collectors": {
+        "cpu": true,
+        "memory": true,
+        "disk": true,
+        "network": true,
+        "load": true,
+        "processes": true
+      }
+    }
+  }
+}

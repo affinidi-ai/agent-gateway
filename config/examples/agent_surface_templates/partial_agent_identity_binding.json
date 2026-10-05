@@ -1,0 +1,25 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "13fdcbb5-ef7e-45ab-ac09-f479086f5a79",
+  "name": "Agent Identity Binding",
+  "description": "Binds an agent identity to the request from the protected agent so downstream hops can trust who served the call.",
+  "details": "Drops an Identity element onto the Access Point → Managed Agent request edge. The Agent Gateway extracts the agent's identity claims from the response payload and stamps them into outbound mirror, trust-registry, and VP flows. Without this binding the upstream agent is treated as anonymous.",
+  "icon": "id-badge",
+  "tags": [
+    "identity",
+    "trust"
+  ],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1000,
+  "items": [
+    {
+      "scope": "edge",
+      "address": "access-point->target/request",
+      "kind": "identity",
+      "config": {
+        "type": "from_payload"
+      }
+    }
+  ]
+}

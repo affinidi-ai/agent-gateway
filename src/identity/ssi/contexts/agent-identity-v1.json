@@ -1,0 +1,39 @@
+{
+  "@context": {
+    "AgentIdentityCredential": {
+      "@id": "https://d2oeuqaac90cm.cloudfront.net/TAgentIdentityCredentialV1R0.jsonld",
+      "@context": {
+        "@version": 1.1,
+        "@protected": true
+      }
+    },
+    "identityFields": {
+      "@id": "schema-id:identityFields",
+      "@type": "@json"
+    },
+    "workloadBinding": {
+      "@id": "schema-id:workloadBinding",
+      "@type": "@json"
+    },
+    "agentIdentity": {
+      "@id": "schema-id:agentIdentity",
+      "@type": "@json"
+    },
+    "llmInfo": {
+      "@id": "schema-id:llmInfo",
+      "@type": "@json"
+    },
+    "softwareInfo": {
+      "@id": "schema-id:softwareInfo",
+      "@type": "@json"
+    },
+    "provisioningInfo": {
+      "@id": "schema-id:provisioningInfo",
+      "@type": "@json"
+    },
+    "region": {
+      "@id": "schema-id:region",
+      "@type": "https://schema.org/Text"
+    }
+  }
+}

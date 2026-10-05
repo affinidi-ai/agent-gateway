@@ -1,0 +1,207 @@
+{
+  "source": {
+    "revision": "2026-07-28",
+    "commit": "271ecc9accafdd9b83a3c869fa67c22953b2af80",
+    "url": "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/271ecc9accafdd9b83a3c869fa67c22953b2af80/schema/2026-07-28/schema.ts",
+    "sha256": "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd"
+  },
+  "scope": "Project-authored common-result preservation fixtures, not a complete method-specific conformance schema. Extension payloads are opaque to this layer.",
+  "results": [
+    {
+      "method": "tools/call",
+      "result": {
+        "resultType": "complete",
+        "content": [
+          { "type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav" },
+          { "type": "resource_link", "uri": "https://example.org/resource", "name": "reference", "title": "Reference" }
+        ],
+        "structuredContent": [false, 1, null, { "shape": "open" }],
+        "isError": true,
+        "_meta": { "com.example/extra": { "opaque": [1, true] } }
+      }
+    },
+    {
+      "method": "tools/list",
+      "result": {
+        "resultType": "complete",
+        "tools": [
+          {
+            "name": "echo",
+            "title": "Echo",
+            "annotations": { "readOnlyHint": true },
+            "icons": [{ "src": "https://example.org/icon.png" }],
+            "inputSchema": {
+              "type": "object",
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "$defs": { "value": { "type": "string" } },
+              "properties": { "value": { "$ref": "#/$defs/value" } },
+              "allOf": [{ "if": { "required": ["value"] }, "then": { "unevaluatedProperties": false } }]
+            },
+            "outputSchema": { "oneOf": [{ "type": "null" }, { "type": "array" }] },
+            "com.example/unknown": [1, 2]
+          }
+        ],
+        "ttlMs": 1200.5,
+        "cacheScope": "public",
+        "nextCursor": "opaque-cursor",
+        "_meta": { "com.example/page": { "marker": true } }
+      }
+    },
+    {
+      "method": "tools/call",
+      "result": {
+        "resultType": "input_required",
+        "inputRequests": {
+          "consent": { "method": "elicitation/create", "params": { "mode": "url", "message": "Authorize access", "url": "https://example.org/authorize" } }
+        },
+        "requestState": "opaque-upstream-state",
+        "_meta": { "com.example/pending": [true, null] }
+      }
+    },
+    {
+      "method": "tasks/get",
+      "result": { "resultType": "task", "task": { "taskId": "task-1", "status": "input_required" }, "com.example/detail": [1, false] }
+    },
+    {
+      "method": "com.example/operation",
+      "result": { "resultType": "com.example/result", "payload": { "opaque": [true, null] } }
+    },
+    {
+      "method": "prompts/list",
+      "result": {
+        "resultType": "complete",
+        "prompts": [
+          {
+            "name": "summarize",
+            "title": "Summarize",
+            "icons": [
+              {
+                "src": "https://example.org/prompt.png",
+                "mimeType": "image/png",
+                "sizes": [
+                  "48x48"
+                ],
+                "theme": "dark"
+              }
+            ],
+            "arguments": [
+              {
+                "name": "text",
+                "title": "Text",
+                "required": true
+              }
+            ],
+            "com.example/unknown": {
+              "kept": [
+                1,
+                null
+              ]
+            }
+          }
+        ],
+        "nextCursor": "prompts-2",
+        "ttlMs": 0,
+        "cacheScope": "public",
+        "_meta": {
+          "com.example/list": [
+            true
+          ]
+        }
+      }
+    },
+    {
+      "method": "resources/list",
+      "result": {
+        "resultType": "complete",
+        "resources": [
+          {
+            "uri": "https://example.org/resource",
+            "name": "reference",
+            "title": "Reference",
+            "icons": [
+              {
+                "src": "https://example.org/resource.png",
+                "mimeType": "image/png",
+                "sizes": [
+                  "48x48"
+                ],
+                "theme": "dark"
+              }
+            ],
+            "mimeType": "text/plain",
+            "size": 12,
+            "annotations": {
+              "audience": [
+                "assistant"
+              ],
+              "priority": 0.5
+            },
+            "com.example/unknown": 1
+          }
+        ],
+        "nextCursor": "resources-2",
+        "ttlMs": 5000,
+        "cacheScope": "public"
+      }
+    },
+    {
+      "method": "resources/templates/list",
+      "result": {
+        "resultType": "complete",
+        "resourceTemplates": [
+          {
+            "uriTemplate": "https://example.org/items/{id}",
+            "name": "item",
+            "title": "Item",
+            "icons": [
+              {
+                "src": "https://example.org/template.png",
+                "mimeType": "image/png",
+                "sizes": [
+                  "48x48"
+                ],
+                "theme": "dark"
+              }
+            ],
+            "mimeType": "application/json"
+          }
+        ],
+        "ttlMs": 5000,
+        "cacheScope": "public",
+        "com.example/detail": [
+          false
+        ]
+      }
+    },
+    {
+      "method": "resources/read",
+      "result": {
+        "resultType": "complete",
+        "contents": [
+          {
+            "uri": "https://example.org/resource",
+            "mimeType": "text/plain",
+            "text": "reference text",
+            "_meta": {
+              "com.example/content": true
+            }
+          },
+          {
+            "uri": "https://example.org/blob",
+            "mimeType": "application/octet-stream",
+            "blob": "AAEC"
+          }
+        ],
+        "ttlMs": 1000,
+        "cacheScope": "public",
+        "_meta": {
+          "com.example/read": {
+            "opaque": [
+              1
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

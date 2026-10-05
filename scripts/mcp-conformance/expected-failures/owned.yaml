@@ -1,0 +1,12 @@
+# Expected failures for the gateway-owned MCP Proxy, standalone and behind a
+# proxy:// Access Point (targets "owned-proxy" and "proxy-surface"), which run
+# only the tools-list, tools-call-simple-text and caching scenarios. Entries are
+# <scenario>:<check-id>. The CLI fails the run on any failure or warning not
+# listed here and on a listed check that now passes.
+server:
+  # OpenAPI-backed Proxies offer tools only: prompts/list returns -32601.
+  - caching:sep-2549-prompts-list-caching-hints
+  # OpenAPI-backed Proxies offer tools only: resources/list returns -32601.
+  - caching:sep-2549-resources-list-caching-hints
+  # OpenAPI-backed Proxies offer tools only: resources/templates/list returns -32601.
+  - caching:sep-2549-resources-templates-list-caching-hints

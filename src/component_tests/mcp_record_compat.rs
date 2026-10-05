@@ -1,0 +1,214 @@
+//! Stored records without the MCP protocol-mode, HTTP and consent settings load
+//! and re-save byte-identically, and bootstrap configs without the Fabric
+//! stream envelope limit still validate.
+//!
+//! Each fixture under `tests/fixtures/records/` is the exact file the
+//! filesystem store writes for a release without those settings
+//! (`serde_json::to_string_pretty`, no trailing newline).
+
+use crate::config::McpProtocolMode;
+use crate::config::agent_surface::AgentSurface;
+use crate::storage::filesystem::{StorableEntity, StorageConfig, cached_storage_with_config};
+
+const MCP_SURFACE: &str = include_str!("../../tests/fixtures/records/agent_surface_mcp.json");
+const A2A_PARENT_SURFACE: &str = include_str!("../../tests/fixtures/records/agent_surface_a2a_parent.json");
+const MCP_PROXY: &str = include_str!("../../tests/fixtures/records/mcp_proxy.json");
+const DELEGATION_TOKEN: &str = include_str!("../../tests/fixtures/records/delegation_token.json");
+const CREDENTIAL_PROVIDER: &str = include_str!("../../tests/fixtures/records/credential_provider.json");
+const BOOTSTRAP_EXAMPLE: &str = include_str!("../../config/examples/config.example.toml");
+
+const MCP_ENDPOINT_KEYS: [&str; 2] = ["mcp_protocol_mode", "mcp_http"];
+
+/// Loads `fixture` through the filesystem store, saves it back, and asserts the
+/// file is unchanged and none of `absent_pointers` was written.
+async fn assert_stable_round_trip<T: StorableEntity>(
+    fixture: &str,
+    absent_pointers: &[String],
+) -> T {
+    let id = serde_json::from_str::<T>(fixture)
+        .expect("fixture must deserialize")
+        .id()
+        .to_string();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir
+        .path()
+        .join(format!("{id}.json"));
+    std::fs::write(&path, fixture).unwrap();
+
+    let storage = cached_storage_with_config::<T>(dir.path().to_path_buf(), "record", StorageConfig::new())
+        .await
+        .expect("store must open");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), fixture, "loading must not rewrite the record");
+    let record = crate::storage::filesystem::StorageBackend::get(&storage, &id)
+        .await
+        .unwrap()
+        .expect("stored record must load");
+    crate::storage::filesystem::StorageBackend::save(&storage, &record)
+        .await
+        .unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(written, fixture, "saving must reproduce the stored bytes");
+    let written: serde_json::Value = serde_json::from_str(&written).unwrap();
+    for pointer in absent_pointers {
+        assert!(
+            written
+                .pointer(pointer)
+                .is_none(),
+            "{pointer} must not be written"
+        );
+    }
+    record
+}
+
+fn endpoint_pointers(prefixes: &[&str]) -> Vec<String> {
+    prefixes
+        .iter()
+        .flat_map(|prefix| {
+            MCP_ENDPOINT_KEYS
+                .iter()
+                .map(move |key| format!("{prefix}/{key}"))
+        })
+        .collect()
+}
+
+fn transit_modes(surface: &AgentSurface) -> Vec<Option<McpProtocolMode>> {
+    surface
+        .transit
+        .iter()
+        .flat_map(|transit| &transit.points)
+        .map(|point| point.mcp_protocol_mode)
+        .collect()
+}
+
+#[tokio::test]
+async fn mcp_surface_with_base_and_variant_transit_points_round_trips() {
+    let surface: AgentSurface = assert_stable_round_trip(
+        MCP_SURFACE,
+        &endpoint_pointers(&["", "/transit/points/0", "/transit/points/1", "/variants/0/overrides/transit/points/0"]),
+    )
+    .await;
+
+    assert_eq!(surface.mcp_protocol_mode, None);
+    assert!(surface.mcp_http.is_none());
+    assert_eq!(surface.validate_mcp_metadata(), Ok(()));
+    assert_eq!(transit_modes(&surface), [None, None]);
+    let staging = surface
+        .resolve_variant(Some("staging"))
+        .expect("variant must resolve");
+    assert_eq!(staging.mcp_protocol_mode, None);
+    assert_eq!(transit_modes(&staging), [None]);
+}
+
+#[tokio::test]
+async fn a2a_surface_with_an_mcp_transit_point_round_trips() {
+    let surface: AgentSurface =
+        assert_stable_round_trip(A2A_PARENT_SURFACE, &endpoint_pointers(&["", "/transit/points/0"])).await;
+
+    assert_eq!(surface.validate_mcp_metadata(), Ok(()));
+    assert_eq!(transit_modes(&surface), [None]);
+}
+
+#[tokio::test]
+async fn mcp_proxy_round_trips() {
+    let proxy: crate::mcp_proxies::types::McpProxy =
+        assert_stable_round_trip(MCP_PROXY, &endpoint_pointers(&[""])).await;
+
+    assert_eq!(proxy.mcp_protocol_mode, None);
+    assert!(proxy.mcp_http.is_none());
+}
+
+#[tokio::test]
+async fn delegation_token_round_trips_without_consent_identity() {
+    let token: crate::delegation_vault::DelegationToken =
+        assert_stable_round_trip(DELEGATION_TOKEN, &["/consent_identity".to_string()]).await;
+
+    assert!(
+        token
+            .consent_identity
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn credential_provider_round_trips_without_resource_or_consent_strategy() {
+    let provider: crate::credential_providers::CredentialProvider = assert_stable_round_trip(
+        CREDENTIAL_PROVIDER,
+        &["/resource".to_string(), "/consent_identity_strategy_id".to_string()],
+    )
+    .await;
+
+    assert_eq!(provider.resource, None);
+    assert_eq!(provider.consent_identity_strategy_id, None);
+}
+
+#[test]
+fn dual_protocol_mode_is_written_and_changes_the_stored_record() {
+    let mut surface: AgentSurface = serde_json::from_str(MCP_SURFACE).unwrap();
+    surface.mcp_protocol_mode = Some(McpProtocolMode::Dual);
+    surface
+        .transit
+        .as_mut()
+        .unwrap()
+        .points[0]
+        .mcp_protocol_mode = Some(McpProtocolMode::Dual);
+    let written = serde_json::to_string_pretty(&surface).unwrap();
+    assert_ne!(written, MCP_SURFACE);
+    let written: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(written["mcp_protocol_mode"], "dual");
+    assert_eq!(written["transit"]["points"][0]["mcp_protocol_mode"], "dual");
+    assert!(
+        written
+            .pointer("/transit/points/1/mcp_protocol_mode")
+            .is_none()
+    );
+
+    let mut proxy: crate::mcp_proxies::types::McpProxy = serde_json::from_str(MCP_PROXY).unwrap();
+    proxy.mcp_protocol_mode = Some(McpProtocolMode::Dual);
+    let written: serde_json::Value = serde_json::to_value(&proxy).unwrap();
+    assert_eq!(written["mcp_protocol_mode"], "dual");
+}
+
+fn bootstrap_example_with_sdk_cache(
+    sdk_inbound_cache_bytes: i64,
+    fabric_stream_max_envelope_bytes: Option<i64>,
+) -> crate::config::BootstrapConfig {
+    let mut example: toml::Table = toml::from_str(BOOTSTRAP_EXAMPLE).expect("example must parse");
+    let a2a = example["a2a"]
+        .as_table_mut()
+        .expect("example must have [a2a]");
+    assert!(!a2a.contains_key("fabric_stream_max_envelope_bytes"), "the example must leave the envelope limit unset");
+    a2a.insert("sdk_inbound_cache_bytes".into(), sdk_inbound_cache_bytes.into());
+    if let Some(limit) = fabric_stream_max_envelope_bytes {
+        a2a.insert("fabric_stream_max_envelope_bytes".into(), limit.into());
+    }
+    toml::from_str(&toml::to_string(&example).unwrap()).expect("example must deserialize")
+}
+
+#[test]
+fn bootstrap_example_without_the_envelope_limit_validates_with_a_small_sdk_cache() {
+    let config = bootstrap_example_with_sdk_cache(64 * 1024, None);
+
+    assert_eq!(config.a2a.validate(), Ok(()));
+    assert_eq!(
+        config
+            .a2a
+            .stream_envelope_limit(),
+        64 * 1024
+    );
+}
+
+#[test]
+fn bootstrap_example_with_an_explicit_envelope_limit_keeps_the_sdk_cache_check() {
+    let config = bootstrap_example_with_sdk_cache(64 * 1024, Some(128 * 1024));
+
+    assert!(
+        config
+            .a2a
+            .validate()
+            .unwrap_err()
+            .contains("fabric_stream_max_envelope_bytes")
+    );
+    let config = bootstrap_example_with_sdk_cache(128 * 1024, Some(128 * 1024));
+    assert_eq!(config.a2a.validate(), Ok(()));
+}

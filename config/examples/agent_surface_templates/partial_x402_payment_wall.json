@@ -1,0 +1,28 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "0b3817c0-2836-4eae-87a4-b800db8c03e1",
+  "name": "x402 Payment Wall",
+  "description": "Gates the surface behind an x402 payment, requiring callers to settle a configured amount before requests are forwarded.",
+  "details": "Drops an x402 Payment element on the target. Each inbound call is held until the caller presents a settlement receipt for the configured amount/currency to the receiver address. Pair with a rate-limit element if you also need per-caller throttling.",
+  "icon": "money-bill-wave",
+  "tags": [
+    "payments",
+    "x402"
+  ],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1007,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "payment",
+      "address": "access-point->target/request",
+      "config": {
+        "protocol": "x402",
+        "amount": "",
+        "currency": "",
+        "receiver": ""
+      }
+    }
+  ]
+}

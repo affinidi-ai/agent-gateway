@@ -1,0 +1,252 @@
+/* Schema Property Card Styles */
+.schema-property-card {
+  background-color: var(--gray-50);
+  border: 1px solid var(--gray-300);
+  border-radius: 0.375rem;
+  padding: 1rem;
+  margin-top: 1rem;
+  position: relative;
+}
+
+/* Nested property indentation and connection lines */
+.schema-property-card[data-level='1'] {
+  margin-left: 2rem;
+  border-left: 3px solid var(--accent-blue);
+  background-color: rgba(74, 144, 226, 0.08);
+  position: relative;
+}
+
+.schema-property-card[data-level='2'] {
+  margin-left: 4rem;
+  border-left: 3px solid var(--success);
+  background-color: rgba(16, 185, 129, 0.08);
+  position: relative;
+}
+
+.schema-property-card[data-level='3'] {
+  margin-left: 6rem;
+  border-left: 3px solid var(--warning);
+  background-color: rgba(245, 158, 11, 0.08);
+  position: relative;
+}
+
+.schema-property-card[data-level='4'] {
+  margin-left: 8rem;
+  border-left: 3px solid var(--danger);
+  background-color: rgba(239, 68, 68, 0.08);
+  position: relative;
+}
+
+/* Vertical connection lines */
+.schema-property-card[data-level]:not([data-level='0'])::after {
+  content: '';
+  position: absolute;
+  left: -2rem;
+  top: -10px;
+  bottom: 50%;
+  width: 1px;
+  background-color: #9ca3af;
+  z-index: -1;
+}
+
+/* Horizontal connection lines from parent to nested property */
+.schema-property-card[data-level]:not([data-level='0'])::before {
+  content: '';
+  position: absolute;
+  left: -2rem;
+  top: 50%;
+  width: 1.5rem;
+  height: 1px;
+  background-color: #9ca3af;
+  transform: translateY(-50%);
+}
+
+.schema-property-card .card-body {
+  padding: 0;
+}
+
+.schema-property-card .form-control {
+  border: 1px solid var(--gray-300);
+  border-radius: 0.375rem;
+  font-size: 0.875rem;
+}
+
+.schema-property-card .form-control:focus {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 0.2rem rgba(74, 144, 226, 0.25);
+}
+
+.schema-property-card .btn {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.5rem;
+}
+
+.schema-property-card .form-check-input {
+  margin-top: 0.3rem;
+}
+
+.schema-property-card .form-check-label {
+  font-size: 0.875rem;
+  margin-left: 0.25rem;
+}
+
+.property-type-select {
+  max-width: 150px;
+}
+
+.schema-property-card select.form-control {
+  line-height: 1.5;
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
+}
+
+.schema-property-card select.form-control.form-control-sm {
+  line-height: 1.5;
+  padding-top: 0.35rem;
+  padding-bottom: 0.35rem;
+}
+
+/* Validation indicators */
+.text-bg-danger {
+  background-color: var(--danger);
+  color: white;
+}
+
+.text-bg-success {
+  background-color: var(--success);
+  color: white;
+}
+
+.border-danger {
+  border-color: var(--danger) !important;
+  border-width: 2px !important;
+}
+
+.border-success {
+  border-color: var(--success) !important;
+  border-width: 2px !important;
+}
+
+.is-invalid {
+  border-color: var(--danger) !important;
+  box-shadow: 0 0 0 0.2rem rgba(239, 68, 68, 0.25) !important;
+}
+
+.is-valid {
+  border-color: var(--success) !important;
+  box-shadow: 0 0 0 0.2rem rgba(16, 185, 129, 0.25) !important;
+}
+
+.invalid-feedback {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.875rem;
+  color: var(--danger);
+  padding: 0.5rem;
+  background-color: rgba(239, 68, 68, 0.1);
+  border-radius: 0.25rem;
+  border-left: 3px solid var(--danger);
+}
+
+/* Property editor row spacing */
+.schema-property-card .d-flex.align-items-center.gap-2 {
+  gap: 0.375rem !important;
+}
+
+.schema-property-card .d-flex.align-items-center.gap-2 .form-control {
+  margin-right: 0.25rem;
+}
+
+.schema-property-card .d-flex.align-items-center.gap-2 .property-type-select {
+  margin-right: 0.375rem;
+}
+
+.schema-property-card .d-flex.align-items-center.gap-2 .btn {
+  margin-left: 0.125rem;
+}
+
+/* Collapse/expand buttons spacing */
+.btn-group .btn {
+  margin-right: 0.25rem;
+}
+
+.btn-info {
+  background-color: var(--info);
+  border-color: var(--info);
+}
+
+.btn-info:hover {
+  background-color: var(--infoStrong);
+  border-color: var(--infoStrong);
+}
+
+/* Dark theme support */
+body.dark-theme .schema-property-card {
+  background-color: var(--dark-card);
+  border-color: var(--dark-border);
+  color: #fff;
+}
+
+body.dark-theme .schema-property-card[data-level='1'] {
+  background-color: rgba(74, 144, 226, 0.12);
+}
+
+body.dark-theme .schema-property-card[data-level='2'] {
+  background-color: rgba(16, 185, 129, 0.12);
+}
+
+body.dark-theme .schema-property-card[data-level='3'] {
+  background-color: rgba(245, 158, 11, 0.12);
+}
+
+body.dark-theme .schema-property-card[data-level='4'] {
+  background-color: rgba(239, 68, 68, 0.12);
+}
+
+body.dark-theme .schema-property-card .form-control {
+  background-color: rgba(15, 23, 42, 0.5);
+  border-color: var(--dark-text-muted);
+  color: #fff;
+}
+
+body.dark-theme .schema-property-card .form-control:focus {
+  background-color: rgba(15, 23, 42, 0.5);
+  border-color: var(--accent-blue);
+  color: #fff;
+}
+
+/* Make monitoring tab chart cards match dashboard glassmorphism */
+.monitoring-chart-card.card {
+  background: rgba(255, 255, 255, 0.5) !important;
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.monitoring-chart-card.card:hover {
+  background: rgba(255, 255, 255, 0.6) !important;
+}
+
+.monitoring-chart-card .card-header {
+  background: transparent !important;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+.monitoring-chart-card .card-body {
+  background: transparent !important;
+}
+
+/* Dark theme support for monitoring chart cards */
+body.dark-theme .monitoring-chart-card.card {
+  background: rgba(15, 23, 42, 0.7) !important;
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+body.dark-theme .monitoring-chart-card.card:hover {
+  background: rgba(15, 23, 42, 0.8) !important;
+}
+
+body.dark-theme .monitoring-chart-card .card-header {
+  background: transparent !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}

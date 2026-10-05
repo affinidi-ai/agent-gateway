@@ -1,0 +1,21 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "caller-context",
+  "name": "Caller Context",
+  "kind": "partial",
+  "description": "Responsible for validating who the caller is and where the credential is extracted from.",
+  "details": "Drops a Caller Context element onto the inbound caller request path. Choose the authentication method and configure where the gateway extracts the caller credential before saving the surface.",
+  "icon": "key",
+  "tags": ["identity", "authentication"],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1002,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "caller-auth",
+      "address": "ap-ma/request",
+      "config": {}
+    }
+  ]
+}

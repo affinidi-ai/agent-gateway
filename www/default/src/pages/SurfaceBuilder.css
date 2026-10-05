@@ -1,0 +1,2496 @@
+/* Surface Builder — D3 Visual Canvas */
+
+/* Snap-to-grid dot pattern painted onto the canvas background rect when
+   grid mode is on. Subtle in both themes — visible but not dominant. */
+.canvas-grid-dot {
+  fill: rgba(0, 0, 0, 0.22);
+}
+
+body.dark-theme .canvas-grid-dot {
+  fill: rgba(255, 255, 255, 0.18);
+}
+
+/* Marching-ants ring used on canvas nodes whose feature dependencies are
+   unmet (e.g. credential-delegation without source auth on the access
+   point). The plain `.unconfigured-ring` (no `.marching`) stays a solid
+   red stroke for the existing incomplete-config indicator. */
+.unconfigured-ring.marching {
+  animation: surface-marching-ants 0.8s linear infinite;
+}
+
+@keyframes surface-marching-ants {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+
+.surface-builder {
+  display: flex;
+  position: relative;
+  /* The builder fills whatever vertical room the surrounding
+     `.surface-form-canvas-wrap` (a flex column) gives it. The wrap in
+     turn fills `.surface-form-main`, which is sized by the shell's
+     grid row. This avoids any hard-coded `100vh - X` reservations and
+     works identically in normal and fullscreen modes. */
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  gap: 0;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: var(--shadow-md);
+}
+
+/* Wrapper around <SurfaceBuilder> inside the main column. Establishes
+   a flex column so the builder can stretch to fill, and provides the
+   positioning context for the canvas overlay. */
+.surface-form-canvas-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+}
+
+.surface-builder-palette {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  bottom: 10px;
+  width: 188px;
+  z-index: 10;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 10px;
+  padding: 10px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+  transition:
+    transform 0.25s ease,
+    opacity 0.25s ease;
+  font-size: 12px;
+}
+
+.surface-builder-palette.hidden {
+  transform: translateX(-210px);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.palette-toggle-btn {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 11;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 14px;
+  color: #5a5c69;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  transition: all 0.2s ease;
+}
+
+.palette-toggle-btn:hover {
+  background: white;
+  color: #4e73df;
+  box-shadow: 0 2px 12px rgba(78, 115, 223, 0.2);
+}
+
+.surface-builder-palette h6 {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: #858796;
+  margin: 6px 0 2px;
+  font-weight: 700;
+}
+
+/* Always-on Variants widget pinned to the top-left of the canvas,
+   sitting next to (or in place of) the collapsible element palette.
+   The underlying `target-variant` node is hidden from the canvas — the
+   widget is the only entry point to the variants editor. */
+.surface-variants-widget {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 10;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+  font-size: 11px;
+  color: #5a5c69;
+  cursor: pointer;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.05);
+  transition: all 0.2s ease;
+  text-align: left;
+}
+
+.surface-variants-widget:hover {
+  background: rgba(255, 255, 255, 0.85);
+  color: #1e3a5f;
+  box-shadow: 0 4px 18px rgba(78, 115, 223, 0.18);
+  transform: translateY(-1px);
+}
+
+.surface-variants-widget.is-selected {
+  border-color: #4a90e2;
+  box-shadow:
+    0 0 0 2px rgba(74, 144, 226, 0.25),
+    0 4px 24px rgba(74, 144, 226, 0.18);
+  color: #1e3a5f;
+}
+
+.surface-variants-widget .widget-icon {
+  font-size: 13px;
+  color: #4a90e2;
+}
+
+.surface-variants-widget .widget-body {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
+.surface-variants-widget .widget-title {
+  font-weight: 700;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: #858796;
+}
+
+.surface-variants-widget .widget-meta {
+  font-size: 10px;
+}
+
+.surface-variants-widget .widget-meta code {
+  font-size: 10px;
+  color: #4a90e2;
+  background: transparent;
+}
+
+.surface-variants-widget .surface-variants-widget-alias-link {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+.surface-variants-widget .surface-variants-widget-alias-link:hover {
+  text-decoration-style: solid;
+  color: #1e3a5f;
+}
+
+.surface-variants-widget-item .surface-variants-widget-alias-link {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+.surface-variants-widget-item .surface-variants-widget-alias-link:hover {
+  text-decoration-style: solid;
+  color: #1e3a5f;
+}
+
+body.dark-theme .surface-variants-widget {
+  background: rgba(30, 41, 59, 0.55);
+  border-color: rgba(255, 255, 255, 0.06);
+  color: #f1f5f9;
+}
+
+body.dark-theme .surface-variants-widget:hover {
+  background: rgba(30, 41, 59, 0.85);
+  color: #ffffff;
+}
+
+body.dark-theme .surface-variants-widget .widget-title {
+  color: #94a3b8;
+}
+
+/* Variants dropdown wrapper — anchors the popup menu underneath the
+   pill button. The pill itself keeps the same look as the standalone
+   button when no variants exist. */
+.surface-variants-widget-wrapper {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 10;
+}
+
+.surface-variants-widget-wrapper .surface-variants-widget {
+  position: static;
+}
+
+/* Access Point URL banner reused from the property sidebar, shown at
+   the top of the canvas next to the variants widget for quick discovery
+   and one-click copy. Capped width keeps the canvas usable on narrow
+   viewports; the banner truncates its own URL text. */
+.surface-access-point-url-widget {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  max-width: 640px;
+  width: max-content;
+  pointer-events: auto;
+}
+
+.surface-access-point-url-widget .alert {
+  margin-bottom: 0 !important;
+  padding: 4px 10px;
+  font-size: 12px !important;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  color: #1e3a5f;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.05);
+}
+
+body.dark-theme .surface-access-point-url-widget .alert {
+  background: rgba(30, 41, 59, 0.55);
+  border-color: rgba(255, 255, 255, 0.06);
+  color: #f1f5f9;
+}
+
+/* Floating canvas toolbar (undo / redo / auto-layout). Mirrors the
+   glassmorphism of the variants widget. Positioned top-right just to
+   the left of the centre / reset-view button rendered inside the
+   canvas so it doesn't fight with the variants pill (top-left) or
+   the AP URL banner (top-center). */
+.surface-toolbar-widget {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 10;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.surface-toolbar-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  color: #1e3a5f;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.surface-toolbar-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 4px 18px rgba(78, 115, 223, 0.18);
+}
+
+.surface-toolbar-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.surface-toolbar-btn.active {
+  background: rgba(78, 115, 223, 0.85);
+  border-color: rgba(78, 115, 223, 0.95);
+  color: #ffffff;
+  box-shadow: 0 1px 4px rgba(78, 115, 223, 0.35);
+}
+
+.surface-toolbar-btn.active:hover:not(:disabled) {
+  background: rgba(78, 115, 223, 0.95);
+}
+
+body.dark-theme .surface-toolbar-btn {
+  background: rgba(30, 41, 59, 0.55);
+  border-color: rgba(255, 255, 255, 0.06);
+  color: #f1f5f9;
+}
+
+body.dark-theme .surface-toolbar-btn:hover:not(:disabled) {
+  background: rgba(30, 41, 59, 0.92);
+}
+
+body.dark-theme .surface-toolbar-btn.active {
+  background: rgba(96, 165, 250, 0.85);
+  border-color: rgba(96, 165, 250, 0.95);
+  color: #0f172a;
+}
+
+body.dark-theme .surface-toolbar-btn.active:hover:not(:disabled) {
+  background: rgba(96, 165, 250, 0.95);
+}
+
+.surface-variants-widget .widget-caret {
+  font-size: 10px;
+  color: #94a3b8;
+  margin-left: 4px;
+}
+
+.surface-variants-widget.is-open {
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 4px 18px rgba(78, 115, 223, 0.18);
+}
+
+.surface-variants-widget-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 200px;
+  background: rgba(255, 255, 255, 0.98);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+  padding: 4px 0;
+  z-index: 20;
+}
+
+.surface-variants-widget-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  background: transparent;
+  border: none;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: #5a5c69;
+  cursor: pointer;
+  text-align: left;
+  gap: 8px;
+}
+
+.surface-variants-widget-item:hover {
+  background: rgba(78, 115, 223, 0.08);
+  color: #1e3a5f;
+}
+
+.surface-variants-widget-item.is-active {
+  background: rgba(78, 115, 223, 0.12);
+  font-weight: 600;
+}
+
+.surface-variants-widget-item.is-action {
+  color: #4a90e2;
+  font-style: italic;
+}
+
+.surface-variants-widget-item .item-name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.surface-variants-widget-item .item-alias {
+  font-size: 10px;
+  color: #4a90e2;
+  background: transparent;
+}
+
+.surface-variants-widget-divider {
+  height: 1px;
+  background: rgba(0, 0, 0, 0.06);
+  margin: 4px 0;
+}
+
+body.dark-theme .surface-variants-widget.is-open {
+  background: rgba(30, 41, 59, 0.92);
+}
+
+body.dark-theme .surface-variants-widget-menu {
+  background: rgba(15, 23, 42, 0.98);
+  border-color: rgba(255, 255, 255, 0.08);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+}
+
+body.dark-theme .surface-variants-widget-item {
+  color: #e2e8f0;
+}
+
+body.dark-theme .surface-variants-widget-item:hover {
+  background: rgba(78, 115, 223, 0.18);
+  color: #ffffff;
+}
+
+body.dark-theme .surface-variants-widget-item.is-active {
+  background: rgba(78, 115, 223, 0.24);
+}
+
+body.dark-theme .surface-variants-widget-divider {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* Zero-state widget — "base" row with right-justified "+". The
+   container reuses `.surface-variants-widget` for chrome but renders a
+   row + add-button as siblings so each click target is independent. */
+.surface-variants-widget--zero {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 10;
+  padding: 0;
+  cursor: default;
+  gap: 0;
+  overflow: hidden;
+}
+
+.surface-variants-widget--zero:hover {
+  background: rgba(255, 255, 255, 0.55);
+  color: #5a5c69;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.05);
+}
+
+.surface-variants-widget-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.2s ease;
+}
+
+.surface-variants-widget-row:hover {
+  background: rgba(78, 115, 223, 0.12);
+}
+
+.surface-variants-widget-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  align-self: stretch;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-left: 1px solid rgba(0, 0, 0, 0.06);
+  font-size: 11px;
+  color: var(--accent-blue, #4a90e2);
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    color 0.2s ease;
+}
+
+.surface-variants-widget-add:hover {
+  background: rgba(78, 115, 223, 0.18);
+  color: #1e3a5f;
+}
+
+body.dark-theme .surface-variants-widget--zero:hover {
+  background: rgba(30, 41, 59, 0.85);
+  color: #e2e8f0;
+}
+
+body.dark-theme .surface-variants-widget-row:hover,
+body.dark-theme .surface-variants-widget-add:hover {
+  background: rgba(78, 115, 223, 0.24);
+  color: #ffffff;
+}
+
+body.dark-theme .surface-variants-widget-add {
+  border-left-color: rgba(255, 255, 255, 0.08);
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1.5px solid #e9ecef;
+  border-radius: 6px;
+  background: white;
+  cursor: grab;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.palette-item:hover {
+  border-color: var(--accent-blue);
+  box-shadow: 0 2px 8px rgba(74, 144, 226, 0.2);
+  transform: translateY(-1px);
+}
+
+.palette-item:active {
+  cursor: grabbing;
+  transform: scale(0.97);
+  opacity: 0.85;
+}
+
+.palette-item.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.palette-item-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: white;
+  flex-shrink: 0;
+}
+
+.palette-item-icon.access-point {
+  background: linear-gradient(135deg, #4e73df, #2e59d9);
+}
+
+.palette-item-icon.transit-point {
+  background: linear-gradient(135deg, #f6c23e, #dda20a);
+}
+
+.palette-item-icon.policy {
+  background: linear-gradient(135deg, #e74a3b, #be2617);
+}
+
+.palette-item-icon.payment {
+  background: linear-gradient(135deg, #1cc88a, #13855c);
+}
+
+.palette-item-icon.identity {
+  background: linear-gradient(135deg, #7b68ee, #5a3fd6);
+}
+
+.palette-item-icon.networking {
+  background: linear-gradient(135deg, #36b9cc, #258391);
+}
+
+.palette-item-icon.rate-limit {
+  background: linear-gradient(135deg, #fd7e14, #c55a00);
+}
+
+.palette-item-icon.mcp-tools {
+  background: linear-gradient(135deg, #20c997, #13795b);
+}
+
+.palette-item-icon.custom-metadata {
+  background: linear-gradient(135deg, #6c757d, #495057);
+}
+
+.palette-item-icon.extension-validation {
+  background: linear-gradient(135deg, #0dcaf0, #0891b2);
+}
+
+.palette-item-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.palette-item-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: #3a3b45;
+  line-height: 1.2;
+}
+
+.palette-item-desc {
+  font-size: 9px;
+  color: #858796;
+  line-height: 1.25;
+  display: none;
+}
+
+.palette-show-descs .palette-item-desc {
+  display: block;
+}
+
+/* Canvas Area */
+.surface-builder-canvas {
+  flex: 1;
+  position: relative;
+  background:
+    radial-gradient(circle at 25% 18%, rgba(78, 115, 223, 0.1), transparent 55%),
+    radial-gradient(circle at 78% 82%, rgba(54, 185, 204, 0.09), transparent 60%),
+    linear-gradient(180deg, #f4f6fb 0%, #eef1f8 100%);
+  overflow: hidden;
+}
+
+.surface-builder-canvas svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Drop zone indicator */
+.surface-builder-canvas.drag-over {
+  background-color: rgba(78, 115, 223, 0.02);
+}
+
+.surface-builder-canvas.drag-over::after {
+  content: '';
+  position: absolute;
+  inset: 8px;
+  border: 2px dashed rgba(78, 115, 223, 0.25);
+  border-radius: var(--radius-lg);
+  pointer-events: none;
+  animation: pulse-border 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-border {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Link highlight when edge-drop target is hovered */
+.link-highlight {
+  stroke-opacity: 0.9 !important;
+  stroke-width: 4 !important;
+  stroke-dasharray: 8 4 !important;
+  filter: drop-shadow(0 0 4px rgba(231, 74, 59, 0.5));
+}
+
+/* Subtle pulse on every link the dragged element is allowed to land on. */
+.link-valid {
+  stroke: #1cc88a !important;
+  stroke-opacity: 0.8 !important;
+  stroke-width: 3 !important;
+  filter: drop-shadow(0 0 4px rgba(28, 200, 138, 0.55));
+}
+
+/* Node highlight when node-drop target is hovered */
+.node-highlight .main-circle {
+  stroke: #4e73df !important;
+  stroke-width: 3 !important;
+  filter: drop-shadow(0 0 6px rgba(78, 115, 223, 0.5)) !important;
+}
+
+/* Node drag cursor */
+.surface-builder-canvas .node {
+  cursor: grab;
+}
+
+.surface-builder-canvas .node:active {
+  cursor: grabbing;
+}
+
+/* Lasso / multi-selection highlight. Stronger than the single-select
+   variant below so users can distinguish "this is part of a multi-pick"
+   from "this is the sidebar's focus". */
+.surface-builder-canvas .node.lasso-selected .main-circle,
+.surface-builder-canvas .node.lasso-selected .main-rect {
+  stroke: #4e73df !important;
+  stroke-width: 3.5 !important;
+  filter: drop-shadow(0 0 8px rgba(78, 115, 223, 0.7)) drop-shadow(0 0 2px rgba(78, 115, 223, 0.9)) !important;
+}
+
+/* Single-selection highlight (the node whose config panel is open).
+   Uses an accent colour distinct from the multi-select blue so the two
+   selection modes never get confused. */
+.surface-builder-canvas .node.node-single-selected .main-circle,
+.surface-builder-canvas .node.node-single-selected .main-rect {
+  stroke: #36b9cc !important;
+  stroke-width: 3 !important;
+  filter: drop-shadow(0 0 6px rgba(54, 185, 204, 0.65)) !important;
+}
+
+/* If a node ends up in both states (sidebar focus + part of a lasso pick),
+   the multi-select cue wins because the user is mid-bulk-action. */
+.surface-builder-canvas .node.lasso-selected.node-single-selected .main-circle,
+.surface-builder-canvas .node.lasso-selected.node-single-selected .main-rect {
+  stroke: #4e73df !important;
+}
+
+/* Policy attachment indicators (small dots between connector) */
+.policy-indicator {
+  cursor: pointer;
+}
+
+.policy-indicator circle {
+  fill: #e74a3b;
+  stroke: white;
+  stroke-width: 2;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.2));
+}
+
+.policy-indicator:hover circle {
+  fill: #c0392b;
+  r: 10;
+}
+
+/* Right panel (config panel) — floating overlay */
+.surface-builder-config {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  bottom: 10px;
+  width: 260px;
+  z-index: 10;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 10px;
+  padding: 12px 14px;
+  overflow-y: auto;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+  transition:
+    transform 0.25s ease,
+    opacity 0.25s ease,
+    width 0.1s ease;
+  font-size: 12px;
+}
+
+.surface-builder-config.collapsed {
+  transform: translateX(280px);
+  opacity: 0;
+  pointer-events: none;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* Compact form controls inside the sidebars (canvas + builder).
+   Scoped so the fullscreen editor tab keeps comfortable defaults. */
+.surface-builder-config .form-label,
+.surface-builder-palette .form-label {
+  font-size: 11px;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.surface-builder-config .form-control,
+.surface-builder-config .form-select,
+.surface-builder-palette .form-control,
+.surface-builder-palette .form-select {
+  font-size: 12px;
+  padding: 4px 8px;
+  min-height: 28px;
+  height: auto;
+}
+
+.surface-builder-config .form-control::placeholder,
+.surface-builder-palette .form-control::placeholder {
+  color: #9ca3af;
+  opacity: 0.7;
+  font-style: italic;
+}
+
+body.dark-theme .surface-builder-config .form-control::placeholder,
+body.dark-theme .surface-builder-palette .form-control::placeholder {
+  color: #64748b;
+  opacity: 1;
+  font-style: italic;
+}
+
+.surface-builder-config textarea.form-control {
+  min-height: 56px;
+}
+
+.surface-builder-config .form-text {
+  font-size: 10px;
+}
+
+.surface-builder-config .form-check-label,
+.surface-builder-config .form-check-input + label {
+  font-size: 12px;
+}
+
+.surface-builder-config .form-check {
+  min-height: 1.25rem;
+  margin-bottom: 4px;
+}
+
+.surface-builder-config .btn,
+.surface-builder-palette .btn {
+  font-size: 11px;
+  padding: 4px 10px;
+}
+
+.surface-builder-config .btn-sm,
+.surface-builder-palette .btn-sm {
+  font-size: 10px;
+  padding: 2px 8px;
+}
+
+.surface-builder-config .badge {
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.surface-builder-config .alert {
+  font-size: 11px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+
+.surface-builder-config h6,
+.surface-builder-config .h6 {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.surface-builder-config .small,
+.surface-builder-config small {
+  font-size: 10px;
+}
+
+/* Resize handle on left edge */
+.config-resize-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 5px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 1;
+  border-radius: 10px 0 0 10px;
+}
+
+.config-resize-handle:hover,
+.config-resize-handle.active {
+  background: rgba(78, 115, 223, 0.2);
+}
+
+/* Builder tabs (Canvas | Editor: <Element>) */
+.surface-builder-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  border-bottom: 1px solid #e9ecef;
+  margin-bottom: 0;
+  background: transparent;
+}
+
+.surface-builder-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: #6c757d;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+  position: relative;
+  top: 1px;
+}
+
+.surface-builder-tab:hover {
+  background: rgba(78, 115, 223, 0.06);
+  color: #4e73df;
+}
+
+.surface-builder-tab.active {
+  background: #ffffff;
+  color: #3a3b45;
+  border-color: #e9ecef;
+  border-bottom-color: #ffffff;
+}
+
+.surface-builder-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 4px;
+  border-radius: 50%;
+  font-size: 10px;
+  color: #adb5bd;
+  cursor: pointer;
+}
+
+.surface-builder-tab-close:hover {
+  background: rgba(231, 74, 59, 0.12);
+  color: #e74a3b;
+}
+
+/* Fullscreen editor — rendered as the editor tab body, occupies the same
+   area the .surface-builder div would have used. Background is transparent
+   so the dashboard's ambient gradient + orbs show through, allowing the
+   `.card` glassmorphism (blur on rgba white) to render correctly — same as
+   other top-level dashboard pages (e.g. EditChannelPage tabs). */
+.surface-builder-fullscreen {
+  position: relative;
+  height: calc(100vh - 240px);
+  min-height: 500px;
+  background: transparent;
+  border: none;
+  border-radius: 0 var(--radius-lg) var(--radius-lg) var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: surface-builder-fullscreen-in 0.18s ease-out;
+}
+
+@keyframes surface-builder-fullscreen-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.surface-builder-fullscreen-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 24px 32px 48px;
+  width: 100%;
+}
+
+body.dark-theme .surface-builder-fullscreen {
+  background: transparent;
+  border: none;
+}
+
+body.dark-theme .surface-builder-tab {
+  color: #adb5bd;
+}
+
+body.dark-theme .surface-builder-tab.active {
+  background: #1f2937;
+  color: #f8f9fa;
+  border-color: rgba(255, 255, 255, 0.08);
+  border-bottom-color: #1f2937;
+}
+
+.config-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e9ecef;
+}
+
+.config-panel-header h5 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: #3a3b45;
+}
+
+.config-panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.config-panel-header .close-btn,
+.config-panel-header .help-btn {
+  background: none;
+  border: none;
+  font-size: 15px;
+  color: #858796;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.config-panel-header .close-btn:hover,
+.config-panel-header .help-btn:hover {
+  background: #f8f9fc;
+  color: #3a3b45;
+}
+
+.config-incomplete-banner {
+  margin: 0 -14px;
+  padding: 6px 14px;
+  background: rgba(231, 74, 59, 0.08);
+  border-left: 3px solid #e74a3b;
+  color: #e74a3b;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.config-section {
+  margin-bottom: 14px;
+}
+
+.config-section label {
+  font-size: 10px;
+  font-weight: 600;
+  color: #5a5c69;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  margin-bottom: 4px;
+  display: block;
+}
+
+.custom-metadata-entry {
+  border: 1px solid var(--gray-200);
+  border-radius: 6px;
+}
+
+.metadata-dynamic-values {
+  background: var(--gray-50);
+  border: 1px solid var(--gray-200);
+  color: var(--gray-700);
+  font-family: 'Monaco', 'Menlo', monospace;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.metadata-dynamic-values > div + div {
+  margin-top: 4px;
+}
+
+.metadata-dynamic-values code {
+  font-size: 1em;
+}
+
+.mcp-tools-empty-state {
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  font-size: 11px;
+}
+
+.mcp-tools-policy-preview {
+  background: var(--gray-100);
+  border: 1px solid var(--gray-200);
+  color: var(--gray-800);
+}
+
+.mcp-tools-policy-preview code {
+  background: transparent;
+  border: none;
+  color: inherit;
+}
+
+.outbound-credential-callback {
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 4px;
+  color: var(--gray-800);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.outbound-credential-callback-title {
+  color: #8a6500;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+/* Drop hint tooltip */
+.drop-hint {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(58, 59, 69, 0.9);
+  color: white;
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 500;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.drop-hint.visible {
+  opacity: 1;
+}
+
+/* Empty canvas state */
+.canvas-empty-state {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  color: #858796;
+  pointer-events: none;
+}
+
+.canvas-empty-state i {
+  font-size: 48px;
+  opacity: 0.3;
+  margin-bottom: 12px;
+  display: block;
+}
+
+.canvas-empty-state p {
+  font-size: 14px;
+  margin: 0;
+}
+
+/* Dark theme overrides */
+body.dark-theme .surface-builder {
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .surface-builder-palette {
+  background: rgba(30, 41, 59, 0.95);
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .palette-toggle-btn {
+  background: rgba(30, 41, 59, 0.9);
+  border-color: var(--dark-border);
+  color: var(--dark-text-muted);
+}
+
+body.dark-theme .palette-toggle-btn:hover {
+  background: var(--dark-card);
+  color: var(--accent-blue);
+}
+
+body.dark-theme .surface-builder-palette h6 {
+  color: var(--dark-text-muted);
+}
+
+body.dark-theme .palette-item {
+  background: var(--dark-card);
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .palette-item:hover {
+  border-color: var(--accent-blue);
+}
+
+body.dark-theme .palette-item-name {
+  color: var(--dark-text);
+}
+
+body.dark-theme .palette-item-desc {
+  color: var(--dark-text-muted);
+}
+
+body.dark-theme .surface-builder-canvas {
+  background: var(--dark-bg);
+}
+
+body.dark-theme .surface-builder-canvas .node-label {
+  fill: var(--dark-text-muted) !important;
+}
+
+body.dark-theme .surface-builder-canvas .link {
+  stroke-opacity: 0.3;
+}
+
+body.dark-theme .link-highlight {
+  filter: drop-shadow(0 0 4px rgba(231, 74, 59, 0.7));
+}
+
+body.dark-theme .node.lasso-selected .main-circle,
+body.dark-theme .node.lasso-selected .main-rect {
+  stroke: #6d9aff !important;
+  filter: drop-shadow(0 0 8px rgba(109, 154, 255, 0.75))
+    drop-shadow(0 0 2px rgba(109, 154, 255, 0.9)) !important;
+}
+
+body.dark-theme .node.node-single-selected .main-circle,
+body.dark-theme .node.node-single-selected .main-rect {
+  stroke: #5dd5e6 !important;
+  filter: drop-shadow(0 0 6px rgba(93, 213, 230, 0.7)) !important;
+}
+
+body.dark-theme .node.lasso-selected.node-single-selected .main-circle,
+body.dark-theme .node.lasso-selected.node-single-selected .main-rect {
+  stroke: #6d9aff !important;
+}
+
+/* Marching-ants animation on the red "incomplete" outline so it pulls focus
+   without being shouty. Stroke-dashoffset cycles to make the dashes appear to
+   crawl around the shape. */
+.surface-builder-canvas .unconfigured-ring {
+  stroke-dasharray: 6 4;
+  animation: marching-ants 0.6s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes marching-ants {
+  to {
+    stroke-dashoffset: -10;
+  }
+}
+
+/* Incomplete reason text rendered just below the node label. */
+.surface-builder-canvas .node-incomplete-reason {
+  font-size: 10px;
+  font-weight: 500;
+  fill: #e74a3b;
+  pointer-events: none;
+}
+
+body.dark-theme .surface-builder-canvas .node-incomplete-reason {
+  fill: #ff8a7d;
+}
+
+body.dark-theme .surface-builder-config {
+  background: rgba(30, 41, 59, 0.95);
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .config-panel-header {
+  border-bottom-color: var(--dark-border);
+}
+
+body.dark-theme .config-panel-header h5 {
+  color: var(--dark-text-heading);
+}
+
+body.dark-theme .config-incomplete-banner {
+  background: rgba(231, 74, 59, 0.15);
+  color: #ff6b5e;
+}
+
+body.dark-theme .config-section label {
+  color: var(--dark-text-muted);
+}
+
+body.dark-theme .custom-metadata-entry {
+  background: var(--dark-bg);
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .metadata-dynamic-values {
+  background: var(--dark-bg);
+  border-color: var(--dark-border);
+  color: var(--dark-text);
+}
+
+body.dark-theme .mcp-tools-empty-state {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.35);
+  color: var(--dark-text) !important;
+}
+
+body.dark-theme .mcp-tools-policy-preview {
+  background: var(--dark-bg);
+  border-color: var(--dark-border);
+  color: var(--dark-text);
+}
+
+body.dark-theme .outbound-credential-callback {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.35);
+  color: var(--dark-text);
+}
+
+body.dark-theme .outbound-credential-callback-title {
+  color: var(--warning);
+}
+
+body.dark-theme .canvas-empty-state {
+  color: var(--dark-text-muted);
+}
+
+/* ── Canvas welcome callout ──────────────────────────────────────────── */
+/* Floats over the right side of the canvas pointing down at the Managed
+ * Agent (which sits at xWeight ~0.85). Speech-bubble tail at the bottom
+ * gives a visual anchor without needing live-tracked node positions. */
+.surface-canvas-callout {
+  position: absolute;
+  top: 24px;
+  right: 80px;
+  z-index: 50;
+  width: 360px;
+  max-width: calc(100% - 32px);
+  background: #ffffff;
+  border: 1px solid rgba(78, 115, 223, 0.4);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  padding: 14px 16px 12px;
+  pointer-events: auto;
+  animation: surface-canvas-callout-in 220ms ease-out;
+}
+
+/* Floating variant pinned above a specific node via inline `top`/`left`
+ * + `transform: translate(-50%, -100%)` set in JSX. The shared rules
+ * above handle background, border, etc. — only positioning differs. */
+.surface-canvas-callout--floating {
+  position: fixed;
+  top: auto;
+  right: auto;
+  z-index: 1100;
+  animation: surface-canvas-callout-floating-in 220ms ease-out;
+}
+
+@keyframes surface-canvas-callout-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes surface-canvas-callout-floating-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, calc(-100% + 6px));
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(-50%, -100%);
+  }
+}
+
+.surface-canvas-callout__close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: transparent;
+  border: none;
+  color: #888;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.surface-canvas-callout__close:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: #333;
+}
+
+.surface-canvas-callout__title {
+  font-weight: 600;
+  font-size: 14px;
+  color: #4e73df;
+  margin-bottom: 8px;
+  padding-right: 24px;
+}
+
+.surface-canvas-callout__body {
+  font-size: 13px;
+  color: #444;
+  line-height: 1.45;
+  margin: 0 0 12px 0;
+}
+
+.surface-canvas-callout__footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.surface-canvas-callout__dontshow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #666;
+  margin: 0;
+  cursor: pointer;
+}
+
+.surface-canvas-callout__dontshow input {
+  margin: 0;
+}
+
+/* Bottom-pointing tail centered under the bubble, pointing down at the
+ * Managed Agent node the callout floats above. */
+.surface-canvas-callout__tail {
+  position: absolute;
+  bottom: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 10px solid transparent;
+  border-right: 10px solid transparent;
+  border-top: 10px solid #ffffff;
+  filter: drop-shadow(0 1px 0 rgba(78, 115, 223, 0.4));
+}
+
+body.dark-theme .surface-canvas-callout {
+  background: #2a2f3a;
+  border-color: rgba(120, 150, 240, 0.5);
+  color: var(--dark-text);
+}
+
+body.dark-theme .surface-canvas-callout__title {
+  color: #8ea7ff;
+}
+
+body.dark-theme .surface-canvas-callout__body {
+  color: var(--dark-text);
+}
+
+body.dark-theme .surface-canvas-callout__dontshow {
+  color: var(--dark-text-muted);
+}
+
+body.dark-theme .surface-canvas-callout__close {
+  color: var(--dark-text-muted);
+}
+
+body.dark-theme .surface-canvas-callout__close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--dark-text);
+}
+
+body.dark-theme .surface-canvas-callout__tail {
+  border-top-color: #2a2f3a;
+  filter: drop-shadow(0 1px 0 rgba(120, 150, 240, 0.5));
+}
+
+/* ── Palette help balloon ────────────────────────────────────────────── */
+/* Click (not drag) on a palette item opens this balloon to the right of
+ * the item. Mirrors `.surface-canvas-callout` styling but with a tail on
+ * the left side (or right when flipped to fit on-screen). */
+.palette-item--help-open {
+  background: rgba(78, 115, 223, 0.08);
+  outline: 1px solid rgba(78, 115, 223, 0.45);
+}
+
+body.dark-theme .palette-item--help-open {
+  background: rgba(120, 150, 240, 0.12);
+  outline-color: rgba(120, 150, 240, 0.55);
+}
+
+.surface-help-balloon {
+  background: #ffffff;
+  border: 1px solid rgba(78, 115, 223, 0.4);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  padding: 14px 16px 12px;
+  pointer-events: auto;
+  animation: surface-help-balloon-in 180ms ease-out;
+  /* Cap height so a verbose help block stays inside the viewport.
+   * The header (title + close) stays pinned and the body scrolls. */
+  display: flex;
+  flex-direction: column;
+  max-height: min(70vh, 520px);
+  overflow: hidden;
+}
+
+@keyframes surface-help-balloon-in {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.surface-help-balloon__close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: transparent;
+  border: none;
+  color: #888;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.surface-help-balloon__close:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: #333;
+}
+
+.surface-help-balloon__title {
+  font-weight: 600;
+  font-size: 14px;
+  color: #4e73df;
+  margin-bottom: 8px;
+  padding-right: 24px;
+}
+
+.surface-help-balloon__body {
+  font-size: 13px;
+  color: #444;
+  line-height: 1.5;
+  /* Body scrolls inside the capped balloon when content overflows. */
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* Reserve room for the scrollbar so it doesn't sit under the close button. */
+  padding-right: 4px;
+}
+
+.surface-help-balloon__body p {
+  margin: 0 0 8px 0;
+}
+
+.surface-help-balloon__body p:last-child {
+  margin-bottom: 0;
+}
+
+.surface-help-balloon__body code {
+  background: rgba(78, 115, 223, 0.08);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+  color: #2c3e75;
+  /* Same fix as .field-help-tooltip and .surface-info-panel: plain inline
+   * `code` doesn't reserve real space for its own vertical padding, so a
+   * chip that wraps onto its own line, or several chips packed into one
+   * list item (some help bodies here have a dozen), end up with touching
+   * or overlapping backgrounds. `inline-block` plus a real vertical margin
+   * fixes both; `overflow-wrap` keeps a long value from overflowing the
+   * balloon's width instead of wrapping inside the chip. */
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  vertical-align: middle;
+  margin: 3px 2px;
+}
+
+.surface-help-balloon__body strong {
+  color: #2c2c2c;
+}
+
+.surface-help-balloon__body ul {
+  margin: 0 0 8px 0;
+  padding-left: 18px;
+}
+
+.surface-help-balloon__body li {
+  margin-bottom: 2px;
+}
+
+.surface-help-balloon__doclink {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-blue);
+  text-decoration: none;
+  flex: 0 0 auto;
+}
+
+.surface-help-balloon__doclink:hover {
+  text-decoration: underline;
+}
+
+/* Default tail: points left, anchored at the left edge. */
+.surface-help-balloon__tail {
+  position: absolute;
+  left: -10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-top: 10px solid transparent;
+  border-bottom: 10px solid transparent;
+  border-right: 10px solid #ffffff;
+  filter: drop-shadow(-1px 0 0 rgba(78, 115, 223, 0.4));
+}
+
+/* Flipped: balloon sits to the LEFT of the anchor; tail points right. */
+.surface-help-balloon--left .surface-help-balloon__tail {
+  left: auto;
+  right: -10px;
+  border-right: none;
+  border-left: 10px solid #ffffff;
+  filter: drop-shadow(1px 0 0 rgba(78, 115, 223, 0.4));
+}
+
+body.dark-theme .surface-help-balloon {
+  background: #2a2f3a;
+  border-color: rgba(120, 150, 240, 0.5);
+  color: var(--dark-text);
+}
+
+body.dark-theme .surface-help-balloon__title {
+  color: #8ea7ff;
+}
+
+body.dark-theme .surface-help-balloon__body {
+  color: var(--dark-text);
+}
+
+body.dark-theme .surface-help-balloon__body strong {
+  color: #ffffff;
+}
+
+body.dark-theme .surface-help-balloon__body code {
+  background: rgba(120, 150, 240, 0.15);
+  color: #c8d4ff;
+}
+
+body.dark-theme .surface-help-balloon__doclink {
+  color: var(--accent-blue);
+}
+
+body.dark-theme .surface-help-balloon__close {
+  color: var(--dark-text-muted);
+}
+
+body.dark-theme .surface-help-balloon__close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--dark-text);
+}
+
+body.dark-theme .surface-help-balloon__tail {
+  border-right-color: #2a2f3a;
+  filter: drop-shadow(-1px 0 0 rgba(120, 150, 240, 0.5));
+}
+
+body.dark-theme .surface-help-balloon--left .surface-help-balloon__tail {
+  border-left-color: #2a2f3a;
+  filter: drop-shadow(1px 0 0 rgba(120, 150, 240, 0.5));
+}
+
+/* Surface Form Shell — left sidebar layout (replaces tabs) */
+.surface-form-shell {
+  display: grid;
+  /* Default; overridden inline by React when the user resizes. */
+  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-height: 400px;
+}
+
+/* Surface pages: make the page container a flex column that fills
+   #content (which has padding-top: 5rem for the fixed topbar). We
+   subtract the topbar (5rem) and the page footer (~80px) so the
+   card can stretch to fill the visible content rect without ever
+   pushing the footer off-screen. */
+.surface-page-fill {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: none;
+  height: calc(100vh - 5rem - 80px);
+  min-height: 480px;
+}
+
+.surface-page-fill > .channel-editor-card {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.surface-page-fill > .channel-editor-card > .card-body {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  display: flex;
+}
+
+.surface-form-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+/* Whatever the active view renders becomes the sole child of the
+   main column. Make it stretch vertically so Elements / Config
+   views fill the available height the same way Surface does. */
+.surface-form-main > * {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Compact density for the Elements list table — keeps two-word labels
+   on one line and reduces vertical real estate so the full list fits
+   without scrolling on common viewports. */
+.surface-elements-list .table {
+  font-size: 0.78rem;
+}
+
+.surface-elements-list .table th,
+.surface-elements-list .table td {
+  padding: 0.25rem 0.4rem;
+  vertical-align: middle;
+}
+
+.surface-elements-list .table thead th {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--bs-secondary-color, #6c757d);
+  font-weight: 600;
+}
+
+.surface-elements-list .badge {
+  font-size: 0.68rem;
+  font-weight: 500;
+  padding: 0.2em 0.45em;
+}
+
+.surface-form-sidebar {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.78) 0%, rgba(248, 249, 252, 0.62) 100%);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  border-right: 1px solid rgba(255, 255, 255, 0.6);
+  box-shadow:
+    inset -1px 0 0 rgba(78, 115, 223, 0.06),
+    2px 0 16px rgba(78, 115, 223, 0.05);
+  padding: 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* Cap to grid row so the inner scroll region works. */
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Middle scroll region — holds Views + Palette. Manage is
+   intentionally outside this so it stays anchored to the bottom
+   and is always visible. */
+.surface-form-sidebar-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.surface-form-sidebar-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.surface-form-sidebar-heading {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #858796;
+  font-weight: 700;
+  padding: 4px 10px 6px;
+}
+
+.surface-form-sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #5a5c69;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+  min-width: 0;
+}
+
+.surface-form-sidebar-item:hover {
+  background: rgba(78, 115, 223, 0.08);
+  color: #4e73df;
+}
+
+.surface-form-sidebar-item.active {
+  background: rgba(78, 115, 223, 0.12);
+  color: #4e73df;
+  font-weight: 600;
+}
+
+body.dark-theme .surface-form-sidebar-item {
+  color: #cbd5e1;
+}
+
+body.dark-theme .surface-form-sidebar-item:hover {
+  background: rgba(96, 165, 250, 0.15);
+  color: #60a5fa;
+}
+
+body.dark-theme .surface-form-sidebar-item.active {
+  background: rgba(96, 165, 250, 0.18);
+  color: #60a5fa;
+}
+
+.surface-form-sidebar-item .text-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.surface-form-sidebar-close {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: #858796;
+  cursor: pointer;
+}
+
+.surface-form-sidebar-close:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: #e74a3b;
+}
+
+/* Policy panel preview box */
+.policy-panel-preview {
+  background: #f8f9fc;
+  border: 1px solid #e9ecef;
+}
+
+.policy-panel-description {
+  color: #6c757d;
+}
+
+.policy-panel-code {
+  background: #ffffff;
+  border: none;
+  color: #1f2937;
+}
+
+.policy-panel-code code {
+  background: transparent;
+  color: inherit;
+}
+
+body.dark-theme .policy-panel-preview,
+.dark-theme .policy-panel-preview {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+body.dark-theme .policy-panel-description,
+.dark-theme .policy-panel-description {
+  color: rgba(255, 255, 255, 0.65);
+}
+
+body.dark-theme .policy-panel-code,
+.dark-theme .policy-panel-code {
+  background: rgba(0, 0, 0, 0.35);
+  border: none;
+  color: #e5e7eb;
+}
+
+/* Variants panel rows — subtle background, no heavy border. Mirrors
+   .policy-panel-preview / .policy-panel-code so the two property
+   sidebars feel consistent in both light and dark themes. */
+.variant-row {
+  background: #f8f9fc;
+  border: none;
+}
+
+.variant-row-base {
+  background: #eef0f6;
+}
+
+.variant-row-body {
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+body.dark-theme .variant-row,
+.dark-theme .variant-row {
+  background: rgba(255, 255, 255, 0.04);
+  border: none;
+}
+
+body.dark-theme .variant-row-base,
+.dark-theme .variant-row-base {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+body.dark-theme .variant-row-body,
+.dark-theme .variant-row-body {
+  border-top-color: rgba(255, 255, 255, 0.08);
+}
+
+.surface-form-main {
+  padding: 12px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Sidebar collapse */
+.surface-form-shell.sidebar-collapsed {
+  grid-template-columns: 36px minmax(0, 1fr);
+}
+
+.surface-form-shell.sidebar-collapsed .surface-form-sidebar {
+  padding: 8px 4px;
+  align-items: center;
+}
+
+.surface-form-sidebar {
+  position: relative;
+}
+
+/* Resize handle on right edge of the sidebar (mirrors the right
+   property panel handle). */
+.surface-form-sidebar-resize {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 5px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 5;
+}
+
+.surface-form-sidebar-resize:hover,
+.surface-form-sidebar-resize.active {
+  background: rgba(78, 115, 223, 0.2);
+}
+
+.surface-form-sidebar-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 2px 6px;
+  border-bottom: 1px solid #e3e6f0;
+  margin-bottom: 8px;
+}
+
+.surface-form-shell.sidebar-collapsed .surface-form-sidebar-toolbar {
+  flex-direction: column;
+  border-bottom: none;
+  padding: 0;
+}
+
+.surface-form-sidebar-iconbtn {
+  width: 24px;
+  height: 24px;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  background: rgba(255, 255, 255, 0.55);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 10px;
+  color: #1e3a5f;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+.surface-form-sidebar-iconbtn:hover {
+  background: rgba(255, 255, 255, 0.92);
+  color: #4e73df;
+  box-shadow: 0 4px 18px rgba(78, 115, 223, 0.18);
+}
+
+body.dark-theme .surface-form-sidebar-iconbtn {
+  background: rgba(30, 41, 59, 0.55);
+  border-color: rgba(255, 255, 255, 0.06);
+  color: #f1f5f9;
+}
+
+body.dark-theme .surface-form-sidebar-iconbtn:hover {
+  background: rgba(30, 41, 59, 0.92);
+  color: #f1f5f9;
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+/* Collapsible entry-card header shared by the Trust Check and Trust
+   Recorder fullscreen editors. Theme-aware so the header background /
+   text remain readable in dark mode (the previous inline `#f8f9fc`
+   stayed light-on-light under `body.dark-theme` and hid the header
+   summary). */
+.entry-card-header {
+  background: #f8f9fc;
+  cursor: pointer;
+}
+
+body.dark-theme .entry-card-header {
+  background: rgba(15, 23, 42, 0.4);
+  color: var(--dark-text);
+}
+
+body.dark-theme .entry-card-header .text-muted {
+  color: var(--dark-text-muted) !important;
+}
+
+/* Inset "Advanced" panel for a Trust Check query (Entity ID template).
+   Shares the readability model of `.entry-card-header` but sits
+   inside the query card rather than acting as its collapse header. */
+.trust-check-advanced-panel {
+  background: #fafbfc;
+  border-radius: 4px;
+}
+
+body.dark-theme .trust-check-advanced-panel {
+  background: rgba(15, 23, 42, 0.35);
+  color: var(--dark-text);
+}
+
+body.dark-theme .trust-check-advanced-panel .text-muted {
+  color: var(--dark-text-muted) !important;
+}
+
+/* Surface name shown alongside the collapse chevron in the sidebar
+   toolbar. Truncates with an ellipsis so a long name never pushes the
+   right-aligned fullscreen button off the bar. */
+.surface-form-sidebar-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #3a3b45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 0 4px;
+}
+
+body.dark-theme .surface-form-sidebar {
+  background: rgba(30, 41, 59, 0.95);
+  border-right-color: var(--dark-border);
+  box-shadow:
+    inset -1px 0 0 rgba(148, 163, 184, 0.06),
+    2px 0 16px rgba(0, 0, 0, 0.25);
+}
+
+body.dark-theme .surface-form-sidebar-title {
+  color: #e5e7eb;
+}
+
+.surface-form-sidebar-toggle {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  border: 1px solid #e3e6f0;
+  background: #fff;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 10px;
+  color: #5a5c69;
+  z-index: 1;
+}
+
+.surface-form-sidebar-toggle:hover {
+  background: #f8f9fc;
+  color: #4e73df;
+  border-color: #4e73df;
+}
+
+.surface-form-shell.sidebar-collapsed .surface-form-sidebar-toggle {
+  position: static;
+}
+
+/* Inline palette inside the sidebar scroll region. Let it grow to
+   fill spare room but defer scrolling to the parent scroll wrapper. */
+.surface-form-sidebar-palette {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
+.surface-builder-palette-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 4px;
+}
+
+.surface-builder-palette-inline .palette-section-header {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: #858796;
+  margin: 8px 6px 4px;
+  font-weight: 700;
+}
+
+.surface-builder-palette-inline .palette-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border: 1px solid #e9ecef;
+  border-radius: 5px;
+  background: #fff;
+  cursor: grab;
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
+.surface-builder-palette-inline .palette-item.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.surface-builder-palette-inline .palette-item:hover:not(.disabled) {
+  border-color: #4e73df;
+  box-shadow: 0 1px 4px rgba(78, 115, 223, 0.15);
+}
+
+.surface-builder-palette-inline .palette-item-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.surface-builder-palette-inline .palette-item-name {
+  font-weight: 600;
+  font-size: 11px;
+  color: #3a3b45;
+  line-height: 1.2;
+}
+
+.surface-builder-palette-inline .palette-item-desc {
+  /* inherits display:none from base; shown by .palette-show-descs */
+}
+
+/* Indent palette items so they look like children of their category.
+   Right margin keeps them clear of the scrollbar. */
+.surface-builder-palette-inline .palette-item {
+  margin-left: 14px;
+  margin-right: 10px;
+}
+
+/* Manage section — pinned to the bottom of the sidebar, always
+   visible (does not scroll with Views/Palette). Buttons are
+   icon-only and centered horizontally. */
+.surface-form-sidebar-manage {
+  flex: 0 0 auto;
+  margin-top: auto;
+  border-top: 1px solid #e3e6f0;
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.surface-form-sidebar-manage > .d-flex {
+  justify-content: center;
+}
+
+.surface-form-sidebar-manage .btn {
+  font-size: 12px;
+}
+
+/* Fullscreen mode — uses the native Fullscreen API to take over the
+   entire screen (hides browser chrome, OS taskbar, etc.). The card
+   element itself becomes the :fullscreen element. */
+.card.surface-form-shell-fullscreen {
+  width: 100% !important;
+  height: 100%;
+  margin: 0 !important;
+  border-radius: 0;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  color: #212529;
+}
+
+body.dark-theme .card.surface-form-shell-fullscreen {
+  background: var(--dark-bg, #0f172a);
+  color: var(--dark-text, #e2e8f0);
+}
+
+.card.surface-form-shell-fullscreen::backdrop {
+  background: #fff;
+}
+
+body.dark-theme .card.surface-form-shell-fullscreen::backdrop {
+  background: var(--dark-bg, #0f172a);
+}
+
+/* Inline page-level alert (e.g. save failures) rendered inside the
+   surface main column via SurfaceFormShell's `topBanner` slot. Stays
+   in normal flow so it pushes only the canvas down — the sidebar is
+   unaffected. */
+.surface-page-alert {
+  margin-bottom: 8px;
+}
+
+.card.surface-form-shell-fullscreen > .card-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
+.card.surface-form-shell-fullscreen .surface-form-shell {
+  height: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  grid-template-rows: 1fr;
+}
+
+/* In fullscreen the surface main column never scrolls — the canvas
+   itself owns the whole area. Other views fall back to scrollable. */
+.card.surface-form-shell-fullscreen .surface-form-main {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* ── Canvas protocol picker overlay ──────────────────────────────────── */
+/* Modal-style overlay shown over the canvas when AddSurfacePage is opened
+ * without a `?protocol=` hint. Forces an explicit protocol choice before
+ * any element configuration is allowed. */
+.surface-canvas-protocol-picker {
+  position: absolute;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+}
+
+.surface-canvas-protocol-picker__panel {
+  position: relative;
+  background: #ffffff;
+  border: 1px solid rgba(78, 115, 223, 0.4);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  padding: 16px 18px 12px;
+  width: min(900px, calc(100% - 32px));
+  height: min(560px, calc(100% - 32px));
+  overflow: auto;
+  animation: surface-canvas-callout-in 220ms ease-out;
+}
+
+.surface-canvas-protocol-picker__panel--list {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Picker rendered as the full create-surface page (no canvas behind it).
+ * The page wrapper is the positioned ancestor for the absolutely-positioned
+ * picker container. The wrapper stays transparent in both themes so the
+ * standard page background (light grey in light mode, the dashboard body
+ * bg in dark mode) shows through. */
+.surface-page-fill--picker {
+  position: relative;
+}
+
+/* Glassmorphic card used as the surface starter picker dialog. Matches the
+ * `card shadow channel-editor-card` pattern used on the Secrets page so the
+ * header, body, and footer get the same look as the rest of the app. Fixed
+ * dimensions keep the dialog height stable regardless of how many templates
+ * are listed; the body scrolls internally. */
+.surface-picker-card {
+  width: min(900px, calc(100% - 32px));
+  max-width: min(900px, calc(100% - 32px));
+  height: min(440px, calc(100% - 32px));
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.surface-picker-card > .card-body-channel-editor.surface-picker-card__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.surface-canvas-protocol-picker__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: 10px;
+}
+
+.surface-canvas-protocol-picker__header {
+  margin-bottom: 10px;
+}
+
+.surface-canvas-protocol-picker__footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+body.dark-theme .surface-canvas-protocol-picker__panel {
+  background: #2a2f3a;
+  border-color: rgba(120, 150, 240, 0.5);
+  color: var(--dark-text);
+}
+
+/* === Surface Templates panel === */
+.surface-templates-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.surface-templates-panel__body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.surface-templates-panel__tabs {
+  flex-shrink: 0;
+}
+
+.surface-template-row {
+  border: 1px solid var(--gray-300);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.surface-template-row__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  background: transparent;
+  border: 0;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+}
+
+.surface-template-row__header:hover {
+  background: var(--gray-100);
+}
+
+.surface-template-row__icon {
+  color: var(--accent-blue);
+  width: 18px;
+  text-align: center;
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.surface-template-row__title {
+  font-weight: 600;
+  line-height: 1.2;
+  margin-bottom: 2px;
+}
+
+.surface-template-row__description {
+  font-size: 12px;
+  color: var(--gray-600);
+  line-height: 1.35;
+}
+
+.surface-template-row__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.surface-template-row__body {
+  /* Left padding aligns details under the title text: 12px row padding
+   * + 18px icon column + 8px gap between icon and title. */
+  padding: 8px 12px 12px 38px;
+  border-top: 1px solid var(--gray-200);
+}
+
+.surface-template-row__details {
+  font-size: 12px;
+  color: var(--gray-500);
+  font-style: italic;
+  white-space: pre-wrap;
+  margin-bottom: 0;
+}
+
+body.dark-theme .surface-template-row {
+  background: var(--dark-card-bg, #1f2937);
+  border-color: var(--dark-border);
+}
+
+body.dark-theme .surface-template-row__header:hover {
+  background: rgba(74, 144, 226, 0.08);
+}
+
+body.dark-theme .surface-template-row__description {
+  color: var(--dark-text-muted, #94a3b8);
+}
+
+body.dark-theme .surface-template-row__body {
+  border-top-color: var(--dark-border);
+}
+
+body.dark-theme .surface-template-row__details {
+  color: var(--dark-text-muted, #94a3b8);
+}
+
+/* Static (non-collapsible) variant used by the create-surface picker.
+ * Each row shows all info up-front with its own action button on the
+ * right — no expand/collapse interaction. */
+.surface-template-row--static .surface-template-row__header--static {
+  cursor: default;
+  align-items: center;
+  gap: 12px;
+}
+
+.surface-template-row--static .surface-template-row__header--static:hover {
+  background: transparent;
+}
+
+body.dark-theme .surface-template-row--static .surface-template-row__header--static:hover {
+  background: transparent;
+}
+
+.surface-template-row__action {
+  flex-shrink: 0;
+  align-self: center;
+  white-space: nowrap;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "8dff8d80-25c7-4ee8-938b-234eae024477",
+  "name": "MCP Tool Gating",
+  "description": "Controls which MCP tools callers can discover and invoke through this surface.",
+  "details": "Adds MCP Tool Gating to the external target response flow. Configure allow or deny rules, optionally activated by an OPA policy, to filter tools/list responses and block matching tools/call requests.",
+  "icon": "filter",
+  "tags": ["mcp", "security", "gating"],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 1008,
+  "items": [
+    {
+      "scope": "edge",
+      "kind": "mcp-tool-gating",
+      "address": "ma-external/response",
+      "config": {
+        "default_effect": "allow",
+        "gates": []
+      }
+    }
+  ]
+}

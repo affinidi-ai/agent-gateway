@@ -1,0 +1,305 @@
+{
+  "$schema": "https://fabric.affinidi.io/schemas/surface-template/v1.json",
+  "id": "2fe63e06-220c-4d9f-94c7-eec893a5310a",
+  "name": "A2A Surface with Trust Check & Trust Recording & Throttling",
+  "description": "An A2A surface configured with Trust Check, Trust Recording, and Network components.",
+  "details": "Quick-start template for an A2A agent surface with integrated Trust Check, Trust Recording, and networking policies.",
+  "starter_hint": "We've pre-configured an Access Point with Trust Check verification, Trust Recording, and rate limiting. Provide the A2A Target endpoint to finish setup, then review the Trust Check, Trust Recording, and Network policy nodes on the canvas before saving.",
+  "icon": "rocket",
+  "tags": [
+    "a2a",
+    "starter",
+    "full"
+  ],
+  "author": "system",
+  "builtin": true,
+  "sort_priority": 50,
+  "kind": "full",
+  "surface": {
+    "name": "A2A Surface Templated",
+    "status": "active",
+    "tags": [],
+    "access_point": {
+      "listen_address": "$HOST",
+      "route": "$ROUTE",
+      "protocol": "a2a",
+      "name": "Front door",
+      "publish_to_did_document": false,
+      "terminate_trace_id": false
+    },
+    "target": {
+      "endpoint": "",
+      "identity_injection": {
+        "inject_vp": true
+      },
+      "trust_check_list": [
+        {
+          "id": "trust-check-target-recognition",
+          "trust_registry_id": "",
+          "query_type": "recognition",
+          "query": {
+            "authority_id": "{{ input.agent.provider_did }}",
+            "entity_id": "{{ input.agent.did }}"
+          },
+          "name": "Verify transit target"
+        }
+      ]
+    },
+    "transit": {
+      "sign_requests": true,
+      "transit_token_mode": "embedded",
+      "points": [
+        {
+          "id": "",
+          "alias": "",
+          "target_endpoint": "",
+          "protocol": "a2a",
+          "require_transit_token": true
+        }
+      ]
+    },
+    "identity_slots": {
+      "protected": {
+        "meta_field": "serverIdentity",
+        "json_schema": {
+          "type": "object",
+          "required": [],
+          "properties": {
+            "serverIdentity": {
+              "type": "object",
+              "required": [],
+              "properties": {}
+            }
+          }
+        }
+      }
+    },
+    "canvas": {
+      "version": 1,
+      "surface": {
+        "width": 650,
+        "height": 500
+      },
+      "view": {
+        "x": -159,
+        "y": 181,
+        "k": 1
+      },
+      "nodes": [
+        {
+          "id": "access-point",
+          "type": "access-point",
+          "label": "Access Point",
+          "parentId": null,
+          "position": {
+            "x": -235,
+            "y": 12.5
+          },
+          "config": {}
+        },
+        {
+          "id": "target",
+          "type": "target",
+          "label": "Managed Agent",
+          "parentId": "trust-check-caller",
+          "position": {
+            "x": 15,
+            "y": 12.5
+          },
+          "config": {
+            "endpoint": "",
+            "networking": {
+              "timeout": {
+                "request_secs": 30,
+                "connect_secs": 5,
+                "idle_secs": 90
+              }
+            },
+            "endpoint_type": "url",
+            "inject_vp": true,
+            "identity_injection": {
+              "inject_vp": true
+            }
+          }
+        },
+        {
+          "id": "identity-protected",
+          "type": "identity",
+          "label": "",
+          "parentId": "target",
+          "position": {
+            "x": -90,
+            "y": -19.5
+          },
+          "config": {
+            "meta_field": "serverIdentity",
+            "json_schema": {
+              "type": "object",
+              "required": [],
+              "properties": {
+                "serverIdentity": {
+                  "type": "object",
+                  "required": [],
+                  "properties": {}
+                }
+              }
+            },
+            "fields": []
+          },
+          "slotId": "response:identity-protected"
+        },
+        {
+          "id": "trust-check-target",
+          "type": "trust-check",
+          "label": "",
+          "parentId": "transit-point-a2a-1",
+          "position": {
+            "x": 47,
+            "y": -90
+          },
+          "radius": 16,
+          "config": {
+            "_edge": "ma-tp",
+            "queries": [
+              {
+                "id": "trust-check-target-recognition",
+                "trust_registry_id": "",
+                "query_type": "recognition",
+                "name": "Verify transit target",
+                "query": {
+                  "authority_id": "{{ input.agent.provider_did }}",
+                  "entity_id": "{{ input.agent.did }}"
+                }
+              }
+            ]
+          },
+          "slotId": "request:trust-check-target_trust_check_list"
+        },
+        {
+          "id": "target-variant",
+          "type": "target-variant",
+          "label": "Variants",
+          "parentId": null,
+          "config": {
+            "variants": []
+          }
+        },
+        {
+          "id": "transit-point-a2a-1",
+          "type": "transit-point-a2a",
+          "label": "",
+          "parentId": null,
+          "position": {
+            "x": 15,
+            "y": -181.5
+          },
+          "config": {
+            "target_endpoint": "",
+            "protocol": "a2a",
+            "require_transit_token": true
+          }
+        },
+        {
+          "id": "networking",
+          "type": "networking",
+          "label": "networking",
+          "parentId": "target",
+          "position": {
+            "x": 180,
+            "y": 40.5
+          },
+          "config": {
+            "timeout": {
+              "request_secs": 30,
+              "connect_secs": 5,
+              "idle_secs": 90
+            }
+          },
+          "slotId": "request:networking"
+        },
+        {
+          "id": "__human__",
+          "type": "human",
+          "label": "Human",
+          "parentId": null,
+          "position": {
+            "x": -467.3690476190476,
+            "y": 12.5
+          },
+          "config": {}
+        },
+        {
+          "id": "__caller__",
+          "type": "caller",
+          "label": "Caller",
+          "parentId": null,
+          "position": {
+            "x": -361.3690476190476,
+            "y": 12.5
+          },
+          "config": {}
+        },
+        {
+          "id": "__managed-agent-npc__",
+          "type": "npc-endpoint",
+          "label": "External Target",
+          "parentId": "target",
+          "position": {
+            "x": 362,
+            "y": 12.5
+          },
+          "config": {
+            "name": "External Target",
+            "npc_description": "External agent endpoint",
+            "connection_direction": "outbound",
+            "connected_to": "target"
+          }
+        },
+        {
+          "id": "npc-endpoint-1",
+          "type": "npc-endpoint",
+          "label": "External Target",
+          "parentId": "transit-point-a2a-1",
+          "position": {
+            "x": 15,
+            "y": -400
+          },
+          "radius": 16.618403851434437,
+          "config": {
+            "npc_name": "External Target",
+            "npc_description": "Destination service",
+            "connection_direction": "outbound",
+            "connected_to": "transit-point-a2a-1"
+          }
+        },
+        {
+          "id": "trust-recorder-target-response",
+          "type": "trust-recorder",
+          "label": "Trust Recorder",
+          "parentId": "target",
+          "position": {
+            "x": -191.5,
+            "y": -19.5
+          },
+          "config": {
+            "entries": []
+          },
+          "slotId": "response:trust-recorder"
+        },
+        {
+          "id": "trust-check-caller",
+          "type": "trust-check",
+          "label": "Trust Check (Caller)",
+          "parentId": "access-point",
+          "position": {
+            "x": -160.32000000000005,
+            "y": 44.5
+          },
+          "radius": 16,
+          "config": {},
+          "slotId": "request:trust-check-access_point_trust_check_list"
+        }
+      ]
+    }
+  }
+}

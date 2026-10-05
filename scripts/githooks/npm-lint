@@ -1,0 +1,6 @@
+#!/bin/bash
+
+for dir in www/default; do
+  echo "Linting $dir..."
+  (cd ./$dir && npm run lint -- --fix) || echo "Linting $dir failed, but allowing commit to proceed for now."
+done

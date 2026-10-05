@@ -1,0 +1,6 @@
+#!/bin/bash
+
+for dir in www/default; do
+  echo "Auditing $dir..."
+  (cd ./$dir && npm audit --omit=dev --audit-level=none) || true
+done

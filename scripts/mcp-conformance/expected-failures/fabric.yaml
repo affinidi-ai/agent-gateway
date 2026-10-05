@@ -1,0 +1,8 @@
+# Expected failures for the Access Point whose target is fabric:// to a second
+# gateway, which forwards to the pinned reference server through shim.mjs
+# (target "fabric"). Entries are <scenario>:<check-id>. The CLI fails the run
+# on any failure or warning not listed here and on a listed check that now
+# passes.
+server:
+  # Reference server: accepts inputResponses that is not an object; forwarded unchanged.
+  - input-required-result-validate-input:sep-2322-validate-input-responses
