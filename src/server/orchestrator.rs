@@ -447,6 +447,45 @@ enum DeferredSurfaceEvent {
 /// surface-store subscriber and the activation drain.
 type PendingSurfaceEvents = Arc<tokio::sync::Mutex<Vec<DeferredSurfaceEvent>>>;
 
+fn spawn_x402_cleanup_worker(txn_store: Arc<crate::x402::TransactionStore>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(86400)); // 24 hours
+        loop {
+            interval.tick().await;
+
+            // Load retention_days from config (default 7 days)
+            let retention_days = if let Ok(x402_config) = crate::x402::config_cache::get_or_load_x402_config().await {
+                x402_config
+                    .transaction_storage
+                    .as_ref()
+                    .map(|ts| ts.retention_days)
+                    .unwrap_or(7)
+            } else {
+                7
+            };
+
+            match txn_store
+                .cleanup_old_transactions(retention_days)
+                .await
+            {
+                Ok(count) => {
+                    info!(
+                        "Transaction cleanup completed: {} old transactions removed (retention: {} days)",
+                        count, retention_days
+                    );
+
+                    // Trigger integration alerts for cleanup completion
+                    crate::integrations::trigger_cleanup_completed(count, retention_days).await;
+                }
+                Err(e) => {
+                    warn!("Transaction cleanup failed: {}", e);
+                }
+            }
+        }
+    });
+    info!("✓ Transaction cleanup worker started (runs daily)");
+}
+
 /// Promote the activation identified by `generation` to health-ready and, under the
 /// pending-buffer lock, drain and replay any surface events deferred during the
 /// window. Holding the lock across the readiness flip closes the race where an event
@@ -880,46 +919,6 @@ pub async fn run_axum_proxy(
                 // Store globally for access by ALL components (DIDComm, HTTP middleware, Admin API, workers)
                 crate::gateways::init_transaction_store(Arc::clone(&store_arc)).await;
                 info!(path = ?transaction_storage_path, "✓ Transaction store initialized - handles both GW1 and GW2 roles");
-
-                // Spawn cleanup worker for transaction store
-                let txn_store_clone = Arc::clone(&store_arc);
-                tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(86400)); // 24 hours
-                    loop {
-                        interval.tick().await;
-
-                        // Load retention_days from config (default 7 days)
-                        let retention_days =
-                            if let Ok(x402_config) = crate::x402::config_cache::get_or_load_x402_config().await {
-                                x402_config
-                                    .transaction_storage
-                                    .as_ref()
-                                    .map(|ts| ts.retention_days)
-                                    .unwrap_or(7)
-                            } else {
-                                7
-                            };
-
-                        match txn_store_clone
-                            .cleanup_old_transactions(retention_days)
-                            .await
-                        {
-                            Ok(count) => {
-                                info!(
-                                    "Transaction cleanup completed: {} old transactions removed (retention: {} days)",
-                                    count, retention_days
-                                );
-
-                                // Trigger integration alerts for cleanup completion
-                                crate::integrations::trigger_cleanup_completed(count, retention_days).await;
-                            }
-                            Err(e) => {
-                                warn!("Transaction cleanup failed: {}", e);
-                            }
-                        }
-                    }
-                });
-                info!("✓ Transaction cleanup worker started (runs daily)");
 
                 // Recover unsettled payments on startup (crash recovery)
                 // Worker checks facilitator_gateway_id to determine what to settle
@@ -2250,6 +2249,10 @@ pub async fn run_axum_proxy(
             // Initialize global integration storage
             crate::storage::init_integration_storage(storage_arc.clone()).await;
             info!("✓ Global integration storage initialized");
+
+            if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
+                spawn_x402_cleanup_worker(txn_store);
+            }
 
             // Validate all active integrations
             crate::integrations::validation::validate_all_integrations(&storage_arc).await;
