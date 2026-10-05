@@ -253,7 +253,7 @@ sequenceDiagram
     participant T as Target
     G1->>M: capabilities-query (nonce)
     M->>G2: Deliver
-    Note over G2: Only an active paired peer gets an answer;<br/>the offer is kept for 5 minutes
+    Note over G2: Only an active paired peer gets an answer,<br/>the offer is kept for 5 minutes
     G2-->>G1: capabilities-disclose (via mediator)
     G1->>G2: frame: Open (offer nonce, surface, deadline)
     Note over G2: Admission: offer, exposure, limits, replay,<br/>then the receive pipeline
