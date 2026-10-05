@@ -99,7 +99,7 @@ pub async fn resolve_synthetic_identity(
 
     let identity_fields = build_identity_fields(proxy);
     let response = vc_issuer
-        .issue_or_get_credential(
+        .issue_or_get_managed_credential(
             identity_fields.clone(),
             Some(identity_hash(proxy)),
             Some(surface.surface_id.clone()),
@@ -208,5 +208,73 @@ mod tests {
         assert!(!serialized.contains("copilot_direct_line"));
         assert!(!serialized.contains("direct-line-secret"));
         assert!(!serialized.contains("should-not-affect-entra"));
+    }
+
+    async fn issuer_with_surface(
+        surface: &crate::config::agent_surface::AgentSurface
+    ) -> (std::sync::Arc<crate::identity::VCIssuer>, tempfile::TempDir, tempfile::TempDir) {
+        use crate::surfaces::AgentSurfaceStore;
+        let (issuer, issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let surface_dir = tempfile::tempdir().unwrap();
+        let surfaces = std::sync::Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(
+                surface_dir
+                    .path()
+                    .to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        surfaces
+            .save(surface)
+            .await
+            .unwrap();
+        issuer.set_surface_store(surfaces);
+        (std::sync::Arc::new(issuer), issuer_dir, surface_dir)
+    }
+
+    #[tokio::test]
+    async fn synthetic_identity_is_recorded_as_managed_and_named_after_surface() {
+        let surface = crate::config::agent_surface::AgentSurface {
+            surface_id: "a2a-proxy-surface".to_string(),
+            name: "Copilot Worker Surface".to_string(),
+            ..Default::default()
+        };
+        let (issuer, _issuer_dir, _surface_dir) = issuer_with_surface(&surface).await;
+
+        let identity = resolve_synthetic_identity(&proxy(None), &surface, Some(&issuer))
+            .await
+            .unwrap();
+
+        let Some(ProtectedAgentIdentity::Managed { did, .. }) = identity else {
+            panic!("expected a managed identity, got {identity:?}");
+        };
+        let record = issuer
+            .get_identity_store()
+            .find_by_did(&did)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(crate::identity::filesystem::IdentityOrigin::Managed));
+        assert_eq!(
+            issuer
+                .surface_display_name(&did, &surface.surface_id)
+                .await,
+            Some(crate::identity::display_name::ManagedDisplayName::Named(
+                crate::identity::display_name::DisplayName::parse("Copilot Worker Surface").unwrap()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_identity_without_vc_issuer_is_none() {
+        let surface = crate::config::agent_surface::AgentSurface::default();
+
+        assert!(
+            resolve_synthetic_identity(&proxy(None), &surface, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -208,6 +208,31 @@ pub async fn resolve_external_agent_identity(
     .await
 }
 
+/// Issue (or fetch) the slot's DID: the protected slot is the managed agent,
+/// the external slot an external caller.
+async fn issue_for_slot(
+    vc_issuer: &crate::identity::VCIssuer,
+    slot: IdentitySlot,
+    identity_fields: HashMap<String, JsonValue>,
+    identity_hash: String,
+    surface: &crate::config::agent_surface::AgentSurface,
+) -> anyhow::Result<crate::identity::AgentIdentityResponse> {
+    let surface_id = Some(surface.surface_id.clone());
+    let issuer_id = surface.issuer_id.clone();
+    match slot {
+        IdentitySlot::Protected => {
+            vc_issuer
+                .issue_or_get_managed_credential(identity_fields, Some(identity_hash), surface_id, issuer_id)
+                .await
+        }
+        IdentitySlot::External => {
+            vc_issuer
+                .issue_or_get_caller_credential(identity_fields, Some(identity_hash), surface_id, issuer_id)
+                .await
+        }
+    }
+}
+
 /// Resolve an agent identity from a response body for a specific channel slot.
 ///
 /// The slot selects which surface accessor to consult (`protected_identity` for
@@ -307,13 +332,7 @@ pub async fn resolve_agent_identity_for_slot(
                     ));
                 };
                 let vc_issuer = selector.get_vc_issuer();
-                match vc_issuer
-                    .issue_or_get_credential(
-                        identity_fields.clone(),
-                        Some(identity_hash.clone()),
-                        Some(surface.surface_id.clone()),
-                        surface.issuer_id.clone(),
-                    )
+                match issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), identity_hash.clone(), surface)
                     .await
                 {
                     Ok(response) => {
@@ -446,13 +465,7 @@ pub async fn resolve_agent_identity_for_slot(
                     ));
                 };
                 let vc_issuer = selector.get_vc_issuer();
-                match vc_issuer
-                    .issue_or_get_credential(
-                        identity_fields.clone(),
-                        Some(identity_hash.clone()),
-                        Some(surface.surface_id.clone()),
-                        surface.issuer_id.clone(),
-                    )
+                match issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), identity_hash.clone(), surface)
                     .await
                 {
                     Ok(response) => {
@@ -735,13 +748,7 @@ pub async fn resolve_agent_identity_for_slot(
         "[TR-TRACE] backend_identity: calling issue_or_get_credential"
     );
 
-    let response = vc_issuer
-        .issue_or_get_credential(
-            identity_fields.clone(),
-            Some(hash.clone()),
-            Some(surface.surface_id.clone()),
-            surface.issuer_id.clone(),
-        )
+    let response = issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), hash.clone(), surface)
         .await
         .map_err(|e| IdentityResolutionError::IdentityBackendUnavailable(e.to_string()))?;
 

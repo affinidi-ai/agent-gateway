@@ -273,6 +273,7 @@ mod tests {
             did: Cow::Owned(agent_did),
             identity_fields: Cow::Owned(identity_fields),
             workload_binding: None,
+            display_name: None,
         }
     }
 

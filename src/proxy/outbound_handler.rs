@@ -1258,7 +1258,7 @@ async fn step_resolve_agent_identity(
                 ));
             };
             let response = vc_issuer
-                .issue_or_get_credential(
+                .issue_or_get_managed_credential(
                     identity_fields.clone(),
                     Some(identity_hash.clone()),
                     ctx.surface
@@ -1483,7 +1483,7 @@ async fn step_resolve_agent_identity(
 
         let vc_issuer = selector.get_vc_issuer();
         let response = vc_issuer
-            .issue_or_get_credential(
+            .issue_or_get_managed_credential(
                 identity_fields.clone(),
                 Some(hash.clone()),
                 ctx.surface
@@ -1541,7 +1541,7 @@ async fn step_resolve_agent_identity(
     };
 
     let response = vc_issuer
-        .issue_or_get_credential(
+        .issue_or_get_managed_credential(
             identity_fields.clone(),
             Some(hash.clone()),
             ctx.surface

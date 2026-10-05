@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::VCIssuer;
+use super::filesystem::IdentityOrigin;
 use super::identity_hash::compute_canonical_identity_hash;
 
 /// Identity selector for extracting stable identity fields and computing deterministic hashes
@@ -112,6 +113,7 @@ impl IdentitySelector {
         channel_name: &str,
         channel_config_id: Option<String>,
         issuer_id: Option<String>,
+        origin: IdentityOrigin,
     ) -> Result<IdentityResult> {
         // Compute the SHA256 hash (validates schema and extracts identity fields)
         let hash = self.compute_identity_hash(payload, channel_name)?;
@@ -121,11 +123,21 @@ impl IdentitySelector {
 
         // Use the VC issuer to get or create a DID for this identity
         // Pass the hash and extracted fields so we only store x-identity marked fields
-        let response = self
-            .vc_issuer
-            .issue_or_get_credential(identity_fields.clone(), Some(hash.clone()), channel_config_id, issuer_id)
-            .await
-            .context("Failed to issue or retrieve DID for identity")?;
+        let fields = identity_fields.clone();
+        let hash_arg = Some(hash.clone());
+        let response = match origin {
+            IdentityOrigin::Managed => {
+                self.vc_issuer
+                    .issue_or_get_managed_credential(fields, hash_arg, channel_config_id, issuer_id)
+                    .await
+            }
+            IdentityOrigin::ExternalCaller => {
+                self.vc_issuer
+                    .issue_or_get_caller_credential(fields, hash_arg, channel_config_id, issuer_id)
+                    .await
+            }
+        }
+        .context("Failed to issue or retrieve DID for identity")?;
 
         info!(
             channel = channel_name,
@@ -448,6 +460,58 @@ mod tests {
             selector
                 .validate(&payload)
                 .is_err()
+        );
+    }
+
+    async fn computed_origin(
+        origin: IdentityOrigin,
+        model: &str,
+    ) -> Option<IdentityOrigin> {
+        use crate::identity::store::IdentityStore;
+        use crate::identity::test_helpers::{MockIdentityStore, MockVpChallengeStore};
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MockIdentityStore::new());
+        let vc_issuer = VCIssuer::new(
+            temp_dir.path(),
+            "example.com",
+            store.clone() as Arc<dyn IdentityStore>,
+            Arc::new(MockVpChallengeStore::new()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let schema = json!({
+            "type": "object",
+            "properties": { "model": { "type": "string", "x-identity": true } }
+        });
+        let selector = IdentitySelector::new(&schema, Arc::new(vc_issuer)).unwrap();
+
+        let result = selector
+            .compute_identity(&json!({ "model": model }), "surface-a", None, None, origin)
+            .await
+            .unwrap();
+
+        store
+            .find_by_hash(&result.hash)
+            .await
+            .unwrap()
+            .and_then(|record| record.origin)
+    }
+
+    #[tokio::test]
+    async fn compute_identity_records_managed_origin() {
+        assert_eq!(computed_origin(IdentityOrigin::Managed, "agent-a").await, Some(IdentityOrigin::Managed));
+    }
+
+    #[tokio::test]
+    async fn compute_identity_records_external_caller_origin() {
+        assert_eq!(
+            computed_origin(IdentityOrigin::ExternalCaller, "caller-b").await,
+            Some(IdentityOrigin::ExternalCaller)
         );
     }
 

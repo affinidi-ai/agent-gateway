@@ -8,6 +8,7 @@ use super::types::{Authority, AuthorityResponse};
 use super::validation::{normalize_context, normalize_description, validate_context, validate_did, validate_name};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::trust_registries::TrustRegistryListenerManager;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAuthorityRequest {
@@ -160,6 +161,7 @@ pub async fn get_authority<S: AuthorityStore>(
 /// DID or the request is rejected.
 pub async fn update_authority<S: AuthorityStore>(
     Extension(store): Extension<Arc<S>>,
+    Extension(tr_manager): Extension<Option<Arc<TrustRegistryListenerManager>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -200,6 +202,9 @@ pub async fn update_authority<S: AuthorityStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     info!("Authority updated: {} ({})", authority.name, authority.id);
+    if let (Some(manager), Some(issuer_store)) = (tr_manager, crate::gateways::connection_points::get_issuer_store()) {
+        crate::trust_registries::reference_fields::spawn_authority_publish(manager, issuer_store, authority.clone());
+    }
     Ok(Json(AuthorityResponse::from(authority)))
 }
 
@@ -466,6 +471,7 @@ mod tests {
 
         let err = update_authority(
             Extension(store),
+            Extension(None),
             Path(created.id.clone()),
             None,
             None,
@@ -503,6 +509,7 @@ mod tests {
 
         let err = update_authority(
             Extension(store),
+            Extension(None),
             Path(created.id.clone()),
             None,
             None,
@@ -543,6 +550,7 @@ mod tests {
 
         let Json(updated) = update_authority(
             Extension(store),
+            Extension(None),
             Path(created.id.clone()),
             None,
             None,

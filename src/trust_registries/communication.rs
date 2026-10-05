@@ -28,8 +28,9 @@ use crate::comm::didcomm::trust_registry::PollResult;
 use super::did_manager::{DidMethod, generate_trust_registry_identity, load_trust_registry_secrets};
 use super::store::TrustRegistryStore;
 use super::types::{
-    TrAdminListRecordsResponse, TrAdminRecordRequest, TrAdminRecordResponse, TrProblemReport,
-    TrqpAuthorizationResponse, TrqpQueryRequest, TrqpRecognitionResponse, TrustRecord, TrustRegistryConnectionStatus,
+    CreateReferenceFieldRequest, TrAdminListRecordsResponse, TrAdminRecordRequest, TrAdminRecordResponse,
+    TrProblemReport, TrqpAuthorizationResponse, TrqpQueryRequest, TrqpRecognitionResponse, TrustRecord,
+    TrustRegistryConnectionStatus, UpdateReferenceFieldRequest,
 };
 use crate::egress::{EgressError, EgressPolicy, bdd_egress_allowlist, guarded_send_inner};
 use crate::mediators::utils::{fetch_mediator_did_from_url, set_acl_to_allow_everything_and_more};
@@ -72,7 +73,14 @@ mod tr_admin {
     pub const READ_RECORD_RESPONSE: &str = "https://affinidi.com/didcomm/protocols/tr-admin/1.0/read-record/response";
     pub const LIST_RECORDS: &str = "https://affinidi.com/didcomm/protocols/tr-admin/1.0/list-records";
     pub const LIST_RECORDS_RESPONSE: &str = "https://affinidi.com/didcomm/protocols/tr-admin/1.0/list-records/response";
+    pub const CREATE_REFERENCE_FIELD: &str =
+        "https://affinidi.com/didcomm/protocols/tr-admin/1.0/create-reference-field";
+    pub const UPDATE_REFERENCE_FIELD: &str =
+        "https://affinidi.com/didcomm/protocols/tr-admin/1.0/update-reference-field";
 }
+
+/// Problem-report code a trust registry returns when a write collides with existing state.
+pub const TR_CONFLICT_CODE: &str = "e.p.msg.conflict";
 
 /// TRQP (Trust Registry Query Protocol) message types
 #[allow(dead_code)]
@@ -234,6 +242,20 @@ pub enum TrustRegistryError {
     ParseError(String),
     #[error("Stale connection: {0}")]
     StaleConnection(String),
+}
+
+impl TrustRegistryError {
+    /// True only for a problem report carrying exactly [`TR_CONFLICT_CODE`].
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::ProblemReport(code, _) if code == TR_CONFLICT_CODE)
+    }
+}
+
+fn problem_report_error(body: serde_json::Value) -> TrustRegistryError {
+    match serde_json::from_value::<TrProblemReport>(body) {
+        Ok(problem) => TrustRegistryError::ProblemReport(problem.code, problem.comment),
+        Err(e) => TrustRegistryError::ParseError(format!("Failed to parse problem report: {}", e)),
+    }
 }
 
 /// Deserialise a registry response into the expected typed shape, returning
@@ -1256,6 +1278,34 @@ impl TrustRegistryListenerManager {
         parse_registry_response(response)
     }
 
+    /// Create a reference field in a trust registry
+    pub async fn create_reference_field(
+        &self,
+        trust_registry_did: &str,
+        request: &CreateReferenceFieldRequest,
+    ) -> Result<(), TrustRegistryError> {
+        let body = serde_json::to_value(request)
+            .map_err(|e| TrustRegistryError::ParseError(format!("Failed to serialize reference field: {}", e)))?;
+
+        self.send_with_reconnect(trust_registry_did, tr_admin::CREATE_REFERENCE_FIELD, body, self.default_timeout)
+            .await?;
+        Ok(())
+    }
+
+    /// Update an existing reference field in a trust registry
+    pub async fn update_reference_field(
+        &self,
+        trust_registry_did: &str,
+        request: &UpdateReferenceFieldRequest,
+    ) -> Result<(), TrustRegistryError> {
+        let body = serde_json::to_value(request)
+            .map_err(|e| TrustRegistryError::ParseError(format!("Failed to serialize reference field: {}", e)))?;
+
+        self.send_with_reconnect(trust_registry_did, tr_admin::UPDATE_REFERENCE_FIELD, body, self.default_timeout)
+            .await?;
+        Ok(())
+    }
+
     // =========================================================================
     // Internal Methods
     // =========================================================================
@@ -1487,10 +1537,7 @@ impl TrustRegistryListenerManager {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => {
                 if result.msg_type == MSG_TYPE_PROBLEM_REPORT {
-                    let problem: TrProblemReport = serde_json::from_value(result.body).map_err(|e| {
-                        TrustRegistryError::ParseError(format!("Failed to parse problem report: {}", e))
-                    })?;
-                    return Err(TrustRegistryError::ProblemReport(problem.code, problem.comment));
+                    return Err(problem_report_error(result.body));
                 }
                 info!("Received response: {}", result.msg_type);
                 Ok(result.body)
@@ -2023,6 +2070,44 @@ mod tests {
                 .await,
             0
         );
+    }
+
+    #[test]
+    fn problem_report_error_detects_exact_conflict_code() {
+        let body = json!({ "code": "e.p.msg.conflict", "comment": "Reference field already exists" });
+
+        let error = problem_report_error(body);
+
+        assert!(error.is_conflict());
+        match error {
+            TrustRegistryError::ProblemReport(code, comment) => {
+                assert_eq!(code, TR_CONFLICT_CODE);
+                assert_eq!(comment, "Reference field already exists");
+            }
+            other => panic!("Expected ProblemReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn problem_report_error_rejects_non_exact_conflict_codes() {
+        for code in ["e.p.msg.internal-error", "conflict", "e.p.msg.conflict-x", "E.P.MSG.CONFLICT"] {
+            let error = problem_report_error(json!({ "code": code, "comment": "x" }));
+            assert!(!error.is_conflict(), "{code} must not be treated as a conflict");
+        }
+    }
+
+    #[test]
+    fn problem_report_error_reports_malformed_body_as_parse_error() {
+        let error = problem_report_error(json!({ "unexpected": true }));
+
+        assert!(matches!(error, TrustRegistryError::ParseError(_)), "got {error:?}");
+        assert!(!error.is_conflict());
+    }
+
+    #[test]
+    fn non_problem_report_errors_are_not_conflicts() {
+        assert!(!TrustRegistryError::Timeout("e.p.msg.conflict".to_string()).is_conflict());
+        assert!(!TrustRegistryError::SendError("e.p.msg.conflict".to_string()).is_conflict());
     }
 
     // --- response-waiter demux: the contract send_and_await + reader rely on ---

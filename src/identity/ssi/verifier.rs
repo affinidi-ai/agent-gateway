@@ -488,6 +488,7 @@ mod tests {
                 did: Cow::Borrowed(subject_did),
                 identity_fields: Cow::Owned(identity_fields),
                 workload_binding: None,
+                display_name: None,
             }))
             .await
             .expect("VC issuance should succeed")
@@ -518,6 +519,50 @@ mod tests {
             .verify_vp(vp)
             .await
             .map_err(|e| format!("{:#}", e))
+    }
+
+    #[tokio::test]
+    async fn verifies_vp_over_vc_with_display_name() {
+        let f = fixture().await;
+        let signer = Arc::new(LocalVcSigner::new(f.issuer_config.clone()));
+        let vc = LocalVcIssuer::new(f.issuer_config.clone(), signer)
+            .issue(IssueVcPayload::AgentIdentity(AgentIdentity {
+                did: Cow::Borrowed(&f.holder_did),
+                identity_fields: Cow::Owned(HashMap::new()),
+                workload_binding: None,
+                display_name: Some(Cow::Borrowed("OXYGEN")),
+            }))
+            .await
+            .expect("VC issuance with a display name should succeed");
+        assert_eq!(vc["credentialSubject"]["name"], json!("OXYGEN"));
+        let vp = present(&f.holder_key, &f.holder_did, vec![vc]).await;
+
+        let result = verify(&f, &vp)
+            .await
+            .expect("VP over a named VC verifies");
+
+        assert_eq!(result.credentials.len(), 1);
+        assert_eq!(result.credentials[0].subject_did, f.holder_did);
+        assert_eq!(result.raw_credentials[0]["credentialSubject"]["name"], json!("OXYGEN"));
+    }
+
+    #[tokio::test]
+    async fn rejects_vc_whose_display_name_was_altered_after_signing() {
+        let f = fixture().await;
+        let signer = Arc::new(LocalVcSigner::new(f.issuer_config.clone()));
+        let mut vc = LocalVcIssuer::new(f.issuer_config.clone(), signer)
+            .issue(IssueVcPayload::AgentIdentity(AgentIdentity {
+                did: Cow::Borrowed(&f.holder_did),
+                identity_fields: Cow::Owned(HashMap::new()),
+                workload_binding: None,
+                display_name: Some(Cow::Borrowed("OXYGEN")),
+            }))
+            .await
+            .unwrap();
+        vc["credentialSubject"]["name"] = json!("HELIUM");
+        let vp = present(&f.holder_key, &f.holder_did, vec![vc]).await;
+
+        assert!(verify(&f, &vp).await.is_err(), "a tampered display name must fail verification");
     }
 
     #[tokio::test]
@@ -663,6 +708,7 @@ mod tests {
                 did: Cow::Borrowed(&holder_did),
                 identity_fields: Cow::Owned(HashMap::new()),
                 workload_binding: None,
+                display_name: None,
             }))
             .await
             .unwrap();

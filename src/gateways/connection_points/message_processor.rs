@@ -130,6 +130,13 @@ pub async fn init_vc_issuer(
     info!("GW2: Global VC issuer initialized for agent identity tracking");
 }
 
+/// Get the global VC issuer, if initialized.
+pub fn get_vc_issuer() -> Option<Arc<crate::identity::VCIssuer>> {
+    GLOBAL_VC_ISSUER
+        .get()
+        .cloned()
+}
+
 /// Listener manager, used on the fabric-receive path to resolve the sending
 /// peer's Remote gateway record and run the issuer exchange on demand.
 static GLOBAL_LISTENER_MANAGER: OnceCell<Arc<super::ConnectionPointListenerManager>> = OnceCell::const_new();
@@ -202,6 +209,13 @@ pub async fn init_agent_surface_store(store: Arc<dyn AgentSurfaceStore>) {
     } else {
         info!("GW2: Global agent-surface store initialized for O(1) surface lookup");
     }
+}
+
+/// Get the global agent-surface store, if initialized.
+pub fn get_agent_surface_store() -> Option<Arc<dyn AgentSurfaceStore>> {
+    GLOBAL_AGENT_SURFACE_STORE
+        .get()
+        .cloned()
 }
 
 /// Initialize the global facilitator mode for GW2
@@ -2184,6 +2198,7 @@ async fn extract_caller_identity_inbound(
                                             .config_id()
                                             .map(str::to_string),
                                         surface.issuer_id.clone(),
+                                        crate::identity::filesystem::IdentityOrigin::ExternalCaller,
                                     )
                                     .await
                                 {
@@ -6216,6 +6231,7 @@ async fn process_forward_request_with_mcp_runtime(
                                                         channel_id,
                                                         surface.config_id().map(str::to_string),
                                                         surface.issuer_id.clone(),
+                                                        crate::identity::filesystem::IdentityOrigin::Managed,
                                                     )
                                                     .await
                                                 {

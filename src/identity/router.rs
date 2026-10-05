@@ -1569,6 +1569,9 @@ pub fn create_identity_api_router(
 
     // Reuse the agents-api TR listener manager for issuer trust registry registration
     let issuer_tr_listener_manager = agents_api_listener_manager;
+    let issuer_authority_store = authority_store
+        .clone()
+        .map(|store| store as Arc<dyn crate::authorities::AuthorityStore>);
 
     // Create issuer routes if store is provided. Legacy `/v1/departments*`
     // paths are still registered below on `legacy_department_router` where
@@ -1636,7 +1639,8 @@ pub fn create_identity_api_router(
         r.layer(Extension(store))
             .layer(Extension(state.vc_issuer.clone()))
             .layer(Extension(state.bootstrap_config.clone()))
-            .layer(Extension(issuer_tr_listener_manager))
+            .layer(Extension(issuer_tr_listener_manager.clone()))
+            .layer(Extension(issuer_authority_store))
             .layer(Extension(
                 state
                     .didwebvh_log_storage
@@ -1705,6 +1709,7 @@ pub fn create_identity_api_router(
                 ),
             )
             .layer(Extension(store))
+            .layer(Extension(issuer_tr_listener_manager))
     } else {
         Router::new()
     };

@@ -261,6 +261,7 @@ async fn extract_a2a_fabric_identity(
                     channel_name,
                     Some(surface.surface_id.clone()),
                     surface.issuer_id.clone(),
+                    crate::identity::filesystem::IdentityOrigin::Managed,
                 )
                 .await
             {

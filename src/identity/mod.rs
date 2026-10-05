@@ -5,6 +5,7 @@
 
 pub mod credential_identity;
 pub mod did_keys;
+pub mod display_name;
 pub mod filesystem;
 pub mod handlers;
 pub mod identity_hash;

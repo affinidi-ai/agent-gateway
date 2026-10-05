@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use super::IssuerStore;
 use super::types::{Issuer, IssuerResponse};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
+use crate::authorities::AuthorityStore;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
 use crate::trust_registries::communication::TrustRegistryListenerManager;
 use crate::trust_registries::types::TrAdminRecordRequest;
@@ -52,6 +53,31 @@ fn issuer_allowed(
         && scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Issuers, &issuer.id)
 }
 
+type AuthorityStoreExt = Option<Arc<dyn AuthorityStore>>;
+
+/// Publish the issuer's and its authority's names to the issuer's trust registry
+/// in the background. No-op for issuers without TR registration.
+fn spawn_issuer_name_publish(
+    tr_manager: &Option<Arc<TrustRegistryListenerManager>>,
+    authority_store: &AuthorityStoreExt,
+    issuer: &Issuer,
+) {
+    if issuer
+        .trust_registry_did
+        .is_none()
+        || issuer.authority_did.is_none()
+    {
+        return;
+    }
+    if let Some(manager) = tr_manager {
+        crate::trust_registries::reference_fields::spawn_issuer_publish(
+            manager.clone(),
+            authority_store.clone(),
+            issuer.clone(),
+        );
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateIssuerRequest {
     pub name: String,
@@ -92,6 +118,7 @@ pub async fn create_issuer<S: IssuerStore>(
     Extension(vc_issuer): Extension<Arc<crate::identity::VCIssuer>>,
     Extension(config): Extension<Arc<crate::config::BootstrapConfig>>,
     Extension(tr_manager): Extension<Option<Arc<TrustRegistryListenerManager>>>,
+    Extension(authority_store): Extension<AuthorityStoreExt>,
     Extension(log_storage): Extension<Option<Arc<dyn crate::storage::DidLogStorage>>>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
@@ -230,6 +257,7 @@ pub async fn create_issuer<S: IssuerStore>(
                     let _ = store.update(&issuer).await;
                 }
             }
+            spawn_issuer_name_publish(&tr_manager, &authority_store, &issuer);
         } else {
             warn!(
                 did = %issuer.did,
@@ -265,6 +293,8 @@ pub async fn get_issuer<S: IssuerStore>(
 /// Update an issuer (name only)
 pub async fn update_issuer<S: IssuerStore>(
     Extension(store): Extension<Arc<S>>,
+    Extension(tr_manager): Extension<Option<Arc<TrustRegistryListenerManager>>>,
+    Extension(authority_store): Extension<AuthorityStoreExt>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -302,6 +332,7 @@ pub async fn update_issuer<S: IssuerStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     info!("Issuer updated: {} ({})", issuer.name, issuer.id);
+    spawn_issuer_name_publish(&tr_manager, &authority_store, &issuer);
     Ok(Json(IssuerResponse::from(issuer)))
 }
 
@@ -410,6 +441,7 @@ pub struct RetryIssuerTrRegistrationResponse {
 pub async fn retry_issuer_tr_registration<S: IssuerStore>(
     Extension(store): Extension<Arc<S>>,
     Extension(tr_manager): Extension<Option<Arc<TrustRegistryListenerManager>>>,
+    Extension(authority_store): Extension<AuthorityStoreExt>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -492,6 +524,7 @@ pub async fn retry_issuer_tr_registration<S: IssuerStore>(
 
     issuer.tr_registered = Some(registered);
     let _ = store.update(&issuer).await;
+    spawn_issuer_name_publish(&tr_manager, &authority_store, &issuer);
 
     let (message, status_text) = if registered {
         ("Issuer successfully registered in trust registry".to_string(), "success")

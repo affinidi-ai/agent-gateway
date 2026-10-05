@@ -48,6 +48,15 @@ pub trait IdentityStore: Send + Sync {
         verified: bool,
     ) -> Result<()>;
 
+    /// Record how an identity entered the store. Stores without origin tracking ignore it.
+    async fn set_origin(
+        &self,
+        _identity_hash: &str,
+        _origin: filesystem::IdentityOrigin,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Returns the base filesystem storage path, if this is a filesystem-backed store.
     /// Returns `None` for in-memory or mock implementations.
     fn base_path(&self) -> Option<std::path::PathBuf> {

@@ -4526,7 +4526,7 @@ async fn proxy_handler_with_mcp_runtime(
                     ));
                 };
                 match issuer
-                    .issue_or_get_credential(
+                    .issue_or_get_caller_credential(
                         identity_fields.clone(),
                         Some(identity_hash.clone()),
                         state
@@ -9594,7 +9594,7 @@ async fn resolve_configured_caller_identity(
                 return Ok(None);
             };
             let issued = issuer
-                .issue_or_get_credential(
+                .issue_or_get_caller_credential(
                     identity_fields.clone(),
                     Some(identity_hash.clone()),
                     state
@@ -9952,7 +9952,7 @@ async fn handle_fabric_request(
                     ));
                 };
                 match issuer
-                    .issue_or_get_credential(
+                    .issue_or_get_caller_credential(
                         identity_fields.clone(),
                         Some(identity_hash.clone()),
                         state
