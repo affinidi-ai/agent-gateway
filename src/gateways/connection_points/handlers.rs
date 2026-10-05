@@ -1112,7 +1112,7 @@ async fn create_oob_invitation(
     // Initialize TDK Shared State with default configuration
     // Note: In production, this should be initialized once at startup and reused
     debug!("Initializing TDK Shared State...");
-    let tdk_config = affinidi_tdk_common::config::TDKConfig::headless()
+    let tdk_config = crate::gateways::did_cache::headless_tdk_config()
         .map_err(|e| format!("Failed to build TDK config: {:?}", e))?;
     let tdk_state = Arc::new(
         TDKSharedState::new(tdk_config)

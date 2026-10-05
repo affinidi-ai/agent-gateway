@@ -3061,6 +3061,12 @@ pub struct DIDCacheBootstrapConfig {
     /// Path to store cached DID documents (default: _storage/cache/did)
     #[serde(default = "default_did_cache_storage_path")]
     pub storage_path: String,
+
+    /// Let did:web and did:webvh resolution contact loopback, private-network,
+    /// link-local and `localhost` / `*.local` / `*.internal` hosts (default:
+    /// false, public hosts only). Startup-only.
+    #[serde(default)]
+    pub allow_private_hosts: bool,
 }
 
 impl Default for DIDCacheBootstrapConfig {
@@ -3070,6 +3076,7 @@ impl Default for DIDCacheBootstrapConfig {
             max_entries: default_did_cache_max_entries(),
             stale_threshold_percent: default_did_cache_stale_threshold_percent(),
             storage_path: default_did_cache_storage_path(),
+            allow_private_hosts: false,
         }
     }
 }
@@ -3479,6 +3486,25 @@ pub struct DidWebVhIdentityConfig {
     /// How to inject the DID identity into outgoing requests
     #[serde(default)]
     pub injection_mode: DidInjectionMode,
+}
+
+#[cfg(test)]
+mod did_cache_bootstrap_config_tests {
+    use super::DIDCacheBootstrapConfig;
+
+    #[test]
+    fn allow_private_hosts_defaults_to_false() {
+        let config: DIDCacheBootstrapConfig = toml::from_str("ttl_seconds = 60").unwrap();
+        assert!(!config.allow_private_hosts);
+        assert!(!DIDCacheBootstrapConfig::default().allow_private_hosts);
+    }
+
+    #[test]
+    fn allow_private_hosts_parses_true() {
+        let config: DIDCacheBootstrapConfig = toml::from_str("allow_private_hosts = true").unwrap();
+        assert!(config.allow_private_hosts);
+        assert_eq!(config.ttl_seconds, 86400);
+    }
 }
 
 #[cfg(test)]

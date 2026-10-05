@@ -50,23 +50,22 @@ impl std::fmt::Display for WellKnownDidResponse {
 // ✅ 18: self_manage_receive_queue_limit
 
 /// Construct a `MediatorAcl` that allows everything.
-fn allow_all_acl() -> MediatorAcl {
-    MediatorAcl {
-        access_list_mode: Some(MediatorAclAccessListMode::ExplicitDeny),
-        anon_receive: Some(true),
-        blocked: Some(false),
-        create_invites: Some(true),
-        didcomm_enabled: None,
-        local: Some(true),
-        receive_forwarded: Some(true),
-        receive_messages: Some(true),
-        self_manage_list: Some(true),
-        self_manage_receive_queue_limit: Some(true),
-        self_manage_send_queue_limit: Some(true),
-        send_forwarded: Some(true),
-        send_messages: Some(true),
-        tsp_enabled: None,
-    }
+fn allow_all_acl() -> Result<MediatorAcl, String> {
+    MediatorAcl::builder()
+        .access_list_mode(MediatorAclAccessListMode::ExplicitDeny)
+        .anon_receive(true)
+        .blocked(false)
+        .create_invites(true)
+        .local(true)
+        .receive_forwarded(true)
+        .receive_messages(true)
+        .self_manage_list(true)
+        .self_manage_receive_queue_limit(true)
+        .self_manage_send_queue_limit(true)
+        .send_forwarded(true)
+        .send_messages(true)
+        .try_into()
+        .map_err(|e| format!("Failed to build ALLOW_ALL ACL: {}", e))
 }
 
 /// GET `url` through the shared SSRF egress guard (Strict policy): the target
@@ -244,7 +243,7 @@ pub async fn set_acl_to_allow_everything_and_more(
     hasher.update(did.as_bytes());
     let did_hash = format!("{:x}", hasher.finalize());
     atm.trust_tasks()
-        .account_update(&profile, Some(did_hash), None, Some(allow_all_acl()), None)
+        .account_update(&profile, Some(did_hash), None, Some(allow_all_acl()?), None)
         .await
         .map_err(|e| format!("Failed to update ACL to ALLOW_ALL_ACL_FLAGS: {}", e))?;
 
@@ -513,6 +512,28 @@ async fn resolve_did(did: &str) -> Result<serde_json::Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn allow_all_acl_grants_every_capability_in_explicit_deny_mode() {
+        let acl = serde_json::to_value(allow_all_acl().unwrap()).unwrap();
+        assert_eq!(
+            acl,
+            json!({
+                "accessListMode": "explicitDeny",
+                "anonReceive": true,
+                "blocked": false,
+                "createInvites": true,
+                "local": true,
+                "receiveForwarded": true,
+                "receiveMessages": true,
+                "selfManageList": true,
+                "selfManageReceiveQueueLimit": true,
+                "selfManageSendQueueLimit": true,
+                "sendForwarded": true,
+                "sendMessages": true,
+            })
+        );
+    }
 
     // ── extract_endpoint_value ────────────────────────────────────────────────
 

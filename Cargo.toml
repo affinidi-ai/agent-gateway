@@ -116,16 +116,16 @@ sha256 = "1.6"
 hmac = "0.12"
 hex = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
-affinidi-did-resolver-cache-sdk = "0.8.22"
-affinidi-messaging-sdk = "0.19"
-trust-tasks-rs = "0.9"
+affinidi-did-resolver-cache-sdk = "0.8.39"
+affinidi-messaging-sdk = "0.30.1"
+trust-tasks-rs = "0.24.8"
 
 # Cryptography for x402 payment signing
 alloy-signer = "1.7"
 alloy-signer-local = "1.7"
-affinidi-messaging-didcomm = "0.15.8"
-affinidi-tdk-common = "0.6.7"
-affinidi-did-common = "0.4.1"
+affinidi-messaging-didcomm = "0.15.9"
+affinidi-tdk-common = "0.6.11"
+affinidi-did-common = "0.4.3"
 ssi = "0.16.0"
 ssi-json-ld = "0.3.3"
 ssi-claims-core = "0.2.0"
@@ -150,7 +150,7 @@ jsonschema = "0.41.0"
 highway = "1.3.0"
 
 # did:webvh support
-didwebvh-rs = { version = "0.6.0", optional = true }
+didwebvh-rs = { version = "0.7.0", optional = true }
 serde_jcs = { version = "0.1", optional = true }
 
 # WebAuthn for passkey authentication

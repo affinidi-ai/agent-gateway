@@ -1127,6 +1127,18 @@ impl ConnectionPointListenerManager {
             return Ok(current);
         }
 
+        self.restart_listener(connection_point_id, timeout)
+            .await
+    }
+
+    /// Stop and start a connection point's listener unconditionally, for a
+    /// caller that already knows the mediator session is unusable (e.g. the
+    /// mediator reported our account missing), and return it once it is live.
+    pub async fn restart_listener(
+        &self,
+        connection_point_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<ListenerInfo, String> {
         let cp = self
             .cp_store
             .get(connection_point_id)
@@ -1929,16 +1941,11 @@ async fn create_atm_instance(
         connection_point_did.to_string(),
         secrets.to_vec(),
         Some(mediator_did.to_string()),
+        mediator_did_document,
         Some(connection_point.name.clone()),
         cache_config.as_ref(),
     )
     .await?;
-
-    if let Some(doc) = mediator_did_document {
-        client
-            .cache_did_document(mediator_did, doc)
-            .await?;
-    }
 
     client
         .enable_websocket()

@@ -1217,6 +1217,20 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
+
+    #[test]
+    fn account_not_found_is_recognised_only_from_its_problem_report() {
+        use affinidi_messaging_sdk::errors::ATMError;
+
+        let missing = ATMError::ProblemReport("e.p.account.not_found".into(), "gone".into(), "false".into());
+        assert!(is_account_not_found(&missing));
+
+        let other_report = ATMError::ProblemReport("e.p.access_list.denied".into(), "denied".into(), "false".into());
+        assert!(!is_account_not_found(&other_report));
+
+        let transport = ATMError::TransportError("account.not_found".into());
+        assert!(!is_account_not_found(&transport));
+    }
 }
 
 /// Request body for connecting to a gateway via OOB
@@ -1293,7 +1307,7 @@ pub async fn connect_via_oob<
     info!("📥 Step 1: Retrieving OOB invitation from URL...");
     info!("  Initializing TDK shared state for DID caching...");
     let tdk = Arc::new(
-        affinidi_tdk_common::TDKSharedState::new(affinidi_tdk_common::config::TDKConfig::headless().map_err(|e| {
+        affinidi_tdk_common::TDKSharedState::new(crate::gateways::did_cache::headless_tdk_config().map_err(|e| {
             error!("❌ Failed to build TDK config: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to build TDK config: {:?}", e))
         })?)
@@ -1950,14 +1964,24 @@ async fn ensure_live_listener(
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("Failed to reconnect connection point: {}", e)))
 }
 
+/// Whether a mediator error is its `account.not_found` problem report.
+fn is_account_not_found(error: &affinidi_messaging_sdk::errors::ATMError) -> bool {
+    matches!(
+        error,
+        affinidi_messaging_sdk::errors::ATMError::ProblemReport(code, _, _) if code.contains("account.not_found")
+    )
+}
+
 /// Handle a gateway-ping timeout by probing our own mediator account: if the
 /// account exists but its receive-list was reset to deny-all (e.g. after a
 /// mediator store flush) the list is re-opened and the ping retried once; if the
 /// list is already open the timeout is reported as a genuine remote
-/// non-response; and if the account itself can't be read the connection point
-/// re-authenticates on its own and the timeout is reported as-is.
+/// non-response; if the mediator reports the account missing the connection
+/// point listener is restarted so it re-authenticates and re-registers; in every
+/// other failure the timeout is reported as-is.
 async fn recover_ping_after_timeout(
     request_id: uuid::Uuid,
+    manager: &ConnectionPointListenerManager,
     gateway_listener: &ListenerInfo,
     gateway: &Gateway,
 ) -> Result<Json<GatewayPingResponse>, (StatusCode, String)> {
@@ -1975,9 +1999,9 @@ async fn recover_ping_after_timeout(
     // A ping timeout is ambiguous: the remote gateway may simply be down or
     // slow, OR our own mediator account/receive-list may have been reset (e.g.
     // after a mediator store flush) so the pong was silently dropped. Probe our
-    // own account: if the mediator no longer has it, the probe surfaces an
-    // `account.not_found` problem report and the connection point listener
-    // reconnects to re-authenticate on its own; if the account exists but its
+    // own account: if the mediator no longer has it, the probe returns its
+    // `account.not_found` problem report and we restart the connection point
+    // listener so it re-authenticates; if the account exists but its
     // receive-list is closed we re-open it and retry here; if the list is
     // already open the remote genuinely did not respond and we report the
     // timeout as-is.
@@ -2003,17 +2027,28 @@ async fn recover_ping_after_timeout(
             .as_ref()
             .map(|m| m.to_string() == "explicitDeny")
             .unwrap_or(false),
+        Ok(Err(e)) if is_account_not_found(&e) => {
+            warn!(
+                "[{request_id}] Mediator no longer has our account after ping timeout ({}); restarting the connection point to re-authenticate and re-register. Reporting timeout.",
+                e
+            );
+            if let Err(restart_error) = manager
+                .restart_listener(&gateway_listener.connection_point_id, LISTENER_RECONNECT_TIMEOUT)
+                .await
+            {
+                warn!("[{request_id}] Connection point restart failed: {}", restart_error);
+            }
+            return timed_out();
+        }
         Ok(Err(e)) => {
             warn!(
-                "[{request_id}] Mediator could not return our account after ping timeout ({}); the connection point will re-authenticate and re-register. Reporting timeout.",
+                "[{request_id}] Mediator could not return our account after ping timeout ({}). Reporting timeout.",
                 e
             );
             return timed_out();
         }
         Err(_) => {
-            warn!(
-                "[{request_id}] Timed out reading our own mediator account after ping timeout; the connection point will re-authenticate and re-register. Reporting timeout."
-            );
+            warn!("[{request_id}] Timed out reading our own mediator account after ping timeout. Reporting timeout.");
             return timed_out();
         }
     };
@@ -2270,7 +2305,7 @@ pub async fn ping_gateway<S: GatewayStore>(
         }
         Ok(None) => {
             warn!("[{request_id}] ✗ Ping timed out after {}ms", elapsed.as_millis());
-            recover_ping_after_timeout(request_id, &gateway_listener, &gateway).await
+            recover_ping_after_timeout(request_id, manager, &gateway_listener, &gateway).await
         }
         Err(e) => {
             error!("[{request_id}] ✗ Ping failed: {:?}", e);

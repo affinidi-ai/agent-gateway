@@ -13,7 +13,56 @@ use crate::storage::filesystem::{StorableEntity, StorageBackend, uncached_storag
 // Shared DID Resolver Client (process-wide singleton)
 // ============================================================================
 
+use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy;
+use std::sync::OnceLock;
 use tokio::sync::OnceCell;
+
+/// Which hosts did:web and did:webvh resolution may contact, set once at
+/// startup from `[did_cache] allow_private_hosts`.
+static DID_HOST_POLICY: OnceLock<HostPolicy> = OnceLock::new();
+
+/// Record the process-wide DID host policy. Call once during startup, before
+/// [`init_shared_resolver`]; later calls are ignored.
+pub fn init_did_host_policy(allow_private_hosts: bool) {
+    let _ = DID_HOST_POLICY.set(host_policy_for(allow_private_hosts));
+}
+
+fn host_policy_for(allow_private_hosts: bool) -> HostPolicy {
+    if allow_private_hosts {
+        HostPolicy::AllowPrivate
+    } else {
+        HostPolicy::PublicOnly
+    }
+}
+
+/// The recorded DID host policy; `PublicOnly` when startup has not set one.
+fn did_host_policy() -> HostPolicy {
+    DID_HOST_POLICY
+        .get()
+        .copied()
+        .unwrap_or(HostPolicy::PublicOnly)
+}
+
+/// Headless TDK config whose own DID resolver follows the process-wide host
+/// policy. Each TDK state keeps its own resolver cache, separate from
+/// [`shared_resolver`].
+pub fn headless_tdk_config() -> Result<affinidi_tdk_common::config::TDKConfig, affinidi_tdk_common::errors::TDKError> {
+    headless_tdk_config_for(did_host_policy())
+}
+
+fn headless_tdk_config_for(
+    host_policy: HostPolicy
+) -> Result<affinidi_tdk_common::config::TDKConfig, affinidi_tdk_common::errors::TDKError> {
+    affinidi_tdk_common::config::TDKConfig::builder()
+        .with_load_environment(false)
+        .with_use_atm(false)
+        .with_did_resolver_config(
+            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default()
+                .with_host_policy(host_policy)
+                .build(),
+        )
+        .build()
+}
 
 /// Process-wide shared DID resolver client.
 ///
@@ -41,6 +90,7 @@ pub async fn init_shared_resolver() -> Result<()> {
     let config = DIDCacheConfigBuilder::default()
         .with_cache_capacity(100)
         .with_cache_ttl(3600) // 1 hour
+        .with_host_policy(did_host_policy())
         .build();
 
     let client = DIDCacheClient::new(config)
@@ -884,8 +934,43 @@ fn extract_did_path_parts(
 
 #[cfg(test)]
 mod tests {
-    use super::{DIDCache, DIDCacheConfig};
+    use super::{DIDCache, DIDCacheConfig, HostPolicy, headless_tdk_config_for, host_policy_for};
     use chrono::Utc;
+
+    #[test]
+    fn host_policy_follows_allow_private_hosts() {
+        assert_eq!(host_policy_for(false), HostPolicy::PublicOnly);
+        assert_eq!(host_policy_for(true), HostPolicy::AllowPrivate);
+    }
+
+    async fn resolve_error(
+        host_policy: HostPolicy,
+        did: &str,
+    ) -> String {
+        let tdk = affinidi_tdk_common::TDKSharedState::new(headless_tdk_config_for(host_policy).unwrap())
+            .await
+            .unwrap();
+        match tdk
+            .did_resolver()
+            .resolve(did)
+            .await
+        {
+            Ok(_) => panic!("resolving an unreachable DID must fail"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_only_tdk_resolver_refuses_localhost_did_web() {
+        let error = resolve_error(HostPolicy::PublicOnly, "did:web:localhost%3A1").await;
+        assert!(error.contains("SSRF-prone host"), "expected a blocked-host refusal, got: {error}");
+    }
+
+    #[tokio::test]
+    async fn allow_private_tdk_resolver_contacts_localhost_did_web() {
+        let error = resolve_error(HostPolicy::AllowPrivate, "did:web:localhost%3A1").await;
+        assert!(!error.contains("SSRF-prone host"), "AllowPrivate must not refuse localhost, got: {error}");
+    }
 
     fn minimal_document(did_str: &str) -> affinidi_did_common::Document {
         affinidi_did_common::Document::new(did_str).unwrap()

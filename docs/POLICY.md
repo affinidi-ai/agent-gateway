@@ -256,6 +256,22 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 
 Both helpers share one `pin_and_build` body.
 
+### DID resolution host policy
+
+`did:web` and `did:webvh` resolution names its own host, so an attacker-supplied
+DID is an egress target. The resolver refuses loopback, private-network, carrier-grade
+NAT, link-local (cloud metadata included), `localhost`, `*.local` and `*.internal`
+hosts, both as literals and as the address a hostname resolves to, and does not
+follow redirects. The refusal applies to every resolver the gateway builds: the
+shared resolver (`src/gateways/did_cache.rs::init_shared_resolver`) and the
+per-client DIDComm resolvers (`did_cache::headless_tdk_config`), which keep their
+own caches. `[did_cache] allow_private_hosts = true` (startup-only, default
+`false`) lifts the refusal for all of them, cloud metadata included, and startup
+logs a warning when it is on. Use it only where the DIDs themselves are trusted: a
+local stack whose mediator lives on `localhost`, or a deployment whose DID hosts are
+on a private network. A DID document the gateway caches itself, such as a stored
+mediator document, is served from the cache and never fetched.
+
 ### Known limitations
 
 These are current, unmitigated coverage gaps in the egress controls. They are

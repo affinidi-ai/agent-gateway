@@ -10,7 +10,8 @@ use reqwest::Method;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 
 use super::mediator::{
-    MediatorAuthTestResult, MediatorTrustPingResult, cache_did_document, test_authentication, trust_ping,
+    MediatorAuthTestResult, MediatorTrustPingResult, cache_did_document, cache_did_document_in_tdk_state,
+    test_authentication, trust_ping,
 };
 use crate::comm::client::DIDCommContract;
 use crate::egress::{EgressError, EgressPolicy, bdd_egress_allowlist, guarded_send_inner};
@@ -86,7 +87,7 @@ impl DIDCommClient {
         mediator_did: Option<String>,
         alias: Option<String>,
     ) -> Result<Self, String> {
-        Self::new_with_cache_config(did, secrets, mediator_did, alias, None).await
+        Self::new_with_cache_config(did, secrets, mediator_did, None, alias, None).await
     }
 
     pub async fn new_with_mediator_document(
@@ -96,28 +97,30 @@ impl DIDCommClient {
         mediator_did_document: Option<serde_json::Value>,
         alias: Option<String>,
     ) -> Result<Self, String> {
-        let client = Self::new_with_cache_config(did, secrets, mediator_did.clone(), alias, None).await?;
-        if let (Some(doc), Some(med_did)) = (mediator_did_document, mediator_did.as_deref()) {
-            cache_did_document(&client, med_did, doc).await?;
-        }
-        Ok(client)
+        Self::new_with_cache_config(did, secrets, mediator_did, mediator_did_document, alias, None).await
     }
 
+    /// A supplied mediator DID document is cached before the ATM profile is
+    /// built, so the profile resolves its mediator from it.
     pub async fn new_with_cache_config(
         did: String,
         secrets: Vec<Secret>,
         mediator_did: Option<String>,
+        mediator_did_document: Option<serde_json::Value>,
         alias: Option<String>,
         cache_config: Option<&super::gateway::CacheConfig>,
     ) -> Result<Self, String> {
         let tdk_state = Arc::new(
             TDKSharedState::new(
-                affinidi_tdk_common::config::TDKConfig::headless()
+                crate::gateways::did_cache::headless_tdk_config()
                     .map_err(|e| format!("Failed to build TDK config: {:?}", e))?,
             )
             .await
             .map_err(|e| format!("Failed to create TDK shared state: {:?}", e))?,
         );
+        if let (Some(doc), Some(med_did)) = (mediator_did_document, mediator_did.as_deref()) {
+            cache_did_document_in_tdk_state(&tdk_state, med_did, doc).await?;
+        }
 
         let tdk_profile = TDKProfile::new(
             alias

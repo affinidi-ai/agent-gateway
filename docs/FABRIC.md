@@ -49,6 +49,16 @@ helper.
 Forward responses are correlated to pending requests by message ID. Resolving the pending
 `oneshot` completes the HTTP request that initiated the G2G call.
 
+The listener deletes a message from the mediator only after processing it, so every in-flight
+fabric request stays queued at the mediator until it is answered. A mediator from v0.27 caps the
+messages one sender may have queued for one recipient at `[limits] queued_send_messages_per_peer`
+(default `50`, and not settable by environment variable in v0.33.1). A forward over the cap is
+refused with `e.p.limits.queue.peer`, and the caller sees a fabric timeout (`504`). Size the cap
+for the concurrent requests expected between two gateways, below the recipient's
+`queued_receive_messages_soft` (default `200`). The E2E mediators (`scripts/g2g-mediator.sh`) and
+the local mediator (`make mediator-up`) run with `150`. `scripts/mediator/user-data-v2.sh` sets the
+cap from its optional thirteenth argument, and without it leaves the mediator default.
+
 Framed stream messages (`forward-stream/1.0` frames and capability queries) also arrive through the
 listener. It answers a capability query only from a registered, active peer gateway, and answers an
 Open it refuses with an `Error` frame to that peer saying why: `stale_offer` (the sender negotiates
