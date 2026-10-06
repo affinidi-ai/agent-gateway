@@ -690,7 +690,6 @@ dependencies = [
  "futures",
  "governor 0.10.4",
  "hex",
- "highway",
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "http-body-util",

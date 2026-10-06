@@ -400,4 +400,57 @@ mod tests {
             .expect_err("metadata must be blocked");
         assert!(err.contains("blocked by egress policy"), "unexpected error: {err}");
     }
+
+    const UNREACHABLE_MEDIATOR_DID: &str = "did:web:localhost%3A1";
+
+    fn unreachable_mediator_document() -> serde_json::Value {
+        serde_json::json!({
+            "id": UNREACHABLE_MEDIATOR_DID,
+            "service": [{
+                "id": format!("{UNREACHABLE_MEDIATOR_DID}#didcomm"),
+                "type": "DIDCommMessaging",
+                "serviceEndpoint": [{ "uri": "https://localhost:1/mediator/v1", "accept": ["didcomm/v2"] }]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_supplied_mediator_document_is_cached_before_the_profile_resolves_its_mediator() {
+        let client = super::DIDCommClient::new_with_mediator_document(
+            "did:example:connection-point".to_string(),
+            Vec::new(),
+            Some(UNREACHABLE_MEDIATOR_DID.to_string()),
+            Some(unreachable_mediator_document()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            client
+                .profile()
+                .get_mediator_rest_endpoint()
+                .as_deref(),
+            Some("https://localhost:1/mediator/v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_supplied_document_an_unresolvable_mediator_leaves_the_profile_without_one() {
+        let client = super::DIDCommClient::new(
+            "did:example:connection-point".to_string(),
+            Vec::new(),
+            Some(UNREACHABLE_MEDIATOR_DID.to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            client
+                .profile()
+                .get_mediator_rest_endpoint(),
+            None
+        );
+    }
 }

@@ -801,15 +801,10 @@ impl DIDCache {
         document: &affinidi_did_common::Document,
         tdk_state: &affinidi_tdk_common::TDKSharedState,
     ) {
-        use highway::HighwayHash;
-
-        let cache = tdk_state
+        tdk_state
             .did_resolver()
-            .get_cache();
-        let did_hash = highway::HighwayHasher::default().hash128(did.as_bytes());
-
-        cache
-            .insert(did_hash, document.clone())
+            .get_cache()
+            .insert(affinidi_did_resolver_cache_sdk::DIDCacheClient::hash_did(did), document.clone())
             .await;
         debug!("✓ Populated ATM DID resolver cache for {}", did);
     }

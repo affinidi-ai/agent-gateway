@@ -1125,32 +1125,18 @@ async fn create_oob_invitation(
     // Add the DID document to the resolver cache to avoid needing to fetch it over HTTPS
     // This prevents SSL certificate issues with self-signed certs
     debug!("Adding DID document to resolver cache for {}", from_did);
-    let cache = tdk_state
-        .did_resolver()
-        .get_cache();
-
-    // Use HighwayHasher to hash the DID (same as affinidi-did-resolver-cache-sdk)
-    use highway::HighwayHash;
-    let did_hash = highway::HighwayHasher::default().hash128(from_did.as_bytes());
-
-    // Convert serde_json::Value to affinidi_did_common::Document (used by affinidi_did_resolver_cache_sdk)
-    let document: affinidi_did_common::Document =
-        serde_json::from_value(did_document).map_err(|e| format!("Failed to convert DID document: {:?}", e))?;
-
-    cache
-        .insert(did_hash, document)
-        .await;
-    info!("✓ DID document cached in resolver with hash: {:?}", did_hash);
+    crate::comm::didcomm::mediator::cache_did_document_in_tdk_state(&tdk_state, from_did, did_document).await?;
+    info!("✓ DID document cached in resolver for {}", from_did);
 
     if let Some(mediator_did_document) = mediator_did_document {
         debug!("Adding mediator DID document to resolver cache for {}", mediator_did);
-        let mediator_did_hash = highway::HighwayHasher::default().hash128(mediator_did.as_bytes());
-        let mediator_document: affinidi_did_common::Document = serde_json::from_value(mediator_did_document)
-            .map_err(|e| format!("Failed to convert mediator DID document: {:?}", e))?;
-        cache
-            .insert(mediator_did_hash, mediator_document)
-            .await;
-        info!("✓ Mediator DID document cached in resolver with hash: {:?}", mediator_did_hash);
+        crate::comm::didcomm::mediator::cache_did_document_in_tdk_state(
+            &tdk_state,
+            mediator_did,
+            mediator_did_document,
+        )
+        .await?;
+        info!("✓ Mediator DID document cached in resolver for {}", mediator_did);
     }
 
     // Create TDK Profile with secrets

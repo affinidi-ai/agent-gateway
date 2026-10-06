@@ -3062,9 +3062,10 @@ pub struct DIDCacheBootstrapConfig {
     #[serde(default = "default_did_cache_storage_path")]
     pub storage_path: String,
 
-    /// Let did:web and did:webvh resolution contact loopback, private-network,
-    /// link-local and `localhost` / `*.local` / `*.internal` hosts (default:
-    /// false, public hosts only). Startup-only.
+    /// Let did:web and did:webvh resolution contact hosts that are, or resolve
+    /// to, loopback, private-network or link-local addresses, cloud metadata
+    /// included, plus the local names each method refuses (default: false,
+    /// public hosts only). Startup-only; meant for local stacks.
     #[serde(default)]
     pub allow_private_hosts: bool,
 }

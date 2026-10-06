@@ -1131,10 +1131,32 @@ impl ConnectionPointListenerManager {
             .await
     }
 
-    /// Stop and start a connection point's listener unconditionally, for a
-    /// caller that already knows the mediator session is unusable (e.g. the
+    /// Restart a Connection Point's listener for a caller that knows the
+    /// mediator session of the listener instance it used is unusable (e.g. the
     /// mediator reported our account missing), and return it once it is live.
-    pub async fn restart_listener(
+    ///
+    /// When the current listener is no longer `instance_id`, another caller
+    /// has already replaced it; that listener is returned without a restart,
+    /// so concurrent callers do not tear down each other's fresh session.
+    pub async fn restart_listener_if_current(
+        &self,
+        connection_point_id: &str,
+        instance_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<ListenerInfo, String> {
+        if let Some(current) = self
+            .get_listener(connection_point_id)
+            .await
+            && current.instance_id != instance_id
+        {
+            return Ok(current);
+        }
+
+        self.restart_listener(connection_point_id, timeout)
+            .await
+    }
+
+    async fn restart_listener(
         &self,
         connection_point_id: &str,
         timeout: std::time::Duration,
@@ -4250,5 +4272,43 @@ mod tests {
         );
 
         assert!(preferred.is_none());
+    }
+}
+
+#[cfg(test)]
+mod restart_listener_tests {
+    use std::time::Duration;
+
+    use crate::gateways::test_helpers::{test_listener, test_listener_manager};
+
+    #[tokio::test]
+    async fn a_listener_another_caller_already_replaced_is_returned_without_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer_dir) = test_listener_manager(root.path()).await;
+        manager
+            .register_test_listener(test_listener("replacement").await)
+            .await;
+
+        let current = manager
+            .restart_listener_if_current("cp-1", "probed", Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(current.instance_id, "replacement");
+    }
+
+    #[tokio::test]
+    async fn the_listener_the_caller_probed_is_restarted() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer_dir) = test_listener_manager(root.path()).await;
+        manager
+            .register_test_listener(test_listener("probed").await)
+            .await;
+
+        let result = manager
+            .restart_listener_if_current("cp-1", "probed", Duration::from_secs(1))
+            .await;
+
+        assert_eq!(result.err().as_deref(), Some("Connection point 'cp-1' not found"));
     }
 }

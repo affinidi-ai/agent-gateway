@@ -69,7 +69,9 @@ cd affinidi-messaging/conf
 # redeploy so the stored functions match the running mediator version.
 if [ -f mediator.toml ]; then
   echo "♻️  Existing mediator config found — skipping setup, preserving DID/secrets."
-  docker run --rm --entrypoint cat "$MEDIATOR_IMAGE" /app/conf/atm-functions.lua > atm-functions.lua
+  docker run --rm --entrypoint cat "$MEDIATOR_IMAGE" /app/conf/atm-functions.lua > atm-functions.lua.new
+  cat atm-functions.lua.new > atm-functions.lua
+  rm -f atm-functions.lua.new
 else
 RECIPE_PUBLIC_URL=""
 RECIPE_SAVE_DID_WEB=""

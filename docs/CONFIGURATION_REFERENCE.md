@@ -154,7 +154,7 @@ description that exists today.
 | `encryption.enabled` | Writes whole storage files as `.json.enc`. Losing the master key loses the data. |
 | `metrics_retention_minutes` | Parsed but not used. Retention is the value in `_storage/settings/settings.json`, set from the dashboard, which defaults to 360 minutes whatever this field says. |
 | `websocket_require_auth` | Off means an unauthenticated client can open the dashboard event stream. |
-| `did_cache.allow_private_hosts` | Off (the default) refuses `did:web` and `did:webvh` on loopback and private-network hosts. On is needed for a local stack whose mediator lives on `localhost`, and reopens SSRF through attacker-supplied DIDs. See [`POLICY.md`](POLICY.md#did-resolution-host-policy). |
+| `did_cache.allow_private_hosts` | Off (the default) refuses `did:web` and `did:webvh` on loopback, private-network and link-local hosts. On is needed for a local stack whose mediator lives on `localhost`, and reopens SSRF through attacker-supplied DIDs, cloud metadata included, so keep it off wherever an instance metadata service is reachable. See [`POLICY.md`](POLICY.md#did-resolution-host-policy). |
 
 ## `gateway.json`
 

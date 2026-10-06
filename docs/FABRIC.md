@@ -78,6 +78,9 @@ Invitation fetching is SSRF-protected. A gateway invitation reaches a local addr
 the test-mode egress allow-list (`AG_BDD_EGRESS_ALLOWLIST`, honoured only when `AG_TEST_MODE=true`);
 the development override `AG_ALLOW_LOCAL_OOB=1`, which must not be set in production, applies
 only to the trust-registry OOB and `did:web` fetches in `src/trust_registries/communication.rs`.
+Pairing also resolves the inviter's and the mediator's DIDs, so a peer or mediator whose
+`did:web` / `did:webvh` lives on a local or private host needs `[did_cache] allow_private_hosts`;
+see [DID resolution host policy](POLICY.md#did-resolution-host-policy).
 
 The wire payloads use `channel_did` for the persistent peer DID. This is an exact legacy wire field
 name. A connection-accepted message must be authcrypt; accepting anoncrypt here would let an
