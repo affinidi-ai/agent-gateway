@@ -6,7 +6,7 @@ use axum::{Extension, Json};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext};
@@ -405,10 +405,6 @@ pub async fn rotate_access_token(
     let Some(existing) = store.get(&id) else {
         return Err((StatusCode::NOT_FOUND, "access token not found".into()));
     };
-    // The response carries a working secret, so only the owner may rotate.
-    if existing.user_id != caller_id {
-        return Err((StatusCode::FORBIDDEN, "only the owner of an access token can rotate it".into()));
-    }
     if existing.revoked_at.is_some() {
         return Err((StatusCode::CONFLICT, "cannot rotate a revoked token".into()));
     }
@@ -428,22 +424,41 @@ pub async fn rotate_access_token(
                     .as_ref()
                     .map(|Extension(context)| context.token_id.as_str()),
             );
-            info!(
-                target: "audit",
-                event = "access_token.rotated",
-                token_id = %id,
-                owner_user_id = %token.user_id,
-                caller_user_id = %caller_id,
-                caller_auth_method = caller_context
-                    .as_ref()
-                    .map_or("", |context| context.auth_method.as_str()),
-                caller_token_id = caller_context
-                    .as_ref()
-                    .and_then(|context| context.token_id.as_deref())
-                    .unwrap_or(""),
-                rotation_generation = token.rotation_generation,
-                "Rotated management access token"
-            );
+            let caller_auth_method = caller_context
+                .as_ref()
+                .map_or("", |context| context.auth_method.as_str());
+            let caller_token_id = caller_context
+                .as_ref()
+                .and_then(|context| context.token_id.as_deref())
+                .unwrap_or("");
+            let rotated_for_other_user = token.user_id != caller_id;
+            if rotated_for_other_user {
+                warn!(
+                    target: "audit",
+                    event = "access_token.rotated",
+                    token_id = %id,
+                    owner_user_id = %token.user_id,
+                    caller_user_id = %caller_id,
+                    caller_auth_method,
+                    caller_token_id,
+                    rotated_for_other_user,
+                    rotation_generation = token.rotation_generation,
+                    "Rotated management access token owned by another user"
+                );
+            } else {
+                info!(
+                    target: "audit",
+                    event = "access_token.rotated",
+                    token_id = %id,
+                    owner_user_id = %token.user_id,
+                    caller_user_id = %caller_id,
+                    caller_auth_method,
+                    caller_token_id,
+                    rotated_for_other_user,
+                    rotation_generation = token.rotation_generation,
+                    "Rotated management access token"
+                );
+            }
             Ok((
                 NO_STORE,
                 Json(CreateAccessTokenResponse {
@@ -784,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_rejects_a_session_caller_who_does_not_own_the_token() {
+    async fn rotate_lets_a_session_caller_rotate_another_users_token() {
         use crate::auth_manager::pat::PatAuthenticator;
 
         let directory = tempfile::tempdir().unwrap();
@@ -798,21 +813,34 @@ mod tests {
             .await
             .unwrap();
 
-        let result = rotate_access_token(
+        let (headers, Json(response)) = rotate_access_token(
             State(store.clone()),
             Path("root".into()),
             Some(Extension(AuthGuardOk("user-2".into()))),
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert!(matches!(result, Err((StatusCode::FORBIDDEN, message)) if message.contains("owner")));
-        let stored = store.get("root").unwrap();
-        assert_eq!(stored.token_hash, hash_secret("agpat_root"));
-        assert_eq!(stored.rotation_generation, 0);
+        assert_eq!(headers[0].0, header::CACHE_CONTROL);
+        assert_eq!(headers[0].1, "no-store");
+        assert_ne!(response.token, "agpat_root");
         assert_eq!(
+            response
+                .meta
+                .rotated_by
+                .as_deref(),
+            Some("user-2")
+        );
+        assert!(
             store
                 .authenticate("agpat_root")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .authenticate(&response.token)
                 .await
                 .unwrap()
                 .user_id,

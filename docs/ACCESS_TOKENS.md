@@ -27,9 +27,12 @@ the old hash leaves the authentication index immediately and only the new hash i
 persisted. The record tracks `rotation_generation`, `rotated_at`, and `rotated_by`,
 and `last_used_at` resets. Rotation returns `409` for a revoked or expired token, a
 token whose lineage is no longer valid, or a concurrent rotation that lost the race.
-Because the response contains a working secret, rotation is limited to the token's
-owner (and its PAT lineage, whose callers authenticate as that same owner) and returns
-`403` to any other caller; responses that carry a secret are sent with
+Rotating returns a working secret that authenticates as the token's owner, so access to
+rotate is the same as access to `access_tokens.edit` (administrator by default); delegate
+`access_tokens.edit` accordingly. A PAT caller can rotate only itself and its descendants,
+never with a resource-scoped PAT. Every rotation is written to the audit log with both the
+owner and the caller (`rotated_for_other_user` marks a rotation by someone other than the
+owner, logged at `warn`). Responses that carry a secret are sent with
 `Cache-Control: no-store`. Rotation does not revoke descendant tokens (revoke cascades,
 rotate does not), so a leaked parent must be revoked, not rotated.
 
