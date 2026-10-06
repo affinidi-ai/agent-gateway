@@ -1,7 +1,13 @@
 use crate::auth::storage::PasskeyStorage;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext};
 use crate::rbac::Feature;
-use axum::{Extension, Json, http::StatusCode};
+use axum::{
+    Extension, Json,
+    http::{
+        HeaderName, StatusCode,
+        header::{CACHE_CONTROL, VARY},
+    },
+};
 
 /// Get user permissions based on RBAC config (with optional authentication)
 /// If user_id extension is present, returns user-specific permissions
@@ -121,12 +127,18 @@ pub async fn get_permissions_optional(
     Ok(Json(serde_json::Value::Object(permissions)))
 }
 
-/// Get user permissions based on RBAC config (authenticated only)
+type PermissionsResponse = ([(HeaderName, &'static str); 2], Json<serde_json::Value>);
+
+/// Get user permissions based on RBAC config (authenticated only).
+/// A personal access token reports its owner's role limited to the token's own
+/// feature scopes, matching `require_feature`. The response is `no-store`
+/// because the body depends on the caller's credential.
 pub async fn get_permissions(
     Extension(user_id): Extension<String>,
     Extension(storage): Extension<std::sync::Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<std::sync::Arc<crate::rbac::RbacConfig>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    pat: Option<Extension<PatContext>>,
+) -> Result<PermissionsResponse, (StatusCode, String)> {
     let user_data = storage
         .load_user_by_id(&user_id)
         .await
@@ -210,13 +222,23 @@ pub async fn get_permissions(
         ("terms.edit", Feature::TermsEdit),
     ];
 
+    let token_scopes = pat.and_then(|Extension(PatContext(scopes))| scopes);
+
     let mut permissions = serde_json::Map::new();
     for (name, feature) in features {
-        permissions
-            .insert(name.to_string(), serde_json::Value::Bool(rbac_config.has_permission(&user_data.role, &feature)));
+        // Match on the canonical feature name so aliases like `departments.view` follow `issuers.view`.
+        let granted = rbac_config.has_permission(&user_data.role, &feature)
+            && token_scopes
+                .as_ref()
+                .is_none_or(|scopes| {
+                    scopes
+                        .iter()
+                        .any(|scope| scope == feature.as_str())
+                });
+        permissions.insert(name.to_string(), serde_json::Value::Bool(granted));
     }
 
-    Ok(Json(serde_json::Value::Object(permissions)))
+    Ok(([(CACHE_CONTROL, "no-store"), (VARY, "Authorization")], Json(serde_json::Value::Object(permissions))))
 }
 
 /// Reads only extensions the auth middleware already resolved, with no lookup by id,
@@ -373,7 +395,7 @@ mod tests {
     async fn permissions_endpoint_grants_sts_clients_to_admin() {
         let (storage, _dir, user_id) = storage_with_user(UserRole::Administrator).await;
         let rbac = Arc::new(RbacConfig::default());
-        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+        let (_, Json(perms)) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
             .await
             .expect("permissions endpoint should succeed for an admin");
         assert_eq!(perms["sts_clients.view"], serde_json::Value::Bool(true));
@@ -385,12 +407,140 @@ mod tests {
     async fn permissions_endpoint_reports_sts_clients_false_for_poweruser() {
         let (storage, _dir, user_id) = storage_with_user(UserRole::PowerUser).await;
         let rbac = Arc::new(RbacConfig::default());
-        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+        let (_, Json(perms)) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
             .await
             .expect("permissions endpoint should succeed for a poweruser");
         // The key must be present so the dashboard can evaluate it — but false,
         // because sts_clients.view is administrator-only.
         assert_eq!(perms["sts_clients.view"], serde_json::Value::Bool(false));
+    }
+
+    async fn permissions_for_token(
+        role: UserRole,
+        scopes: Option<Vec<String>>,
+    ) -> serde_json::Value {
+        let (storage, _dir, user_id) = storage_with_user(role).await;
+        let rbac = Arc::new(RbacConfig::default());
+        let pat = Some(Extension(PatContext(scopes)));
+        let (_, Json(perms)) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), pat)
+            .await
+            .expect("permissions endpoint should succeed");
+        perms
+    }
+
+    fn scopes(names: &[&str]) -> Option<Vec<String>> {
+        Some(
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_reports_full_role_for_a_session_login() {
+        let (storage, _dir, user_id) = storage_with_user(UserRole::Administrator).await;
+        let rbac = Arc::new(RbacConfig::default());
+        let (_, Json(perms)) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
+            .await
+            .expect("permissions endpoint should succeed for a session login");
+        assert_eq!(perms["secrets.view"], serde_json::Value::Bool(true));
+        assert_eq!(perms["secrets.edit"], serde_json::Value::Bool(true));
+        assert_eq!(perms["gateways.delete"], serde_json::Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_narrows_to_a_scoped_tokens_own_scopes() {
+        let perms = permissions_for_token(UserRole::Administrator, scopes(&["secrets.view", "issuers.view"])).await;
+        assert_eq!(perms["secrets.view"], serde_json::Value::Bool(true));
+        assert_eq!(perms["secrets.edit"], serde_json::Value::Bool(false));
+        assert_eq!(perms["gateways.view"], serde_json::Value::Bool(false));
+        assert_eq!(perms["issuers.view"], serde_json::Value::Bool(true));
+        assert_eq!(perms["departments.view"], serde_json::Value::Bool(true));
+        assert_eq!(perms["departments.edit"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_never_exceeds_the_owners_role_for_a_scoped_token() {
+        // sts_clients.view is administrator-only, so a power user's token cannot hold it.
+        let perms = permissions_for_token(UserRole::PowerUser, scopes(&["sts_clients.view", "gateways.view"])).await;
+        assert_eq!(perms["sts_clients.view"], serde_json::Value::Bool(false));
+        assert_eq!(perms["gateways.view"], serde_json::Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_reports_the_role_ceiling_for_an_unrestricted_token() {
+        let token = permissions_for_token(UserRole::PowerUser, None).await;
+        let (storage, _dir, user_id) = storage_with_user(UserRole::PowerUser).await;
+        let (_, Json(session)) =
+            get_permissions(Extension(user_id), Extension(storage), Extension(Arc::new(RbacConfig::default())), None)
+                .await
+                .expect("permissions endpoint should succeed for a session login");
+        assert_eq!(token, session);
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_reports_the_role_ceiling_for_a_token_scoped_to_every_feature() {
+        let session = permissions_for_token(UserRole::Administrator, None).await;
+        let all: Vec<String> = session
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let perms = permissions_for_token(UserRole::PowerUser, Some(all)).await;
+        let power_user = permissions_for_token(UserRole::PowerUser, None).await;
+        assert_eq!(perms, power_user);
+    }
+
+    #[tokio::test]
+    async fn permissions_response_is_marked_no_store_and_varies_on_authorization() {
+        let (storage, _dir, user_id) = storage_with_user(UserRole::Administrator).await;
+        let rbac = Arc::new(RbacConfig::default());
+        let response = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
+            .await
+            .expect("permissions endpoint should succeed")
+            .into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(VARY)
+                .unwrap(),
+            "Authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissions_route_returns_401_without_authentication() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (storage, _dir, _user_id) = storage_with_user(UserRole::Administrator).await;
+        let sessions = Arc::new(crate::auth::session::SessionManager::new());
+        let app = axum::Router::new()
+            .route("/v1/permissions", axum::routing::get(get_permissions))
+            .layer(axum::middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+            .layer(Extension(sessions))
+            .layer(Extension(storage))
+            .layer(Extension(Arc::new(RbacConfig::default())));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/permissions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

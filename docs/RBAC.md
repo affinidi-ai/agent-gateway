@@ -36,6 +36,19 @@ There is no `role` field, wrapper object, or granted-key array. The dashboard co
 directly. The optional/public permission path returns the same shape with unavailable permissions
 set to `false` when no authenticated user can be resolved.
 
+For a session login the map reflects the user's role. When the caller authenticated with a personal
+access token (`agpat_`), a key is `true` only when the owner's role grants the feature and the
+token's feature scopes include it. This matches the feature-gated routes, which check the same
+intersection. A token created without feature scopes reports the owner's full role. Some routes
+authorize on the owner's role only and never read the token's feature scopes, so a token is limited
+there only by its owner's role: user management (`/v1/users`), settings writes, `sign-jwt`, backup
+and restore, storage export, and the JWT verification strategy create, update and delete routes.
+For those routes the map can show `false` for a feature the route still accepts. Resource patterns
+limit which resource ids a token can reach, not which features it holds, so they do not change the
+map: a resource-scoped token is still refused on unscoped writes even when the map says `true`.
+The response carries `Cache-Control: no-store` and `Vary: Authorization` because its body depends on
+the caller's credential.
+
 [`get_permissions`](../src/auth_manager/permissions.rs) defines the frontend-exposed key set. It is
 not an enumeration of every backend `Feature`: route-only capabilities can be enforced without
 appearing in this response. The response currently also includes `departments.*` aliases for legacy
