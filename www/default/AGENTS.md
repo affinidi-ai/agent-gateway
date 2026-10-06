@@ -190,14 +190,12 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
 
 - The **Governance Audit** category (`audit`) is offered in the Add and Edit integration
   category selects only to users with `audit.view` (`selectableCategories` in
-  `utils/auditIntegrations.ts`), and only for Stream and Webhook
-  (`AUDIT_INTEGRATION_TYPES`, which the gateway enforces too).
-- In the Add wizard, choosing it narrows the type select to those two (`selectableTypes`)
-  and moves Email or Slack onto Stream. The Edit page, whose type is fixed, doesn't offer
-  it to Email or Slack integrations.
+  `utils/auditIntegrations.ts`), for every integration type: Email and Slack are allowed
+  and send one message per record. Choosing it never changes the selected type.
 - Choosing it shows the shared **Governance Audit** card
   (`components/integrations/AuditIntegrationCard.tsx`, `integration-audit-card`) at the
-  top of the right column. For Stream and Webhook, the card's **Use audit record
+  top of the right column. For Stream and Webhook (`AUDIT_PAYLOAD_TYPES`, the types with a
+  JSON payload), the card's **Use audit record
   template** action (`integration-audit-template-button`) replaces the payload with the
   audit template (routing fields plus `record: ${AUDIT_RECORD}`), which is the `audit`
   category's Stream/Webhook sample (see [Starting content](#starting-content)).
@@ -229,6 +227,12 @@ The Audit Log header shows `audit-forward-button` beside Refresh for users with
   variables plus the category's own), so a sample only uses variables that category can
   substitute. `audit` keeps its curated full-record JSON payload, and Email and Slack
   leave out `AUDIT_RECORD` and `AUDIT_VP_JWT`.
+- Every sample leads with `appliance_id: ${APPLIANCE_ID}`. The backend fills it on every
+  delivery from the **Appliance ID** in Settings › System Settings (`appliance_id`,
+  `settings-appliance-id-input`, e.g. the appliance's Agent Watch id), never from event or
+  caller values, and leaves it unfilled while none is set. It is never the appliance DID
+  and is independent of any Kafka topic name. `GET /integrations/runtime-variables`
+  returns the set value as its `example`, and saving settings clears the cached catalogue.
 - The Add wizard and Edit page apply it through `hooks/useIntegrationSamples.ts`. When the
   category changes, each type's content that is empty or still the previous category's
   sample (compared ignoring key order, since the gateway stores payloads with keys sorted)

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::config::GatewayConfig;
-use crate::integrations::audit_integration_triggers::{AUDIT_CATEGORY, AUDIT_INTEGRATION_TYPES, is_audit_integration};
+use crate::integrations::audit_integration_triggers::{AUDIT_CATEGORY, is_audit_integration};
 use crate::storage::{Integration, IntegrationStorage};
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
 
@@ -118,22 +118,6 @@ fn ensure_audit_integration_is_global(
         return Err((
             StatusCode::BAD_REQUEST,
             "Governance audit integrations are appliance-wide and cannot belong to a tenant".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Every write to the VP Audit Log becomes a delivery, far more than Email or
-/// Slack can carry, and the records hold admin-only evidence, so audit
-/// integrations are Stream or Webhook only.
-fn ensure_audit_integration_type(
-    category: Option<&str>,
-    integration_type: &str,
-) -> Result<(), (StatusCode, String)> {
-    if category == Some(AUDIT_CATEGORY) && !AUDIT_INTEGRATION_TYPES.contains(&integration_type) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Governance audit integrations must be of type {}", AUDIT_INTEGRATION_TYPES.join(" or ")),
         ));
     }
     Ok(())
@@ -272,7 +256,6 @@ pub async fn create_notifier(
     req.tenant_id = tenant_for_create(req.tenant_id.take(), pat.is_some(), tenant_context(&context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     ensure_audit_integration_is_global(req.category.as_deref(), req.tenant_id.as_deref())?;
-    ensure_audit_integration_type(req.category.as_deref(), &req.integration_type)?;
     // Validate name
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Integration name is required".to_string()));
@@ -446,7 +429,6 @@ pub async fn update_notifier(
             .await?;
     }
     ensure_audit_integration_is_global(req.category.as_deref(), existing.tenant_id.as_deref())?;
-    ensure_audit_integration_type(req.category.as_deref(), &req.integration_type)?;
 
     // Create updated integration
     let now = chrono::Utc::now().to_rfc3339();
@@ -919,24 +901,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_integrations_are_stream_or_webhook_only() {
+    async fn audit_integrations_accept_every_integration_type() {
         let f = fixture().await;
-        for (integration_type, expected) in
-            [("email", Err(StatusCode::BAD_REQUEST)), ("slack", Err(StatusCode::BAD_REQUEST)), ("webhook", Ok(()))]
-        {
+        for integration_type in ["stream", "webhook", "email", "slack"] {
             let mut typed = request("audit", None);
             typed.integration_type = integration_type.to_string();
             let created = f
                 .create(Some(ADMIN), None, f.guard(), typed)
                 .await
                 .map(|_| ());
-            assert_eq!(created, expected, "{integration_type}");
+            assert_eq!(created, Ok(()), "{integration_type}");
         }
-        assert_eq!(f.stored().await.len(), 1, "only the webhook was stored");
+        assert_eq!(f.stored().await.len(), 4);
     }
 
     #[tokio::test]
-    async fn a_slack_integration_cannot_move_into_the_audit_category() {
+    async fn a_slack_integration_can_move_into_the_audit_category() {
         let f = fixture().await;
         let mut slack = f.seed("general").await;
         slack.integration_type = "slack".to_string();
@@ -948,7 +928,7 @@ mod tests {
         assert_eq!(
             f.update(ADMIN, &slack, "audit")
                 .await,
-            StatusCode::BAD_REQUEST
+            StatusCode::OK
         );
     }
 

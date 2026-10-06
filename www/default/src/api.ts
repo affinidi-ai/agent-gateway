@@ -332,6 +332,7 @@ class APIClient {
         trust_checks: false,
         identity: false,
       },
+      appliance_id: backendSettings.appliance_id || '',
       expose_user_identity_downstream: backendSettings.expose_user_identity_downstream || false,
     };
   }
@@ -404,6 +405,10 @@ class APIClient {
       backendSettings.audit_categories = settings.audit_categories;
     }
 
+    if (settings.appliance_id !== undefined) {
+      backendSettings.appliance_id = settings.appliance_id;
+    }
+
     if (settings.expose_user_identity_downstream !== undefined) {
       backendSettings.expose_user_identity_downstream = settings.expose_user_identity_downstream;
     }
@@ -449,6 +454,7 @@ class APIClient {
           trust_checks: false,
           identity: false,
         },
+        appliance_id: backendSettings.appliance_id || '',
         expose_user_identity_downstream: backendSettings.expose_user_identity_downstream || false,
       };
     } catch {

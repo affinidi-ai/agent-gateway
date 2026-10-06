@@ -140,11 +140,9 @@ const EditIntegrationPage: React.FC = () => {
     content: '{}',
     status: 'active',
   });
-  // The type is fixed once created, so an Email or Slack integration is never
-  // offered the Stream/Webhook-only audit category.
   const categories = useMemo(
-    () => selectableCategories(integrationConfig?.categories ?? [], canViewAudit, formData.type),
-    [integrationConfig, canViewAudit, formData.type]
+    () => selectableCategories(integrationConfig?.categories ?? [], canViewAudit),
+    [integrationConfig, canViewAudit]
   );
 
   // Email-specific state

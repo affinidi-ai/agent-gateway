@@ -111,6 +111,8 @@ pub struct UpdateSettingsRequest {
     pub prometheus_auth_password: Option<String>,
     pub audit_enabled: Option<bool>,
     pub audit_categories: Option<crate::storage::settings_store::AuditCategories>,
+    /// Id that fills `${APPLIANCE_ID}`; empty leaves the variable unfilled.
+    pub appliance_id: Option<String>,
 }
 
 /// Update settings
@@ -202,6 +204,11 @@ pub async fn update_settings(
     }
     if let Some(v) = req.audit_categories {
         settings.audit_categories = v;
+    }
+    if let Some(appliance_id) = req.appliance_id {
+        settings.appliance_id = appliance_id
+            .trim()
+            .to_string();
     }
 
     // Validate and update settings

@@ -103,6 +103,33 @@ pub struct DashboardSettings {
     /// Which event categories are written to the VP audit log
     #[serde(default)]
     pub audit_categories: AuditCategories,
+
+    /// Operator-set id that fills `${APPLIANCE_ID}` in integration templates,
+    /// e.g. the appliance's id in Agent Watch. Empty leaves the variable unfilled.
+    #[serde(default)]
+    pub appliance_id: String,
+}
+
+/// Longest accepted `appliance_id`.
+pub const APPLIANCE_ID_MAX_LEN: usize = 256;
+
+/// Whether `id` may be used as an `appliance_id`: printable ASCII without
+/// quotes, backslashes, braces or whitespace, so it substitutes safely into
+/// JSON and text templates. DIDs, UUIDs and slugs all qualify.
+pub fn is_valid_appliance_id(id: &str) -> bool {
+    id.len() <= APPLIANCE_ID_MAX_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\\' | b'{' | b'}' | b'$'))
+}
+
+/// The operator-set appliance id from the global settings store, read under
+/// the lock without cloning the settings. `None` when unset or before the
+/// store is registered.
+pub fn global_appliance_id_override() -> Option<String> {
+    GLOBAL_SETTINGS
+        .get()
+        .and_then(|s| s.appliance_id_override())
 }
 
 fn default_badge_threshold_minutes() -> u64 {
@@ -164,6 +191,7 @@ impl Default for DashboardSettings {
             prometheus_auth_password_hash: String::new(),
             audit_enabled: false,
             audit_categories: AuditCategories::default(),
+            appliance_id: String::new(),
         }
     }
 }
@@ -372,6 +400,12 @@ impl SettingsStore {
             anyhow::bail!("Badge threshold must be at least 1 minute");
         }
 
+        if !is_valid_appliance_id(&new_settings.appliance_id) {
+            anyhow::bail!(
+                "Appliance ID must be at most {APPLIANCE_ID_MAX_LEN} printable characters without spaces, quotes, backslashes, braces or $"
+            );
+        }
+
         if new_settings.metrics_retention_minutes < 1 || new_settings.metrics_retention_minutes > 10080 {
             anyhow::bail!("Metrics retention must be between 1 and 10,080 minutes (7 days)");
         }
@@ -381,6 +415,13 @@ impl SettingsStore {
         *current = new_settings;
 
         Ok(())
+    }
+
+    /// The operator-set appliance id, or `None` when it is empty.
+    pub fn appliance_id_override(&self) -> Option<String> {
+        let settings = self.settings.read().unwrap();
+        let id = settings.appliance_id.trim();
+        (!id.is_empty()).then(|| id.to_string())
     }
 
     /// Get metrics retention minutes
@@ -588,6 +629,7 @@ impl UserSettingsStore {
             audit_categories: system
                 .audit_categories
                 .clone(),
+            appliance_id: system.appliance_id.clone(),
         }
     }
 
@@ -621,6 +663,59 @@ mod tests {
         let settings = DashboardSettings::default();
         assert_eq!(settings.badge_threshold_minutes, 5);
         assert_eq!(settings.metrics_retention_minutes, 360);
+        assert!(
+            settings
+                .appliance_id
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn appliance_id_accepts_dids_uuids_and_slugs() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        for id in ["", "did:web:as.example.com%3A8443", "7f3c2a1e-9b4d-4c8e-a1f2-3b4c5d6e7f80", "aw-appliance_42.eu"] {
+            let settings = DashboardSettings {
+                appliance_id: id.to_string(),
+                ..DashboardSettings::default()
+            };
+            assert!(store.update(settings).is_ok(), "{id} must be accepted");
+        }
+    }
+
+    #[test]
+    fn appliance_id_rejects_values_that_break_templates() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        for id in
+            ["has space", "quote\"d", "back\\slash", "${OTHER}", "line\nbreak", &"a".repeat(APPLIANCE_ID_MAX_LEN + 1)]
+        {
+            let settings = DashboardSettings {
+                appliance_id: id.to_string(),
+                ..DashboardSettings::default()
+            };
+            assert!(
+                store
+                    .update(settings)
+                    .is_err(),
+                "{id} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn appliance_id_override_is_none_when_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        assert_eq!(store.appliance_id_override(), None);
+
+        store
+            .update(DashboardSettings {
+                appliance_id: "aw-appliance-42".to_string(),
+                ..DashboardSettings::default()
+            })
+            .unwrap();
+        assert_eq!(store.appliance_id_override(), Some("aw-appliance-42".to_string()));
     }
 
     #[test]

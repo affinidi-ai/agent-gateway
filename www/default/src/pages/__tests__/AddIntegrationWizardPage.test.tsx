@@ -69,7 +69,7 @@ const RUNTIME_VARIABLES = {
       category: 'general',
       label: 'General',
       description: 'General',
-      variables: ['EVENT_TYPE', 'TIMESTAMP'].map(name => variable(name, 'general')),
+      variables: ['APPLIANCE_ID', 'EVENT_TYPE', 'TIMESTAMP'].map(name => variable(name, 'general')),
     },
     {
       category: 'user',
@@ -88,13 +88,18 @@ const RUNTIME_VARIABLES = {
   ],
 };
 
-const GENERAL_PAYLOAD = { event_type: '${EVENT_TYPE}', timestamp: '${TIMESTAMP}' };
+const GENERAL_PAYLOAD = {
+  appliance_id: '${APPLIANCE_ID}',
+  event_type: '${EVENT_TYPE}',
+  timestamp: '${TIMESTAMP}',
+};
 const USER_PAYLOAD = {
   ...GENERAL_PAYLOAD,
   user: { user_id: '${USER_ID}', username: '${USERNAME}' },
 };
 
 const AUDIT_TEMPLATE = {
+  appliance_id: '${APPLIANCE_ID}',
   event_type: '${EVENT_TYPE}',
   category: '${AUDIT_CATEGORY}',
   timestamp: '${TIMESTAMP}',
@@ -223,14 +228,16 @@ describe('AddIntegrationWizardPage category samples', () => {
 
     await waitFor(() =>
       expect(fieldValue('body')).toBe(
-        'EVENT_TYPE: ${EVENT_TYPE}\nTIMESTAMP: ${TIMESTAMP}\n\nUser Management\nUSER_ID: ${USER_ID}\nUSERNAME: ${USERNAME}'
+        'APPLIANCE_ID: ${APPLIANCE_ID}\nEVENT_TYPE: ${EVENT_TYPE}\nTIMESTAMP: ${TIMESTAMP}\n\nUser Management\nUSER_ID: ${USER_ID}\nUSERNAME: ${USERNAME}'
       )
     );
     expect(fieldValue('subject')).toBe('${EVENT_TYPE}');
 
     fireEvent.change(select, { target: { value: 'general' } });
     await waitFor(() =>
-      expect(fieldValue('body')).toBe('EVENT_TYPE: ${EVENT_TYPE}\nTIMESTAMP: ${TIMESTAMP}')
+      expect(fieldValue('body')).toBe(
+        'APPLIANCE_ID: ${APPLIANCE_ID}\nEVENT_TYPE: ${EVENT_TYPE}\nTIMESTAMP: ${TIMESTAMP}'
+      )
     );
   });
 
@@ -259,19 +266,18 @@ describe('AddIntegrationWizardPage category samples', () => {
     expect(payloadTemplate()).toEqual(AUDIT_TEMPLATE);
   });
 
-  it('offers only Stream and Webhook for Governance Audit and moves Email onto Stream', async () => {
+  it('keeps Email for Governance Audit and offers every type', async () => {
     renderWizard('?category=general&type=email');
     const select = await categorySelect('general');
     const typeSelect = screen.getByLabelText(/Integration Type/) as HTMLSelectElement;
+    const allTypes = Array.from(typeSelect.options).map(option => option.value);
     expect(typeSelect.value).toBe('email');
 
     fireEvent.change(select, { target: { value: 'audit' } });
-    await waitFor(() => expect(typeSelect.value).toBe('stream'));
-    expect(Array.from(typeSelect.options).map(option => option.value)).toEqual([
-      'stream',
-      'webhook',
-    ]);
-    await expectPayload(AUDIT_TEMPLATE);
+    expect(await screen.findByTestId('integration-audit-card')).toBeInTheDocument();
+    expect(typeSelect.value).toBe('email');
+    expect(Array.from(typeSelect.options).map(option => option.value)).toEqual(allTypes);
+    expect(screen.queryByTestId('integration-audit-template-button')).not.toBeInTheDocument();
   });
 
   it('says so when the requested category is unavailable instead of silently switching', async () => {
