@@ -1,0 +1,21 @@
+branch: cli-browser-login
+changes:
+  added:
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Add browser sign-in for the fabric CLI
+      description: The fabric CLI can now sign in through the browser using passkey or SAML. A confirmation page asks the user to allow the CLI before a one-time code is issued, and the code is exchanged over a PKCE-protected back channel so the session token never appears in a URL.
+    - timestamp: '2026-10-06T00:00:01.000Z'
+      title: Return to the requested page after dashboard sign-in
+      description: The login page and SAML sign-in now honor a same-origin next target, so users land back on the page that asked them to sign in.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-06T00:00:02.000Z'
+      title: Harden CLI login requests
+      description: CLI login rejects ports below 1024, checks PKCE challenge and verifier lengths, caps pending codes, and sends no-store headers on responses that carry a code or token. A code is issued only after the signed-in user approves on a confirmation page, through a same-origin JSON request.
+  breaking: []
+  internal:
+    - timestamp: '2026-10-06T00:00:03.000Z'
+      title: Add tests and docs for CLI browser login
+      description: Adds unit tests for the code store, the authorize, consent and exchange endpoints and the safe redirect check, and documents the flow in the capabilities guide.

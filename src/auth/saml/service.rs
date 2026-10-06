@@ -136,8 +136,11 @@ impl SamlService {
         Ok(metadata)
     }
 
-    /// Create an authentication request (for SP-initiated flow)
-    pub fn create_authn_request(&self) -> Result<String> {
+    /// Create an authentication request (for SP-initiated flow).
+    pub fn create_authn_request_with_relay_state(
+        &self,
+        relay_state: Option<&str>,
+    ) -> Result<String> {
         use uuid::Uuid;
 
         // Generate unique request ID and timestamp
@@ -183,7 +186,10 @@ impl SamlService {
         let encoded_url = urlencoding::encode(&encoded);
 
         // Create redirect URL
-        let redirect_url = format!("{}?SAMLRequest={}", self.config.idp_sso_url, encoded_url);
+        let mut redirect_url = format!("{}?SAMLRequest={}", self.config.idp_sso_url, encoded_url);
+        if let Some(relay) = relay_state {
+            redirect_url.push_str(&format!("&RelayState={}", urlencoding::encode(relay)));
+        }
 
         info!("Created SAML AuthnRequest (signed: {})", self.config.sign_requests);
         Ok(redirect_url)

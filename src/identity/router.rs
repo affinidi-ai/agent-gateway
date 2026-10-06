@@ -2184,7 +2184,14 @@ pub fn create_identity_api_router(
         },
     );
 
+    let cli_login_router = if let Some(sess_mgr) = session_manager_for_manager.as_ref() {
+        crate::auth::cli_login::cli_login_router(sess_mgr.clone())
+    } else {
+        Router::new()
+    };
+
     let mut app = Router::new()
+        .merge(cli_login_router)
         .merge(didwebvh_router)
         .merge(gateway_router)
         .merge(connection_point_router)

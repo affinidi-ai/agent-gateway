@@ -16,6 +16,23 @@ interface LoginPageProps {
   onLogin: () => void;
 }
 
+// Resolving against the origin also rejects backslash tricks like `/\evil.com`.
+function safeNextTarget(): string | null {
+  const next = new URLSearchParams(window.location.search).get('next');
+  if (!next || !next.startsWith('/') || next.startsWith('//')) {
+    return null;
+  }
+  try {
+    const resolved = new URL(next, window.location.origin);
+    if (resolved.origin === window.location.origin) {
+      return next;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 const COPY = {
   login: {
     heading: 'Sign in',
@@ -187,12 +204,20 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
 
     if (authMode === 'saml') {
       await new Promise(resolve => setTimeout(resolve, 100));
-      window.location.href = '/api/saml/login';
+      const next = safeNextTarget();
+      window.location.href = next
+        ? `/api/saml/login?next=${encodeURIComponent(next)}`
+        : '/api/saml/login';
       return;
     }
 
     try {
       await authenticateWithPasskey(username);
+      const next = safeNextTarget();
+      if (next) {
+        window.location.href = next;
+        return;
+      }
       onLogin();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');

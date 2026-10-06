@@ -1,6 +1,6 @@
 use axum::{
     Extension, Form, Json,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
 };
@@ -68,15 +68,43 @@ pub struct SamlUserInfo {
     pub role: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SamlLoginQuery {
+    pub next: Option<String>,
+}
+
+/// Rejects off-origin and protocol-relative targets and any character that could break out of the ACS markup.
+pub(crate) fn is_safe_relative_path(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    if lowered.contains("%2f") || lowered.contains("%5c") || path.contains('\\') {
+        return false;
+    }
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && path.len() <= 1024
+        && path.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'-' | b'_' | b'.' | b'/' | b'?' | b'&' | b'=' | b'%' | b'~' | b':' | b'+')
+        })
+}
+
 /// Initiate SAML login (SP-initiated flow)
 /// GET /saml/login
-pub async fn saml_login(State(saml_state): State<Arc<SamlState>>) -> Result<Redirect, StatusCode> {
+pub async fn saml_login(
+    State(saml_state): State<Arc<SamlState>>,
+    Query(query): Query<SamlLoginQuery>,
+) -> Result<Redirect, StatusCode> {
     info!("Initiating SAML login");
+
+    let relay_state = query
+        .next
+        .as_deref()
+        .filter(|next| is_safe_relative_path(next));
 
     // Create authentication request
     let authn_request = saml_state
         .saml_service
-        .create_authn_request()
+        .create_authn_request_with_relay_state(relay_state)
         .map_err(|e| {
             error!("Failed to create SAML authn request: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -207,23 +235,38 @@ pub async fn saml_acs(
 
     tracing::info!("Setting SAML session cookie");
 
+    let redirect_target = form
+        .relay_state
+        .as_deref()
+        .filter(|target| is_safe_relative_path(target))
+        .unwrap_or("/");
+
+    let redirect_target_js = serde_json::to_string(redirect_target).unwrap_or_else(|_| "\"/\"".to_string());
+    let redirect_target_attr = redirect_target
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+
     // Return HTML with cookie and redirect
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Login Successful</title>
-    <meta http-equiv="refresh" content="0;url=/">
+    <meta http-equiv="refresh" content="0;url={redirect_target_attr}">
     <script>
-        sessionStorage.setItem('session_token', '{}');
-        window.location.href = '/';
+        sessionStorage.setItem('session_token', '{token}');
+        window.location.href = {redirect_target_js};
     </script>
 </head>
 <body>
     <p>Login successful. Redirecting...</p>
 </body>
 </html>"#,
-        finalized_session.session_token
+        redirect_target_attr = redirect_target_attr,
+        redirect_target_js = redirect_target_js,
+        token = finalized_session.session_token
     );
 
     Ok((finalized_session.headers, Html(html)).into_response())
@@ -362,4 +405,32 @@ pub async fn saml_logout_generic(
     response_headers.insert(axum::http::header::SET_COOKIE, session_cookie);
 
     (response_headers, StatusCode::OK).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_relative_path_accepts_cli_authorize_target() {
+        assert!(is_safe_relative_path("/api/auth/cli/authorize?port=52111&state=st&challenge=ch"));
+        assert!(is_safe_relative_path("/"));
+    }
+
+    #[test]
+    fn safe_relative_path_rejects_off_origin_targets() {
+        assert!(!is_safe_relative_path("//evil.example"));
+        assert!(!is_safe_relative_path("https://evil.example"));
+        assert!(!is_safe_relative_path("/\\evil.example"));
+        assert!(!is_safe_relative_path("/%2fevil.example"));
+        assert!(!is_safe_relative_path("/%5Cevil.example"));
+        assert!(!is_safe_relative_path("evil.example"));
+    }
+
+    #[test]
+    fn safe_relative_path_rejects_markup_and_script_characters() {
+        assert!(!is_safe_relative_path("/a\"</script><script>alert(1)"));
+        assert!(!is_safe_relative_path("/a'b"));
+        assert!(!is_safe_relative_path("/a b"));
+    }
 }

@@ -378,6 +378,18 @@ After onboarding, payload capture lets you watch the traffic at every stage. See
 Everything is managed from a web dashboard, signed into with a passkey or, for enterprise
 deployments, SAML single sign-on.
 
+The `fabric` CLI signs in through the browser. It opens `/api/auth/cli/authorize` with a
+loopback port and a PKCE challenge. After the dashboard sign-in (passkey or SAML) the browser
+shows a confirmation page that names the signed-in user and the loopback port. Only when the
+user chooses Allow does the dashboard request a short-lived, single-use code and return it to
+`127.0.0.1`. Cancel issues nothing. The CLI redeems the code with its PKCE verifier at
+`/api/auth/cli/exchange`, so the session token never appears in a URL. The loopback port must
+be 1024 or higher, the challenge is a 43 character S256 value, and the verifier is 43 to 128
+characters as defined in RFC 7636.
+
+Known limitations: the login hands the CLI the browser's own session, and the code store is in
+memory so it works with one gateway instance.
+
 Surfaces are built on a canvas by dragging in elements. Adding a caller context element
 extracts the JWT claims a user presents to their agent from an identity provider such as
 Microsoft Entra ID or Okta. Adding a policy element then enforces a rule over those claims

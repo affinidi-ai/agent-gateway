@@ -1,0 +1,36 @@
+.page {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1.25rem;
+  background: #f8f9fa;
+  overflow-y: auto;
+}
+
+.details {
+  padding: 1rem;
+  margin-bottom: 1rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.75rem;
+  background: #fff;
+  color: #1f2937;
+  font-size: 0.875rem;
+}
+
+.details p {
+  margin: 0;
+}
+
+.details p + p {
+  margin-top: 0.5rem;
+}
+
+.note {
+  margin: 1rem 0 0;
+  text-align: center;
+  font-size: 0.75rem;
+  color: #6b7280;
+}
