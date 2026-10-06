@@ -62,7 +62,7 @@ beforeEach(() => {
 });
 
 describe('TrustRecorderEntryForm — Authority dropdown', () => {
-  it('renders authorities from the Authority register with their own description and issuer-derived entries with a "Via Issuer" prefix', () => {
+  it('renders authorities from the Authority register with their own description and Issuers with an "Issuer" prefix', () => {
     const authorities: Authority[] = [
       {
         id: 'auth-1',
@@ -96,11 +96,9 @@ describe('TrustRecorderEntryForm — Authority dropdown', () => {
     expect(acmeRoot).toBeInTheDocument();
     expect(within(acmeRoot).getByText('Acme root of trust')).toBeInTheDocument();
 
-    // Issuer-derived option: label = issuer name, description prefixed
-    // with `Via Issuer · ` for disambiguation (previously an <optgroup>).
     const acmeHr = screen.getByRole('option', { name: /Acme HR/ });
     expect(acmeHr).toBeInTheDocument();
-    expect(within(acmeHr).getByText(/^Via Issuer · /)).toBeInTheDocument();
+    expect(within(acmeHr).getByText('Issuer · HR issuer')).toBeInTheDocument();
 
     // Authority-register entries render before issuer-derived entries in
     // the flat option list.
@@ -111,7 +109,32 @@ describe('TrustRecorderEntryForm — Authority dropdown', () => {
     expect(issuerIdx).toBeGreaterThan(authIdx);
   });
 
-  it('de-duplicates a DID that appears in both Authorities and a Issuer.authority_did (Authority wins)', () => {
+  it("selecting an Issuer stores the Issuer's own DID, not the authority it registered under", () => {
+    const updateEntry = jest.fn();
+    const issuers: Issuer[] = [
+      {
+        id: 'issuer-1',
+        name: 'ABC Issuer',
+        did: 'did:webvh:scid:gateway.example:issuers:issuer-1',
+        authority_did: 'did:webvh:scid:gateway.example',
+        created_at: '2026-07-01T10:00:00Z',
+        updated_at: '2026-07-01T10:00:00Z',
+      },
+    ];
+
+    renderForm(baseProps({ issuers, updateEntry }));
+    fireEvent.click(screen.getByTestId('trust-recorder-entry-0-authority'));
+    fireEvent.click(screen.getByRole('option', { name: /ABC Issuer/ }));
+
+    expect(updateEntry).toHaveBeenCalledWith(0, {
+      authority_did: 'did:webvh:scid:gateway.example:issuers:issuer-1',
+    });
+    expect(updateEntry).not.toHaveBeenCalledWith(0, {
+      authority_did: 'did:webvh:scid:gateway.example',
+    });
+  });
+
+  it('de-duplicates a DID that is both an Authority and an Issuer (Authority wins)', () => {
     const sharedDid = 'did:web:shared.example';
     const authorities: Authority[] = [
       {
@@ -126,8 +149,7 @@ describe('TrustRecorderEntryForm — Authority dropdown', () => {
       {
         id: 'issuer-1',
         name: 'From Issuer',
-        did: 'did:web:hr.example',
-        authority_did: sharedDid,
+        did: sharedDid,
         created_at: '2026-07-01T10:00:00Z',
         updated_at: '2026-07-01T10:00:00Z',
       },
@@ -137,8 +159,6 @@ describe('TrustRecorderEntryForm — Authority dropdown', () => {
 
     fireEvent.click(screen.getByTestId('trust-recorder-entry-0-authority'));
 
-    // Only the Authority-register entry survives; the issuer that would
-    // otherwise contribute the same DID via `authority_did` is dropped.
     expect(screen.getByRole('option', { name: /From Authority Register/ })).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: /From Issuer/ })).toBeNull();
   });
@@ -361,5 +381,40 @@ describe('TrustRecorderEntryForm — Use surface Issuer toggle', () => {
     );
     fireEvent.click(screen.getByTestId('trust-recorder-entry-0-authority-mode-explicit-radio'));
     expect(updateEntry).toHaveBeenCalledWith(0, { authority_did: '' });
+  });
+});
+
+describe('TrustRecorderEntryForm — custom resource row', () => {
+  const entryWithResource = () =>
+    baseEntry({
+      custom_resources: [
+        {
+          action: 'is',
+          resource: 'paymentAgent',
+          entity_target: 'agent',
+          record_type: 'recognition',
+        },
+      ],
+    });
+
+  it('labels every column so action and resource align with the selects', () => {
+    renderForm(baseProps({ entry: entryWithResource() }));
+
+    expect(screen.getByLabelText('Action')).toHaveValue('is');
+    expect(screen.getByLabelText('Resource')).toHaveValue('paymentAgent');
+    expect(screen.getByLabelText('Entity Target')).toHaveValue('agent');
+    expect(screen.getByLabelText('Record Type')).toHaveValue('recognition');
+  });
+
+  it('lets the text inputs shrink and keeps the selects at a fixed width', () => {
+    renderForm(baseProps({ entry: entryWithResource() }));
+
+    const column = (field: string) =>
+      screen.getByTestId(`trust-recorder-entry-0-custom-resource-0-${field}-column`);
+
+    expect(column('action')).toHaveStyle({ flex: '1 1 0', minWidth: '0' });
+    expect(column('resource')).toHaveStyle({ flex: '1 1 0', minWidth: '0' });
+    expect(column('target')).toHaveStyle({ flex: '0 0 140px' });
+    expect(column('record-type')).toHaveStyle({ flex: '0 0 150px' });
   });
 });

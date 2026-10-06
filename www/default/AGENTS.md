@@ -141,6 +141,46 @@ modern catalog could be registered. Render them with the shared `WriteWarnings` 
 - The edit page shows the warnings from the latest save above the editor card, and clears
   them when the next save starts or another proxy opens.
 
+## Identities page
+
+`pages/IdentitiesPage.tsx` orchestrates. Its page-only parts live in
+`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: grouping and
+change-log logic in `identityGrouping.ts`, grouping, search, unnamed filter, and surface
+links in the `useIdentityGroups` hook, and the row parts `IdentityNameCell`,
+`IdentityOriginBadge`, and `IdentityChangeLog` (with its `IdentityChangeLogSection` card).
+
+- Rows are grouped by the backend's `group_key`, falling back to `did:<did>`. A managed
+  agent gets one row per surface, with the most recently active identity as primary and
+  an expandable change log of DID, credential, and claim changes. A caller gets one row
+  per DID.
+- Expansion state is a `Set`. Rows expand and collapse independently, and a deep link
+  adds to the set rather than replacing it.
+- The name cell shows the display name prominently, with the shortened DID in monospace
+  beside it and a copy button for the full DID. Without a name, the shortened DID and
+  copy button are the primary line, with no placeholder chip. While a caller name
+  lookup is pending (`display_name_pending`), a muted "resolving…" line sits above the
+  DID. A name conflict shows the DID as primary with a "name conflict" marker beside it.
+  A verified agent name renders as `local · host` with a verified marker, and a
+  caller's Agent Card name is marked unverified. A managed agent named from its own
+  target's Agent Card (`target_agent_card`) shows the name with no badge.
+- The unnamed filter and its count include only rows with no name and no pending lookup.
+- The **Origin** column holds the origin badge (Managed Agent or External Caller), or
+  LOCAL/REMOTE for records without an origin, plus a VERIFIED badge where it applies.
+- Managed rows show an origin badge, the live surface name linking to
+  `/surfaces/<surface_id>`, and the credential principal as a separate field.
+- When the backend sends none of the naming fields, the page renders as it did without
+  them: no name line, filter, or origin badge.
+
+| Element | Test id |
+| --- | --- |
+| Group row | `identities-row-<group_key>` |
+| Name, pending, conflict, verified, unverified | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`, `identities-name-unverified` |
+| Copy DID | `identities-copy-did-button` |
+| Origin badge | `identities-origin-<origin>` |
+| Surface link, credential principal | `identities-surface-link`, `identities-credential-principal` |
+| Unnamed filter | `identities-unnamed-filter-button` |
+| Change log | `identities-change-log`, `identities-change-log-toggle`, `identities-change-log-entry` |
+
 ## Remote gateway Issuer DIDs
 
 The **Remote** tab of a remote gateway starts with the **Issuer DIDs** card

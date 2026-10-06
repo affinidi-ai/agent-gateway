@@ -189,6 +189,30 @@ export interface Identity {
   uuid?: string;
   scid?: string;
   uai?: string;
+  origin?: IdentityOrigin;
+  display_name?: string;
+  display_name_source?: IdentityDisplayNameSource;
+  display_name_verified?: boolean;
+  display_name_pending?: boolean;
+  surface_id?: string;
+  surface_name?: string;
+  credential_principal?: CredentialPrincipal;
+  name_conflict?: boolean;
+  group_key?: string;
+}
+
+export type IdentityOrigin = 'managed' | 'external_caller';
+
+export type IdentityDisplayNameSource =
+  | 'surface_name'
+  | 'agent_name'
+  | 'agent_card'
+  | 'target_agent_card';
+
+export interface CredentialPrincipal {
+  kind: 'certificate' | 'api_key';
+  id: string;
+  name?: string;
 }
 
 // DID:webvh Types

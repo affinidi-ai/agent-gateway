@@ -1,9 +1,9 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import IdentitiesPage from '../IdentitiesPage';
 import { AppContext } from '../../context/AppContext';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
 
@@ -714,5 +714,184 @@ describe('IdentitiesPage', () => {
     expect(screen.queryAllByTitle(/View trust score/i)).toHaveLength(1);
     expect(screen.queryAllByTitle(/View version history/i)).toHaveLength(1);
     expect(screen.getByText('v2')).toBeInTheDocument();
+  });
+
+  describe('naming metadata', () => {
+    const statsWith = (identities: any[], channels: any[] = []) => ({
+      ...mockAppContext.getCurrentStats(),
+      identities,
+      channels,
+      total_identities: identities.length,
+    });
+
+    const renderWithStats = (identities: any[], channels: any[] = []) => {
+      const stats = statsWith(identities, channels);
+      const context = { ...mockAppContext, getCurrentStats: jest.fn(() => stats) };
+      return render(
+        <MemoryRouter initialEntries={['/identities']}>
+          <AppContext.Provider value={context}>
+            <Routes>
+              <Route path="/identities" element={<IdentitiesPage />} />
+              <Route path="/identities/:did" element={<IdentitiesPage />} />
+              <Route path="/surfaces/:id" element={<div data-testid="surface-builder" />} />
+            </Routes>
+          </AppContext.Provider>
+        </MemoryRouter>
+      );
+    };
+
+    const managedOld = {
+      did: 'did:key:managed-old',
+      identity_hash: 'hash-old',
+      created_at: '2026-01-01T00:00:00Z',
+      last_used_at: '2026-01-05T00:00:00Z',
+      is_local: true,
+      origin: 'managed',
+      display_name: 'OXYGEN',
+      display_name_source: 'surface_name',
+      surface_id: 'surface-1',
+      surface_name: 'OXYGEN',
+      credential_principal: { kind: 'certificate', id: 'cert-1', name: 'NITROGEN' },
+      group_key: 'surface:surface-1',
+    };
+    const managedNew = {
+      ...managedOld,
+      did: 'did:key:managed-new',
+      identity_hash: 'hash-new',
+      created_at: '2026-02-01T00:00:00Z',
+      last_used_at: '2026-02-05T00:00:00Z',
+    };
+    const callerNamed = {
+      did: 'did:web:caller.example',
+      identity_hash: 'hash-caller',
+      created_at: '2026-01-01T00:00:00Z',
+      is_local: false,
+      origin: 'external_caller',
+      display_name: 'acme.com/@billing',
+      display_name_source: 'agent_name',
+      display_name_verified: true,
+      group_key: 'did:did:web:caller.example',
+    };
+    const callerUnnamed = {
+      did: 'did:web:anon.example',
+      identity_hash: 'hash-anon',
+      created_at: '2026-01-01T00:00:00Z',
+      is_local: false,
+      origin: 'external_caller',
+      group_key: 'did:did:web:anon.example',
+    };
+    const callerPending = {
+      did: 'did:web:pending.example',
+      identity_hash: 'hash-pending',
+      created_at: '2026-01-01T00:00:00Z',
+      is_local: false,
+      origin: 'external_caller',
+      display_name_pending: true,
+      group_key: 'did:did:web:pending.example',
+    };
+
+    it('groups managed identities into one row with the latest as primary', async () => {
+      renderWithStats([managedOld, managedNew, callerNamed]);
+
+      const row = await screen.findByTestId('identities-row-surface:surface-1');
+      expect(within(row).getByTitle('did:key:managed-new')).toBeInTheDocument();
+      expect(screen.queryByTitle('did:key:managed-old')).not.toBeInTheDocument();
+      expect(within(row).getByTestId('identities-origin-managed')).toHaveTextContent(
+        'Managed Agent'
+      );
+      expect(within(row).getByTestId('identities-credential-principal')).toHaveTextContent(
+        'NITROGEN'
+      );
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(2);
+      expect(
+        within(screen.getByTestId('identities-row-did:did:web:caller.example')).getByTestId(
+          'identities-origin-external_caller'
+        )
+      ).toBeInTheDocument();
+    });
+
+    it('shows the change log of the surface group when expanded', async () => {
+      renderWithStats([managedOld, managedNew]);
+
+      fireEvent.click(await screen.findByTestId('identities-row-surface:surface-1'));
+      fireEvent.click(screen.getByTestId('identities-change-log-toggle'));
+
+      const entries = screen.getAllByTestId('identities-change-log-entry');
+      expect(entries).toHaveLength(1);
+      expect(within(entries[0]).getByTitle('did:key:managed-old')).toBeInTheDocument();
+    });
+
+    it('prefers the live surface name and deep links to the surface', async () => {
+      renderWithStats([managedNew], [{ config_id: 'surface-1', name: 'OXYGEN renamed' }]);
+
+      const link = await screen.findByTestId('identities-surface-link');
+      expect(link).toHaveTextContent('OXYGEN renamed');
+      expect(screen.getByTestId('identities-name')).toHaveTextContent('OXYGEN renamed');
+
+      fireEvent.click(link);
+      expect(await screen.findByTestId('surface-builder')).toBeInTheDocument();
+    });
+
+    it('filters to unnamed identities, excluding names still resolving', async () => {
+      renderWithStats([managedNew, callerNamed, callerUnnamed, callerPending]);
+
+      const filter = await screen.findByTestId('identities-unnamed-filter-button');
+      expect(filter).toHaveTextContent('Unnamed only (1)');
+      expect(filter).toHaveAttribute('aria-pressed', 'false');
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(4);
+      expect(
+        within(screen.getByTestId('identities-row-did:did:web:pending.example')).getByTestId(
+          'identities-name-pending'
+        )
+      ).toHaveTextContent('resolving…');
+
+      fireEvent.click(filter);
+
+      expect(filter).toHaveAttribute('aria-pressed', 'true');
+      const rows = screen.getAllByTestId(/^identities-row-/);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toHaveAttribute('data-testid', 'identities-row-did:did:web:anon.example');
+      expect(within(rows[0]).queryByTestId('identities-name')).not.toBeInTheDocument();
+      expect(within(rows[0]).getByTitle('did:web:anon.example')).toBeInTheDocument();
+      expect(within(rows[0]).queryByText('No name')).not.toBeInTheDocument();
+
+      fireEvent.click(filter);
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(4);
+    });
+
+    it('looks as before when the backend sends no naming fields', async () => {
+      renderWithStats([
+        { did: 'did:key:legacy-a', identity_hash: 'a', created_at: '2026-01-01T00:00:00Z' },
+        { did: 'did:key:legacy-b', identity_hash: 'b', created_at: '2026-01-02T00:00:00Z' },
+      ]);
+
+      expect(await screen.findAllByTestId(/^identities-row-/)).toHaveLength(2);
+      expect(screen.getByRole('columnheader', { name: 'DID' })).toBeInTheDocument();
+      expect(screen.getByRole('columnheader', { name: 'Origin' })).toBeInTheDocument();
+      expect(screen.queryByRole('columnheader', { name: 'Status' })).not.toBeInTheDocument();
+      expect(screen.queryByTestId('identities-unnamed-filter-button')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
+      expect(screen.queryByText('No name')).not.toBeInTheDocument();
+      expect(screen.queryByTestId(/^identities-origin-/)).not.toBeInTheDocument();
+    });
+
+    it('expands rows independently', async () => {
+      renderWithStats([managedNew, callerNamed]);
+
+      const rowA = await screen.findByTestId('identities-row-surface:surface-1');
+      const rowB = screen.getByTestId('identities-row-did:did:web:caller.example');
+
+      fireEvent.click(rowA);
+      fireEvent.click(rowB);
+      expect(rowA).toHaveAttribute('aria-expanded', 'true');
+      expect(rowB).toHaveAttribute('aria-expanded', 'true');
+      expect(screen.getAllByText('Identity Hash:')).toHaveLength(2);
+
+      fireEvent.click(rowA);
+      expect(rowA).toHaveAttribute('aria-expanded', 'false');
+      expect(rowB).toHaveAttribute('aria-expanded', 'true');
+      expect(screen.getAllByText('Identity Hash:')).toHaveLength(1);
+      expect(screen.getByText('hash-caller')).toBeInTheDocument();
+    });
   });
 });
