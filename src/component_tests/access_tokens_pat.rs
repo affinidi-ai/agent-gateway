@@ -376,6 +376,51 @@ async fn token_info_reports_a_scoped_pats_id_and_scopes() {
 }
 
 #[tokio::test]
+async fn token_info_serves_a_tenant_scoped_pat_without_exposing_secrets() {
+    let store = new_store().await;
+    let (id, secret) = create_token(
+        &store,
+        Some("TENANT:${x-external-account}:gateways:.*"),
+        vec![RequiredHeader {
+            name: "x-external-account".to_string(),
+            pattern: "tenant-a".to_string(),
+        }],
+    )
+    .await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/token-info")
+                .header("Authorization", format!("Bearer {secret}"))
+                .header("x-external-account", "tenant-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json body");
+    assert_eq!(body["token_id"], id);
+    assert_eq!(body["user_id"], "user-1");
+    assert!(!text.contains(&secret));
+    assert!(!text.contains(&hash_secret(&secret)));
+    assert!(body.get("token").is_none());
+    assert!(
+        body.get("token_hash")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn token_info_reports_null_scopes_for_an_unrestricted_pat() {
     let store = new_store().await;
     let (id, secret) = create_token(&store, None, Vec::new()).await;

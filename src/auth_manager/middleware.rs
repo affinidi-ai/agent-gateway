@@ -744,6 +744,7 @@ mod tests {
             .route("/v1/users/u1", get(ok_handler))
             .route("/v1/profile", get(ok_handler))
             .route("/v1/permissions", get(ok_handler))
+            .route("/v1/token-info", get(ok_handler))
             .route("/v1/identities", get(ok_handler))
             .route("/v1/identities/id1/policy", get(ok_handler))
             .route("/v1/secrets", get(ok_handler))
@@ -1001,6 +1002,7 @@ mod tests {
             "/v1/users/u1",
             "/v1/profile",
             "/v1/permissions",
+            "/v1/token-info",
             "/v1/identities",
             "/v1/identities/id1/policy",
             "/v1/secrets",
