@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_messaging_sdk::profiles::ATMProfile;
 use affinidi_tdk_common::TDKSharedState;
-use highway::HighwayHash;
 
 use super::client::DIDCommClient;
 
@@ -33,17 +33,13 @@ pub async fn cache_did_document_in_tdk_state(
     did: &str,
     did_document: serde_json::Value,
 ) -> Result<(), String> {
-    let cache = tdk_state
-        .did_resolver()
-        .get_cache();
-
-    let did_hash = highway::HighwayHasher::default().hash128(did.as_bytes());
-
     let document: affinidi_did_common::Document =
         serde_json::from_value(did_document).map_err(|e| format!("Failed to parse DID document: {:?}", e))?;
 
-    cache
-        .insert(did_hash, document)
+    tdk_state
+        .did_resolver()
+        .get_cache()
+        .insert(DIDCacheClient::hash_did(did), document)
         .await;
 
     Ok(())

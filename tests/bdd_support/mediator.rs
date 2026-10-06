@@ -105,11 +105,9 @@ impl ScenarioDockerMediator {
 
         generate_mediator_config(&relative_dir, port.number, &label).await?;
 
-        // v0.17.0 mediator-setup writes `mediator_did` into `conf/mediator.toml`
-        // and the resolved DID document into the last JSONL entry of
-        // `conf/did.jsonl` (`.state` field). Matches the pattern main uses in
-        // its own `tests/g2g_bdd/harness/mediator.rs` — we're aligning our
-        // harness on that so the merged script Just Works.
+        // mediator-setup writes `mediator_did` into `conf/mediator.toml` and the
+        // resolved DID document into the last JSONL entry of `conf/did.jsonl`
+        // (`.state` field).
         let mediator_toml_path = temp_dir
             .path()
             .join("conf")

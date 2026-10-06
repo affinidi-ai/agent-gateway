@@ -21,7 +21,7 @@
 #                            other containers piggyback on the mediator's
 #                            netns via `network_mode: container:<mediator>`
 #                            (they can't publish their own ports in that mode).
-#   MEDIATOR_VERSION         Mediator image tag (default: v0.18.0)
+#   MEDIATOR_VERSION         Mediator image tag (default: v0.33.1)
 #   VALKEY_VERSION           Valkey image tag (default: 8.1.4)
 
 set -euo pipefail
@@ -31,7 +31,7 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 127
 fi
 
-MEDIATOR_VERSION="${MEDIATOR_VERSION:-v0.18.0}"
+MEDIATOR_VERSION="${MEDIATOR_VERSION:-v0.33.1}"
 VALKEY_VERSION="${VALKEY_VERSION:-8.1.4}"
 MEDIATOR_PORT="${G2G_MEDIATOR_PORT:-7037}"
 MEDIATOR_NAME="${G2G_MEDIATOR_NAME:-g2g-mediator}"
@@ -94,6 +94,18 @@ if [[ "${needs_regen}" -eq 1 ]]; then
     --admin generate \
     --listen-address "0.0.0.0:${MEDIATOR_PORT}" \
     2>&1 | tee mediator_config_output.txt
+
+  # A gateway deletes a fabric message only after processing it, so concurrent
+  # requests to one peer stay queued and a burst exceeds the mediator's default
+  # per-peer cap of 50. Raise it, staying below the default receive limit (200).
+  # Rewrite the file in place: replacing it (sed -i) leaves Docker Desktop bind
+  # mounts briefly serving the old, deleted file.
+  PATCHED_TOML="$(sed 's/^queued_send_messages_per_peer = .*/queued_send_messages_per_peer = "150"/' "${CONF_DIR}/mediator.toml")"
+  printf '%s\n' "${PATCHED_TOML}" > "${CONF_DIR}/mediator.toml"
+  if ! grep -q '^queued_send_messages_per_peer = "150"$' "${CONF_DIR}/mediator.toml"; then
+    echo "❌ ${CONF_DIR}/mediator.toml has no queued_send_messages_per_peer to raise" >&2
+    exit 1
+  fi
 
   # Ensure config files are accessible by the mediator container's non-root user.
   # In CI (running as root), mediator-setup writes root-owned files that the

@@ -30,6 +30,8 @@ DID_WEB_FROM_DID_WEBVH="${9}"
 BLOCK_ANONYMOUS_OUTER_ENVELOPE="${10}"
 USE_P256_KEY_SUITE="${11:-true}"
 ADMIN_DID="${12:-}"
+# Empty leaves the mediator's default per-peer queue cap in place.
+QUEUED_SEND_MESSAGES_PER_PEER="${13:-}"
 
 # ECR login — only needed for private ECR (*.dkr.ecr.*.amazonaws.com);
 # public.ecr.aws is pulled anonymously.
@@ -61,8 +63,15 @@ cd affinidi-messaging/conf
 # the existing DID/secrets and lets the script fall through to re-pull the new
 # image and restart. To rotate identity, wipe conf/ (or run mediator-setup
 # --force-reprovision) before redeploying.
+#
+# The conf/ mount hides the image's own atm-functions.lua, and the mediator loads
+# the mounted copy into Redis at start. Refresh it from the image on every
+# redeploy so the stored functions match the running mediator version.
 if [ -f mediator.toml ]; then
   echo "♻️  Existing mediator config found — skipping setup, preserving DID/secrets."
+  docker run --rm --entrypoint cat "$MEDIATOR_IMAGE" /app/conf/atm-functions.lua > atm-functions.lua.new
+  cat atm-functions.lua.new > atm-functions.lua
+  rm -f atm-functions.lua.new
 else
 RECIPE_PUBLIC_URL=""
 RECIPE_SAVE_DID_WEB=""
@@ -116,11 +125,13 @@ fi  # end idempotent setup guard
 
 # listen_address is always a wildcard bind (0.0.0.0:${MEDIATOR_PORT}), so
 # Routing 2.0 self-loopback delivery needs the public URL in local_endpoints.
-# Reconcile it on every run so existing configs are repaired without reprovisioning.
+# Reconcile it (and the per-peer queue cap, when given) on every run so existing
+# configs are repaired without reprovisioning.
 "${SCRIPT_DIR}/reconcile-mediator-config.sh" \
   mediator.toml \
   "${MEDIATOR_URL}" \
-  "${ADMIN_DID}"
+  "${ADMIN_DID}" \
+  "${QUEUED_SEND_MESSAGES_PER_PEER}"
 
 cd ..
 

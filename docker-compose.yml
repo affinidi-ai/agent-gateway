@@ -33,6 +33,9 @@
 # For a real deployment, override webauthn.rp_id, webauthn.external_origin, and
 # the did.domain in envs/docker/config/gateway.json with your public host.
 # Browser passkey login requires that WebAuthn origin to match the URL you open.
+# Also set `[did_cache] allow_private_hosts = false` in
+# envs/docker/config/config.toml: the generated dev config turns it on so DID
+# resolution can reach a localhost mediator.
 
 services:
   agent-gateway:

@@ -316,7 +316,7 @@ from.
 | [`state/`](src/state/) | Per-surface runtime state shared across handlers | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`protocols/`](src/protocols/) | Protocol-agnostic extension inspection, metadata injection, and header rules shared by A2A, MCP, and others | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`surface_context/`](src/surface_context/) | The types that become OPA policy input | [`POLICY.md`](docs/POLICY.md) |
-| [`egress.rs`](src/egress.rs) | The DNS-pinning SSRF guard used by every outbound sink | [`POLICY.md`](docs/POLICY.md) |
+| [`egress.rs`](src/egress.rs) | The DNS-pinning SSRF guard used by every outbound sink except DID resolution, which relies on the resolver's host policy | [`POLICY.md`](docs/POLICY.md), [DID resolution host policy](docs/POLICY.md#did-resolution-host-policy) |
 | [`http_client.rs`](src/http_client.rs) | Shared reqwest client defaults | Source only: [`src/http_client.rs`](src/http_client.rs) |
 | [`url_validation.rs`](src/url_validation.rs) | SSRF checks on operator-supplied URLs | [`POLICY.md`](docs/POLICY.md) |
 

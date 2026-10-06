@@ -5,7 +5,7 @@ source "$(dirname "$0")/_url.sh"
 
 # must contain trailing slash
 TARGET_DIR="${current_dir}/envs/mediator/"
-VERSION="v0.18.0"
+VERSION="v0.33.1"
 MEDIATOR_IMAGE="public.ecr.aws/affinidi/messaging-mediator:${VERSION}"
 MEDIATOR_PORT="7037"
 # Plain host:port — used for the prompt, the recipe public_url, and the healthchecker
@@ -22,6 +22,9 @@ DID_WEB_FROM_DID_WEBVH="true"
 BLOCK_ANONYMOUS_OUTER_ENVELOPE="false"
 USE_P256_KEY_SUITE="true"
 ADMIN_DID=""
+# A gateway keeps each fabric message queued until processed; the mediator's
+# default per-peer cap of 50 times out larger bursts to one peer gateway.
+QUEUED_SEND_MESSAGES_PER_PEER="150"
 
 # check if envs/mediator exists and ask for mediator domain if it doesn't exist
 if [ -d "${TARGET_DIR}" ]; then
@@ -61,7 +64,8 @@ echo "📦 Starting Affinidi Mediator..."
     "${DID_WEB_FROM_DID_WEBVH}" \
     "${BLOCK_ANONYMOUS_OUTER_ENVELOPE}" \
     "${USE_P256_KEY_SUITE}" \
-    "${ADMIN_DID}"
+    "${ADMIN_DID}" \
+    "${QUEUED_SEND_MESSAGES_PER_PEER}"
 
 echo "✅ Mediator setup done!"
 

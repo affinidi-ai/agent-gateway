@@ -678,6 +678,20 @@ pub async fn run_axum_proxy(
 
     crate::identity::credential_identity::initialize_pepper().await;
 
+    crate::gateways::did_cache::init_did_host_policy(
+        bootstrap_config
+            .did_cache
+            .allow_private_hosts,
+    );
+    if bootstrap_config
+        .did_cache
+        .allow_private_hosts
+    {
+        warn!(
+            "[did_cache] allow_private_hosts is enabled: did:web / did:webvh resolution may contact private-network hosts"
+        );
+    }
+
     // Initialise the process-wide shared DID resolver client (one TLS context
     // + connection pool instead of 7 separate ones — saves ~200-400 MB RSS).
     crate::gateways::did_cache::init_shared_resolver().await?;

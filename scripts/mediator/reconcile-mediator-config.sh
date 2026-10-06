@@ -4,15 +4,17 @@ set -euo pipefail
 config_path="${1:?mediator.toml path required}"
 mediator_url="${2:?mediator URL required}"
 admin_did="${3:-}"
+queued_send_messages_per_peer="${4:-}"
 
-upsert_server_setting() {
-  local key="$1"
-  local value="$2"
+upsert_setting() {
+  local section="$1"
+  local key="$2"
+  local value="$3"
   local temporary
   temporary="$(mktemp "${config_path}.XXXXXX")"
   cp -p "${config_path}" "${temporary}"
 
-  if awk -v key="${key}" -v value="${value}" '
+  if awk -v section="${section}" -v key="${key}" -v value="${value}" '
     BEGIN {
       single_quote = sprintf("%c", 39)
     }
@@ -57,18 +59,18 @@ upsert_server_setting() {
       next
     }
     /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
-      if (in_server) {
+      if (in_section) {
         write_setting()
       }
-      in_server = ($0 ~ /^[[:space:]]*\[server\][[:space:]]*$/)
-      if (in_server) {
-        found_server = 1
+      in_section = ($0 ~ "^[[:space:]]*\\[" section "\\][[:space:]]*$")
+      if (in_section) {
+        found_section = 1
       }
       print
       next
     }
     {
-      if (in_server && $0 ~ "^[[:space:]]*" key "[[:space:]]*=") {
+      if (in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=") {
         write_setting()
         remaining = array_balance(substr($0, index($0, "=") + 1))
         if (remaining < 0) {
@@ -84,10 +86,10 @@ upsert_server_setting() {
       if (consuming || malformed) {
         exit 2
       }
-      if (in_server) {
+      if (in_section) {
         write_setting()
       }
-      if (!found_server) {
+      if (!found_section) {
         exit 1
       }
     }
@@ -99,15 +101,21 @@ upsert_server_setting() {
     if [[ "${status}" -eq 2 ]]; then
       echo "❌ ${config_path} has a malformed multi-line ${key} value" >&2
     else
-      echo "❌ ${config_path} has no [server] section" >&2
+      echo "❌ ${config_path} has no [${section}] section" >&2
     fi
     exit 1
   fi
 
-  mv "${temporary}" "${config_path}"
+  # Rewrite in place: replacing the file leaves Docker Desktop bind mounts
+  # briefly serving the old, deleted copy to a mediator started right after.
+  cat "${temporary}" > "${config_path}"
+  rm -f "${temporary}"
 }
 
-upsert_server_setting "local_endpoints" "[\"${mediator_url}\"]"
+upsert_setting "server" "local_endpoints" "[\"${mediator_url}\"]"
 if [[ -n "${admin_did}" ]]; then
-  upsert_server_setting "admin_did" "\"did://${admin_did}\""
+  upsert_setting "server" "admin_did" "\"did://${admin_did}\""
+fi
+if [[ -n "${queued_send_messages_per_peer}" ]]; then
+  upsert_setting "limits" "queued_send_messages_per_peer" "\"${queued_send_messages_per_peer}\""
 fi
