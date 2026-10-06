@@ -1,0 +1,59 @@
+branch: feat/mediator-v0.33.1
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-05T13:57:17.000Z'
+      title: ⭐ Support DIDComm mediator v0.33.1 with the messaging SDK 0.30.1
+      description: >-
+        Upgrades affinidi-messaging-sdk 0.19 → 0.30.1, affinidi-messaging-didcomm 0.15.9,
+        affinidi-tdk-common 0.6.11, affinidi-did-common 0.4.3, affinidi-did-resolver-cache-sdk
+        0.8.39, trust-tasks-rs 0.24.8 and didwebvh-rs 0.7, the client side of mediator v0.33.1.
+        Trust Tasks sent to the mediator are now signed, and the ALLOW_ALL account ACL is built
+        through the trust-tasks builder. The local, E2E and EC2 mediator scripts run
+        `public.ecr.aws/affinidi/messaging-mediator:v0.33.1`.
+    - timestamp: '2026-10-05T13:57:17.000Z'
+      title: Refresh the mediator Lua functions from the image on every EC2 redeploy
+      description: >-
+        `scripts/mediator/user-data-v2.sh` keeps an existing mediator's DID and secrets on redeploy,
+        and the mounted `conf/` directory hid the image's `atm-functions.lua`. A host upgraded to a
+        newer mediator therefore loaded the old Redis functions, which left the per-peer queue limit
+        inert and `/readyz` reporting `degraded`. The redeploy now copies the file from the image
+        first.
+  fixed:
+    - timestamp: '2026-10-05T13:57:17.000Z'
+      title: Restart the connection point when the mediator reports its account missing
+      description: >-
+        After a gateway ping timed out, the account probe's `account.not_found` problem report went
+        back to the probe itself, never reached the listener, and the connection point stayed on a
+        dead mediator session. The ping handler now restarts that connection point's listener so it
+        re-authenticates and re-registers. A stored mediator DID document is also cached before the
+        messaging profile is built, so the profile always finds its mediator.
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-05T13:57:17.000Z'
+      title: ⭐ Refuse did:web and did:webvh on private hosts unless allow_private_hosts is on
+      description: >-
+        The DID resolver now refuses loopback, private-network, link-local, `localhost`, `*.local`
+        and `*.internal` hosts for did:web and did:webvh. This closes an SSRF path through
+        attacker-supplied DIDs and applies to the shared resolver and to every DIDComm client. A
+        deployment whose mediator or peer DIDs live on such hosts must set the startup-only
+        `[did_cache] allow_private_hosts = true`, which logs a warning at startup.
+        `scripts/_prepare.sh` turns it on for local stacks, and the BDD configs turn it on too.
+  internal:
+    - timestamp: '2026-10-05T13:57:17.000Z'
+      title: Raise the E2E and local mediators' per-peer queue cap to 150
+      description: >-
+        Mediator v0.27+ refuses a forward once one sender has 50 messages queued for one recipient,
+        and a gateway keeps each fabric message queued until it has processed it, so the 50-request
+        concurrency scenario timed out one request. `scripts/g2g-mediator.sh` and
+        `make mediator-up` now set `queued_send_messages_per_peer = "150"`.
+        `reconcile-mediator-config.sh` adds or replaces it under `[limits]` when `user-data-v2.sh`
+        is given the cap. Both scripts rewrite `mediator.toml` in place, so Docker Desktop bind
+        mounts do not serve the replaced copy. `docs/FABRIC.md` documents the cap for operators.
+    - timestamp: '2026-10-05T13:57:17.000Z'
+      title: Cover the DID host policy, ALLOW_ALL ACL and account-missing classification
+      description: >-
+        Adds unit tests for the `allow_private_hosts` default and parsing, for a public-only
+        resolver refusing `did:web:localhost` while a private-allowing one does not, for the ACL
+        builder output, and for recognising only the `account.not_found` problem report.
