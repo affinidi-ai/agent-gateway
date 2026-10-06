@@ -11,7 +11,9 @@ use tower::ServiceExt;
 use crate::access_tokens::store::hash_secret;
 use crate::access_tokens::{AccessToken, FsAccessTokenStore, generate_token};
 use crate::auth::session::SessionManager;
-use crate::auth_manager::middleware::{AuthGuardState, require_session_auth};
+use crate::auth::storage::{PasskeyStorage, UserData};
+use crate::auth::types::{UserRole, UserStatus};
+use crate::auth_manager::middleware::{AuthGuardState, RbacGuard, require_session_auth};
 use crate::auth_manager::pat::PatResourceScope;
 use crate::auth_manager::resource_scope::RequiredHeader;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource};
@@ -76,6 +78,9 @@ async fn create_token(
             last_used_at: None,
             expires_at: None,
             revoked_at: None,
+            rotation_generation: 0,
+            rotated_at: None,
+            rotated_by: None,
         })
         .await
         .expect("create token");
@@ -217,6 +222,96 @@ async fn revocation_invalidates_the_pat_immediately() {
         request(&app, "GET", "/v1/gateways/gateway-global", Some(&secret), None).await,
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn rotation_through_the_api_swaps_the_pat_secret_in_place() {
+    let store = new_store().await;
+    let (id, old_secret) = create_token(&store, None, Vec::new()).await;
+    let user_directory = tempfile::tempdir().expect("tempdir");
+    let users = Arc::new(
+        PasskeyStorage::new(
+            user_directory
+                .path()
+                .join("users")
+                .to_string_lossy()
+                .into_owned(),
+            user_directory
+                .path()
+                .join("avatars")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .expect("user storage"),
+    );
+    let now = Utc::now();
+    users
+        .save_user(&UserData {
+            user_id: "user-1".to_string(),
+            username: "user-1".to_string(),
+            passkeys: Vec::new(),
+            role: UserRole::Administrator,
+            status: UserStatus::Approved,
+            is_primary: false,
+            first_name: None,
+            last_name: None,
+            email: None,
+            department: None,
+            job_title: None,
+            avatar_path: None,
+            created_at: now,
+            updated_at: now,
+            last_logged_in: None,
+            saml_id: None,
+        })
+        .await
+        .expect("save user");
+    let rbac = Arc::new(crate::rbac::RbacConfig::default());
+    let auth =
+        AuthGuardState::new(Arc::new(SessionManager::new()), None, Arc::new(crate::terms::TermsManager::disabled()))
+            .with_pat_authenticator(Some(store.clone()));
+    let app = Router::new()
+        .route("/v1/gateways/{id}", get(gateway_get))
+        .merge(crate::access_tokens::router::create_access_tokens_router(
+            store.clone(),
+            rbac.clone(),
+            Arc::new(crate::tenancy::TenancyConfig::default()),
+            Some(RbacGuard::new(users, rbac)),
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_session_auth));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/access-tokens/{id}/rotate"))
+                .header("Authorization", format!("Bearer {old_secret}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(body["id"], id);
+    assert_eq!(body["name"], "component token");
+    let new_secret = body["token"]
+        .as_str()
+        .expect("new secret")
+        .to_string();
+    assert_ne!(new_secret, old_secret);
+
+    assert_eq!(
+        request(&app, "GET", "/v1/gateways/gateway-global", Some(&old_secret), None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(request(&app, "GET", "/v1/gateways/gateway-global", Some(&new_secret), None).await, StatusCode::OK);
 }
 
 #[tokio::test]

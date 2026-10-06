@@ -1,22 +1,25 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode, header};
 use axum::{Extension, Json};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext};
 use crate::auth_manager::resource_scope::{self, RequiredHeader};
+use crate::delegation_vault::audit::management_caller_context;
 use crate::rbac::RbacConfig;
 
-use super::store::{FsAccessTokenStore, hash_secret};
+use super::store::{FsAccessTokenStore, RotateOutcome, hash_secret};
 use super::{AccessToken, AccessTokenMeta, MAX_DELEGATION_DEPTH, generate_token};
 
 const MAX_EXPIRY_DAYS: u32 = 3650;
+
+const NO_STORE: [(HeaderName, &str); 1] = [(header::CACHE_CONTROL, "no-store")];
 
 fn normalize_pattern(pattern: Option<String>) -> Option<String> {
     pattern
@@ -177,7 +180,7 @@ pub async fn create_access_token(
     delegation: Option<Extension<PatDelegationContext>>,
     tenancy: Option<Extension<Arc<crate::tenancy::TenancyConfig>>>,
     Json(request): Json<CreateAccessTokenRequest>,
-) -> Result<(StatusCode, Json<CreateAccessTokenResponse>), (StatusCode, String)> {
+) -> Result<(StatusCode, [(HeaderName, &'static str); 1], Json<CreateAccessTokenResponse>), (StatusCode, String)> {
     let name = request.name.trim();
     if name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name is required".into()));
@@ -236,6 +239,9 @@ pub async fn create_access_token(
         last_used_at: None,
         expires_at,
         revoked_at: None,
+        rotation_generation: 0,
+        rotated_at: None,
+        rotated_by: None,
     };
     store
         .create(token.clone())
@@ -251,6 +257,7 @@ pub async fn create_access_token(
 
     Ok((
         StatusCode::CREATED,
+        NO_STORE,
         Json(CreateAccessTokenResponse {
             token: secret,
             meta: AccessTokenMeta::from_token(&token, now),
@@ -373,6 +380,89 @@ pub async fn revoke_access_token(
         Ok(Some(_)) => Ok(StatusCode::NO_CONTENT),
         Ok(None) => Err((StatusCode::NOT_FOUND, "access token not found".into())),
         Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("failed to revoke token: {error}"))),
+    }
+}
+
+pub async fn rotate_access_token(
+    State(store): State<Arc<FsAccessTokenStore>>,
+    Path(id): Path<String>,
+    caller: Option<Extension<AuthGuardOk>>,
+    delegation: Option<Extension<PatDelegationContext>>,
+) -> Result<([(HeaderName, &'static str); 1], Json<CreateAccessTokenResponse>), (StatusCode, String)> {
+    let caller_id = caller
+        .map(|Extension(auth)| auth.0)
+        .unwrap_or_default();
+    if caller_id.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "no authenticated caller".into()));
+    }
+    validate_target_authority(
+        &store,
+        delegation
+            .as_ref()
+            .map(|Extension(context)| context),
+        &id,
+    )?;
+    let Some(existing) = store.get(&id) else {
+        return Err((StatusCode::NOT_FOUND, "access token not found".into()));
+    };
+    // The response carries a working secret, so only the owner may rotate.
+    if existing.user_id != caller_id {
+        return Err((StatusCode::FORBIDDEN, "only the owner of an access token can rotate it".into()));
+    }
+    if existing.revoked_at.is_some() {
+        return Err((StatusCode::CONFLICT, "cannot rotate a revoked token".into()));
+    }
+    if existing.is_expired(Utc::now()) {
+        return Err((StatusCode::CONFLICT, "cannot rotate an expired token".into()));
+    }
+
+    let (_, secret) = generate_token();
+    match store
+        .rotate(&id, &caller_id, existing.rotation_generation, hash_secret(&secret))
+        .await
+    {
+        Ok(RotateOutcome::Rotated(token)) => {
+            let caller_context = management_caller_context(
+                Some(&caller_id),
+                delegation
+                    .as_ref()
+                    .map(|Extension(context)| context.token_id.as_str()),
+            );
+            info!(
+                target: "audit",
+                event = "access_token.rotated",
+                token_id = %id,
+                owner_user_id = %token.user_id,
+                caller_user_id = %caller_id,
+                caller_auth_method = caller_context
+                    .as_ref()
+                    .map_or("", |context| context.auth_method.as_str()),
+                caller_token_id = caller_context
+                    .as_ref()
+                    .and_then(|context| context.token_id.as_deref())
+                    .unwrap_or(""),
+                rotation_generation = token.rotation_generation,
+                "Rotated management access token"
+            );
+            Ok((
+                NO_STORE,
+                Json(CreateAccessTokenResponse {
+                    token: secret,
+                    meta: AccessTokenMeta::from_token(&token, Utc::now()),
+                }),
+            ))
+        }
+        Ok(RotateOutcome::NotFound) => Err((StatusCode::NOT_FOUND, "access token not found".into())),
+        Ok(RotateOutcome::Inactive) => {
+            Err((StatusCode::CONFLICT, "access token is inactive or its parent token is no longer valid".into()))
+        }
+        Ok(RotateOutcome::Stale) => {
+            Err((StatusCode::CONFLICT, "access token was rotated concurrently; fetch it and retry".into()))
+        }
+        Err(source) => {
+            error!(token_id = %id, error = %source, "Failed to rotate management access token");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to rotate access token".into()))
+        }
     }
 }
 
@@ -520,6 +610,9 @@ mod tests {
             last_used_at: None,
             expires_at: None,
             revoked_at: None,
+            rotation_generation: 0,
+            rotated_at: None,
+            rotated_by: None,
         }
     }
 
@@ -611,6 +704,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotate_returns_new_secret_and_keeps_token_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FsAccessTokenStore::new(directory.path())
+                .await
+                .unwrap(),
+        );
+        store
+            .create(token("root", None, 0))
+            .await
+            .unwrap();
+
+        let (headers, Json(response)) = rotate_access_token(
+            State(store.clone()),
+            Path("root".into()),
+            Some(Extension(AuthGuardOk("user-1".into()))),
+            delegation("root"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(headers[0].0, header::CACHE_CONTROL);
+        assert_eq!(headers[0].1, "no-store");
+        assert!(
+            response
+                .token
+                .starts_with(crate::access_tokens::TOKEN_PREFIX)
+        );
+        assert_ne!(response.token, "agpat_root");
+        assert_eq!(response.meta.id, "root");
+        assert_eq!(response.meta.name, "root");
+        assert_eq!(response.meta.scopes, vec!["secrets.view".to_string()]);
+        assert_eq!(
+            response
+                .meta
+                .rotation_generation,
+            1
+        );
+        assert_eq!(
+            response
+                .meta
+                .rotated_by
+                .as_deref(),
+            Some("user-1")
+        );
+        let stored = store.get("root").unwrap();
+        assert_eq!(stored.token_hash, hash_secret(&response.token));
+
+        let (_, Json(second)) = rotate_access_token(
+            State(store.clone()),
+            Path("root".into()),
+            Some(Extension(AuthGuardOk("user-1".into()))),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_ne!(second.token, response.token);
+        assert_eq!(
+            second
+                .meta
+                .rotation_generation,
+            2
+        );
+        assert_eq!(
+            second
+                .meta
+                .rotated_by
+                .as_deref(),
+            Some("user-1")
+        );
+        assert_eq!(
+            store
+                .get("root")
+                .unwrap()
+                .token_hash,
+            hash_secret(&second.token)
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_rejects_a_session_caller_who_does_not_own_the_token() {
+        use crate::auth_manager::pat::PatAuthenticator;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FsAccessTokenStore::new(directory.path())
+                .await
+                .unwrap(),
+        );
+        store
+            .create(token("root", None, 0))
+            .await
+            .unwrap();
+
+        let result = rotate_access_token(
+            State(store.clone()),
+            Path("root".into()),
+            Some(Extension(AuthGuardOk("user-2".into()))),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err((StatusCode::FORBIDDEN, message)) if message.contains("owner")));
+        let stored = store.get("root").unwrap();
+        assert_eq!(stored.token_hash, hash_secret("agpat_root"));
+        assert_eq!(stored.rotation_generation, 0);
+        assert_eq!(
+            store
+                .authenticate("agpat_root")
+                .await
+                .unwrap()
+                .user_id,
+            "user-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_requires_an_authenticated_caller() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FsAccessTokenStore::new(directory.path())
+                .await
+                .unwrap(),
+        );
+        store
+            .create(token("root", None, 0))
+            .await
+            .unwrap();
+
+        for caller in [None, Some(Extension(AuthGuardOk(String::new())))] {
+            assert!(matches!(
+                rotate_access_token(State(store.clone()), Path("root".into()), caller, None).await,
+                Err((StatusCode::UNAUTHORIZED, _))
+            ));
+        }
+        let stored = store.get("root").unwrap();
+        assert_eq!(stored.token_hash, hash_secret("agpat_root"));
+        assert_eq!(stored.rotation_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn rotate_rejects_missing_revoked_expired_and_unrelated_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FsAccessTokenStore::new(directory.path())
+                .await
+                .unwrap(),
+        );
+        store
+            .create(token("root", None, 0))
+            .await
+            .unwrap();
+        store
+            .create(token("unrelated", None, 0))
+            .await
+            .unwrap();
+        store
+            .create(token("revoked", None, 0))
+            .await
+            .unwrap();
+        store
+            .revoke("revoked")
+            .await
+            .unwrap();
+        let mut expired = token("expired", None, 0);
+        expired.expires_at = Some(Utc::now() - Duration::minutes(1));
+        store
+            .create(expired)
+            .await
+            .unwrap();
+
+        let rotate = |id: &str, caller: Option<Extension<PatDelegationContext>>| {
+            rotate_access_token(
+                State(store.clone()),
+                Path(id.into()),
+                Some(Extension(AuthGuardOk("user-1".into()))),
+                caller,
+            )
+        };
+
+        assert!(matches!(rotate("missing", None).await, Err((StatusCode::NOT_FOUND, _))));
+        assert!(
+            matches!(rotate("revoked", None).await, Err((StatusCode::CONFLICT, message)) if message.contains("revoked"))
+        );
+        assert!(
+            matches!(rotate("expired", None).await, Err((StatusCode::CONFLICT, message)) if message.contains("expired"))
+        );
+        assert!(matches!(rotate("unrelated", delegation("root")).await, Err((StatusCode::FORBIDDEN, _))));
+        assert_eq!(
+            store
+                .get("unrelated")
+                .unwrap()
+                .token_hash,
+            hash_secret("agpat_unrelated")
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_keeps_lineage_and_rejects_resource_scoped_callers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FsAccessTokenStore::new(directory.path())
+                .await
+                .unwrap(),
+        );
+        store
+            .create(token("root", None, 0))
+            .await
+            .unwrap();
+        store
+            .create(token("child", Some("root"), 1))
+            .await
+            .unwrap();
+
+        let (_, Json(rotated)) = rotate_access_token(
+            State(store.clone()),
+            Path("child".into()),
+            Some(Extension(AuthGuardOk("user-1".into()))),
+            delegation("root"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rotated
+                .meta
+                .parent_token_id
+                .as_deref(),
+            Some("root")
+        );
+        assert_eq!(rotated.meta.delegation_depth, 1);
+
+        let scoped = Some(Extension(PatDelegationContext {
+            token_id: "root".into(),
+            delegation_depth: 0,
+            resource_scoped: true,
+        }));
+        assert!(matches!(
+            rotate_access_token(
+                State(store.clone()),
+                Path("root".into()),
+                Some(Extension(AuthGuardOk("user-1".into()))),
+                scoped
+            )
+            .await,
+            Err((StatusCode::FORBIDDEN, _))
+        ));
+        assert_eq!(
+            store
+                .get("root")
+                .unwrap()
+                .rotation_generation,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn create_access_token_rejects_broad_tenant_selector_without_trusted_edge() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -665,7 +1014,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "exact-literal selector should be accepted");
+        let (status, headers, _) = result.expect("exact-literal selector should be accepted");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(headers[0].0, header::CACHE_CONTROL);
+        assert_eq!(headers[0].1, "no-store");
         assert_eq!(store.list().len(), 1);
     }
 

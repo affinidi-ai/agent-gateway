@@ -13,11 +13,25 @@ management-token contract: `agpat_` plus 32 random base64url bytes, `agat_`
 record IDs, SHA-256 hash-only persistence, O(1) active-hash lookup, optional
 immutable expiry, 60-second `last_used_at` write coalescing, immutable
 user/expiry, and idempotent DELETE revocation. Per-token mutation locks serialize
-update/revoke/usage writes so a stale usage write cannot undo revocation; revoked
+update/revoke/rotate/usage writes so a stale usage write cannot undo revocation; revoked
 hashes are removed from the authentication index. Create accepts only exact
 RFC 3339 `expires_at`, bounded to the future and at most 3650 days; omission means
 never, and the removed `expires_in_days` field is rejected so affected clients
 must calculate an exact timestamp and reissue their tokens.
+
+`POST /api/v1/access-tokens/{id}/rotate` (gated by `access_tokens.edit`) replaces the
+secret of an active token in place and returns the new `token` once, in the create
+response shape with status `200`. The record keeps its id, name, scopes, resource
+scope, expiry, `parent_token_id`, and `delegation_depth`, so descendants keep working;
+the old hash leaves the authentication index immediately and only the new hash is
+persisted. The record tracks `rotation_generation`, `rotated_at`, and `rotated_by`,
+and `last_used_at` resets. Rotation returns `409` for a revoked or expired token, a
+token whose lineage is no longer valid, or a concurrent rotation that lost the race.
+Because the response contains a working secret, rotation is limited to the token's
+owner (and its PAT lineage, whose callers authenticate as that same owner) and returns
+`403` to any other caller; responses that carry a secret are sent with
+`Cache-Control: no-store`. Rotation does not revoke descendant tokens (revoke cascades,
+rotate does not), so a leaked parent must be revoked, not rotated.
 
 ## Resource patterns and required headers
 
@@ -48,7 +62,7 @@ cascades to every transitive descendant under the same lock, so child creation
 cannot race an ancestor revoke. A PAT carrying a resource pattern or required
 headers cannot create or edit PATs; only appliance-wide/coarse feature-scoped
 PATs can delegate non-empty feature-scope subsets. PAT-authenticated
-list/get/update/revoke operations are confined to the caller token and its
+list/get/update/revoke/rotate operations are confined to the caller token and its
 descendants, while interactive administrators retain appliance-wide token
 administration. Records predating lineage remain backward-compatible roots.
 

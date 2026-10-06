@@ -36,6 +36,16 @@ fn constant_time_eq(
 
 const LAST_USED_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// `Inactive` covers the token and every ancestor; `Stale` means another
+/// rotation committed after the caller read `expected_generation`.
+#[derive(Debug)]
+pub enum RotateOutcome {
+    Rotated(Box<AccessToken>),
+    NotFound,
+    Inactive,
+    Stale,
+}
+
 pub struct FsAccessTokenStore {
     dir: PathBuf,
     cache: Arc<DashMap<String, AccessToken>>,
@@ -112,7 +122,36 @@ impl FsAccessTokenStore {
     ) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(token)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        fs::write(self.path_for(&token.id), bytes).await
+        let target = self.path_for(&token.id);
+        let temporary = target.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().as_simple()));
+        let written = Self::write_private_file(&temporary, &bytes).await;
+        let renamed = match written {
+            Ok(()) => fs::rename(&temporary, &target).await,
+            Err(error) => Err(error),
+        };
+        if renamed.is_err() {
+            let _ = fs::remove_file(&temporary).await;
+        }
+        renamed
+    }
+
+    /// Writes `bytes` to `path` readable only by the owner (mode 0o600 on unix)
+    /// and flushed to disk, so a rename over the target never exposes a partial file.
+    async fn write_private_file(
+        path: &Path,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut options = fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(path).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await
     }
 
     pub async fn create(
@@ -315,6 +354,48 @@ impl FsAccessTokenStore {
         Ok(Some(token))
     }
 
+    /// Holds the delegation lock so the lineage check cannot race an ancestor revoke.
+    pub async fn rotate(
+        &self,
+        id: &str,
+        actor: &str,
+        expected_generation: u32,
+        new_hash: String,
+    ) -> std::io::Result<RotateOutcome> {
+        let _delegation_guard = self
+            .delegation_lock
+            .lock()
+            .await;
+        let mutation_lock = self.mutation_lock(id);
+        let _guard = mutation_lock.lock().await;
+        let Some(mut token) = self.get(id) else {
+            return Ok(RotateOutcome::NotFound);
+        };
+        let now = Utc::now();
+        if !token.is_active(now) || !self.lineage_is_active(&token, now) {
+            return Ok(RotateOutcome::Inactive);
+        }
+        if token.rotation_generation != expected_generation {
+            return Ok(RotateOutcome::Stale);
+        }
+        let old_hash = std::mem::replace(&mut token.token_hash, new_hash);
+        token.rotation_generation = token
+            .rotation_generation
+            .saturating_add(1);
+        token.rotated_at = Some(now);
+        token.rotated_by = Some(actor.to_string());
+        token.last_used_at = None;
+        self.persist(&token).await?;
+        self.cache
+            .insert(token.id.clone(), token.clone());
+        self.hash_index
+            .remove(&old_hash);
+        self.hash_index
+            .insert(token.token_hash.clone(), token.id.clone());
+        self.last_persist.remove(id);
+        Ok(RotateOutcome::Rotated(Box::new(token)))
+    }
+
     async fn touch_last_used(
         &self,
         id: &str,
@@ -502,7 +583,42 @@ mod tests {
             last_used_at: None,
             expires_at: None,
             revoked_at: None,
+            rotation_generation: 0,
+            rotated_at: None,
+            rotated_by: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persisted_record_is_owner_only_and_leaves_no_temporary_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let store = store().await;
+        let token = record(&hash_secret("agpat_mode"), Vec::new());
+        let id = token.id.clone();
+        store
+            .create(token)
+            .await
+            .unwrap();
+
+        let path = store.path_for(&id);
+        let mode = std::fs::metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let leftovers = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[tokio::test]
@@ -772,6 +888,330 @@ mod tests {
                     .authenticate(secret)
                     .await
                     .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_swaps_secret_in_place_and_survives_reload() {
+        let store = store().await;
+        let old_secret = "agpat_rotate_old";
+        let new_secret = "agpat_rotate_new";
+        let child_secret = "agpat_rotate_child";
+
+        let mut root = record(&hash_secret(old_secret), vec!["access_tokens.edit".into()]);
+        root.name = "ci".into();
+        root.last_used_at = Some(Utc::now());
+        let root_id = root.id.clone();
+        store
+            .create(root)
+            .await
+            .unwrap();
+        let mut child = record(&hash_secret(child_secret), vec!["access_tokens.edit".into()]);
+        child.parent_token_id = Some(root_id.clone());
+        child.delegation_depth = 1;
+        store
+            .create(child)
+            .await
+            .unwrap();
+
+        let RotateOutcome::Rotated(rotated) = store
+            .rotate(&root_id, "admin-1", 0, hash_secret(new_secret))
+            .await
+            .unwrap()
+        else {
+            panic!("rotation of an active token should succeed");
+        };
+        assert_eq!(rotated.id, root_id);
+        assert_eq!(rotated.rotation_generation, 1);
+        assert_eq!(rotated.rotated_by.as_deref(), Some("admin-1"));
+        assert!(rotated.rotated_at.is_some());
+        assert_eq!(rotated.name, "ci");
+        assert_eq!(rotated.scopes, vec!["access_tokens.edit".to_string()]);
+        assert_eq!(rotated.token_hash, hash_secret(new_secret));
+        assert!(rotated.last_used_at.is_none());
+
+        assert!(
+            store
+                .authenticate(old_secret)
+                .await
+                .is_none()
+        );
+        let principal = store
+            .authenticate(new_secret)
+            .await
+            .unwrap();
+        assert_eq!(principal.token_id, root_id);
+        assert!(
+            store
+                .authenticate(child_secret)
+                .await
+                .is_some()
+        );
+
+        let reloaded = FsAccessTokenStore::new(&store.dir)
+            .await
+            .unwrap();
+        assert!(
+            reloaded
+                .authenticate(old_secret)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            reloaded
+                .authenticate(new_secret)
+                .await
+                .unwrap()
+                .token_id,
+            root_id
+        );
+        assert_eq!(
+            reloaded
+                .get(&root_id)
+                .unwrap()
+                .rotation_generation,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_rejects_missing_revoked_and_expired_tokens() {
+        let store = store().await;
+        assert!(matches!(
+            store
+                .rotate("agat_missing", "admin-1", 0, hash_secret("agpat_unused"))
+                .await
+                .unwrap(),
+            RotateOutcome::NotFound
+        ));
+
+        let revoked = record(&hash_secret("agpat_revoked"), vec![]);
+        let revoked_id = revoked.id.clone();
+        store
+            .create(revoked)
+            .await
+            .unwrap();
+        store
+            .revoke(&revoked_id)
+            .await
+            .unwrap();
+        let replacement = "agpat_revoked_replacement";
+        assert!(matches!(
+            store
+                .rotate(&revoked_id, "admin-1", 0, hash_secret(replacement))
+                .await
+                .unwrap(),
+            RotateOutcome::Inactive
+        ));
+        assert!(
+            !store
+                .hash_index
+                .contains_key(&hash_secret(replacement))
+        );
+        assert!(
+            store
+                .authenticate(replacement)
+                .await
+                .is_none()
+        );
+
+        let mut expired = record(&hash_secret("agpat_expired_rotate"), vec![]);
+        expired.expires_at = Some(Utc::now() - Duration::minutes(1));
+        let expired_id = expired.id.clone();
+        store
+            .create(expired)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .rotate(&expired_id, "admin-1", 0, hash_secret("agpat_expired_replacement"))
+                .await
+                .unwrap(),
+            RotateOutcome::Inactive
+        ));
+        assert_eq!(
+            store
+                .get(&expired_id)
+                .unwrap()
+                .token_hash,
+            hash_secret("agpat_expired_rotate")
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_rejects_an_active_child_whose_lineage_is_broken() {
+        let store = store().await;
+
+        let mut expiring_parent = record(&hash_secret("agpat_expiring_parent"), vec!["secrets.view".into()]);
+        expiring_parent.expires_at = Some(Utc::now() + Duration::milliseconds(200));
+        let expiring_parent_id = expiring_parent.id.clone();
+        store
+            .create(expiring_parent)
+            .await
+            .unwrap();
+        let mut orphan = record(&hash_secret("agpat_expired_parent_child"), vec!["secrets.view".into()]);
+        orphan.parent_token_id = Some(expiring_parent_id);
+        orphan.delegation_depth = 1;
+        let orphan_id = orphan.id.clone();
+        store
+            .create(orphan)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            store
+                .get(&orphan_id)
+                .unwrap()
+                .is_active(Utc::now()),
+            "parent expiry does not cascade to the child record"
+        );
+
+        let narrowed_root =
+            record(&hash_secret("agpat_narrowed_root"), vec!["access_tokens.edit".into(), "secrets.view".into()]);
+        let narrowed_root_id = narrowed_root.id.clone();
+        store
+            .create(narrowed_root)
+            .await
+            .unwrap();
+        let mut broader_child = record(&hash_secret("agpat_broader_child"), vec!["secrets.view".into()]);
+        broader_child.parent_token_id = Some(narrowed_root_id.clone());
+        broader_child.delegation_depth = 1;
+        let broader_child_id = broader_child.id.clone();
+        store
+            .create(broader_child)
+            .await
+            .unwrap();
+        store
+            .update(
+                &narrowed_root_id,
+                "narrowed".into(),
+                String::new(),
+                vec!["access_tokens.edit".into()],
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        for (id, replacement) in
+            [(&orphan_id, "agpat_expired_parent_replacement"), (&broader_child_id, "agpat_narrowed_replacement")]
+        {
+            assert!(matches!(
+                store
+                    .rotate(id, "admin-1", 0, hash_secret(replacement))
+                    .await
+                    .unwrap(),
+                RotateOutcome::Inactive
+            ));
+            let record = store.get(id).unwrap();
+            assert_eq!(record.rotation_generation, 0);
+            assert!(
+                !store
+                    .hash_index
+                    .contains_key(&hash_secret(replacement))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_with_a_stale_generation_is_rejected_and_keeps_the_winning_secret() {
+        let store = store().await;
+        let token = record(&hash_secret("agpat_stale_original"), vec![]);
+        let id = token.id.clone();
+        store
+            .create(token)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .rotate(&id, "admin-1", 0, hash_secret("agpat_stale_first"))
+                .await
+                .unwrap(),
+            RotateOutcome::Rotated(_)
+        ));
+        assert!(matches!(
+            store
+                .rotate(&id, "admin-2", 0, hash_secret("agpat_stale_second"))
+                .await
+                .unwrap(),
+            RotateOutcome::Stale
+        ));
+        assert!(
+            store
+                .authenticate("agpat_stale_first")
+                .await
+                .is_some()
+        );
+        assert!(
+            store
+                .authenticate("agpat_stale_second")
+                .await
+                .is_none()
+        );
+
+        let RotateOutcome::Rotated(again) = store
+            .rotate(&id, "admin-2", 1, hash_secret("agpat_stale_third"))
+            .await
+            .unwrap()
+        else {
+            panic!("a rotation that read the current generation should succeed");
+        };
+        assert_eq!(again.rotation_generation, 2);
+        assert_eq!(again.rotated_by.as_deref(), Some("admin-2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rotations_of_the_same_generation_have_exactly_one_winner() {
+        for iteration in 0..32 {
+            let store = Arc::new(store().await);
+            let token = record(&hash_secret(&format!("agpat_race_{iteration}")), vec![]);
+            let id = token.id.clone();
+            store
+                .create(token)
+                .await
+                .unwrap();
+
+            let attempts: Vec<_> = ["a", "b"]
+                .into_iter()
+                .map(|label| {
+                    let store = store.clone();
+                    let id = id.clone();
+                    let secret = format!("agpat_race_{iteration}_{label}");
+                    tokio::spawn(async move {
+                        let outcome = store
+                            .rotate(&id, label, 0, hash_secret(&secret))
+                            .await
+                            .unwrap();
+                        (secret, outcome)
+                    })
+                })
+                .collect();
+            let mut winners = Vec::new();
+            for attempt in attempts {
+                let (secret, outcome) = attempt.await.unwrap();
+                match outcome {
+                    RotateOutcome::Rotated(_) => winners.push(secret),
+                    RotateOutcome::Stale => {}
+                    other => panic!("iteration {iteration}: unexpected outcome {other:?}"),
+                }
+            }
+
+            assert_eq!(winners.len(), 1, "iteration {iteration}: exactly one rotation wins");
+            assert_eq!(
+                store
+                    .get(&id)
+                    .unwrap()
+                    .rotation_generation,
+                1
+            );
+            assert!(
+                store
+                    .authenticate(&winners[0])
+                    .await
+                    .is_some(),
+                "iteration {iteration}: the winner's secret is live"
             );
         }
     }

@@ -36,6 +36,10 @@ pub fn create_access_tokens_router(
             "/api/v1/access-tokens/{id}",
             maybe_gate(guard.as_ref(), delete(handlers::revoke_access_token), Feature::AccessTokensDelete),
         )
+        .route(
+            "/api/v1/access-tokens/{id}/rotate",
+            maybe_gate(guard.as_ref(), post(handlers::rotate_access_token), Feature::AccessTokensEdit),
+        )
         .layer(Extension(tenancy_config))
         .layer(Extension(rbac_config))
         .with_state(store)

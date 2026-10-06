@@ -1,0 +1,18 @@
+branch: access-token-rotation
+changes:
+  added:
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Add access token rotation endpoint
+      description: POST /api/v1/access-tokens/{id}/rotate issues a new secret for an active token and keeps its id, scopes and expiry. Only the token owner can rotate, and the old secret stops working at once. A rotation is recorded as the access_token.rotated audit event.
+  changed:
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Send no-store on access token create and rotate responses
+      description: Responses that return a token secret now carry Cache-Control no-store so caches never keep them.
+  security:
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Write access token files atomically with owner-only permissions
+      description: Token files are written to a temporary file with mode 0600 and then renamed, so they are never readable by other users or left half written.
+  internal:
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Add tests and docs for access token rotation
+      description: Adds unit and component tests for rotation and updates the access token reference.
