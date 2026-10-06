@@ -3,7 +3,7 @@ changes:
   added:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Add access token rotation endpoint
-      description: POST /api/v1/access-tokens/{id}/rotate issues a new secret for an active token and keeps its id, scopes and expiry. Rotation needs access_tokens.edit and the old secret stops working at once. Every rotation is recorded as the access_token.rotated audit event with the token owner and the caller.
+      description: POST /api/v1/access-tokens/{id}/rotate issues a new secret for an active token and keeps its id, scopes and expiry. Rotation needs access_tokens.edit and the old secret stops working at once. Every rotation and every denied attempt is emitted as a structured log event on the audit target, with the token owner and the caller.
   changed:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Send no-store on access token create and rotate responses

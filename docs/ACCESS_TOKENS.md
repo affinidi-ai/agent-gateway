@@ -28,13 +28,26 @@ persisted. The record tracks `rotation_generation`, `rotated_at`, and `rotated_b
 and `last_used_at` resets. Rotation returns `409` for a revoked or expired token, a
 token whose lineage is no longer valid, or a concurrent rotation that lost the race.
 Rotating returns a working secret that authenticates as the token's owner, so access to
-rotate is the same as access to `access_tokens.edit` (administrator by default); delegate
-`access_tokens.edit` accordingly. A PAT caller can rotate only itself and its descendants,
-never with a resource-scoped PAT. Every rotation is written to the audit log with both the
-owner and the caller (`rotated_for_other_user` marks a rotation by someone other than the
-owner, logged at `warn`). Responses that carry a secret are sent with
-`Cache-Control: no-store`. Rotation does not revoke descendant tokens (revoke cascades,
-rotate does not), so a leaked parent must be revoked, not rotated.
+rotate is the same as access to `access_tokens.edit` (administrator by default). A caller
+with `access_tokens.edit` may rotate any active token, including one owned by another user,
+and the new secret acts as that owner. A PAT caller can rotate only itself and its
+descendants, never with a resource-scoped PAT. Rotation is appliance-wide and is not limited
+by tenant. Responses that carry a secret are sent with `Cache-Control: no-store`.
+
+Each rotation is emitted as a structured log event on the `audit` tracing target
+(`access_token.rotated`, with the token id, owner, caller, auth method, and
+`rotated_for_other_user`, logged at `warn` when the caller is not the owner). A refused
+attempt is emitted as `access_token.rotate_denied` with the token id, caller, auth method,
+and reason. These events are not stored in the delegation audit store, so operators should
+ship the `audit` target off the appliance. `rotated_by`, `rotated_at`, and
+`rotation_generation` are returned to anyone with `access_tokens.view`.
+
+Operator advice:
+
+- Keep `access_tokens.edit` administrator-only. Rotating an administrator-owned full-role
+  token hands the caller that token's access.
+- On a suspected leak, revoke the parent token instead of rotating it. Revoke cascades to
+  descendants, while rotation does not touch them.
 
 ## Resource patterns and required headers
 

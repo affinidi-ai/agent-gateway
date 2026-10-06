@@ -66,11 +66,16 @@ impl FsAccessTokenStore {
         let mut entries = fs::read_dir(&dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path
+            let extension = path
                 .extension()
-                .and_then(|extension| extension.to_str())
-                != Some("json")
-            {
+                .and_then(|extension| extension.to_str());
+            if extension == Some("tmp") {
+                if let Err(error) = fs::remove_file(&path).await {
+                    warn!(?path, %error, "Failed to remove leftover access-token temporary file");
+                }
+                continue;
+            }
+            if extension != Some("json") {
                 continue;
             }
             match fs::read(&path).await {
@@ -619,6 +624,24 @@ mod tests {
             })
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn loading_removes_leftover_temporary_files() {
+        let dir = std::env::temp_dir().join(format!("ag-access-tokens-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let leftover = dir.join("agat_crashed.0123456789abcdef.tmp");
+        std::fs::write(&leftover, b"{\"token_hash\":\"secret-hash\"}").unwrap();
+        let unrelated = dir.join("notes.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let store = FsAccessTokenStore::new(&dir)
+            .await
+            .unwrap();
+
+        assert!(!leftover.exists());
+        assert!(unrelated.exists());
+        assert!(store.list().is_empty());
     }
 
     #[tokio::test]

@@ -224,10 +224,79 @@ async fn revocation_invalidates_the_pat_immediately() {
     );
 }
 
-#[tokio::test]
-async fn rotation_through_the_api_swaps_the_pat_secret_in_place() {
+async fn save_user(
+    users: &PasskeyStorage,
+    user_id: &str,
+    role: UserRole,
+) {
+    let now = Utc::now();
+    users
+        .save_user(&UserData {
+            user_id: user_id.to_string(),
+            username: user_id.to_string(),
+            passkeys: Vec::new(),
+            role,
+            status: UserStatus::Approved,
+            is_primary: false,
+            first_name: None,
+            last_name: None,
+            email: None,
+            department: None,
+            job_title: None,
+            avatar_path: None,
+            created_at: now,
+            updated_at: now,
+            last_logged_in: None,
+            saml_id: None,
+        })
+        .await
+        .expect("save user");
+}
+
+async fn create_managed_token(
+    store: &FsAccessTokenStore,
+    scopes: &[&str],
+    parent_token_id: Option<&str>,
+) -> (String, String) {
+    let (id, secret) = generate_token();
+    store
+        .create(AccessToken {
+            id: id.clone(),
+            name: "managed token".to_string(),
+            description: String::new(),
+            token_hash: hash_secret(&secret),
+            user_id: "user-1".to_string(),
+            scopes: scopes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            resource_pattern: None,
+            required_headers: Vec::new(),
+            created_by: "user-1".to_string(),
+            parent_token_id: parent_token_id.map(str::to_string),
+            delegation_depth: u32::from(parent_token_id.is_some()),
+            created_at: Utc::now(),
+            last_used_at: None,
+            expires_at: None,
+            revoked_at: None,
+            rotation_generation: 0,
+            rotated_at: None,
+            rotated_by: None,
+        })
+        .await
+        .expect("create managed token");
+    (id, secret)
+}
+
+struct RotationApp {
+    app: Router,
+    store: Arc<FsAccessTokenStore>,
+    admin_session: String,
+    power_user_session: String,
+}
+
+async fn rotation_app() -> RotationApp {
     let store = new_store().await;
-    let (id, old_secret) = create_token(&store, None, Vec::new()).await;
     let user_directory = tempfile::tempdir().expect("tempdir");
     let users = Arc::new(
         PasskeyStorage::new(
@@ -245,32 +314,20 @@ async fn rotation_through_the_api_swaps_the_pat_secret_in_place() {
         .await
         .expect("user storage"),
     );
-    let now = Utc::now();
-    users
-        .save_user(&UserData {
-            user_id: "user-1".to_string(),
-            username: "user-1".to_string(),
-            passkeys: Vec::new(),
-            role: UserRole::Administrator,
-            status: UserStatus::Approved,
-            is_primary: false,
-            first_name: None,
-            last_name: None,
-            email: None,
-            department: None,
-            job_title: None,
-            avatar_path: None,
-            created_at: now,
-            updated_at: now,
-            last_logged_in: None,
-            saml_id: None,
-        })
-        .await
-        .expect("save user");
+    std::mem::forget(user_directory);
+    save_user(&users, "user-1", UserRole::Administrator).await;
+    save_user(&users, "admin-1", UserRole::Administrator).await;
+    save_user(&users, "power-1", UserRole::PowerUser).await;
+    let sessions = Arc::new(SessionManager::new());
+    let admin_session = sessions
+        .create_session("admin-1".to_string(), "admin-1".to_string())
+        .await;
+    let power_user_session = sessions
+        .create_session("power-1".to_string(), "power-1".to_string())
+        .await;
     let rbac = Arc::new(crate::rbac::RbacConfig::default());
-    let auth =
-        AuthGuardState::new(Arc::new(SessionManager::new()), None, Arc::new(crate::terms::TermsManager::disabled()))
-            .with_pat_authenticator(Some(store.clone()));
+    let auth = AuthGuardState::new(sessions, None, Arc::new(crate::terms::TermsManager::disabled()))
+        .with_pat_authenticator(Some(store.clone()));
     let app = Router::new()
         .route("/v1/gateways/{id}", get(gateway_get))
         .merge(crate::access_tokens::router::create_access_tokens_router(
@@ -280,14 +337,29 @@ async fn rotation_through_the_api_swaps_the_pat_secret_in_place() {
             Some(RbacGuard::new(users, rbac)),
         ))
         .layer(middleware::from_fn_with_state(auth, require_session_auth));
+    RotationApp {
+        app,
+        store,
+        admin_session,
+        power_user_session,
+    }
+}
 
+async fn rotate(
+    app: &Router,
+    id: &str,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/access-tokens/{id}/rotate"));
+    if let Some(bearer) = bearer {
+        builder = builder.header("Authorization", format!("Bearer {bearer}"));
+    }
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/access-tokens/{id}/rotate"))
-                .header("Authorization", format!("Bearer {old_secret}"))
+            builder
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -297,8 +369,19 @@ async fn rotation_through_the_api_swaps_the_pat_secret_in_place() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let json = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&body).into_owned()));
+    (status, json)
+}
+
+#[tokio::test]
+async fn rotation_through_the_api_swaps_the_pat_secret_in_place() {
+    let fixture = rotation_app().await;
+    let (id, old_secret) = create_token(&fixture.store, None, Vec::new()).await;
+
+    let (status, body) = rotate(&fixture.app, &id, Some(&old_secret)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["id"], id);
     assert_eq!(body["name"], "component token");
     let new_secret = body["token"]
@@ -308,10 +391,123 @@ async fn rotation_through_the_api_swaps_the_pat_secret_in_place() {
     assert_ne!(new_secret, old_secret);
 
     assert_eq!(
-        request(&app, "GET", "/v1/gateways/gateway-global", Some(&old_secret), None).await,
+        request(&fixture.app, "GET", "/v1/gateways/gateway-global", Some(&old_secret), None).await,
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(request(&app, "GET", "/v1/gateways/gateway-global", Some(&new_secret), None).await, StatusCode::OK);
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/gateways/gateway-global", Some(&new_secret), None).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn rotation_without_authentication_is_unauthorized() {
+    let fixture = rotation_app().await;
+    let (id, _) = create_token(&fixture.store, None, Vec::new()).await;
+
+    assert_eq!(
+        rotate(&fixture.app, &id, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn rotation_by_a_session_role_without_access_tokens_edit_is_forbidden() {
+    let fixture = rotation_app().await;
+    let (id, secret) = create_token(&fixture.store, None, Vec::new()).await;
+
+    assert_eq!(
+        rotate(&fixture.app, &id, Some(&fixture.power_user_session))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(request(&fixture.app, "GET", "/v1/gateways/gateway-global", Some(&secret), None).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rotation_by_a_pat_without_access_tokens_edit_is_forbidden() {
+    let fixture = rotation_app().await;
+    let (id, secret) = create_managed_token(&fixture.store, &["access_tokens.view"], None).await;
+
+    assert_eq!(
+        rotate(&fixture.app, &id, Some(&secret))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn a_pat_rotates_its_own_descendant() {
+    let fixture = rotation_app().await;
+    let (parent_id, parent_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
+    let (child_id, child_secret) =
+        create_managed_token(&fixture.store, &["access_tokens.edit"], Some(&parent_id)).await;
+
+    let (status, body) = rotate(&fixture.app, &child_id, Some(&parent_secret)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], child_id);
+    assert_eq!(body["rotated_by"], "user-1");
+    assert_ne!(body["token"], child_secret);
+}
+
+#[tokio::test]
+async fn a_pat_cannot_rotate_a_token_outside_its_lineage_and_the_denial_leaves_it_usable() {
+    let fixture = rotation_app().await;
+    let (_, caller_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
+    let (other_id, other_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
+
+    assert_eq!(
+        rotate(&fixture.app, &other_id, Some(&caller_secret))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/gateways/gateway-global", Some(&other_secret), None).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        rotate(&fixture.app, &other_id, Some(&fixture.admin_session))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn rotating_an_unknown_token_is_not_found() {
+    let fixture = rotation_app().await;
+
+    assert_eq!(
+        rotate(&fixture.app, "agat_missing", Some(&fixture.admin_session))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn rotating_a_revoked_token_is_a_conflict() {
+    let fixture = rotation_app().await;
+    let (id, _) = create_token(&fixture.store, None, Vec::new()).await;
+    fixture
+        .store
+        .revoke(&id)
+        .await
+        .expect("revoke");
+
+    assert_eq!(
+        rotate(&fixture.app, &id, Some(&fixture.admin_session))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
 }
 
 #[tokio::test]

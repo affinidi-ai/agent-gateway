@@ -11,7 +11,6 @@ use tracing::{error, info, warn};
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext};
 use crate::auth_manager::resource_scope::{self, RequiredHeader};
-use crate::delegation_vault::audit::management_caller_context;
 use crate::rbac::RbacConfig;
 
 use super::store::{FsAccessTokenStore, RotateOutcome, hash_secret};
@@ -250,7 +249,8 @@ pub async fn create_access_token(
             if error.kind() == std::io::ErrorKind::PermissionDenied {
                 (StatusCode::FORBIDDEN, "parent access token is no longer active".to_string())
             } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to store token: {error}"))
+                error!(token_id = %token.id, %error, "Failed to store management access token");
+                (StatusCode::INTERNAL_SERVER_ERROR, "failed to store token".to_string())
             }
         })?;
     info!(token_id = %token.id, user_id = %token.user_id, "Created management access token");
@@ -360,7 +360,10 @@ pub async fn update_access_token(
             Ok(Json(AccessTokenMeta::from_token(&token, Utc::now())))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, "access token not found".into())),
-        Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("failed to update token: {error}"))),
+        Err(error) => {
+            error!(token_id = %id, %error, "Failed to update management access token");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to update token".into()))
+        }
     }
 }
 
@@ -379,7 +382,10 @@ pub async fn revoke_access_token(
     match store.revoke(&id).await {
         Ok(Some(_)) => Ok(StatusCode::NO_CONTENT),
         Ok(None) => Err((StatusCode::NOT_FOUND, "access token not found".into())),
-        Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("failed to revoke token: {error}"))),
+        Err(error) => {
+            error!(token_id = %id, %error, "Failed to revoke management access token");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to revoke token".into()))
+        }
     }
 }
 
@@ -395,21 +401,44 @@ pub async fn rotate_access_token(
     if caller_id.is_empty() {
         return Err((StatusCode::UNAUTHORIZED, "no authenticated caller".into()));
     }
+    let caller_auth_method = if delegation.is_some() {
+        "access_token"
+    } else {
+        "session"
+    };
+    let caller_token_id = delegation
+        .as_ref()
+        .map_or("", |Extension(context)| context.token_id.as_str());
+    let deny = |status: StatusCode, reason: &str| {
+        warn!(
+            target: "audit",
+            event = "access_token.rotate_denied",
+            token_id = %id,
+            caller_user_id = %caller_id,
+            caller_auth_method,
+            caller_token_id,
+            status = status.as_u16(),
+            reason,
+            "Denied management access token rotation"
+        );
+        (status, reason.to_string())
+    };
     validate_target_authority(
         &store,
         delegation
             .as_ref()
             .map(|Extension(context)| context),
         &id,
-    )?;
+    )
+    .map_err(|(status, message)| deny(status, &message))?;
     let Some(existing) = store.get(&id) else {
         return Err((StatusCode::NOT_FOUND, "access token not found".into()));
     };
     if existing.revoked_at.is_some() {
-        return Err((StatusCode::CONFLICT, "cannot rotate a revoked token".into()));
+        return Err(deny(StatusCode::CONFLICT, "cannot rotate a revoked token"));
     }
     if existing.is_expired(Utc::now()) {
-        return Err((StatusCode::CONFLICT, "cannot rotate an expired token".into()));
+        return Err(deny(StatusCode::CONFLICT, "cannot rotate an expired token"));
     }
 
     let (_, secret) = generate_token();
@@ -418,46 +447,27 @@ pub async fn rotate_access_token(
         .await
     {
         Ok(RotateOutcome::Rotated(token)) => {
-            let caller_context = management_caller_context(
-                Some(&caller_id),
-                delegation
-                    .as_ref()
-                    .map(|Extension(context)| context.token_id.as_str()),
-            );
-            let caller_auth_method = caller_context
-                .as_ref()
-                .map_or("", |context| context.auth_method.as_str());
-            let caller_token_id = caller_context
-                .as_ref()
-                .and_then(|context| context.token_id.as_deref())
-                .unwrap_or("");
             let rotated_for_other_user = token.user_id != caller_id;
+            macro_rules! emit_rotated {
+                ($level:ident) => {
+                    $level!(
+                        target: "audit",
+                        event = "access_token.rotated",
+                        token_id = %id,
+                        owner_user_id = %token.user_id,
+                        caller_user_id = %caller_id,
+                        caller_auth_method,
+                        caller_token_id,
+                        rotated_for_other_user,
+                        rotation_generation = token.rotation_generation,
+                        "Rotated management access token"
+                    )
+                };
+            }
             if rotated_for_other_user {
-                warn!(
-                    target: "audit",
-                    event = "access_token.rotated",
-                    token_id = %id,
-                    owner_user_id = %token.user_id,
-                    caller_user_id = %caller_id,
-                    caller_auth_method,
-                    caller_token_id,
-                    rotated_for_other_user,
-                    rotation_generation = token.rotation_generation,
-                    "Rotated management access token owned by another user"
-                );
+                emit_rotated!(warn);
             } else {
-                info!(
-                    target: "audit",
-                    event = "access_token.rotated",
-                    token_id = %id,
-                    owner_user_id = %token.user_id,
-                    caller_user_id = %caller_id,
-                    caller_auth_method,
-                    caller_token_id,
-                    rotated_for_other_user,
-                    rotation_generation = token.rotation_generation,
-                    "Rotated management access token"
-                );
+                emit_rotated!(info);
             }
             Ok((
                 NO_STORE,
@@ -469,10 +479,10 @@ pub async fn rotate_access_token(
         }
         Ok(RotateOutcome::NotFound) => Err((StatusCode::NOT_FOUND, "access token not found".into())),
         Ok(RotateOutcome::Inactive) => {
-            Err((StatusCode::CONFLICT, "access token is inactive or its parent token is no longer valid".into()))
+            Err(deny(StatusCode::CONFLICT, "access token is inactive or its parent token is no longer valid"))
         }
         Ok(RotateOutcome::Stale) => {
-            Err((StatusCode::CONFLICT, "access token was rotated concurrently; fetch it and retry".into()))
+            Err(deny(StatusCode::CONFLICT, "access token was rotated concurrently; fetch it and retry"))
         }
         Err(source) => {
             error!(token_id = %id, error = %source, "Failed to rotate management access token");
