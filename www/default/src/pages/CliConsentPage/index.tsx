@@ -1,6 +1,7 @@
 import React from 'react';
 import { Alert, Spinner } from 'react-bootstrap';
 import { AppButton } from '../../components/shared/AppButton';
+import '../../dashboard.css';
 import loginStyles from '../LoginPage.module.css';
 import styles from './CliConsentPage.module.css';
 import { useCliConsent } from './useCliConsent';
