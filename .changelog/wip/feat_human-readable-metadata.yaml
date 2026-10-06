@@ -1,0 +1,98 @@
+branch: feat/human-readable-metadata
+changes:
+  added:
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: ⭐ Publish human-readable names for agents, Issuers and Authorities to TRs
+      description: >-
+        The gateway now publishes display names as trust-registry reference fields: the
+        managed agent's name (its target Agent Card name on A2A and AP2 surfaces, else
+        its surface name), and the configured names for Issuers and Authorities. Names
+        are sent when an Issuer is created, retried or edited, when an Authority is
+        edited, when a surface is renamed or its Agent Card name changes, and by the
+        Trust Recorder. Each
+        publish creates the field and updates it on conflict. Publishing runs in the
+        background and never blocks requests or record creation.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Attach the agent display name to new Trust Recorder records as context
+      description: >-
+        Records the Trust Recorder creates for a managed agent carry
+        {"displayName", "origin": "managed"} as context, taken once at creation. A DID
+        managed on more than one surface publishes no name.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Include the managed agent's display name in its identity VC
+      description: >-
+        Agent identity VCs carry credentialSubject.name, set to the managed agent's
+        display name, on the legacy and SSI issuance paths. The next VC after a rename
+        or an Agent Card name change carries the new name under the same DID.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Show identity origin, display names and per-surface history in Identities
+      description: >-
+        The Identities page shows a Managed Agent or External Caller badge, and each
+        name with its DID in monospace and a copy button. Managed identities are grouped
+        one row per surface, with a change log of DID, credential and claim changes. The
+        page also adds an unnamed filter, a name-conflict marker, and the credential
+        principal. An identity without a name shows its DID as the primary line, and a
+        caller whose name is still being looked up shows "resolving…". Older local
+        identities linked to a surface are named as its managed agent. External callers are
+        named by a verified alsoKnownAs agent name, then by their Agent Card name (marked unverified), then by their DID.
+    - timestamp: '2026-10-06T09:00:00.000Z'
+      title: ⭐ Name managed agents from their target's Agent Card
+      description: >-
+        On A2A and AP2 surfaces with an HTTP(S) target, the managed agent is named by
+        the name in its own Agent Card instead of the surface name, so the Identities
+        page, the identity VC, Trust Recorder context and the trust-registry entity
+        field all carry the same name. The card is cached for five minutes per surface;
+        credential issuance waits for the first lookup, and a name change republishes
+        the entity field. An unreachable card or invalid name falls back to the surface
+        name. The name is self-asserted by the target and not verified.
+  changed:
+    - timestamp: '2026-10-06T10:00:00.000Z'
+      title: Rename the Identities Status column to Origin
+      description: >-
+        The column shows whether an identity is a Managed Agent or an External Caller
+        (or LOCAL/REMOTE for older records), which is its origin rather than a status.
+        The header now matches the identity origin term used in the glossary and API.
+    - timestamp: '2026-10-05T17:00:00.000Z'
+      title: Name the authorities and Issuers that Trust Recorder records reference
+      description: >-
+        After writing its records, the Trust Recorder publishes an authority reference
+        field for each authority DID, named after the matching Authority or Issuer.
+        It also names an Issuer DID used as a record's entity. Trust registries can
+        now show the authority by name instead of only its DID.
+  fixed:
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Keep other Identities rows expanded when a row is expanded via its link
+      description: >-
+        Expanding an identity row on the /identities/:did route no longer collapses rows
+        that were already expanded.
+    - timestamp: '2026-10-05T16:00:00.000Z'
+      title: Stop Trust Recorder custom resource inputs squeezing the selects
+      description: >-
+        In the Trust Recorder editor, the Action and Resource inputs of a custom
+        resource row now share the remaining width and can shrink. Entity Target and
+        Record Type keep fixed widths, and every column has a label so the row lines up.
+    - timestamp: '2026-10-05T16:30:00.000Z'
+      title: Record an Issuer's own DID when it is chosen as Trust Recorder authority
+      description: >-
+        Choosing an Issuer in the Trust Recorder Authority dropdown stored the
+        authority the Issuer was registered under, often the gateway's DID, so
+        records showed the gateway as the authority. It now stores the Issuer's own
+        DID. Entries saved with the old value show as Custom until re-selected.
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Enable the agent-names feature of the DID resolver SDK
+      description: >-
+        Turns on the affinidi-did-resolver-cache-sdk agent-names feature (agent-names
+        0.1.3), which caller-name verification needs.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Record identity origin on identity records
+      description: >-
+        AgentIdentityRecord gains an optional origin (managed or external_caller),
+        stamped at DID issuance. Records without one deserialise unchanged.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Document display names, reference fields and caller naming
+      description: >-
+        Updates SOURCE_AUTH.md, CONTEXT.md, ARCHITECTURE.md and the dashboard AGENTS.md.

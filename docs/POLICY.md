@@ -253,6 +253,23 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   well-known URL with `egress::pinned_forward_client`, the forward step's
   policy, and reads the card within the Transit Point's response bounds. A
   blocked URL, a redirect or an oversized card yields no card.
+- The **managed agent Agent Card fetch** for display names
+  (`src/identity/target_card_names.rs`) reads the card of an A2A or AP2
+  surface's operator-configured HTTP(S) target through the same
+  `outbound_handler.rs::fetch_agent_card`, so it shares the forward step's
+  policy: loopback and private targets are allowed, cloud metadata is blocked,
+  and redirects are not followed. The fetch has a 5-second timeout and a 64 KiB
+  limit. Credential issuance and Trust Recorder publishing wait for the first
+  fetch of a surface; later fetches run in the background. See
+  [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-names).
+- The dashboard's **caller Agent Card fetch**
+  (`src/observability/caller_names.rs`) reads a URL taken from the caller's own
+  DID document, so the caller chooses it. It goes through
+  `egress::guarded_send_inner` with the Strict policy, which validates and pins
+  the URL and re-validates and re-pins each of at most five manually followed
+  redirects. The fetch has a 5-second timeout and a 64 KiB limit and runs in the
+  background, off the request path. A blocked URL or a failed fetch yields no
+  name; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#external-callers).
 
 Both helpers share one `pin_and_build` body.
 

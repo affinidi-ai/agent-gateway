@@ -70,7 +70,7 @@ changes:
 Frontend work spans two concerns:
 
 - **Every user-visible change** needs a changelog fragment — see _Changelog fragments_ above.
-- **Dashboard UI (`www/default/src/**`, `www/default/src/pages/**`)** follows the existing dashboard design conventions: reuse the shared shell components, tokens, and dark theme already in the tree; keep page entry files orchestration-focused and extract sections, hooks, helpers, and local types as pages grow.
+- **Dashboard UI (`www/default/src/**`, `www/default/src/pages/**`)** follows the existing dashboard design conventions: reuse the shared shell components, tokens, and dark theme already in the tree; keep page entry files orchestration-focused and extract sections, hooks, helpers, and local types as pages grow. Page-specific patterns, such as the Identities page's grouping, name cell, and test ids, live in [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 For frontend work under `www/default/` (the current dashboard shipped to users), use the scoped frontend instructions at [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
