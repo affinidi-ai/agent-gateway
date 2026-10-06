@@ -60,6 +60,12 @@ flowchart LR
 Revoking any token revokes everything to its right. Authenticating a token walks back to
 the root and fails if any ancestor is inactive, missing, or inconsistent.
 
+## Inspecting the calling token
+
+`GET /api/v1/token-info` returns the `user_id`, `token_id`, and granted `scopes` of the PAT making the
+call (`token_id` and `scopes` are `null` for a session login). See
+[`RBAC.md`](RBAC.md#token-info-endpoint) for the response shape.
+
 ## Tenant ownership
 
 Tenant-owned top-level management records carry an optional `tenant_id`. Its absence

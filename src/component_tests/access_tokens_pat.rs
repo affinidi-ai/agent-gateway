@@ -58,6 +58,15 @@ async fn create_token(
     pattern: Option<&str>,
     headers: Vec<RequiredHeader>,
 ) -> (String, String) {
+    create_token_with_scopes(store, pattern, headers, Vec::new()).await
+}
+
+async fn create_token_with_scopes(
+    store: &FsAccessTokenStore,
+    pattern: Option<&str>,
+    headers: Vec<RequiredHeader>,
+    scopes: Vec<String>,
+) -> (String, String) {
     let (id, secret) = generate_token();
     store
         .create(AccessToken {
@@ -66,7 +75,7 @@ async fn create_token(
             description: String::new(),
             token_hash: hash_secret(&secret),
             user_id: "user-1".to_string(),
-            scopes: Vec::new(),
+            scopes,
             resource_pattern: pattern.map(str::to_string),
             required_headers: headers,
             created_by: "user-1".to_string(),
@@ -280,5 +289,154 @@ async fn already_issued_broad_selector_token_is_honored_with_trusted_edge() {
     assert_eq!(
         request(&app, "GET", "/v1/gateways/gateway-b", Some(&secret), Some("tenant-a")).await,
         StatusCode::NOT_FOUND
+    );
+}
+
+async fn token_info_app(
+    store: Arc<FsAccessTokenStore>,
+    sessions: Arc<SessionManager>,
+) -> (Router, tempfile::TempDir) {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let user_storage = Arc::new(
+        crate::auth::storage::PasskeyStorage::new(
+            directory
+                .path()
+                .join("passkeys")
+                .to_string_lossy()
+                .to_string(),
+            directory
+                .path()
+                .join("avatars")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .await
+        .expect("user storage"),
+    );
+    let auth = AuthGuardState::new(sessions.clone(), None, Arc::new(crate::terms::TermsManager::disabled()))
+        .with_pat_authenticator(Some(store));
+    let app = Router::new()
+        .route("/v1/token-info", get(crate::auth_manager::permissions::get_token_info))
+        .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+        .layer(Extension(sessions))
+        .layer(Extension(user_storage))
+        .layer(middleware::from_fn_with_state(auth, require_session_auth));
+    (app, directory)
+}
+
+async fn token_info(
+    app: &Router,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri("/v1/token-info");
+    if let Some(bearer) = bearer {
+        builder = builder.header("Authorization", format!("Bearer {bearer}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+}
+
+#[tokio::test]
+async fn token_info_reports_a_scoped_pats_id_and_scopes() {
+    let store = new_store().await;
+    let (id, secret) = create_token_with_scopes(
+        &store,
+        None,
+        Vec::new(),
+        vec!["gateways.view".to_string(), "secrets.view".to_string()],
+    )
+    .await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    let (status, body) = token_info(&app, Some(&secret)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"], "user-1");
+    assert_eq!(body["token_id"], id);
+    assert_eq!(body["scopes"], serde_json::json!(["gateways.view", "secrets.view"]));
+    assert!(body.get("token").is_none());
+    assert!(
+        body.get("token_hash")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn token_info_reports_null_scopes_for_an_unrestricted_pat() {
+    let store = new_store().await;
+    let (id, secret) = create_token(&store, None, Vec::new()).await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    let (status, body) = token_info(&app, Some(&secret)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["token_id"], id);
+    assert!(body["scopes"].is_null());
+}
+
+#[tokio::test]
+async fn token_info_reports_null_token_for_a_session_bearer() {
+    let sessions = Arc::new(SessionManager::new());
+    let session_token = sessions
+        .create_session("alice".into(), "user-2".into())
+        .await;
+    let (app, _directory) = token_info_app(new_store().await, sessions).await;
+
+    let (status, body) = token_info(&app, Some(&session_token)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"], "user-2");
+    assert!(body["token_id"].is_null());
+    assert!(body["scopes"].is_null());
+}
+
+#[tokio::test]
+async fn token_info_requires_authentication() {
+    let (app, _directory) = token_info_app(new_store().await, Arc::new(SessionManager::new())).await;
+
+    assert_eq!(token_info(&app, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        token_info(&app, Some("agpat_not-a-real-token"))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn token_info_rejects_a_revoked_pat() {
+    let store = new_store().await;
+    let (id, secret) = create_token(&store, None, Vec::new()).await;
+    let (app, _directory) = token_info_app(store.clone(), Arc::new(SessionManager::new())).await;
+
+    assert_eq!(
+        token_info(&app, Some(&secret))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    store
+        .revoke(&id)
+        .await
+        .expect("revoke");
+    assert_eq!(
+        token_info(&app, Some(&secret))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
     );
 }

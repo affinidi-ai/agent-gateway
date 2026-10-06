@@ -1,4 +1,5 @@
 use crate::auth::storage::PasskeyStorage;
+use crate::auth_manager::pat::{PatContext, PatDelegationContext};
 use crate::rbac::Feature;
 use axum::{Extension, Json, http::StatusCode};
 
@@ -218,6 +219,26 @@ pub async fn get_permissions(
     Ok(Json(serde_json::Value::Object(permissions)))
 }
 
+/// Reads only extensions the auth middleware already resolved, with no lookup by id,
+/// so a token can only inspect itself.
+pub async fn get_token_info(
+    Extension(user_id): Extension<String>,
+    pat: Option<Extension<PatContext>>,
+    delegation: Option<Extension<PatDelegationContext>>,
+) -> impl axum::response::IntoResponse {
+    let scopes = pat.and_then(|Extension(PatContext(scopes))| scopes);
+    let token_id = delegation.map(|Extension(context)| context.token_id);
+
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store"), (axum::http::header::VARY, "Authorization")],
+        Json(serde_json::json!({
+            "user_id": user_id,
+            "token_id": token_id,
+            "scopes": scopes,
+        })),
+    )
+}
+
 /// Get public permissions (for unauthenticated users during registration)
 /// Returns all permissions as false since no user is logged in
 #[allow(dead_code)]
@@ -300,6 +321,7 @@ mod tests {
     use crate::auth::storage::{PasskeyStorage, UserData};
     use crate::auth::types::{UserRole, UserStatus};
     use crate::rbac::RbacConfig;
+    use axum::response::IntoResponse;
     use chrono::Utc;
     use std::sync::Arc;
 
@@ -369,5 +391,60 @@ mod tests {
         // The key must be present so the dashboard can evaluate it — but false,
         // because sts_clients.view is administrator-only.
         assert_eq!(perms["sts_clients.view"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn token_info_reports_scoped_pats_own_scopes_and_id() {
+        let scopes = vec!["secrets.view".to_string(), "gateways.view".to_string()];
+        let delegation = PatDelegationContext {
+            token_id: "tok-123".to_string(),
+            delegation_depth: 0,
+            resource_scoped: false,
+        };
+        let response = get_token_info(
+            Extension("user-1".to_string()),
+            Some(Extension(PatContext(Some(scopes.clone())))),
+            Some(Extension(delegation)),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::VARY)
+                .unwrap(),
+            "Authorization"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["user_id"], "user-1");
+        assert_eq!(value["token_id"], "tok-123");
+        assert_eq!(value["scopes"], serde_json::json!(scopes));
+    }
+
+    #[tokio::test]
+    async fn token_info_reports_null_scopes_for_a_session_login() {
+        let response = get_token_info(Extension("user-1".to_string()), None, None)
+            .await
+            .into_response();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["user_id"], "user-1");
+        assert!(value["token_id"].is_null());
+        assert!(value["scopes"].is_null());
     }
 }

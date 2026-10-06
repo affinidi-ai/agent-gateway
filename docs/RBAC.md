@@ -41,6 +41,24 @@ not an enumeration of every backend `Feature`: route-only capabilities can be en
 appearing in this response. The response currently also includes `departments.*` aliases for legacy
 dashboard compatibility; new UI uses `issuers.*`.
 
+## Token info endpoint
+
+`GET /v1/token-info` (served as `GET /api/v1/token-info`) reports the credential making the call, so a
+client can validate a bearer token and show who it is acting as. It takes no parameters and only reads
+the identity the session-auth middleware already resolved, so a caller can only inspect its own
+credential. It accepts either a session token or an `agpat_` personal access token as
+`Authorization: Bearer`, and returns `401` without one. The response is sent with
+`Cache-Control: no-store` and `Vary: Authorization`. The `scopes` list is enforced only on
+feature-gated routes: a few routes authorize on the owner's role alone and ignore it.
+
+```json
+{ "user_id": "user-1", "token_id": "agat_...", "scopes": ["gateways.view", "secrets.view"] }
+```
+
+For a session login, `token_id` and `scopes` are `null` and the caller holds its full role. For a
+personal access token, `token_id` is the token record ID and `scopes` is the list of feature scopes it
+was issued, or `null` when it is not scope-restricted. It never returns the token secret or hash.
+
 ## Payments admin API
 
 The x402 (`/api/admin/x402/...`) and MPP (`/api/admin/mpp/...`) admin routers require
