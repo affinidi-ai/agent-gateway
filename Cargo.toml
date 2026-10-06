@@ -116,7 +116,7 @@ sha256 = "1.6"
 hmac = "0.12"
 hex = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
-affinidi-did-resolver-cache-sdk = "0.8.39"
+affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = ["agent-names"] }
 affinidi-messaging-sdk = "0.30.1"
 trust-tasks-rs = "0.24.8"
 
