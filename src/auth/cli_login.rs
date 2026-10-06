@@ -3,6 +3,7 @@
 //! The session token is returned only on the back-channel exchange, never in a browser URL.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -17,11 +18,13 @@ use base64::Engine;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::auth::session::{SessionManager, TermsSessionGate};
-use crate::auth_manager::middleware::extract_session_token_from_headers;
+use crate::auth::storage::PasskeyStorage;
+use crate::auth_manager::middleware::{extract_session_token_from_headers, user_is_approved};
 
 /// Dashboard page that asks the signed-in user to approve the CLI login.
 const CONSENT_PAGE_PATH: &str = "/cli-consent";
@@ -42,15 +45,20 @@ const CODE_LEN: usize = 36;
 /// Caps memory held by unredeemed codes.
 const MAX_PENDING_CODES: usize = 1000;
 
+/// Keeps one signed-in account from using up the shared cap.
+const MAX_PENDING_CODES_PER_SESSION: usize = 3;
+
 struct PendingCliAuth {
     code_challenge: String,
     session_token: String,
     expires_at: Instant,
+    sequence: u64,
 }
 
 #[derive(Default)]
 pub struct CliLoginStore {
     entries: DashMap<String, PendingCliAuth>,
+    next_sequence: AtomicU64,
 }
 
 impl CliLoginStore {
@@ -66,6 +74,7 @@ impl CliLoginStore {
         let now = Instant::now();
         self.entries
             .retain(|_, pending| pending.expires_at > now);
+        self.drop_oldest_codes_beyond_session_cap(&session_token);
         if self.entries.len() >= MAX_PENDING_CODES {
             return None;
         }
@@ -76,9 +85,37 @@ impl CliLoginStore {
                 code_challenge,
                 session_token,
                 expires_at: now + CODE_TTL,
+                sequence: self
+                    .next_sequence
+                    .fetch_add(1, Ordering::Relaxed),
             },
         );
         Some(code)
+    }
+
+    /// Leaves room for one more code for the session, so a retry never fails.
+    fn drop_oldest_codes_beyond_session_cap(
+        &self,
+        session_token: &str,
+    ) {
+        let mut session_codes: Vec<(u64, String)> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.session_token == session_token)
+            .map(|entry| (entry.sequence, entry.key().clone()))
+            .collect();
+        let keep = MAX_PENDING_CODES_PER_SESSION - 1;
+        if session_codes.len() <= keep {
+            return;
+        }
+        session_codes.sort_unstable();
+        let excess = session_codes.len() - keep;
+        for (_, code) in session_codes
+            .into_iter()
+            .take(excess)
+        {
+            self.entries.remove(&code);
+        }
     }
 
     /// The code is consumed even when the verifier is wrong, so it cannot be guessed against.
@@ -92,24 +129,31 @@ impl CliLoginStore {
             return None;
         }
         let expected = pkce_challenge_s256(verifier);
-        if !constant_time_eq(
-            expected.as_bytes(),
-            pending
-                .code_challenge
-                .as_bytes(),
-        ) {
+        let matches: bool = expected
+            .as_bytes()
+            .ct_eq(
+                pending
+                    .code_challenge
+                    .as_bytes(),
+            )
+            .into();
+        if !matches {
             return None;
         }
         Some(pending.session_token)
     }
 }
 
-pub fn cli_login_router(session_manager: Arc<SessionManager>) -> Router {
+pub fn cli_login_router(
+    session_manager: Arc<SessionManager>,
+    user_storage: Arc<PasskeyStorage>,
+) -> Router {
     Router::new()
         .route("/auth/cli/authorize", get(authorize))
         .route("/auth/cli/consent", post(consent))
         .route("/auth/cli/exchange", post(exchange))
         .layer(Extension(session_manager))
+        .layer(Extension(user_storage))
         .layer(Extension(Arc::new(CliLoginStore::new())))
 }
 
@@ -166,11 +210,12 @@ pub struct ConsentResponse {
     pub redirect_url: String,
 }
 
-/// Issues the code once the signed-in user approves. The cookie is `SameSite=Strict`; this also
-/// requires a same-origin JSON request so a page on another origin cannot trigger an approval.
+/// Issues the code once the signed-in, approved user approves. The cookie is `SameSite=Strict`; this
+/// also requires a same-origin JSON request so a page on another origin cannot trigger an approval.
 pub async fn consent(
     headers: HeaderMap,
     Extension(session_manager): Extension<Arc<SessionManager>>,
+    Extension(user_storage): Extension<Arc<PasskeyStorage>>,
     Extension(store): Extension<Arc<CliLoginStore>>,
     body: Bytes,
 ) -> Response {
@@ -193,6 +238,9 @@ pub async fn consent(
     };
     if session.terms_gate == TermsSessionGate::ConsentPending {
         return no_store((StatusCode::FORBIDDEN, "terms acceptance required").into_response());
+    }
+    if !user_is_approved(&user_storage, &session.user_id).await {
+        return no_store((StatusCode::FORBIDDEN, "account is not approved").into_response());
     }
 
     let Ok(request) = serde_json::from_slice::<ConsentRequest>(&body) else {
@@ -278,20 +326,6 @@ fn pkce_challenge_s256(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-fn constant_time_eq(
-    a: &[u8],
-    b: &[u8],
-) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// The host is fixed to `127.0.0.1` so a crafted request cannot redirect to another host.
 fn build_loopback_redirect(
     port: u16,
@@ -355,6 +389,8 @@ fn is_valid_verifier(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::storage::UserData;
+    use crate::auth::types::{UserRole, UserStatus};
     use axum::{
         body::Body,
         http::{Method, Request},
@@ -435,6 +471,7 @@ mod tests {
                 code_challenge: "ch".to_string(),
                 session_token: "session-old".to_string(),
                 expires_at: Instant::now() - Duration::from_secs(1),
+                sequence: 0,
             },
         );
 
@@ -461,6 +498,7 @@ mod tests {
                 code_challenge: pkce_challenge_s256(verifier),
                 session_token: "session-abc".to_string(),
                 expires_at: Instant::now() - Duration::from_secs(1),
+                sequence: 0,
             },
         );
 
@@ -524,19 +562,127 @@ mod tests {
     #[test]
     fn create_refuses_new_codes_at_the_pending_cap() {
         let store = CliLoginStore::new();
-        for _ in 0..MAX_PENDING_CODES {
+        for index in 0..MAX_PENDING_CODES {
             assert!(
                 store
-                    .create("ch".to_string(), "session".to_string())
+                    .create("ch".to_string(), format!("session-{index}"))
                     .is_some()
             );
         }
         assert!(
             store
-                .create("ch".to_string(), "session".to_string())
+                .create("ch".to_string(), "session-extra".to_string())
                 .is_none()
         );
         assert_eq!(store.entries.len(), MAX_PENDING_CODES);
+    }
+
+    #[test]
+    fn one_session_never_holds_more_than_its_cap() {
+        let store = CliLoginStore::new();
+        for _ in 0..(MAX_PENDING_CODES_PER_SESSION * 4) {
+            assert!(
+                store
+                    .create("ch".to_string(), "spammer".to_string())
+                    .is_some()
+            );
+        }
+        assert_eq!(store.entries.len(), MAX_PENDING_CODES_PER_SESSION);
+    }
+
+    #[test]
+    fn a_spamming_session_does_not_block_another_session() {
+        let store = CliLoginStore::new();
+        for _ in 0..(MAX_PENDING_CODES * 2) {
+            store
+                .create("ch".to_string(), "spammer".to_string())
+                .unwrap();
+        }
+
+        assert!(
+            store
+                .create("ch".to_string(), "honest".to_string())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_oldest_code_of_a_full_session_stops_working() {
+        let store = CliLoginStore::new();
+        let verifier = TEST_VERIFIER;
+        let codes: Vec<String> = (0..=MAX_PENDING_CODES_PER_SESSION)
+            .map(|_| {
+                store
+                    .create(pkce_challenge_s256(verifier), "session-abc".to_string())
+                    .unwrap()
+            })
+            .collect();
+
+        assert!(
+            store
+                .redeem(&codes[0], verifier)
+                .is_none()
+        );
+        for code in &codes[1..] {
+            assert_eq!(
+                store
+                    .redeem(code, verifier)
+                    .as_deref(),
+                Some("session-abc")
+            );
+        }
+    }
+
+    async fn test_storage(status: UserStatus) -> (Arc<PasskeyStorage>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = PasskeyStorage::new(
+            dir.path()
+                .join("passkeys")
+                .to_string_lossy()
+                .to_string(),
+            dir.path()
+                .join("avatars")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        storage
+            .save_user(&UserData {
+                user_id: "user-1".to_string(),
+                username: "alice".to_string(),
+                passkeys: Vec::new(),
+                role: UserRole::User,
+                status,
+                is_primary: false,
+                first_name: None,
+                last_name: None,
+                email: None,
+                department: None,
+                job_title: None,
+                avatar_path: None,
+                created_at: now,
+                updated_at: now,
+                last_logged_in: None,
+                saml_id: None,
+            })
+            .await
+            .unwrap();
+        (Arc::new(storage), dir)
+    }
+
+    async fn app_with_status(status: UserStatus) -> (Router, String, tempfile::TempDir) {
+        let (storage, dir) = test_storage(status).await;
+        let manager = Arc::new(SessionManager::new());
+        let token = manager
+            .create_session("alice".to_string(), "user-1".to_string())
+            .await;
+        (cli_login_router(manager, storage), token, dir)
+    }
+
+    async fn approved_app() -> (Router, String, tempfile::TempDir) {
+        app_with_status(UserStatus::Approved).await
     }
 
     fn authorize_uri(port: u16) -> String {
@@ -654,7 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_rejects_privileged_ports_and_accepts_1024() {
-        let router = cli_login_router(Arc::new(SessionManager::new()));
+        let (router, _token, _storage_dir) = approved_app().await;
 
         for port in [0, 80, 1023] {
             let response = get_authorize(&router, port, None).await;
@@ -670,7 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_rejects_a_challenge_of_the_wrong_length() {
-        let router = cli_login_router(Arc::new(SessionManager::new()));
+        let (router, _token, _storage_dir) = approved_app().await;
         let response = router
             .oneshot(
                 Request::builder()
@@ -685,19 +831,21 @@ mod tests {
 
     #[tokio::test]
     async fn consent_answers_429_when_the_pending_cap_is_reached() {
+        let (storage, _storage_dir) = test_storage(UserStatus::Approved).await;
         let manager = Arc::new(SessionManager::new());
         let token = manager
             .create_session("alice".to_string(), "user-1".to_string())
             .await;
         let store = Arc::new(CliLoginStore::new());
-        for _ in 0..MAX_PENDING_CODES {
+        for index in 0..MAX_PENDING_CODES {
             store
-                .create("ch".to_string(), "session".to_string())
+                .create("ch".to_string(), format!("session-{index}"))
                 .unwrap();
         }
         let router = Router::new()
             .route("/auth/cli/consent", post(consent))
             .layer(Extension(manager))
+            .layer(Extension(storage))
             .layer(Extension(store));
 
         let response = post_consent(&router, consent_body(52111), Some(&token), &SAME_ORIGIN_JSON).await;
@@ -705,12 +853,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorize_with_a_session_redirects_to_consent_without_issuing_a_code() {
+    async fn consent_rejects_a_user_who_is_not_approved() {
+        for status in [UserStatus::New, UserStatus::Disabled] {
+            let (router, token, _storage_dir) = app_with_status(status).await;
+            let response = post_consent(&router, consent_body(52111), Some(&token), &SAME_ORIGIN_JSON).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn consent_rejects_a_session_pending_terms_acceptance_and_issues_no_code() {
+        let (storage, _storage_dir) = test_storage(UserStatus::Approved).await;
         let manager = Arc::new(SessionManager::new());
         let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
+            .create_session_with_terms_gate("alice".to_string(), "user-1".to_string(), TermsSessionGate::ConsentPending)
             .await;
-        let router = cli_login_router(manager);
+        let store = Arc::new(CliLoginStore::new());
+        let router = Router::new()
+            .route("/auth/cli/consent", post(consent))
+            .layer(Extension(manager))
+            .layer(Extension(storage))
+            .layer(Extension(store.clone()));
+
+        let response = post_consent(&router, consent_body(52111), Some(&token), &SAME_ORIGIN_JSON).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(store.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authorize_with_a_session_redirects_to_consent_without_issuing_a_code() {
+        let (router, token, _storage_dir) = approved_app().await;
 
         let response = get_authorize(&router, 52111, Some(&token)).await;
         let target = location(&response);
@@ -720,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_requires_a_session() {
-        let router = cli_login_router(Arc::new(SessionManager::new()));
+        let (router, _token, _storage_dir) = approved_app().await;
         let response = post_consent(&router, consent_body(52111), None, &SAME_ORIGIN_JSON).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
@@ -730,11 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_rejects_cross_origin_requests() {
-        let manager = Arc::new(SessionManager::new());
-        let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
-            .await;
-        let router = cli_login_router(manager);
+        let (router, token, _storage_dir) = approved_app().await;
 
         let cases: [&[(&str, &str)]; 4] = [
             &[("content-type", "application/json"), ("sec-fetch-site", "cross-site")],
@@ -750,11 +918,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_accepts_a_matching_origin_and_host_without_fetch_metadata() {
-        let manager = Arc::new(SessionManager::new());
-        let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
-            .await;
-        let router = cli_login_router(manager);
+        let (router, token, _storage_dir) = approved_app().await;
 
         let headers = [
             ("content-type", "application/json; charset=utf-8"),
@@ -767,11 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_rejects_non_json_content_types() {
-        let manager = Arc::new(SessionManager::new());
-        let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
-            .await;
-        let router = cli_login_router(manager);
+        let (router, token, _storage_dir) = approved_app().await;
 
         for content_type in ["text/plain", "application/x-www-form-urlencoded"] {
             let headers = [("content-type", content_type), ("sec-fetch-site", "same-origin")];
@@ -785,11 +945,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_rejects_invalid_port_state_and_challenge() {
-        let manager = Arc::new(SessionManager::new());
-        let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
-            .await;
-        let router = cli_login_router(manager);
+        let (router, token, _storage_dir) = approved_app().await;
 
         let bad_bodies = [
             consent_body(80),
@@ -809,11 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_returns_a_pinned_loopback_redirect_with_a_single_use_code() {
-        let manager = Arc::new(SessionManager::new());
-        let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
-            .await;
-        let router = cli_login_router(manager);
+        let (router, token, _storage_dir) = approved_app().await;
 
         let response = post_consent(&router, consent_body(52111), Some(&token), &SAME_ORIGIN_JSON).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -845,18 +997,14 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_rejects_a_code_that_is_not_36_characters() {
-        let router = cli_login_router(Arc::new(SessionManager::new()));
+        let (router, _token, _storage_dir) = approved_app().await;
         let response = post_exchange(&router, "short", TEST_VERIFIER).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn exchange_rejects_an_invalid_verifier_before_redeeming() {
-        let manager = Arc::new(SessionManager::new());
-        let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
-            .await;
-        let router = cli_login_router(manager);
+        let (router, token, _storage_dir) = approved_app().await;
         let response = post_consent(&router, consent_body(52111), Some(&token), &SAME_ORIGIN_JSON).await;
         let code = code_from_redirect(&consent_redirect_url(response).await);
 
@@ -870,11 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_flow_through_mounted_routes() {
-        let manager = Arc::new(SessionManager::new());
-        let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
-            .await;
-        let router = cli_login_router(manager);
+        let (router, token, _storage_dir) = approved_app().await;
 
         let bounce = get_authorize(&router, 52111, None).await;
         assert!(

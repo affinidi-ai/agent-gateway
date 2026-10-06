@@ -1,16 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { apiClient } from '../../api';
+import type { CliLoginRequest } from '../../types';
 
 const MIN_LOOPBACK_PORT = 1024;
 const MAX_LOOPBACK_PORT = 65535;
 const MAX_STATE_LENGTH = 256;
 const CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
-
-export interface CliLoginRequest {
-  port: number;
-  state: string;
-  challenge: string;
-}
 
 export type CliConsentStatus = 'loading' | 'ready' | 'submitting' | 'redirecting' | 'cancelled';
 
@@ -75,11 +70,7 @@ export function useCliConsent(search: string) {
     setError(null);
     setStatus('submitting');
     try {
-      const response = await apiClient.fetch('/api/auth/cli/consent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-      });
+      const response = await apiClient.cliConsent(request);
       if (!response.ok) {
         setError(consentFailureMessage(response.status));
         setStatus('ready');

@@ -9,6 +9,7 @@ import {
 import styles from './LoginPage.module.css';
 import { apiClient, sessionManager } from '../api';
 import { ROUTES } from '../routes';
+import { safeNextTarget } from '../utils/loginNextTarget';
 import { RegistrationTerms } from './RegistrationTerms';
 import { useRegistrationTerms } from './useRegistrationTerms';
 
@@ -16,21 +17,11 @@ interface LoginPageProps {
   onLogin: () => void;
 }
 
-// Resolving against the origin also rejects backslash tricks like `/\evil.com`.
-function safeNextTarget(): string | null {
-  const next = new URLSearchParams(window.location.search).get('next');
-  if (!next || !next.startsWith('/') || next.startsWith('//')) {
-    return null;
-  }
-  try {
-    const resolved = new URL(next, window.location.origin);
-    if (resolved.origin === window.location.origin) {
-      return next;
-    }
-  } catch {
-    return null;
-  }
-  return null;
+function nextTargetFromLocation(): string | null {
+  return safeNextTarget(
+    new URLSearchParams(window.location.search).get('next'),
+    window.location.origin
+  );
 }
 
 const COPY = {
@@ -204,7 +195,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
 
     if (authMode === 'saml') {
       await new Promise(resolve => setTimeout(resolve, 100));
-      const next = safeNextTarget();
+      const next = nextTargetFromLocation();
       window.location.href = next
         ? `/api/saml/login?next=${encodeURIComponent(next)}`
         : '/api/saml/login';
@@ -213,7 +204,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
 
     try {
       await authenticateWithPasskey(username);
-      const next = safeNextTarget();
+      const next = nextTargetFromLocation();
       if (next) {
         window.location.href = next;
         return;

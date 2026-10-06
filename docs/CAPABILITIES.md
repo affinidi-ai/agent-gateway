@@ -385,7 +385,12 @@ user chooses Allow does the dashboard request a short-lived, single-use code and
 `127.0.0.1`. Cancel issues nothing. The CLI redeems the code with its PKCE verifier at
 `/api/auth/cli/exchange`, so the session token never appears in a URL. The loopback port must
 be 1024 or higher, the challenge is a 43 character S256 value, and the verifier is 43 to 128
-characters as defined in RFC 7636.
+characters as defined in RFC 7636. The consent page and its API must be served from the same
+origin: the consent request is accepted only when `Sec-Fetch-Site` is `same-origin`, or when
+`Origin` equals `Host` for clients that do not send it. The user must also be approved. After
+sign-in, the browser returns only to the dashboard root or the CLI authorize path, and for SAML
+that return target travels in `RelayState`. A session holds at most three pending codes, and a
+new request replaces the oldest.
 
 Known limitations: the login hands the CLI the browser's own session, and the code store is in
 memory so it works with one gateway instance.

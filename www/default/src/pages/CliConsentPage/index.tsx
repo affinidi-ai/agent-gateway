@@ -80,7 +80,7 @@ const CliConsentPage: React.FC = () => {
             className="flex-fill"
             onClick={cancel}
             disabled={busy}
-            data-testid="cli-consent-cancel"
+            data-testid="cli-consent-cancel-button"
           >
             Cancel
           </AppButton>
@@ -89,7 +89,7 @@ const CliConsentPage: React.FC = () => {
             className="flex-fill"
             onClick={() => void allow()}
             disabled={busy || !username}
-            data-testid="cli-consent-allow"
+            data-testid="cli-consent-allow-button"
           >
             {busy ? 'Allowing…' : 'Allow'}
           </AppButton>

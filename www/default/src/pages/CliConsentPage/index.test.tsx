@@ -4,7 +4,7 @@ import { apiClient } from '../../api';
 import CliConsentPage from '.';
 
 jest.mock('../../api', () => ({
-  apiClient: { fetch: jest.fn() },
+  apiClient: { fetch: jest.fn(), cliConsent: jest.fn() },
 }));
 
 const CHALLENGE = 'a'.repeat(43);
@@ -30,23 +30,17 @@ function jsonResponse(body: unknown, status = 200) {
 beforeEach(() => {
   jest.resetAllMocks();
   setLocation(VALID_SEARCH);
-  (apiClient.fetch as jest.Mock).mockImplementation(async (url: string) => {
-    if (url === '/api/auth/check') {
-      return jsonResponse({ authenticated: true, username: 'alice' });
-    }
-    return jsonResponse({ redirect_url: REDIRECT_URL });
-  });
+  (apiClient.fetch as jest.Mock).mockResolvedValue(
+    jsonResponse({ authenticated: true, username: 'alice' })
+  );
+  (apiClient.cliConsent as jest.Mock).mockResolvedValue(
+    jsonResponse({ redirect_url: REDIRECT_URL })
+  );
 });
 
 afterEach(() => {
   Object.defineProperty(window, 'location', { configurable: true, value: originalLocation });
 });
-
-function consentCalls() {
-  return (apiClient.fetch as jest.Mock).mock.calls.filter(
-    ([url]) => url === '/api/auth/cli/consent'
-  );
-}
 
 test('shows the signed-in username and the loopback port', async () => {
   render(<CliConsentPage />);
@@ -56,53 +50,60 @@ test('shows the signed-in username and the loopback port', async () => {
   expect(screen.getByText('Allow the CLI to sign in as you?')).toBeInTheDocument();
 });
 
-test('Allow posts the request as JSON and sends the browser to the returned loopback URL', async () => {
+test('Allow sends the request and sends the browser to the returned loopback URL', async () => {
   render(<CliConsentPage />);
 
-  fireEvent.click(await screen.findByTestId('cli-consent-allow'));
+  fireEvent.click(await screen.findByTestId('cli-consent-allow-button'));
 
   await waitFor(() => expect(window.location.href).toBe(REDIRECT_URL));
-  const [, init] = consentCalls()[0];
-  expect(init.method).toBe('POST');
-  expect(init.headers).toEqual({ 'Content-Type': 'application/json' });
-  expect(JSON.parse(init.body)).toEqual({ port: 52111, state: 'state-123', challenge: CHALLENGE });
+  expect(apiClient.cliConsent).toHaveBeenCalledWith({
+    port: 52111,
+    state: 'state-123',
+    challenge: CHALLENGE,
+  });
 });
 
 test('Allow refuses a redirect that does not point at the requested loopback port', async () => {
-  (apiClient.fetch as jest.Mock).mockImplementation(async (url: string) =>
-    url === '/api/auth/check'
-      ? jsonResponse({ authenticated: true, username: 'alice' })
-      : jsonResponse({ redirect_url: 'https://evil.example/callback?code=x' })
+  (apiClient.cliConsent as jest.Mock).mockResolvedValue(
+    jsonResponse({ redirect_url: 'https://evil.example/callback?code=x' })
   );
   render(<CliConsentPage />);
 
-  fireEvent.click(await screen.findByTestId('cli-consent-allow'));
+  fireEvent.click(await screen.findByTestId('cli-consent-allow-button'));
 
   expect(await screen.findByTestId('cli-consent-error')).toBeInTheDocument();
   expect(window.location.href).not.toContain('evil.example');
 });
 
-test('shows an error and allows a retry when the endpoint fails', async () => {
-  (apiClient.fetch as jest.Mock).mockImplementation(async (url: string) =>
-    url === '/api/auth/check'
-      ? jsonResponse({ authenticated: true, username: 'alice' })
-      : new Response('too many', { status: 429 })
-  );
+test('Allow refuses a redirect to port 52111 when port 5211 was requested', async () => {
+  const lookalike = 'http://127.0.0.1:52111/callback?code=x&state=state-123';
+  setLocation(`?port=5211&state=state-123&challenge=${CHALLENGE}`);
+  (apiClient.cliConsent as jest.Mock).mockResolvedValue(jsonResponse({ redirect_url: lookalike }));
   render(<CliConsentPage />);
 
-  fireEvent.click(await screen.findByTestId('cli-consent-allow'));
+  fireEvent.click(await screen.findByTestId('cli-consent-allow-button'));
+
+  expect(await screen.findByTestId('cli-consent-error')).toBeInTheDocument();
+  expect(window.location.href).not.toBe(lookalike);
+});
+
+test('shows an error and allows a retry when the endpoint fails', async () => {
+  (apiClient.cliConsent as jest.Mock).mockResolvedValue(new Response('too many', { status: 429 }));
+  render(<CliConsentPage />);
+
+  fireEvent.click(await screen.findByTestId('cli-consent-allow-button'));
 
   expect(await screen.findByTestId('cli-consent-error')).toHaveTextContent('Too many sign-ins');
-  expect(screen.getByTestId('cli-consent-allow')).toBeEnabled();
+  expect(screen.getByTestId('cli-consent-allow-button')).toBeEnabled();
 });
 
 test('Cancel shows the close tab message and never calls the consent endpoint', async () => {
   render(<CliConsentPage />);
 
-  fireEvent.click(await screen.findByTestId('cli-consent-cancel'));
+  fireEvent.click(await screen.findByTestId('cli-consent-cancel-button'));
 
   expect(screen.getByTestId('cli-consent-cancelled')).toHaveTextContent('You can close this tab');
-  expect(consentCalls()).toHaveLength(0);
+  expect(apiClient.cliConsent).not.toHaveBeenCalled();
 });
 
 test.each([
@@ -117,6 +118,6 @@ test.each([
   render(<CliConsentPage />);
 
   expect(await screen.findByTestId('cli-consent-invalid')).toBeInTheDocument();
-  expect(screen.queryByTestId('cli-consent-allow')).not.toBeInTheDocument();
+  expect(screen.queryByTestId('cli-consent-allow-button')).not.toBeInTheDocument();
   expect(apiClient.fetch).not.toHaveBeenCalled();
 });

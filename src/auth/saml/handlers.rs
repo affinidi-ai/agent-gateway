@@ -73,19 +73,28 @@ pub struct SamlLoginQuery {
     pub next: Option<String>,
 }
 
-/// Rejects off-origin and protocol-relative targets and any character that could break out of the ACS markup.
-pub(crate) fn is_safe_relative_path(path: &str) -> bool {
-    let lowered = path.to_ascii_lowercase();
-    if lowered.contains("%2f") || lowered.contains("%5c") || path.contains('\\') {
+const CLI_AUTHORIZE_PATH: &str = "/api/auth/cli/authorize";
+
+/// Only the dashboard root and the CLI authorize path (with its query) may be a return target.
+/// Anything else, including off-origin and protocol-relative targets and characters that could
+/// break out of the ACS markup, is rejected.
+pub(crate) fn is_allowed_return_target(target: &str) -> bool {
+    let lowered = target.to_ascii_lowercase();
+    if lowered.contains("%2f") || lowered.contains("%5c") {
         return false;
     }
-    path.starts_with('/')
-        && !path.starts_with("//")
-        && path.len() <= 1024
-        && path.bytes().all(|b| {
+    let charset_ok = target.len() <= 1024
+        && target.bytes().all(|b| {
             b.is_ascii_alphanumeric()
                 || matches!(b, b'-' | b'_' | b'.' | b'/' | b'?' | b'&' | b'=' | b'%' | b'~' | b':' | b'+')
-        })
+        });
+    if !charset_ok {
+        return false;
+    }
+    match target.split_once('?') {
+        None => target == "/",
+        Some((path, query)) => path == CLI_AUTHORIZE_PATH && !query.is_empty(),
+    }
 }
 
 /// Initiate SAML login (SP-initiated flow)
@@ -99,7 +108,7 @@ pub async fn saml_login(
     let relay_state = query
         .next
         .as_deref()
-        .filter(|next| is_safe_relative_path(next));
+        .filter(|next| is_allowed_return_target(next));
 
     // Create authentication request
     let authn_request = saml_state
@@ -141,6 +150,35 @@ fn saml_error_page(
         message = escape(message),
     );
     (status, Html(html)).into_response()
+}
+
+fn acs_success_html(
+    redirect_target: &str,
+    session_token: &str,
+) -> String {
+    let redirect_target_js = serde_json::to_string(redirect_target).unwrap_or_else(|_| "\"/\"".to_string());
+    let redirect_target_attr = redirect_target
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+
+    format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Login Successful</title>
+    <meta http-equiv="refresh" content="0;url={redirect_target_attr}">
+    <script>
+        sessionStorage.setItem('session_token', '{session_token}');
+        window.location.href = {redirect_target_js};
+    </script>
+</head>
+<body>
+    <p>Login successful. Redirecting...</p>
+</body>
+</html>"#
+    )
 }
 
 /// Assertion Consumer Service - receives SAML response from Azure AD
@@ -238,36 +276,10 @@ pub async fn saml_acs(
     let redirect_target = form
         .relay_state
         .as_deref()
-        .filter(|target| is_safe_relative_path(target))
+        .filter(|target| is_allowed_return_target(target))
         .unwrap_or("/");
 
-    let redirect_target_js = serde_json::to_string(redirect_target).unwrap_or_else(|_| "\"/\"".to_string());
-    let redirect_target_attr = redirect_target
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-
-    // Return HTML with cookie and redirect
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Login Successful</title>
-    <meta http-equiv="refresh" content="0;url={redirect_target_attr}">
-    <script>
-        sessionStorage.setItem('session_token', '{token}');
-        window.location.href = {redirect_target_js};
-    </script>
-</head>
-<body>
-    <p>Login successful. Redirecting...</p>
-</body>
-</html>"#,
-        redirect_target_attr = redirect_target_attr,
-        redirect_target_js = redirect_target_js,
-        token = finalized_session.session_token
-    );
+    let html = acs_success_html(redirect_target, &finalized_session.session_token);
 
     Ok((finalized_session.headers, Html(html)).into_response())
 }
@@ -410,27 +422,152 @@ pub async fn saml_logout_generic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::auth_config::{SamlAttributeMapping, SamlConfig};
+    use axum::http::header::LOCATION;
+    use std::collections::HashMap;
+
+    const CLI_TARGET: &str = "/api/auth/cli/authorize?port=52111&state=st&challenge=ch";
 
     #[test]
-    fn safe_relative_path_accepts_cli_authorize_target() {
-        assert!(is_safe_relative_path("/api/auth/cli/authorize?port=52111&state=st&challenge=ch"));
-        assert!(is_safe_relative_path("/"));
+    fn return_target_accepts_the_dashboard_root_and_cli_authorize() {
+        assert!(is_allowed_return_target("/"));
+        assert!(is_allowed_return_target(CLI_TARGET));
+        assert!(is_allowed_return_target("/api/auth/cli/authorize?port=52111&state=a%20b&challenge=ch"));
     }
 
     #[test]
-    fn safe_relative_path_rejects_off_origin_targets() {
-        assert!(!is_safe_relative_path("//evil.example"));
-        assert!(!is_safe_relative_path("https://evil.example"));
-        assert!(!is_safe_relative_path("/\\evil.example"));
-        assert!(!is_safe_relative_path("/%2fevil.example"));
-        assert!(!is_safe_relative_path("/%5Cevil.example"));
-        assert!(!is_safe_relative_path("evil.example"));
+    fn return_target_rejects_paths_outside_the_allow_list() {
+        assert!(!is_allowed_return_target("/settings"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize/extra?port=1"));
+        assert!(!is_allowed_return_target("/?port=52111"));
+        assert!(!is_allowed_return_target("/api/v1/secrets?x=1"));
     }
 
     #[test]
-    fn safe_relative_path_rejects_markup_and_script_characters() {
-        assert!(!is_safe_relative_path("/a\"</script><script>alert(1)"));
-        assert!(!is_safe_relative_path("/a'b"));
-        assert!(!is_safe_relative_path("/a b"));
+    fn return_target_rejects_off_origin_targets() {
+        assert!(!is_allowed_return_target("//evil.example"));
+        assert!(!is_allowed_return_target("https://evil.example"));
+        assert!(!is_allowed_return_target("/\\evil.example"));
+        assert!(!is_allowed_return_target("/%2fevil.example"));
+        assert!(!is_allowed_return_target("/%5Cevil.example"));
+        assert!(!is_allowed_return_target("evil.example"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?next=%2f%2fevil.example"));
+    }
+
+    #[test]
+    fn return_target_rejects_markup_and_control_characters() {
+        assert!(!is_allowed_return_target("/a\"</script><script>alert(1)"));
+        assert!(!is_allowed_return_target("/a'b"));
+        assert!(!is_allowed_return_target("/a b"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1<"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1>"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1\n"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1\u{7f}"));
+    }
+
+    #[test]
+    fn acs_html_redirects_to_the_target_in_markup_and_script() {
+        let html = acs_success_html(CLI_TARGET, "tok-1");
+
+        assert!(html.contains("content=\"0;url=/api/auth/cli/authorize?port=52111&amp;state=st&amp;challenge=ch\""));
+        assert!(html.contains("window.location.href = \"/api/auth/cli/authorize?port=52111&state=st&challenge=ch\";"));
+        assert!(html.contains("sessionStorage.setItem('session_token', 'tok-1');"));
+    }
+
+    #[test]
+    fn acs_html_escapes_a_hostile_target_in_the_meta_refresh() {
+        let html = acs_success_html("/a\"><script>x</script>", "tok-1");
+
+        assert!(html.contains("content=\"0;url=/a&quot;&gt;&lt;script&gt;x&lt;/script&gt;\""));
+    }
+
+    async fn saml_state(dir: &std::path::Path) -> Arc<SamlState> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::default()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.join("idp.crt");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        let config = SamlConfig {
+            idp_entity_id: "test-idp".to_string(),
+            idp_sso_url: "https://idp.example.test/sso".to_string(),
+            idp_slo_url: None,
+            sp_entity_id: "test-sp".to_string(),
+            sp_acs_url: "https://sp.example.test/saml/acs".to_string(),
+            idp_cert_path: cert_path
+                .to_string_lossy()
+                .to_string(),
+            attribute_mapping: SamlAttributeMapping::default(),
+            role_mapping: HashMap::new(),
+            require_encrypted_assertions: false,
+            sign_requests: false,
+            sp_key_path: None,
+            sp_cert_path: None,
+            graph_api: None,
+        };
+        let avatars = dir
+            .join("avatars")
+            .to_string_lossy()
+            .to_string();
+        Arc::new(SamlState {
+            saml_service: Arc::new(SamlService::new(config).unwrap()),
+            storage: Arc::new(
+                PasskeyStorage::new(
+                    dir.join("passkeys")
+                        .to_string_lossy()
+                        .to_string(),
+                    avatars.clone(),
+                )
+                .await
+                .unwrap(),
+            ),
+            session_manager: Arc::new(SessionManager::new()),
+            avatars_storage_path: avatars,
+            notification_store: Arc::new(tokio::sync::RwLock::new(None)),
+            terms_manager: Arc::new(crate::terms::TermsManager::disabled()),
+        })
+    }
+
+    async fn login_location(
+        state: Arc<SamlState>,
+        next: Option<&str>,
+    ) -> String {
+        let redirect = saml_login(State(state), Query(SamlLoginQuery { next: next.map(str::to_string) }))
+            .await
+            .unwrap();
+        redirect
+            .into_response()
+            .headers()
+            .get(LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn saml_login_carries_an_allowed_target_in_relay_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+
+        let location = login_location(state, Some(CLI_TARGET)).await;
+
+        assert!(location.starts_with("https://idp.example.test/sso?SAMLRequest="));
+        assert!(location.ends_with(&format!("&RelayState={}", urlencoding::encode(CLI_TARGET))));
+    }
+
+    #[tokio::test]
+    async fn saml_login_drops_a_target_outside_the_allow_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+
+        for next in ["//evil.example", "/settings", "https://evil.example"] {
+            let location = login_location(state.clone(), Some(next)).await;
+            assert!(!location.contains("RelayState"), "{next}");
+        }
+        let location = login_location(state, None).await;
+        assert!(!location.contains("RelayState"));
     }
 }

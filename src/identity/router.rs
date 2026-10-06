@@ -2184,8 +2184,10 @@ pub fn create_identity_api_router(
         },
     );
 
-    let cli_login_router = if let Some(sess_mgr) = session_manager_for_manager.as_ref() {
-        crate::auth::cli_login::cli_login_router(sess_mgr.clone())
+    let cli_login_router = if let (Some(sess_mgr), Some(storage)) =
+        (session_manager_for_manager.as_ref(), passkey_storage_for_manager.as_ref())
+    {
+        crate::auth::cli_login::cli_login_router(sess_mgr.clone(), storage.clone())
     } else {
         Router::new()
     };
