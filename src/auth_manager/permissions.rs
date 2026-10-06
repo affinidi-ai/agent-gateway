@@ -1,4 +1,5 @@
 use crate::auth::storage::PasskeyStorage;
+use crate::auth_manager::middleware::pat_scope_allows;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext};
 use crate::rbac::Feature;
 use axum::{
@@ -222,19 +223,12 @@ pub async fn get_permissions(
         ("terms.edit", Feature::TermsEdit),
     ];
 
-    let token_scopes = pat.and_then(|Extension(PatContext(scopes))| scopes);
+    let pat = pat.map(|Extension(context)| context);
 
     let mut permissions = serde_json::Map::new();
     for (name, feature) in features {
         // Match on the canonical feature name so aliases like `departments.view` follow `issuers.view`.
-        let granted = rbac_config.has_permission(&user_data.role, &feature)
-            && token_scopes
-                .as_ref()
-                .is_none_or(|scopes| {
-                    scopes
-                        .iter()
-                        .any(|scope| scope == feature.as_str())
-                });
+        let granted = rbac_config.has_permission(&user_data.role, &feature) && pat_scope_allows(pat.as_ref(), &feature);
         permissions.insert(name.to_string(), serde_json::Value::Bool(granted));
     }
 
