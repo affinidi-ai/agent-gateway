@@ -1,0 +1,14 @@
+CODEOWNERS
+  h_218db94655109c 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ffd69842b840ad94a734d7e34d23b5fc881dd8f7",
+  "prompts": {},
+  "humans": {
+    "h_218db94655109c": {
+      "author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
