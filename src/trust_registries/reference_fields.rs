@@ -352,6 +352,61 @@ pub fn authority_reference_value(authority: &Authority) -> Option<ReferenceField
     )
 }
 
+/// Authority field for a DID written as a record's `authority_id`: the Authority
+/// register entry with that DID, else the Issuer with that DID.
+pub async fn authority_value_for_did(
+    did: &str,
+    authorities: Option<&dyn AuthorityStore>,
+    issuers: Option<&dyn IssuerStore>,
+) -> Option<ReferenceFieldValue> {
+    if let Some(authority) = find_authority(did, authorities).await {
+        return authority_reference_value(&authority);
+    }
+    let issuer = find_issuer(did, issuers).await?;
+    named_value(ReferenceFieldType::Authority, &issuer.did, &issuer.name, issuer.description.as_deref())
+}
+
+/// Entity field for an Issuer DID written as a record's `entity_id`.
+pub async fn issuer_entity_value_for_did(
+    did: &str,
+    issuers: Option<&dyn IssuerStore>,
+) -> Option<ReferenceFieldValue> {
+    let issuer = find_issuer(did, issuers).await?;
+    named_value(ReferenceFieldType::Entity, &issuer.did, &issuer.name, issuer.description.as_deref())
+}
+
+async fn find_authority(
+    did: &str,
+    authorities: Option<&dyn AuthorityStore>,
+) -> Option<Authority> {
+    match authorities?
+        .find_by_did(did)
+        .await
+    {
+        Ok(authority) => authority,
+        Err(e) => {
+            warn!(did, error = %e, "Authority lookup for reference field failed");
+            None
+        }
+    }
+}
+
+async fn find_issuer(
+    did: &str,
+    issuers: Option<&dyn IssuerStore>,
+) -> Option<Issuer> {
+    match issuers?
+        .find_by_did(did)
+        .await
+    {
+        Ok(issuer) => issuer,
+        Err(e) => {
+            warn!(did, error = %e, "Issuer lookup for reference field failed");
+            None
+        }
+    }
+}
+
 /// Trust registries the authority's issuers are registered with.
 pub fn registries_for_authority(
     authority: &Authority,
@@ -378,6 +433,7 @@ pub fn registries_for_authority(
 pub fn surface_reference_values(
     surface: &AgentSurface,
     records: &[AgentIdentityRecord],
+    card_name: Option<&str>,
 ) -> Vec<ReferenceFieldValue> {
     let mut by_did: Vec<_> = surfaces_by_did(records)
         .into_iter()
@@ -387,7 +443,7 @@ pub fn surface_reference_values(
     by_did
         .into_iter()
         .filter_map(|(did, surfaces)| {
-            resolve_managed_display_name(surface, &surfaces)
+            resolve_managed_display_name(surface, &surfaces, card_name)
                 .publishable(&did)
                 .map(|name| ReferenceFieldValue::entity(&did, name.clone()))
         })
@@ -425,8 +481,8 @@ pub fn spawn_authority_publish(
     });
 }
 
-/// Republish the entity fields of a renamed surface's managed DIDs to the trust
-/// registries its Trust Recorder writes to.
+/// Republish the entity fields of a surface's managed DIDs to the trust registries its
+/// Trust Recorder writes to, after the surface or its target Agent Card name changed.
 pub fn spawn_surface_rename_publish(surface: AgentSurface) {
     let Some(recorder) = surface
         .trust_recorder()
@@ -456,7 +512,10 @@ pub fn spawn_surface_rename_publish(surface: AgentSurface) {
                 return;
             }
         };
-        let values = surface_reference_values(&surface, &records);
+        let card_name = crate::identity::target_card_names::TargetCardNameService::global()
+            .name_for(&surface)
+            .await;
+        let values = surface_reference_values(&surface, &records, card_name.as_deref());
         if values.is_empty() {
             return;
         }
@@ -466,6 +525,23 @@ pub fn spawn_surface_rename_publish(surface: AgentSurface) {
         ReferenceFieldPublisher::global()
             .publish_all(manager.as_ref(), &tr_dids, &values)
             .await;
+    });
+}
+
+/// Republish the entity fields of `surface_id` after its target Agent Card name changed.
+pub fn spawn_surface_name_republish(surface_id: String) {
+    let Some(store) = crate::gateways::connection_points::get_agent_surface_store() else {
+        return;
+    };
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        match store.get(&surface_id).await {
+            Ok(Some(surface)) => spawn_surface_rename_publish(surface),
+            Ok(None) => {}
+            Err(e) => warn!(surface_id, error = %e, "Surface lookup for Agent Card name republish failed"),
+        }
     });
 }
 
@@ -599,6 +675,102 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    async fn stores_with(
+        authorities: &[Authority],
+        issuers: &[Issuer],
+    ) -> (crate::authorities::FileSystemAuthorityStore, crate::issuers::FileSystemIssuerStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let authority_store = crate::authorities::FileSystemAuthorityStore::new(dir.path().join("authorities"))
+            .await
+            .unwrap();
+        let issuer_store = crate::issuers::FileSystemIssuerStore::new(dir.path().join("issuers"))
+            .await
+            .unwrap();
+        for a in authorities {
+            authority_store
+                .create(a)
+                .await
+                .unwrap();
+        }
+        for i in issuers {
+            issuer_store
+                .create(i)
+                .await
+                .unwrap();
+        }
+        (authority_store, issuer_store, dir)
+    }
+
+    #[tokio::test]
+    async fn authority_value_for_did_names_an_authority_register_entry() {
+        let (authorities, issuers, _dir) = stores_with(&[authority("ABC Authority")], &[]).await;
+
+        let value = authority_value_for_did("did:web:authority", Some(&authorities), Some(&issuers))
+            .await
+            .unwrap();
+
+        assert_eq!(value.field_type, ReferenceFieldType::Authority);
+        assert_eq!(value.id, "did:web:authority");
+        assert_eq!(value.name.as_str(), "ABC Authority");
+        assert_eq!(value.description.as_deref(), Some("Root of trust"));
+    }
+
+    #[tokio::test]
+    async fn authority_value_for_did_names_an_issuer_used_as_authority() {
+        let gateway_did = "did:web:gateway";
+        let issuer_did = "did:web:gateway:issuers:abc";
+        let (authorities, issuers, _dir) = stores_with(&[], &[issuer(issuer_did, Some(gateway_did), None)]).await;
+
+        let value = authority_value_for_did(issuer_did, Some(&authorities), Some(&issuers))
+            .await
+            .unwrap();
+
+        assert_eq!(value.field_type, ReferenceFieldType::Authority);
+        assert_eq!(value.id, issuer_did);
+        assert_eq!(value.name.as_str(), "Billing Issuer");
+        assert!(
+            authority_value_for_did(gateway_did, Some(&authorities), Some(&issuers))
+                .await
+                .is_none(),
+            "an Issuer's registration authority is not the Issuer"
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_value_for_did_is_none_for_unknown_did_or_missing_stores() {
+        let (authorities, issuers, _dir) = stores_with(&[authority("ABC Authority")], &[]).await;
+
+        assert!(
+            authority_value_for_did("did:web:unknown", Some(&authorities), Some(&issuers))
+                .await
+                .is_none()
+        );
+        assert!(
+            authority_value_for_did("did:web:authority", None, None)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_entity_value_for_did_names_the_issuer_as_an_entity() {
+        let issuer_did = "did:web:gateway:issuers:abc";
+        let (_authorities, issuers, _dir) = stores_with(&[], &[issuer(issuer_did, None, None)]).await;
+
+        let value = issuer_entity_value_for_did(issuer_did, Some(&issuers))
+            .await
+            .unwrap();
+
+        assert_eq!(value.field_type, ReferenceFieldType::Entity);
+        assert_eq!(value.id, issuer_did);
+        assert_eq!(value.name.as_str(), "Billing Issuer");
+        assert!(
+            issuer_entity_value_for_did("did:web:unknown", Some(&issuers))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -828,7 +1000,7 @@ mod tests {
         caller.origin = Some(IdentityOrigin::ExternalCaller);
         let unrelated = test_surface_identity_record("did:web:unrelated", "s9");
 
-        let values = surface_reference_values(&surface, &[managed, shared, shared_elsewhere, caller, unrelated]);
+        let values = surface_reference_values(&surface, &[managed, shared, shared_elsewhere, caller, unrelated], None);
 
         assert_eq!(values, vec![ReferenceFieldValue::entity("did:web:managed", DisplayName::parse("OXYGEN").unwrap())]);
     }
@@ -846,7 +1018,7 @@ mod tests {
         let mut managed = test_surface_identity_record("did:web:managed", "s1");
         managed.origin = Some(IdentityOrigin::Managed);
 
-        let values = surface_reference_values(&surface, &[legacy, managed]);
+        let values = surface_reference_values(&surface, &[legacy, managed], None);
 
         assert_eq!(values, vec![ReferenceFieldValue::entity("did:web:managed", DisplayName::parse("OXYGEN").unwrap())]);
     }

@@ -11,12 +11,14 @@ use tracing::error;
 use crate::identity::IdentityStore;
 use crate::identity::display_name::{ManagedDisplayName, resolve_managed_display_name, surfaces_by_did};
 use crate::identity::filesystem::IdentityOrigin;
+use crate::identity::target_card_names::{CardLocation, TargetCardNameService};
 use crate::integrations::filesystem::NotificationStore;
 use crate::mcp_proxies::filesystem::McpProxyStore;
 use crate::metrics::MetricsStore;
 use crate::observability::caller_names::{CallerNameService, DisplayNameSource};
 use crate::observability::identity_view::{
-    CredentialPrincipal, PrincipalNames, credential_principal, group_key, naming_for,
+    CredentialPrincipal, PrincipalNames, credential_principal, group_key, naming_for, view_origin,
+    with_target_card_name,
 };
 use crate::{config::GatewayConfig, observability::system_metrics::SystemInfo};
 
@@ -297,6 +299,8 @@ pub struct IdentityInfo {
     pub display_name_source: Option<DisplayNameSource>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub display_name_verified: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub display_name_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -921,7 +925,11 @@ pub async fn compute_dashboard_delta(
             .changed_since(since)
             .into_iter()
             .collect();
-        let modified_identities = identities_changed_since(all_identities, since, &renamed);
+        let renamed_surfaces: std::collections::HashSet<String> = TargetCardNameService::global()
+            .changed_since(since)
+            .into_iter()
+            .collect();
+        let modified_identities = identities_changed_since(all_identities, since, &renamed, &renamed_surfaces);
 
         if !modified_identities.is_empty() {
             changes.identities = Some(IdentitiesDelta {
@@ -1943,7 +1951,7 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-/// Identities created, last used, or whose caller name changed after `since`.
+/// Identities created, last used, or whose caller or target Agent Card name changed after `since`.
 /// Newly issued identities have `last_used_at = None` until the first usage
 /// event, so falling back to `created_at` surfaces them on the very first
 /// request that creates them.
@@ -1951,6 +1959,7 @@ pub(crate) fn identities_changed_since(
     identities: Vec<IdentityInfo>,
     since: DateTime<Utc>,
     renamed_dids: &std::collections::HashSet<String>,
+    renamed_surfaces: &std::collections::HashSet<String>,
 ) -> Vec<IdentityInfo> {
     identities
         .into_iter()
@@ -1960,6 +1969,10 @@ pub(crate) fn identities_changed_since(
                 .as_deref()
                 .unwrap_or(id.created_at.as_str());
             renamed_dids.contains(&id.did)
+                || id
+                    .surface_id
+                    .as_ref()
+                    .is_some_and(|surface_id| renamed_surfaces.contains(surface_id))
                 || DateTime::parse_from_rfc3339(ts)
                     .ok()
                     .map(|dt| dt.with_timezone(&Utc) > since)
@@ -1980,6 +1993,7 @@ async fn build_identity_list(
         metrics_store,
         agent_surface_store,
         CallerNameService::global(),
+        TargetCardNameService::global(),
     )
     .await
 }
@@ -1990,6 +2004,7 @@ pub(crate) async fn build_identity_list_with(
     metrics_store: &Arc<MetricsStore>,
     agent_surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
     caller_names: &Arc<CallerNameService>,
+    card_names: &Arc<TargetCardNameService>,
 ) -> Result<Vec<IdentityInfo>, (axum::http::StatusCode, String)> {
     let records = identity_store
         .list_all()
@@ -2065,20 +2080,27 @@ pub(crate) async fn build_identity_list_with(
                 });
             let channel_name = surface.map(|s| s.name.clone());
 
-            let origin = r.effective_origin();
+            let origin = view_origin(r.effective_origin(), surface.is_some());
             let managed_surface = surface.filter(|_| origin == Some(IdentityOrigin::Managed));
+            let card_name = managed_surface.and_then(|s| {
+                CardLocation::for_surface(s).and_then(|location| card_names.lookup_or_spawn(&s.surface_id, &location))
+            });
             let managed_name: Option<ManagedDisplayName> = managed_surface.map(|s| {
                 resolve_managed_display_name(
                     s,
                     managed_surfaces_by_did
                         .get(&r.did)
                         .unwrap_or(&no_surfaces),
+                    card_name.as_deref(),
                 )
             });
-            let caller_name = (origin == Some(IdentityOrigin::ExternalCaller))
-                .then(|| caller_names.lookup_or_spawn(&r.did))
-                .flatten();
-            let naming = naming_for(origin, managed_name.as_ref(), caller_name.as_ref());
+            let caller_lookup =
+                (origin == Some(IdentityOrigin::ExternalCaller)).then(|| caller_names.lookup_or_spawn(&r.did));
+            let naming = with_target_card_name(
+                naming_for(origin, managed_name.as_ref(), caller_lookup.as_ref()),
+                origin,
+                card_name,
+            );
             let is_managed = origin == Some(IdentityOrigin::Managed);
             let surface_id = channel_config_id
                 .clone()
@@ -2121,6 +2143,7 @@ pub(crate) async fn build_identity_list_with(
                 display_name: naming.display_name,
                 display_name_source: naming.display_name_source,
                 display_name_verified: naming.display_name_verified,
+                display_name_pending: naming.display_name_pending,
                 surface_id,
                 surface_name,
                 credential_principal: principal,
@@ -2487,9 +2510,10 @@ mod tests {
         use crate::config::agent_surface::AgentSurface;
         use crate::identity::IdentityStore;
         use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin};
+        use crate::identity::target_card_names::{NoTargetCards, TargetCardNameService};
         use crate::identity::test_helpers::{MockIdentityStore, test_surface_identity_record};
         use crate::metrics::MetricsStore;
-        use crate::observability::caller_names::{CallerNameService, CallerNameSources};
+        use crate::observability::caller_names::{CallerNameService, CallerNameSources, DisplayNameSource};
 
         const CALLER_DID: &str = "did:web:acme.com:billing";
 
@@ -2562,12 +2586,19 @@ mod tests {
                     .unwrap();
             }
             let store: Arc<dyn IdentityStore> = Arc::new(store);
-            build_identity_list_with(&store, surfaces, &Arc::new(MetricsStore::new(10)), None, caller_names)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|i| (i.did.clone(), i))
-                .collect()
+            build_identity_list_with(
+                &store,
+                surfaces,
+                &Arc::new(MetricsStore::new(10)),
+                None,
+                caller_names,
+                &Arc::new(TargetCardNameService::new(Arc::new(NoTargetCards))),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.did.clone(), i))
+            .collect()
         }
 
         fn names() -> Arc<CallerNameService> {
@@ -2578,6 +2609,7 @@ mod tests {
             for _ in 0..200 {
                 if caller_names
                     .lookup_or_spawn(CALLER_DID)
+                    .into_name()
                     .is_some()
                 {
                     return;
@@ -2641,6 +2673,7 @@ mod tests {
             let first = serde_json::to_value(&rows[CALLER_DID]).unwrap();
             assert_eq!(first["origin"], json!("external_caller"));
             assert_eq!(first["group_key"], json!(format!("did:{CALLER_DID}")));
+            assert_eq!(first["display_name_pending"], json!(true));
             for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "name_conflict"] {
                 assert!(first.get(absent).is_none(), "{absent} must be omitted for a caller row: {first}");
             }
@@ -2656,6 +2689,31 @@ mod tests {
                     .get("surface_name")
                     .is_none()
             );
+            assert!(
+                named
+                    .get("display_name_pending")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_unstamped_local_row_linked_to_a_surface_is_named_as_managed() {
+            let mut legacy = test_surface_identity_record("did:example:legacy", "oxygen");
+            legacy.origin = None;
+            let mut orphan = test_surface_identity_record("did:example:orphan", "deleted");
+            orphan.origin = None;
+            let rows = list(vec![legacy, orphan], &[surface("oxygen", "OXYGEN")], &names()).await;
+
+            let legacy = &rows["did:example:legacy"];
+            assert_eq!(legacy.origin, Some(IdentityOrigin::Managed));
+            assert_eq!(legacy.display_name.as_deref(), Some("OXYGEN"));
+            assert_eq!(legacy.display_name_source, Some(DisplayNameSource::SurfaceName));
+            assert_eq!(legacy.group_key, "surface:oxygen");
+
+            let orphan = &rows["did:example:orphan"];
+            assert_eq!(orphan.origin, None);
+            assert_eq!(orphan.display_name, None);
+            assert!(!orphan.display_name_pending);
         }
 
         #[tokio::test]
@@ -2729,7 +2787,7 @@ mod tests {
                 .changed_since(since)
                 .into_iter()
                 .collect();
-            assert!(identities_changed_since(rows, since, &renamed).is_empty());
+            assert!(identities_changed_since(rows, since, &renamed, &HashSet::new()).is_empty());
 
             wait_for_caller_name(&caller_names).await;
             let rows: Vec<IdentityInfo> = list(vec![record], &[], &caller_names)
@@ -2740,7 +2798,7 @@ mod tests {
                 .changed_since(since)
                 .into_iter()
                 .collect();
-            let delta = identities_changed_since(rows, since, &renamed);
+            let delta = identities_changed_since(rows, since, &renamed, &HashSet::new());
             assert_eq!(delta.len(), 1);
             assert_eq!(
                 delta[0]

@@ -14,6 +14,7 @@ pub mod router;
 pub mod ssi;
 pub mod state;
 pub mod store;
+pub mod target_card_names;
 #[cfg(test)]
 pub mod test_helpers;
 pub mod utils;

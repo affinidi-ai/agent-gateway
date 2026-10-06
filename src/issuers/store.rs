@@ -34,7 +34,6 @@ pub trait IssuerStore: Send + Sync {
     ) -> Result<()>;
 
     /// Find an issuer by its DID
-    #[allow(dead_code)]
     async fn find_by_did(
         &self,
         did: &str,

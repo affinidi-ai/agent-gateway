@@ -768,7 +768,7 @@ impl VCIssuer {
     }
 
     /// [`Self::issue_or_get_credential`] for the managed agent of `channel_config_id`:
-    /// records the identity as managed and names the VC after the surface.
+    /// records the identity as managed and names the VC with its managed display name.
     pub async fn issue_or_get_managed_credential(
         &self,
         identity_fields: std::collections::HashMap<String, serde_json::Value>,
@@ -946,8 +946,9 @@ impl VCIssuer {
         .await
     }
 
-    /// Surface name for a managed identity; `None` for callers, unknown origins,
-    /// unnamed surfaces and DIDs shared by several surfaces.
+    /// Display name for a managed identity (its target Agent Card name, else its surface
+    /// name); `None` for callers, unknown origins, unnamed agents and DIDs shared by
+    /// several surfaces.
     async fn managed_display_name(
         &self,
         agent_did: &str,

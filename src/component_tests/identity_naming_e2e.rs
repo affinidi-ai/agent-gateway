@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::config::agent_surface::AgentSurface;
 use crate::identity::IdentityStore;
 use crate::identity::filesystem::{AgentIdentityRecord, ChannelUsage, FilesystemIdentityStore, IdentityOrigin};
+use crate::identity::target_card_names::{CardLocation, TargetCardNameService, TargetCardSource};
 use crate::metrics::MetricsStore;
 use crate::observability::IdentityInfo;
 use crate::observability::caller_names::{CallerNameService, CallerNameSources};
@@ -17,6 +18,19 @@ use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
 
 const CALLER_DID: &str = "did:web:acme.com:billing";
 const CARD_URL: &str = "https://acme.com/.well-known/agent-card.json";
+const TARGET_URL: &str = "http://localhost:9000";
+
+struct TargetDirectory;
+
+#[async_trait]
+impl TargetCardSource for TargetDirectory {
+    async fn fetch_agent_card(
+        &self,
+        location: &CardLocation,
+    ) -> Option<Value> {
+        (location.endpoint == TARGET_URL).then(|| json!({ "name": "DateTime Agent" }))
+    }
+}
 
 struct CallerDirectory;
 
@@ -57,10 +71,19 @@ struct Fixture {
     identities: Arc<dyn IdentityStore>,
     surfaces: Arc<FileSystemAgentSurfaceStore>,
     caller_names: Arc<CallerNameService>,
+    card_names: Arc<TargetCardNameService>,
 }
 
 impl Fixture {
     async fn new(surfaces: &[(&str, &str)]) -> Self {
+        let surfaces: Vec<(&str, &str, &str)> = surfaces
+            .iter()
+            .map(|(id, name)| (*id, *name, ""))
+            .collect();
+        Self::with_targets(&surfaces).await
+    }
+
+    async fn with_targets(surfaces: &[(&str, &str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let identities: Arc<dyn IdentityStore> = Arc::new(
             FilesystemIdentityStore::new(dir.path().join("identities"))
@@ -72,13 +95,15 @@ impl Fixture {
                 .await
                 .expect("surface store"),
         );
-        for (id, name) in surfaces {
+        for (id, name, endpoint) in surfaces {
+            let mut surface = AgentSurface {
+                surface_id: id.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            };
+            surface.target.endpoint = endpoint.to_string();
             surface_store
-                .save(&AgentSurface {
-                    surface_id: id.to_string(),
-                    name: name.to_string(),
-                    ..Default::default()
-                })
+                .save(&surface)
                 .await
                 .expect("save surface");
         }
@@ -87,6 +112,7 @@ impl Fixture {
             identities,
             surfaces: surface_store,
             caller_names: Arc::new(CallerNameService::new(Arc::new(CallerDirectory))),
+            card_names: Arc::new(TargetCardNameService::new(Arc::new(TargetDirectory))),
         }
     }
 
@@ -97,6 +123,7 @@ impl Fixture {
             &Arc::new(MetricsStore::new(10)),
             Some(&self.surfaces),
             &self.caller_names,
+            &self.card_names,
         )
         .await
         .expect("identity list")
@@ -110,6 +137,7 @@ impl Fixture {
             if self
                 .caller_names
                 .lookup_or_spawn(CALLER_DID)
+                .into_name()
                 .is_some()
             {
                 return;
@@ -117,6 +145,27 @@ impl Fixture {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("caller name for {CALLER_DID} never resolved");
+    }
+
+    async fn wait_for_target_card_name(
+        &self,
+        surface_id: &str,
+    ) {
+        let location = CardLocation {
+            endpoint: TARGET_URL.to_string(),
+            card_path: None,
+        };
+        for _ in 0..200 {
+            if self
+                .card_names
+                .lookup_or_spawn(surface_id, &location)
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("target Agent Card name for {surface_id} never resolved");
     }
 }
 
@@ -258,7 +307,7 @@ async fn delta_includes_caller_after_its_name_resolves() {
         .changed_since(since)
         .into_iter()
         .collect();
-    assert!(identities_changed_since(before, since, &renamed).is_empty());
+    assert!(identities_changed_since(before, since, &renamed, &HashSet::new()).is_empty());
 
     fixture
         .wait_for_caller_name()
@@ -273,7 +322,7 @@ async fn delta_includes_caller_after_its_name_resolves() {
         .changed_since(since)
         .into_iter()
         .collect();
-    let delta = identities_changed_since(after, since, &renamed);
+    let delta = identities_changed_since(after, since, &renamed, &HashSet::new());
 
     assert_eq!(delta.len(), 1);
     assert_eq!(delta[0].did, CALLER_DID);
@@ -282,5 +331,79 @@ async fn delta_includes_caller_after_its_name_resolves() {
             .display_name
             .as_deref(),
         Some("Billing Bot")
+    );
+}
+
+#[tokio::test]
+async fn managed_identity_shows_target_agent_card_name_once_resolved() {
+    let fixture = Fixture::with_targets(&[("def", "DEF", TARGET_URL)]).await;
+    store_managed(&fixture, legacy_managed_record("did:example:def", &["def"], HashMap::new())).await;
+
+    let first = serde_json::to_value(&fixture.rows().await["did:example:def"]).expect("row JSON");
+    assert_eq!(first["display_name"], json!("DEF"));
+    assert_eq!(first["display_name_source"], json!("surface_name"));
+    assert!(
+        first
+            .get("display_name_pending")
+            .is_none(),
+        "managed rows never wait on a lookup: {first}"
+    );
+
+    fixture
+        .wait_for_target_card_name("def")
+        .await;
+    let row = serde_json::to_value(&fixture.rows().await["did:example:def"]).expect("row JSON");
+    assert_eq!(row["display_name"], json!("DateTime Agent"));
+    assert_eq!(row["display_name_source"], json!("target_agent_card"));
+    assert!(
+        row.get("display_name_verified")
+            .is_none(),
+        "target Agent Card names are unverified: {row}"
+    );
+    assert_eq!(row["surface_name"], json!("DEF"));
+}
+
+#[tokio::test]
+async fn managed_identity_without_reachable_card_keeps_surface_name() {
+    let fixture = Fixture::with_targets(&[("ghi", "GHI", "http://localhost:9999")]).await;
+    store_managed(&fixture, legacy_managed_record("did:example:ghi", &["ghi"], HashMap::new())).await;
+
+    fixture.rows().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let row = serde_json::to_value(&fixture.rows().await["did:example:ghi"]).expect("row JSON");
+    assert_eq!(row["display_name"], json!("GHI"));
+    assert_eq!(row["display_name_source"], json!("surface_name"));
+}
+
+#[tokio::test]
+async fn delta_includes_managed_identity_after_its_card_name_resolves() {
+    let fixture = Fixture::with_targets(&[("def", "DEF", TARGET_URL)]).await;
+    store_managed(&fixture, legacy_managed_record("did:example:def", &["def"], HashMap::new())).await;
+    let since = Utc::now() + chrono::Duration::milliseconds(1);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    fixture.rows().await;
+    fixture
+        .wait_for_target_card_name("def")
+        .await;
+    let after: Vec<IdentityInfo> = fixture
+        .rows()
+        .await
+        .into_values()
+        .collect();
+    let renamed_surfaces: HashSet<String> = fixture
+        .card_names
+        .changed_since(since)
+        .into_iter()
+        .collect();
+    let delta = identities_changed_since(after, since, &HashSet::new(), &renamed_surfaces);
+
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0].did, "did:example:def");
+    assert_eq!(
+        delta[0]
+            .display_name
+            .as_deref(),
+        Some("DateTime Agent")
     );
 }

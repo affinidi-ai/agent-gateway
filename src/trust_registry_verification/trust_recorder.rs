@@ -21,7 +21,9 @@ use crate::config::agent_surface::AgentSurface;
 use crate::config::types::{EntityTarget, TrustRecorderConfig, TrustRecorderEntry};
 use crate::identity::display_name::DisplayName;
 use crate::trust_registries::TrustRegistryListenerManager;
-use crate::trust_registries::reference_fields::{ReferenceFieldPublisher, ReferenceFieldValue};
+use crate::trust_registries::reference_fields::{
+    ReferenceFieldPublisher, ReferenceFieldValue, authority_value_for_did, issuer_entity_value_for_did,
+};
 use crate::trust_registries::store::TrustRegistryStore;
 use crate::trust_registries::types::TrAdminRecordRequest;
 
@@ -120,15 +122,52 @@ pub async fn apply_trust_recorder(
         }
     }
 
-    if let Some(name) = display_name {
-        let tr_dids: BTreeSet<String> = targets
-            .into_iter()
-            .map(|(_, _, tr_did)| tr_did)
-            .collect();
-        ReferenceFieldPublisher::global()
-            .publish_all(tr_manager.as_ref(), &tr_dids, &[ReferenceFieldValue::entity(agent_did, name.clone())])
+    let authorities = crate::gateways::connection_points::get_authority_store();
+    let issuers = crate::gateways::connection_points::get_issuer_store();
+    let fields =
+        recorder_reference_fields(&targets, agent_did, display_name, authorities.as_deref(), issuers.as_deref()).await;
+    let publisher = ReferenceFieldPublisher::global();
+    for (tr_did, value) in &fields {
+        publisher
+            .publish(tr_manager.as_ref(), tr_did, value)
             .await;
     }
+}
+
+/// Names for the DIDs the recorder wrote, per trust registry: the agent entity (when
+/// named), each authority, and each Issuer used as a record entity.
+async fn recorder_reference_fields(
+    targets: &[(&TrustRecorderEntry, String, String)],
+    agent_did: &str,
+    display_name: Option<&DisplayName>,
+    authorities: Option<&dyn crate::authorities::AuthorityStore>,
+    issuers: Option<&dyn crate::issuers::IssuerStore>,
+) -> Vec<(String, ReferenceFieldValue)> {
+    let mut fields: Vec<(String, ReferenceFieldValue)> = Vec::new();
+    let mut push = |tr_did: &str, value: ReferenceFieldValue| {
+        if !fields
+            .iter()
+            .any(|(t, v)| t == tr_did && v.field_type == value.field_type && v.id == value.id)
+        {
+            fields.push((tr_did.to_string(), value));
+        }
+    };
+    for (entry, authority_did, tr_did) in targets {
+        if let Some(name) = display_name {
+            push(tr_did, ReferenceFieldValue::entity(agent_did, name.clone()));
+        }
+        if let Some(value) = authority_value_for_did(authority_did, authorities, issuers).await {
+            push(tr_did, value);
+        }
+        let issuer_is_entity = entry
+            .custom_resources
+            .iter()
+            .any(|r| r.entity_target == EntityTarget::Issuer);
+        if issuer_is_entity && let Some(value) = issuer_entity_value_for_did(&entry.issuer_did, issuers).await {
+            push(tr_did, value);
+        }
+    }
+    fields
 }
 
 /// Resolve a Trust Recorder entry's `trust_registry_id` to the TR DID that
@@ -378,6 +417,109 @@ mod tests {
             include_owned_agent: false,
             custom_resources: vec![],
         }
+    }
+
+    async fn issuer_store_with(
+        issuers: &[crate::issuers::types::Issuer]
+    ) -> (crate::issuers::FileSystemIssuerStore, tempfile::TempDir) {
+        use crate::issuers::IssuerStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::issuers::FileSystemIssuerStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        for issuer in issuers {
+            store
+                .create(issuer)
+                .await
+                .unwrap();
+        }
+        (store, dir)
+    }
+
+    fn named_issuer(
+        did: &str,
+        name: &str,
+    ) -> crate::issuers::types::Issuer {
+        crate::issuers::types::Issuer::new(
+            format!("id-{did}"),
+            name.to_string(),
+            did.to_string(),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
+    }
+
+    fn summary(fields: &[(String, ReferenceFieldValue)]) -> Vec<(String, String, String, String)> {
+        fields
+            .iter()
+            .map(|(tr, v)| (tr.clone(), format!("{:?}", v.field_type), v.id.clone(), v.name.as_str().to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn recorder_reference_fields_name_the_agent_authority_and_issuer_entity() {
+        let issuer_did = "did:web:gw:issuers:abc";
+        let (issuers, _dir) = issuer_store_with(&[named_issuer(issuer_did, "ABC Issuer")]).await;
+        let mut entry = base_entry();
+        entry.issuer_did = issuer_did.into();
+        entry.custom_resources = vec![CustomResource {
+            action: "issue".into(),
+            resource: "credential".into(),
+            entity_target: EntityTarget::Issuer,
+            record_type: "authorization".into(),
+        }];
+        let targets = vec![(&entry, issuer_did.to_string(), "did:example:tr".to_string())];
+        let name = DisplayName::parse("OXYGEN").unwrap();
+
+        let fields = recorder_reference_fields(&targets, "did:example:agent", Some(&name), None, Some(&issuers)).await;
+
+        assert_eq!(
+            summary(&fields),
+            vec![
+                ("did:example:tr".into(), "Entity".into(), "did:example:agent".into(), "OXYGEN".into()),
+                ("did:example:tr".into(), "Authority".into(), issuer_did.into(), "ABC Issuer".into()),
+                ("did:example:tr".into(), "Entity".into(), issuer_did.into(), "ABC Issuer".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recorder_reference_fields_skip_unknown_dids_and_unnamed_agents() {
+        let (issuers, _dir) = issuer_store_with(&[]).await;
+        let mut entry = base_entry();
+        entry.custom_resources = vec![CustomResource {
+            action: "issue".into(),
+            resource: "credential".into(),
+            entity_target: EntityTarget::Issuer,
+            record_type: "authorization".into(),
+        }];
+        let targets = vec![(&entry, "did:example:authority".to_string(), "did:example:tr".to_string())];
+
+        let fields = recorder_reference_fields(&targets, "did:example:agent", None, None, Some(&issuers)).await;
+
+        assert!(fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorder_reference_fields_publish_once_per_registry() {
+        let issuer_did = "did:web:gw:issuers:abc";
+        let (issuers, _dir) = issuer_store_with(&[named_issuer(issuer_did, "ABC Issuer")]).await;
+        let entry = base_entry();
+        let targets = vec![
+            (&entry, issuer_did.to_string(), "did:example:tr-1".to_string()),
+            (&entry, issuer_did.to_string(), "did:example:tr-1".to_string()),
+            (&entry, issuer_did.to_string(), "did:example:tr-2".to_string()),
+        ];
+
+        let fields = recorder_reference_fields(&targets, "did:example:agent", None, None, Some(&issuers)).await;
+
+        assert_eq!(
+            summary(&fields),
+            vec![
+                ("did:example:tr-1".into(), "Authority".into(), issuer_did.into(), "ABC Issuer".into()),
+                ("did:example:tr-2".into(), "Authority".into(), issuer_did.into(), "ABC Issuer".into()),
+            ]
+        );
     }
 
     #[test]

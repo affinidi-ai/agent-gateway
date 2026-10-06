@@ -133,9 +133,12 @@ pub fn surfaces_by_did(records: &[AgentIdentityRecord]) -> HashMap<String, BTree
     by_did
 }
 
+/// A managed agent is named by its target's Agent Card name when that is valid, else by its
+/// surface name. A DID managed on several surfaces has no name.
 pub fn resolve_managed_display_name(
     surface: &AgentSurface,
     surfaces_for_did: &BTreeSet<String>,
+    card_name: Option<&str>,
 ) -> ManagedDisplayName {
     if surfaces_for_did
         .iter()
@@ -147,10 +150,10 @@ pub fn resolve_managed_display_name(
             surface_ids: ids.into_iter().collect(),
         };
     }
-    match DisplayName::parse(&surface.name) {
-        Ok(name) => ManagedDisplayName::Named(name),
-        Err(_) => ManagedDisplayName::Unnamed,
-    }
+    card_name
+        .and_then(|name| DisplayName::parse(name).ok())
+        .or_else(|| DisplayName::parse(&surface.name).ok())
+        .map_or(ManagedDisplayName::Unnamed, ManagedDisplayName::Named)
 }
 
 type SurfacesByDid = HashMap<String, BTreeSet<String>>;
@@ -244,7 +247,10 @@ pub async fn resolve_managed_display_name_in(
     let surfaces = cache
         .surfaces_for(did, identity_store)
         .await?;
-    Some(resolve_managed_display_name(&surface, &surfaces))
+    let card_name = crate::identity::target_card_names::TargetCardNameService::global()
+        .name_for(&surface)
+        .await;
+    Some(resolve_managed_display_name(&surface, &surfaces, card_name.as_deref()))
 }
 
 #[cfg(test)]
@@ -441,13 +447,13 @@ mod tests {
             .identity_fields
             .insert("certificate_id".to_string(), serde_json::json!("NITROGEN"));
         let surfaces = surfaces_by_did(&[record]);
-        let result = resolve_managed_display_name(&surface("s1", "OXYGEN"), &surfaces["did:web:a"]);
+        let result = resolve_managed_display_name(&surface("s1", "OXYGEN"), &surfaces["did:web:a"], None);
         assert_eq!(result, ManagedDisplayName::Named(DisplayName::parse("OXYGEN").unwrap()));
     }
 
     #[test]
     fn resolve_reports_conflict_with_sorted_ids() {
-        let result = resolve_managed_display_name(&surface("s2", "OXYGEN"), &set(&["s3", "s2", "s1"]));
+        let result = resolve_managed_display_name(&surface("s2", "OXYGEN"), &set(&["s3", "s2", "s1"]), None);
         assert_eq!(
             result,
             ManagedDisplayName::Conflict {
@@ -458,7 +464,7 @@ mod tests {
 
     #[test]
     fn resolve_conflict_includes_current_surface_when_absent() {
-        let result = resolve_managed_display_name(&surface("s2", "OXYGEN"), &set(&["s1"]));
+        let result = resolve_managed_display_name(&surface("s2", "OXYGEN"), &set(&["s1"]), None);
         assert_eq!(
             result,
             ManagedDisplayName::Conflict {
@@ -468,9 +474,39 @@ mod tests {
     }
 
     #[test]
+    fn resolve_prefers_valid_agent_card_name_over_surface_name() {
+        let result = resolve_managed_display_name(&surface("s1", "DEF"), &set(&["s1"]), Some("DateTime Agent"));
+        assert_eq!(result, ManagedDisplayName::Named(DisplayName::parse("DateTime Agent").unwrap()));
+    }
+
+    #[test]
+    fn resolve_invalid_agent_card_name_falls_back_to_surface_name() {
+        let result = resolve_managed_display_name(&surface("s1", "DEF"), &set(&["s1"]), Some("bad\nname"));
+        assert_eq!(result, ManagedDisplayName::Named(DisplayName::parse("DEF").unwrap()));
+    }
+
+    #[test]
+    fn resolve_agent_card_name_does_not_override_conflict() {
+        let result = resolve_managed_display_name(&surface("s2", "DEF"), &set(&["s1"]), Some("DateTime Agent"));
+        assert!(matches!(result, ManagedDisplayName::Conflict { .. }));
+    }
+
+    #[test]
+    fn resolve_agent_card_name_names_unnamed_surface() {
+        let result = resolve_managed_display_name(&surface("s1", "  "), &set(&["s1"]), Some("DateTime Agent"));
+        assert_eq!(result, ManagedDisplayName::Named(DisplayName::parse("DateTime Agent").unwrap()));
+    }
+
+    #[test]
     fn resolve_invalid_name_is_unnamed() {
-        assert_eq!(resolve_managed_display_name(&surface("s1", "  "), &set(&["s1"])), ManagedDisplayName::Unnamed);
-        assert_eq!(resolve_managed_display_name(&surface("s1", "bad\nname"), &set(&[])), ManagedDisplayName::Unnamed);
+        assert_eq!(
+            resolve_managed_display_name(&surface("s1", "  "), &set(&["s1"]), None),
+            ManagedDisplayName::Unnamed
+        );
+        assert_eq!(
+            resolve_managed_display_name(&surface("s1", "bad\nname"), &set(&[]), None),
+            ManagedDisplayName::Unnamed
+        );
     }
 
     #[test]

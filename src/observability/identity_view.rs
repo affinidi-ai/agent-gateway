@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
-use super::caller_names::{CallerName, DisplayNameSource};
+use super::caller_names::{CallerLookup, DisplayNameSource};
 use crate::identity::display_name::ManagedDisplayName;
 use crate::identity::filesystem::IdentityOrigin;
 
@@ -122,19 +122,29 @@ pub fn group_key(
     }
 }
 
+/// A record with no effective origin (a local record stored before origin stamping) counts as
+/// managed when it links to an existing surface.
+pub fn view_origin(
+    effective_origin: Option<IdentityOrigin>,
+    links_existing_surface: bool,
+) -> Option<IdentityOrigin> {
+    effective_origin.or_else(|| links_existing_surface.then_some(IdentityOrigin::Managed))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NamingFields {
     pub display_name: Option<String>,
     pub display_name_source: Option<DisplayNameSource>,
     pub display_name_verified: bool,
+    pub display_name_pending: bool,
     pub name_conflict: bool,
 }
 
-/// Managed rows take names only from their surface; caller rows only from caller lookups.
+/// Managed rows take names only from their managed display name; caller rows only from caller lookups.
 pub fn naming_for(
     origin: Option<IdentityOrigin>,
     managed: Option<&ManagedDisplayName>,
-    caller: Option<&CallerName>,
+    caller: Option<&CallerLookup>,
 ) -> NamingFields {
     match (origin, managed, caller) {
         (Some(IdentityOrigin::Managed), Some(ManagedDisplayName::Named(name)), _) => NamingFields {
@@ -146,13 +156,34 @@ pub fn naming_for(
             name_conflict: true,
             ..Default::default()
         },
-        (Some(IdentityOrigin::ExternalCaller), _, Some(caller)) => NamingFields {
+        (Some(IdentityOrigin::ExternalCaller), _, Some(CallerLookup::Pending)) => NamingFields {
+            display_name_pending: true,
+            ..Default::default()
+        },
+        (Some(IdentityOrigin::ExternalCaller), _, Some(CallerLookup::Resolved(Some(caller)))) => NamingFields {
             display_name: Some(caller.name.clone()),
             display_name_source: Some(caller.source),
             display_name_verified: caller.verified && caller.source == DisplayNameSource::AgentName,
-            name_conflict: false,
+            ..Default::default()
         },
         _ => NamingFields::default(),
+    }
+}
+
+/// A managed row shows its target's Agent Card name, when known, in place of the surface name.
+/// A name conflict still hides every name.
+pub fn with_target_card_name(
+    naming: NamingFields,
+    origin: Option<IdentityOrigin>,
+    card_name: Option<String>,
+) -> NamingFields {
+    match (origin, card_name) {
+        (Some(IdentityOrigin::Managed), Some(name)) if !naming.name_conflict => NamingFields {
+            display_name: Some(name),
+            display_name_source: Some(DisplayNameSource::TargetAgentCard),
+            ..Default::default()
+        },
+        _ => naming,
     }
 }
 
@@ -160,19 +191,20 @@ pub fn naming_for(
 mod tests {
     use super::*;
     use crate::identity::display_name::DisplayName;
+    use crate::observability::caller_names::CallerName;
     use chrono::Utc;
     use serde_json::json;
 
     fn caller(
         source: DisplayNameSource,
         verified: bool,
-    ) -> CallerName {
-        CallerName {
+    ) -> CallerLookup {
+        CallerLookup::Resolved(Some(CallerName {
             name: "acme.com/@billing".into(),
             source,
             verified,
             resolved_at: Utc::now(),
-        }
+        }))
     }
 
     fn named(name: &str) -> ManagedDisplayName {
@@ -295,10 +327,81 @@ mod tests {
     }
 
     #[test]
+    fn test_naming_for_caller_pending_sets_flag_without_name() {
+        let fields = naming_for(Some(IdentityOrigin::ExternalCaller), None, Some(&CallerLookup::Pending));
+        assert!(fields.display_name_pending);
+        assert_eq!(fields.display_name, None);
+        assert_eq!(fields.display_name_source, None);
+    }
+
+    #[test]
+    fn test_naming_for_caller_without_name_is_empty_and_not_pending() {
+        assert_eq!(
+            naming_for(Some(IdentityOrigin::ExternalCaller), None, Some(&CallerLookup::Resolved(None))),
+            NamingFields::default()
+        );
+    }
+
+    #[test]
+    fn test_naming_for_managed_is_never_pending() {
+        let fields = naming_for(Some(IdentityOrigin::Managed), Some(&named("OXYGEN")), Some(&CallerLookup::Pending));
+        assert!(!fields.display_name_pending);
+        assert_eq!(fields.display_name.as_deref(), Some("OXYGEN"));
+    }
+
+    #[test]
+    fn test_view_origin_infers_managed_only_for_unstamped_records_with_a_surface() {
+        assert_eq!(view_origin(None, true), Some(IdentityOrigin::Managed));
+        assert_eq!(view_origin(None, false), None);
+        assert_eq!(view_origin(Some(IdentityOrigin::ExternalCaller), true), Some(IdentityOrigin::ExternalCaller));
+        assert_eq!(view_origin(Some(IdentityOrigin::Managed), false), Some(IdentityOrigin::Managed));
+    }
+
+    #[test]
     fn test_naming_for_unknown_origin_is_empty() {
         assert_eq!(
             naming_for(None, Some(&named("OXYGEN")), Some(&caller(DisplayNameSource::AgentName, true))),
             NamingFields::default()
         );
+    }
+
+    #[test]
+    fn test_target_card_name_replaces_managed_surface_name() {
+        let base = naming_for(Some(IdentityOrigin::Managed), Some(&named("DEF")), None);
+        let fields = with_target_card_name(base, Some(IdentityOrigin::Managed), Some("DateTime Agent".into()));
+        assert_eq!(fields.display_name.as_deref(), Some("DateTime Agent"));
+        assert_eq!(fields.display_name_source, Some(DisplayNameSource::TargetAgentCard));
+        assert!(!fields.display_name_verified);
+        assert!(!fields.display_name_pending);
+    }
+
+    #[test]
+    fn test_target_card_name_names_unnamed_managed_rows() {
+        let base = naming_for(Some(IdentityOrigin::Managed), Some(&ManagedDisplayName::Unnamed), None);
+        let fields = with_target_card_name(base, Some(IdentityOrigin::Managed), Some("DateTime Agent".into()));
+        assert_eq!(fields.display_name.as_deref(), Some("DateTime Agent"));
+    }
+
+    #[test]
+    fn test_target_card_name_absent_keeps_surface_name() {
+        let base = naming_for(Some(IdentityOrigin::Managed), Some(&named("DEF")), None);
+        let fields = with_target_card_name(base.clone(), Some(IdentityOrigin::Managed), None);
+        assert_eq!(fields, base);
+        assert_eq!(fields.display_name_source, Some(DisplayNameSource::SurfaceName));
+    }
+
+    #[test]
+    fn test_target_card_name_ignored_for_conflicts_and_callers() {
+        let conflict = ManagedDisplayName::Conflict {
+            surface_ids: vec!["s1".into(), "s2".into()],
+        };
+        let base = naming_for(Some(IdentityOrigin::Managed), Some(&conflict), None);
+        let fields = with_target_card_name(base.clone(), Some(IdentityOrigin::Managed), Some("DateTime Agent".into()));
+        assert_eq!(fields, base);
+
+        let caller = naming_for(Some(IdentityOrigin::ExternalCaller), None, None);
+        let fields =
+            with_target_card_name(caller.clone(), Some(IdentityOrigin::ExternalCaller), Some("DateTime Agent".into()));
+        assert_eq!(fields, caller);
     }
 }

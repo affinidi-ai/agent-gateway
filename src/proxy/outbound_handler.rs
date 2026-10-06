@@ -2280,7 +2280,7 @@ fn resolve_agent_card_url(tp: &TransitPoint) -> (String, Option<String>) {
 /// `/.well-known/agent.json`. Each URL is dialled through a client pinned to
 /// the address it resolved to, under the forward step's egress policy, and the
 /// card is read within the Transit Point's response bounds.
-async fn fetch_agent_card(
+pub(crate) async fn fetch_agent_card(
     target_url: &str,
     agent_card_path: Option<&str>,
     request_id: &str,

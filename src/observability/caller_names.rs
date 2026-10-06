@@ -4,7 +4,8 @@
 //! `host/@local` entry whose resolution returns exactly the caller DID), the
 //! caller's Agent Card `name` (unverified), or nothing. Names are dashboard-only
 //! and never published. Lookups never block the caller: [`CallerNameService::lookup_or_spawn`]
-//! returns the cached value and refreshes it in the background.
+//! returns the cached value, or [`CallerLookup::Pending`] before the first lookup finishes,
+//! and refreshes it in the background.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ pub enum DisplayNameSource {
     SurfaceName,
     AgentName,
     AgentCard,
+    TargetAgentCard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +64,24 @@ pub trait CallerNameSources: Send + Sync {
         &self,
         url: &str,
     ) -> Result<Value, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerLookup {
+    /// No lookup for this DID has finished yet.
+    Pending,
+    /// The latest finished lookup; `None` when it found no name or failed.
+    Resolved(Option<CallerName>),
+}
+
+#[cfg(test)]
+impl CallerLookup {
+    pub fn into_name(self) -> Option<CallerName> {
+        match self {
+            Self::Pending => None,
+            Self::Resolved(name) => name,
+        }
+    }
 }
 
 struct CacheEntry {
@@ -120,10 +140,10 @@ impl CallerNameService {
     pub fn lookup_or_spawn(
         self: &Arc<Self>,
         did: &str,
-    ) -> Option<CallerName> {
+    ) -> CallerLookup {
         let (cached, fresh) = match self.cache.get(did) {
-            Some(entry) => (entry.name.clone(), entry.checked_at.elapsed() < self.ttl),
-            None => (None, false),
+            Some(entry) => (CallerLookup::Resolved(entry.name.clone()), entry.checked_at.elapsed() < self.ttl),
+            None => (CallerLookup::Pending, false),
         };
         if !fresh {
             self.spawn_refresh(did);
@@ -172,13 +192,15 @@ impl CallerNameService {
             .cache
             .get(did)
             .map(|e| (e.name.clone(), e.changed_at));
+        let first_lookup = previous.is_none();
         let (previous_name, previous_changed_at) = previous.unwrap_or((None, None));
-        let changed = previous_name
-            .as_ref()
-            .map(|n| (&n.name, n.source, n.verified))
-            != name
+        let changed = first_lookup
+            || previous_name
                 .as_ref()
-                .map(|n| (&n.name, n.source, n.verified));
+                .map(|n| (&n.name, n.source, n.verified))
+                != name
+                    .as_ref()
+                    .map(|n| (&n.name, n.source, n.verified));
         let changed_at = if changed {
             Some(Utc::now())
         } else {
@@ -305,7 +327,8 @@ impl CallerNameService {
         }
     }
 
-    /// DIDs whose resolved name changed (appeared, changed, or disappeared) after `since`.
+    /// DIDs whose first lookup finished, or whose resolved name changed (appeared, changed, or
+    /// disappeared), after `since`.
     pub fn changed_since(
         &self,
         since: DateTime<Utc>,
@@ -789,7 +812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lookup_or_spawn_returns_none_then_value_without_double_spawn() {
+    async fn test_lookup_or_spawn_returns_pending_then_value_without_double_spawn() {
         let gate = Arc::new(Notify::new());
         let mut sources = FakeSources {
             gate: Some(gate.clone()),
@@ -804,8 +827,8 @@ mod tests {
         let sources = Arc::new(sources);
         let service = Arc::new(CallerNameService::new(sources.clone()));
 
-        assert_eq!(service.lookup_or_spawn(DID), None);
-        assert_eq!(service.lookup_or_spawn(DID), None);
+        assert_eq!(service.lookup_or_spawn(DID), CallerLookup::Pending);
+        assert_eq!(service.lookup_or_spawn(DID), CallerLookup::Pending);
         tokio::time::sleep(Duration::from_millis(20)).await;
         gate.notify_one();
 
@@ -814,6 +837,7 @@ mod tests {
         assert_eq!(
             service
                 .lookup_or_spawn(DID)
+                .into_name()
                 .map(|n| n.name),
             Some("acme.com/@billing".to_string())
         );
@@ -845,6 +869,7 @@ mod tests {
         assert_eq!(
             service
                 .lookup_or_spawn(DID)
+                .into_name()
                 .map(|n| n.verified),
             Some(true)
         );
@@ -862,7 +887,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_changed_since_reports_only_changed_names() {
+    async fn test_lookup_or_spawn_reports_finished_lookup_without_name_as_resolved() {
+        let service = Arc::new(service_with(FakeSources::default()));
+        service.store("did:example:unnamed", None);
+        assert_eq!(service.lookup_or_spawn("did:example:unnamed"), CallerLookup::Resolved(None));
+        assert_eq!(service.lookup_or_spawn("did:example:other"), CallerLookup::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_changed_since_reports_first_lookups_and_changed_names() {
         let service = service_with(FakeSources::default());
         let before = Utc::now() - chrono::Duration::seconds(1);
         service.store("did:example:unnamed", None);
@@ -875,9 +908,12 @@ mod tests {
                 resolved_at: Utc::now(),
             }),
         );
-        assert_eq!(service.changed_since(before), vec![DID.to_string()]);
+        let mut changed = service.changed_since(before);
+        changed.sort();
+        assert_eq!(changed, vec!["did:example:unnamed".to_string(), DID.to_string()]);
 
         let after = Utc::now() + chrono::Duration::seconds(1);
+        service.store("did:example:unnamed", None);
         service.store(
             DID,
             Some(CallerName {

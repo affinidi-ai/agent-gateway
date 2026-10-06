@@ -83,6 +83,7 @@ static GLOBAL_APPLIANCE_POLICY_MANAGER: OnceCell<Arc<crate::policies::GlobalPoli
 
 /// Global issuer store for GW2 - for trust registry validation lookups
 static GLOBAL_ISSUER_STORE: OnceCell<Arc<dyn crate::issuers::IssuerStore>> = OnceCell::const_new();
+static GLOBAL_AUTHORITY_STORE: OnceCell<Arc<dyn crate::authorities::AuthorityStore>> = OnceCell::const_new();
 
 /// Global secrets store for GW2 - for target_auth and credential delegation secret resolution
 static GLOBAL_SECRETS_STORE: OnceCell<Arc<dyn crate::secrets::SecretsStore>> = OnceCell::const_new();
@@ -315,6 +316,18 @@ pub async fn init_issuer_store(store: Arc<dyn crate::issuers::IssuerStore>) {
 #[allow(dead_code)]
 pub fn get_issuer_store() -> Option<Arc<dyn crate::issuers::IssuerStore>> {
     GLOBAL_ISSUER_STORE
+        .get()
+        .cloned()
+}
+
+/// Initialize the global authority store used to name Trust Recorder authorities.
+pub fn init_authority_store(store: Arc<dyn crate::authorities::AuthorityStore>) {
+    let _ = GLOBAL_AUTHORITY_STORE.set(store);
+}
+
+/// Get the global authority store.
+pub fn get_authority_store() -> Option<Arc<dyn crate::authorities::AuthorityStore>> {
+    GLOBAL_AUTHORITY_STORE
         .get()
         .cloned()
 }
