@@ -211,6 +211,23 @@ then
   fi
 fi
 
+# The local mediator's did:webvh / did:web lives on localhost, which DID
+# resolution refuses unless [did_cache] allow_private_hosts is on.
+if [[ "${regenerate_config_toml}" == "true" ]]
+then
+  sedi -E 's/^allow_private_hosts[[:space:]]*=.*/allow_private_hosts = true/' "${config_toml}"
+elif ! grep -qE '^allow_private_hosts[[:space:]]*=' "${config_toml}"
+then
+  if grep -qE '^\[did_cache\]' "${config_toml}"
+  then
+    awk '{ print } $0 == "[did_cache]" { print "allow_private_hosts = true" }' "${config_toml}" > "${config_toml}.tmp"
+    mv "${config_toml}.tmp" "${config_toml}"
+  else
+    printf '\n[did_cache]\nallow_private_hosts = true\n' >> "${config_toml}"
+  fi
+  echo "✅ [did_cache] allow_private_hosts enabled for the local mediator"
+fi
+
 if [[ ! -f "${target_dir}/config/gateway.json" ]]
 then
   # Determine which template to use (all local* instances share the local template)

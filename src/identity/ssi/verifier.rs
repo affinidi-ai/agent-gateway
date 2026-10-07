@@ -104,7 +104,7 @@ impl DIDResolver for CompositeResolver {
                     resolution::Metadata::from_content_type(Some(MediaType::JsonLd.to_string())),
                 ))
             }
-            "web" | "key" | "jwk" | "pkh" | "ethr" | "ion" | "tz" => {
+            "key" | "jwk" | "pkh" | "ethr" | "ion" | "tz" => {
                 self.ssi_resolver
                     .resolve_representation(did, options)
                     .await
@@ -677,6 +677,41 @@ mod tests {
             .await
             .unwrap();
         (vp, holder_did)
+    }
+
+    async fn did_web_resolution_error(
+        host_policy: affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy
+    ) -> String {
+        let client = DIDCacheClient::new(
+            DIDCacheConfigBuilder::default()
+                .with_host_policy(host_policy)
+                .build(),
+        )
+        .await
+        .expect("Failed to create DID cache client");
+        let resolver = CompositeResolver::new(Arc::new(client));
+        match resolver
+            .resolve_representation(DID::new("did:web:localhost%3A1").unwrap(), Options::default())
+            .await
+        {
+            Ok(_) => panic!("resolving an unreachable did:web must fail"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn did_web_on_a_private_host_is_refused_under_the_default_policy() {
+        let error =
+            did_web_resolution_error(affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy::PublicOnly).await;
+        assert!(error.contains("SSRF-prone host"), "expected a blocked-host refusal, got: {error}");
+    }
+
+    #[tokio::test]
+    async fn did_web_on_a_private_host_is_fetched_when_private_hosts_are_allowed() {
+        let error =
+            did_web_resolution_error(affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy::AllowPrivate)
+                .await;
+        assert!(!error.contains("SSRF-prone host"), "AllowPrivate must not refuse localhost, got: {error}");
     }
 
     async fn local_verifier() -> LocalVerifier {

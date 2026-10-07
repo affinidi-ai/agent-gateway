@@ -152,6 +152,10 @@ max_entries = 1000
 stale_threshold_percent = 80
 # Path to store cached DID documents (persisted as JSON files)
 storage_path = "../_storage/cache/did"
+# Let did:web / did:webvh resolution contact loopback, private-network and
+# link-local hosts, cloud metadata included (default: false). Enable only for a
+# local stack, e.g. a mediator on localhost. Startup-only.
+allow_private_hosts = false
 
 # TLS Configuration (required)
 [tls]

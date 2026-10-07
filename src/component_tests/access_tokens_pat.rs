@@ -61,7 +61,7 @@ async fn create_token(
     pattern: Option<&str>,
     headers: Vec<RequiredHeader>,
 ) -> (String, String) {
-    create_token_owned_by(store, "user-1", pattern, headers).await
+    create_token_with(store, "user-1", pattern, headers, Vec::new()).await
 }
 
 async fn create_token_owned_by(
@@ -69,6 +69,25 @@ async fn create_token_owned_by(
     owner: &str,
     pattern: Option<&str>,
     headers: Vec<RequiredHeader>,
+) -> (String, String) {
+    create_token_with(store, owner, pattern, headers, Vec::new()).await
+}
+
+async fn create_token_with_scopes(
+    store: &FsAccessTokenStore,
+    pattern: Option<&str>,
+    headers: Vec<RequiredHeader>,
+    scopes: Vec<String>,
+) -> (String, String) {
+    create_token_with(store, "user-1", pattern, headers, scopes).await
+}
+
+async fn create_token_with(
+    store: &FsAccessTokenStore,
+    owner: &str,
+    pattern: Option<&str>,
+    headers: Vec<RequiredHeader>,
+    scopes: Vec<String>,
 ) -> (String, String) {
     let (id, secret) = generate_token();
     store
@@ -78,7 +97,7 @@ async fn create_token_owned_by(
             description: String::new(),
             token_hash: hash_secret(&secret),
             user_id: owner.to_string(),
-            scopes: Vec::new(),
+            scopes,
             resource_pattern: pattern.map(str::to_string),
             required_headers: headers,
             created_by: owner.to_string(),
@@ -654,5 +673,308 @@ async fn already_issued_broad_selector_token_is_honored_with_trusted_edge() {
     assert_eq!(
         request(&app, "GET", "/v1/gateways/gateway-b", Some(&secret), Some("tenant-a")).await,
         StatusCode::NOT_FOUND
+    );
+}
+
+fn tenant_selector_header() -> Vec<RequiredHeader> {
+    vec![RequiredHeader {
+        name: "x-external-account".to_string(),
+        pattern: "tenant-a".to_string(),
+    }]
+}
+
+async fn token_info_app(
+    store: Arc<FsAccessTokenStore>,
+    sessions: Arc<SessionManager>,
+) -> (Router, tempfile::TempDir) {
+    token_info_app_with_terms(store, sessions, Arc::new(crate::terms::TermsManager::disabled())).await
+}
+
+async fn token_info_app_with_terms(
+    store: Arc<FsAccessTokenStore>,
+    sessions: Arc<SessionManager>,
+    terms: Arc<crate::terms::TermsManager>,
+) -> (Router, tempfile::TempDir) {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let user_storage = Arc::new(
+        crate::auth::storage::PasskeyStorage::new(
+            directory
+                .path()
+                .join("passkeys")
+                .to_string_lossy()
+                .to_string(),
+            directory
+                .path()
+                .join("avatars")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .await
+        .expect("user storage"),
+    );
+    let auth = AuthGuardState::new(sessions.clone(), None, terms).with_pat_authenticator(Some(store));
+    let app = Router::new()
+        .route("/v1/token-info", get(crate::auth_manager::permissions::get_token_info))
+        .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+        .layer(Extension(sessions))
+        .layer(Extension(user_storage))
+        .layer(middleware::from_fn_with_state(auth, require_session_auth));
+    (app, directory)
+}
+
+async fn token_info(
+    app: &Router,
+    bearer: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri("/v1/token-info");
+    if let Some(bearer) = bearer {
+        builder = builder.header("Authorization", format!("Bearer {bearer}"));
+    }
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    if body.is_empty() {
+        return (status, serde_json::Value::Null);
+    }
+    (status, serde_json::from_slice(&body).expect("json body"))
+}
+
+#[tokio::test]
+async fn token_info_reports_a_scoped_pats_id_and_scopes() {
+    let store = new_store().await;
+    let (id, secret) = create_token_with_scopes(
+        &store,
+        None,
+        Vec::new(),
+        vec!["gateways.view".to_string(), "secrets.view".to_string()],
+    )
+    .await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    let (status, body) = token_info(&app, Some(&secret), &[]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"], "user-1");
+    assert_eq!(body["token_id"], id);
+    assert_eq!(body["scopes"], serde_json::json!(["gateways.view", "secrets.view"]));
+    assert!(body.get("token").is_none());
+    assert!(
+        body.get("token_hash")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn token_info_serves_a_tenant_scoped_pat_without_exposing_secrets() {
+    let store = new_store().await;
+    let (id, secret) =
+        create_token(&store, Some("TENANT:${x-external-account}:gateways:.*"), tenant_selector_header()).await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    let (status, body) = token_info(&app, Some(&secret), &[("x-external-account", "tenant-a")]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["token_id"], id);
+    assert_eq!(body["user_id"], "user-1");
+    let text = body.to_string();
+    assert!(!text.contains(&secret));
+    assert!(!text.contains(&hash_secret(&secret)));
+    assert!(body.get("token").is_none());
+    assert!(
+        body.get("token_hash")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn token_info_serves_a_tenant_scoped_pat_without_its_selector_header() {
+    let store = new_store().await;
+    let (id, secret) =
+        create_token(&store, Some("TENANT:${x-external-account}:gateways:.*"), tenant_selector_header()).await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    let (status, body) = token_info(&app, Some(&secret), &[]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"], "user-1");
+    assert_eq!(body["token_id"], id);
+}
+
+#[tokio::test]
+async fn token_info_still_fails_closed_for_a_broad_selector_without_trusted_edge() {
+    let store = new_store().await;
+    let (_, secret) = create_token(
+        &store,
+        Some("TENANT:${x-external-account}:gateways:.*"),
+        vec![RequiredHeader {
+            name: "x-external-account".to_string(),
+            pattern: "[a-z0-9-]+".to_string(),
+        }],
+    )
+    .await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    assert_eq!(
+        token_info(&app, Some(&secret), &[])
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn token_info_selector_exemption_does_not_cover_lookalike_paths() {
+    let store = new_store().await;
+    let (_, secret) =
+        create_token(&store, Some("TENANT:${x-external-account}:gateways:.*"), tenant_selector_header()).await;
+    let auth =
+        AuthGuardState::new(Arc::new(SessionManager::new()), None, Arc::new(crate::terms::TermsManager::disabled()))
+            .with_pat_authenticator(Some(store));
+    let app = Router::new()
+        .route("/v1/token-info/", get(accepted))
+        .route("/v1/token-info/{rest}", get(accepted))
+        .route("/v1/token-infox", get(accepted))
+        .route("/api/v1/token-info/{rest}", get(accepted))
+        .layer(middleware::from_fn_with_state(auth, require_session_auth));
+
+    for path in ["/v1/token-info/", "/v1/token-info/x", "/v1/token-infox", "/api/v1/token-info/x"] {
+        assert_eq!(request(&app, "GET", path, Some(&secret), None).await, StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(request(&app, "GET", path, Some(&secret), Some("tenant-a")).await, StatusCode::OK, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn token_info_reports_null_scopes_for_an_unrestricted_pat() {
+    let store = new_store().await;
+    let (id, secret) = create_token(&store, None, Vec::new()).await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    let (status, body) = token_info(&app, Some(&secret), &[]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["token_id"], id);
+    assert!(body["scopes"].is_null());
+}
+
+#[tokio::test]
+async fn token_info_reports_null_token_for_a_session_bearer() {
+    let sessions = Arc::new(SessionManager::new());
+    let session_token = sessions
+        .create_session("alice".into(), "user-2".into())
+        .await;
+    let (app, _directory) = token_info_app(new_store().await, sessions).await;
+
+    let (status, body) = token_info(&app, Some(&session_token), &[]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"], "user-2");
+    assert!(body["token_id"].is_null());
+    assert!(body["scopes"].is_null());
+}
+
+#[tokio::test]
+async fn token_info_accepts_a_session_from_the_cookie() {
+    let sessions = Arc::new(SessionManager::new());
+    let session_token = sessions
+        .create_session("alice".into(), "user-2".into())
+        .await;
+    let (app, _directory) = token_info_app(new_store().await, sessions).await;
+
+    let cookie = format!("session_token={session_token}");
+    let (status, body) = token_info(&app, None, &[("cookie", &cookie)]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"], "user-2");
+    assert!(body["token_id"].is_null());
+}
+
+#[tokio::test]
+async fn token_info_requires_the_pat_owner_to_accept_terms() {
+    let terms_directory = tempfile::tempdir().expect("tempdir");
+    let terms = crate::terms::TermsManager::open(
+        true,
+        "did:web:gateway.example".to_string(),
+        terms_directory
+            .path()
+            .join("terms"),
+        Some(crate::terms::TermsVersion {
+            terms_type: crate::terms::TermsType::Affinidi,
+            document_id: crate::terms::AFFINIDI_TERMS_DOCUMENT_ID.to_string(),
+            version_id: "terms-v1".to_string(),
+            version: "1".to_string(),
+            title: "Terms".to_string(),
+            url: "https://example.com/terms".to_string(),
+            requires_reconsent: true,
+            published_at: Utc::now(),
+            published_by: None,
+        }),
+    )
+    .await
+    .expect("terms manager");
+    let store = new_store().await;
+    let (_, secret) = create_token(&store, None, Vec::new()).await;
+    let (app, _directory) = token_info_app_with_terms(store, Arc::new(SessionManager::new()), Arc::new(terms)).await;
+
+    let (status, body) = token_info(&app, Some(&secret), &[]).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "TERMS_ACCEPTANCE_REQUIRED");
+}
+
+#[tokio::test]
+async fn token_info_requires_authentication() {
+    let (app, _directory) = token_info_app(new_store().await, Arc::new(SessionManager::new())).await;
+
+    assert_eq!(
+        token_info(&app, None, &[])
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        token_info(&app, Some("agpat_not-a-real-token"), &[])
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn token_info_rejects_a_revoked_pat() {
+    let store = new_store().await;
+    let (id, secret) = create_token(&store, None, Vec::new()).await;
+    let (app, _directory) = token_info_app(store.clone(), Arc::new(SessionManager::new())).await;
+
+    assert_eq!(
+        token_info(&app, Some(&secret), &[])
+            .await
+            .0,
+        StatusCode::OK
+    );
+    store
+        .revoke(&id)
+        .await
+        .expect("revoke");
+    assert_eq!(
+        token_info(&app, Some(&secret), &[])
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
     );
 }

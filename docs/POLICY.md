@@ -256,10 +256,61 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 
 Both helpers share one `pin_and_build` body.
 
+### DID resolution host policy
+
+`did:web` and `did:webvh` resolution names its own host, so an attacker-supplied
+DID is an egress target. Every resolver the gateway builds refuses non-public hosts
+by default:
+
+- the shared resolver (`src/gateways/did_cache.rs::init_shared_resolver`), which VP
+  and VC verification (`src/identity/ssi/verifier.rs::CompositeResolver`) also uses
+  for `did:web` and `did:webvh`;
+- the per-client DIDComm resolvers (`did_cache::headless_tdk_config`), which keep
+  their own caches.
+
+The common guard is the address check: a host that is, or resolves to, a loopback,
+private-network, carrier-grade NAT or link-local address (cloud metadata included)
+is refused, and redirects are not followed. Each method also refuses some names
+before resolving them. `did:web` refuses `localhost`, `*.localhost` and `*.local`.
+`did:webvh` also refuses `*.internal`, `home.arpa` and single-label names, so
+`did:webvh:…:mediator` is refused by name, while `did:web:mediator` is refused only
+when `mediator` resolves to a non-public address.
+
+`[did_cache] allow_private_hosts = true` (startup-only, default `false`) lifts both
+checks for every resolver, cloud metadata included, and startup logs a warning when
+it is on. Use it only for a local stack whose mediator and DIDs live on `localhost`.
+On a network where an instance metadata service is reachable it reopens that
+endpoint (see [Known limitations](#known-limitations)).
+
+A DID document the gateway caches itself, such as a stored mediator document, is
+served from the resolver cache only until the cache TTL expires (300 s for the
+DIDComm clients). After that it is resolved like any other DID, so a mediator whose
+DID lives on a private host needs `allow_private_hosts`. The same holds for the
+gateway's own Connection Point DID: the messaging SDK signs each Trust Task with a
+key it finds by resolving that DID, and sends the task unsigned when resolution
+fails, which a mediator enforcing `trust_task_verification` refuses.
+
+The guard is the resolver's own host policy (`HostPolicy` in
+`affinidi-did-resolver-cache-sdk`), not `src/egress.rs`. The SDK fetches DID
+documents with its own HTTP client, which the gateway cannot pin to a vetted
+address. The trade-off is that the policy has only two settings, and the one that
+allows private hosts also allows link-local addresses, whereas
+`egress::pinned_forward_client` keeps cloud metadata blocked. Routing DID fetches
+through the egress guard would need a resolver hook the SDK does not offer, and a
+setting that allows private hosts but keeps link-local refused would have to come
+from the SDK.
+
 ### Known limitations
 
 These are current, unmitigated coverage gaps in the egress controls. They are
 documented here so operators can assess exposure.
+
+- **`allow_private_hosts` reopens cloud metadata for DID resolution.** The
+  resolver's host policy has no setting that allows private hosts while keeping
+  link-local addresses refused, so with `[did_cache] allow_private_hosts` on, a DID
+  naming `169.254.169.254` is fetched. Keep the flag off wherever an instance
+  metadata service is reachable. See
+  [DID resolution host policy](#did-resolution-host-policy).
 
 - **The legacy stored-MCP-proxy runtime path is not pinned.** A stored MCP Proxy
   serving `2024-11-05` is an `rmcp_openapi` `Server` (`src/mcp_proxies/handlers.rs::McpServerManager`);

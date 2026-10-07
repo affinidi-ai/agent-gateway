@@ -130,7 +130,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[encryption]` | Encryption at rest: on or off, key source, KMS settings |
 | `[config_files]` | Where the other configuration files are |
 | `[storage_paths]` | Where each record kind is persisted under `_storage/` |
-| `[did_cache]` | DID document cache TTL, size, staleness, and path |
+| `[did_cache]` | DID document cache TTL, size, staleness, and path; whether DID resolution may contact private hosts |
 | `[tls]` | Certificate and key paths, upstream verification |
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
 | `[reconnect_policy]` | Backoff for DIDComm connection points |
@@ -154,6 +154,7 @@ description that exists today.
 | `encryption.enabled` | Writes whole storage files as `.json.enc`. Losing the master key loses the data. |
 | `metrics_retention_minutes` | Parsed but not used. Retention is the value in `_storage/settings/settings.json`, set from the dashboard, which defaults to 360 minutes whatever this field says. |
 | `websocket_require_auth` | Off means an unauthenticated client can open the dashboard event stream. |
+| `did_cache.allow_private_hosts` | Off (the default) refuses `did:web` and `did:webvh` on loopback, private-network and link-local hosts. On is needed for a local stack whose mediator lives on `localhost`, and reopens SSRF through attacker-supplied DIDs, cloud metadata included, so keep it off wherever an instance metadata service is reachable. See [`POLICY.md`](POLICY.md#did-resolution-host-policy). |
 
 ## `gateway.json`
 

@@ -11,11 +11,12 @@ run_case() {
   local name="$1"
   local input="$2"
   local expected="$3"
+  local per_peer="${4:-}"
   local config="${TEMP_DIR}/${name}.toml"
   local first_run="${TEMP_DIR}/${name}.first.toml"
 
   printf '%s' "${input}" > "${config}"
-  "${RECONCILE}" "${config}" "https://mediator.example.com" "did:example:admin"
+  "${RECONCILE}" "${config}" "https://mediator.example.com" "did:example:admin" "${per_peer}"
 
   if [[ "$(cat "${config}")" != "${expected}" ]]; then
     echo "❌ ${name}: unexpected reconciled config" >&2
@@ -24,7 +25,7 @@ run_case() {
   fi
 
   cp "${config}" "${first_run}"
-  "${RECONCILE}" "${config}" "https://mediator.example.com" "did:example:admin"
+  "${RECONCILE}" "${config}" "https://mediator.example.com" "did:example:admin" "${per_peer}"
   if ! cmp -s "${first_run}" "${config}"; then
     echo "❌ ${name}: reconciliation is not idempotent" >&2
     diff -u "${first_run}" "${config}" >&2 || true
@@ -51,6 +52,30 @@ run_case \
   "multi-line" \
   $'[server]\nlocal_endpoints = [\n  "http://first.example.com",\n  "http://second.example.com", # old endpoint\n]\nadmin_did = "did://did:old:admin"\n\n[database]\nurl = "redis://localhost/"\n' \
   $'[server]\nlocal_endpoints = ["https://mediator.example.com"]\nadmin_did = "did://did:example:admin"\n\n[database]\nurl = "redis://localhost/"'
+
+run_case \
+  "per-peer-replaced" \
+  $'[server]\nadmin_did = "did://did:example:admin"\n\n[limits]\nqueued_send_messages_per_peer = "50"\nqueued_send_messages_soft = "2000"\n' \
+  $'[server]\nadmin_did = "did://did:example:admin"\n\nlocal_endpoints = ["https://mediator.example.com"]\n[limits]\nqueued_send_messages_per_peer = "150"\nqueued_send_messages_soft = "2000"' \
+  "150"
+
+run_case \
+  "per-peer-inserted" \
+  $'[server]\nadmin_did = "did://did:example:admin"\n\n[limits]\nqueued_send_messages_soft = "200"\n\n[database]\nurl = "redis://localhost/"\n' \
+  $'[server]\nadmin_did = "did://did:example:admin"\n\nlocal_endpoints = ["https://mediator.example.com"]\n[limits]\nqueued_send_messages_soft = "200"\n\nqueued_send_messages_per_peer = "150"\n[database]\nurl = "redis://localhost/"' \
+  "150"
+
+run_case \
+  "per-peer-unset-leaves-limits" \
+  $'[server]\nadmin_did = "did://did:example:admin"\n\n[limits]\nqueued_send_messages_per_peer = "50"\n' \
+  $'[server]\nadmin_did = "did://did:example:admin"\n\nlocal_endpoints = ["https://mediator.example.com"]\n[limits]\nqueued_send_messages_per_peer = "50"'
+
+missing_limits="${TEMP_DIR}/missing-limits.toml"
+printf '%s' $'[server]\nadmin_did = "did://did:example:admin"\n' > "${missing_limits}"
+if "${RECONCILE}" "${missing_limits}" "https://mediator.example.com" "did:example:admin" "150" >/dev/null 2>&1; then
+  echo "❌ missing-limits: reconciliation unexpectedly succeeded" >&2
+  exit 1
+fi
 
 missing_server="${TEMP_DIR}/missing-server.toml"
 missing_server_before="${TEMP_DIR}/missing-server.before.toml"

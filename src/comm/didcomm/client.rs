@@ -10,7 +10,8 @@ use reqwest::Method;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 
 use super::mediator::{
-    MediatorAuthTestResult, MediatorTrustPingResult, cache_did_document, test_authentication, trust_ping,
+    MediatorAuthTestResult, MediatorTrustPingResult, cache_did_document, cache_did_document_in_tdk_state,
+    test_authentication, trust_ping,
 };
 use crate::comm::client::DIDCommContract;
 use crate::egress::{EgressError, EgressPolicy, bdd_egress_allowlist, guarded_send_inner};
@@ -86,7 +87,7 @@ impl DIDCommClient {
         mediator_did: Option<String>,
         alias: Option<String>,
     ) -> Result<Self, String> {
-        Self::new_with_cache_config(did, secrets, mediator_did, alias, None).await
+        Self::new_with_cache_config(did, secrets, mediator_did, None, alias, None).await
     }
 
     pub async fn new_with_mediator_document(
@@ -96,28 +97,30 @@ impl DIDCommClient {
         mediator_did_document: Option<serde_json::Value>,
         alias: Option<String>,
     ) -> Result<Self, String> {
-        let client = Self::new_with_cache_config(did, secrets, mediator_did.clone(), alias, None).await?;
-        if let (Some(doc), Some(med_did)) = (mediator_did_document, mediator_did.as_deref()) {
-            cache_did_document(&client, med_did, doc).await?;
-        }
-        Ok(client)
+        Self::new_with_cache_config(did, secrets, mediator_did, mediator_did_document, alias, None).await
     }
 
+    /// A supplied mediator DID document is cached before the ATM profile is
+    /// built, so the profile resolves its mediator from it.
     pub async fn new_with_cache_config(
         did: String,
         secrets: Vec<Secret>,
         mediator_did: Option<String>,
+        mediator_did_document: Option<serde_json::Value>,
         alias: Option<String>,
         cache_config: Option<&super::gateway::CacheConfig>,
     ) -> Result<Self, String> {
         let tdk_state = Arc::new(
             TDKSharedState::new(
-                affinidi_tdk_common::config::TDKConfig::headless()
+                crate::gateways::did_cache::headless_tdk_config()
                     .map_err(|e| format!("Failed to build TDK config: {:?}", e))?,
             )
             .await
             .map_err(|e| format!("Failed to create TDK shared state: {:?}", e))?,
         );
+        if let (Some(doc), Some(med_did)) = (mediator_did_document, mediator_did.as_deref()) {
+            cache_did_document_in_tdk_state(&tdk_state, med_did, doc).await?;
+        }
 
         let tdk_profile = TDKProfile::new(
             alias
@@ -396,5 +399,58 @@ mod tests {
             .await
             .expect_err("metadata must be blocked");
         assert!(err.contains("blocked by egress policy"), "unexpected error: {err}");
+    }
+
+    const UNREACHABLE_MEDIATOR_DID: &str = "did:web:localhost%3A1";
+
+    fn unreachable_mediator_document() -> serde_json::Value {
+        serde_json::json!({
+            "id": UNREACHABLE_MEDIATOR_DID,
+            "service": [{
+                "id": format!("{UNREACHABLE_MEDIATOR_DID}#didcomm"),
+                "type": "DIDCommMessaging",
+                "serviceEndpoint": [{ "uri": "https://localhost:1/mediator/v1", "accept": ["didcomm/v2"] }]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_supplied_mediator_document_is_cached_before_the_profile_resolves_its_mediator() {
+        let client = super::DIDCommClient::new_with_mediator_document(
+            "did:example:connection-point".to_string(),
+            Vec::new(),
+            Some(UNREACHABLE_MEDIATOR_DID.to_string()),
+            Some(unreachable_mediator_document()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            client
+                .profile()
+                .get_mediator_rest_endpoint()
+                .as_deref(),
+            Some("https://localhost:1/mediator/v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_supplied_document_an_unresolvable_mediator_leaves_the_profile_without_one() {
+        let client = super::DIDCommClient::new(
+            "did:example:connection-point".to_string(),
+            Vec::new(),
+            Some(UNREACHABLE_MEDIATOR_DID.to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            client
+                .profile()
+                .get_mediator_rest_endpoint(),
+            None
+        );
     }
 }

@@ -67,6 +67,7 @@ ttl_seconds = 3600
 max_entries = 100
 stale_threshold_percent = 80
 storage_path = "{storage}/cache/did"
+allow_private_hosts = true
 
 [tls]
 cert_path = "{cert}"
