@@ -1,0 +1,15 @@
+branch: token-info-endpoint
+changes:
+  added:
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Add GET /api/v1/token-info to inspect the calling token
+      description: Returns the user ID, token ID and granted scopes of the bearer token making the call, so a client such as the CLI can check who it is signed in as. Session logins get null for token ID and scopes. A tenant-scoped token does not need to send its resource-scope headers to this route.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-06T00:00:01.000Z'
+      title: Add tests and docs for the token-info endpoint
+      description: Covers scoped and unrestricted personal access tokens, session logins by header or cookie, missing or revoked tokens, owners who have not accepted the Terms, and tenant-scoped tokens called without their scope headers, and documents the response in the RBAC and access token guides.

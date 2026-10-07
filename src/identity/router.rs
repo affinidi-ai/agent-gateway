@@ -429,6 +429,7 @@ pub fn create_identity_api_router(
                 .route("/v1/profile", put(crate::auth_manager::handlers::update_profile))
                 .route("/v1/profile/avatar", post(crate::auth_manager::handlers::upload_avatar))
                 .route("/v1/permissions", get(crate::auth_manager::permissions::get_permissions))
+                .route("/v1/token-info", get(crate::auth_manager::permissions::get_token_info))
                 .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
                 .layer(Extension(sess_mgr.clone()))
                 .layer(Extension(storage.clone()))
