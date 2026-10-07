@@ -137,7 +137,12 @@ impl FsAccessTokenStore {
         if renamed.is_err() {
             let _ = fs::remove_file(&temporary).await;
         }
-        renamed
+        renamed?;
+        #[cfg(unix)]
+        crate::storage::filesystem::sync_directory(&self.dir)
+            .await
+            .map_err(std::io::Error::other)?;
+        Ok(())
     }
 
     /// Writes `bytes` to `path` readable only by the owner (mode 0o600 on unix)
