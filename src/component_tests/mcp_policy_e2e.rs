@@ -11,7 +11,7 @@ use serde_json::json;
 const DENY_ALL_POLICY_ID: &str = "deny-all-channel";
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mcp_http_and_protocol_mode_survive_older_put_and_patch_null_removes_them() {
+async fn mcp_http_survives_older_put_and_patch_null_while_protocol_mode_is_dropped() {
     use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
 
     let mut storage_path = std::path::PathBuf::new();
@@ -54,21 +54,19 @@ async fn mcp_http_and_protocol_mode_survive_older_put_and_patch_null_removes_the
         "/transit/points/0/mcp_protocol_mode",
         "/variants/0/overrides/transit/points/0/mcp_protocol_mode",
     ];
-    original
-        .as_object_mut()
-        .unwrap()
-        .remove("mcp_protocol_mode");
+    for path in mode_paths {
+        assert!(
+            original
+                .pointer(path)
+                .is_none(),
+            "{path} was stored"
+        );
+    }
     original
         .as_object_mut()
         .unwrap()
         .remove("mcp_http");
     for path in ["/transit/points/0", "/variants/0/overrides/transit/points/0"] {
-        original
-            .pointer_mut(path)
-            .unwrap()
-            .as_object_mut()
-            .unwrap()
-            .remove("mcp_protocol_mode");
         original
             .pointer_mut(path)
             .unwrap()
@@ -85,9 +83,6 @@ async fn mcp_http_and_protocol_mode_survive_older_put_and_patch_null_removes_the
         .unwrap();
     assert_eq!(updated.status(), 200);
     let mut stored: serde_json::Value = updated.json().await.unwrap();
-    for path in mode_paths {
-        assert_eq!(stored.pointer(path), Some(&json!("dual")), "{path}");
-    }
     assert_eq!(stored["mcp_http"]["max_request_bytes"], 4096);
     assert_eq!(stored["mcp_http"]["allowed_origins"], json!(["https://console.example"]));
     for path in [
@@ -106,18 +101,25 @@ async fn mcp_http_and_protocol_mode_survive_older_put_and_patch_null_removes_the
         .unwrap();
     assert_eq!(updated.status(), 200);
     let stored: serde_json::Value = updated.json().await.unwrap();
-    assert_eq!(stored["mcp_protocol_mode"], "legacy");
-    assert_eq!(stored["transit"]["points"][0]["mcp_protocol_mode"], "legacy");
-    assert_eq!(stored["variants"][0]["overrides"]["transit"]["points"][0]["mcp_protocol_mode"], "dual");
+    for path in mode_paths {
+        assert!(stored.pointer(path).is_none(), "{path} was stored");
+    }
 
-    let invalid = client
+    let ignored = client
         .patch(&endpoint)
         .header("content-type", "application/merge-patch+json")
         .json(&json!({"mcp_protocol_mode": "modern"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(invalid.status(), 400);
+    assert_eq!(ignored.status(), 200);
+    let ignored: serde_json::Value = ignored.json().await.unwrap();
+    assert!(
+        ignored
+            .get("mcp_protocol_mode")
+            .is_none()
+    );
+    assert_eq!(ignored["mcp_http"], stored["mcp_http"]);
     let readback: serde_json::Value = client
         .get(&endpoint)
         .send()
@@ -126,7 +128,7 @@ async fn mcp_http_and_protocol_mode_survive_older_put_and_patch_null_removes_the
         .json()
         .await
         .unwrap();
-    assert_eq!(readback, stored);
+    assert_eq!(readback, ignored);
     let response = client.patch(&endpoint).header("content-type", "application/merge-patch+json")
         .json(&json!({"mcp_protocol_mode": null, "mcp_http": null, "transit": original["transit"], "variants": original["variants"]}))
         .send().await.unwrap();
@@ -160,11 +162,10 @@ async fn mcp_http_and_protocol_mode_survive_older_put_and_patch_null_removes_the
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mcp_protocol_mode_dual_follows_the_direct_access_point_policy() {
+async fn modern_mcp_follows_the_direct_access_point_policy() {
     let harness = GatewayHarness::start(|_, config, _| {
         let mut surface = surface_with_deny_all_channel_policy();
         surface.target.policy = None;
-        surface.mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
         config.surfaces = vec![surface];
     })
     .await;
@@ -470,7 +471,6 @@ async fn mcp_http_direct_guards_opt_in_before_target_dispatch() {
     let harness = GatewayHarness::start(|_, config, _| {
         let mut surface = surface_with_deny_all_channel_policy();
         surface.target.policy = None;
-        surface.mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
         surface.mcp_http = Some(
             serde_json::from_value(json!({
                 "allowed_origins": ["https://console.example"], "max_request_bytes": 1024, "max_header_bytes": 512
@@ -955,13 +955,15 @@ async fn mcp_wire_validation_precedes_policy_without_rejecting_legacy_headers() 
         .as_object_mut()
         .unwrap()
         .remove("name");
+    let mut unmodelled_body = modern_body.clone();
+    unmodelled_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2025-11-25");
     let mut mixed_era_body = list_body.clone();
     mixed_era_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
         json!(crate::mcp::MCP_LEGACY_VERSION);
     for (body, method, version, name, expected_code, expected_id) in [
         (String::new(), "tools/call", crate::mcp::MCP_MODERN_VERSION, "echo", -32700, None),
         (modern_body.to_string(), "tools/call", crate::mcp::MCP_MODERN_VERSION, "=?base64?=", -32020, Some(json!(8))),
-        (modern_body.to_string(), "tools/call", crate::mcp::MCP_MODERN_VERSION, "echo", -32022, Some(json!(8))),
+        (unmodelled_body.to_string(), "tools/call", "2025-11-25", "echo", -32022, Some(json!(8))),
         (list_body.to_string(), "tools/list", crate::mcp::MCP_MODERN_VERSION, "=?base64?=", -32020, Some(json!(8))),
         (
             mixed_era_body.to_string(),
@@ -1021,7 +1023,7 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
     let client = reqwest::Client::new();
     let response = client
         .post(&harness.gateway_url)
-        .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
+        .header("mcp-protocol-version", "2025-11-25")
         .header("mcp-method", "tasks/get")
         .json(&json!({
             "jsonrpc": "2.0",
@@ -1030,7 +1032,7 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
             "params": {
                 "taskId": "task-1",
                 "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
                     "io.modelcontextprotocol/clientCapabilities": {
                         "extensions": { "io.modelcontextprotocol/tasks": {} }
                     }
@@ -1048,8 +1050,8 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
     assert_eq!(
         envelope["error"]["data"],
         json!({
-            "requested": crate::mcp::MCP_MODERN_VERSION,
-            "supported": [crate::mcp::MCP_LEGACY_VERSION]
+            "requested": "2025-11-25",
+            "supported": [crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION]
         })
     );
 

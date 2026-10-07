@@ -287,27 +287,16 @@ async fn wait_for_message(
 
 /// MCP Sandbox: connect as MCP client, run initialize + tools/list,
 /// validate correct sandbox URL is used and a list of tools is returned.
+/// The deprecated HTTP+SSE endpoint keeps serving `2024-11-05` clients, with
+/// the Origin and size checks applied to legacy traffic too.
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_sandbox_connect_and_tools_list_succeeds() {
-    assert_legacy_sse_session(None).await;
-}
-
-/// The deprecated HTTP+SSE endpoint keeps serving `2024-11-05` clients on a
-/// `dual` Access Point, where the Origin and size checks also apply to legacy
-/// traffic.
-#[tokio::test(flavor = "multi_thread")]
-async fn mcp_sandbox_legacy_sse_session_works_on_a_dual_endpoint() {
-    assert_legacy_sse_session(Some(crate::config::types::McpProtocolMode::Dual)).await;
-}
-
-async fn assert_legacy_sse_session(mode: Option<crate::config::types::McpProtocolMode>) {
     let mock = McpSandboxMockServer::start().await;
     let mock_url = mock.url();
 
     let h = GatewayHarness::start(|_, gw_config, _| {
         let mut surface = helpers::build_minimal_mcp_surface();
         surface.target.endpoint = mock_url.clone();
-        surface.mcp_protocol_mode = mode;
         gw_config.surfaces = vec![surface];
     })
     .await;

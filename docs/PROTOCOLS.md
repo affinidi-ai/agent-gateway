@@ -11,7 +11,7 @@ revision-specific behavior and limitations of the checked-out source.
 | A2A `1.0` | Active, advertised | JSON-RPC messaging, discovery, identity extensions, policy, and proxy targets; implemented against spec revision [`1.0.1`](https://a2a-protocol.org/v1.0.1/specification/) |
 | A2A `0.3` | Accepted | Accepted while the `a2a_legacy_compatibility` feature flag is on (the default); see [A2A Protocol Versions](#a2a-protocol-versions) |
 | MCP `2024-11-05` | Active | Admitted and advertised on every MCP endpoint |
-| MCP `2026-07-28` | Active on `dual` endpoints | Admitted and advertised on endpoints whose `mcp_protocol_mode` is `dual`; `legacy` and unset endpoints reject it as unsupported |
+| MCP `2026-07-28` | Active | Admitted and advertised alongside `2024-11-05` on every MCP endpoint |
 | AP2 | Experimental | Disabled by default; production proof signing is not implemented |
 
 The hosted documentation is rolling product documentation. Use this matrix and the repository
@@ -445,10 +445,9 @@ Not bounded here: `fabric://` legs.
 
 `2024-11-05` is active on every MCP endpoint. The Gateway recognizes `2026-07-28` per-request
 metadata and mirrored HTTP headers on direct Access Points, Transit Points, standalone MCP Proxies
-and Fabric receive, and admits and advertises that revision alongside `2024-11-05` only on
-endpoints whose `mcp_protocol_mode` is `dual`. Fabric carries it only as framed streams; the
-buffered Fabric forward stays `2024-11-05`-only. `legacy` endpoints and endpoints without a mode
-(the default) reject it as an unsupported revision.
+and Fabric receive, and admits and advertises that revision alongside `2024-11-05` on every MCP
+endpoint. Fabric carries it only as framed streams; the buffered Fabric forward stays
+`2024-11-05`-only. Revisions the gateway does not model are rejected as unsupported.
 
 `2026-07-28` support is measured against the published MCP conformance suite with
 `make mcp-conformance`, which runs the ordinary gateway binary; see
@@ -457,7 +456,7 @@ Harness section of [`MCP_METADATA.md`](MCP_METADATA.md).
 
 | Condition | HTTP / JSON-RPC result |
 | --- | --- |
-| Valid modern request to a `legacy` or unset endpoint | HTTP `400`, `-32022`, with `supported: ["2024-11-05"]` |
+| Valid modern request whose upstream answers with a legacy (non-modern) result | HTTP `502` |
 | Request using an unmodelled revision such as `2025-06-18` | HTTP `400`, `-32022`, listing the revisions the endpoint supports |
 | Malformed modern metadata | HTTP `400`, `-32602` |
 | Missing, malformed, or mismatched mirrored headers | HTTP `400`, `-32020` |

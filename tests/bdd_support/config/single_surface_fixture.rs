@@ -42,7 +42,6 @@ pub struct SurfaceConfigBuilder {
     pub caller_trust_check_list: Vec<serde_json::Value>,
     pub target_trust_check_list: Vec<serde_json::Value>,
     pub transit_shared_policy: Option<RequestPolicyFixture>,
-    pub mcp_protocol_mode: Option<String>,
     pub mcp_http: Option<serde_json::Value>,
 }
 
@@ -87,7 +86,6 @@ impl Default for SurfaceConfigBuilder {
             caller_trust_check_list: Vec::new(),
             target_trust_check_list: Vec::new(),
             transit_shared_policy: None,
-            mcp_protocol_mode: None,
             mcp_http: None,
         }
     }

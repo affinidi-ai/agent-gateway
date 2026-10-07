@@ -122,11 +122,11 @@ Feature: MCP requests travel across gateways over fabric
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 surface "charlie" for available MCP tools using protocol version "2026-07-28"
+    When the caller asks gateway 1 surface "charlie" for available MCP tools using protocol version "2025-11-25"
     Then the response status is 400
     And the MCP response is a JSON-RPC error with code -32022
     And the MCP response id matches the request id
-    And the MCP unsupported-version error requests "2026-07-28" and supports only "2024-11-05"
+    And the MCP unsupported-version error requests "2025-11-25" and supports only "2024-11-05, 2026-07-28"
     And MCP server "bravo" was not called
     And gateway 2 did not receive a fabric forward request
 
@@ -180,28 +180,16 @@ Feature: MCP requests travel across gateways over fabric
     Then MCP server "bravo" received 2 forwarded MCP requests
     And each Legacy SSE reply answers its own request with MCP server "bravo" response result
 
-  Scenario: A modern MCP request crosses fabric between dual-era surfaces
+  Scenario: A modern MCP request crosses fabric between MCP surfaces
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
-    And surface "alpha" uses "dual" MCP protocol mode
     And MCP server "bravo" serves a modern MCP tool catalog
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    And surface "charlie" uses "dual" MCP protocol mode
     When the caller asks gateway 1 surface "charlie" for available MCP tools using protocol version "2026-07-28"
     Then the response status is 200
     And the MCP response id matches the request id
     And the MCP response tool catalog includes a tool named "echo"
     And MCP server "bravo" received MCP _meta key "io.modelcontextprotocol/protocolVersion" with value "2026-07-28"
-
-  Scenario: A Legacy SSE session stays available on dual-era surfaces over fabric
-    Given a fabric with 2 gateways
-    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
-    And surface "alpha" uses "dual" MCP protocol mode
-    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    And surface "charlie" uses "dual" MCP protocol mode
-    When the caller asks gateway 1 surface "charlie" for available MCP tools twice over one Legacy SSE session
-    Then MCP server "bravo" received 2 forwarded MCP requests
-    And each Legacy SSE reply answers its own request with MCP server "bravo" response result
 
   Scenario: SSE MCP requests over fabric are answered as JSON
     Given a fabric with 2 gateways

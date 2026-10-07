@@ -240,9 +240,7 @@ impl StreamRuntime {
         ) {
             return Err("Fabric stream peer or route is unavailable".into());
         }
-        if surface.mcp_protocol_mode != Some(crate::config::McpProtocolMode::Dual)
-            || !versions.supports_modern(crate::mcp::MCP_MODERN_VERSION)
-        {
+        if !versions.supports_modern(crate::mcp::MCP_MODERN_VERSION) {
             return Err(OpenRefusal::new(
                 wire::StreamErrorCode::LegacyOnly,
                 "Modern MCP execution is not active for the receiving endpoint",
@@ -277,7 +275,6 @@ impl StreamRuntime {
         let deadline_ms = u64::try_from(now_ms + remaining_ms).map_err(|_| "Fabric stream deadline is out of range")?;
         let headers = wire::decode_headers(&request.headers)?;
         let http_policy = crate::mcp::modern_http::EndpointHttpPolicy::new(
-            surface.mcp_protocol_mode,
             Some(&limits),
             std::slice::from_ref(
                 &surface
@@ -769,7 +766,7 @@ mod tests {
             .await
             .unwrap();
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface", "name": "Surface", "mcp_protocol_mode": "dual",
+            "surface_id": "surface", "name": "Surface",
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": "https://target.example/mcp"},
             "variants": [
@@ -1088,11 +1085,26 @@ mod tests {
         assert!(forwarded_deadline <= now_ms + lifetime_ms, "{forwarded_deadline} exceeds the lifetime");
         assert!(forwarded_deadline + 60_000 > now_ms + lifetime_ms, "the lifetime bound, not a shorter one");
         drop(bounded);
-        for change in ["disabled", "legacy", "other-protocol", "empty-variant-catalog"] {
+        // A receiver that does not serve modern MCP is named as such, so the
+        // sender can answer as a legacy endpoint would.
+        assert_eq!(
+            runtime
+                .prepare_incoming_with_versions(
+                    &fresh_message(),
+                    &connection,
+                    &peer,
+                    crate::mcp::request_validation::LEGACY_ONLY_POLICY,
+                )
+                .await
+                .err()
+                .expect("a legacy-only receiver refuses modern streams")
+                .code,
+            wire::StreamErrorCode::LegacyOnly
+        );
+        for change in ["disabled", "other-protocol", "empty-variant-catalog"] {
             let mut changed = surface.clone();
             match change {
                 "disabled" => changed.status = crate::config::agent_surface::SurfaceStatus::Disabled,
-                "legacy" => changed.mcp_protocol_mode = None,
                 "other-protocol" => changed.access_point.protocol = serde_json::from_value(json!("a2a")).unwrap(),
                 "empty-variant-catalog" => changed.variants.clear(),
                 _ => unreachable!(),
@@ -1110,14 +1122,7 @@ mod tests {
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("{change} was admitted"));
-            // A surface that does not serve modern MCP is named as such, so the
-            // sender can answer as a legacy endpoint would.
-            let expected = if change == "legacy" {
-                wire::StreamErrorCode::LegacyOnly
-            } else {
-                wire::StreamErrorCode::Unavailable
-            };
-            assert_eq!(refusal.code, expected, "{change}");
+            assert_eq!(refusal.code, wire::StreamErrorCode::Unavailable, "{change}");
             store
                 .save(&surface)
                 .await
@@ -1863,7 +1868,7 @@ mod tests {
             .await
             .unwrap();
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface", "name": "Surface", "mcp_protocol_mode": "dual",
+            "surface_id": "surface", "name": "Surface",
             "mcp_http": {"stream_idle_timeout_secs": 1, "stream_max_lifetime_secs": 1},
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": "https://target.example/mcp"}
@@ -2036,7 +2041,7 @@ mod tests {
             .await
             .unwrap();
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface", "name": "Surface", "mcp_protocol_mode": "dual",
+            "surface_id": "surface", "name": "Surface",
             "mcp_http": {"stream_idle_timeout_secs": 1, "stream_max_lifetime_secs": 1},
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": "https://target.example/mcp"}

@@ -98,7 +98,6 @@ async fn outbound_mcp_listener_preserves_variant_catalog_and_custom_routes() {
             .transit
             .as_mut()
             .unwrap();
-        transit.points[0].mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
         transit.points[0].listen_path = Some("/custom/mcp".into());
         let mut default_point = transit.points[0].clone();
         default_point.target_endpoint = base_url.clone();
@@ -243,9 +242,9 @@ async fn outbound_mcp_canonical_metadata_and_modern_rejection() {
         .request_count
         .load(std::sync::atomic::Ordering::SeqCst);
     let response = reqwest::Client::new().post(format!("{}/outbound/smoke/target", harness.outbound_url.as_ref().unwrap()))
-        .header("MCP-Protocol-Version", crate::mcp::MCP_MODERN_VERSION).header("Mcp-Method", "tasks/get")
+        .header("MCP-Protocol-Version", "2025-11-25").header("Mcp-Method", "tasks/get")
         .json(&json!({"jsonrpc": "2.0", "id": "modern-transit", "method": "tasks/get", "params": {"taskId": "one", "_meta": {
-            "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+            "io.modelcontextprotocol/protocolVersion": "2025-11-25",
             "io.modelcontextprotocol/clientCapabilities": {}
         }}})).send().await.unwrap();
     assert_eq!(response.status(), 400);
@@ -254,7 +253,7 @@ async fn outbound_mcp_canonical_metadata_and_modern_rejection() {
     assert_eq!(error["error"]["code"], -32022);
     assert_eq!(
         error["error"]["data"],
-        json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": [crate::mcp::MCP_LEGACY_VERSION]})
+        json!({"requested": "2025-11-25", "supported": [crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION]})
     );
     assert_eq!(
         harness

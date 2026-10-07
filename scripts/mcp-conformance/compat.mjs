@@ -2,10 +2,10 @@
 //
 //   probe     a modern request to the Access Point is admitted; exit 2 when the
 //             binary answers -32022
-//   admitted  dual endpoints admit 2026-07-28, the surface without a protocol
-//             mode still rejects it
-//   rejected  the surface without a protocol mode rejects 2026-07-28 with
-//             -32022, supported ["2024-11-05"] and the request id echoed
+//   admitted  every endpoint admits 2026-07-28, including the surface whose
+//             record still carries the retired mcp_protocol_mode
+//   rejected  every endpoint rejects the unmodelled 2025-11-25 with -32022,
+//             a supported list that offers 2024-11-05, and the request id echoed
 //   legacy    a 2024-11-05 client session (initialize, notifications/initialized,
 //             tools/list, tools/call) gives the same results through the gateway
 //             as directly, and owned endpoints return the fixture's text
@@ -16,7 +16,8 @@ import { SIMPLE_TEXT } from './fixture.mjs';
 const MODERN = '2026-07-28';
 const LEGACY = '2024-11-05';
 const CLIENT_INFO = { name: 'trust-gateway-compat', version: '1.0.0' };
-const DUAL = ['access-point', 'transit', 'owned-proxy', 'proxy-surface'];
+const UNMODELLED = '2025-11-25';
+const ENDPOINTS = ['access-point', 'transit', 'owned-proxy', 'proxy-surface', 'legacy-surface'];
 const FORWARDING = ['access-point', 'transit', 'legacy-surface'];
 const OWNED = ['owned-proxy', 'proxy-surface'];
 
@@ -79,7 +80,7 @@ async function post(url, body, headers = {}) {
   return { status: res.status, headers: res.headers, message: await readMessage(res, body.id) };
 }
 
-function modernToolsList(url, id) {
+function modernToolsList(url, id, version = MODERN) {
   return post(
     url,
     {
@@ -88,13 +89,13 @@ function modernToolsList(url, id) {
       method: 'tools/list',
       params: {
         _meta: {
-          'io.modelcontextprotocol/protocolVersion': MODERN,
+          'io.modelcontextprotocol/protocolVersion': version,
           'io.modelcontextprotocol/clientInfo': CLIENT_INFO,
           'io.modelcontextprotocol/clientCapabilities': {},
         },
       },
     },
-    { 'MCP-Protocol-Version': MODERN, 'Mcp-Method': 'tools/list' },
+    { 'MCP-Protocol-Version': version, 'Mcp-Method': 'tools/list' },
   );
 }
 
@@ -102,13 +103,16 @@ function describe(response) {
   return `HTTP ${response.status} ${JSON.stringify(response.message)?.slice(0, 300)}`;
 }
 
-function isUnsupported(response, id) {
+function isUnsupported(response, id, requested) {
   const error = response.message?.error;
+  const supported = error?.data?.supported;
   return (
     response.status === 400 &&
     response.message?.id === id &&
     error?.code === -32022 &&
-    isDeepStrictEqual(error?.data?.supported, [LEGACY])
+    Array.isArray(supported) &&
+    supported.includes(LEGACY) &&
+    !supported.includes(requested)
   );
 }
 
@@ -127,20 +131,20 @@ async function probe() {
 }
 
 async function admitted() {
-  for (const name of DUAL) {
+  for (const name of ENDPOINTS) {
     const id = `compat-admitted-${name}`;
     const response = await modernToolsList(targets[name], id);
     report(isAdmitted(response, id), `${name} admits ${MODERN}`, isAdmitted(response, id) ? '' : describe(response));
   }
-  const id = 'compat-admitted-legacy-surface';
-  const response = await modernToolsList(targets['legacy-surface'], id);
-  report(isUnsupported(response, id), `legacy-surface rejects ${MODERN} with -32022`, describe(response));
 }
 
 async function rejected() {
-  const id = 'compat-rejected-legacy-surface';
-  const response = await modernToolsList(targets['legacy-surface'], id);
-  report(isUnsupported(response, id), `legacy-surface rejects ${MODERN} with -32022 and [${LEGACY}]`, describe(response));
+  for (const name of ENDPOINTS) {
+    const id = `compat-rejected-${name}`;
+    const response = await modernToolsList(targets[name], id, UNMODELLED);
+    const ok = isUnsupported(response, id, UNMODELLED);
+    report(ok, `${name} rejects ${UNMODELLED} with -32022 offering ${LEGACY}`, ok ? '' : describe(response));
+  }
 }
 
 async function legacySession(url) {

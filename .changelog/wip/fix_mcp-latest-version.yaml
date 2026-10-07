@@ -1,0 +1,81 @@
+branch: fix/mcp-latest-version
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Register a modern-only catalog when the legacy OpenAPI converter fails
+      description: >-
+        An MCP Proxy whose OpenAPI spec the legacy catalog converter cannot load now registers a
+        modern-only catalog instead of failing, and its request body limit always comes from
+        `mcp_http`. Its create and update responses carry a `warnings` entry naming the converter
+        error, because `2024-11-05` clients of that Proxy get `500`; the dashboard's create
+        wizard and edit page display those warnings. Updates that do not rebuild the catalogs
+        still return the warning until a rebuild loads the legacy catalog. Management tool
+        discovery reads the modern catalog, so it lists that Proxy's tools instead of returning
+        `500`.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Trust the sending gateway's Origin check on buffered Fabric receive
+      description: >-
+        A buffered Fabric `ForwardRequest` no longer rechecks the caller's browser Origin against
+        the receiving surface's `mcp_http.allowed_origins`, so a legacy browser client admitted by
+        the sending gateway is not refused with `403` by its peer. Header and body limits still
+        apply, with the forwarded Origin counted toward the header budget, and framed streams
+        still check Origin on receive.
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Apply mcp_http Origin and size limits to every MCP endpoint
+      description: >-
+        `mcp_http` Origin allowlist, header budget and `max_request_bytes` (default 1 MiB) now
+        apply to every MCP endpoint and to `2024-11-05` traffic as well, so legacy browser clients
+        whose Origin is not allowed get `403`, and oversized requests get `413`/`431`. Before
+        upgrading, add browser origins to `mcp_http.allowed_origins` and raise
+        `max_request_bytes` / `max_header_bytes` on endpoints that need them. Public endpoints
+        given as bare listen addresses are skipped by the Origin check; any other public endpoint
+        that is not an HTTP(S) origin is skipped with a warning.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Send delegated access tokens to Fabric peers for every modern MCP request
+      description: >-
+        A modern MCP request on a `fabric://` route with `outbound_credentials` now sends the
+        caller's delegated access token to the peer inside the framed stream without the former
+        `dual` opt-in, so existing routes start sharing tokens on upgrade. Remove
+        `outbound_credentials` from any `fabric://` route whose peer must not receive them.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: ⭐ Admit MCP 2026-07-28 on every MCP endpoint and retire mcp_protocol_mode
+      description: >-
+        Access Points, Transit Points, MCP Proxies and Fabric framed streams now admit MCP
+        `2026-07-28` alongside `2024-11-05` without configuration, instead of rejecting it with
+        `400` / `-32022` unless the endpoint was set to `dual`. `mcp_protocol_mode` is retired:
+        stored records and API payloads that carry it still load, the value is ignored, it is
+        dropped on the next save and no longer returned. There is no per-endpoint opt-out, so a
+        modern request to a legacy-only upstream gets `502`. Buffered Fabric `ForwardRequest`
+        stays `2024-11-05`-only.
+  internal:
+    - timestamp: '2026-10-07T09:00:00.000Z'
+      title: Narrow the MCP Origin-check skip to crate-internal Fabric receive
+      description: >-
+        `EndpointHttpPolicy::without_origin_check` is now `pub(crate)` and documented as only for
+        buffered Fabric `ForwardRequest` receive. The skip lives on `EndpointHttpPolicy` and the
+        `admit_post` helper is private, so `OriginPolicy` always enforces its allowlist and that
+        method is the only way to skip it.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Remove protocol mode from tests, BDD fixtures, conformance and dashboard
+      description: >-
+        Tests that pinned legacy or unset rejection now use the unmodelled `2025-11-25`; record
+        compatibility tests cover surfaces carrying `legacy`, `dual` or no mode. BDD support, the
+        conformance harness and the dashboard schema and types no longer set the field, and a
+        dashboard payload test fails if any element writes it.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Describe modern MCP admission on every endpoint in the docs
+      description: >-
+        AGENTS.md, ARCHITECTURE.md, CONTEXT.md, README and the MCP, protocol, Fabric and
+        conformance docs describe modern MCP as admitted on every MCP endpoint, with a short
+        compatibility note for the retired setting.
+    - timestamp: '2026-10-07T10:00:00.000Z'
+      title: Require saving every surface before downgrading to an older release
+      description: >-
+        The MCP rollback steps now PATCH `{"mcp_http": null}` onto every surface, even when GET
+        shows neither field, and verify the stored records rather than GET, because GET hides a
+        retired `mcp_protocol_mode` that only a save removes and that older releases reject.

@@ -1674,15 +1674,12 @@ async fn step_extract_protocol_context_with_versions(
 
     let versions = crate::mcp::request_validation::admission_policy_for_target(
         versions,
-        ctx.virtual_channel
-            .mcp_protocol_mode,
         &ctx.virtual_channel
             .target_endpoint,
     );
     let mcp_http =
         if ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp {
             Some(crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-            ctx.virtual_channel.mcp_protocol_mode,
             ctx.virtual_channel.mcp_http.as_ref(),
             &state.network_config.get_outbound_external_urls(),
             versions,
@@ -1712,9 +1709,7 @@ async fn step_extract_protocol_context_with_versions(
         )
         .await
         .map_err(|error| {
-            if let Some(policy) = &mcp_http
-                && policy.body_limit() != usize::MAX
-            {
+            if let Some(policy) = &mcp_http {
                 return OutboundPipelineError::McpValidation(policy.body_read_error(error));
             }
             OutboundPipelineError::BodyReadFailed(error.to_string())
@@ -4797,8 +4792,6 @@ async fn process_modern_outbound_response(
     let limits = crate::mcp::modern_sse::SseLimits::from(&config);
     let mut discovery_support = crate::mcp::modern::ForwardingSupport::for_endpoint(
         ctx.virtual_channel
-            .mcp_protocol_mode,
-        ctx.virtual_channel
             .target_endpoint
             .starts_with("fabric://"),
         crate::mcp::request_validation::McpPathKind::TransitPoint,
@@ -5620,7 +5613,7 @@ mod tests {
             "target": {"endpoint": "https://managed.example/agent"},
             "transit": {"outbound_listen_address": "https://outbound.example", "points": [{
                 "alias": "partner-a", "protocol": "mcp", "target_endpoint": format!("http://{target_address}/json"),
-                "mcp_protocol_mode": "dual", "mcp_http": {"authorization": {"resource": resource, "scopes": ["read"]}}
+                "mcp_http": {"authorization": {"resource": resource, "scopes": ["read"]}}
             }]},
             "outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"]}]
         }))
@@ -7400,7 +7393,7 @@ mod tests {
                 "surface_id": "variant-surface", "name": "Variant surface",
                 "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
                 "target": {"endpoint": "http://127.0.0.1:1"},
-                "transit": {"points": [{"alias": "partner-a", "protocol": "mcp", "mcp_protocol_mode": "dual",
+                "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
                     "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr)}]},
                 "variants": [{"id": "candidate", "alias": "candidate", "name": "Candidate", "enabled": false}]
             }))
@@ -7593,8 +7586,6 @@ mod tests {
         for method in [Method::GET, Method::DELETE] {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
-            ctx.virtual_channel
-                .mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
             ctx.original_method = method;
             ctx.original_headers.insert(
                 "mcp-protocol-version",
@@ -7621,22 +7612,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_step_extract_protocol_context_mcp_http_uses_transit_opt_in_only() {
+    async fn test_step_extract_protocol_context_mcp_http_applies_the_transit_point_origin_policy() {
         let state = test_outbound_state();
-        for (mode, origin, blocked) in [
-            (None, "https://untrusted.example", false),
-            (Some(crate::config::McpProtocolMode::Dual), "https://agent.example", false),
-            (Some(crate::config::McpProtocolMode::Dual), "https://console.example", true),
-        ] {
+        for (origin, blocked) in
+            [("https://agent.example", false), ("https://console.example", true), ("https://untrusted.example", true)]
+        {
             let mut ctx = test_pipeline_context();
             let surface = Arc::make_mut(&mut ctx.surface);
             surface.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
-            surface.mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
             surface.mcp_http =
                 Some(serde_json::from_value(json!({"allowed_origins": ["https://console.example"]})).unwrap());
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
-            ctx.virtual_channel
-                .mcp_protocol_mode = mode;
             ctx.virtual_channel.mcp_http =
                 Some(serde_json::from_value(json!({"allowed_origins": ["https://agent.example"]})).unwrap());
             ctx.original_headers
@@ -7674,8 +7660,6 @@ mod tests {
                 .access_point
                 .protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
-            ctx.virtual_channel
-                .mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
             ctx.virtual_channel.mcp_http =
                 Some(serde_json::from_value(json!({"allowed_origins": [ALLOWED_ORIGIN]})).unwrap());
             ctx.original_headers = case.header_map();
@@ -7701,8 +7685,6 @@ mod tests {
             .access_point
             .protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
         ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
-        ctx.virtual_channel
-            .mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
         for (name, value) in [
             ("content-type", "application/json"),
             ("accept", "application/json, text/event-stream"),
@@ -7788,8 +7770,6 @@ mod tests {
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
-        ctx.virtual_channel
-            .mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
         ctx.virtual_channel.mcp_http = Some(serde_json::from_value(json!({"max_request_bytes": 32})).unwrap());
         ctx.request = Some(axum::http::Request::new(axum::body::Body::from(" ".repeat(33))));
         let OutboundPipelineError::McpValidation(error) = step_extract_protocol_context(&state, &mut ctx)
@@ -7810,21 +7790,21 @@ mod tests {
             &[crate::mcp::MCP_MODERN_VERSION],
             &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
         );
-        // A `fabric://` Transit Point narrows to its own mode's Fabric send
-        // policy, so a `legacy` one rejects the modern request at admission.
-        for (target, mode, admitted) in [
-            ("fabric://gateway/channel", crate::config::McpProtocolMode::Dual, true),
-            ("https://agent.example/mcp", crate::config::McpProtocolMode::Dual, true),
-            ("fabric://gateway/channel", crate::config::McpProtocolMode::Legacy, false),
+        // A `fabric://` Transit Point resolves to the Fabric send policy, which
+        // admits the same revisions as an HTTP(S) Target; each row pins that
+        // the two Targets still agree.
+        for (target, version, admitted) in [
+            ("fabric://gateway/channel", crate::mcp::MCP_MODERN_VERSION, true),
+            ("https://agent.example/mcp", crate::mcp::MCP_MODERN_VERSION, true),
+            ("fabric://gateway/channel", "2025-11-25", false),
+            ("https://agent.example/mcp", "2025-11-25", false),
         ] {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
             ctx.virtual_channel
-                .mcp_protocol_mode = Some(mode);
-            ctx.virtual_channel
                 .target_endpoint = target.to_string();
             for (name, value) in [
-                ("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION),
+                ("mcp-protocol-version", version),
                 ("mcp-method", "tools/list"),
                 ("content-type", "application/json"),
                 ("accept", "application/json, text/event-stream"),
@@ -7834,7 +7814,7 @@ mod tests {
             }
             ctx.request = Some(axum::http::Request::new(axum::body::Body::from(
                 json!({"jsonrpc": "2.0", "id": "transit-admission", "method": "tools/list", "params": {"_meta": {
-                    "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                    "io.modelcontextprotocol/protocolVersion": version,
                     "io.modelcontextprotocol/clientCapabilities": {}
                 }}})
                 .to_string(),
@@ -7842,12 +7822,15 @@ mod tests {
             let result = step_extract_protocol_context_with_versions(&state, &mut ctx, versions).await;
             if !admitted {
                 let OutboundPipelineError::McpValidation(error) = result.unwrap_err() else {
-                    panic!("expected MCP version rejection for {target}");
+                    panic!("expected MCP version rejection for {target} {version}");
                 };
                 assert_eq!(error.status, StatusCode::BAD_REQUEST);
                 assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
                 assert_eq!(error.id, Some(json!("transit-admission")));
-                assert_eq!(error.data.unwrap()["supported"], json!([crate::mcp::MCP_LEGACY_VERSION]));
+                assert_eq!(
+                    error.data.unwrap()["supported"],
+                    json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
+                );
                 assert!(
                     ctx.mcp_classification
                         .is_none()
@@ -7875,8 +7858,6 @@ mod tests {
         );
         let transit_point = |ctx: &mut OutboundPipelineContext, alias: &str| {
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
-            ctx.virtual_channel
-                .mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
             ctx.virtual_channel.alias = alias.to_string();
             ctx.virtual_channel
                 .target_endpoint = "https://agent.example/mcp".to_string();

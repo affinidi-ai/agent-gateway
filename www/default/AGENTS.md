@@ -130,6 +130,17 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
 
+## MCP Proxy write warnings
+
+MCP Proxy create and update responses can carry `warnings`, for example when only the
+modern catalog could be registered. Render them with the shared `WriteWarnings` alert
+(`components/mcp-proxy/WriteWarnings.tsx`, `data-testid="mcp-proxy-write-warnings"`):
+
+- The wizard's `CompleteStep` shows them, titles the step **MCP Proxy Created with
+  Warnings**, and does not claim the proxy is ready to use.
+- The edit page shows the warnings from the latest save above the editor card, and clears
+  them when the next save starts or another proxy opens.
+
 ## Remote gateway Issuer DIDs
 
 The **Remote** tab of a remote gateway starts with the **Issuer DIDs** card

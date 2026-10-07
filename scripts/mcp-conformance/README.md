@@ -85,13 +85,15 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    suite per target, `check-results.mjs`, `compat.mjs admitted` and
    `compat.mjs legacy`. The `fabric` target runs `fabric.feature` through the
    g2g BDD runner (`cargo test --test g2g_bdd`): two gateways
-   paired over a managed mediator in Docker, a dual Access Point on gateway 1
-   whose Target is `fabric://` gateway 2, and a dual surface on gateway 2 that
+   paired over a managed mediator in Docker, an Access Point on gateway 1
+   whose Target is `fabric://` gateway 2, and a surface on gateway 2 that
    forwards to the shim. A step in the scenario runs the suite against gateway
    1, so the requests cross the Fabric as framed streams.
 5. **Legacy phase.** Starts the same binary on another fresh env and runs
-   `compat.mjs rejected` (the surface without a protocol mode answers
-   `-32022` with `["2024-11-05"]`) and `compat.mjs legacy`.
+   `compat.mjs rejected` (every endpoint answers the unmodelled `2025-11-25`
+   with `-32022` and a `supported` list offering `2024-11-05`) and
+   `compat.mjs legacy`. `compat.mjs admitted`, in the modern phase, requires
+   every endpoint, `legacy-surface` included, to admit `2026-07-28`.
 
 `env.mjs` builds everything from scratch under `target/mcp-conformance/env/`:
 `config.toml` from the binary's own `--generate-bootstrap`, a certificate from
@@ -103,12 +105,12 @@ gateway starts and exists only in its environment.
 | Target | Endpoint | Suite run | Baseline |
 | --- | --- | --- | --- |
 | `direct` | The reference server itself | Full `2026-07-28` requirement set | `direct.yaml` |
-| `access-point` | Dual Access Point `/conformance/mcp` forwarding to the reference server through the shim | Full requirement set | `forwarding.yaml` |
-| `transit` | Dual Transit Point `/transit/conformance-mcp` on the outbound listener | Full requirement set | `forwarding.yaml` |
-| `owned-proxy` | Standalone dual MCP Proxy `/owned/api` over the REST fixture | `tools-list`, `tools-call-simple-text`, `caching` | `owned.yaml` |
-| `proxy-surface` | Dual Access Point `/conformance/owned-mcp` with Target `proxy://conformance-owned` | Same subset | `owned.yaml` |
-| `fabric` | Dual Access Point on gateway 1 with Target `fabric://` gateway 2, whose dual surface forwards to the reference server through the shim | Full requirement set | `fabric.yaml` |
-| `legacy-surface` | Access Point `/conformance/legacy-mcp` without a protocol mode | `compat.mjs` only | |
+| `access-point` | Access Point `/conformance/mcp` forwarding to the reference server through the shim | Full requirement set | `forwarding.yaml` |
+| `transit` | Transit Point `/transit/conformance-mcp` on the outbound listener | Full requirement set | `forwarding.yaml` |
+| `owned-proxy` | Standalone MCP Proxy `/owned/api` over the REST fixture | `tools-list`, `tools-call-simple-text`, `caching` | `owned.yaml` |
+| `proxy-surface` | Access Point `/conformance/owned-mcp` with Target `proxy://conformance-owned` | Same subset | `owned.yaml` |
+| `fabric` | Access Point on gateway 1 with Target `fabric://` gateway 2, whose surface forwards to the reference server through the shim | Full requirement set | `fabric.yaml` |
+| `legacy-surface` | Access Point `/conformance/legacy-mcp` whose stored record deliberately still carries the retired `mcp_protocol_mode: 'legacy'`, which is ignored | `compat.mjs` only | |
 
 Outputs, all under the ignored `target/mcp-conformance/`:
 

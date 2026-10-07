@@ -1761,7 +1761,6 @@ mod tests {
                     alias: "partner-a".to_string(),
                     target_endpoint: tp_target_endpoint.to_string(),
                     protocol: TransitProtocol::A2a,
-                    mcp_protocol_mode: None,
                     mcp_http: None,
                     header_metadata_mapping: None,
                     target_auth: None,

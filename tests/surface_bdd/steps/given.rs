@@ -3536,16 +3536,6 @@ fn managed_agent_publishes_card_with_extra_urls(
     set_primary_target_response(world, agent_card);
 }
 
-#[given(expr = "the surface uses {string} MCP protocol mode")]
-fn surface_uses_mcp_protocol_mode(
-    world: &mut SurfaceWorld,
-    mode: String,
-) {
-    world
-        .surface_config
-        .mcp_protocol_mode = Some(mode);
-}
-
 #[given(expr = "the surface accepts MCP Origin {string}")]
 fn surface_accepts_mcp_origin(
     world: &mut SurfaceWorld,

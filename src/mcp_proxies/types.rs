@@ -58,9 +58,6 @@ pub struct McpProxy {
     pub managed_by: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_protocol_mode: Option<crate::config::McpProtocolMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_http: Option<crate::config::McpHttpConfig>,
 
     /// Timestamp when this record was created
@@ -93,7 +90,6 @@ impl McpProxy {
             flatten_post_params: false,
             direct_access: true,
             managed_by: None,
-            mcp_protocol_mode: None,
             mcp_http: None,
             created_at: now,
             updated_at: now,
@@ -116,6 +112,16 @@ impl StorableEntity for McpProxy {
     }
 }
 
+/// A created or updated MCP Proxy, with any problem that left part of it
+/// unusable without failing the write.
+#[derive(Debug, Serialize)]
+pub struct McpProxyWriteResponse {
+    #[serde(flatten)]
+    pub proxy: McpProxy,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 /// Request to create a new MCP Proxy
 #[derive(Debug, Deserialize)]
 pub struct CreateMcpProxyRequest {
@@ -136,7 +142,6 @@ pub struct CreateMcpProxyRequest {
     pub direct_access: Option<bool>,
     #[serde(default)]
     pub managed_by: Option<String>,
-    pub mcp_protocol_mode: Option<crate::config::McpProtocolMode>,
     pub mcp_http: Option<crate::config::McpHttpConfig>,
 }
 
@@ -154,7 +159,6 @@ pub struct UpdateMcpProxyRequest {
     pub direct_access: Option<bool>,
     /// Absent keeps the stored label; an empty string clears it.
     pub managed_by: Option<String>,
-    pub mcp_protocol_mode: Option<crate::config::McpProtocolMode>,
     pub mcp_http: Option<crate::config::McpHttpConfig>,
 }
 
@@ -163,8 +167,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mcp_protocol_mode_is_omitted_by_default_and_round_trips() {
-        let mut proxy = McpProxy::new(
+    fn a_record_carrying_the_retired_protocol_mode_loads_and_saves_without_it() {
+        let proxy = McpProxy::new(
             "example".into(),
             String::new(),
             "https://example.org".into(),
@@ -172,14 +176,20 @@ mod tests {
             "/mcp".into(),
             "/example".into(),
         );
-        assert!(
-            serde_json::to_value(&proxy)
-                .unwrap()
-                .get("mcp_protocol_mode")
-                .is_none()
-        );
-        proxy.mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
-        let restored: McpProxy = serde_json::from_value(serde_json::to_value(&proxy).unwrap()).unwrap();
-        assert_eq!(restored.mcp_protocol_mode, proxy.mcp_protocol_mode);
+        for mode in ["legacy", "dual"] {
+            let mut stored = serde_json::to_value(&proxy).unwrap();
+            stored["mcp_protocol_mode"] = serde_json::json!(mode);
+            let restored: McpProxy = serde_json::from_value(stored).unwrap();
+            assert_eq!(restored.id, proxy.id);
+            assert!(
+                serde_json::to_value(&restored)
+                    .unwrap()
+                    .get("mcp_protocol_mode")
+                    .is_none()
+            );
+        }
+        let request: UpdateMcpProxyRequest =
+            serde_json::from_value(serde_json::json!({"name": "renamed", "mcp_protocol_mode": "legacy"})).unwrap();
+        assert_eq!(request.name.as_deref(), Some("renamed"));
     }
 }

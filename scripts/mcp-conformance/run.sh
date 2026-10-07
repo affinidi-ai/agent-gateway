@@ -595,7 +595,7 @@ if [[ "${RUN_MODERN}" == true ]]; then
     check "modern: check-results (caching parity, real owned calls, results present)" "${LOGS}/check-results.log" \
         node "${HERE}/check-results.mjs" --results "${RESULTS}" --targets "${targets_csv}" \
         --owned-scenarios "${owned_csv}" --requirements "${HERE}/node_modules/@modelcontextprotocol/conformance/requirements/${SPEC_VERSION}.yaml"
-    check "modern: compat admitted (dual endpoints 200, legacy surface -32022)" "${LOGS}/compat-admitted-modern.log" \
+    check "modern: compat admitted (every endpoint admits ${SPEC_VERSION})" "${LOGS}/compat-admitted-modern.log" \
         node "${HERE}/compat.mjs" admitted --targets "${TARGETS_FILE}"
     check "modern: compat legacy session (2024-11-05)" "${LOGS}/compat-legacy-modern.log" \
         node "${HERE}/compat.mjs" legacy --targets "${TARGETS_FILE}"
@@ -609,7 +609,7 @@ if [[ "${RUN_LEGACY}" == true ]]; then
         [[ -n "${BINARY}" ]] || build_step "legacy: build" "${LOGS}/build.log" gateway_cargo build
     fi
     start_gateway legacy "${LEGACY_BINARY}" "${LEGACY_INBOUND_PORT}" "${LEGACY_OUTBOUND_PORT}"
-    check "legacy: compat rejected (legacy endpoint -32022 with [2024-11-05])" "${LOGS}/compat-rejected-legacy.log" \
+    check "legacy: compat rejected (every endpoint -32022 for 2025-11-25)" "${LOGS}/compat-rejected-legacy.log" \
         node "${HERE}/compat.mjs" rejected --targets "${TARGETS_FILE}"
     check "legacy: compat legacy session (2024-11-05)" "${LOGS}/compat-legacy-legacy.log" \
         node "${HERE}/compat.mjs" legacy --targets "${TARGETS_FILE}"

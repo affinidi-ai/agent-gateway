@@ -838,7 +838,7 @@ mod tests {
         }});
         let target = crate::component_tests::helpers::MockServer::start_with_response(expected.to_string()).await;
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface", "name": "Surface", "mcp_protocol_mode": "dual",
+            "surface_id": "surface", "name": "Surface",
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": "http://127.0.0.1:1"},
             "variants": [{"id": "variant", "alias": "candidate", "name": "Candidate", "overrides": {
@@ -1049,7 +1049,6 @@ mod tests {
             assert_eq!(response.status(), axum::http::StatusCode::OK);
             assert_eq!(response.headers()["x-preserved"], "stream");
             let support = crate::mcp::modern::ForwardingSupport::for_endpoint(
-                Some(crate::config::McpProtocolMode::Dual),
                 true,
                 crate::mcp::request_validation::McpPathKind::FabricSend,
             )
@@ -1229,7 +1228,6 @@ mod tests {
                 .unwrap();
                 assert_eq!(response.status(), axum::http::StatusCode::OK);
                 let support = crate::mcp::modern::ForwardingSupport::for_endpoint(
-                    Some(crate::config::McpProtocolMode::Dual),
                     true,
                     crate::mcp::request_validation::McpPathKind::FabricSend,
                 )

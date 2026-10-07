@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use super::McpProxyStore;
-use super::types::{CreateMcpProxyRequest, McpProxy, UpdateMcpProxyRequest};
+use super::types::{CreateMcpProxyRequest, McpProxy, McpProxyWriteResponse, UpdateMcpProxyRequest};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::mcp::sse_server::SseSessionManager;
 use crate::tenancy::{
@@ -402,6 +402,7 @@ impl Default for McpServerManager {
 struct RegisteredCatalogs {
     legacy: Option<Arc<RwLock<McpServer>>>,
     modern: Arc<RwLock<McpServer>>,
+    warning: Option<String>,
 }
 
 impl McpServerManager {
@@ -411,11 +412,12 @@ impl McpServerManager {
         }
     }
 
-    /// Create and register a new MCP Server for the given proxy
+    /// Create and register a new MCP Server for the given proxy. Returns a
+    /// warning when only the modern catalog could be registered.
     pub async fn create_server(
         &self,
         proxy: &McpProxy,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         // Parse the OpenAPI spec from YAML to JSON
         let openapi_json: serde_json::Value =
             serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
@@ -435,9 +437,10 @@ impl McpServerManager {
                 RegisteredCatalogs {
                     legacy: Some(server.clone()),
                     modern: server,
+                    warning: None,
                 }
             }
-            Err(error) if proxy.mcp_protocol_mode == Some(crate::config::McpProtocolMode::Dual) => {
+            Err(error) => {
                 let original = server.openapi_spec.clone();
                 server.openapi_spec = super::modern_rest::routing_spec(&original).map_err(|error| error.to_string())?;
                 server
@@ -448,17 +451,21 @@ impl McpServerManager {
                 RegisteredCatalogs {
                     legacy: None,
                     modern: Arc::new(RwLock::new(server)),
+                    warning: Some(format!(
+                        "OpenAPI spec is unavailable to the MCP {legacy} tool catalog, so {legacy} clients cannot use this proxy: {error}",
+                        legacy = crate::mcp::MCP_LEGACY_VERSION
+                    )),
                 }
             }
-            Err(error) => return Err(format!("Failed to load OpenAPI spec: {error}")),
         };
+        let warning = catalogs.warning.clone();
         self.servers
             .write()
             .await
             .insert(proxy.id.clone(), catalogs);
 
         info!("✓ Created MCP Server for proxy '{}' at endpoint '{}'", proxy.name, proxy.endpoint_path);
-        Ok(())
+        Ok(warning)
     }
 
     /// Remove an MCP Server
@@ -494,11 +501,21 @@ impl McpServerManager {
             .cloned()
     }
 
+    /// The converter warning of the catalogs currently registered for a proxy.
+    async fn catalog_warning(
+        &self,
+        proxy_id: &str,
+    ) -> Option<String> {
+        self.get_catalogs(proxy_id)
+            .await
+            .and_then(|catalogs| catalogs.warning)
+    }
+
     /// Reload a server (useful when proxy config changes)
     pub async fn reload_server(
         &self,
         proxy: &McpProxy,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         self.create_server(proxy)
             .await
     }
@@ -684,7 +701,7 @@ async fn discover_proxy_tools<S: McpProxyStore>(
     }
 
     if manager
-        .get_server(proxy_id)
+        .get_catalogs(proxy_id)
         .await
         .is_none()
     {
@@ -694,12 +711,12 @@ async fn discover_proxy_tools<S: McpProxyStore>(
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to initialize MCP proxy: {}", e)))?;
     }
 
-    let server = manager
-        .get_server(proxy_id)
+    let catalogs = manager
+        .get_catalogs(proxy_id)
         .await
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "MCP proxy server is not available".to_string()))?;
 
-    let server = server.read().await;
+    let server = catalogs.modern.read().await;
     let mut tools = server
         .get_tool_names()
         .into_iter()
@@ -1027,7 +1044,7 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(mut request): Json<CreateMcpProxyRequest>,
-) -> Result<Json<McpProxy>, (StatusCode, String)> {
+) -> Result<Json<McpProxyWriteResponse>, (StatusCode, String)> {
     request.tenant_id = tenant_for_create(request.tenant_id.take(), pat.is_some(), tenant_context(&context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     crate::config::enforce_add("proxies.mcp")
@@ -1088,7 +1105,6 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
         .direct_access
         .unwrap_or(true);
     proxy.managed_by = managed_by;
-    proxy.mcp_protocol_mode = request.mcp_protocol_mode;
     if let Some(config) = &request.mcp_http {
         config
             .validate()
@@ -1098,10 +1114,12 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
     ensure_proxy_may_declare_resource(&resource_owners, &proxy).await?;
 
     // Try to create the MCP Server first
-    manager
+    let warnings = manager
         .create_server(&proxy)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to create MCP Server: {}", e)))?;
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to create MCP Server: {}", e)))?
+        .into_iter()
+        .collect();
 
     // Store the proxy
     store
@@ -1158,7 +1176,7 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
         });
     }
 
-    Ok(Json(proxy))
+    Ok(Json(McpProxyWriteResponse { proxy, warnings }))
 }
 
 /// Update an MCP Proxy
@@ -1171,7 +1189,7 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(request): Json<UpdateMcpProxyRequest>,
-) -> Result<Json<McpProxy>, (StatusCode, String)> {
+) -> Result<Json<McpProxyWriteResponse>, (StatusCode, String)> {
     let mut proxy = store
         .get(&id)
         .await
@@ -1225,9 +1243,6 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
     if request.managed_by.is_some() {
         proxy.managed_by = normalise_managed_by(request.managed_by)?;
     }
-    if let Some(mode) = request.mcp_protocol_mode {
-        proxy.mcp_protocol_mode = Some(mode);
-    }
     if let Some(config) = request.mcp_http {
         config
             .validate()
@@ -1241,12 +1256,19 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
     proxy.updated_at = chrono::Utc::now();
 
     // Reload the MCP Server if needed
-    if needs_reload {
+    let warning = if needs_reload {
         manager
             .reload_server(&proxy)
             .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to reload MCP Server: {}", e)))?;
-    }
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to reload MCP Server: {}", e)))?
+    } else {
+        manager
+            .catalog_warning(&proxy.id)
+            .await
+    };
+    let warnings = warning
+        .into_iter()
+        .collect::<Vec<_>>();
 
     store
         .update(&proxy)
@@ -1330,7 +1352,7 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
         });
     }
 
-    Ok(Json(proxy))
+    Ok(Json(McpProxyWriteResponse { proxy, warnings }))
 }
 
 /// Delete an MCP Proxy
@@ -2229,7 +2251,6 @@ pub(crate) async fn handle_modern_surface_request(
     crate::mcp::modern::require_active_version(request, versions)?;
     let mut proxy = proxy.clone();
     proxy.mcp_http = surface.mcp_http.clone();
-    proxy.mcp_protocol_mode = surface.mcp_protocol_mode;
     let manager = McpServerManager::new();
     manager
         .create_server(&proxy)
@@ -2326,7 +2347,6 @@ pub async fn handle_mcp_get<S: McpProxyStore>(
             }
         }
         let policy = crate::mcp::modern_http::EndpointHttpPolicy::new(
-            proxy.mcp_protocol_mode,
             proxy.mcp_http.as_ref(),
             &network.get_inbound_external_urls(),
             crate::mcp::request_validation::McpPathKind::OwnedProxy,
@@ -2415,7 +2435,6 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
     Path(path): Path<String>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    use axum::RequestExt;
     use axum::extract::FromRequest;
     use axum::response::IntoResponse;
 
@@ -2449,7 +2468,6 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
         headers.remove(axum::http::header::AUTHORIZATION);
     }
     let policy = crate::mcp::modern_http::EndpointHttpPolicy::new(
-        proxy.mcp_protocol_mode,
         proxy.mcp_http.as_ref(),
         &network.get_inbound_external_urls(),
         crate::mcp::request_validation::McpPathKind::OwnedProxy,
@@ -2458,11 +2476,6 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
     if let Err(error) = policy.validate_headers(&headers) {
         return Ok(error.into_response(None));
     }
-    let request = if proxy.mcp_protocol_mode == Some(crate::config::McpProtocolMode::Dual) {
-        request
-    } else {
-        request.with_limited_body()
-    };
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, policy.body_limit()).await {
         Ok(body) => body,
@@ -2482,10 +2495,7 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
             &proxy,
             &manager,
             &request,
-            crate::mcp::request_validation::endpoint_version_policy(
-                proxy.mcp_protocol_mode,
-                crate::mcp::request_validation::McpPathKind::OwnedProxy,
-            ),
+            crate::mcp::request_validation::runtime_policy_for(crate::mcp::request_validation::McpPathKind::OwnedProxy),
             &headers,
         )
         .await;
@@ -3557,7 +3567,7 @@ mod tests {
             "$defs": {"Proof": {"type": "string", "minLength": 5}},
             "properties": {"proof": {"$ref": "#/$defs/Proof"}}, "required": ["proof"]
         });
-        let mut proxy = McpProxy::new(
+        let proxy = McpProxy::new(
             "Schema resource".into(),
             String::new(),
             target.url(),
@@ -3571,12 +3581,13 @@ mod tests {
             "/mcp".into(),
             "/resource".into(),
         );
-        proxy.mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
         let manager = super::McpServerManager::new();
-        manager
+        let warning = manager
             .create_server(&proxy)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("legacy catalog warning");
+        assert!(warning.contains(crate::mcp::MCP_LEGACY_VERSION), "{warning}");
         assert!(
             manager
                 .get_server(&proxy.id)
@@ -4016,7 +4027,7 @@ mod tests {
             "/owned".into(),
         );
         let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface-tools", "name": "Surface tools", "mcp_protocol_mode": "dual",
+            "surface_id": "surface-tools", "name": "Surface tools",
             "access_point": {"listen_address": "https://gateway.example", "route": "/tools", "protocol": "mcp"},
             "target": {"endpoint": format!("proxy://{}", proxy.id)}
         }))
@@ -4106,7 +4117,7 @@ mod tests {
             "/owned".into(),
         );
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface-subscriptions", "name": "Surface subscriptions", "mcp_protocol_mode": "dual",
+            "surface_id": "surface-subscriptions", "name": "Surface subscriptions",
             "mcp_http": {"max_response_bytes": 1},
             "access_point": {"listen_address": "https://gateway.example", "route": "/tools", "protocol": "mcp"},
             "target": {"endpoint": format!("proxy://{}", proxy.id)}
@@ -4540,9 +4551,7 @@ mod tests {
         assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
     }
 
-    async fn standalone_mcp_router(
-        mode: Option<crate::config::McpProtocolMode>
-    ) -> (axum::Router, super::SseSessionManager, tempfile::TempDir) {
+    async fn standalone_mcp_router() -> (axum::Router, super::SseSessionManager, tempfile::TempDir) {
         use crate::mcp_proxies::McpProxyStore;
 
         let directory = tempfile::tempdir().unwrap();
@@ -4561,7 +4570,6 @@ mod tests {
             "/mcp".into(),
             "/owned".into(),
         );
-        proxy.mcp_protocol_mode = mode;
         proxy.mcp_http = Some(
             serde_json::from_value(
                 serde_json::json!({"allowed_origins": ["https://console.example"], "max_request_bytes": 1024}),
@@ -4598,71 +4606,55 @@ mod tests {
     async fn standalone_mcp_http_non_post_ownership_preserves_legacy_sse() {
         use tower::ServiceExt;
 
-        for mode in [None, Some(crate::config::McpProtocolMode::Dual)] {
-            let (router, _sessions, _directory) = standalone_mcp_router(mode).await;
-            for method in [axum::http::Method::GET, axum::http::Method::DELETE] {
-                let response = router
-                    .clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method(method.clone())
-                            .uri("/mcp/owned")
-                            .header("mcp-protocol-version", "2026-07-28")
-                            .header("mcp-session-id", "legacy-session")
-                            .body(axum::body::Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                if mode.is_some() {
-                    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-                    assert_eq!(response.headers()["allow"], "POST");
-                } else if method == axum::http::Method::DELETE {
-                    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-                    assert_eq!(response.headers()["allow"], "GET,HEAD,POST");
-                } else {
-                    assert_eq!(response.status(), StatusCode::OK);
-                }
-            }
-            let sse = router
+        let (router, _sessions, _directory) = standalone_mcp_router().await;
+        for method in [axum::http::Method::GET, axum::http::Method::DELETE] {
+            let response = router
                 .clone()
                 .oneshot(
                     axum::http::Request::builder()
-                        .uri("/mcp/owned/sse")
+                        .method(method.clone())
+                        .uri("/mcp/owned")
+                        .header("mcp-protocol-version", "2026-07-28")
+                        .header("mcp-session-id", "legacy-session")
                         .body(axum::body::Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(sse.status(), StatusCode::OK);
-            assert_eq!(sse.headers()["content-type"], "text/event-stream");
-            drop(sse);
-            let invalid_origin = router
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri("/mcp/owned/sse")
-                        .header("origin", "https://untrusted.example")
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                invalid_origin.status(),
-                if mode.is_some() {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::OK
-                }
-            );
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(response.headers()["allow"], "POST");
         }
+        let sse = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/mcp/owned/sse")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        assert_eq!(sse.headers()["content-type"], "text/event-stream");
+        drop(sse);
+        let invalid_origin = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/mcp/owned/sse")
+                    .header("origin", "https://untrusted.example")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_origin.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn standalone_mcp_http_validates_raw_posts_before_legacy_sessions() {
         use tower::ServiceExt;
 
-        let (router, sessions, _directory) = standalone_mcp_router(Some(crate::config::McpProtocolMode::Dual)).await;
+        let (router, sessions, _directory) = standalone_mcp_router().await;
         let (session_id, _stream) = sessions
             .create_session()
             .await;
@@ -4722,7 +4714,7 @@ mod tests {
         use crate::mcp::admission_cases::{admission_cases, assert_rejected};
         use tower::ServiceExt;
 
-        let (router, _sessions, _directory) = standalone_mcp_router(Some(crate::config::McpProtocolMode::Dual)).await;
+        let (router, _sessions, _directory) = standalone_mcp_router().await;
         for case in admission_cases() {
             let mut request = axum::http::Request::builder()
                 .method("POST")
@@ -4754,91 +4746,75 @@ mod tests {
     async fn standalone_mcp_http_keeps_legacy_initialization_notifications_and_sse() {
         use tower::ServiceExt;
 
-        for mode in [None, Some(crate::config::McpProtocolMode::Dual)] {
-            let (router, sessions, _directory) = standalone_mcp_router(mode).await;
-            let (session_id, _stream) = sessions
-                .create_session()
-                .await;
-            for (path, method, expected_status) in [
-                ("/mcp/owned".to_string(), "initialize", StatusCode::OK),
-                ("/mcp/owned".to_string(), "notifications/initialized", StatusCode::NO_CONTENT),
-                (format!("/mcp/owned/mcp/messages?session_id={session_id}"), "initialize", StatusCode::ACCEPTED),
-            ] {
-                let mut body = serde_json::json!({"jsonrpc": "2.0", "method": method});
-                if method == "initialize" {
-                    body["id"] = serde_json::json!(1);
-                }
-                let response = router
-                    .clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri(path)
-                            .header("content-type", "application/json")
-                            .body(axum::body::Body::from(body.to_string()))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), expected_status);
-                let body = axum::body::to_bytes(response.into_body(), 8192)
-                    .await
-                    .unwrap();
-                if expected_status == StatusCode::OK {
-                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
-                    assert!(
-                        body["result"]
-                            .get("resultType")
-                            .is_none()
-                    );
-                } else {
-                    assert!(body.is_empty());
-                }
+        let (router, sessions, _directory) = standalone_mcp_router().await;
+        let (session_id, _stream) = sessions
+            .create_session()
+            .await;
+        for (path, method, expected_status) in [
+            ("/mcp/owned".to_string(), "initialize", StatusCode::OK),
+            ("/mcp/owned".to_string(), "notifications/initialized", StatusCode::NO_CONTENT),
+            (format!("/mcp/owned/mcp/messages?session_id={session_id}"), "initialize", StatusCode::ACCEPTED),
+        ] {
+            let mut body = serde_json::json!({"jsonrpc": "2.0", "method": method});
+            if method == "initialize" {
+                body["id"] = serde_json::json!(1);
             }
             let response = router
                 .clone()
                 .oneshot(
                     axum::http::Request::builder()
                         .method("POST")
-                        .uri("/mcp/owned")
+                        .uri(path)
                         .header("content-type", "application/json")
-                        .header("origin", "https://untrusted.example")
-                        .body(axum::body::Body::from(
-                            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).to_string(),
-                        ))
+                        .body(axum::body::Body::from(body.to_string()))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                response.status(),
-                if mode.is_some() {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::OK
-                }
-            );
-            let oversized = router
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method("POST")
-                        .uri("/mcp/owned")
-                        .header("content-type", "application/json")
-                        .body(axum::body::Body::from(" ".repeat(1025)))
-                        .unwrap(),
-                )
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), 8192)
                 .await
                 .unwrap();
-            assert_eq!(
-                oversized.status(),
-                if mode.is_some() {
-                    StatusCode::PAYLOAD_TOO_LARGE
-                } else {
-                    StatusCode::BAD_REQUEST
-                }
-            );
+            if expected_status == StatusCode::OK {
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+                assert!(
+                    body["result"]
+                        .get("resultType")
+                        .is_none()
+                );
+            } else {
+                assert!(body.is_empty());
+            }
         }
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp/owned")
+                    .header("content-type", "application/json")
+                    .header("origin", "https://untrusted.example")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let oversized = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp/owned")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(" ".repeat(1025)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
@@ -5204,7 +5180,7 @@ mod tests {
             Json(serde_json::from_value(body).unwrap()),
         )
         .await
-        .map(|Json(p)| p)
+        .map(|Json(response)| response.proxy)
     }
 
     fn create_body(id: Option<&str>) -> serde_json::Value {
@@ -5434,6 +5410,226 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
+    fn legacy_incompatible_spec() -> String {
+        serde_json::json!({
+            "openapi": "3.1.0", "info": {"title": "Resources", "version": "1.0"},
+            "paths": {"/filter": {"post": {"operationId": "filter", "requestBody": {"required": true,
+                "content": {"application/json": {"schema": {
+                    "$id": "https://schemas.example/filter", "type": "object",
+                    "$defs": {"Proof": {"type": "string"}}, "properties": {"proof": {"$ref": "#/$defs/Proof"}}
+                }}}
+            }, "responses": {"200": {"description": "OK"}}}}}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn create_and_update_warn_when_the_legacy_catalog_is_unavailable() {
+        let legacy_incompatible = legacy_incompatible_spec();
+        let store = store_with(vec![]);
+        let manager = Arc::new(super::McpServerManager::new());
+        let mut body = create_body(Some("schema-api"));
+        body["openapi_spec"] = serde_json::json!(legacy_incompatible);
+        let Json(created) = super::create_mcp_proxy(
+            Extension(store.clone()),
+            Extension(manager.clone()),
+            Extension(None),
+            Extension(no_resource_owners()),
+            None,
+            None,
+            None,
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .expect("created with a modern-only catalog");
+        assert_eq!(created.warnings.len(), 1);
+        assert!(created.warnings[0].contains(crate::mcp::MCP_LEGACY_VERSION), "{:?}", created.warnings);
+        assert_eq!(serde_json::to_value(&created).unwrap()["warnings"], serde_json::json!(created.warnings));
+        assert!(
+            store
+                .get("schema-api")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let update = |spec: &str| {
+            super::update_mcp_proxy(
+                Extension(store.clone()),
+                Extension(manager.clone()),
+                Extension(None),
+                Extension(no_resource_owners()),
+                Path("schema-api".to_string()),
+                None,
+                None,
+                Json(serde_json::from_value(serde_json::json!({ "openapi_spec": spec })).unwrap()),
+            )
+        };
+        let Json(fixed) = update(SPEC)
+            .await
+            .expect("updated");
+        assert!(fixed.warnings.is_empty());
+        assert!(
+            !serde_json::to_value(&fixed)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("warnings")
+        );
+        let Json(broken) = update(&legacy_incompatible)
+            .await
+            .expect("updated");
+        assert_eq!(broken.warnings, created.warnings);
+
+        let rename = |name: &str| {
+            super::update_mcp_proxy(
+                Extension(store.clone()),
+                Extension(manager.clone()),
+                Extension(None),
+                Extension(no_resource_owners()),
+                Path("schema-api".to_string()),
+                None,
+                None,
+                Json(serde_json::from_value(serde_json::json!({ "name": name })).unwrap()),
+            )
+        };
+        let Json(renamed) = rename("Renamed")
+            .await
+            .expect("renamed without a reload");
+        assert_eq!(renamed.proxy.name, "Renamed");
+        assert_eq!(renamed.warnings, created.warnings);
+
+        let failed = update("openapi: [unclosed")
+            .await
+            .expect_err("an unparseable spec fails the rebuild");
+        assert_eq!(failed.0, StatusCode::BAD_REQUEST);
+        let Json(after_failure) = rename("After failure")
+            .await
+            .expect("renamed without a reload");
+        assert_eq!(after_failure.warnings, created.warnings);
+
+        let Json(restored) = update(SPEC)
+            .await
+            .expect("legacy catalog restored");
+        assert!(restored.warnings.is_empty());
+        let Json(renamed_again) = rename("Renamed again")
+            .await
+            .expect("renamed without a reload");
+        assert!(
+            renamed_again
+                .warnings
+                .is_empty()
+        );
+    }
+
+    async fn create_with_manager(
+        store: &Arc<MemStore>,
+        manager: &Arc<super::McpServerManager>,
+        body: serde_json::Value,
+    ) -> super::McpProxyWriteResponse {
+        let Json(created) = super::create_mcp_proxy(
+            Extension(store.clone()),
+            Extension(manager.clone()),
+            Extension(None),
+            Extension(no_resource_owners()),
+            None,
+            None,
+            None,
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .expect("created");
+        created
+    }
+
+    async fn discover_proxy(
+        store: &Arc<MemStore>,
+        manager: &Arc<super::McpServerManager>,
+        proxy_id: &str,
+    ) -> Result<Vec<String>, (StatusCode, String)> {
+        let Json(response) = super::discover_mcp_tools(
+            Extension(store.clone()),
+            Extension(manager.clone()),
+            Extension(None),
+            None,
+            None,
+            Json(DiscoverMcpToolsRequest {
+                mcp_proxy_id: Some(proxy_id.to_string()),
+                target_endpoint: None,
+                target_auth: None,
+            }),
+        )
+        .await?;
+        Ok(response
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_lists_a_modern_only_proxy_from_its_modern_catalog() {
+        let store = store_with(vec![]);
+        let manager = Arc::new(super::McpServerManager::new());
+        let mut body = create_body(Some("schema-api"));
+        body["openapi_spec"] = serde_json::json!(legacy_incompatible_spec());
+        let created = create_with_manager(&store, &manager, body).await;
+        assert_eq!(created.warnings.len(), 1);
+        assert!(
+            manager
+                .get_server("schema-api")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            discover_proxy(&store, &manager, "schema-api")
+                .await
+                .unwrap(),
+            vec!["filter".to_string()]
+        );
+
+        manager
+            .remove_server("schema-api")
+            .await;
+        assert_eq!(
+            discover_proxy(&store, &manager, "schema-api")
+                .await
+                .unwrap(),
+            vec!["filter".to_string()]
+        );
+        assert!(
+            manager
+                .get_server("schema-api")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_lists_a_legacy_capable_proxy_and_rejects_an_unknown_one() {
+        let store = store_with(vec![]);
+        let manager = Arc::new(super::McpServerManager::new());
+        let created = create_with_manager(&store, &manager, create_body(Some("pets-api"))).await;
+        assert!(created.warnings.is_empty());
+        assert!(
+            manager
+                .get_server("pets-api")
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            discover_proxy(&store, &manager, "pets-api")
+                .await
+                .unwrap(),
+            vec!["listPets".to_string()]
+        );
+
+        let error = discover_proxy(&store, &manager, "missing-api")
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn a_managed_by_label_is_kept_trimmed_and_cleared_on_request() {
         let store = store_with(vec![]);
@@ -5460,11 +5656,17 @@ mod tests {
         let Json(kept) = update(serde_json::json!({ "name": "renamed" }))
             .await
             .expect("updated");
-        assert_eq!(kept.managed_by.as_deref(), Some("Boris"), "absent keeps the label");
+        assert_eq!(
+            kept.proxy
+                .managed_by
+                .as_deref(),
+            Some("Boris"),
+            "absent keeps the label"
+        );
         let Json(cleared) = update(serde_json::json!({ "managed_by": "" }))
             .await
             .expect("cleared");
-        assert_eq!(cleared.managed_by, None);
+        assert_eq!(cleared.proxy.managed_by, None);
         assert!(
             !serde_json::to_value(&cleared)
                 .unwrap()

@@ -1182,8 +1182,6 @@ export interface SurfaceTemplateItem {
   config?: any;
 }
 
-export type McpProtocolMode = 'legacy' | 'dual';
-
 export interface McpHttpConfig {
   allowed_origins?: string[];
   max_request_bytes?: number;
@@ -1207,7 +1205,6 @@ export interface AgentSurface {
   agent_did?: string;
   issuer_id?: string;
   mcp_legacy_metadata_output?: 'compatibility' | 'canonical';
-  mcp_protocol_mode?: McpProtocolMode;
   mcp_http?: McpHttpConfig;
   tags: string[];
   access_point: {
@@ -1307,7 +1304,6 @@ export interface TransitPoint {
   name: string;
   target_endpoint: string;
   protocol: 'a2a' | 'ap2' | 'mcp' | 'http';
-  mcp_protocol_mode?: McpProtocolMode;
   mcp_http?: McpHttpConfig;
   target_auth?: any;
   policy?: { policy_definition_id: string };

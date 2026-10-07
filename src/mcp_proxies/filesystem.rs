@@ -79,7 +79,6 @@ impl McpProxyStore for FileSystemMcpProxyStore {
                 || previous.base_url != proxy.base_url
                 || previous.endpoint_path != proxy.endpoint_path
                 || previous.channel_prefix != proxy.channel_prefix
-                || previous.mcp_protocol_mode != proxy.mcp_protocol_mode
                 || previous.mcp_http != proxy.mcp_http
         });
         if close {

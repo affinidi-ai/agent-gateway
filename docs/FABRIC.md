@@ -62,9 +62,9 @@ cap from its optional thirteenth argument, and without it leaves the mediator de
 Framed stream messages (`forward-stream/1.0` frames and capability queries) also arrive through the
 listener. It answers a capability query only from a registered, active peer gateway, and answers an
 Open it refuses with an `Error` frame to that peer saying why: `stale_offer` (the sender negotiates
-again), `legacy_only` (the surface is not `dual`; the sender's caller gets `-32022`, as from a
-`legacy` endpoint) or `unavailable`. An Open's envelope must carry a valid `expires_time`, as a
-`forward-request`'s must. See the Framed Fabric Transport section of
+again), `legacy_only` (sent only by an older peer whose surface does not admit modern MCP; the
+sender's caller gets `-32022`, as from a legacy-only endpoint) or `unavailable`. An Open's
+envelope must carry a valid `expires_time`, as a `forward-request`'s must. See the Framed Fabric Transport section of
 [`MCP_METADATA.md`](MCP_METADATA.md#framed-fabric-transport).
 
 The Agent Gateway exposes DID documents at `/.well-known/did.json` for `did:web` and
@@ -243,27 +243,31 @@ gating on each side composes: a tool hidden or denied by either surface remains 
 
 ### Modern MCP activation
 
-Modern MCP (`2026-07-28`) crosses Fabric only as framed streams, and only to a
-receiving surface whose mode is `dual`. Enable `dual` on single-tenant or
-trusted deployments first, and not on a multi-tenant or internet-facing gateway
-yet: some gateway-wide tables and signals are still shared across tenants and
-peers (process-wide subscription invalidation, the capability offer and Open
-replay tables), and the new limits are per caller, per peer or per surface,
-never per tenant. Framed streams are capped at 8 per peer and 16 per surface,
+Modern MCP (`2026-07-28`) is active on every MCP surface and crosses Fabric only
+as framed streams, which any active MCP surface on the receiving gateway serves.
+Pair single-tenant or trusted deployments first, and do not pair a
+multi-tenant or internet-facing gateway: some gateway-wide tables and signals
+are shared across tenants and peers (process-wide subscription invalidation,
+the capability offer and Open replay tables), and the limits are per caller,
+per peer or per surface, never per tenant. Framed streams are capped at 8 per peer and 16 per surface,
 so a partner's long-lived listens can use up its slots; past a cap the sending
 caller gets `502`, not `429`. The full list of limits is in
-[Framed Fabric limits](MCP_METADATA.md#framed-fabric-limits).
+[Framed Fabric limits](MCP_METADATA.md#framed-fabric-limits). A buffered `ForwardRequest` receiver
+does not recheck the caller's browser Origin against its own `mcp_http.allowed_origins`; it trusts
+the paired sending gateway's check, as it trusts that peer for every other forwarded header.
 
 ### Delegated credentials over Fabric
 
 A sending surface with `outbound_credentials` keeps its delegated tokens to itself for legacy
-traffic. For a modern (`2026-07-28`) MCP request on a `dual` route, the sending gateway applies the
+traffic. For a modern (`2026-07-28`) MCP request, the sending gateway applies the
 caller's delegated credential after stripping the caller's own token, the same way it would for a
 local Target, and sends it to the peer inside the authcrypt framed stream: the access token only,
 injected as the binding's `inject_as` says (a header or a `_meta` field), never the refresh token.
 The receiving gateway, and its Target, can therefore use that access token until it expires.
-Turning a route to `dual` is what switches this on, so pair only with peers you would trust with
-those tokens. See [Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
+Any modern MCP caller on a `fabric://` route with `outbound_credentials` triggers this, with no
+per-route opt-in or opt-out, so routes that predate this behaviour start sharing tokens on upgrade.
+Pair only with peers you would trust with those tokens, and remove `outbound_credentials` from a
+`fabric://` route whose peer must not receive them. See [Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
 
 A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 `agent_gateway_a2a_protocol_version_total` metric do not run on either G2G leg. The sending gateway

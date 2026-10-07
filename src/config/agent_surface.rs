@@ -112,8 +112,8 @@ pub struct AgentSurface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_legacy_metadata_output: Option<super::types::McpLegacyMetadataOutput>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_protocol_mode: Option<super::types::McpProtocolMode>,
+    #[serde(default, rename = "mcp_protocol_mode", skip_serializing)]
+    pub _retired_protocol_mode: super::types::RetiredSetting,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_http: Option<super::types::McpHttpConfig>,
@@ -998,9 +998,6 @@ pub struct TransitPoint {
     pub protocol: TransitProtocol,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_protocol_mode: Option<super::types::McpProtocolMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_http: Option<super::types::McpHttpConfig>,
 
     /// Header-to-metadata normalization for A2A/AP2 requests received
@@ -1816,13 +1813,6 @@ impl AgentSurface {
     pub(crate) fn validate_mcp_metadata_base(&self) -> Result<(), String> {
         let context = crate::mcp::meta::McpMetadataContext::legacy(self.mcp_legacy_metadata_output);
         let is_mcp = self.access_point.protocol == SurfaceProtocol::Mcp;
-        if self
-            .mcp_protocol_mode
-            .is_some()
-            && !is_mcp
-        {
-            return Err("mcp_protocol_mode requires an MCP Access Point".to_string());
-        }
         if let Some(config) = &self.mcp_http {
             if !is_mcp {
                 return Err("mcp_http requires an MCP Access Point".to_string());
@@ -1834,13 +1824,6 @@ impl AgentSurface {
         }
         if let Some(transit) = &self.transit {
             for point in &transit.points {
-                if point
-                    .mcp_protocol_mode
-                    .is_some()
-                    && point.protocol != TransitProtocol::Mcp
-                {
-                    return Err(format!("Transit Point '{}': mcp_protocol_mode requires MCP", point.alias));
-                }
                 if let Some(config) = &point.mcp_http {
                     if point.protocol != TransitProtocol::Mcp {
                         return Err(format!("Transit Point '{}': mcp_http requires MCP", point.alias));
@@ -2199,72 +2182,50 @@ mod tests {
     }
 
     #[test]
-    fn mcp_protocol_mode_is_optional_inherited_and_independent_of_transit_points() {
-        use crate::config::McpProtocolMode;
+    fn a_stored_retired_protocol_mode_loads_and_is_dropped_on_save() {
         use serde_json::json;
 
-        let mut stored = json!({
+        let stored = json!({
             "surface_id": "mode", "name": "mode",
             "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": "http://127.0.0.1:8081"},
             "transit": {"points": [{"id": "transit", "alias": "service", "protocol": "mcp", "target_endpoint": "http://127.0.0.1:8082"}]},
             "variants": [{"id": "variant", "alias": "test", "name": "test", "enabled": true, "overrides": {"complete": true}}]
         });
-        let surface: super::AgentSurface = serde_json::from_value(stored.clone()).unwrap();
-        assert_eq!(
-            surface
-                .mcp_protocol_mode
-                .unwrap_or_default(),
-            McpProtocolMode::Legacy
-        );
-        assert!(
-            serde_json::to_value(surface)
+        let without: super::AgentSurface = serde_json::from_value(stored.clone()).unwrap();
+        let expected = serde_json::to_value(&without).unwrap();
+        for mode in [json!("legacy"), json!("dual"), json!("modern"), json!(null)] {
+            let mut legacy = stored.clone();
+            legacy["mcp_protocol_mode"] = mode.clone();
+            legacy["transit"]["points"][0]["mcp_protocol_mode"] = mode.clone();
+            let surface: super::AgentSurface = serde_json::from_value(legacy).unwrap();
+            assert_eq!(surface.validate_mcp_metadata(), Ok(()), "{mode}");
+            let saved = serde_json::to_value(&surface).unwrap();
+            assert_eq!(saved, expected, "{mode} survived a save");
+            assert!(
+                saved
+                    .get("mcp_protocol_mode")
+                    .is_none()
+            );
+            assert!(
+                saved["transit"]["points"][0]
+                    .get("mcp_protocol_mode")
+                    .is_none()
+            );
+            assert!(
+                serde_json::to_value(
+                    surface
+                        .resolve_variant(Some("test"))
+                        .unwrap()
+                )
                 .unwrap()
                 .get("mcp_protocol_mode")
                 .is_none()
-        );
-        stored["mcp_protocol_mode"] = json!("dual");
-        let surface: super::AgentSurface = serde_json::from_value(stored.clone()).unwrap();
-        assert_eq!(surface.validate_mcp_metadata(), Ok(()));
-        assert_eq!(
-            surface
-                .resolve_variant(Some("test"))
-                .unwrap()
-                .mcp_protocol_mode,
-            Some(McpProtocolMode::Dual)
-        );
-        assert_eq!(
-            surface
-                .transit
-                .as_ref()
-                .unwrap()
-                .points[0]
-                .mcp_protocol_mode,
-            None
-        );
-        stored["transit"]["points"][0]["mcp_protocol_mode"] = json!("dual");
-        json_patch::merge(&mut stored, &json!({"mcp_protocol_mode": null}));
-        let surface: super::AgentSurface = serde_json::from_value(stored.clone()).unwrap();
-        assert_eq!(surface.mcp_protocol_mode, None);
-        assert_eq!(
-            surface
-                .transit
-                .as_ref()
-                .unwrap()
-                .points[0]
-                .mcp_protocol_mode,
-            Some(McpProtocolMode::Dual)
-        );
-        stored["transit"]["points"][0]["protocol"] = json!("a2a");
-        let surface: super::AgentSurface = serde_json::from_value(stored.clone()).unwrap();
-        assert!(
-            surface
-                .validate_mcp_metadata()
-                .unwrap_err()
-                .contains("Transit Point")
-        );
-        stored["mcp_protocol_mode"] = json!("modern");
-        assert!(serde_json::from_value::<super::AgentSurface>(stored).is_err());
+            );
+        }
+        let mut unknown = stored;
+        unknown["mcp_protocol_modes"] = json!("dual");
+        assert!(serde_json::from_value::<super::AgentSurface>(unknown).is_err());
     }
 
     #[test]
@@ -2828,7 +2789,7 @@ mod tests {
             outbound_credentials: Vec::new(),
             identity_slots: Default::default(),
             mcp_legacy_metadata_output: None,
-            mcp_protocol_mode: None,
+            _retired_protocol_mode: Default::default(),
             mcp_http: None,
         };
 
@@ -2902,7 +2863,6 @@ mod tests {
                         alias: "github-api".to_string(),
                         target_endpoint: "https://api.github.com".to_string(),
                         protocol: TransitProtocol::Http,
-                        mcp_protocol_mode: None,
                         mcp_http: None,
                         header_metadata_mapping: None,
                         target_auth: None,
@@ -2929,7 +2889,6 @@ mod tests {
                         alias: "partner".to_string(),
                         target_endpoint: "fabric://gw2/partner".to_string(),
                         protocol: TransitProtocol::A2a,
-                        mcp_protocol_mode: None,
                         mcp_http: None,
                         header_metadata_mapping: None,
                         target_auth: None,
@@ -2960,7 +2919,7 @@ mod tests {
             outbound_credentials: Vec::new(),
             identity_slots: Default::default(),
             mcp_legacy_metadata_output: None,
-            mcp_protocol_mode: None,
+            _retired_protocol_mode: Default::default(),
             mcp_http: None,
         };
 
@@ -4172,7 +4131,7 @@ mod tests {
             outbound_credentials: Vec::new(),
             identity_slots: Default::default(),
             mcp_legacy_metadata_output: None,
-            mcp_protocol_mode: None,
+            _retired_protocol_mode: Default::default(),
             mcp_http: None,
         };
         let value = serde_json::to_value(&surface).expect("surface must serialize");

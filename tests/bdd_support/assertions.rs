@@ -187,7 +187,11 @@ pub fn assert_mcp_unsupported_version_error(
     );
     assert_eq!(
         response_body.pointer("/error/data/supported"),
-        Some(&serde_json::json!([supported])),
+        Some(&serde_json::json!(
+            supported
+                .split(", ")
+                .collect::<Vec<_>>()
+        )),
         "unsupported-version error must list exactly the active MCP versions: {response_body}"
     );
 }

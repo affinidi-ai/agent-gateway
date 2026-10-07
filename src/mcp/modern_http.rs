@@ -34,62 +34,49 @@ pub struct EndpointHttpPolicy {
 
 impl EndpointHttpPolicy {
     pub fn new(
-        mode: Option<crate::config::McpProtocolMode>,
         config: Option<&crate::config::McpHttpConfig>,
         public_endpoints: &[String],
         path: super::request_validation::McpPathKind,
     ) -> Result<Self, String> {
-        Self::with_versions(
-            mode,
-            config,
-            public_endpoints,
-            super::request_validation::endpoint_version_policy(mode, path),
-        )
+        Self::with_versions(config, public_endpoints, super::request_validation::runtime_policy_for(path))
     }
 
     pub(crate) fn with_versions(
-        mode: Option<crate::config::McpProtocolMode>,
         config: Option<&crate::config::McpHttpConfig>,
         public_endpoints: &[String],
         versions: McpVersionPolicy<'static>,
     ) -> Result<Self, String> {
         let defaults = crate::config::McpHttpConfig::default();
         let config = config.unwrap_or(&defaults);
-        let origins = if mode == Some(crate::config::McpProtocolMode::Dual) {
-            Some(OriginPolicy::new(public_endpoints, &config.allowed_origins)?)
-        } else {
-            None
-        };
         Ok(Self {
-            origins,
+            origins: Some(OriginPolicy::new(public_endpoints, &config.allowed_origins)?),
             limits: config.into(),
-            versions: if mode == Some(crate::config::McpProtocolMode::Dual) {
-                versions
-            } else {
-                super::request_validation::LEGACY_ONLY_POLICY
-            },
+            versions,
         })
     }
 
+    /// Skips the Origin allowlist while keeping the header and body limits.
+    /// Only for buffered Fabric `ForwardRequest` receive, whose Origin the
+    /// sending gateway already checked; never for a browser-reachable route.
+    pub(crate) fn without_origin_check(mut self) -> Self {
+        self.origins = None;
+        self
+    }
+
     pub fn body_limit(&self) -> usize {
-        self.origins
-            .as_ref()
-            .map_or(usize::MAX, |_| {
-                self.limits
-                    .max_request_bytes
-                    .get()
-            })
+        self.limits
+            .max_request_bytes
+            .get()
     }
 
     pub fn validate_headers(
         &self,
         headers: &HeaderMap,
     ) -> Result<(), HttpAdmissionError> {
-        if let Some(origins) = &self.origins {
-            validate_header_budget(headers, self.limits)?;
-            origins.validate(headers)?;
-        }
-        Ok(())
+        validate_header_budget(headers, self.limits)?;
+        self.origins
+            .as_ref()
+            .map_or(Ok(()), |origins| origins.validate(headers))
     }
 
     pub fn admit_post(
@@ -116,7 +103,7 @@ impl EndpointHttpPolicy {
         method: &axum::http::Method,
         headers: &HeaderMap,
     ) -> Option<axum::response::Response> {
-        if self.origins.is_none() || !matches!(*method, axum::http::Method::GET | axum::http::Method::DELETE) {
+        if !matches!(*method, axum::http::Method::GET | axum::http::Method::DELETE) {
             return None;
         }
         let mut versions = headers
@@ -217,7 +204,7 @@ pub fn strip_protocol_session_headers(headers: &mut HeaderMap) {
     headers.remove("last-event-id");
 }
 
-pub fn admit_post(
+fn admit_post(
     headers: &HeaderMap,
     body: &[u8],
     session: LegacySessionEvidence,
@@ -236,23 +223,17 @@ pub fn admit_post(
             });
         error.into_validation_error(id)
     };
+    validate_header_budget(headers, limits).map_err(transport_error)?;
     if let Some(origins) = origins {
-        validate_header_budget(headers, limits).map_err(transport_error)?;
         origins
             .validate(headers)
             .map_err(transport_error)?;
-        if body.len() > limits.max_request_bytes.get() {
-            return Err(transport_error(BODY_TOO_LARGE));
-        }
+    }
+    if body.len() > limits.max_request_bytes.get() {
+        return Err(transport_error(BODY_TOO_LARGE));
     }
     let classification = validate_mcp_post(headers, body, session, versions)?;
     if let McpRequestClassification::Modern(message) = &classification {
-        if origins.is_none() {
-            return Err(transport_error(HttpAdmissionError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: "Modern MCP endpoint has no configured Origin policy",
-            }));
-        }
         if message.kind == McpMessageKind::Request {
             validate_modern_post(headers, limits).map_err(transport_error)?;
             if message.method == "subscriptions/listen" {
@@ -286,6 +267,29 @@ fn parsed_origin(value: &str) -> Option<String> {
     )
 }
 
+/// The policy is built per request, so each unusable value is logged once.
+fn warn_unusable_public_endpoint(endpoint: &str) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(endpoint.to_string());
+    if first {
+        tracing::warn!(
+            endpoint = %endpoint,
+            "MCP public endpoint is neither an HTTP(S) origin nor a host:port listen address, so it adds nothing to the Origin allowlist"
+        );
+    }
+}
+
+fn is_bare_listen_address(value: &str) -> bool {
+    !value.contains("://")
+        && value
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+}
+
 impl OriginPolicy {
     pub fn new(
         public_endpoints: &[String],
@@ -293,8 +297,15 @@ impl OriginPolicy {
     ) -> Result<Self, String> {
         let mut allowed = HashSet::new();
         for endpoint in public_endpoints {
-            let origin = parsed_origin(endpoint).ok_or("MCP public endpoints must have an HTTP(S) origin")?;
-            allowed.insert(origin);
+            match parsed_origin(endpoint) {
+                Some(origin) => {
+                    allowed.insert(origin);
+                }
+                // A bare `host:port` listen address names no origin a browser
+                // can send, so it adds nothing to the allowlist.
+                None if is_bare_listen_address(endpoint) => {}
+                None => warn_unusable_public_endpoint(endpoint),
+            }
         }
         for origin in allowed_origins {
             if parsed_origin(origin).as_deref() != Some(origin.as_str()) {
@@ -574,16 +585,8 @@ mod tests {
 
     #[test]
     fn explicit_modern_get_and_delete_are_post_only_without_affecting_legacy_routes() {
-        let dual = EndpointHttpPolicy::new(
-            Some(crate::config::McpProtocolMode::Dual),
-            None,
-            &[],
-            crate::mcp::request_validation::McpPathKind::DirectAccessPoint,
-        )
-        .unwrap();
-        let legacy =
-            EndpointHttpPolicy::new(None, None, &[], crate::mcp::request_validation::McpPathKind::DirectAccessPoint)
-                .unwrap();
+        let policy =
+            EndpointHttpPolicy::new(None, &[], crate::mcp::request_validation::McpPathKind::DirectAccessPoint).unwrap();
         let mut headers = modern_headers();
         headers.insert(
             "mcp-session-id",
@@ -592,27 +595,25 @@ mod tests {
                 .unwrap(),
         );
         for method in [axum::http::Method::GET, axum::http::Method::DELETE] {
-            let response = dual
+            let response = policy
                 .non_post_response(&method, &headers)
                 .unwrap();
             assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
             assert_eq!(response.headers()[header::ALLOW], "POST");
             assert!(
-                legacy
-                    .non_post_response(&method, &headers)
-                    .is_none()
-            );
-            assert!(
-                dual.non_post_response(&method, &HeaderMap::new())
+                policy
+                    .non_post_response(&method, &HeaderMap::new())
                     .is_none()
             );
         }
         assert!(
-            dual.non_post_response(&axum::http::Method::POST, &headers)
+            policy
+                .non_post_response(&axum::http::Method::POST, &headers)
                 .is_none()
         );
         assert!(
-            dual.non_post_response(&axum::http::Method::OPTIONS, &headers)
+            policy
+                .non_post_response(&axum::http::Method::OPTIONS, &headers)
                 .is_none()
         );
         headers.insert(
@@ -622,7 +623,8 @@ mod tests {
                 .unwrap(),
         );
         assert!(
-            dual.non_post_response(&axum::http::Method::GET, &headers)
+            policy
+                .non_post_response(&axum::http::Method::GET, &headers)
                 .is_none()
         );
         headers.append(
@@ -632,7 +634,8 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            dual.non_post_response(&axum::http::Method::GET, &headers)
+            policy
+                .non_post_response(&axum::http::Method::GET, &headers)
                 .unwrap()
                 .status(),
             StatusCode::BAD_REQUEST
@@ -671,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_http_endpoint_policy_applies_limits_only_to_opted_in_endpoints() {
+    fn mcp_http_endpoint_policy_applies_limits_to_every_endpoint() {
         let config = crate::config::McpHttpConfig::default();
         let mut headers = modern_headers();
         headers.insert(
@@ -680,38 +683,64 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        for mode in [None, Some(crate::config::McpProtocolMode::Legacy)] {
-            let policy = EndpointHttpPolicy::new(
-                mode,
-                Some(&config),
-                &[],
-                crate::mcp::request_validation::McpPathKind::DirectAccessPoint,
-            )
-            .unwrap();
-            assert_eq!(policy.body_limit(), usize::MAX);
-            assert_eq!(policy.validate_headers(&headers), Ok(()));
-            assert_eq!(
+        for path in crate::mcp::request_validation::McpPathKind::ALL {
+            let policy = EndpointHttpPolicy::new(Some(&config), &[], path).unwrap();
+            assert_eq!(policy.body_limit(), config.max_request_bytes.get(), "{path:?}");
+            assert_eq!(policy.validate_headers(&headers), Err(INVALID_ORIGIN), "{path:?}");
+            assert_eq!(policy.validate_headers(&modern_headers()), Ok(()), "{path:?}");
+            assert!(
                 policy
-                    .admit_post(&headers, &modern_body(), LegacySessionEvidence::Absent)
-                    .unwrap_err()
-                    .code,
-                super::super::error_codes::UNSUPPORTED_PROTOCOL_VERSION
+                    .versions
+                    .supports_modern(super::super::MCP_MODERN_VERSION),
+                "{path:?} admits modern requests"
             );
         }
-        let policy = EndpointHttpPolicy::new(
-            Some(crate::config::McpProtocolMode::Dual),
-            Some(&config),
-            &[],
-            crate::mcp::request_validation::McpPathKind::DirectAccessPoint,
-        )
-        .unwrap();
-        assert_eq!(policy.body_limit(), config.max_request_bytes.get());
-        assert_eq!(policy.validate_headers(&headers), Err(INVALID_ORIGIN));
+    }
+
+    #[test]
+    fn origin_check_can_be_skipped_without_exempting_origin_from_the_header_budget() {
+        let mut headers = modern_headers();
+        headers.insert(
+            header::ORIGIN,
+            "https://untrusted.example"
+                .parse()
+                .unwrap(),
+        );
+        let without_origin_bytes = modern_headers()
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
+            .sum::<usize>();
+        let config = crate::config::McpHttpConfig {
+            max_header_bytes: NonZeroUsize::new(without_origin_bytes).unwrap(),
+            ..Default::default()
+        };
+        let path = crate::mcp::request_validation::McpPathKind::FabricReceive;
+        let checked = EndpointHttpPolicy::new(None, &[], path).unwrap();
+        let unchecked = checked
+            .clone()
+            .without_origin_check();
+        assert_eq!(checked.validate_headers(&headers), Err(INVALID_ORIGIN));
+        assert_eq!(unchecked.validate_headers(&headers), Ok(()));
+        let body = modern_body();
         assert!(
-            policy
-                .versions
-                .supports_modern(super::super::MCP_MODERN_VERSION),
-            "a dual endpoint admits modern requests"
+            unchecked
+                .admit_post(&headers, &body, LegacySessionEvidence::Absent)
+                .is_ok()
+        );
+
+        let tight = EndpointHttpPolicy::new(Some(&config), &[], path)
+            .unwrap()
+            .without_origin_check();
+        assert_eq!(tight.validate_headers(&modern_headers()), Ok(()));
+        assert_eq!(tight.validate_headers(&headers), Err(HEADERS_TOO_LARGE));
+        let error = tight
+            .admit_post(&headers, &body, LegacySessionEvidence::Absent)
+            .unwrap_err();
+        assert_eq!(
+            (*error)
+                .into_response()
+                .status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
         );
     }
 
@@ -769,6 +798,36 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(policy.validate(&headers), Err(INVALID_ORIGIN), "{origin}");
+        }
+    }
+
+    #[test]
+    fn public_endpoints_without_an_origin_add_nothing_to_the_allowlist() {
+        let policy =
+            OriginPolicy::new(&["0.0.0.0:8443".into(), "127.0.0.1:8080".into(), "https://gateway.example".into()], &[])
+                .unwrap();
+        assert_eq!(policy.validate(&HeaderMap::new()), Ok(()));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            "https://gateway.example"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(policy.validate(&headers), Ok(()));
+        for origin in ["http://0.0.0.0:8443", "http://127.0.0.1:8080"] {
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+            assert_eq!(policy.validate(&headers), Err(INVALID_ORIGIN), "{origin}");
+        }
+    }
+
+    #[test]
+    fn only_host_port_values_are_bare_listen_addresses() {
+        for value in ["0.0.0.0:8443", "127.0.0.1:8080", "localhost:3000", "[::]:8443"] {
+            assert!(is_bare_listen_address(value), "{value}");
+        }
+        for value in ["gateway.example/mcp", "gateway.example", ":8443", "host:port", "ftp://gateway.example:21", ""] {
+            assert!(!is_bare_listen_address(value), "{value}");
         }
     }
 
@@ -943,29 +1002,29 @@ mod tests {
     }
 
     #[test]
-    fn admission_preserves_legacy_paths_and_requires_modern_origin_configuration() {
+    fn admission_applies_the_origin_policy_to_legacy_and_modern_requests() {
         let versions = McpVersionPolicy::new(&[super::super::MCP_MODERN_VERSION], &[super::super::MCP_MODERN_VERSION]);
+        let origins = OriginPolicy::new(&[], &[]).unwrap();
         let mut legacy_headers = HeaderMap::new();
+        let legacy = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        assert_eq!(
+            admit_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions, Some(&origins), limits()),
+            validate_mcp_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions)
+        );
         legacy_headers.insert(
             header::ORIGIN,
             "https://untrusted.example"
                 .parse()
                 .unwrap(),
         );
-        let legacy = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
         assert_eq!(
-            admit_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions, None, limits()),
-            validate_mcp_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions)
+            admit_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions, Some(&origins), limits())
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
         );
         let body = modern_body();
         let headers = modern_headers();
-        assert_eq!(
-            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, None, limits())
-                .unwrap_err()
-                .status,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        let origins = OriginPolicy::new(&[], &[]).unwrap();
         assert!(matches!(
             admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits()),
             Ok(McpRequestClassification::Modern(_))

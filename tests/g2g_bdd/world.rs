@@ -126,17 +126,11 @@ pub(crate) fn fabric_route_probe(
     let mut extra_headers = source_auth_headers(source);
     let body = match source.protocol.as_str() {
         "a2a" => build_a2a_request_body(),
-        // A dual surface in front of a modern upstream is probed the way its
+        // An MCP surface in front of a modern upstream is probed the way its
         // callers reach it, without a protocol session. The mock MCP servers
-        // answer only legacy MCP, which a dual surface also carries, so their
-        // routes are probed with legacy MCP.
-        "mcp"
-            if target.external_target
-                && source
-                    .mcp_protocol_mode
-                    .as_deref()
-                    == Some("dual") =>
-        {
+        // answer only legacy MCP, which every MCP surface also carries, so
+        // their routes are probed with legacy MCP.
+        "mcp" if target.external_target => {
             extra_headers.extend(modern_mcp_request_headers(MODERN_PROBE_VERSION, "tools/list"));
             build_modern_mcp_list_tools_body(Value::from("fabric-route-probe"), MODERN_PROBE_VERSION, true)
         }
