@@ -1,0 +1,108 @@
+name: Publish release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - CHANGELOG.md
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish reviewed release
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Create release app token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.x'
+
+      - name: Install changelog dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Detect reviewed release
+        id: release
+        run: |
+          version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
+          tag="v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "${tag} is already published; nothing to do."
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+          elif ! python3 .github/scripts/changelog.py github-notes "${version}" > "${RUNNER_TEMP}/release-body.md"; then
+            echo "CHANGELOG.md has no reviewed ${version} section; nothing to publish."
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "publish=true" >> "${GITHUB_OUTPUT}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust toolchain
+        if: steps.release.outputs.publish == 'true'
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.95.0
+
+      - name: Install system build dependencies
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libdbus-1-dev libssl-dev \
+            libsasl2-dev libsasl2-modules cmake libcurl4-openssl-dev \
+            libxml2-dev libxmlsec1-dev xmlsec1 libclang-dev pkg-config \
+            protobuf-compiler
+
+      - if: steps.release.outputs.publish == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build release binary
+        if: steps.release.outputs.publish == 'true'
+        run: cargo build --release --locked --bin agent-gateway
+
+      - name: Tag reviewed merge commit
+        if: steps.release.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "${TAG}" --message "Release ${TAG}" "${GITHUB_SHA}"
+          git push origin "${TAG}"
+
+      - name: Create GitHub Release
+        if: steps.release.outputs.publish == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          tag_name: ${{ steps.release.outputs.tag }}
+          body_path: ${{ runner.temp }}/release-body.md
+          generate_release_notes: true
+          files: target/release/agent-gateway
