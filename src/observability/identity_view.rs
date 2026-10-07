@@ -122,15 +122,6 @@ pub fn group_key(
     }
 }
 
-/// A record with no effective origin (a local record stored before origin stamping) counts as
-/// managed when it links to an existing surface.
-pub fn view_origin(
-    effective_origin: Option<IdentityOrigin>,
-    links_existing_surface: bool,
-) -> Option<IdentityOrigin> {
-    effective_origin.or_else(|| links_existing_surface.then_some(IdentityOrigin::Managed))
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NamingFields {
     pub display_name: Option<String>,
@@ -347,14 +338,6 @@ mod tests {
         let fields = naming_for(Some(IdentityOrigin::Managed), Some(&named("OXYGEN")), Some(&CallerLookup::Pending));
         assert!(!fields.display_name_pending);
         assert_eq!(fields.display_name.as_deref(), Some("OXYGEN"));
-    }
-
-    #[test]
-    fn test_view_origin_infers_managed_only_for_unstamped_records_with_a_surface() {
-        assert_eq!(view_origin(None, true), Some(IdentityOrigin::Managed));
-        assert_eq!(view_origin(None, false), None);
-        assert_eq!(view_origin(Some(IdentityOrigin::ExternalCaller), true), Some(IdentityOrigin::ExternalCaller));
-        assert_eq!(view_origin(Some(IdentityOrigin::Managed), false), Some(IdentityOrigin::Managed));
     }
 
     #[test]

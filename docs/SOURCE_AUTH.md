@@ -210,9 +210,10 @@ with no inbound slot, an inbound request that derives the DID from the protected
 (or legacy `target.identity_injection`) issues it as `managed`, the same as the
 outbound leg and the response path. A
 record written before origins existed has none until the gateway next issues its
-credential. Until then it is never published. The dashboard treats a local record
-without an origin as managed when it links to an existing surface, and names it as that
-surface's managed agent; otherwise it shows the record without an origin or name.
+credential. Until then it is never published, and the dashboard shows it unnamed, in its
+own row, with the LOCAL or REMOTE badge instead of an origin badge. A record is not
+classified from the surface it links to: before origins existed, caller DIDs were also
+stored as local records linked to the surface, so a link does not prove a managed agent.
 Credential principals (the name of the backing certificate or secret) appear only in
 the dashboard and are never published.
 

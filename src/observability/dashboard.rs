@@ -17,8 +17,7 @@ use crate::mcp_proxies::filesystem::McpProxyStore;
 use crate::metrics::MetricsStore;
 use crate::observability::caller_names::{CallerNameService, DisplayNameSource};
 use crate::observability::identity_view::{
-    CredentialPrincipal, PrincipalNames, credential_principal, group_key, naming_for, view_origin,
-    with_target_card_name,
+    CredentialPrincipal, PrincipalNames, credential_principal, group_key, naming_for, with_target_card_name,
 };
 use crate::{config::GatewayConfig, observability::system_metrics::SystemInfo};
 
@@ -2080,7 +2079,7 @@ pub(crate) async fn build_identity_list_with(
                 });
             let channel_name = surface.map(|s| s.name.clone());
 
-            let origin = view_origin(r.effective_origin(), surface.is_some());
+            let origin = r.effective_origin();
             let managed_surface = surface.filter(|_| origin == Some(IdentityOrigin::Managed));
             let card_name = managed_surface.and_then(|s| {
                 CardLocation::for_surface(s).and_then(|location| card_names.lookup_or_spawn(&s.surface_id, &location))
@@ -2513,7 +2512,7 @@ mod tests {
         use crate::identity::target_card_names::{NoTargetCards, TargetCardNameService};
         use crate::identity::test_helpers::{MockIdentityStore, test_surface_identity_record};
         use crate::metrics::MetricsStore;
-        use crate::observability::caller_names::{CallerNameService, CallerNameSources, DisplayNameSource};
+        use crate::observability::caller_names::{CallerNameService, CallerNameSources};
 
         const CALLER_DID: &str = "did:web:acme.com:billing";
 
@@ -2697,23 +2696,22 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_unstamped_local_row_linked_to_a_surface_is_named_as_managed() {
+        async fn test_unstamped_local_row_linked_to_a_surface_stays_unclassified() {
             let mut legacy = test_surface_identity_record("did:example:legacy", "oxygen");
             legacy.origin = None;
             let mut orphan = test_surface_identity_record("did:example:orphan", "deleted");
             orphan.origin = None;
             let rows = list(vec![legacy, orphan], &[surface("oxygen", "OXYGEN")], &names()).await;
 
-            let legacy = &rows["did:example:legacy"];
-            assert_eq!(legacy.origin, Some(IdentityOrigin::Managed));
-            assert_eq!(legacy.display_name.as_deref(), Some("OXYGEN"));
-            assert_eq!(legacy.display_name_source, Some(DisplayNameSource::SurfaceName));
-            assert_eq!(legacy.group_key, "surface:oxygen");
-
-            let orphan = &rows["did:example:orphan"];
-            assert_eq!(orphan.origin, None);
-            assert_eq!(orphan.display_name, None);
-            assert!(!orphan.display_name_pending);
+            for did in ["did:example:legacy", "did:example:orphan"] {
+                let row = &rows[did];
+                assert_eq!(row.origin, None, "{did}");
+                assert_eq!(row.display_name, None, "{did}");
+                assert_eq!(row.display_name_source, None, "{did}");
+                assert!(!row.display_name_pending, "{did}");
+                assert_eq!(row.surface_id, None, "{did}");
+                assert_eq!(row.group_key, format!("did:{did}"));
+            }
         }
 
         #[tokio::test]

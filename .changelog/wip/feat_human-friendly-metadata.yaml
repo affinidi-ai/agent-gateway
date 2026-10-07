@@ -30,8 +30,9 @@ changes:
         one row per surface, with a change log of DID, credential and claim changes. The
         page also adds an unnamed filter, a name-conflict marker, and the credential
         principal. An identity without a name shows its DID as the primary line, and a
-        caller whose name is still being looked up shows "resolving…". Older local
-        identities linked to a surface are named as its managed agent. External callers are
+        caller whose name is still being looked up shows "resolving…". Identities stored
+        before origins existed stay unnamed and ungrouped until the gateway next issues
+        their credential. External callers are
         named by a verified alsoKnownAs agent name, then by their Agent Card name (marked unverified), then by their DID.
     - timestamp: '2026-10-06T09:00:00.000Z'
       title: Show managed agents' target Agent Card names, marked unverified
