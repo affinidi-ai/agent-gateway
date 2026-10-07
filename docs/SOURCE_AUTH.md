@@ -258,6 +258,14 @@ rewriting trust records:
 | Surface rename | Entity field for each managed DID of the surface, to each Trust Recorder registry |
 | Trust Recorder | Entity field for the agent DID; authority field for each record's authority (an Authority, else an Issuer with that DID); entity field for an Issuer DID used as a record's entity |
 
+An Authority or Issuer is either global or owned by one tenant, and an owned one is named
+only within its tenant.
+An Issuer publishes its Authority's name only when that Authority is global or in the
+Issuer's tenant. The Trust Recorder names an Authority or Issuer only when it is global
+or in the surface's tenant; a surface without a tenant names only global ones. A DID
+that fails this check gets no reference field, but its records are still written, so
+external DIDs keep working.
+
 Each publish sends `create-reference-field`. On the problem-report code
 `e.p.msg.conflict` it sends `update-reference-field`, and on a second conflict it
 resends the update once. Any other error is logged and retried on the next trigger.

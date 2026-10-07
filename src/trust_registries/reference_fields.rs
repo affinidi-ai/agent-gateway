@@ -307,7 +307,15 @@ fn authority_visible_to_issuer(
     authority: &Authority,
     issuer: &Issuer,
 ) -> bool {
-    authority.tenant_id.is_none() || authority.tenant_id == issuer.tenant_id
+    visible_to_tenant(authority.tenant_id.as_deref(), issuer.tenant_id.as_deref())
+}
+
+/// A global (unowned) record is visible to every tenant; an owned one only to its own tenant.
+fn visible_to_tenant(
+    owner: Option<&str>,
+    tenant_id: Option<&str>,
+) -> bool {
+    owner.is_none() || owner == tenant_id
 }
 
 fn named_value(
@@ -353,25 +361,32 @@ pub fn authority_reference_value(authority: &Authority) -> Option<ReferenceField
 }
 
 /// Authority field for a DID written as a record's `authority_id`: the Authority
-/// register entry with that DID, else the Issuer with that DID.
+/// register entry with that DID, else the Issuer with that DID. Only entries that are
+/// global or owned by `tenant_id` are named.
 pub async fn authority_value_for_did(
     did: &str,
+    tenant_id: Option<&str>,
     authorities: Option<&dyn AuthorityStore>,
     issuers: Option<&dyn IssuerStore>,
 ) -> Option<ReferenceFieldValue> {
-    if let Some(authority) = find_authority(did, authorities).await {
+    if let Some(authority) = find_authority(did, authorities)
+        .await
+        .filter(|a| visible_to_tenant(a.tenant_id.as_deref(), tenant_id))
+    {
         return authority_reference_value(&authority);
     }
-    let issuer = find_issuer(did, issuers).await?;
+    let issuer = find_issuer(did, tenant_id, issuers).await?;
     named_value(ReferenceFieldType::Authority, &issuer.did, &issuer.name, issuer.description.as_deref())
 }
 
-/// Entity field for an Issuer DID written as a record's `entity_id`.
+/// Entity field for an Issuer DID written as a record's `entity_id`, when the Issuer is
+/// global or owned by `tenant_id`.
 pub async fn issuer_entity_value_for_did(
     did: &str,
+    tenant_id: Option<&str>,
     issuers: Option<&dyn IssuerStore>,
 ) -> Option<ReferenceFieldValue> {
-    let issuer = find_issuer(did, issuers).await?;
+    let issuer = find_issuer(did, tenant_id, issuers).await?;
     named_value(ReferenceFieldType::Entity, &issuer.did, &issuer.name, issuer.description.as_deref())
 }
 
@@ -393,13 +408,14 @@ async fn find_authority(
 
 async fn find_issuer(
     did: &str,
+    tenant_id: Option<&str>,
     issuers: Option<&dyn IssuerStore>,
 ) -> Option<Issuer> {
     match issuers?
         .find_by_did(did)
         .await
     {
-        Ok(issuer) => issuer,
+        Ok(issuer) => issuer.filter(|i| visible_to_tenant(i.tenant_id.as_deref(), tenant_id)),
         Err(e) => {
             warn!(did, error = %e, "Issuer lookup for reference field failed");
             None
@@ -686,7 +702,7 @@ mod tests {
     async fn authority_value_for_did_names_an_authority_register_entry() {
         let (authorities, issuers, _dir) = stores_with(&[authority("ABC Authority")], &[]).await;
 
-        let value = authority_value_for_did("did:web:authority", Some(&authorities), Some(&issuers))
+        let value = authority_value_for_did("did:web:authority", None, Some(&authorities), Some(&issuers))
             .await
             .unwrap();
 
@@ -702,7 +718,7 @@ mod tests {
         let issuer_did = "did:web:gateway:issuers:abc";
         let (authorities, issuers, _dir) = stores_with(&[], &[issuer(issuer_did, Some(gateway_did), None)]).await;
 
-        let value = authority_value_for_did(issuer_did, Some(&authorities), Some(&issuers))
+        let value = authority_value_for_did(issuer_did, None, Some(&authorities), Some(&issuers))
             .await
             .unwrap();
 
@@ -710,7 +726,7 @@ mod tests {
         assert_eq!(value.id, issuer_did);
         assert_eq!(value.name.as_str(), "Billing Issuer");
         assert!(
-            authority_value_for_did(gateway_did, Some(&authorities), Some(&issuers))
+            authority_value_for_did(gateway_did, None, Some(&authorities), Some(&issuers))
                 .await
                 .is_none(),
             "an Issuer's registration authority is not the Issuer"
@@ -722,12 +738,12 @@ mod tests {
         let (authorities, issuers, _dir) = stores_with(&[authority("ABC Authority")], &[]).await;
 
         assert!(
-            authority_value_for_did("did:web:unknown", Some(&authorities), Some(&issuers))
+            authority_value_for_did("did:web:unknown", None, Some(&authorities), Some(&issuers))
                 .await
                 .is_none()
         );
         assert!(
-            authority_value_for_did("did:web:authority", None, None)
+            authority_value_for_did("did:web:authority", None, None, None)
                 .await
                 .is_none()
         );
@@ -738,7 +754,7 @@ mod tests {
         let issuer_did = "did:web:gateway:issuers:abc";
         let (_authorities, issuers, _dir) = stores_with(&[], &[issuer(issuer_did, None, None)]).await;
 
-        let value = issuer_entity_value_for_did(issuer_did, Some(&issuers))
+        let value = issuer_entity_value_for_did(issuer_did, None, Some(&issuers))
             .await
             .unwrap();
 
@@ -746,7 +762,97 @@ mod tests {
         assert_eq!(value.id, issuer_did);
         assert_eq!(value.name.as_str(), "Billing Issuer");
         assert!(
-            issuer_entity_value_for_did("did:web:unknown", Some(&issuers))
+            issuer_entity_value_for_did("did:web:unknown", None, Some(&issuers))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_value_for_did_names_only_global_or_same_tenant_entries() {
+        let mut owned = authority("Tenant A Authority");
+        owned.tenant_id = Some("tenant-a".to_string());
+        let issuer_did = "did:web:gateway:issuers:abc";
+        let mut owned_issuer = issuer(issuer_did, None, None);
+        owned_issuer.tenant_id = Some("tenant-a".to_string());
+        let (authorities, issuers, _dir) = stores_with(&[owned], &[owned_issuer]).await;
+
+        let same_tenant =
+            authority_value_for_did("did:web:authority", Some("tenant-a"), Some(&authorities), Some(&issuers))
+                .await
+                .unwrap();
+        assert_eq!(same_tenant.name.as_str(), "Tenant A Authority");
+        assert_eq!(
+            authority_value_for_did(issuer_did, Some("tenant-a"), Some(&authorities), Some(&issuers))
+                .await
+                .unwrap()
+                .name
+                .as_str(),
+            "Billing Issuer"
+        );
+
+        for tenant in [Some("tenant-b"), None] {
+            assert!(
+                authority_value_for_did("did:web:authority", tenant, Some(&authorities), Some(&issuers))
+                    .await
+                    .is_none(),
+                "tenant-a Authority must not be named for {tenant:?}"
+            );
+            assert!(
+                authority_value_for_did(issuer_did, tenant, Some(&authorities), Some(&issuers))
+                    .await
+                    .is_none(),
+                "tenant-a Issuer must not be named for {tenant:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_value_for_did_names_global_entries_for_any_tenant() {
+        let (authorities, issuers, _dir) = stores_with(&[authority("ABC Authority")], &[]).await;
+
+        for tenant in [Some("tenant-a"), None] {
+            let value = authority_value_for_did("did:web:authority", tenant, Some(&authorities), Some(&issuers))
+                .await
+                .unwrap();
+            assert_eq!(value.name.as_str(), "ABC Authority");
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_value_for_did_falls_back_to_a_visible_issuer_when_the_authority_is_hidden() {
+        let mut hidden = authority("Tenant A Authority");
+        hidden.tenant_id = Some("tenant-a".to_string());
+        let mut visible = issuer("did:web:authority", None, None);
+        visible.tenant_id = Some("tenant-b".to_string());
+        let (authorities, issuers, _dir) = stores_with(&[hidden], &[visible]).await;
+
+        let value = authority_value_for_did("did:web:authority", Some("tenant-b"), Some(&authorities), Some(&issuers))
+            .await
+            .unwrap();
+
+        assert_eq!(value.field_type, ReferenceFieldType::Authority);
+        assert_eq!(value.name.as_str(), "Billing Issuer");
+    }
+
+    #[tokio::test]
+    async fn issuer_entity_value_for_did_hides_another_tenants_issuer() {
+        let issuer_did = "did:web:gateway:issuers:abc";
+        let mut owned = issuer(issuer_did, None, None);
+        owned.tenant_id = Some("tenant-a".to_string());
+        let (_authorities, issuers, _dir) = stores_with(&[], &[owned]).await;
+
+        let value = issuer_entity_value_for_did(issuer_did, Some("tenant-a"), Some(&issuers))
+            .await
+            .unwrap();
+        assert_eq!(value.name.as_str(), "Billing Issuer");
+        assert!(
+            issuer_entity_value_for_did(issuer_did, Some("tenant-b"), Some(&issuers))
+                .await
+                .is_none()
+        );
+        assert!(
+            issuer_entity_value_for_did(issuer_did, None, Some(&issuers))
                 .await
                 .is_none()
         );

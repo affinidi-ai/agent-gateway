@@ -56,7 +56,9 @@ changes:
         After writing its records, the Trust Recorder publishes an authority reference
         field for each authority DID, named after the matching Authority or Issuer.
         It also names an Issuer DID used as a record's entity. Trust registries can
-        now show the authority by name instead of only its DID.
+        now show the authority by name instead of only its DID. Only Authorities and
+        Issuers that are global or in the surface's tenant are named, so one tenant's
+        names are never published from another tenant's surface.
   fixed:
     - timestamp: '2026-10-05T14:39:32.000Z'
       title: Keep other Identities rows expanded when a row is expanded via its link

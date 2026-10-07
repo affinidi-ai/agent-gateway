@@ -53,6 +53,7 @@ pub async fn apply_trust_recorder(
     cfg: &TrustRecorderConfig,
     agent_did: &str,
     resolved_issuer_did: Option<&str>,
+    tenant_id: Option<&str>,
     display_name: Option<&DisplayName>,
     tr_manager: Arc<TrustRegistryListenerManager>,
     tr_store: Arc<dyn TrustRegistryStore>,
@@ -124,8 +125,15 @@ pub async fn apply_trust_recorder(
 
     let authorities = crate::gateways::connection_points::get_authority_store();
     let issuers = crate::gateways::connection_points::get_issuer_store();
-    let fields =
-        recorder_reference_fields(&targets, agent_did, display_name, authorities.as_deref(), issuers.as_deref()).await;
+    let fields = recorder_reference_fields(
+        &targets,
+        agent_did,
+        display_name,
+        tenant_id,
+        authorities.as_deref(),
+        issuers.as_deref(),
+    )
+    .await;
     let publisher = ReferenceFieldPublisher::global();
     for (tr_did, value) in &fields {
         publisher
@@ -135,11 +143,13 @@ pub async fn apply_trust_recorder(
 }
 
 /// Names for the DIDs the recorder wrote, per trust registry: the agent entity (when
-/// named), each authority, and each Issuer used as a record entity.
+/// named), each authority, and each Issuer used as a record entity. Authorities and
+/// Issuers are named only when global or owned by the surface's `tenant_id`.
 async fn recorder_reference_fields(
     targets: &[(&TrustRecorderEntry, String, String)],
     agent_did: &str,
     display_name: Option<&DisplayName>,
+    tenant_id: Option<&str>,
     authorities: Option<&dyn crate::authorities::AuthorityStore>,
     issuers: Option<&dyn crate::issuers::IssuerStore>,
 ) -> Vec<(String, ReferenceFieldValue)> {
@@ -156,14 +166,16 @@ async fn recorder_reference_fields(
         if let Some(name) = display_name {
             push(tr_did, ReferenceFieldValue::entity(agent_did, name.clone()));
         }
-        if let Some(value) = authority_value_for_did(authority_did, authorities, issuers).await {
+        if let Some(value) = authority_value_for_did(authority_did, tenant_id, authorities, issuers).await {
             push(tr_did, value);
         }
         let issuer_is_entity = entry
             .custom_resources
             .iter()
             .any(|r| r.entity_target == EntityTarget::Issuer);
-        if issuer_is_entity && let Some(value) = issuer_entity_value_for_did(&entry.issuer_did, issuers).await {
+        if issuer_is_entity
+            && let Some(value) = issuer_entity_value_for_did(&entry.issuer_did, tenant_id, issuers).await
+        {
             push(tr_did, value);
         }
     }
@@ -310,14 +322,23 @@ pub fn spawn_trust_recorder(
     let did = agent_did.to_string();
     let issuer_id = surface.issuer_id.clone();
     let surface_id = surface.surface_id.clone();
+    let tenant_id = surface.tenant_id.clone();
     tokio::spawn(async move {
         let Some(store) = tr_manager.store().await else {
             return;
         };
         let resolved_issuer_did = resolve_surface_issuer_did(issuer_id.as_deref()).await;
         let display_name = resolve_recorder_display_name(&did, &surface_id).await;
-        apply_trust_recorder(&cfg, &did, resolved_issuer_did.as_deref(), display_name.as_ref(), tr_manager, store)
-            .await;
+        apply_trust_recorder(
+            &cfg,
+            &did,
+            resolved_issuer_did.as_deref(),
+            tenant_id.as_deref(),
+            display_name.as_ref(),
+            tr_manager,
+            store,
+        )
+        .await;
     });
 }
 
@@ -471,7 +492,8 @@ mod tests {
         let targets = vec![(&entry, issuer_did.to_string(), "did:example:tr".to_string())];
         let name = DisplayName::parse("OXYGEN").unwrap();
 
-        let fields = recorder_reference_fields(&targets, "did:example:agent", Some(&name), None, Some(&issuers)).await;
+        let fields =
+            recorder_reference_fields(&targets, "did:example:agent", Some(&name), None, None, Some(&issuers)).await;
 
         assert_eq!(
             summary(&fields),
@@ -495,9 +517,59 @@ mod tests {
         }];
         let targets = vec![(&entry, "did:example:authority".to_string(), "did:example:tr".to_string())];
 
-        let fields = recorder_reference_fields(&targets, "did:example:agent", None, None, Some(&issuers)).await;
+        let fields = recorder_reference_fields(&targets, "did:example:agent", None, None, None, Some(&issuers)).await;
 
         assert!(fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorder_reference_fields_skip_another_tenants_issuer() {
+        let issuer_did = "did:web:gw:issuers:abc";
+        let mut owned = named_issuer(issuer_did, "Tenant A Issuer");
+        owned.tenant_id = Some("tenant-a".to_string());
+        let (issuers, _dir) = issuer_store_with(&[owned]).await;
+        let mut entry = base_entry();
+        entry.issuer_did = issuer_did.into();
+        entry.custom_resources = vec![CustomResource {
+            action: "issue".into(),
+            resource: "credential".into(),
+            entity_target: EntityTarget::Issuer,
+            record_type: "authorization".into(),
+        }];
+        let targets = vec![(&entry, issuer_did.to_string(), "did:example:tr".to_string())];
+        let name = DisplayName::parse("OXYGEN").unwrap();
+
+        let other_tenant = recorder_reference_fields(
+            &targets,
+            "did:example:agent",
+            Some(&name),
+            Some("tenant-b"),
+            None,
+            Some(&issuers),
+        )
+        .await;
+        let same_tenant = recorder_reference_fields(
+            &targets,
+            "did:example:agent",
+            Some(&name),
+            Some("tenant-a"),
+            None,
+            Some(&issuers),
+        )
+        .await;
+
+        assert_eq!(
+            summary(&other_tenant),
+            vec![("did:example:tr".into(), "Entity".into(), "did:example:agent".into(), "OXYGEN".into())]
+        );
+        assert_eq!(
+            summary(&same_tenant),
+            vec![
+                ("did:example:tr".into(), "Entity".into(), "did:example:agent".into(), "OXYGEN".into()),
+                ("did:example:tr".into(), "Authority".into(), issuer_did.into(), "Tenant A Issuer".into()),
+                ("did:example:tr".into(), "Entity".into(), issuer_did.into(), "Tenant A Issuer".into()),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -511,7 +583,7 @@ mod tests {
             (&entry, issuer_did.to_string(), "did:example:tr-2".to_string()),
         ];
 
-        let fields = recorder_reference_fields(&targets, "did:example:agent", None, None, Some(&issuers)).await;
+        let fields = recorder_reference_fields(&targets, "did:example:agent", None, None, None, Some(&issuers)).await;
 
         assert_eq!(
             summary(&fields),
