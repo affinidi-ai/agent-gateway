@@ -595,7 +595,9 @@ async fn token_info_rejects_a_revoked_pat() {
     );
 }
 
-async fn new_user_storage(role: crate::auth::types::UserRole) -> (Arc<crate::auth::storage::PasskeyStorage>, String) {
+async fn new_user_storage(
+    role: crate::auth::types::UserRole
+) -> (Arc<crate::auth::storage::PasskeyStorage>, String, tempfile::TempDir) {
     let directory = tempfile::tempdir().expect("tempdir");
     let users_dir = directory.path().join("users");
     let avatars_dir = directory
@@ -636,8 +638,7 @@ async fn new_user_storage(role: crate::auth::types::UserRole) -> (Arc<crate::aut
     )
     .await
     .expect("user storage");
-    std::mem::forget(directory);
-    (Arc::new(storage), user_id)
+    (Arc::new(storage), user_id, directory)
 }
 
 async fn create_owned_token(
@@ -674,7 +675,7 @@ async fn create_owned_token(
 
 #[tokio::test]
 async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
-    let (users, user_id) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
+    let (users, user_id, _users_dir) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
     let sessions = Arc::new(SessionManager::new());
     let store = new_store().await;
     let secret = create_owned_token(&store, &user_id, &["secrets.view", "issuers.view"]).await;
@@ -739,17 +740,19 @@ struct JwtStrategiesApp {
     store: Arc<FsAccessTokenStore>,
     sessions: Arc<SessionManager>,
     user_id: String,
+    // Held so the temp directories are removed when the test ends.
+    _users_dir: tempfile::TempDir,
+    _strategies_dir: tempfile::TempDir,
 }
 
 async fn jwt_strategies_app() -> JwtStrategiesApp {
-    let (users, user_id) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
+    let (users, user_id, users_dir) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
     let sessions = Arc::new(SessionManager::new());
     let store = new_store().await;
     let directory = tempfile::tempdir().expect("tempdir");
     let strategies = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(directory.path().to_path_buf())
         .await
         .expect("strategy store");
-    std::mem::forget(directory);
 
     let auth =
         AuthGuardState::new(sessions.clone(), Some(users.clone()), Arc::new(crate::terms::TermsManager::disabled()))
@@ -760,7 +763,14 @@ async fn jwt_strategies_app() -> JwtStrategiesApp {
         .layer(Extension(sessions.clone()))
         .layer(Extension(users))
         .layer(Extension(Arc::new(crate::rbac::RbacConfig::default())));
-    JwtStrategiesApp { app, store, sessions, user_id }
+    JwtStrategiesApp {
+        app,
+        store,
+        sessions,
+        user_id,
+        _users_dir: users_dir,
+        _strategies_dir: directory,
+    }
 }
 
 #[tokio::test]
