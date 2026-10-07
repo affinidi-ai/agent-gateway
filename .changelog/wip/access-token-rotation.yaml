@@ -11,7 +11,7 @@ changes:
   security:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Write access token files atomically with owner-only permissions
-      description: Token files are written to a temporary file with mode 0600, renamed into place and the directory synced, so they are never readable by other users, left half written, or rolled back by a power loss after a successful response. Existing token files readable by group or others are set to 0600 when the store loads; a failure is logged and startup continues.
+      description: Token files are written to a temporary file with mode 0600, renamed into place and the directory synced, so they are never readable by other users or left half written. If only the directory sync fails after the rename, the change is kept, the request succeeds and a warning is logged. Existing token files readable by group or others are set to 0600 when the store loads; a failure is logged and startup continues.
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Stop returning storage error details from access token endpoints
       description: Create, update and revoke no longer include the underlying IO error text in 500 responses; the error is logged instead.

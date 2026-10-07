@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::auth_manager::pat::{PatAuthenticator, PatPrincipal};
 use crate::auth_manager::resource_scope::{self, CompiledResourceScope, RequiredHeader};
+use crate::storage::filesystem::{AtomicWriteError, atomic_write_file_with_mode};
 
 use super::{AccessToken, MAX_DELEGATION_DEPTH, TOKEN_PREFIX};
 
@@ -145,47 +146,24 @@ impl FsAccessTokenStore {
             .join(format!("{id}.json"))
     }
 
+    /// Atomically replaces the token file, readable only by the owner. Once the
+    /// rename has replaced the file the record counts as written: a failed directory
+    /// sync is logged and the call succeeds, so the cache always matches the file
+    /// that readers and a restarted gateway see.
     async fn persist(
         &self,
         token: &AccessToken,
     ) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(token)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let target = self.path_for(&token.id);
-        let temporary = target.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().as_simple()));
-        let written = Self::write_private_file(&temporary, &bytes).await;
-        let renamed = match written {
-            Ok(()) => fs::rename(&temporary, &target).await,
-            Err(error) => Err(error),
-        };
-        if renamed.is_err() {
-            let _ = fs::remove_file(&temporary).await;
+        match atomic_write_file_with_mode(&self.path_for(&token.id), &bytes, Some(0o600)).await {
+            Ok(()) => Ok(()),
+            Err(AtomicWriteError::ReplacedButUnsynced(error)) => {
+                warn!(token_id = %token.id, error = %format!("{error:#}"), "Access-token file replaced but directory sync failed");
+                Ok(())
+            }
+            Err(AtomicWriteError::NotReplaced(error)) => Err(std::io::Error::other(error)),
         }
-        renamed?;
-        #[cfg(unix)]
-        crate::storage::filesystem::sync_directory(&self.dir)
-            .await
-            .map_err(std::io::Error::other)?;
-        Ok(())
-    }
-
-    /// Writes `bytes` to `path` readable only by the owner (mode 0o600 on unix)
-    /// and flushed to disk, so a rename over the target never exposes a partial file.
-    async fn write_private_file(
-        path: &Path,
-        bytes: &[u8],
-    ) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-
-        let mut options = fs::OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(path).await?;
-        file.write_all(bytes).await?;
-        file.sync_all().await
     }
 
     pub async fn create(
@@ -430,9 +408,13 @@ impl FsAccessTokenStore {
         Ok(RotateOutcome::Rotated(Box::new(token)))
     }
 
+    /// Records a use of the secret whose hash is `authenticated_hash`. Skips the write
+    /// when the token was rotated after that secret was checked, so an old-secret use
+    /// never lands on the rotated record.
     async fn touch_last_used(
         &self,
         id: &str,
+        authenticated_hash: &str,
     ) {
         let mutation_lock = self.mutation_lock(id);
         let _guard = mutation_lock.lock().await;
@@ -442,19 +424,20 @@ impl FsAccessTokenStore {
         {
             return;
         }
+        let Some(mut token) = self.get(id) else {
+            return;
+        };
+        if token.token_hash != authenticated_hash || !token.is_active(Utc::now()) {
+            return;
+        }
         self.last_persist
             .insert(id.to_string(), now);
-        if let Some(mut token) = self.get(id) {
-            if !token.is_active(Utc::now()) {
-                return;
-            }
-            token.last_used_at = Some(Utc::now());
-            if let Err(error) = self.persist(&token).await {
-                debug!(token_id = id, %error, "Failed to persist access-token usage time");
-            }
-            self.cache
-                .insert(token.id.clone(), token);
+        token.last_used_at = Some(Utc::now());
+        if let Err(error) = self.persist(&token).await {
+            debug!(token_id = id, %error, "Failed to persist access-token usage time");
         }
+        self.cache
+            .insert(token.id.clone(), token);
     }
 
     fn find_by_secret(
@@ -570,7 +553,7 @@ impl PatAuthenticator for FsAccessTokenStore {
         let resource_scope = self
             .compiled_scope_for(&record)
             .ok()?;
-        self.touch_last_used(&record.id)
+        self.touch_last_used(&record.id, &record.token_hash)
             .await;
         Some(PatPrincipal {
             user_id: record.user_id,
@@ -850,7 +833,7 @@ mod tests {
         let touch_id = id.clone();
         let touch = tokio::spawn(async move {
             touch_store
-                .touch_last_used(&touch_id)
+                .touch_last_used(&touch_id, &hash_secret(secret))
                 .await
         });
         tokio::task::yield_now().await;
@@ -1239,6 +1222,118 @@ mod tests {
         };
         assert_eq!(again.rotation_generation, 2);
         assert_eq!(again.rotated_by.as_deref(), Some("admin-2"));
+    }
+
+    #[tokio::test]
+    async fn usage_touch_with_the_pre_rotation_secret_leaves_the_rotated_record_unused() {
+        let store = store().await;
+        let old_secret = "agpat_touch_old";
+        let new_secret = "agpat_touch_new";
+        let token = record(&hash_secret(old_secret), vec![]);
+        let id = token.id.clone();
+        store
+            .create(token)
+            .await
+            .unwrap();
+
+        let authenticated = store
+            .find_by_secret(old_secret)
+            .unwrap();
+        assert!(matches!(
+            store
+                .rotate(&id, "admin-1", 0, hash_secret(new_secret))
+                .await
+                .unwrap(),
+            RotateOutcome::Rotated(_)
+        ));
+        store
+            .touch_last_used(&authenticated.id, &authenticated.token_hash)
+            .await;
+
+        assert_eq!(
+            store
+                .get(&id)
+                .unwrap()
+                .last_used_at,
+            None
+        );
+        let reloaded = FsAccessTokenStore::new(&store.dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .get(&id)
+                .unwrap()
+                .last_used_at,
+            None
+        );
+
+        assert!(
+            store
+                .authenticate(new_secret)
+                .await
+                .is_some()
+        );
+        assert!(
+            store
+                .get(&id)
+                .unwrap()
+                .last_used_at
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rotation_commits_when_only_the_directory_sync_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let store = store().await;
+        let old_secret = "agpat_unsynced_old";
+        let new_secret = "agpat_unsynced_new";
+        let token = record(&hash_secret(old_secret), vec![]);
+        let id = token.id.clone();
+        store
+            .create(token)
+            .await
+            .unwrap();
+
+        // Write and search access without read access: the rename succeeds,
+        // opening the directory for the sync fails.
+        std::fs::set_permissions(&store.dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::read_dir(&store.dir).is_ok() {
+            // Privileged users bypass the permission check, so the failure cannot be injected.
+            std::fs::set_permissions(&store.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let outcome = store
+            .rotate(&id, "admin-1", 0, hash_secret(new_secret))
+            .await;
+        std::fs::set_permissions(&store.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(outcome.unwrap(), RotateOutcome::Rotated(_)));
+        assert!(
+            store
+                .authenticate(new_secret)
+                .await
+                .is_some()
+        );
+        assert!(
+            store
+                .authenticate(old_secret)
+                .await
+                .is_none()
+        );
+        let reloaded = FsAccessTokenStore::new(&store.dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .get(&id)
+                .unwrap()
+                .token_hash,
+            hash_secret(new_secret)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

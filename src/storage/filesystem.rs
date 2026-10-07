@@ -1208,24 +1208,66 @@ async fn atomic_write_file(
     target_path: &Path,
     content: &[u8],
 ) -> Result<()> {
+    atomic_write_file_with_mode(target_path, content, None)
+        .await
+        .map_err(AtomicWriteError::into_inner)
+}
+
+/// Failure of [`atomic_write_file_with_mode`], split by whether the target was replaced.
+#[derive(Debug)]
+pub(crate) enum AtomicWriteError {
+    /// The target still holds its previous content and no temporary file is left behind.
+    NotReplaced(anyhow::Error),
+    /// The rename replaced the target, so readers already see the new content, but the
+    /// parent directory sync failed and the replacement may not survive a power loss.
+    ReplacedButUnsynced(anyhow::Error),
+}
+
+impl AtomicWriteError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::NotReplaced(error) | Self::ReplacedButUnsynced(error) => error,
+        }
+    }
+}
+
+/// Writes `content` to a temporary file, flushes it, renames it over `target_path`
+/// and syncs the parent directory. On unix, `mode` sets the permission bits of the
+/// new file; `None` keeps the process default.
+pub(crate) async fn atomic_write_file_with_mode(
+    target_path: &Path,
+    content: &[u8],
+    mode: Option<u32>,
+) -> std::result::Result<(), AtomicWriteError> {
     let parent = target_path
         .parent()
-        .context("Target path has no parent directory")?;
+        .context("Target path has no parent directory")
+        .map_err(AtomicWriteError::NotReplaced)?;
     fs::create_dir_all(parent)
         .await
-        .context("Failed to create parent directory for atomic write")?;
+        .context("Failed to create parent directory for atomic write")
+        .map_err(AtomicWriteError::NotReplaced)?;
 
     let file_name = target_path
         .file_name()
         .and_then(|name| name.to_str())
-        .context("Target path has invalid file name")?;
+        .context("Target path has invalid file name")
+        .map_err(AtomicWriteError::NotReplaced)?;
     let tmp_name = format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4());
     let tmp_path = parent.join(tmp_name);
 
-    let result = async {
-        let mut temporary = fs::OpenOptions::new()
+    let replaced = async {
+        let mut options = fs::OpenOptions::new();
+        options
             .write(true)
-            .create_new(true)
+            .create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut temporary = options
             .open(&tmp_path)
             .await
             .context("Failed to create atomic temporary file")?;
@@ -1244,20 +1286,22 @@ async fn atomic_write_file(
         drop(temporary);
         fs::rename(&tmp_path, target_path)
             .await
-            .context("Failed to atomically replace entity file")?;
-        #[cfg(unix)]
-        sync_directory(parent).await?;
-        Ok(())
+            .context("Failed to atomically replace entity file")
     }
     .await;
-    if result.is_err() {
+    if let Err(error) = replaced {
         let _ = fs::remove_file(&tmp_path).await;
+        return Err(AtomicWriteError::NotReplaced(error));
     }
-    result
+    #[cfg(unix)]
+    sync_directory(parent)
+        .await
+        .map_err(AtomicWriteError::ReplacedButUnsynced)?;
+    Ok(())
 }
 
 #[cfg(unix)]
-pub(crate) async fn sync_directory(directory: &Path) -> Result<()> {
+async fn sync_directory(directory: &Path) -> Result<()> {
     static UNSUPPORTED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     let handle = fs::File::open(directory)
