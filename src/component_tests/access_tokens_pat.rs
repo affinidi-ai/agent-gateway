@@ -714,7 +714,7 @@ async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
             .headers()
             .get("vary")
             .expect("vary"),
-        "Authorization"
+        "Authorization, Cookie"
     );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

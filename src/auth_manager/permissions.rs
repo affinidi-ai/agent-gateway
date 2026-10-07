@@ -232,7 +232,7 @@ pub async fn get_permissions(
         permissions.insert(name.to_string(), serde_json::Value::Bool(granted));
     }
 
-    Ok(([(CACHE_CONTROL, "no-store"), (VARY, "Authorization")], Json(serde_json::Value::Object(permissions))))
+    Ok(([(CACHE_CONTROL, "no-store"), (VARY, "Authorization, Cookie")], Json(serde_json::Value::Object(permissions))))
 }
 
 /// Reads only extensions the auth middleware already resolved, with no lookup by id,
@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permissions_response_is_marked_no_store_and_varies_on_authorization() {
+    async fn permissions_response_is_marked_no_store_and_varies_on_authorization_and_cookie() {
         let (storage, _dir, user_id) = storage_with_user(UserRole::Administrator).await;
         let rbac = Arc::new(RbacConfig::default());
         let response = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
@@ -507,7 +507,7 @@ mod tests {
                 .headers()
                 .get(VARY)
                 .unwrap(),
-            "Authorization"
+            "Authorization, Cookie"
         );
     }
 

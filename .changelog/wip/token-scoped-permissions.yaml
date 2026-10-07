@@ -5,7 +5,7 @@ changes:
   fixed:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Limit /api/v1/permissions for access tokens to the token's own scopes
-      description: A personal access token now sees only the features its scopes grant, capped by its owner's role, instead of the full role. The response is also sent with no-store and Vary Authorization so it is not cached across credentials.
+      description: A personal access token now sees only the features its scopes grant, capped by its owner's role, instead of the full role. The response is also sent with no-store and Vary Authorization, Cookie so it is not cached across credentials.
   removed: []
   security:
     - timestamp: '2026-10-07T00:00:00.000Z'

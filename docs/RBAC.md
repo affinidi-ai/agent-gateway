@@ -46,7 +46,8 @@ and restore, and storage export. For those routes the map can show `false` for a
 still accepts. Resource patterns limit which resource ids a token can reach, not which features it
 holds, so they do not change the map: a resource-scoped token is still refused on unscoped writes
 even when the map says `true`. The response carries `Cache-Control: no-store` and
-`Vary: Authorization` because its body depends on the caller's credential.
+`Vary: Authorization, Cookie` because its body depends on the caller's credential, which arrives in
+the `Authorization` header or the `session_token` cookie.
 
 [`get_permissions`](../src/auth_manager/permissions.rs) defines the frontend-exposed key set. It is
 not an enumeration of every backend `Feature`: route-only capabilities can be enforced without
