@@ -55,6 +55,11 @@ impl EndpointHttpPolicy {
         })
     }
 
+    pub fn without_origin_check(mut self) -> Self {
+        self.origins = OriginPolicy { allowed: None };
+        self
+    }
+
     pub fn body_limit(&self) -> usize {
         self.limits
             .max_request_bytes
@@ -236,7 +241,7 @@ pub fn admit_post(
 
 #[derive(Debug, Clone)]
 pub struct OriginPolicy {
-    allowed: HashSet<String>,
+    allowed: Option<HashSet<String>>,
 }
 
 fn parsed_origin(value: &str) -> Option<String> {
@@ -301,13 +306,16 @@ impl OriginPolicy {
             }
             allowed.insert(origin.clone());
         }
-        Ok(Self { allowed })
+        Ok(Self { allowed: Some(allowed) })
     }
 
     pub fn validate(
         &self,
         headers: &HeaderMap,
     ) -> Result<(), HttpAdmissionError> {
+        let Some(allowed) = &self.allowed else {
+            return Ok(());
+        };
         let mut values = headers
             .get_all(header::ORIGIN)
             .iter();
@@ -317,8 +325,7 @@ impl OriginPolicy {
         let origin = value
             .to_str()
             .map_err(|_| INVALID_ORIGIN)?;
-        if values.next().is_some() || parsed_origin(origin).as_deref() != Some(origin) || !self.allowed.contains(origin)
-        {
+        if values.next().is_some() || parsed_origin(origin).as_deref() != Some(origin) || !allowed.contains(origin) {
             return Err(INVALID_ORIGIN);
         }
         Ok(())
@@ -683,6 +690,53 @@ mod tests {
                 "{path:?} admits modern requests"
             );
         }
+    }
+
+    #[test]
+    fn origin_check_can_be_skipped_without_exempting_origin_from_the_header_budget() {
+        let mut headers = modern_headers();
+        headers.insert(
+            header::ORIGIN,
+            "https://untrusted.example"
+                .parse()
+                .unwrap(),
+        );
+        let without_origin_bytes = modern_headers()
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 4)
+            .sum::<usize>();
+        let config = crate::config::McpHttpConfig {
+            max_header_bytes: NonZeroUsize::new(without_origin_bytes).unwrap(),
+            ..Default::default()
+        };
+        let path = crate::mcp::request_validation::McpPathKind::ALL[0];
+        let checked = EndpointHttpPolicy::new(None, &[], path).unwrap();
+        let unchecked = checked
+            .clone()
+            .without_origin_check();
+        assert_eq!(checked.validate_headers(&headers), Err(INVALID_ORIGIN));
+        assert_eq!(unchecked.validate_headers(&headers), Ok(()));
+        let body = modern_body();
+        assert!(
+            unchecked
+                .admit_post(&headers, &body, LegacySessionEvidence::Absent)
+                .is_ok()
+        );
+
+        let tight = EndpointHttpPolicy::new(Some(&config), &[], path)
+            .unwrap()
+            .without_origin_check();
+        assert_eq!(tight.validate_headers(&modern_headers()), Ok(()));
+        assert_eq!(tight.validate_headers(&headers), Err(HEADERS_TOO_LARGE));
+        let error = tight
+            .admit_post(&headers, &body, LegacySessionEvidence::Absent)
+            .unwrap_err();
+        assert_eq!(
+            (*error)
+                .into_response()
+                .status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
     }
 
     fn limits() -> HttpLimits {

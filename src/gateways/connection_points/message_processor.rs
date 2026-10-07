@@ -4193,6 +4193,10 @@ async fn process_forward_request_with_mcp_runtime(
             std::slice::from_ref(&surface.access_point.listen_address),
             mcp_versions,
         ) {
+            // The sending gateway already checked the caller's browser Origin
+            // against its own surface, so a buffered ForwardRequest is not
+            // checked again against this surface's allowlist.
+            Ok(policy) if stream_request.is_none() => policy.without_origin_check(),
             Ok(policy) => policy,
             Err(error) => {
                 channel_warn!(config_id, "Invalid MCP HTTP configuration: {}", error);
@@ -4213,13 +4217,6 @@ async fn process_forward_request_with_mcp_runtime(
             }
         }
         let mcp_headers = match stream_request.as_ref().map(|request| Ok(request.headers.clone())).unwrap_or_else(|| fabric_mcp_headers(headers.as_ref())) {
-            // The sending gateway already checked the caller's browser Origin
-            // against its own surface, so a buffered ForwardRequest is not
-            // checked again against this surface's allowlist.
-            Ok(mut headers) if stream_request.is_none() => {
-                headers.remove(axum::http::header::ORIGIN);
-                headers
-            }
             Ok(headers) => headers,
             Err(message) => {
                 let error = crate::mcp::request_validation::malformed_transport_header(&body_bytes, message);

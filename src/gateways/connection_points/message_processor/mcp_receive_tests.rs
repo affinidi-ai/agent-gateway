@@ -713,7 +713,8 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             200,
         ),
         (json!(" ".repeat(1025)), json!({}), 413),
-        (legacy_body, json!({"x-extra": "x".repeat(513)}), 431),
+        (legacy_body.clone(), json!({"x-extra": "x".repeat(513)}), 431),
+        (legacy_body, json!({"Origin": format!("https://{}.example", "a".repeat(500))}), 431),
     ] {
         let (response, _) = receive(&forward_message(body, headers)).await;
         assert_eq!(response["status"], expected_status);
