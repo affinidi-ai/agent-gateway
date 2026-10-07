@@ -230,7 +230,7 @@ pub async fn get_token_info(
     let token_id = delegation.map(|Extension(context)| context.token_id);
 
     (
-        [(axum::http::header::CACHE_CONTROL, "no-store"), (axum::http::header::VARY, "Authorization")],
+        [(axum::http::header::CACHE_CONTROL, "no-store"), (axum::http::header::VARY, "Authorization, Cookie")],
         Json(serde_json::json!({
             "user_id": user_id,
             "token_id": token_id,
@@ -421,7 +421,7 @@ mod tests {
                 .headers()
                 .get(axum::http::header::VARY)
                 .unwrap(),
-            "Authorization"
+            "Authorization, Cookie"
         );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
