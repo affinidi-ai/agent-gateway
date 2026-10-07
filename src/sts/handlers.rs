@@ -1626,7 +1626,7 @@ fn grant_label(grant_type: Option<&str>) -> &'static str {
 
 /// The client source address for throttling, resolved from proxy-forwarded
 /// headers (`X-Forwarded-For` first entry, then RFC 7239 `Forwarded for=`).
-pub(super) fn client_source_ip(headers: &HeaderMap) -> Option<String> {
+fn client_source_ip(headers: &HeaderMap) -> Option<String> {
     first_forwarded_token(headers, "x-forwarded-for").or_else(|| forwarded_directive(headers, "for"))
 }
 

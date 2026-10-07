@@ -62,7 +62,7 @@ pub struct SamlConfig {
     #[serde(default)]
     pub graph_api: Option<GraphApiConfig>,
 
-    /// Per-source-address limit on starting a SAML sign-in.
+    /// Per-client-IP limit on starting a SAML sign-in.
     #[serde(default)]
     pub login_throttle: crate::config::types::LoginThrottleConfig,
 }

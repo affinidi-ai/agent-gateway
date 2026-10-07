@@ -4407,7 +4407,7 @@ async fn initialize_saml_state(
         avatars_storage_path: avatars_path,
         notification_store,
         terms_manager,
-        login_throttle: Arc::new(crate::sts::throttle::TokenEndpointThrottle::per_source_address(
+        login_throttle: Arc::new(crate::sts::throttle::TokenEndpointThrottle::per_client_ip(
             &saml_config.login_throttle,
         )),
     })

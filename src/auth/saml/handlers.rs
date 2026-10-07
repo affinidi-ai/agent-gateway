@@ -1,7 +1,7 @@
 use axum::{
     Extension, Form, Json,
     extract::{Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use crate::auth::session_finalizer::{
     AuthenticatedPrincipal, SessionFinalizationError, SessionFinalizer, SessionManagerFinalizer,
 };
 use crate::auth::storage::PasskeyStorage;
+use crate::source_auth::client_ip::ClientIp;
 use crate::sts::throttle::TokenEndpointThrottle;
 
 use crate::metrics::MetricsStore;
@@ -41,7 +42,7 @@ pub struct SamlState {
     /// Terms enforcement for human authentication.
     pub terms_manager: Arc<crate::terms::TermsManager>,
 
-    /// Per-source-address limit on starting a sign-in, built from `saml.json` `login_throttle`.
+    /// Per-client-IP limit on starting a sign-in, built from `saml.json` `login_throttle`.
     pub login_throttle: Arc<TokenEndpointThrottle>,
 }
 
@@ -106,21 +107,21 @@ pub(crate) fn is_allowed_return_target(target: &str) -> bool {
 /// Initiate SAML login (SP-initiated flow)
 /// GET /saml/login
 ///
-/// A source address over its login limit gets 429 before any AuthnRequest is recorded. The
-/// address comes from `X-Forwarded-For` / `Forwarded`; without either the per-address check is
-/// skipped and only the cap on outstanding sign-ins applies. When that cap is reached the answer
-/// is 503, since a request the gateway cannot record would be rejected at the ACS anyway. Both
-/// answers are readable pages.
+/// A client IP over its login limit gets 429 before any AuthnRequest is recorded. The IP is
+/// resolved from the connection by [`crate::source_auth::client_ip`], which trusts forwarded
+/// headers only from `client_auth.trusted_proxies`. When the cap on outstanding sign-ins is
+/// reached the answer is 503, since a request the gateway cannot record would be rejected at the
+/// ACS anyway. Both answers are readable pages.
 pub async fn saml_login(
     State(saml_state): State<Arc<SamlState>>,
-    headers: HeaderMap,
+    client_ip: Option<Extension<ClientIp>>,
     Query(query): Query<SamlLoginQuery>,
 ) -> Response {
     info!("Initiating SAML login");
 
     if let Some(retry_after) = saml_state
         .login_throttle
-        .record_source_attempt(&headers)
+        .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
     {
         warn!("Throttling SAML login from a source over its limit");
         return throttled_login_page(retry_after);
@@ -604,26 +605,68 @@ mod tests {
             avatars_storage_path: avatars,
             notification_store: Arc::new(tokio::sync::RwLock::new(None)),
             terms_manager: Arc::new(crate::terms::TermsManager::disabled()),
-            login_throttle: Arc::new(TokenEndpointThrottle::per_source_address(&login_throttle)),
+            login_throttle: Arc::new(TokenEndpointThrottle::per_client_ip(&login_throttle)),
         })
+    }
+
+    const TRUSTED_PROXY_CIDR: &str = "10.0.0.0/8";
+
+    /// Sends a login through the client IP layer, from a TCP connection at `peer` when given.
+    async fn login_request(
+        state: &Arc<SamlState>,
+        peer: Option<&str>,
+        forwarded_for: Option<&str>,
+    ) -> Response {
+        use tower::ServiceExt;
+
+        let router = axum::Router::new()
+            .route("/saml/login", axum::routing::get(saml_login))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(crate::config::types::ClientAuthConfig {
+                    trusted_proxies: vec![
+                        TRUSTED_PROXY_CIDR
+                            .parse()
+                            .unwrap(),
+                    ],
+                    ..Default::default()
+                }),
+                crate::source_auth::client_ip::resolve_client_ip_layer,
+            ));
+        let mut request = axum::http::Request::builder().uri("/saml/login");
+        if let Some(value) = forwarded_for {
+            request = request.header("x-forwarded-for", value);
+        }
+        let mut request = request
+            .body(axum::body::Body::empty())
+            .unwrap();
+        if let Some(peer) = peer {
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                    format!("{peer}:40000")
+                        .parse()
+                        .unwrap(),
+                ));
+        }
+        router
+            .oneshot(request)
+            .await
+            .unwrap()
     }
 
     async fn login_from(
         state: &Arc<SamlState>,
-        source_ip: Option<&str>,
+        peer: Option<&str>,
     ) -> Response {
-        let mut headers = HeaderMap::new();
-        if let Some(ip) = source_ip {
-            headers.insert("x-forwarded-for", HeaderValue::from_str(ip).unwrap());
-        }
-        saml_login(State(state.clone()), headers, Query(SamlLoginQuery { next: None })).await
+        login_request(state, peer, None).await
     }
 
     async fn login_location(
         state: Arc<SamlState>,
         next: Option<&str>,
     ) -> String {
-        saml_login(State(state), HeaderMap::new(), Query(SamlLoginQuery { next: next.map(str::to_string) }))
+        saml_login(State(state), None, Query(SamlLoginQuery { next: next.map(str::to_string) }))
             .await
             .headers()
             .get(LOCATION)
@@ -850,5 +893,54 @@ mod tests {
                     .is_redirection()
             );
         }
+    }
+    #[tokio::test]
+    async fn a_spoofed_x_forwarded_for_cannot_lock_a_victim_out_of_saml_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(true, 1)).await;
+        login_request(&state, Some("203.0.113.7"), Some("192.0.2.10")).await;
+
+        let attacker = login_request(&state, Some("203.0.113.7"), Some("192.0.2.10")).await;
+        let victim = login_from(&state, Some("192.0.2.10")).await;
+
+        assert_eq!(attacker.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            victim
+                .status()
+                .is_redirection()
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_fake_x_forwarded_for_values_cannot_fill_the_saml_sign_in_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+        let limit = LoginThrottleConfig::default()
+            .per_ip
+            .requests;
+        for index in 0..limit {
+            login_request(&state, Some("203.0.113.7"), Some(&format!("192.0.2.{index}"))).await;
+        }
+
+        let response = login_request(&state, Some("203.0.113.7"), Some("192.0.2.250")).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn saml_login_limits_the_client_behind_a_trusted_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(true, 1)).await;
+        login_request(&state, Some("10.0.0.5"), Some("203.0.113.7")).await;
+
+        let same_client = login_request(&state, Some("10.0.0.5"), Some("192.0.2.10, 203.0.113.7")).await;
+        let other_client = login_request(&state, Some("10.0.0.5"), Some("198.51.100.4")).await;
+
+        assert_eq!(same_client.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            other_client
+                .status()
+                .is_redirection()
+        );
     }
 }

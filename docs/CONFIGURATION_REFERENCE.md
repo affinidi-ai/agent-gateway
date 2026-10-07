@@ -131,7 +131,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[config_files]` | Where the other configuration files are |
 | `[storage_paths]` | Where each record kind is persisted under `_storage/` |
 | `[did_cache]` | DID document cache TTL, size, staleness, and path; whether DID resolution may contact private hosts |
-| `[tls]` | Certificate and key paths, upstream verification |
+| `[tls]` | Certificate and key paths, upstream verification. `client_auth.trusted_proxies` lists the proxy CIDRs whose forwarded client certificate, `X-Forwarded-For` and `Forwarded` headers are trusted. The SAML login and CLI login limits use the connection's address otherwise, so list your load balancer here. The STS token endpoint throttle does not use this list. |
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |
 | `[reconnect_policy]` | Backoff for DIDComm connection points |
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
@@ -171,7 +171,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `webauthn` | Relying-party ID and external origin for passkey registration |
 | `integration` | Notification and webhook integration settings |
 | `sts` | Security Token Service runtime settings. See [`STS.md`](STS.md). |
-| `cli_login_throttle` | Per-source-address limit on each `fabric` CLI login endpoint: `enabled` (default `true`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). |
+| `cli_login_throttle` | Per-client-IP limit on each `fabric` CLI login endpoint: `enabled` (default `true`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). |
 | `facilitator_mode` | x402 facilitator behaviour |
 | `cors` | Permitted dashboard origins |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
@@ -271,7 +271,7 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 | Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_slo_url`, `idp_cert_path` |
 | Service provider | `sp_entity_id`, `sp_acs_url`, `sp_key_path`, `sp_cert_path` |
 | Security | `sign_requests`, `require_encrypted_assertions` |
-| Sign-in throttle | `login_throttle`: `enabled` (default `true`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) for `/saml/login` |
+| Sign-in throttle | `login_throttle`: `enabled` (default `true`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) per client IP for `/saml/login` |
 | Claims | `attribute_mapping` from SAML claim URI to user field |
 | Roles | `role_mapping` from identity-provider role to gateway role |
 | Directory | `graph_api` for Microsoft Entra ID group and profile lookup |

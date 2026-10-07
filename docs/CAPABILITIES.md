@@ -377,12 +377,18 @@ After onboarding, payload capture lets you watch the traffic at every stage. See
 
 Everything is managed from a web dashboard, signed into with a passkey or, for enterprise
 deployments, SAML single sign-on. A SAML sign-in must return from the identity provider within
-five minutes and is accepted once. `/api/saml/login` allows 20 sign-ins per source address per
+five minutes and is accepted once. `/api/saml/login` allows 20 sign-ins per client IP per
 minute by default (`login_throttle` in `saml.json`) and answers 429 with `Retry-After` past
-that. The source address is read from `X-Forwarded-For` or `Forwarded`, which a caller can set
-unless a proxy overwrites it, so a request without one is not limited per address. The backstop
-is a cap of 1000 unfinished SAML sign-ins for the whole gateway; past that, `/api/saml/login`
-answers 503 until older ones expire.
+that. The backstop is a cap of 1000 unfinished SAML sign-ins for the whole gateway; past that,
+`/api/saml/login` answers 503 until older ones expire.
+
+The SAML login and CLI login limits count by client IP, taken from the TCP connection.
+`X-Forwarded-For` and `Forwarded` are only read when the connection comes from an address in
+`tls.client_auth.trusted_proxies` (`config.toml`), and then from the right, skipping trusted
+hops, so a caller cannot choose the address it is counted under. A gateway behind a load
+balancer or reverse proxy must list it there; otherwise every user is counted as the balancer's
+address and shares one limit. The STS token endpoint throttle keeps its own address rule, see
+[`STS.md`](STS.md#token-endpoint-throttle).
 
 The `fabric` CLI signs in through the browser. It opens `/api/auth/cli/authorize` with a
 loopback port and a PKCE challenge. After the dashboard sign-in (passkey or SAML) the browser
@@ -399,13 +405,10 @@ gateway keeps that return target for five minutes and sends only a one-time 32 c
 `RelayState`, within the 80 byte limit of the HTTP-Redirect binding. The assertion consumer
 service uses the key once and checks the target again; an unknown, expired or reused key lands
 on the dashboard root. A session holds at most three pending codes, and a new request replaces
-the oldest. The authorize, consent and exchange endpoints each allow 20 requests per source
-address per minute by default (`cli_login_throttle` in `gateway.json`). Past that they answer
-429 with `Retry-After` before any code is issued or redeemed, and exchange answers in JSON. The
-source address comes from `X-Forwarded-For` or `Forwarded`, which a caller can set unless a
-proxy overwrites it, so a request without one is not limited per address. Codes stay safe
-regardless, because each is random, single use, expires in two minutes and needs the PKCE
-verifier. The gateway logs each issued code, each redemption and each failed redemption with
+the oldest. The authorize, consent and exchange endpoints each allow 20 requests per client IP
+per minute by default (`cli_login_throttle` in `gateway.json`). Past that they answer 429 with
+`Retry-After` before any code is issued or redeemed, and exchange answers in JSON. Each code is
+also random, single use, expires in two minutes and needs the PKCE verifier. The gateway logs each issued code, each redemption and each failed redemption with
 the user id where known, never with the code or verifier.
 
 Known limitations: the login hands the CLI the browser's own session, and the code store and the

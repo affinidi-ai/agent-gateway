@@ -26,6 +26,7 @@ use crate::auth::session::{SessionManager, TermsSessionGate};
 use crate::auth::storage::PasskeyStorage;
 use crate::auth_manager::middleware::{extract_session_token_from_headers, user_is_approved};
 use crate::config::types::LoginThrottleConfig;
+use crate::source_auth::client_ip::ClientIp;
 use crate::sts::throttle::TokenEndpointThrottle;
 
 /// Dashboard page that asks the signed-in user to approve the CLI login.
@@ -171,8 +172,8 @@ impl CliLoginStore {
     }
 }
 
-/// Per-source-address limits, one per endpoint, so a source's authorize retries do not use up
-/// its exchange budget. A request without `X-Forwarded-For` / `Forwarded` is not limited here.
+/// Per-client-IP limits, one per endpoint, so a client's authorize retries do not use up its
+/// exchange budget. The IP is resolved by [`crate::source_auth::client_ip`].
 pub struct CliLoginThrottles {
     authorize: TokenEndpointThrottle,
     consent: TokenEndpointThrottle,
@@ -182,9 +183,9 @@ pub struct CliLoginThrottles {
 impl CliLoginThrottles {
     pub fn new(config: &LoginThrottleConfig) -> Self {
         Self {
-            authorize: TokenEndpointThrottle::per_source_address(config),
-            consent: TokenEndpointThrottle::per_source_address(config),
-            exchange: TokenEndpointThrottle::per_source_address(config),
+            authorize: TokenEndpointThrottle::per_client_ip(config),
+            consent: TokenEndpointThrottle::per_client_ip(config),
+            exchange: TokenEndpointThrottle::per_client_ip(config),
         }
     }
 }
@@ -238,11 +239,12 @@ pub async fn authorize(
     headers: HeaderMap,
     Extension(session_manager): Extension<Arc<SessionManager>>,
     Extension(throttles): Extension<Arc<CliLoginThrottles>>,
+    client_ip: Option<Extension<ClientIp>>,
     Query(query): Query<AuthorizeQuery>,
 ) -> Response {
     if let Some(retry_after) = throttles
         .authorize
-        .record_source_attempt(&headers)
+        .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
     {
         return throttled(retry_after, THROTTLED_MESSAGE);
     }
@@ -286,11 +288,12 @@ pub async fn consent(
     Extension(user_storage): Extension<Arc<PasskeyStorage>>,
     Extension(store): Extension<Arc<CliLoginStore>>,
     Extension(throttles): Extension<Arc<CliLoginThrottles>>,
+    client_ip: Option<Extension<ClientIp>>,
     body: Bytes,
 ) -> Response {
     if let Some(retry_after) = throttles
         .consent
-        .record_source_attempt(&headers)
+        .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
     {
         return throttled(retry_after, THROTTLED_MESSAGE);
     }
@@ -378,14 +381,14 @@ pub struct ExchangeResponse {
 
 /// A throttled source gets a JSON error and its code is left untouched, so the CLI can retry.
 pub async fn exchange(
-    headers: HeaderMap,
     Extension(store): Extension<Arc<CliLoginStore>>,
     Extension(throttles): Extension<Arc<CliLoginThrottles>>,
+    client_ip: Option<Extension<ClientIp>>,
     Json(request): Json<ExchangeRequest>,
 ) -> Response {
     if let Some(retry_after) = throttles
         .exchange
-        .record_source_attempt(&headers)
+        .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
     {
         return throttled(
             retry_after,
@@ -479,6 +482,8 @@ mod tests {
     use super::*;
     use crate::auth::storage::UserData;
     use crate::auth::types::{UserRole, UserStatus};
+    use crate::config::types::ClientAuthConfig;
+    use crate::source_auth::client_ip::resolve_client_ip_layer;
     use axum::{
         body::Body,
         http::{Method, Request},
@@ -952,7 +957,18 @@ mod tests {
             .layer(Extension(manager))
             .layer(Extension(storage))
             .layer(Extension(store.clone()))
-            .layer(Extension(Arc::new(CliLoginThrottles::new(&throttle))));
+            .layer(Extension(Arc::new(CliLoginThrottles::new(&throttle))))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(ClientAuthConfig {
+                    trusted_proxies: vec![
+                        TRUSTED_PROXY_CIDR
+                            .parse()
+                            .unwrap(),
+                    ],
+                    ..ClientAuthConfig::default()
+                }),
+                resolve_client_ip_layer,
+            ));
         ThrottledApp {
             router,
             token,
@@ -961,44 +977,78 @@ mod tests {
         }
     }
 
-    async fn authorize_from(
+    const TRUSTED_PROXY_CIDR: &str = "10.0.0.0/8";
+    const TRUSTED_PROXY: &str = "10.0.0.5";
+    const CLIENT: &str = "203.0.113.7";
+    const OTHER_CLIENT: &str = "198.51.100.4";
+    const VICTIM: &str = "192.0.2.10";
+
+    /// Sends `request` as if it arrived on a TCP connection from `peer`.
+    async fn send_from(
         router: &Router,
-        ip: &str,
+        peer: &str,
+        mut request: Request<Body>,
     ) -> Response {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                format!("{peer}:40000")
+                    .parse()
+                    .unwrap(),
+            ));
         router
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(authorize_uri(52111))
-                    .header("x-forwarded-for", ip)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(request)
             .await
             .unwrap()
     }
 
+    async fn authorize_from(
+        router: &Router,
+        peer: &str,
+        forwarded_for: Option<&str>,
+    ) -> Response {
+        let mut request = Request::builder().uri(authorize_uri(52111));
+        if let Some(value) = forwarded_for {
+            request = request.header("x-forwarded-for", value);
+        }
+        send_from(
+            router,
+            peer,
+            request
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
     async fn exchange_from(
         router: &Router,
-        ip: Option<&str>,
+        peer: &str,
         code: &str,
     ) -> Response {
-        let mut request = Request::builder()
+        let request = Request::builder()
             .method(Method::POST)
             .uri("/auth/cli/exchange")
-            .header(header::CONTENT_TYPE, "application/json");
-        if let Some(ip) = ip {
-            request = request.header("x-forwarded-for", ip);
-        }
-        router
-            .clone()
-            .oneshot(
-                request
-                    .body(Body::from(serde_json::json!({ "code": code, "verifier": TEST_VERIFIER }).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "code": code, "verifier": TEST_VERIFIER }).to_string()))
+            .unwrap();
+        send_from(router, peer, request).await
+    }
+
+    async fn consent_from(
+        app: &ThrottledApp,
+        peer: &str,
+    ) -> Response {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/cli/consent")
+            .header(header::AUTHORIZATION, format!("Bearer {}", app.token))
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::from(consent_body(52111)))
+            .unwrap();
+        send_from(&app.router, peer, request).await
     }
 
     fn assert_throttled(response: &Response) {
@@ -1450,7 +1500,7 @@ mod tests {
 
         for _ in 0..2 {
             assert!(
-                authorize_from(&app.router, "203.0.113.7")
+                authorize_from(&app.router, CLIENT, None)
                     .await
                     .status()
                     .is_redirection()
@@ -1461,9 +1511,9 @@ mod tests {
     #[tokio::test]
     async fn authorize_answers_429_with_retry_after_for_a_source_over_its_limit() {
         let app = throttled_app(throttle_of(true, 1)).await;
-        authorize_from(&app.router, "203.0.113.7").await;
+        authorize_from(&app.router, CLIENT, None).await;
 
-        let response = authorize_from(&app.router, "203.0.113.7").await;
+        let response = authorize_from(&app.router, CLIENT, None).await;
 
         assert_throttled(&response);
         assert!(
@@ -1478,11 +1528,11 @@ mod tests {
     #[tokio::test]
     async fn the_cli_login_limit_counts_each_source_separately() {
         let app = throttled_app(throttle_of(true, 1)).await;
-        authorize_from(&app.router, "203.0.113.7").await;
-        authorize_from(&app.router, "203.0.113.7").await;
+        authorize_from(&app.router, CLIENT, None).await;
+        authorize_from(&app.router, CLIENT, None).await;
 
         assert!(
-            authorize_from(&app.router, "198.51.100.4")
+            authorize_from(&app.router, OTHER_CLIENT, None)
                 .await
                 .status()
                 .is_redirection()
@@ -1492,11 +1542,10 @@ mod tests {
     #[tokio::test]
     async fn a_throttled_consent_issues_no_code() {
         let app = throttled_app(throttle_of(true, 1)).await;
-        let headers = [SAME_ORIGIN_JSON[0], SAME_ORIGIN_JSON[1], ("x-forwarded-for", "203.0.113.7")];
-        let first = post_consent(&app.router, consent_body(52111), Some(&app.token), &headers).await;
+        let first = consent_from(&app, CLIENT).await;
         assert_eq!(first.status(), StatusCode::OK);
 
-        let second = post_consent(&app.router, consent_body(52111), Some(&app.token), &headers).await;
+        let second = consent_from(&app, CLIENT).await;
 
         assert_throttled(&second);
         assert_eq!(app.store.entries.len(), 1);
@@ -1511,13 +1560,13 @@ mod tests {
             .unwrap();
         let unknown_code = Uuid::new_v4().to_string();
         assert_eq!(
-            exchange_from(&app.router, Some("203.0.113.7"), &unknown_code)
+            exchange_from(&app.router, CLIENT, &unknown_code)
                 .await
                 .status(),
             StatusCode::BAD_REQUEST
         );
 
-        let throttled_response = exchange_from(&app.router, Some("203.0.113.7"), &code).await;
+        let throttled_response = exchange_from(&app.router, CLIENT, &code).await;
 
         assert_throttled(&throttled_response);
         let body = throttled_response
@@ -1529,7 +1578,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "too_many_requests");
         assert_eq!(
-            exchange_from(&app.router, None, &code)
+            exchange_from(&app.router, OTHER_CLIENT, &code)
                 .await
                 .status(),
             StatusCode::OK
@@ -1542,11 +1591,56 @@ mod tests {
 
         for _ in 0..5 {
             assert!(
-                authorize_from(&app.router, "203.0.113.7")
+                authorize_from(&app.router, CLIENT, None)
                     .await
                     .status()
                     .is_redirection()
             );
         }
+    }
+    #[tokio::test]
+    async fn a_spoofed_x_forwarded_for_counts_against_the_untrusted_peer_and_not_the_victim() {
+        let app = throttled_app(throttle_of(true, 1)).await;
+        authorize_from(&app.router, CLIENT, Some(VICTIM)).await;
+
+        assert_throttled(&authorize_from(&app.router, CLIENT, Some(VICTIM)).await);
+        assert!(
+            authorize_from(&app.router, VICTIM, None)
+                .await
+                .status()
+                .is_redirection()
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_fake_x_forwarded_for_values_does_not_escape_the_limit() {
+        let app = throttled_app(LoginThrottleConfig::default()).await;
+        let limit = LoginThrottleConfig::default()
+            .per_ip
+            .requests;
+        for index in 0..limit {
+            assert!(
+                authorize_from(&app.router, CLIENT, Some(&format!("192.0.2.{index}")))
+                    .await
+                    .status()
+                    .is_redirection()
+            );
+        }
+
+        assert_throttled(&authorize_from(&app.router, CLIENT, Some("192.0.2.250")).await);
+    }
+
+    #[tokio::test]
+    async fn clients_behind_a_trusted_proxy_are_counted_separately() {
+        let app = throttled_app(throttle_of(true, 1)).await;
+        authorize_from(&app.router, TRUSTED_PROXY, Some(CLIENT)).await;
+
+        assert_throttled(&authorize_from(&app.router, TRUSTED_PROXY, Some(&format!("{VICTIM}, {CLIENT}"))).await);
+        assert!(
+            authorize_from(&app.router, TRUSTED_PROXY, Some(OTHER_CLIENT))
+                .await
+                .status()
+                .is_redirection()
+        );
     }
 }

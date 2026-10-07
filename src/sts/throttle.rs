@@ -1,6 +1,8 @@
 //! Throttle for the token endpoint: bounds repeated attempts per client id and
 //! per source address so credential guessing is rate-limited. SAML and CLI login
-//! reuse it per source address only, with a bound on tracked addresses.
+//! reuse it per client IP only, with a bound on tracked addresses; their IP comes
+//! from [`crate::source_auth::client_ip`], which trusts forwarded headers only from
+//! `client_auth.trusted_proxies`.
 //!
 //! Process-local, like the other runtime caches. Counters roll over a
 //! configurable window; a key that exceeds its limit is blocked for a
@@ -8,16 +10,17 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use axum::http::HeaderMap;
+use std::net::IpAddr;
+
 use dashmap::DashMap;
 
-use super::handlers::{client_source_ip, now_secs};
+use super::handlers::now_secs;
 use crate::config::types::{LoginThrottleConfig, RateLimitConfig, TokenEndpointThrottleConfig};
 
 /// Soft cap on retained keys before a sweep of inactive entries.
 const PRUNE_THRESHOLD: usize = 100_000;
 
-/// Caps how many source addresses a sign-in throttle tracks at once.
+/// Caps how many client IPs a sign-in throttle tracks at once.
 const MAX_TRACKED_LOGIN_SOURCES: usize = 10_000;
 
 #[derive(Clone, Copy)]
@@ -76,9 +79,9 @@ impl TokenEndpointThrottle {
         }
     }
 
-    /// A sign-in throttle that only limits source addresses, blocking a source until its window
-    /// rolls off. It tracks about 10,000 sources at most; past that a new source is not limited.
-    pub fn per_source_address(cfg: &LoginThrottleConfig) -> Self {
+    /// A sign-in throttle that only limits client IPs, blocking an IP until its window rolls off.
+    /// It tracks about 10,000 IPs at most; past that a new IP is not limited.
+    pub fn per_client_ip(cfg: &LoginThrottleConfig) -> Self {
         Self::tracking_at_most(cfg, MAX_TRACKED_LOGIN_SOURCES)
     }
 
@@ -103,14 +106,15 @@ impl TokenEndpointThrottle {
         }
     }
 
-    /// Records one attempt for the request's source address and returns how long it must wait
-    /// when it is over its limit. `None` when the request carries no `X-Forwarded-For` /
-    /// `Forwarded` address, so such a request is never throttled here.
-    pub fn record_source_attempt(
+    /// Records one attempt for the caller's IP (see [`crate::source_auth::client_ip`]) and
+    /// returns how long it must wait when it is over its limit. The IP is only missing when the
+    /// server was not built with `ConnectInfo`, which every gateway listener is; such a request
+    /// is not limited here.
+    pub fn record_client_attempt(
         &self,
-        headers: &HeaderMap,
+        client_ip: Option<IpAddr>,
     ) -> Option<u64> {
-        let ip = client_source_ip(headers)?;
+        let ip = client_ip?.to_string();
         let now = now_secs();
         self.record(None, Some(&ip), now);
         self.retry_after(None, Some(&ip), now)
@@ -324,8 +328,8 @@ mod tests {
     }
 
     #[test]
-    fn per_source_address_blocks_until_the_window_rolls_off() {
-        let t = TokenEndpointThrottle::per_source_address(&login_limit(2));
+    fn per_client_ip_blocks_until_the_window_rolls_off() {
+        let t = TokenEndpointThrottle::per_client_ip(&login_limit(2));
         for _ in 0..3 {
             t.record(None, Some("203.0.113.7"), 1_000);
         }
@@ -336,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn per_source_address_tracks_at_most_max_keys_sources() {
+    fn per_client_ip_tracks_at_most_max_keys_sources() {
         let t = TokenEndpointThrottle::tracking_at_most(&login_limit(1), 2);
         for ip in ["a", "b", "c"] {
             t.record(None, Some(ip), 1_000);
@@ -351,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn per_source_address_tracks_a_new_source_once_inactive_ones_are_pruned() {
+    fn per_client_ip_tracks_a_new_source_once_inactive_ones_are_pruned() {
         let t = TokenEndpointThrottle::tracking_at_most(&login_limit(1), 2);
         for ip in ["a", "b"] {
             t.record(None, Some(ip), 1_000);

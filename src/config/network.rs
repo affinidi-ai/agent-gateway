@@ -65,7 +65,7 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub sts: crate::config::types::StsRuntimeConfig,
 
-    /// Per-source-address limit on each `fabric` CLI login endpoint.
+    /// Per-client-IP limit on each `fabric` CLI login endpoint.
     #[serde(default)]
     pub cli_login_throttle: crate::config::types::LoginThrottleConfig,
 }

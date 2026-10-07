@@ -1149,6 +1149,12 @@ pub async fn run_port_server(
         crate::source_auth::peer_cert::forwarded_peer_cert,
     ));
 
+    // Caller IP for per-client limits; forwarded headers count only from trusted proxies.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        std::sync::Arc::new(config.tls.client_auth.clone()),
+        crate::source_auth::client_ip::resolve_client_ip_layer,
+    ));
+
     // Promote a direct-TLS peer cert (captured by PeerCertAcceptor when
     // `client_auth.direct` is enabled) into the canonical PeerCertInfo
     // extension. No-op when the upstream extension is absent.
@@ -1524,6 +1530,12 @@ pub async fn run_outbound_port_server(
     let app = app.layer(axum::middleware::from_fn_with_state(
         std::sync::Arc::new(config.tls.client_auth.clone()),
         crate::source_auth::peer_cert::forwarded_peer_cert,
+    ));
+
+    // Caller IP for per-client limits; forwarded headers count only from trusted proxies.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        std::sync::Arc::new(config.tls.client_auth.clone()),
+        crate::source_auth::client_ip::resolve_client_ip_layer,
     ));
     let app = app.layer(axum::middleware::from_fn(crate::source_auth::peer_cert::promote_direct_peer_cert));
 

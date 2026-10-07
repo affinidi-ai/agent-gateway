@@ -1404,14 +1404,14 @@ pub struct StsRuntimeConfig {
     pub mcp_replay: crate::sts::replay::McpReplayConfig,
 }
 
-/// Per-source-address throttle for a sign-in endpoint (SAML login, CLI login). The source is read
-/// from `X-Forwarded-For` / `Forwarded`; a request without either is not throttled per address.
+/// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login). The IP is resolved by
+/// [`crate::source_auth::client_ip`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginThrottleConfig {
     /// Master switch for the throttle.
     #[serde(default = "sts_throttle_default_true")]
     pub enabled: bool,
-    /// Per-source-address limit. A source over it waits until its window rolls off.
+    /// Per-client-IP limit. A client over it waits until its window rolls off.
     #[serde(default = "default_login_throttle_per_ip")]
     pub per_ip: RateLimitConfig,
 }
