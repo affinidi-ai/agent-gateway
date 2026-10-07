@@ -198,7 +198,6 @@ export interface Identity {
   surface_name?: string;
   credential_principal?: CredentialPrincipal;
   name_conflict?: boolean;
-  group_key?: string;
 }
 
 export type IdentityOrigin = 'managed' | 'external_caller';

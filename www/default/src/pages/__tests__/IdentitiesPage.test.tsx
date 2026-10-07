@@ -724,11 +724,11 @@ describe('IdentitiesPage', () => {
       total_identities: identities.length,
     });
 
-    const renderWithStats = (identities: any[], channels: any[] = []) => {
+    const renderWithStats = (identities: any[], channels: any[] = [], path = '/identities') => {
       const stats = statsWith(identities, channels);
       const context = { ...mockAppContext, getCurrentStats: jest.fn(() => stats) };
       return render(
-        <MemoryRouter initialEntries={['/identities']}>
+        <MemoryRouter initialEntries={[path]}>
           <AppContext.Provider value={context}>
             <Routes>
               <Route path="/identities" element={<IdentitiesPage />} />
@@ -752,7 +752,6 @@ describe('IdentitiesPage', () => {
       surface_id: 'surface-1',
       surface_name: 'OXYGEN',
       credential_principal: { kind: 'certificate', id: 'cert-1', name: 'NITROGEN' },
-      group_key: 'surface:surface-1',
     };
     const managedNew = {
       ...managedOld,
@@ -770,7 +769,6 @@ describe('IdentitiesPage', () => {
       display_name: 'acme.com/@billing',
       display_name_source: 'agent_name',
       display_name_verified: true,
-      group_key: 'did:did:web:caller.example',
     };
     const callerUnnamed = {
       did: 'did:web:anon.example',
@@ -778,7 +776,6 @@ describe('IdentitiesPage', () => {
       created_at: '2026-01-01T00:00:00Z',
       is_local: false,
       origin: 'external_caller',
-      group_key: 'did:did:web:anon.example',
     };
     const callerPending = {
       did: 'did:web:pending.example',
@@ -787,38 +784,77 @@ describe('IdentitiesPage', () => {
       is_local: false,
       origin: 'external_caller',
       display_name_pending: true,
-      group_key: 'did:did:web:pending.example',
     };
 
-    it('groups managed identities into one row with the latest as primary', async () => {
+    const jwtClaimA = {
+      ...managedNew,
+      did: 'did:key:jwt-claim-a',
+      identity_hash: 'hash-jwt-a',
+      trust_score: 0.9,
+      credential_principal: { kind: 'jwt_claim', id: 'sub-a', name: 'alice' },
+    };
+    const jwtClaimB = {
+      ...managedNew,
+      did: 'did:key:jwt-claim-b',
+      identity_hash: 'hash-jwt-b',
+      trust_score: 0.4,
+      credential_principal: { kind: 'jwt_claim', id: 'sub-b', name: 'bob' },
+    };
+
+    it('renders one row per identity, including managed identities on one surface', async () => {
       renderWithStats([managedOld, managedNew, callerNamed]);
 
-      const row = await screen.findByTestId('identities-row-surface:surface-1');
-      expect(within(row).getByTitle('did:key:managed-new')).toBeInTheDocument();
-      expect(screen.queryByTitle('did:key:managed-old')).not.toBeInTheDocument();
-      expect(within(row).getByTestId('identities-origin-managed')).toHaveTextContent(
+      const oldRow = await screen.findByTestId('identities-row-did:key:managed-old');
+      const newRow = screen.getByTestId('identities-row-did:key:managed-new');
+      expect(within(oldRow).getByTitle('did:key:managed-old')).toBeInTheDocument();
+      expect(within(newRow).getByTitle('did:key:managed-new')).toBeInTheDocument();
+      expect(within(newRow).getByTestId('identities-origin-managed')).toHaveTextContent(
         'Managed Agent'
       );
-      expect(within(row).getByTestId('identities-credential-principal')).toHaveTextContent(
+      expect(within(newRow).getByTestId('identities-credential-principal')).toHaveTextContent(
         'NITROGEN'
       );
-      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(2);
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(3);
       expect(
-        within(screen.getByTestId('identities-row-did:did:web:caller.example')).getByTestId(
+        within(screen.getByTestId('identities-row-did:web:caller.example')).getByTestId(
           'identities-origin-external_caller'
         )
       ).toBeInTheDocument();
     });
 
-    it('shows the change log of the surface group when expanded', async () => {
-      renderWithStats([managedOld, managedNew]);
+    it('gives each parallel managed identity on a surface its own actions', async () => {
+      renderWithStats([jwtClaimA, jwtClaimB]);
 
-      fireEvent.click(await screen.findByTestId('identities-row-surface:surface-1'));
-      fireEvent.click(screen.getByTestId('identities-change-log-toggle'));
+      const rowA = await screen.findByTestId('identities-row-did:key:jwt-claim-a');
+      const rowB = screen.getByTestId('identities-row-did:key:jwt-claim-b');
+      expect(within(rowA).getAllByTitle('View Trust Score')).toHaveLength(1);
+      expect(within(rowB).getAllByTitle('View Trust Score')).toHaveLength(1);
+      expect(within(rowA).getByText('90%')).toBeInTheDocument();
+      expect(within(rowB).getByText('40%')).toBeInTheDocument();
+      expect(within(rowA).getByTestId('identities-credential-principal')).toHaveTextContent(
+        'alice'
+      );
+      expect(within(rowB).getByTestId('identities-credential-principal')).toHaveTextContent('bob');
+      expect(within(rowA).getByTestId('identities-surface-link')).toHaveTextContent('OXYGEN');
+      expect(within(rowB).getByTestId('identities-surface-link')).toHaveTextContent('OXYGEN');
+    });
 
-      const entries = screen.getAllByTestId('identities-change-log-entry');
-      expect(entries).toHaveLength(1);
-      expect(within(entries[0]).getByTitle('did:key:managed-old')).toBeInTheDocument();
+    it('deep links to the exact identity, not another on the same surface', async () => {
+      renderWithStats(
+        [jwtClaimA, jwtClaimB],
+        [],
+        `/identities/${encodeURIComponent('did:key:jwt-claim-b')}`
+      );
+
+      const rowB = await screen.findByTestId('identities-row-did:key:jwt-claim-b');
+      await waitFor(() => expect(rowB).toHaveAttribute('aria-expanded', 'true'));
+      expect(screen.getByTestId('identities-row-did:key:jwt-claim-a')).toHaveAttribute(
+        'aria-expanded',
+        'false'
+      );
+      expect(screen.getAllByText('Identity Hash:')).toHaveLength(1);
+      expect(screen.getByText('hash-jwt-b')).toBeInTheDocument();
+      expect(screen.queryByText('hash-jwt-a')).not.toBeInTheDocument();
     });
 
     it('prefers the live surface name and deep links to the surface', async () => {
@@ -840,7 +876,7 @@ describe('IdentitiesPage', () => {
       expect(filter).toHaveAttribute('aria-pressed', 'false');
       expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(4);
       expect(
-        within(screen.getByTestId('identities-row-did:did:web:pending.example')).getByTestId(
+        within(screen.getByTestId('identities-row-did:web:pending.example')).getByTestId(
           'identities-name-pending'
         )
       ).toHaveTextContent('resolving…');
@@ -850,7 +886,7 @@ describe('IdentitiesPage', () => {
       expect(filter).toHaveAttribute('aria-pressed', 'true');
       const rows = screen.getAllByTestId(/^identities-row-/);
       expect(rows).toHaveLength(1);
-      expect(rows[0]).toHaveAttribute('data-testid', 'identities-row-did:did:web:anon.example');
+      expect(rows[0]).toHaveAttribute('data-testid', 'identities-row-did:web:anon.example');
       expect(within(rows[0]).queryByTestId('identities-name')).not.toBeInTheDocument();
       expect(within(rows[0]).getByTitle('did:web:anon.example')).toBeInTheDocument();
       expect(within(rows[0]).queryByText('No name')).not.toBeInTheDocument();
@@ -878,8 +914,8 @@ describe('IdentitiesPage', () => {
     it('expands rows independently', async () => {
       renderWithStats([managedNew, callerNamed]);
 
-      const rowA = await screen.findByTestId('identities-row-surface:surface-1');
-      const rowB = screen.getByTestId('identities-row-did:did:web:caller.example');
+      const rowA = await screen.findByTestId('identities-row-did:key:managed-new');
+      const rowB = screen.getByTestId('identities-row-did:web:caller.example');
 
       fireEvent.click(rowA);
       fireEvent.click(rowB);

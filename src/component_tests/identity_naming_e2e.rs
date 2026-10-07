@@ -231,7 +231,6 @@ async fn managed_identity_shows_surface_name_and_credential_principal() {
     assert_eq!(row["surface_id"], json!("oxygen"));
     assert_eq!(row["surface_name"], json!("OXYGEN"));
     assert_eq!(row["credential_principal"], json!({ "kind": "certificate", "id": "NITROGEN" }));
-    assert_eq!(row["group_key"], json!("surface:oxygen"));
 }
 
 #[tokio::test]
@@ -251,7 +250,7 @@ async fn did_shared_by_two_surfaces_is_marked_as_a_name_conflict() {
 }
 
 #[tokio::test]
-async fn external_caller_is_grouped_by_did_and_never_takes_surface_fields() {
+async fn external_caller_never_takes_surface_fields() {
     let fixture = Fixture::new(&[("oxygen", "OXYGEN")]).await;
     fixture
         .identities
@@ -267,7 +266,6 @@ async fn external_caller_is_grouped_by_did_and_never_takes_surface_fields() {
     let row = serde_json::to_value(&fixture.rows().await[CALLER_DID]).expect("row JSON");
 
     assert_eq!(row["origin"], json!("external_caller"));
-    assert_eq!(row["group_key"], json!(format!("did:{CALLER_DID}")));
     for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "name_conflict"] {
         assert!(row.get(absent).is_none(), "{absent} must be omitted for a caller row: {row}");
     }

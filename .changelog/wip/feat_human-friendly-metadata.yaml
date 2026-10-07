@@ -23,15 +23,15 @@ changes:
         surface name, on the legacy and SSI issuance paths. The next VC after a surface
         rename carries the new name under the same DID.
     - timestamp: '2026-10-05T14:39:32.000Z'
-      title: Show identity origin, display names and per-surface history in Identities
+      title: Show identity origin, display names and surface links in Identities
       description: >-
         The Identities page shows a Managed Agent or External Caller badge, and each
-        name with its DID in monospace and a copy button. Managed identities are grouped
-        one row per surface, with a change log of DID, credential and claim changes. The
-        page also adds an unnamed filter, a name-conflict marker, and the credential
+        name with its DID in monospace and a copy button. Each identity has its own row
+        and actions, so parallel managed agents behind one surface (for example one DID
+        per JWT claim value) each keep their Trust Score and policy. The page also adds an unnamed filter, a name-conflict marker, and the credential
         principal. An identity without a name shows its DID as the primary line, and a
         caller whose name is still being looked up shows "resolving…". Identities stored
-        before origins existed stay unnamed and ungrouped until the gateway next issues
+        before origins existed stay unnamed until the gateway next issues
         their credential. External callers are
         named by a verified alsoKnownAs agent name, then by their Agent Card name (marked unverified), then by their DID.
     - timestamp: '2026-10-06T09:00:00.000Z'

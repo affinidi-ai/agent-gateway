@@ -41,12 +41,12 @@ Every new interactive element ships with a `data-testid`. Tests under `ui-tests/
 are the consumer; the convention is documented in
 [`ui-tests/README.md`](../../ui-tests/README.md).
 
-| Element | Pattern |
-| --- | --- |
-| Page root | `page-<area>` |
-| Action button | `<area>-<verb>-button` |
-| List item | `<area>-card-<id>` or `<area>-row-<id>` |
-| Wizard | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
+| Element       | Pattern                                                                              |
+| ------------- | ------------------------------------------------------------------------------------ |
+| Page root     | `page-<area>`                                                                        |
+| Action button | `<area>-<verb>-button`                                                               |
+| List item     | `<area>-card-<id>` or `<area>-row-<id>`                                              |
+| Wizard        | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
 
 ## Surface Builder
 
@@ -144,16 +144,15 @@ modern catalog could be registered. Render them with the shared `WriteWarnings` 
 ## Identities page
 
 `pages/IdentitiesPage.tsx` orchestrates. Its page-only parts live in
-`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: grouping and
-change-log logic in `identityGrouping.ts`, grouping, search, unnamed filter, and surface
-links in the `useIdentityGroups` hook, and the row parts `IdentityNameCell`,
-`IdentityOriginBadge`, and `IdentityChangeLog` (with its `IdentityChangeLogSection` card).
+`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: search,
+unnamed filter, and surface links in the `useIdentityRows` hook, and the row parts
+`IdentityNameCell` and `IdentityOriginBadge`.
 
-- Rows are grouped by the backend's `group_key`, falling back to `did:<did>`. A managed
-  agent gets one row per surface, with the most recently active identity as primary and
-  an expandable change log of DID, credential, and claim changes. A caller gets one row
-  per DID.
-- Expansion state is a `Set`. Rows expand and collapse independently, and a deep link
+- Each DID gets its own row, keyed by the DID, with its own actions (Trust Score, Version History, Configure Policy, Copy link).
+  Managed identities that share a surface, such as parallel `from_jwt_claim` DIDs, are
+  separate rows linked to the same surface. `/identities/<did>` expands that exact
+  identity.
+- Expansion state is a `Set` of DIDs. Rows expand and collapse independently, and a deep link
   adds to the set rather than replacing it.
 - The name cell shows the display name prominently, with the shortened DID in monospace
   beside it and a copy button for the full DID. Without a name, the shortened DID and
@@ -171,15 +170,14 @@ links in the `useIdentityGroups` hook, and the row parts `IdentityNameCell`,
 - When the backend sends none of the naming fields, the page renders as it did without
   them: no name line, filter, or origin badge.
 
-| Element | Test id |
-| --- | --- |
-| Group row | `identities-row-<group_key>` |
+| Element                                       | Test id                                                                                                                            |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Identity row                                  | `identities-row-<did>`                                                                                                             |
 | Name, pending, conflict, verified, unverified | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`, `identities-name-unverified` |
-| Copy DID | `identities-copy-did-button` |
-| Origin badge | `identities-origin-<origin>` |
-| Surface link, credential principal | `identities-surface-link`, `identities-credential-principal` |
-| Unnamed filter | `identities-unnamed-filter-button` |
-| Change log | `identities-change-log`, `identities-change-log-toggle`, `identities-change-log-entry` |
+| Copy DID                                      | `identities-copy-did-button`                                                                                                       |
+| Origin badge                                  | `identities-origin-<origin>`                                                                                                       |
+| Surface link, credential principal            | `identities-surface-link`, `identities-credential-principal`                                                                       |
+| Unnamed filter                                | `identities-unnamed-filter-button`                                                                                                 |
 
 ## Remote gateway Issuer DIDs
 

@@ -1,6 +1,5 @@
 import { useCallback, useMemo } from 'react';
 import type { Identity } from '../../types';
-import { groupIdentities, IdentityGroup } from './identityGrouping';
 
 type SurfaceRef = Pick<
   Identity,
@@ -15,37 +14,33 @@ export interface SurfaceLink {
   name: string;
 }
 
-interface UseIdentityGroupsOptions<T extends Identity> {
+interface UseIdentityRowsOptions<T extends Identity> {
   identities: T[];
   channels?: Array<{ config_id: string; name: string }>;
   searchTerm: string;
   showUnnamedOnly: boolean;
 }
 
-export interface IdentityGroupsView<T extends Identity> {
-  identityGroups: IdentityGroup<T>[];
-  filteredGroups: IdentityGroup<T>[];
+export interface IdentityRowsView<T extends Identity> {
+  filteredIdentities: T[];
   hasNamingMetadata: boolean;
   unnamedCount: number;
   liveSurfaceNames: Map<string, string>;
   surfaceLinkFor: (identity: SurfaceRef) => SurfaceLink | null;
 }
 
-export function useIdentityGroups<T extends Identity>({
+export function useIdentityRows<T extends Identity>({
   identities,
   channels,
   searchTerm,
   showUnnamedOnly,
-}: UseIdentityGroupsOptions<T>): IdentityGroupsView<T> {
-  const identityGroups = useMemo(() => groupIdentities(identities), [identities]);
-
+}: UseIdentityRowsOptions<T>): IdentityRowsView<T> {
   const hasNamingMetadata = useMemo(
     () =>
       identities.some(
         identity =>
           identity.origin !== undefined ||
           identity.display_name !== undefined ||
-          identity.group_key !== undefined ||
           identity.name_conflict !== undefined
       ),
     [identities]
@@ -74,33 +69,27 @@ export function useIdentityGroups<T extends Identity>({
     [liveSurfaceNames]
   );
 
-  const unnamedCount = useMemo(
-    () => identityGroups.filter(group => isUnnamed(group.primary)).length,
-    [identityGroups]
-  );
+  const unnamedCount = useMemo(() => identities.filter(isUnnamed).length, [identities]);
 
-  const filteredGroups = useMemo(() => {
+  const filteredIdentities = useMemo(() => {
     const searchLower = searchTerm.trim().toLowerCase();
-    return identityGroups.filter(group => {
-      if (hasNamingMetadata && showUnnamedOnly && !isUnnamed(group.primary)) return false;
+    return identities.filter(identity => {
+      if (hasNamingMetadata && showUnnamedOnly && !isUnnamed(identity)) return false;
       if (!searchLower) return true;
-      return group.members.some(identity =>
-        [
-          identity.name,
-          identity.did,
-          identity.channel_name,
-          identity.identity_hash,
-          identity.display_name,
-          identity.surface_name,
-          identity.credential_principal?.name,
-        ].some(value => typeof value === 'string' && value.toLowerCase().includes(searchLower))
-      );
+      return [
+        identity.name,
+        identity.did,
+        identity.channel_name,
+        identity.identity_hash,
+        identity.display_name,
+        identity.surface_name,
+        identity.credential_principal?.name,
+      ].some(value => typeof value === 'string' && value.toLowerCase().includes(searchLower));
     });
-  }, [identityGroups, searchTerm, hasNamingMetadata, showUnnamedOnly]);
+  }, [identities, searchTerm, hasNamingMetadata, showUnnamedOnly]);
 
   return {
-    identityGroups,
-    filteredGroups,
+    filteredIdentities,
     hasNamingMetadata,
     unnamedCount,
     liveSurfaceNames,

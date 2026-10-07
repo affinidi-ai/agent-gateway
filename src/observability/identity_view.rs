@@ -111,17 +111,6 @@ impl PrincipalNames {
     }
 }
 
-pub fn group_key(
-    origin: Option<IdentityOrigin>,
-    surface_id: Option<&str>,
-    did: &str,
-) -> String {
-    match (origin, surface_id) {
-        (Some(IdentityOrigin::Managed), Some(id)) if !id.is_empty() => format!("surface:{id}"),
-        _ => format!("did:{did}"),
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NamingFields {
     pub display_name: Option<String>,
@@ -257,14 +246,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value, json!({ "kind": "api_key", "id": "k", "name": "Key" }));
-    }
-
-    #[test]
-    fn test_group_key_by_surface_for_managed_and_by_did_otherwise() {
-        assert_eq!(group_key(Some(IdentityOrigin::Managed), Some("s1"), "did:a"), "surface:s1");
-        assert_eq!(group_key(Some(IdentityOrigin::Managed), None, "did:a"), "did:did:a");
-        assert_eq!(group_key(Some(IdentityOrigin::ExternalCaller), Some("s1"), "did:a"), "did:did:a");
-        assert_eq!(group_key(None, Some("s1"), "did:a"), "did:did:a");
     }
 
     #[test]

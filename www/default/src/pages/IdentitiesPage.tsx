@@ -16,8 +16,7 @@ import { DOCS_URL } from '../config/docs';
 import { CopyButton } from '../components/shared/CopyButton';
 import { CredentialPrincipalLabel, IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
 import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
-import { IdentityChangeLogSection } from './IdentitiesPage/IdentityChangeLog';
-import { useIdentityGroups } from './IdentitiesPage/useIdentityGroups';
+import { useIdentityRows } from './IdentitiesPage/useIdentityRows';
 import IssuersTab from './SettingsPage/IssuersTab';
 import AuthoritiesTab from './SettingsPage/AuthoritiesTab';
 
@@ -147,19 +146,13 @@ const IdentitiesPage: React.FC = () => {
     return Array.from(didMap.values());
   }, [stats?.identities, didWebVhIdentities]);
 
-  const {
-    identityGroups,
-    filteredGroups,
-    hasNamingMetadata,
-    unnamedCount,
-    liveSurfaceNames,
-    surfaceLinkFor,
-  } = useIdentityGroups({
-    identities,
-    channels: stats?.channels,
-    searchTerm,
-    showUnnamedOnly,
-  });
+  const { filteredIdentities, hasNamingMetadata, unnamedCount, liveSurfaceNames, surfaceLinkFor } =
+    useIdentityRows({
+      identities,
+      channels: stats?.channels,
+      searchTerm,
+      showUnnamedOnly,
+    });
 
   // Handle deep linking to a specific identity
   useEffect(() => {
@@ -419,12 +412,12 @@ const IdentitiesPage: React.FC = () => {
             title={
               <>
                 <i className="fas fa-fingerprint"></i> Agent Identities{' '}
-                {tabBadge(filteredGroups.length)}
+                {tabBadge(filteredIdentities.length)}
               </>
             }
           >
             <div className="pt-3">
-              {identityGroups.length === 0 ? (
+              {identities.length === 0 ? (
                 <div className="card shadow mb-4">
                   <div className="card-body">
                     <EmptyState
@@ -441,19 +434,19 @@ const IdentitiesPage: React.FC = () => {
                     <h6 className="m-0 font-weight-bold text-primary d-flex align-items-center">
                       <i className="fas fa-fingerprint me-2"></i> Agent Identities
                       <Badge
-                        value={filteredGroups.length}
+                        value={filteredIdentities.length}
                         className="ms-2"
-                        ariaLabel={`${filteredGroups.length} agent identities`}
+                        ariaLabel={`${filteredIdentities.length} agent identities`}
                         suffix={
                           searchTerm || (hasNamingMetadata && showUnnamedOnly)
-                            ? ` of ${identityGroups.length}`
+                            ? ` of ${identities.length}`
                             : undefined
                         }
                       />
                     </h6>
                   </div>
                   <div className="card-body">
-                    {filteredGroups.length === 0 ? (
+                    {filteredIdentities.length === 0 ? (
                       <div className="text-center text-muted py-5">
                         <i className="fas fa-search fa-3x mb-3" aria-hidden="true" />
                         <p className="mb-0">No identities match your search.</p>
@@ -476,25 +469,19 @@ const IdentitiesPage: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody>
-                            {filteredGroups.map(group => {
-                              const identity = group.primary;
-                              const rowDid =
-                                group.members.find(member => expandedIdentityDids.has(member.did))
-                                  ?.did ?? identity.did;
-                              const isExpanded = expandedIdentityDids.has(rowDid);
+                            {filteredIdentities.map(identity => {
+                              const isExpanded = expandedIdentityDids.has(identity.did);
                               const surfaceLink = surfaceLinkFor(identity);
                               return (
-                                <React.Fragment key={group.key}>
+                                <React.Fragment key={identity.did}>
                                   <tr
                                     ref={el => {
-                                      group.members.forEach(member => {
-                                        identityRefs.current[member.did] = el;
-                                      });
+                                      identityRefs.current[identity.did] = el;
                                     }}
                                     style={{ cursor: 'pointer' }}
-                                    onClick={() => toggleIdentityDetails(rowDid)}
+                                    onClick={() => toggleIdentityDetails(identity.did)}
                                     aria-expanded={isExpanded}
-                                    data-testid={`identities-row-${group.key}`}
+                                    data-testid={`identities-row-${identity.did}`}
                                   >
                                     <td>
                                       <div className="d-inline-flex align-items-center flex-nowrap">
@@ -735,16 +722,18 @@ const IdentitiesPage: React.FC = () => {
                                               <div
                                                 className="card-header py-1 bg-light"
                                                 style={{ cursor: 'pointer' }}
-                                                onClick={() => toggleSection(rowDid, 'summary')}
+                                                onClick={() =>
+                                                  toggleSection(identity.did, 'summary')
+                                                }
                                               >
                                                 <small className="mb-0 text-muted">
                                                   <i
-                                                    className={`fas fa-chevron-${isSectionExpanded(rowDid, 'summary') ? 'down' : 'right'} me-2`}
+                                                    className={`fas fa-chevron-${isSectionExpanded(identity.did, 'summary') ? 'down' : 'right'} me-2`}
                                                   ></i>
                                                   <i className="fas fa-info-circle"></i> Summary
                                                 </small>
                                               </div>
-                                              {isSectionExpanded(rowDid, 'summary') && (
+                                              {isSectionExpanded(identity.did, 'summary') && (
                                                 <div className="card-body py-2 px-3">
                                                   <div className="row">
                                                     <div className="col-md-6">
@@ -884,17 +873,19 @@ const IdentitiesPage: React.FC = () => {
                                                 <div
                                                   className="card-header py-1 bg-light"
                                                   style={{ cursor: 'pointer' }}
-                                                  onClick={() => toggleSection(rowDid, 'fields')}
+                                                  onClick={() =>
+                                                    toggleSection(identity.did, 'fields')
+                                                  }
                                                 >
                                                   <small className="mb-0 text-muted">
                                                     <i
-                                                      className={`fas fa-chevron-${isSectionExpanded(rowDid, 'fields') ? 'down' : 'right'} me-2`}
+                                                      className={`fas fa-chevron-${isSectionExpanded(identity.did, 'fields') ? 'down' : 'right'} me-2`}
                                                     ></i>
                                                     <i className="fas fa-id-badge"></i> Identity
                                                     Field Values
                                                   </small>
                                                 </div>
-                                                {isSectionExpanded(rowDid, 'fields') && (
+                                                {isSectionExpanded(identity.did, 'fields') && (
                                                   <div className="card-body py-2 px-3">
                                                     <p className="text-muted small mb-2">
                                                       <i className="fas fa-info-circle"></i> These
@@ -961,17 +952,19 @@ const IdentitiesPage: React.FC = () => {
                                                 <div
                                                   className="card-header py-1 bg-light"
                                                   style={{ cursor: 'pointer' }}
-                                                  onClick={() => toggleSection(rowDid, 'json')}
+                                                  onClick={() =>
+                                                    toggleSection(identity.did, 'json')
+                                                  }
                                                 >
                                                   <small className="mb-0 text-muted">
                                                     <i
-                                                      className={`fas fa-chevron-${isSectionExpanded(rowDid, 'json') ? 'down' : 'right'} me-2`}
+                                                      className={`fas fa-chevron-${isSectionExpanded(identity.did, 'json') ? 'down' : 'right'} me-2`}
                                                     ></i>
                                                     <i className="fas fa-robot"></i> Identity Field
                                                     Values (Full JSON)
                                                   </small>
                                                 </div>
-                                                {isSectionExpanded(rowDid, 'json') && (
+                                                {isSectionExpanded(identity.did, 'json') && (
                                                   <div className="card-body py-2 px-3">
                                                     <pre className="mb-0">
                                                       <code>
@@ -993,11 +986,11 @@ const IdentitiesPage: React.FC = () => {
                                                 <div
                                                   className="card-header py-1 bg-light"
                                                   style={{ cursor: 'pointer' }}
-                                                  onClick={() => toggleSection(rowDid, 'dna')}
+                                                  onClick={() => toggleSection(identity.did, 'dna')}
                                                 >
                                                   <small className="mb-0 text-muted">
                                                     <i
-                                                      className={`fas fa-chevron-${isSectionExpanded(rowDid, 'dna') ? 'down' : 'right'} mr-2`}
+                                                      className={`fas fa-chevron-${isSectionExpanded(identity.did, 'dna') ? 'down' : 'right'} mr-2`}
                                                     ></i>
                                                     <i className="fas fa-dna"></i> Agent DNA
                                                     <span
@@ -1008,7 +1001,7 @@ const IdentitiesPage: React.FC = () => {
                                                     </span>
                                                   </small>
                                                 </div>
-                                                {isSectionExpanded(rowDid, 'dna') && (
+                                                {isSectionExpanded(identity.did, 'dna') && (
                                                   <div className="card-body py-2 px-3">
                                                     {(() => {
                                                       const dna = identity.metadata.agentDNA;
@@ -1292,23 +1285,15 @@ const IdentitiesPage: React.FC = () => {
                                               </div>
                                             )}
 
-                                            {group.members.length > 1 && (
-                                              <IdentityChangeLogSection
-                                                changes={group.changes}
-                                                expanded={isSectionExpanded(rowDid, 'changes')}
-                                                onToggle={() => toggleSection(rowDid, 'changes')}
-                                              />
-                                            )}
-
                                             {/* DID Document */}
                                             <div className="card mb-2">
                                               <div
                                                 className="card-header py-1 bg-light"
                                                 style={{ cursor: 'pointer' }}
                                                 onClick={() => {
-                                                  toggleSection(rowDid, 'did');
+                                                  toggleSection(identity.did, 'did');
                                                   if (
-                                                    !isSectionExpanded(rowDid, 'did') &&
+                                                    !isSectionExpanded(identity.did, 'did') &&
                                                     !didDocumentContent &&
                                                     !loadingDidDocument
                                                   ) {
@@ -1318,12 +1303,12 @@ const IdentitiesPage: React.FC = () => {
                                               >
                                                 <small className="mb-0 text-muted">
                                                   <i
-                                                    className={`fas fa-chevron-${isSectionExpanded(rowDid, 'did') ? 'down' : 'right'} me-2`}
+                                                    className={`fas fa-chevron-${isSectionExpanded(identity.did, 'did') ? 'down' : 'right'} me-2`}
                                                   ></i>
                                                   <i className="fas fa-file-alt"></i> DID Document
                                                 </small>
                                               </div>
-                                              {isSectionExpanded(rowDid, 'did') && (
+                                              {isSectionExpanded(identity.did, 'did') && (
                                                 <div className="card-body py-2 px-3">
                                                   {loadingDidDocument ? (
                                                     <div className="text-center text-muted">

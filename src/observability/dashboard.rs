@@ -17,7 +17,7 @@ use crate::mcp_proxies::filesystem::McpProxyStore;
 use crate::metrics::MetricsStore;
 use crate::observability::caller_names::{CallerNameService, DisplayNameSource};
 use crate::observability::identity_view::{
-    CredentialPrincipal, PrincipalNames, credential_principal, group_key, naming_for, with_target_card_name,
+    CredentialPrincipal, PrincipalNames, credential_principal, naming_for, with_target_card_name,
 };
 use crate::{config::GatewayConfig, observability::system_metrics::SystemInfo};
 
@@ -308,8 +308,6 @@ pub struct IdentityInfo {
     pub credential_principal: Option<CredentialPrincipal>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub name_conflict: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub group_key: String,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2114,7 +2112,6 @@ pub(crate) async fn build_identity_list_with(
             };
 
             IdentityInfo {
-                group_key: group_key(origin, surface_id.as_deref(), &r.did),
                 did: r.did.clone(),
                 created_at: r.created_at.to_rfc3339(),
                 identity_hash: r.identity_hash.clone(),
@@ -2632,7 +2629,6 @@ mod tests {
             assert_eq!(row["surface_id"], json!("oxygen"));
             assert_eq!(row["surface_name"], json!("OXYGEN"));
             assert_eq!(row["credential_principal"], json!({ "kind": "certificate", "id": "NITROGEN" }));
-            assert_eq!(row["group_key"], json!("surface:oxygen"));
             assert!(
                 row.get("display_name_verified")
                     .is_none()
@@ -2671,7 +2667,6 @@ mod tests {
             let rows = list(vec![caller(CALLER_DID)], &[surface("oxygen", "OXYGEN")], &caller_names).await;
             let first = serde_json::to_value(&rows[CALLER_DID]).unwrap();
             assert_eq!(first["origin"], json!("external_caller"));
-            assert_eq!(first["group_key"], json!(format!("did:{CALLER_DID}")));
             assert_eq!(first["display_name_pending"], json!(true));
             for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "name_conflict"] {
                 assert!(first.get(absent).is_none(), "{absent} must be omitted for a caller row: {first}");
@@ -2710,7 +2705,6 @@ mod tests {
                 assert_eq!(row.display_name_source, None, "{did}");
                 assert!(!row.display_name_pending, "{did}");
                 assert_eq!(row.surface_id, None, "{did}");
-                assert_eq!(row.group_key, format!("did:{did}"));
             }
         }
 
@@ -2750,11 +2744,9 @@ mod tests {
                 "is_local",
                 "verified",
                 "channel_usage",
-                "group_key",
             ]
             .into();
             assert_eq!(keys, expected);
-            assert_eq!(json["group_key"], json!("did:did:example:legacy"));
         }
 
         #[test]
@@ -2766,7 +2758,6 @@ mod tests {
             .unwrap();
             assert_eq!(info.origin, None);
             assert!(!info.name_conflict);
-            assert_eq!(info.group_key, "");
         }
 
         #[tokio::test]
