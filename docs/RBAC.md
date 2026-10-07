@@ -47,9 +47,11 @@ dashboard compatibility; new UI uses `issuers.*`.
 client can validate a bearer token and show who it is acting as. It takes no parameters and only reads
 the identity the session-auth middleware already resolved, so a caller can only inspect its own
 credential. It accepts either a session token or an `agpat_` personal access token as
-`Authorization: Bearer`, and returns `401` without one. The response is sent with
-`Cache-Control: no-store` and `Vary: Authorization`. The `scopes` list is enforced only on
-feature-gated routes: a few routes authorize on the owner's role alone and ignore it.
+`Authorization: Bearer`, and returns `401` without one or when the token is revoked. A PAT's
+resource-scope headers (such as `x-external-account`) are not required or evaluated on this route,
+but a PAT with a broad tenant selector still gets `403` when no trusted edge is configured. The
+response is sent with `Cache-Control: no-store` and `Vary: Authorization`. The `scopes` list is
+enforced only on feature-gated routes: a few routes authorize on the owner's role alone and ignore it.
 
 ```json
 { "user_id": "user-1", "token_id": "agat_...", "scopes": ["gateways.view", "secrets.view"] }

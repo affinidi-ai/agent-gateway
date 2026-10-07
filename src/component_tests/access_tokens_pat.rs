@@ -292,6 +292,13 @@ async fn already_issued_broad_selector_token_is_honored_with_trusted_edge() {
     );
 }
 
+fn tenant_selector_header() -> Vec<RequiredHeader> {
+    vec![RequiredHeader {
+        name: "x-external-account".to_string(),
+        pattern: "tenant-a".to_string(),
+    }]
+}
+
 async fn token_info_app(
     store: Arc<FsAccessTokenStore>,
     sessions: Arc<SessionManager>,
@@ -378,15 +385,8 @@ async fn token_info_reports_a_scoped_pats_id_and_scopes() {
 #[tokio::test]
 async fn token_info_serves_a_tenant_scoped_pat_without_exposing_secrets() {
     let store = new_store().await;
-    let (id, secret) = create_token(
-        &store,
-        Some("TENANT:${x-external-account}:gateways:.*"),
-        vec![RequiredHeader {
-            name: "x-external-account".to_string(),
-            pattern: "tenant-a".to_string(),
-        }],
-    )
-    .await;
+    let (id, secret) =
+        create_token(&store, Some("TENANT:${x-external-account}:gateways:.*"), tenant_selector_header()).await;
     let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
 
     let response = app
@@ -418,6 +418,63 @@ async fn token_info_serves_a_tenant_scoped_pat_without_exposing_secrets() {
         body.get("token_hash")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn token_info_serves_a_tenant_scoped_pat_without_its_selector_header() {
+    let store = new_store().await;
+    let (id, secret) =
+        create_token(&store, Some("TENANT:${x-external-account}:gateways:.*"), tenant_selector_header()).await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    let (status, body) = token_info(&app, Some(&secret)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"], "user-1");
+    assert_eq!(body["token_id"], id);
+}
+
+#[tokio::test]
+async fn token_info_still_fails_closed_for_a_broad_selector_without_trusted_edge() {
+    let store = new_store().await;
+    let (_, secret) = create_token(
+        &store,
+        Some("TENANT:${x-external-account}:gateways:.*"),
+        vec![RequiredHeader {
+            name: "x-external-account".to_string(),
+            pattern: "[a-z0-9-]+".to_string(),
+        }],
+    )
+    .await;
+    let (app, _directory) = token_info_app(store, Arc::new(SessionManager::new())).await;
+
+    assert_eq!(
+        token_info(&app, Some(&secret))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn token_info_selector_exemption_does_not_cover_lookalike_paths() {
+    let store = new_store().await;
+    let (_, secret) =
+        create_token(&store, Some("TENANT:${x-external-account}:gateways:.*"), tenant_selector_header()).await;
+    let auth =
+        AuthGuardState::new(Arc::new(SessionManager::new()), None, Arc::new(crate::terms::TermsManager::disabled()))
+            .with_pat_authenticator(Some(store));
+    let app = Router::new()
+        .route("/v1/token-info/", get(accepted))
+        .route("/v1/token-info/{rest}", get(accepted))
+        .route("/v1/token-infox", get(accepted))
+        .route("/api/v1/token-info/{rest}", get(accepted))
+        .layer(middleware::from_fn_with_state(auth, require_session_auth));
+
+    for path in ["/v1/token-info/", "/v1/token-info/x", "/v1/token-infox", "/api/v1/token-info/x"] {
+        assert_eq!(request(&app, "GET", path, Some(&secret), None).await, StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(request(&app, "GET", path, Some(&secret), Some("tenant-a")).await, StatusCode::OK, "{path}");
+    }
 }
 
 #[tokio::test]

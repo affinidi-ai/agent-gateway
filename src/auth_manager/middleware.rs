@@ -31,6 +31,10 @@ const CONSENT_PENDING_PATHS: &[&str] = &[
     "/api/saml/logout",
 ];
 
+/// Paths where a personal access token only inspects itself, so its resource-scope
+/// headers are not evaluated. Token authentication and revocation still apply.
+const TOKEN_SELF_INSPECTION_PATHS: &[&str] = &["/v1/token-info", "/api/v1/token-info"];
+
 const PUBLIC_PATH_PREFIXES: &[&str] = &[
     "/auth/",                    // Passkey auth flows
     "/saml/",                    // SAML auth flows
@@ -295,24 +299,25 @@ pub async fn require_session_auth(
         let resource_scoped = principal
             .resource_scope
             .is_some();
-        let scope_evaluation = if let Some(scope) = principal
+        let scope_evaluation = match principal
             .resource_scope
             .as_ref()
         {
-            match scope.evaluate(request.headers()) {
-                Ok(scope) => scope,
-                Err(rejection) => {
-                    warn!(
-                        token_id = %principal.token_id,
-                        path = %path,
-                        reason = %rejection.message(),
-                        "Access-token resource scope rejected request"
-                    );
-                    return Err(StatusCode::FORBIDDEN.into_response());
+            Some(scope) if !TOKEN_SELF_INSPECTION_PATHS.contains(&path.as_str()) => {
+                match scope.evaluate(request.headers()) {
+                    Ok(scope) => scope,
+                    Err(rejection) => {
+                        warn!(
+                            token_id = %principal.token_id,
+                            path = %path,
+                            reason = %rejection.message(),
+                            "Access-token resource scope rejected request"
+                        );
+                        return Err(StatusCode::FORBIDDEN.into_response());
+                    }
                 }
             }
-        } else {
-            crate::auth_manager::resource_scope::ScopeEvaluation { pattern: None, tenant_id: None }
+            _ => crate::auth_manager::resource_scope::ScopeEvaluation { pattern: None, tenant_id: None },
         };
 
         // Fail closed for an already-issued broad (multi-valued) tenant selector
