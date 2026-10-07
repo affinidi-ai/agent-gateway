@@ -1,6 +1,9 @@
 //! JWT verification strategy CRUD HTTP handlers
 //!
-//! All endpoints require `Administrator` role.  Non-admin callers receive `403 Forbidden`.
+//! Every endpoint requires the caller's role to grant the endpoint's
+//! `jwt_verification_strategies.*` feature. A personal access token restricted
+//! to explicit feature scopes must also include that feature. Otherwise the
+//! caller receives `403 Forbidden`.
 
 use axum::{Extension, Json, extract::Path, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
@@ -8,6 +11,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::auth::storage::PasskeyStorage;
+use crate::auth_manager::middleware::pat_scope_allows;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::jwt_bearer::{
     JwtVerificationStrategyStorage,
@@ -64,6 +68,7 @@ async fn require_permission(
     storage: &PasskeyStorage,
     rbac_config: &RbacConfig,
     feature: &Feature,
+    pat: Option<&PatContext>,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     let user = storage
         .load_user_by_id(user_id)
@@ -79,6 +84,14 @@ async fn require_permission(
             user_id = %user_id,
             feature = %feature.as_str(),
             "JWT verification strategy CRUD rejected — insufficient permissions"
+        );
+        return Err((StatusCode::FORBIDDEN, ErrorBody::json("Insufficient permissions")));
+    }
+    if !pat_scope_allows(pat, feature) {
+        warn!(
+            user_id = %user_id,
+            feature = %feature.as_str(),
+            "JWT verification strategy CRUD rejected — access-token scope excludes permission"
         );
         return Err((StatusCode::FORBIDDEN, ErrorBody::json("Insufficient permissions")));
     }
@@ -98,8 +111,15 @@ pub async fn create_strategy(
     scope: Option<Extension<PatResourceScope>>,
     Json(mut body): Json<JwtVerificationStrategyRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) =
-        require_permission(&user_id, &passkey_storage, &rbac_config, &Feature::JwtVerificationStrategiesEdit).await
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::JwtVerificationStrategiesEdit,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
     {
         return e.into_response();
     }
@@ -158,11 +178,19 @@ pub async fn list_strategies(
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     axum::extract::State(store): axum::extract::State<JwtVerificationStrategyState>,
+    pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> impl IntoResponse {
-    if let Err(e) =
-        require_permission(&user_id, &passkey_storage, &rbac_config, &Feature::JwtVerificationStrategiesView).await
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::JwtVerificationStrategiesView,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
     {
         return e.into_response();
     }
@@ -195,11 +223,19 @@ pub async fn get_strategy(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     axum::extract::State(store): axum::extract::State<JwtVerificationStrategyState>,
     Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> impl IntoResponse {
-    if let Err(e) =
-        require_permission(&user_id, &passkey_storage, &rbac_config, &Feature::JwtVerificationStrategiesView).await
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::JwtVerificationStrategiesView,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
     {
         return e.into_response();
     }
@@ -232,12 +268,20 @@ pub async fn update_strategy(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     axum::extract::State(store): axum::extract::State<JwtVerificationStrategyState>,
     Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(body): Json<JwtVerificationStrategyRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) =
-        require_permission(&user_id, &passkey_storage, &rbac_config, &Feature::JwtVerificationStrategiesEdit).await
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::JwtVerificationStrategiesEdit,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
     {
         return e.into_response();
     }
@@ -299,11 +343,19 @@ pub async fn delete_strategy(
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     axum::extract::State(store): axum::extract::State<JwtVerificationStrategyState>,
     Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> impl IntoResponse {
-    if let Err(e) =
-        require_permission(&user_id, &passkey_storage, &rbac_config, &Feature::JwtVerificationStrategiesDelete).await
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::JwtVerificationStrategiesDelete,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
     {
         return e.into_response();
     }
@@ -344,13 +396,13 @@ pub async fn delete_strategy(
 
 // ── JWKS URI validation ───────────────────────────────────────────────────────
 
-/// Query parameters for `GET /v1/jwt-verification-strategies/validate-jwks-uri`.
+/// JSON request body for `POST /v1/jwt-verification-strategies/validate-jwks-uri`.
 #[derive(Debug, Deserialize)]
 pub struct JwksUriQuery {
     pub uri: String,
 }
 
-/// Response body for `GET /v1/jwt-verification-strategies/validate-jwks-uri`.
+/// Response body for `POST /v1/jwt-verification-strategies/validate-jwks-uri`.
 #[derive(Debug, Serialize)]
 pub struct JwksUriValidationResponse {
     pub valid: bool,
@@ -366,12 +418,14 @@ pub struct JwksUriValidationResponse {
 /// Returns `200 OK` with `{ "valid": true, "key_count": N }` on success, or
 /// `400 Bad Request` with `{ "valid": false, "error": "…" }` on failure.
 ///
-/// Requires `JwtVerificationStrategiesView` (or `Edit`) permission.
+/// Requires `JwtVerificationStrategiesView`. A personal access token restricted
+/// to explicit feature scopes must also include that feature.
 pub async fn validate_jwks_uri(
     Extension(user_id): Extension<String>,
     Extension(passkey_storage): Extension<Arc<crate::auth::storage::PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<crate::rbac::RbacConfig>>,
     Extension(jwks_client): Extension<Arc<crate::jwt_bearer::JwksClient>>,
+    pat: Option<Extension<PatContext>>,
     Json(params): Json<JwksUriQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_permission(
@@ -379,6 +433,8 @@ pub async fn validate_jwks_uri(
         &passkey_storage,
         &rbac_config,
         &crate::rbac::Feature::JwtVerificationStrategiesView,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
     )
     .await
     {

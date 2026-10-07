@@ -640,11 +640,11 @@ async fn new_user_storage(role: crate::auth::types::UserRole) -> (Arc<crate::aut
     (Arc::new(storage), user_id)
 }
 
-#[tokio::test]
-async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
-    let (users, user_id) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
-    let sessions = Arc::new(SessionManager::new());
-    let store = new_store().await;
+async fn create_owned_token(
+    store: &FsAccessTokenStore,
+    user_id: &str,
+    scopes: &[&str],
+) -> String {
     let (id, secret) = generate_token();
     store
         .create(AccessToken {
@@ -652,11 +652,14 @@ async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
             name: "scoped token".to_string(),
             description: String::new(),
             token_hash: hash_secret(&secret),
-            user_id: user_id.clone(),
-            scopes: vec!["secrets.view".to_string(), "issuers.view".to_string()],
+            user_id: user_id.to_string(),
+            scopes: scopes
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
             resource_pattern: None,
             required_headers: Vec::new(),
-            created_by: user_id,
+            created_by: user_id.to_string(),
             parent_token_id: None,
             delegation_depth: 0,
             created_at: Utc::now(),
@@ -666,6 +669,15 @@ async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
         })
         .await
         .expect("create token");
+    secret
+}
+
+#[tokio::test]
+async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
+    let (users, user_id) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
+    let sessions = Arc::new(SessionManager::new());
+    let store = new_store().await;
+    let secret = create_owned_token(&store, &user_id, &["secrets.view", "issuers.view"]).await;
 
     let auth =
         AuthGuardState::new(sessions.clone(), Some(users.clone()), Arc::new(crate::terms::TermsManager::disabled()))
@@ -720,4 +732,91 @@ async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
     granted.sort_unstable();
     expected.sort_unstable();
     assert_eq!(granted, expected);
+}
+
+struct JwtStrategiesApp {
+    app: Router,
+    store: Arc<FsAccessTokenStore>,
+    sessions: Arc<SessionManager>,
+    user_id: String,
+}
+
+async fn jwt_strategies_app() -> JwtStrategiesApp {
+    let (users, user_id) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
+    let sessions = Arc::new(SessionManager::new());
+    let store = new_store().await;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let strategies = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(directory.path().to_path_buf())
+        .await
+        .expect("strategy store");
+    std::mem::forget(directory);
+
+    let auth =
+        AuthGuardState::new(sessions.clone(), Some(users.clone()), Arc::new(crate::terms::TermsManager::disabled()))
+            .with_pat_authenticator(Some(store.clone()));
+    let app = crate::jwt_bearer::router::create_jwt_verification_strategies_router(Arc::new(strategies))
+        .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+        .layer(middleware::from_fn_with_state(auth, require_session_auth))
+        .layer(Extension(sessions.clone()))
+        .layer(Extension(users))
+        .layer(Extension(Arc::new(crate::rbac::RbacConfig::default())));
+    JwtStrategiesApp { app, store, sessions, user_id }
+}
+
+#[tokio::test]
+async fn jwt_strategy_list_refuses_a_pat_without_the_view_scope() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["secrets.view"]).await;
+
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/jwt-verification-strategies", Some(&secret), None).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_list_accepts_a_pat_with_the_view_scope() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
+
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/jwt-verification-strategies", Some(&secret), None).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_delete_refuses_a_pat_without_the_delete_scope() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
+
+    assert_eq!(
+        request(&fixture.app, "DELETE", "/v1/jwt-verification-strategies/missing", Some(&secret), None).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_delete_lets_a_pat_with_the_delete_scope_reach_the_handler() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.delete"]).await;
+
+    assert_eq!(
+        request(&fixture.app, "DELETE", "/v1/jwt-verification-strategies/missing", Some(&secret), None).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_list_accepts_a_session_login_on_role_alone() {
+    let fixture = jwt_strategies_app().await;
+    let session = fixture
+        .sessions
+        .create_session("pat-owner".to_string(), fixture.user_id.clone())
+        .await;
+
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/jwt-verification-strategies", Some(&session), None).await,
+        StatusCode::OK
+    );
 }
