@@ -91,6 +91,13 @@ changes:
         trust registries can no longer visually impersonate another agent's name.
   breaking: []
   internal:
+    - timestamp: '2026-10-07T12:00:00.000Z'
+      title: Document that shared reference fields are last-writer-wins
+      description: >-
+        SOURCE_AUTH.md now states that a trust-registry reference field is shared by
+        every writer for its type and id, so gateways naming the same Authority
+        differently overwrite each other. Fields stay create-then-update so an operator
+        can still rename their own Authority or Issuer in registries that already hold it.
     - timestamp: '2026-10-07T00:00:00.000Z'
       title: Share one background refresh cache between caller and target card names
       description: >-

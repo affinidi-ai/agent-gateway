@@ -273,6 +273,10 @@ external DIDs keep working.
 Each publish sends `create-reference-field`. On the problem-report code
 `e.p.msg.conflict` it sends `update-reference-field`, and on a second conflict it
 resends the update once. Any other error is logged and retried on the next trigger.
+A reference field is shared by every writer for its type and id, so gateways that
+publish different names for the same Authority overwrite each other, and the last write
+wins. Fields are not create-only, so renaming an Authority or Issuer updates the name
+in every registry that already holds it.
 Successful publishes are cached per registry, field type, and id, so an unchanged name
 is not re-sent. Publishing runs in the background and never delays or fails an HTTP
 response, record creation, forwarding, or a TRQP query.
