@@ -88,7 +88,9 @@ changes:
       title: Record identity origin on identity records
       description: >-
         AgentIdentityRecord gains an optional origin (managed or external_caller),
-        stamped at DID issuance. Records without one deserialise unchanged.
+        stamped at DID issuance from the identity slot the DID came from. An inbound
+        request on a surface with no inbound slot derives the DID from the protected
+        slot, so it is stamped managed. Records without one deserialise unchanged.
     - timestamp: '2026-10-05T14:39:32.000Z'
       title: Document display names, reference fields and caller naming
       description: >-

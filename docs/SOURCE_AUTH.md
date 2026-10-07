@@ -204,7 +204,11 @@ name is ever published with the DID as the name.
 The managed agent's display name is its surface name. On A2A and AP2 surfaces with an
 `http` or `https` target, the dashboard shows the `name` in the target's Agent Card
 instead, marked unverified (see [Agent Card names](#agent-card-names)). Each identity record carries an
-origin (`managed` or `external_caller`), stamped when the gateway issues the DID. A
+origin (`managed` or `external_caller`), stamped when the gateway issues the DID. The
+origin follows the identity slot the DID came from, not the request leg: on a surface
+with no inbound slot, an inbound request that derives the DID from the protected slot
+(or legacy `target.identity_injection`) issues it as `managed`, the same as the
+outbound leg and the response path. A
 record written before origins existed has none until the gateway next issues its
 credential. Until then it is never published. The dashboard treats a local record
 without an origin as managed when it links to an existing surface, and names it as that
