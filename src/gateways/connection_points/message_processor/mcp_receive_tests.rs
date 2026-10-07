@@ -684,13 +684,15 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         "io.modelcontextprotocol/protocolVersion": MCP_MODERN_VERSION,
         "io.modelcontextprotocol/clientCapabilities": {}
     }}});
-    for (origin, expected_status) in [
-        (json!("https://console.example"), 400),
-        (json!("https://receiver.example"), 400),
-        (json!("https://untrusted.example"), 403),
-        (json!("null"), 403),
-        (Value::Null, 403),
-        (json!(["https://console.example"]), 403),
+    // The sending gateway owns the browser Origin check, so no Origin value
+    // changes the buffered receive outcome.
+    for origin in [
+        json!("https://console.example"),
+        json!("https://receiver.example"),
+        json!("https://untrusted.example"),
+        json!("null"),
+        Value::Null,
+        json!(["https://console.example"]),
     ] {
         let message = forward_message(
             modern_body.clone(),
@@ -700,14 +702,16 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             }),
         );
         let (response, envelope) = receive(&message).await;
-        assert_eq!(response["status"], expected_status, "{origin}");
-        if expected_status == 400 {
-            assert_eq!(envelope["id"], "http-receive");
-            assert_eq!(envelope["error"]["code"], -32022);
-        }
+        assert_eq!(response["status"], 400, "{origin}");
+        assert_eq!(envelope["id"], "http-receive");
+        assert_eq!(envelope["error"]["code"], -32022);
     }
     for (body, headers, expected_status) in [
-        (legacy_body.clone(), json!({"origin": "https://console.example", "Origin": "https://console.example"}), 403),
+        (
+            legacy_body.clone(),
+            json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION, "origin": "https://untrusted.example", "Origin": "https://untrusted.example"}),
+            200,
+        ),
         (json!(" ".repeat(1025)), json!({}), 413),
         (legacy_body, json!({"x-extra": "x".repeat(513)}), 431),
     ] {
@@ -737,7 +741,13 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         .load(Ordering::SeqCst);
     for case in crate::mcp::admission_cases::admission_cases()
         .into_iter()
-        .filter(|case| !case.http_only)
+        .filter(|case| {
+            !case.http_only
+                && !case
+                    .headers
+                    .iter()
+                    .any(|(name, _)| *name == "origin")
+        })
     {
         let mut headers = serde_json::Map::new();
         for (name, value) in &case.headers {
@@ -875,13 +885,13 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             }
         );
     }
-    // Includes the capped initialize and the one envelope-replay delivery
-    // checked above.
+    // Includes the capped initialize, the one envelope-replay delivery and the
+    // legacy request whose forwarded Origin is not rechecked.
     assert_eq!(
         target
             .request_count
             .load(Ordering::SeqCst),
-        5
+        6
     );
 }
 

@@ -3,23 +3,40 @@ changes:
   added: []
   changed:
     - timestamp: '2026-10-07T02:15:14.000Z'
-      title: Apply mcp_http Origin and size limits to every MCP endpoint
-      description: >-
-        `mcp_http` Origin allowlist, header budget and `max_request_bytes` (default 1 MiB) now
-        apply to every MCP endpoint and to `2024-11-05` traffic as well, so legacy browser clients
-        whose Origin is not allowed get `403`, and oversized requests get `413`/`431`. Public
-        endpoints given as bare listen addresses have no HTTP(S) origin and are skipped by the
-        Origin check.
-    - timestamp: '2026-10-07T02:15:14.000Z'
       title: Register a modern-only catalog when the legacy OpenAPI converter fails
       description: >-
         An MCP Proxy whose OpenAPI spec the legacy catalog converter cannot load now registers a
         modern-only catalog instead of failing, and its request body limit always comes from
-        `mcp_http`.
+        `mcp_http`. Its create and update responses carry a `warnings` entry naming the converter
+        error, because `2024-11-05` clients of that Proxy get `500`.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Trust the sending gateway's Origin check on buffered Fabric receive
+      description: >-
+        A buffered Fabric `ForwardRequest` no longer rechecks the caller's browser Origin against
+        the receiving surface's `mcp_http.allowed_origins`, so a legacy browser client admitted by
+        the sending gateway is not refused with `403` by its peer. Header and body limits still
+        apply, and framed streams still check Origin on receive.
   fixed: []
   removed: []
   security: []
   breaking:
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Apply mcp_http Origin and size limits to every MCP endpoint
+      description: >-
+        `mcp_http` Origin allowlist, header budget and `max_request_bytes` (default 1 MiB) now
+        apply to every MCP endpoint and to `2024-11-05` traffic as well, so legacy browser clients
+        whose Origin is not allowed get `403`, and oversized requests get `413`/`431`. Before
+        upgrading, add browser origins to `mcp_http.allowed_origins` and raise
+        `max_request_bytes` / `max_header_bytes` on endpoints that need them. Public endpoints
+        given as bare listen addresses are skipped by the Origin check; any other public endpoint
+        that is not an HTTP(S) origin is skipped with a warning.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Send delegated access tokens to Fabric peers for every modern MCP request
+      description: >-
+        A modern MCP request on a `fabric://` route with `outbound_credentials` now sends the
+        caller's delegated access token to the peer inside the framed stream without the former
+        `dual` opt-in, so existing routes start sharing tokens on upgrade. Remove
+        `outbound_credentials` from any `fabric://` route whose peer must not receive them.
     - timestamp: '2026-10-07T02:15:14.000Z'
       title: ⭐ Admit MCP 2026-07-28 on every MCP endpoint and retire mcp_protocol_mode
       description: >-

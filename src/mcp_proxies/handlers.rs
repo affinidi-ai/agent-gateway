@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use super::McpProxyStore;
-use super::types::{CreateMcpProxyRequest, McpProxy, UpdateMcpProxyRequest};
+use super::types::{CreateMcpProxyRequest, McpProxy, McpProxyWriteResponse, UpdateMcpProxyRequest};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::mcp::sse_server::SseSessionManager;
 use crate::tenancy::{
@@ -411,11 +411,12 @@ impl McpServerManager {
         }
     }
 
-    /// Create and register a new MCP Server for the given proxy
+    /// Create and register a new MCP Server for the given proxy. Returns a
+    /// warning when only the modern catalog could be registered.
     pub async fn create_server(
         &self,
         proxy: &McpProxy,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         // Parse the OpenAPI spec from YAML to JSON
         let openapi_json: serde_json::Value =
             serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
@@ -429,13 +430,14 @@ impl McpServerManager {
             .base_url(base_url)
             .build();
 
-        let catalogs = match server.load_openapi_spec() {
+        let (catalogs, warning) = match server.load_openapi_spec() {
             Ok(()) => {
                 let server = Arc::new(RwLock::new(server));
-                RegisteredCatalogs {
+                let catalogs = RegisteredCatalogs {
                     legacy: Some(server.clone()),
                     modern: server,
-                }
+                };
+                (catalogs, None)
             }
             Err(error) => {
                 let original = server.openapi_spec.clone();
@@ -445,10 +447,15 @@ impl McpServerManager {
                     .map_err(|error| format!("Failed to load modern tool routing: {error}"))?;
                 server.openapi_spec = original;
                 warn!(proxy_id = %proxy.id, error = %error, "OpenAPI schema is unavailable to the legacy tool catalog");
-                RegisteredCatalogs {
+                let catalogs = RegisteredCatalogs {
                     legacy: None,
                     modern: Arc::new(RwLock::new(server)),
-                }
+                };
+                let warning = format!(
+                    "OpenAPI spec is unavailable to the MCP {legacy} tool catalog, so {legacy} clients cannot use this proxy: {error}",
+                    legacy = crate::mcp::MCP_LEGACY_VERSION
+                );
+                (catalogs, Some(warning))
             }
         };
         self.servers
@@ -457,7 +464,7 @@ impl McpServerManager {
             .insert(proxy.id.clone(), catalogs);
 
         info!("✓ Created MCP Server for proxy '{}' at endpoint '{}'", proxy.name, proxy.endpoint_path);
-        Ok(())
+        Ok(warning)
     }
 
     /// Remove an MCP Server
@@ -497,7 +504,7 @@ impl McpServerManager {
     pub async fn reload_server(
         &self,
         proxy: &McpProxy,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         self.create_server(proxy)
             .await
     }
@@ -1026,7 +1033,7 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(mut request): Json<CreateMcpProxyRequest>,
-) -> Result<Json<McpProxy>, (StatusCode, String)> {
+) -> Result<Json<McpProxyWriteResponse>, (StatusCode, String)> {
     request.tenant_id = tenant_for_create(request.tenant_id.take(), pat.is_some(), tenant_context(&context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     crate::config::enforce_add("proxies.mcp")
@@ -1096,10 +1103,12 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
     ensure_proxy_may_declare_resource(&resource_owners, &proxy).await?;
 
     // Try to create the MCP Server first
-    manager
+    let warnings = manager
         .create_server(&proxy)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to create MCP Server: {}", e)))?;
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to create MCP Server: {}", e)))?
+        .into_iter()
+        .collect();
 
     // Store the proxy
     store
@@ -1156,7 +1165,7 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
         });
     }
 
-    Ok(Json(proxy))
+    Ok(Json(McpProxyWriteResponse { proxy, warnings }))
 }
 
 /// Update an MCP Proxy
@@ -1169,7 +1178,7 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(request): Json<UpdateMcpProxyRequest>,
-) -> Result<Json<McpProxy>, (StatusCode, String)> {
+) -> Result<Json<McpProxyWriteResponse>, (StatusCode, String)> {
     let mut proxy = store
         .get(&id)
         .await
@@ -1236,11 +1245,14 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
     proxy.updated_at = chrono::Utc::now();
 
     // Reload the MCP Server if needed
+    let mut warnings = Vec::new();
     if needs_reload {
-        manager
-            .reload_server(&proxy)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to reload MCP Server: {}", e)))?;
+        warnings.extend(
+            manager
+                .reload_server(&proxy)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to reload MCP Server: {}", e)))?,
+        );
     }
 
     store
@@ -1325,7 +1337,7 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
         });
     }
 
-    Ok(Json(proxy))
+    Ok(Json(McpProxyWriteResponse { proxy, warnings }))
 }
 
 /// Delete an MCP Proxy
@@ -3555,10 +3567,12 @@ mod tests {
             "/resource".into(),
         );
         let manager = super::McpServerManager::new();
-        manager
+        let warning = manager
             .create_server(&proxy)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("legacy catalog warning");
+        assert!(warning.contains(crate::mcp::MCP_LEGACY_VERSION), "{warning}");
         assert!(
             manager
                 .get_server(&proxy.id)
@@ -5151,7 +5165,7 @@ mod tests {
             Json(serde_json::from_value(body).unwrap()),
         )
         .await
-        .map(|Json(p)| p)
+        .map(|Json(response)| response.proxy)
     }
 
     fn create_body(id: Option<&str>) -> serde_json::Value {
@@ -5382,6 +5396,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_and_update_warn_when_the_legacy_catalog_is_unavailable() {
+        let legacy_incompatible = serde_json::json!({
+            "openapi": "3.1.0", "info": {"title": "Resources", "version": "1.0"},
+            "paths": {"/filter": {"post": {"operationId": "filter", "requestBody": {"required": true,
+                "content": {"application/json": {"schema": {
+                    "$id": "https://schemas.example/filter", "type": "object",
+                    "$defs": {"Proof": {"type": "string"}}, "properties": {"proof": {"$ref": "#/$defs/Proof"}}
+                }}}
+            }, "responses": {"200": {"description": "OK"}}}}}
+        })
+        .to_string();
+        let store = store_with(vec![]);
+        let manager = Arc::new(super::McpServerManager::new());
+        let mut body = create_body(Some("schema-api"));
+        body["openapi_spec"] = serde_json::json!(legacy_incompatible);
+        let Json(created) = super::create_mcp_proxy(
+            Extension(store.clone()),
+            Extension(manager.clone()),
+            Extension(None),
+            Extension(no_resource_owners()),
+            None,
+            None,
+            None,
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .expect("created with a modern-only catalog");
+        assert_eq!(created.warnings.len(), 1);
+        assert!(created.warnings[0].contains(crate::mcp::MCP_LEGACY_VERSION), "{:?}", created.warnings);
+        assert_eq!(serde_json::to_value(&created).unwrap()["warnings"], serde_json::json!(created.warnings));
+        assert!(
+            store
+                .get("schema-api")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let update = |spec: &str| {
+            super::update_mcp_proxy(
+                Extension(store.clone()),
+                Extension(manager.clone()),
+                Extension(None),
+                Extension(no_resource_owners()),
+                Path("schema-api".to_string()),
+                None,
+                None,
+                Json(serde_json::from_value(serde_json::json!({ "openapi_spec": spec })).unwrap()),
+            )
+        };
+        let Json(fixed) = update(SPEC)
+            .await
+            .expect("updated");
+        assert!(fixed.warnings.is_empty());
+        assert!(
+            !serde_json::to_value(&fixed)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("warnings")
+        );
+        let Json(broken) = update(&legacy_incompatible)
+            .await
+            .expect("updated");
+        assert_eq!(broken.warnings, created.warnings);
+    }
+
+    #[tokio::test]
     async fn a_managed_by_label_is_kept_trimmed_and_cleared_on_request() {
         let store = store_with(vec![]);
         let mut body = create_body(Some("boris-a-api"));
@@ -5407,11 +5489,17 @@ mod tests {
         let Json(kept) = update(serde_json::json!({ "name": "renamed" }))
             .await
             .expect("updated");
-        assert_eq!(kept.managed_by.as_deref(), Some("Boris"), "absent keeps the label");
+        assert_eq!(
+            kept.proxy
+                .managed_by
+                .as_deref(),
+            Some("Boris"),
+            "absent keeps the label"
+        );
         let Json(cleared) = update(serde_json::json!({ "managed_by": "" }))
             .await
             .expect("cleared");
-        assert_eq!(cleared.managed_by, None);
+        assert_eq!(cleared.proxy.managed_by, None);
         assert!(
             !serde_json::to_value(&cleared)
                 .unwrap()

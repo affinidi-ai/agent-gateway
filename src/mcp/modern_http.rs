@@ -255,17 +255,46 @@ fn parsed_origin(value: &str) -> Option<String> {
     )
 }
 
+/// The policy is built per request, so each unusable value is logged once.
+fn warn_unusable_public_endpoint(endpoint: &str) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(endpoint.to_string());
+    if first {
+        tracing::warn!(
+            endpoint = %endpoint,
+            "MCP public endpoint is neither an HTTP(S) origin nor a host:port listen address, so it adds nothing to the Origin allowlist"
+        );
+    }
+}
+
+fn is_bare_listen_address(value: &str) -> bool {
+    !value.contains("://")
+        && value
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+}
+
 impl OriginPolicy {
     pub fn new(
         public_endpoints: &[String],
         allowed_origins: &[String],
     ) -> Result<Self, String> {
-        // A bare `host:port` listen address names no origin a browser can
-        // send, so it adds nothing to the allowlist.
-        let mut allowed: HashSet<String> = public_endpoints
-            .iter()
-            .filter_map(|endpoint| parsed_origin(endpoint))
-            .collect();
+        let mut allowed = HashSet::new();
+        for endpoint in public_endpoints {
+            match parsed_origin(endpoint) {
+                Some(origin) => {
+                    allowed.insert(origin);
+                }
+                // A bare `host:port` listen address names no origin a browser
+                // can send, so it adds nothing to the allowlist.
+                None if is_bare_listen_address(endpoint) => {}
+                None => warn_unusable_public_endpoint(endpoint),
+            }
+        }
         for origin in allowed_origins {
             if parsed_origin(origin).as_deref() != Some(origin.as_str()) {
                 return Err("MCP allowed origins must be exact serialized HTTP(S) origins".to_string());
@@ -730,6 +759,16 @@ mod tests {
         for origin in ["http://0.0.0.0:8443", "http://127.0.0.1:8080"] {
             headers.insert(header::ORIGIN, origin.parse().unwrap());
             assert_eq!(policy.validate(&headers), Err(INVALID_ORIGIN), "{origin}");
+        }
+    }
+
+    #[test]
+    fn only_host_port_values_are_bare_listen_addresses() {
+        for value in ["0.0.0.0:8443", "127.0.0.1:8080", "localhost:3000", "[::]:8443"] {
+            assert!(is_bare_listen_address(value), "{value}");
+        }
+        for value in ["gateway.example/mcp", "gateway.example", ":8443", "host:port", "ftp://gateway.example:21", ""] {
+            assert!(!is_bare_listen_address(value), "{value}");
         }
     }
 

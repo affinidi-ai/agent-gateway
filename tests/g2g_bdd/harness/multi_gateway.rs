@@ -470,9 +470,9 @@ impl MultiGatewayHarness {
     }
 
     /// Add `origin_gw`'s origins to the `mcp_http.allowed_origins` of
-    /// `gw_index`'s `surface_id`. A Fabric receiver checks a forwarded Origin
-    /// against its own allowlist, so a caller Origin the sending gateway
-    /// accepts must be allowlisted on both.
+    /// `gw_index`'s `surface_id`. A framed Fabric stream receiver checks a
+    /// forwarded Origin against its own allowlist, so a caller Origin the
+    /// sending gateway accepts must be allowlisted on both.
     pub async fn accept_mcp_origins_of(
         &self,
         gw_index: usize,

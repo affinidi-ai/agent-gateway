@@ -112,6 +112,16 @@ impl StorableEntity for McpProxy {
     }
 }
 
+/// A created or updated MCP Proxy, with any problem that left part of it
+/// unusable without failing the write.
+#[derive(Debug, Serialize)]
+pub struct McpProxyWriteResponse {
+    #[serde(flatten)]
+    pub proxy: McpProxy,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 /// Request to create a new MCP Proxy
 #[derive(Debug, Deserialize)]
 pub struct CreateMcpProxyRequest {

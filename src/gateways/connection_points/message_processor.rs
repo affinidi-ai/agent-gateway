@@ -4201,11 +4201,11 @@ async fn process_forward_request_with_mcp_runtime(
         };
         if stream_request.is_none() {
             for (name, value) in headers.iter().flat_map(|headers| headers.iter()) {
-                if matches!(name.to_ascii_lowercase().as_str(), "origin" | "accept" | "content-type")
+                if matches!(name.to_ascii_lowercase().as_str(), "accept" | "content-type")
                     && value.as_str().and_then(|value| axum::http::HeaderValue::from_str(value).ok()).is_none()
                 {
                     let error = crate::mcp::modern_http::HttpAdmissionError {
-                        status: if name.eq_ignore_ascii_case("origin") { axum::http::StatusCode::FORBIDDEN } else { axum::http::StatusCode::BAD_REQUEST },
+                        status: axum::http::StatusCode::BAD_REQUEST,
                         message: "Malformed MCP HTTP header in Fabric request",
                     };
                     return axum_response_to_forward_result(error.into_response(None)).await;
@@ -4213,6 +4213,13 @@ async fn process_forward_request_with_mcp_runtime(
             }
         }
         let mcp_headers = match stream_request.as_ref().map(|request| Ok(request.headers.clone())).unwrap_or_else(|| fabric_mcp_headers(headers.as_ref())) {
+            // The sending gateway already checked the caller's browser Origin
+            // against its own surface, so a buffered ForwardRequest is not
+            // checked again against this surface's allowlist.
+            Ok(mut headers) if stream_request.is_none() => {
+                headers.remove(axum::http::header::ORIGIN);
+                headers
+            }
             Ok(headers) => headers,
             Err(message) => {
                 let error = crate::mcp::request_validation::malformed_transport_header(&body_bytes, message);

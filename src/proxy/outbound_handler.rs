@@ -7790,8 +7790,9 @@ mod tests {
             &[crate::mcp::MCP_MODERN_VERSION],
             &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
         );
-        // A `fabric://` Transit Point narrows to the Fabric send policy, so a
-        // revision that leg cannot carry is rejected at admission.
+        // A `fabric://` Transit Point resolves to the Fabric send policy, which
+        // admits the same revisions as an HTTP(S) Target; each row pins that
+        // the two Targets still agree.
         for (target, version, admitted) in [
             ("fabric://gateway/channel", crate::mcp::MCP_MODERN_VERSION, true),
             ("https://agent.example/mcp", crate::mcp::MCP_MODERN_VERSION, true),

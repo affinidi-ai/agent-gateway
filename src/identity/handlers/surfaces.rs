@@ -1043,7 +1043,7 @@ fn retain_mcp_settings(
 
 /// PUT carries the whole record, so an omitted `mcp_http` — or an `mcp_http`
 /// that omits `authorization` — means "unchanged", never "remove". Resource
-/// Server authorization is enforced in every protocol mode, so dropping it on
+/// Server authorization is enforced for every MCP revision, so dropping it on
 /// an unrelated edit would silently unauthenticate the endpoint. Removal is
 /// explicit, via PATCH with a `null`.
 fn retain_mcp_http(
