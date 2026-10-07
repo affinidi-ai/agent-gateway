@@ -709,7 +709,7 @@ mod tests {
             max_header_bytes: NonZeroUsize::new(without_origin_bytes).unwrap(),
             ..Default::default()
         };
-        let path = crate::mcp::request_validation::McpPathKind::ALL[0];
+        let path = crate::mcp::request_validation::McpPathKind::FabricReceive;
         let checked = EndpointHttpPolicy::new(None, &[], path).unwrap();
         let unchecked = checked
             .clone()

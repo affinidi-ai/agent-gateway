@@ -734,6 +734,11 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(response_body["headers"]["allow"], "POST");
         assert_eq!(response_body["body"], "");
     }
+    let mut oversized_origin =
+        forward_message(Value::Null, json!({"Origin": format!("https://{}.example", "a".repeat(500))}));
+    oversized_origin.message_body["method"] = json!("GET");
+    let (response, _) = receive(&oversized_origin).await;
+    assert_eq!(response["status"], 431);
     // The shared negative admission cases, through the
     // ForwardRequest path. Envelope headers are JSON: a repeated header is an
     // array, and a value that is not UTF-8 cannot be carried at all.

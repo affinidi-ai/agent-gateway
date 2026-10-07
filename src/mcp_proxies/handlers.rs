@@ -690,7 +690,7 @@ async fn discover_proxy_tools<S: McpProxyStore>(
     }
 
     if manager
-        .get_server(proxy_id)
+        .get_catalogs(proxy_id)
         .await
         .is_none()
     {
@@ -700,12 +700,12 @@ async fn discover_proxy_tools<S: McpProxyStore>(
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to initialize MCP proxy: {}", e)))?;
     }
 
-    let server = manager
-        .get_server(proxy_id)
+    let catalogs = manager
+        .get_catalogs(proxy_id)
         .await
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "MCP proxy server is not available".to_string()))?;
 
-    let server = server.read().await;
+    let server = catalogs.modern.read().await;
     let mut tools = server
         .get_tool_names()
         .into_iter()
@@ -5395,9 +5395,8 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
-    #[tokio::test]
-    async fn create_and_update_warn_when_the_legacy_catalog_is_unavailable() {
-        let legacy_incompatible = serde_json::json!({
+    fn legacy_incompatible_spec() -> String {
+        serde_json::json!({
             "openapi": "3.1.0", "info": {"title": "Resources", "version": "1.0"},
             "paths": {"/filter": {"post": {"operationId": "filter", "requestBody": {"required": true,
                 "content": {"application/json": {"schema": {
@@ -5406,7 +5405,12 @@ mod tests {
                 }}}
             }, "responses": {"200": {"description": "OK"}}}}}
         })
-        .to_string();
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn create_and_update_warn_when_the_legacy_catalog_is_unavailable() {
+        let legacy_incompatible = legacy_incompatible_spec();
         let store = store_with(vec![]);
         let manager = Arc::new(super::McpServerManager::new());
         let mut body = create_body(Some("schema-api"));
@@ -5461,6 +5465,114 @@ mod tests {
             .await
             .expect("updated");
         assert_eq!(broken.warnings, created.warnings);
+    }
+
+    async fn create_with_manager(
+        store: &Arc<MemStore>,
+        manager: &Arc<super::McpServerManager>,
+        body: serde_json::Value,
+    ) -> super::McpProxyWriteResponse {
+        let Json(created) = super::create_mcp_proxy(
+            Extension(store.clone()),
+            Extension(manager.clone()),
+            Extension(None),
+            Extension(no_resource_owners()),
+            None,
+            None,
+            None,
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .expect("created");
+        created
+    }
+
+    async fn discover_proxy(
+        store: &Arc<MemStore>,
+        manager: &Arc<super::McpServerManager>,
+        proxy_id: &str,
+    ) -> Result<Vec<String>, (StatusCode, String)> {
+        let Json(response) = super::discover_mcp_tools(
+            Extension(store.clone()),
+            Extension(manager.clone()),
+            Extension(None),
+            None,
+            None,
+            Json(DiscoverMcpToolsRequest {
+                mcp_proxy_id: Some(proxy_id.to_string()),
+                target_endpoint: None,
+                target_auth: None,
+            }),
+        )
+        .await?;
+        Ok(response
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_lists_a_modern_only_proxy_from_its_modern_catalog() {
+        let store = store_with(vec![]);
+        let manager = Arc::new(super::McpServerManager::new());
+        let mut body = create_body(Some("schema-api"));
+        body["openapi_spec"] = serde_json::json!(legacy_incompatible_spec());
+        let created = create_with_manager(&store, &manager, body).await;
+        assert_eq!(created.warnings.len(), 1);
+        assert!(
+            manager
+                .get_server("schema-api")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            discover_proxy(&store, &manager, "schema-api")
+                .await
+                .unwrap(),
+            vec!["filter".to_string()]
+        );
+
+        manager
+            .remove_server("schema-api")
+            .await;
+        assert_eq!(
+            discover_proxy(&store, &manager, "schema-api")
+                .await
+                .unwrap(),
+            vec!["filter".to_string()]
+        );
+        assert!(
+            manager
+                .get_server("schema-api")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_lists_a_legacy_capable_proxy_and_rejects_an_unknown_one() {
+        let store = store_with(vec![]);
+        let manager = Arc::new(super::McpServerManager::new());
+        let created = create_with_manager(&store, &manager, create_body(Some("pets-api"))).await;
+        assert!(created.warnings.is_empty());
+        assert!(
+            manager
+                .get_server("pets-api")
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            discover_proxy(&store, &manager, "pets-api")
+                .await
+                .unwrap(),
+            vec!["listPets".to_string()]
+        );
+
+        let error = discover_proxy(&store, &manager, "missing-api")
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
