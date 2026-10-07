@@ -46,13 +46,23 @@ describe('IdentityNameCell', () => {
     expect(screen.getByTestId('identities-name')).not.toHaveTextContent('OXYGEN');
   });
 
-  it('shows a managed agent name from its Agent Card without any badge', () => {
+  it('marks a managed agent name from its target Agent Card as unverified', () => {
     renderCell({ display_name: 'DateTime Agent', display_name_source: 'target_agent_card' }, 'DEF');
 
     expect(screen.getByTestId('identities-name')).toHaveTextContent('DateTime Agent');
     expect(screen.getByTestId('identities-name')).not.toHaveTextContent('DEF');
-    expect(screen.queryByTestId('identities-name-unverified')).not.toBeInTheDocument();
+    expect(screen.getByTestId('identities-name-unverified')).toHaveAttribute(
+      'title',
+      expect.stringContaining("target's Agent Card")
+    );
     expect(screen.queryByTestId('identities-name-verified')).not.toBeInTheDocument();
+  });
+
+  it('shows a managed agent surface name without any badge', () => {
+    renderCell({ display_name: 'DEF', display_name_source: 'surface_name' }, 'DEF');
+
+    expect(screen.getByTestId('identities-name')).toHaveTextContent('DEF');
+    expect(screen.queryByTestId('identities-name-unverified')).not.toBeInTheDocument();
   });
 
   it('makes the DID the primary line when no name is known', () => {

@@ -433,7 +433,6 @@ pub fn registries_for_authority(
 pub fn surface_reference_values(
     surface: &AgentSurface,
     records: &[AgentIdentityRecord],
-    card_name: Option<&str>,
 ) -> Vec<ReferenceFieldValue> {
     let mut by_did: Vec<_> = surfaces_by_did(records)
         .into_iter()
@@ -443,7 +442,7 @@ pub fn surface_reference_values(
     by_did
         .into_iter()
         .filter_map(|(did, surfaces)| {
-            resolve_managed_display_name(surface, &surfaces, card_name)
+            resolve_managed_display_name(surface, &surfaces, None)
                 .publishable(&did)
                 .map(|name| ReferenceFieldValue::entity(&did, name.clone()))
         })
@@ -482,7 +481,7 @@ pub fn spawn_authority_publish(
 }
 
 /// Republish the entity fields of a surface's managed DIDs to the trust registries its
-/// Trust Recorder writes to, after the surface or its target Agent Card name changed.
+/// Trust Recorder writes to, after the surface was renamed.
 pub fn spawn_surface_rename_publish(surface: AgentSurface) {
     let Some(recorder) = surface
         .trust_recorder()
@@ -512,10 +511,7 @@ pub fn spawn_surface_rename_publish(surface: AgentSurface) {
                 return;
             }
         };
-        let card_name = crate::identity::target_card_names::TargetCardNameService::global()
-            .name_for(&surface)
-            .await;
-        let values = surface_reference_values(&surface, &records, card_name.as_deref());
+        let values = surface_reference_values(&surface, &records);
         if values.is_empty() {
             return;
         }
@@ -525,23 +521,6 @@ pub fn spawn_surface_rename_publish(surface: AgentSurface) {
         ReferenceFieldPublisher::global()
             .publish_all(manager.as_ref(), &tr_dids, &values)
             .await;
-    });
-}
-
-/// Republish the entity fields of `surface_id` after its target Agent Card name changed.
-pub fn spawn_surface_name_republish(surface_id: String) {
-    let Some(store) = crate::gateways::connection_points::get_agent_surface_store() else {
-        return;
-    };
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    handle.spawn(async move {
-        match store.get(&surface_id).await {
-            Ok(Some(surface)) => spawn_surface_rename_publish(surface),
-            Ok(None) => {}
-            Err(e) => warn!(surface_id, error = %e, "Surface lookup for Agent Card name republish failed"),
-        }
     });
 }
 
@@ -1000,7 +979,7 @@ mod tests {
         caller.origin = Some(IdentityOrigin::ExternalCaller);
         let unrelated = test_surface_identity_record("did:web:unrelated", "s9");
 
-        let values = surface_reference_values(&surface, &[managed, shared, shared_elsewhere, caller, unrelated], None);
+        let values = surface_reference_values(&surface, &[managed, shared, shared_elsewhere, caller, unrelated]);
 
         assert_eq!(values, vec![ReferenceFieldValue::entity("did:web:managed", DisplayName::parse("OXYGEN").unwrap())]);
     }
@@ -1018,7 +997,7 @@ mod tests {
         let mut managed = test_surface_identity_record("did:web:managed", "s1");
         managed.origin = Some(IdentityOrigin::Managed);
 
-        let values = surface_reference_values(&surface, &[legacy, managed], None);
+        let values = surface_reference_values(&surface, &[legacy, managed]);
 
         assert_eq!(values, vec![ReferenceFieldValue::entity("did:web:managed", DisplayName::parse("OXYGEN").unwrap())]);
     }

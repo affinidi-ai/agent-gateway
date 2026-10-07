@@ -5,11 +5,9 @@ changes:
       title: ⭐ Publish human-readable names for agents, Issuers and Authorities to TRs
       description: >-
         The gateway now publishes display names as trust-registry reference fields: the
-        managed agent's name (its target Agent Card name on A2A and AP2 surfaces, else
-        its surface name), and the configured names for Issuers and Authorities. Names
-        are sent when an Issuer is created, retried or edited, when an Authority is
-        edited, when a surface is renamed or its Agent Card name changes, and by the
-        Trust Recorder. Each
+        managed agent's surface name, and the configured names for Issuers and
+        Authorities. Names are sent when an Issuer is created, retried or edited, when
+        an Authority is edited, when a surface is renamed, and by the Trust Recorder. Each
         publish creates the field and updates it on conflict. Publishing runs in the
         background and never blocks requests or record creation.
     - timestamp: '2026-10-05T14:39:32.000Z'
@@ -22,8 +20,8 @@ changes:
       title: Include the managed agent's display name in its identity VC
       description: >-
         Agent identity VCs carry credentialSubject.name, set to the managed agent's
-        display name, on the legacy and SSI issuance paths. The next VC after a rename
-        or an Agent Card name change carries the new name under the same DID.
+        surface name, on the legacy and SSI issuance paths. The next VC after a surface
+        rename carries the new name under the same DID.
     - timestamp: '2026-10-05T14:39:32.000Z'
       title: Show identity origin, display names and per-surface history in Identities
       description: >-
@@ -36,15 +34,14 @@ changes:
         identities linked to a surface are named as its managed agent. External callers are
         named by a verified alsoKnownAs agent name, then by their Agent Card name (marked unverified), then by their DID.
     - timestamp: '2026-10-06T09:00:00.000Z'
-      title: ⭐ Name managed agents from their target's Agent Card
+      title: Show managed agents' target Agent Card names, marked unverified
       description: >-
-        On A2A and AP2 surfaces with an HTTP(S) target, the managed agent is named by
-        the name in its own Agent Card instead of the surface name, so the Identities
-        page, the identity VC, Trust Recorder context and the trust-registry entity
-        field all carry the same name. The card is cached for five minutes per surface;
-        credential issuance waits for the first lookup, and a name change republishes
-        the entity field. An unreachable card or invalid name falls back to the surface
-        name. The name is self-asserted by the target and not verified.
+        On A2A and AP2 surfaces with an HTTP(S) target, the Identities page shows the
+        name in the managed agent's own Agent Card in place of the surface name, with an
+        "unverified" marker. The name is self-asserted by the target, so it is never
+        signed into the identity VC or published to Trust Recorder context or trust
+        registries, and card lookups never block requests. The card is cached for five
+        minutes per surface; an unreachable card or invalid name shows the surface name.
   changed:
     - timestamp: '2026-10-06T10:00:00.000Z'
       title: Rename the Identities Status column to Origin

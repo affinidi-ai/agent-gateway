@@ -1,7 +1,7 @@
 Feature: Identity names on the Identities dashboard
   The Identities dashboard names each identity after where it came from. A
   managed agent identity takes the name in its target's Agent Card on A2A and AP2
-  surfaces, and the name of its surface otherwise. An external caller is
+  surfaces, marked unverified, and the name of its surface otherwise. An external caller is
   never named after a surface; without a verified agent name or an Agent Card
   name it is shown by its DID alone.
 

@@ -161,8 +161,8 @@ links in the `useIdentityGroups` hook, and the row parts `IdentityNameCell`,
   lookup is pending (`display_name_pending`), a muted "resolving…" line sits above the
   DID. A name conflict shows the DID as primary with a "name conflict" marker beside it.
   A verified agent name renders as `local · host` with a verified marker, and a
-  caller's Agent Card name is marked unverified. A managed agent named from its own
-  target's Agent Card (`target_agent_card`) shows the name with no badge.
+  caller's Agent Card name (`agent_card`) and a managed agent's target Agent Card name
+  (`target_agent_card`) are both marked unverified. A surface name shows no badge.
 - The unnamed filter and its count include only rows with no name and no pending lookup.
 - The **Origin** column holds the origin badge (Managed Agent or External Caller), or
   LOCAL/REMOTE for records without an origin, plus a VERIFIED badge where it applies.

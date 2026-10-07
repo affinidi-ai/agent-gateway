@@ -946,8 +946,7 @@ impl VCIssuer {
         .await
     }
 
-    /// Display name for a managed identity (its target Agent Card name, else its surface
-    /// name); `None` for callers, unknown origins, unnamed agents and DIDs shared by
+    /// Display name for a managed identity (its surface name); `None` for callers, unknown origins, unnamed agents and DIDs shared by
     /// several surfaces.
     async fn managed_display_name(
         &self,

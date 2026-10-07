@@ -1,10 +1,9 @@
 Feature: Managed agent display names
-  The gateway names a managed agent after the name in its target's Agent Card on
-  A2A and AP2 surfaces, and after its surface otherwise or when the card has no
-  valid name. The display name appears in the Agent Identity credential the gateway
-  issues for the managed agent and in the trust registry entity reference field for
-  the managed agent's DID. Callers are never named after the surface, and naming
-  never blocks forwarding.
+  The gateway names a managed agent after its surface in the Agent Identity
+  credential it issues for the managed agent and in the trust registry entity
+  reference field for the managed agent's DID. The name in the target's Agent Card
+  is self-asserted, so it is never signed or published. Callers are never named
+  after the surface, and naming never blocks forwarding.
 
   Scenario: The managed agent's credential carries the surface name when its Agent Card has no name
     Given A2A surface "alpha" is defined for route "/example" with managed agent "bravo" as its target
@@ -16,7 +15,7 @@ Feature: Managed agent display names
     Then the response status is 200
     And external agent "charlie" received the forwarded request with a VP naming the managed agent "alpha"
 
-  Scenario: The managed agent's credential carries its Agent Card name
+  Scenario: The managed agent's credential carries the surface name, not its Agent Card name
     Given A2A surface "alpha" is defined for route "/example" with managed agent "bravo" as its target
     And surface "alpha" has A2A Transit Point "tr1" to external agent "charlie"
     And transit point "tr1" maps managed-agent header "x-ms-entra-agent-id" to A2A metadata field "entra_agent_id"
@@ -25,7 +24,7 @@ Feature: Managed agent display names
     And managed agent "bravo" serves an Agent Card named "DateTime Agent"
     When managed agent "bravo" sends an A2A message/send request through Transit Point "tr1" with header "x-ms-entra-agent-id" set to "agent-123" and header "x-ms-client-tenant-id" set to "tenant-456"
     Then the response status is 200
-    And external agent "charlie" received the forwarded request with a VP naming the managed agent "DateTime Agent"
+    And external agent "charlie" received the forwarded request with a VP naming the managed agent "alpha"
 
   Scenario: A caller's credential carries no display name
     Given A2A surface "alpha" exists for route "/example" with managed agent "bravo" as its target

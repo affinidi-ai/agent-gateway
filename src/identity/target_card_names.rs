@@ -1,11 +1,9 @@
 //! Cached managed-agent names read from the `name` of the surface target's Agent Card.
 //!
-//! For A2A and AP2 surfaces with an HTTP(S) target, this name replaces the surface name
-//! everywhere a managed agent is named: the dashboard, the identity VC, Trust Recorder
-//! context, and trust-registry entity fields. The name is self-asserted by the target and
-//! never verified. [`TargetCardNameService::lookup_or_spawn`] never waits;
-//! [`TargetCardNameService::name_for`] waits for the first lookup of a surface. A name that
-//! appears, changes, or disappears fires the change hook, which republishes entity fields.
+//! For A2A and AP2 surfaces with an HTTP(S) target, the dashboard shows this name in place
+//! of the surface name, marked unverified. The name is self-asserted by the target, so it is
+//! never signed into the identity VC or published to trust registries.
+//! [`TargetCardNameService::lookup_or_spawn`] never waits.
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -23,8 +21,6 @@ use crate::observability::caller_names::{AGENT_CARD_FETCH_TIMEOUT, AGENT_CARD_MA
 
 pub const TARGET_CARD_NAME_TTL: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT_FETCHES: usize = 4;
-
-type NameChangeHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardLocation {
@@ -68,7 +64,6 @@ pub struct TargetCardNameService {
     permits: Semaphore,
     ttl: Duration,
     source: Arc<dyn TargetCardSource>,
-    on_name_change: Option<NameChangeHook>,
 }
 
 struct InflightGuard<'a> {
@@ -86,13 +81,7 @@ impl Drop for InflightGuard<'_> {
 impl TargetCardNameService {
     pub fn global() -> &'static Arc<TargetCardNameService> {
         static GLOBAL: OnceLock<Arc<TargetCardNameService>> = OnceLock::new();
-        GLOBAL.get_or_init(|| {
-            Arc::new(TargetCardNameService::new(Arc::new(HttpTargetCardSource)).with_name_change_hook(Arc::new(
-                |surface_id: &str| {
-                    crate::trust_registries::reference_fields::spawn_surface_name_republish(surface_id.to_string())
-                },
-            )))
-        })
+        GLOBAL.get_or_init(|| Arc::new(TargetCardNameService::new(Arc::new(HttpTargetCardSource))))
     }
 
     pub fn new(source: Arc<dyn TargetCardSource>) -> Self {
@@ -109,43 +98,7 @@ impl TargetCardNameService {
             permits: Semaphore::new(MAX_CONCURRENT_FETCHES),
             ttl,
             source,
-            on_name_change: None,
         }
-    }
-
-    pub fn with_name_change_hook(
-        mut self,
-        hook: NameChangeHook,
-    ) -> Self {
-        self.on_name_change = Some(hook);
-        self
-    }
-
-    /// The surface's target Agent Card name; `None` for surfaces without a card location or
-    /// whose card has no valid name. Waits only for the first lookup of a location; later
-    /// calls return the cached name and refresh a stale one in the background.
-    pub async fn name_for(
-        self: &Arc<Self>,
-        surface: &AgentSurface,
-    ) -> Option<String> {
-        let location = CardLocation::for_surface(surface)?;
-        let surface_id = surface.surface_id.as_str();
-        let cached = self
-            .cache
-            .get(surface_id)
-            .filter(|entry| entry.location == location)
-            .map(|entry| (entry.name.clone(), entry.checked_at.elapsed() < self.ttl));
-        if let Some((name, fresh)) = cached {
-            if !fresh {
-                self.spawn_refresh(surface_id, &location);
-            }
-            return name;
-        }
-        let name = self
-            .resolve(surface_id, &location)
-            .await;
-        self.store(surface_id, location, name.clone());
-        name
     }
 
     /// Returns the cached name for the surface's current card location without waiting, and
@@ -249,9 +202,6 @@ impl TargetCardNameService {
                 changed_at,
             },
         );
-        if changed && let Some(hook) = &self.on_name_change {
-            hook(surface_id);
-        }
     }
 
     /// Surfaces whose target Agent Card name appeared, changed, or disappeared after `since`.
@@ -368,16 +318,6 @@ mod tests {
         panic!("target card lookup did not finish");
     }
 
-    fn surface_with_id(
-        id: &str,
-        protocol: SurfaceProtocol,
-        endpoint: &str,
-    ) -> AgentSurface {
-        let mut s = surface(protocol, endpoint);
-        s.surface_id = id.to_string();
-        s
-    }
-
     fn surface(
         protocol: SurfaceProtocol,
         endpoint: &str,
@@ -487,71 +427,6 @@ mod tests {
                 .load(Ordering::SeqCst),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn test_name_for_waits_for_first_lookup_then_uses_cache() {
-        let source = FakeSource::with_card(json!({"name": "DateTime Agent"}));
-        let service = Arc::new(TargetCardNameService::new(source.clone()));
-        let s = surface_with_id("s1", SurfaceProtocol::A2a, "http://localhost:9000");
-
-        assert_eq!(
-            service
-                .name_for(&s)
-                .await
-                .as_deref(),
-            Some("DateTime Agent")
-        );
-        assert_eq!(
-            service
-                .name_for(&s)
-                .await
-                .as_deref(),
-            Some("DateTime Agent")
-        );
-        assert_eq!(
-            source
-                .calls
-                .load(Ordering::SeqCst),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn test_name_for_without_card_location_is_none_without_fetching() {
-        let source = FakeSource::with_card(json!({"name": "DateTime Agent"}));
-        let service = Arc::new(TargetCardNameService::new(source.clone()));
-
-        let mcp = surface_with_id("s1", SurfaceProtocol::Mcp, "http://localhost:9000");
-        assert_eq!(service.name_for(&mcp).await, None);
-        assert_eq!(
-            source
-                .calls
-                .load(Ordering::SeqCst),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn test_name_change_hook_fires_only_when_the_name_changes() {
-        let fired = Arc::new(Mutex::new(Vec::<String>::new()));
-        let recorder = Arc::clone(&fired);
-        let service = TargetCardNameService::new(Arc::new(FakeSource::default())).with_name_change_hook(Arc::new(
-            move |surface_id: &str| {
-                recorder
-                    .lock()
-                    .unwrap()
-                    .push(surface_id.to_string())
-            },
-        ));
-
-        service.store("s1", location("http://a"), None);
-        service.store("s1", location("http://a"), Some("DateTime Agent".into()));
-        service.store("s1", location("http://a"), Some("DateTime Agent".into()));
-        service.store("s1", location("http://a"), Some("Clock Agent".into()));
-        service.store("s1", location("http://a"), None);
-
-        assert_eq!(*fired.lock().unwrap(), vec!["s1".to_string(); 3]);
     }
 
     #[tokio::test]

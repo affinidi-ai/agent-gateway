@@ -167,12 +167,12 @@ async fn surface_rename_republishes_managed_agent_name() {
         .await
         .unwrap();
     publisher
-        .publish_all(&client, &registries, &surface_reference_values(&surface, &records, None))
+        .publish_all(&client, &registries, &surface_reference_values(&surface, &records))
         .await;
 
     surface.name = "HELIUM".to_string();
     let outcomes = publisher
-        .publish_all(&client, &registries, &surface_reference_values(&surface, &records, None))
+        .publish_all(&client, &registries, &surface_reference_values(&surface, &records))
         .await;
 
     assert_eq!(outcomes, vec![PublishOutcome::Updated]);
@@ -190,58 +190,6 @@ async fn surface_rename_republishes_managed_agent_name() {
             Call::Update(
                 TR_DID.to_string(),
                 json!({"id": "did:web:agent.example", "field_type": "entity", "name": "HELIUM", "description": ""})
-            ),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn agent_card_name_replaces_surface_name_and_republishes_on_change() {
-    let dir = tempfile::tempdir().unwrap();
-    let identity_store = FilesystemIdentityStore::new(dir.path())
-        .await
-        .unwrap();
-    let mut managed = crate::identity::test_helpers::test_surface_identity_record("did:web:agent.example", "s1");
-    managed.origin = Some(IdentityOrigin::Managed);
-    identity_store
-        .create(managed)
-        .await
-        .unwrap();
-    let surface = AgentSurface {
-        surface_id: "s1".to_string(),
-        name: "DEF".to_string(),
-        ..Default::default()
-    };
-    let publisher = ReferenceFieldPublisher::default();
-    let client = FakeClient::with_replies(vec![Ok(()), conflict()], vec![]);
-    let registries = BTreeSet::from([TR_DID.to_string()]);
-    let records = identity_store
-        .list_all()
-        .await
-        .unwrap();
-
-    publisher
-        .publish_all(&client, &registries, &surface_reference_values(&surface, &records, Some("DateTime Agent")))
-        .await;
-    let outcomes = publisher
-        .publish_all(&client, &registries, &surface_reference_values(&surface, &records, Some("Clock Agent")))
-        .await;
-
-    assert_eq!(outcomes, vec![PublishOutcome::Updated]);
-    assert_eq!(
-        client.calls(),
-        vec![
-            Call::Create(
-                TR_DID.to_string(),
-                json!({"id": "did:web:agent.example", "field_type": "entity", "name": "DateTime Agent"})
-            ),
-            Call::Create(
-                TR_DID.to_string(),
-                json!({"id": "did:web:agent.example", "field_type": "entity", "name": "Clock Agent"})
-            ),
-            Call::Update(
-                TR_DID.to_string(),
-                json!({"id": "did:web:agent.example", "field_type": "entity", "name": "Clock Agent", "description": ""})
             ),
         ]
     );

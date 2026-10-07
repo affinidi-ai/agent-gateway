@@ -201,9 +201,9 @@ name is ever published with the DID as the name.
 
 ### Managed agents
 
-The managed agent's display name is the `name` in its target's Agent Card on A2A and
-AP2 surfaces with an `http` or `https` target, and its surface name otherwise or when
-the card has no valid name. Each identity record carries an
+The managed agent's display name is its surface name. On A2A and AP2 surfaces with an
+`http` or `https` target, the dashboard shows the `name` in the target's Agent Card
+instead, marked unverified (see [Agent Card names](#agent-card-names)). Each identity record carries an
 origin (`managed` or `external_caller`), stamped when the gateway issues the DID. A
 record written before origins existed has none until the gateway next issues its
 credential. Until then it is never published. The dashboard treats a local record
@@ -218,29 +218,27 @@ shows a name conflict.
 #### Agent Card names
 
 The Agent Card name ([`target_card_names.rs`](../src/identity/target_card_names.rs))
-applies to every managed-identity mode, and is the one name used everywhere the managed
-agent is named: the VC `credentialSubject.name`, Trust Recorder context, the
-trust-registry entity reference field, and the dashboard. The card is read from
+is dashboard-only. It applies to every managed-identity mode, and the Identities page
+shows it in place of the surface name with an "unverified" marker. The card is read from
 `<target endpoint>/.well-known/agent-card.json`, then `/.well-known/agent.json`, or from
 the target origin plus the access point's `agent_card_path` when that is set. Surfaces of
 other protocols, such as MCP, and targets with another scheme, such as `fabric://`, are
 never looked up.
 
 Lookups are cached per surface for 300 seconds and are re-read when the target endpoint
-or card path changes. Credential issuance, Trust Recorder publishing and the rename
-republish wait for the first lookup of a surface, with a 5-second timeout for each card
-URL tried, so the first published name already reflects the card. Later lookups return the cached name and refresh it in the
-background. The dashboard never waits: until its first lookup finishes, a row shows the
-surface name. An unreachable card, or a card without a valid `name`, falls back to the
-surface name and is cached the same way.
+or card path changes, with a 5-second timeout for each card URL tried. The dashboard
+never waits: until its first lookup finishes, and whenever the card is unreachable or
+has no valid `name`, a row shows the surface name.
 
-The card name is self-asserted by the target and never verified. Whoever controls the
-target endpoint chooses the name the gateway signs into the VC and publishes to trust
-registries. A name conflict publishes no name, whatever the card says.
+The card name is self-asserted by the target and never verified. The target is trusted
+to serve traffic, not to choose what the gateway's Issuer signs, so the card name never
+reaches the VC, Trust Recorder context, or trust-registry reference fields, and card
+lookups never sit on the request path. A name conflict shows no name, whatever the card
+says.
 
-The agent identity VC carries the name as `credentialSubject.name` on both the legacy
-and SSI paths. VCs are signed on each issuance, so the next VC after a rename, or after
-the Agent Card name changes, carries the new name under the same DID.
+The agent identity VC carries the surface name as `credentialSubject.name` on both the
+legacy and SSI paths. VCs are signed on each issuance, so the next VC after a surface
+rename carries the new name under the same DID.
 
 ### Trust registry reference fields
 
@@ -253,7 +251,6 @@ rewriting trust records:
 | Issuer create, retry, or edit | Entity field for the Issuer DID, authority field for its Authority |
 | Authority edit | Authority field, to every registry an Issuer of that Authority uses |
 | Surface rename | Entity field for each managed DID of the surface, to each Trust Recorder registry |
-| Agent Card name appears, changes, or disappears | Same as surface rename. The first lookup that finds a name after a restart counts as a change, so that name is re-sent once |
 | Trust Recorder | Entity field for the agent DID; authority field for each record's authority (an Authority, else an Issuer with that DID); entity field for an Issuer DID used as a record's entity |
 
 Each publish sends `create-reference-field`. On the problem-report code

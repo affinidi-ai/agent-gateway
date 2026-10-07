@@ -134,7 +134,8 @@ pub fn surfaces_by_did(records: &[AgentIdentityRecord]) -> HashMap<String, BTree
 }
 
 /// A managed agent is named by its target's Agent Card name when that is valid, else by its
-/// surface name. A DID managed on several surfaces has no name.
+/// surface name. A DID managed on several surfaces has no name. Pass `card_name` only for
+/// dashboard display: signed and published names come from the surface alone.
 pub fn resolve_managed_display_name(
     surface: &AgentSurface,
     surfaces_for_did: &BTreeSet<String>,
@@ -226,6 +227,8 @@ impl SurfacesByDidCache {
     }
 }
 
+/// Name signed into the managed agent's VC and published for it: the surface name, never the
+/// target-controlled Agent Card name.
 pub async fn resolve_managed_display_name_in(
     surface_store: &dyn AgentSurfaceStore,
     did: &str,
@@ -247,10 +250,7 @@ pub async fn resolve_managed_display_name_in(
     let surfaces = cache
         .surfaces_for(did, identity_store)
         .await?;
-    let card_name = crate::identity::target_card_names::TargetCardNameService::global()
-        .name_for(&surface)
-        .await;
-    Some(resolve_managed_display_name(&surface, &surfaces, card_name.as_deref()))
+    Some(resolve_managed_display_name(&surface, &surfaces, None))
 }
 
 #[cfg(test)]
