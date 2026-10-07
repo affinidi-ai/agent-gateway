@@ -63,8 +63,10 @@ the root and fails if any ancestor is inactive, missing, or inconsistent.
 ## Inspecting the calling token
 
 `GET /api/v1/token-info` returns the `user_id`, `token_id`, and granted `scopes` of the PAT making the
-call (`token_id` and `scopes` are `null` for a session login). See
-[`RBAC.md`](RBAC.md#token-info-endpoint) for the response shape.
+call (`token_id` and `scopes` are `null` for a session login). A PAT's required headers (such as
+`x-external-account`) are not evaluated on this route, so a tenant-scoped PAT can call it without
+them. Authentication, revocation, the Terms check, and the broad-selector fail-closed check still
+apply. See [`RBAC.md`](RBAC.md#token-info-endpoint) for the response shape.
 
 ## Tenant ownership
 
