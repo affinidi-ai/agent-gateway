@@ -11,6 +11,7 @@ import { McpProxyFormData, ChannelPrefix, ValidationResult } from './EditMcpProx
 import './SchemaEditor.css';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
 import { ManagedByBadge, useSurfacesFronting } from '../components/mcp-proxy/exposure';
+import WriteWarnings, { McpProxyWriteResult } from '../components/mcp-proxy/WriteWarnings';
 
 interface McpProxy {
   id: string;
@@ -62,12 +63,14 @@ const EditMcpProxyPage: React.FC = () => {
   const [isModified, setIsModified] = useState(false);
   const [validating, setValidating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [writeWarnings, setWriteWarnings] = useState<string[]>([]);
   const [availablePrefixes, setAvailablePrefixes] = useState<ChannelPrefix[]>([]);
   const [availableListenAddresses, setAvailableListenAddresses] = useState<string[]>([]);
   const [selectedHostPort, setSelectedHostPort] = useState<string>('');
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
 
   useEffect(() => {
+    setWriteWarnings([]);
     if (isEditMode && id) {
       fetchProxy();
     }
@@ -141,11 +144,13 @@ const EditMcpProxyPage: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setWriteWarnings([]);
 
     try {
       setIsSaving(true);
       if (isEditMode && id) {
-        await apiClient.put(`/mcp-proxies/${id}`, formData);
+        const response = await apiClient.put<McpProxyWriteResult>(`/mcp-proxies/${id}`, formData);
+        setWriteWarnings(response.data?.warnings ?? []);
         // Clear dirty state on successful save
         setIsModified(false);
         // Stay on the edit page after saving
@@ -253,6 +258,8 @@ const EditMcpProxyPage: React.FC = () => {
           <button type="button" className="btn-close" onClick={() => setError(null)}></button>
         </div>
       )}
+
+      <WriteWarnings warnings={writeWarnings} />
 
       <div className="card shadow mb-4">
         <div className="card-header py-3 d-flex justify-content-between align-items-center">

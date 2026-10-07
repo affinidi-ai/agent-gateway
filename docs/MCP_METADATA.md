@@ -508,7 +508,8 @@ operation and parameter mapping; original schemas remain authoritative for
 modern validation. That routing catalog is never used by legacy calls, and
 discovery omits legacy support when no legacy catalog exists. `2024-11-05`
 clients of such a Proxy get `500`, so its create and update responses carry a
-`warnings` entry naming the converter error. Management tool discovery
+`warnings` entry naming the converter error, which the dashboard's create wizard
+and edit page display. Management tool discovery
 (`POST /v1/mcp-proxies/discover-tools`) lists tools from the modern catalog, so
 it works for such a Proxy too. Both catalogs
 are published as one snapshot after a successful build; a failed reload keeps
