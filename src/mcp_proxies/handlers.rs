@@ -402,6 +402,7 @@ impl Default for McpServerManager {
 struct RegisteredCatalogs {
     legacy: Option<Arc<RwLock<McpServer>>>,
     modern: Arc<RwLock<McpServer>>,
+    warning: Option<String>,
 }
 
 impl McpServerManager {
@@ -430,14 +431,14 @@ impl McpServerManager {
             .base_url(base_url)
             .build();
 
-        let (catalogs, warning) = match server.load_openapi_spec() {
+        let catalogs = match server.load_openapi_spec() {
             Ok(()) => {
                 let server = Arc::new(RwLock::new(server));
-                let catalogs = RegisteredCatalogs {
+                RegisteredCatalogs {
                     legacy: Some(server.clone()),
                     modern: server,
-                };
-                (catalogs, None)
+                    warning: None,
+                }
             }
             Err(error) => {
                 let original = server.openapi_spec.clone();
@@ -447,17 +448,17 @@ impl McpServerManager {
                     .map_err(|error| format!("Failed to load modern tool routing: {error}"))?;
                 server.openapi_spec = original;
                 warn!(proxy_id = %proxy.id, error = %error, "OpenAPI schema is unavailable to the legacy tool catalog");
-                let catalogs = RegisteredCatalogs {
+                RegisteredCatalogs {
                     legacy: None,
                     modern: Arc::new(RwLock::new(server)),
-                };
-                let warning = format!(
-                    "OpenAPI spec is unavailable to the MCP {legacy} tool catalog, so {legacy} clients cannot use this proxy: {error}",
-                    legacy = crate::mcp::MCP_LEGACY_VERSION
-                );
-                (catalogs, Some(warning))
+                    warning: Some(format!(
+                        "OpenAPI spec is unavailable to the MCP {legacy} tool catalog, so {legacy} clients cannot use this proxy: {error}",
+                        legacy = crate::mcp::MCP_LEGACY_VERSION
+                    )),
+                }
             }
         };
+        let warning = catalogs.warning.clone();
         self.servers
             .write()
             .await
@@ -498,6 +499,16 @@ impl McpServerManager {
             .await
             .get(proxy_id)
             .cloned()
+    }
+
+    /// The converter warning of the catalogs currently registered for a proxy.
+    async fn catalog_warning(
+        &self,
+        proxy_id: &str,
+    ) -> Option<String> {
+        self.get_catalogs(proxy_id)
+            .await
+            .and_then(|catalogs| catalogs.warning)
     }
 
     /// Reload a server (useful when proxy config changes)
@@ -1245,15 +1256,19 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
     proxy.updated_at = chrono::Utc::now();
 
     // Reload the MCP Server if needed
-    let mut warnings = Vec::new();
-    if needs_reload {
-        warnings.extend(
-            manager
-                .reload_server(&proxy)
-                .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to reload MCP Server: {}", e)))?,
-        );
-    }
+    let warning = if needs_reload {
+        manager
+            .reload_server(&proxy)
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to reload MCP Server: {}", e)))?
+    } else {
+        manager
+            .catalog_warning(&proxy.id)
+            .await
+    };
+    let warnings = warning
+        .into_iter()
+        .collect::<Vec<_>>();
 
     store
         .update(&proxy)
@@ -5465,6 +5480,46 @@ mod tests {
             .await
             .expect("updated");
         assert_eq!(broken.warnings, created.warnings);
+
+        let rename = |name: &str| {
+            super::update_mcp_proxy(
+                Extension(store.clone()),
+                Extension(manager.clone()),
+                Extension(None),
+                Extension(no_resource_owners()),
+                Path("schema-api".to_string()),
+                None,
+                None,
+                Json(serde_json::from_value(serde_json::json!({ "name": name })).unwrap()),
+            )
+        };
+        let Json(renamed) = rename("Renamed")
+            .await
+            .expect("renamed without a reload");
+        assert_eq!(renamed.proxy.name, "Renamed");
+        assert_eq!(renamed.warnings, created.warnings);
+
+        let failed = update("openapi: [unclosed")
+            .await
+            .expect_err("an unparseable spec fails the rebuild");
+        assert_eq!(failed.0, StatusCode::BAD_REQUEST);
+        let Json(after_failure) = rename("After failure")
+            .await
+            .expect("renamed without a reload");
+        assert_eq!(after_failure.warnings, created.warnings);
+
+        let Json(restored) = update(SPEC)
+            .await
+            .expect("legacy catalog restored");
+        assert!(restored.warnings.is_empty());
+        let Json(renamed_again) = rename("Renamed again")
+            .await
+            .expect("renamed without a reload");
+        assert!(
+            renamed_again
+                .warnings
+                .is_empty()
+        );
     }
 
     async fn create_with_manager(

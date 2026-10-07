@@ -503,20 +503,23 @@ and reference scope. Unresolvable external references are never fetched or
 advertised as enforceable tools.
 
 For Proxies whose source schemas the legacy OpenAPI converter cannot load, the
-Proxy registers with a modern-only catalog instead of failing: a separate modern routing catalog uses the library only for
-operation and parameter mapping; original schemas remain authoritative for
-modern validation. That routing catalog is never used by legacy calls, and
-discovery omits legacy support when no legacy catalog exists. `2024-11-05`
-clients of such a Proxy get `500`, so its create and update responses carry a
-`warnings` entry naming the converter error, which the dashboard's create wizard
-and edit page display. Management tool discovery
+Proxy registers with a modern-only catalog instead of failing: a separate modern
+routing catalog uses the library only for operation and parameter mapping;
+original schemas remain authoritative for modern validation. That routing
+catalog is never used by legacy calls, and discovery omits legacy support when
+no legacy catalog exists. `2024-11-05` clients of such a Proxy get `500`, so its
+create and update responses carry a `warnings` entry naming the converter error,
+which the dashboard's create wizard and edit page display. The warning is stored
+with the registered catalogs, so an update that does not rebuild them (for
+example only `name`, `status` or `mcp_http`) still returns it; a rebuild that
+loads the legacy catalog clears it. Management tool discovery
 (`POST /v1/mcp-proxies/discover-tools`) lists tools from the modern catalog, so
-it works for such a Proxy too. Both catalogs
-are published as one snapshot after a successful build; a failed reload keeps
-the previous snapshot and removal drops both. Tests cover conditional input
-constraints, nested component references, scoped local definitions, output
-constraints, truthful discovery and failed-reload preservation. This does not
-establish fidelity for every OpenAPI or JSON Schema composition.
+it works for such a Proxy too. Both catalogs are published as one snapshot after
+a successful build; a failed reload keeps the previous snapshot and removal
+drops both. Tests cover conditional input constraints, nested component
+references, scoped local definitions, output constraints, truthful discovery and
+failed-reload preservation. This does not establish fidelity for every OpenAPI
+or JSON Schema composition.
 
 The modern-only REST adapter uses the shared no-redirect HTTP client. Redirects
 fail before a second endpoint is contacted; response content length, chunks,
