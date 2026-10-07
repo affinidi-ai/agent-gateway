@@ -1,0 +1,46 @@
+branch: fix/mcp-latest-version
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Apply mcp_http Origin and size limits to every MCP endpoint
+      description: >-
+        `mcp_http` Origin allowlist, header budget and `max_request_bytes` (default 1 MiB) now
+        apply to every MCP endpoint and to `2024-11-05` traffic as well, so legacy browser clients
+        whose Origin is not allowed get `403`, and oversized requests get `413`/`431`. Public
+        endpoints given as bare listen addresses have no HTTP(S) origin and are skipped by the
+        Origin check.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Register a modern-only catalog when the legacy OpenAPI converter fails
+      description: >-
+        An MCP Proxy whose OpenAPI spec the legacy catalog converter cannot load now registers a
+        modern-only catalog instead of failing, and its request body limit always comes from
+        `mcp_http`.
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: ⭐ Admit MCP 2026-07-28 on every MCP endpoint and retire mcp_protocol_mode
+      description: >-
+        Access Points, Transit Points, MCP Proxies and Fabric framed streams now admit MCP
+        `2026-07-28` alongside `2024-11-05` without configuration, instead of rejecting it with
+        `400` / `-32022` unless the endpoint was set to `dual`. `mcp_protocol_mode` is retired:
+        stored records and API payloads that carry it still load, the value is ignored, it is
+        dropped on the next save and no longer returned. There is no per-endpoint opt-out, so a
+        modern request to a legacy-only upstream gets `502`. Buffered Fabric `ForwardRequest`
+        stays `2024-11-05`-only.
+  internal:
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Remove protocol mode from tests, BDD fixtures, conformance and dashboard
+      description: >-
+        Tests that pinned legacy or unset rejection now use the unmodelled `2025-11-25`; record
+        compatibility tests cover surfaces carrying `legacy`, `dual` or no mode. BDD support, the
+        conformance harness and the dashboard schema and types no longer set the field, and a
+        dashboard payload test fails if any element writes it.
+    - timestamp: '2026-10-07T02:15:14.000Z'
+      title: Describe modern MCP admission on every endpoint in the docs
+      description: >-
+        AGENTS.md, ARCHITECTURE.md, CONTEXT.md, README and the MCP, protocol, Fabric and
+        conformance docs describe modern MCP as admitted on every MCP endpoint, with a short
+        compatibility note for the retired setting.
