@@ -379,29 +379,51 @@ pub struct ExchangeResponse {
     pub session_token: String,
 }
 
-/// A throttled source gets a JSON error and its code is left untouched, so the CLI can retry.
+/// Every failure answers `{"error", "error_description"}` JSON with `no-store`: `invalid_request`
+/// for a malformed request, one `invalid_grant` for an unknown, expired, used or mismatched code
+/// (so a caller cannot tell which), and `too_many_requests` when throttled. A throttled call
+/// leaves the code untouched, so the CLI can retry.
 pub async fn exchange(
+    headers: HeaderMap,
     Extension(store): Extension<Arc<CliLoginStore>>,
     Extension(throttles): Extension<Arc<CliLoginThrottles>>,
     client_ip: Option<Extension<ClientIp>>,
-    Json(request): Json<ExchangeRequest>,
+    body: Bytes,
 ) -> Response {
     if let Some(retry_after) = throttles
         .exchange
         .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
     {
-        return throttled(
-            retry_after,
-            Json(serde_json::json!({ "error": "too_many_requests", "error_description": THROTTLED_MESSAGE })),
-        );
+        return throttled(retry_after, exchange_error_body("too_many_requests", THROTTLED_MESSAGE));
     }
+    if !is_json_request(&headers) {
+        return exchange_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid_request", "expected application/json");
+    }
+    let Ok(request) = serde_json::from_slice::<ExchangeRequest>(&body) else {
+        return exchange_error(StatusCode::BAD_REQUEST, "invalid_request", "invalid exchange request");
+    };
     if request.code.len() != CODE_LEN || !is_valid_verifier(&request.verifier) {
-        return (StatusCode::BAD_REQUEST, "invalid exchange request").into_response();
+        return exchange_error(StatusCode::BAD_REQUEST, "invalid_request", "invalid exchange request");
     }
     match store.redeem(&request.code, &request.verifier) {
         Some(session_token) => no_store(Json(ExchangeResponse { session_token }).into_response()),
-        None => (StatusCode::BAD_REQUEST, "invalid or expired authorization code").into_response(),
+        None => exchange_error(StatusCode::BAD_REQUEST, "invalid_grant", "invalid or expired authorization code"),
     }
+}
+
+fn exchange_error_body(
+    error: &str,
+    description: &str,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "error": error, "error_description": description }))
+}
+
+fn exchange_error(
+    status: StatusCode,
+    error: &str,
+    description: &str,
+) -> Response {
+    no_store((status, exchange_error_body(error, description)).into_response())
 }
 
 fn no_store(mut response: Response) -> Response {
@@ -1642,5 +1664,80 @@ mod tests {
                 .status()
                 .is_redirection()
         );
+    }
+    #[tokio::test]
+    async fn every_exchange_failure_answers_an_uncached_json_error() {
+        let (router, token, _storage_dir) = approved_app().await;
+        let send = |content_type: &'static str, body: String| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/auth/cli/exchange")
+                            .header(header::CONTENT_TYPE, content_type)
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let consent = post_consent(&router, consent_body(52111), Some(&token), &SAME_ORIGIN_JSON).await;
+        let code = code_from_redirect(&consent_redirect_url(consent).await);
+        let exchange_body =
+            |code: &str, verifier: &str| serde_json::json!({ "code": code, "verifier": verifier }).to_string();
+        let wrong_verifier = "a-different-verifier-that-is-long-enough-000";
+
+        let cases = [
+            (
+                send("text/plain", exchange_body(&code, TEST_VERIFIER)).await,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "invalid_request",
+            ),
+            (send("application/json", "not json".to_string()).await, StatusCode::BAD_REQUEST, "invalid_request"),
+            (send("application/json", "{}".to_string()).await, StatusCode::BAD_REQUEST, "invalid_request"),
+            (
+                send("application/json", exchange_body("short", TEST_VERIFIER)).await,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+            (
+                send("application/json", exchange_body(&Uuid::new_v4().to_string(), TEST_VERIFIER)).await,
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+            ),
+            (
+                send("application/json", exchange_body(&code, wrong_verifier)).await,
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+            ),
+            (
+                send("application/json", exchange_body(&code, TEST_VERIFIER)).await,
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+            ),
+        ];
+        for (index, (response, status, error)) in cases.into_iter().enumerate() {
+            assert_eq!(response.status(), status, "case {index}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .unwrap(),
+                "no-store",
+                "case {index}"
+            );
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], error, "case {index}");
+            assert!(json["error_description"].is_string(), "case {index}");
+        }
     }
 }

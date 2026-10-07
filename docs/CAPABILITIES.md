@@ -387,8 +387,12 @@ The SAML login and CLI login limits count by client IP, taken from the TCP conne
 `tls.client_auth.trusted_proxies` (`config.toml`), and then from the right, skipping trusted
 hops, so a caller cannot choose the address it is counted under. A gateway behind a load
 balancer or reverse proxy must list it there; otherwise every user is counted as the balancer's
-address and shares one limit. The STS token endpoint throttle keeps its own address rule, see
-[`STS.md`](STS.md#token-endpoint-throttle).
+address and shares one limit. An IPv4 address counts on its own, and an IPv6 address counts by
+its /64 prefix, so one host cannot get a fresh limit by changing addresses inside its prefix.
+Each of these limits tracks up to 10,000 client IPs active within a window. While that many are
+active, a new client IP gets 429 with `Retry-After` until a slot frees up, IPs already tracked
+keep their normal limit, and the gateway logs one warning per window. The STS token endpoint
+throttle keeps its own address rule, see [`STS.md`](STS.md#token-endpoint-throttle).
 
 The `fabric` CLI signs in through the browser. It opens `/api/auth/cli/authorize` with a
 loopback port and a PKCE challenge. After the dashboard sign-in (passkey or SAML) the browser
@@ -407,9 +411,12 @@ service uses the key once and checks the target again; an unknown, expired or re
 on the dashboard root. A session holds at most three pending codes, and a new request replaces
 the oldest. The authorize, consent and exchange endpoints each allow 20 requests per client IP
 per minute by default (`cli_login_throttle` in `gateway.json`). Past that they answer 429 with
-`Retry-After` before any code is issued or redeemed, and exchange answers in JSON. Each code is
-also random, single use, expires in two minutes and needs the PKCE verifier. The gateway logs each issued code, each redemption and each failed redemption with
-the user id where known, never with the code or verifier.
+`Retry-After` before any code is issued or redeemed. Every exchange failure answers uncached
+JSON `{"error", "error_description"}`: `invalid_request` for a malformed request,
+`invalid_grant` for an unknown, expired, used or mismatched code without saying which, and
+`too_many_requests` when throttled. Each code is also random, single use, expires in two
+minutes and needs the PKCE verifier. The gateway logs each issued code, each redemption and
+each failed redemption with the user id where known, never with the code or verifier.
 
 Known limitations: the login hands the CLI the browser's own session, and the code store and the
 SAML return targets are in memory, so the login works with one gateway instance.

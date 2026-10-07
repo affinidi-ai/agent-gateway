@@ -8,11 +8,11 @@
 //! configurable window; a key that exceeds its limit is blocked for a
 //! configurable lockout. Every bound comes from the gateway configuration.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
+use tracing::warn;
 
 use super::handlers::now_secs;
 use crate::config::types::{LoginThrottleConfig, RateLimitConfig, TokenEndpointThrottleConfig};
@@ -53,10 +53,14 @@ pub struct TokenEndpointThrottle {
     per_ip: Limit,
     lockout_secs: u64,
     keep_secs: u64,
-    /// New keys past this many are not tracked, so their attempts are not limited.
+    /// New keys past this many are not tracked. The token endpoint never reaches it
+    /// (`usize::MAX`); the login throttle refuses such sources, see [`Self::per_client_ip`].
     max_keys: usize,
     state: DashMap<String, KeyState>,
     inserts: AtomicUsize,
+    /// The window (`now / window_secs`, plus one) in which the last saturation warning was
+    /// logged, so a full table logs at most once per window.
+    saturation_warned_window: AtomicU64,
 }
 
 impl TokenEndpointThrottle {
@@ -76,18 +80,21 @@ impl TokenEndpointThrottle {
             max_keys: usize::MAX,
             state: DashMap::new(),
             inserts: AtomicUsize::new(0),
+            saturation_warned_window: AtomicU64::new(0),
         }
     }
 
     /// A sign-in throttle that only limits client IPs, blocking an IP until its window rolls off.
-    /// It tracks about 10,000 IPs at most; past that a new IP is not limited.
+    /// An IPv6 client is counted by its /64 prefix, since one host usually holds the whole /64.
+    /// It tracks about 10,000 sources; while that many are active, a new source is refused until
+    /// a slot frees up, and sources already tracked keep their normal limit.
     pub fn per_client_ip(cfg: &LoginThrottleConfig) -> Self {
         Self::tracking_at_most(cfg, MAX_TRACKED_LOGIN_SOURCES)
     }
 
-    /// Once `max_keys` sources are tracked and none can be pruned, a new source is let through
-    /// untracked, so the map stays near `max_keys` (concurrent requests can overshoot it by at
-    /// most their own number).
+    /// Once `max_keys` sources are tracked and none can be pruned, a new source is not tracked
+    /// and [`Self::record_client_attempt`] refuses it. Concurrent requests can push the map past
+    /// `max_keys` by at most their own number.
     fn tracking_at_most(
         cfg: &LoginThrottleConfig,
         max_keys: usize,
@@ -103,6 +110,7 @@ impl TokenEndpointThrottle {
             max_keys,
             state: DashMap::new(),
             inserts: AtomicUsize::new(0),
+            saturation_warned_window: AtomicU64::new(0),
         }
     }
 
@@ -114,10 +122,43 @@ impl TokenEndpointThrottle {
         &self,
         client_ip: Option<IpAddr>,
     ) -> Option<u64> {
-        let ip = client_ip?.to_string();
-        let now = now_secs();
-        self.record(None, Some(&ip), now);
-        self.retry_after(None, Some(&ip), now)
+        self.record_client_attempt_at(client_ip?, now_secs())
+    }
+
+    /// A new source arriving while the table is full waits one window, the longest it can take
+    /// for a tracked source to expire.
+    fn record_client_attempt_at(
+        &self,
+        client_ip: IpAddr,
+        now: u64,
+    ) -> Option<u64> {
+        if !self.enabled {
+            return None;
+        }
+        let source = source_key(client_ip);
+        if !self.bump(ip_key(&source), self.per_ip, now) {
+            self.warn_saturated(now);
+            return Some(self.per_ip.window_secs);
+        }
+        self.retry_after(None, Some(&source), now)
+    }
+
+    fn warn_saturated(
+        &self,
+        now: u64,
+    ) {
+        let window = now / self.per_ip.window_secs + 1;
+        if self
+            .saturation_warned_window
+            .swap(window, Ordering::Relaxed)
+            != window
+        {
+            warn!(
+                tracked = self.state.len(),
+                max = self.max_keys,
+                "Sign-in throttle is full; refusing new client IPs until tracked ones expire"
+            );
+        }
     }
 
     /// Whether only failed client authentications should be recorded (vs every request).
@@ -187,16 +228,18 @@ impl TokenEndpointThrottle {
             .unwrap_or(0)
     }
 
+    /// Counts one attempt for `key`. Returns `false`, counting nothing, when `key` is new and
+    /// the table is still full after pruning.
     fn bump(
         &self,
         key: String,
         limit: Limit,
         now: u64,
-    ) {
+    ) -> bool {
         if self.state.len() >= self.max_keys && !self.state.contains_key(&key) {
             self.prune(now);
             if self.state.len() >= self.max_keys {
-                return;
+                return false;
             }
         }
         let mut st = self
@@ -216,6 +259,7 @@ impl TokenEndpointThrottle {
                     .saturating_add(limit.window_secs)
             };
         }
+        true
     }
 
     fn prune(
@@ -234,6 +278,21 @@ fn client_key(client_id: &str) -> String {
 
 fn ip_key(ip: &str) -> String {
     format!("i:{ip}")
+}
+
+/// The login throttle's source for an address: IPv4 (including IPv4-mapped IPv6) as is, other
+/// IPv6 by its /64 prefix.
+fn source_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+                format!("{}/64", std::net::Ipv6Addr::from(prefix))
+            }
+        },
+    }
 }
 
 #[cfg(test)]
@@ -327,45 +386,97 @@ mod tests {
         }
     }
 
-    #[test]
-    fn per_client_ip_blocks_until_the_window_rolls_off() {
-        let t = TokenEndpointThrottle::per_client_ip(&login_limit(2));
-        for _ in 0..3 {
-            t.record(None, Some("203.0.113.7"), 1_000);
-        }
-
-        assert_eq!(t.retry_after(None, Some("203.0.113.7"), 1_000), Some(60));
-        assert_eq!(t.retry_after(None, Some("203.0.113.8"), 1_000), None);
-        assert_eq!(t.retry_after(None, Some("203.0.113.7"), 1_060), None);
+    fn ip(value: &str) -> IpAddr {
+        value.parse().unwrap()
     }
 
     #[test]
-    fn per_client_ip_tracks_at_most_max_keys_sources() {
-        let t = TokenEndpointThrottle::tracking_at_most(&login_limit(1), 2);
-        for ip in ["a", "b", "c"] {
-            t.record(None, Some(ip), 1_000);
-            t.record(None, Some(ip), 1_000);
+    fn per_client_ip_blocks_until_the_window_rolls_off() {
+        let t = TokenEndpointThrottle::per_client_ip(&login_limit(2));
+        for _ in 0..2 {
+            assert_eq!(t.record_client_attempt_at(ip("203.0.113.7"), 1_000), None);
         }
 
+        assert_eq!(t.record_client_attempt_at(ip("203.0.113.7"), 1_000), Some(60));
+        assert_eq!(t.record_client_attempt_at(ip("203.0.113.8"), 1_000), None);
+        assert_eq!(t.record_client_attempt_at(ip("203.0.113.7"), 1_060), None);
+    }
+
+    #[test]
+    fn ipv6_addresses_in_one_64_share_a_budget() {
+        let t = TokenEndpointThrottle::per_client_ip(&login_limit(2));
+        assert_eq!(t.record_client_attempt_at(ip("2001:db8:1:2::1"), 1_000), None);
+        assert_eq!(t.record_client_attempt_at(ip("2001:db8:1:2:ffff:ffff:ffff:ffff"), 1_000), None);
+
+        assert_eq!(t.record_client_attempt_at(ip("2001:db8:1:2::abcd"), 1_000), Some(60));
+        assert_eq!(t.record_client_attempt_at(ip("2001:db8:1:3::1"), 1_000), None);
+    }
+
+    #[test]
+    fn ipv4_addresses_are_counted_one_by_one_and_mapped_ipv6_counts_as_ipv4() {
+        let t = TokenEndpointThrottle::per_client_ip(&login_limit(1));
+        assert_eq!(t.record_client_attempt_at(ip("203.0.113.7"), 1_000), None);
+
+        assert_eq!(t.record_client_attempt_at(ip("203.0.113.8"), 1_000), None);
+        assert_eq!(t.record_client_attempt_at(ip("::ffff:203.0.113.7"), 1_000), Some(60));
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_new_source_and_still_serves_tracked_ones() {
+        let t = TokenEndpointThrottle::tracking_at_most(&login_limit(2), 2);
+        for source in ["203.0.113.1", "203.0.113.2"] {
+            assert_eq!(t.record_client_attempt_at(ip(source), 1_000), None);
+        }
+
+        assert_eq!(t.record_client_attempt_at(ip("203.0.113.3"), 1_010), Some(60));
+        assert_eq!(t.record_client_attempt_at(ip("203.0.113.1"), 1_010), None);
         assert_eq!(t.state.len(), 2);
+    }
+
+    #[test]
+    fn a_full_table_takes_new_sources_again_once_tracked_ones_expire() {
+        let t = TokenEndpointThrottle::tracking_at_most(&login_limit(1), 2);
+        for source in ["203.0.113.1", "203.0.113.2"] {
+            t.record_client_attempt_at(ip(source), 1_000);
+        }
         assert!(
-            t.retry_after(None, Some("c"), 1_000)
-                .is_none()
+            t.record_client_attempt_at(ip("203.0.113.3"), 1_030)
+                .is_some()
+        );
+
+        assert_eq!(t.record_client_attempt_at(ip("203.0.113.3"), 1_060), None);
+        assert!(
+            t.record_client_attempt_at(ip("203.0.113.3"), 1_060)
+                .is_some()
         );
     }
 
     #[test]
-    fn per_client_ip_tracks_a_new_source_once_inactive_ones_are_pruned() {
-        let t = TokenEndpointThrottle::tracking_at_most(&login_limit(1), 2);
-        for ip in ["a", "b"] {
-            t.record(None, Some(ip), 1_000);
+    fn a_disabled_login_throttle_refuses_nothing() {
+        let mut cfg = login_limit(1);
+        cfg.enabled = false;
+        let t = TokenEndpointThrottle::tracking_at_most(&cfg, 1);
+        for index in 0..5 {
+            assert_eq!(t.record_client_attempt_at(ip(&format!("203.0.113.{index}")), 1_000), None);
         }
-        t.record(None, Some("c"), 1_060);
-        t.record(None, Some("c"), 1_060);
+    }
+
+    #[test]
+    fn the_token_endpoint_throttle_still_keys_each_ipv6_address_on_its_own() {
+        let mut config = cfg(1000, 60, 300);
+        config.per_ip.requests = 1;
+        let t = TokenEndpointThrottle::from_config(&config);
+        for _ in 0..2 {
+            t.record(None, Some("2001:db8:1:2::1"), 1_000);
+        }
 
         assert!(
-            t.retry_after(None, Some("c"), 1_060)
+            t.retry_after(None, Some("2001:db8:1:2::1"), 1_000)
                 .is_some()
+        );
+        assert!(
+            t.retry_after(None, Some("2001:db8:1:2::2"), 1_000)
+                .is_none()
         );
     }
 
