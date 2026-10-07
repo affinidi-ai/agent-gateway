@@ -48,6 +48,20 @@ are the consumer; the convention is documented in
 | List item | `<area>-card-<id>` or `<area>-row-<id>` |
 | Wizard | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
 
+## CLI consent page
+
+`/cli-consent` (`pages/CliConsentPage/`) asks a signed-in user to approve a `fabric` CLI
+login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar or topbar.
+
+- Reuse the login card: the `LoginPage.module.css` form panel, logo, heading, and subtext
+  classes on a centred full-screen backdrop. Do not build a second card style.
+- Show the signed-in username and the `127.0.0.1:<port>` return target in the bordered
+  details box, then a warning `Alert` to only allow a login the user just started.
+- Actions are shared `AppButton`s side by side: **Cancel** (`secondary`) and **Allow**
+  (`primary`), with `cli-consent-cancel-button` and `cli-consent-allow-button`.
+- Invalid link, loading, cancelled, and redirecting states replace the body in the same
+  card. Never show a code or token on the page.
+
 ## Surface Builder
 
 - Sidebars may include small, legible configuration controls. Move dense editors,

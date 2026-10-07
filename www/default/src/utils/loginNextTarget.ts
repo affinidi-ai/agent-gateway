@@ -8,15 +8,16 @@ const MAX_TARGET_LENGTH = 1024;
 
 /**
  * Returns the post-login return target rebuilt from its validated parts, or null. Only the
- * dashboard root and the CLI authorize path with a query are allowed. The same rule is applied by
- * the gateway to the SAML RelayState.
+ * dashboard root and the CLI authorize path with a query are allowed, and the path may not hold an
+ * encoded slash or backslash. The query may, since the CLI `state` is opaque. The gateway applies
+ * the same rule to the SAML return target.
  */
 export function safeNextTarget(next: string | null, origin: string): string | null {
   if (
     !next ||
     next.length > MAX_TARGET_LENGTH ||
     !ALLOWED_CHARACTERS.test(next) ||
-    ENCODED_SLASH_OR_BACKSLASH.test(next) ||
+    ENCODED_SLASH_OR_BACKSLASH.test(next.split('?', 1)[0]) ||
     !next.startsWith('/') ||
     next.startsWith('//')
   ) {
