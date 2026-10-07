@@ -6,18 +6,17 @@
 //! [`TargetCardNameService::lookup_or_spawn`] never waits.
 
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use dashmap::{DashMap, DashSet};
 use serde_json::Value;
-use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::config::agent_surface::{AgentSurface, SurfaceProtocol};
 use crate::identity::display_name::DisplayName;
 use crate::observability::caller_names::{AGENT_CARD_FETCH_TIMEOUT, AGENT_CARD_MAX_BYTES};
+use crate::observability::refresh_cache::RefreshCache;
 
 pub const TARGET_CARD_NAME_TTL: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT_FETCHES: usize = 4;
@@ -51,31 +50,29 @@ pub trait TargetCardSource: Send + Sync {
     ) -> Option<Value>;
 }
 
-struct CacheEntry {
+enum CardName {
+    Unreadable,
+    Read(Option<String>),
+}
+
+#[derive(Clone)]
+struct CardEntry {
     location: CardLocation,
     name: Option<String>,
-    checked_at: Instant,
-    changed_at: Option<DateTime<Utc>>,
+}
+
+/// A change is a name appearing, changing, or disappearing; a target moving with the same
+/// name is not.
+fn card_name_changed(
+    previous: Option<&CardEntry>,
+    entry: &CardEntry,
+) -> bool {
+    previous.and_then(|p| p.name.as_ref()) != entry.name.as_ref()
 }
 
 pub struct TargetCardNameService {
-    cache: DashMap<String, CacheEntry>,
-    inflight: DashSet<String>,
-    permits: Semaphore,
-    ttl: Duration,
+    cache: Arc<RefreshCache<CardEntry>>,
     source: Arc<dyn TargetCardSource>,
-}
-
-struct InflightGuard<'a> {
-    inflight: &'a DashSet<String>,
-    surface_id: String,
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        self.inflight
-            .remove(&self.surface_id);
-    }
 }
 
 impl TargetCardNameService {
@@ -93,10 +90,7 @@ impl TargetCardNameService {
         ttl: Duration,
     ) -> Self {
         Self {
-            cache: DashMap::new(),
-            inflight: DashSet::new(),
-            permits: Semaphore::new(MAX_CONCURRENT_FETCHES),
-            ttl,
+            cache: Arc::new(RefreshCache::new(ttl, MAX_CONCURRENT_FETCHES, card_name_changed)),
             source,
         }
     }
@@ -110,7 +104,7 @@ impl TargetCardNameService {
         location: &CardLocation,
     ) -> Option<String> {
         let (cached, fresh) = match self.cache.get(surface_id) {
-            Some(entry) if entry.location == *location => (entry.name.clone(), entry.checked_at.elapsed() < self.ttl),
+            Some((entry, fresh)) if entry.location == *location => (entry.name, fresh),
             _ => (None, false),
         };
         if !fresh {
@@ -124,84 +118,58 @@ impl TargetCardNameService {
         surface_id: &str,
         location: &CardLocation,
     ) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        if !self
-            .inflight
-            .insert(surface_id.to_string())
-        {
-            return;
-        }
         let service = Arc::clone(self);
-        let surface_id = surface_id.to_string();
+        let owned_id = surface_id.to_string();
         let location = location.clone();
-        handle.spawn(async move {
-            let _guard = InflightGuard {
-                inflight: &service.inflight,
-                surface_id: surface_id.clone(),
-            };
-            let Ok(_permit) = service
-                .permits
-                .acquire()
-                .await
-            else {
-                return;
-            };
-            let name = service
-                .resolve(&surface_id, &location)
-                .await;
-            service.store(&surface_id, location, name);
-        });
+        self.cache
+            .spawn_refresh(surface_id, move || async move {
+                let name = match service
+                    .resolve(&owned_id, &location)
+                    .await
+                {
+                    CardName::Read(name) => name,
+                    CardName::Unreadable => service.last_known_name(&owned_id, &location),
+                };
+                CardEntry { location, name }
+            });
     }
 
     async fn resolve(
         &self,
         surface_id: &str,
         location: &CardLocation,
-    ) -> Option<String> {
-        let card = self
+    ) -> CardName {
+        let Some(card) = self
             .source
             .fetch_agent_card(location)
-            .await?;
-        let raw = card
+            .await
+        else {
+            return CardName::Unreadable;
+        };
+        let Some(raw) = card
             .get("name")
-            .and_then(Value::as_str)?;
+            .and_then(Value::as_str)
+        else {
+            return CardName::Read(None);
+        };
         match DisplayName::parse(raw) {
-            Ok(name) => Some(name.as_str().to_string()),
+            Ok(name) => CardName::Read(Some(name.as_str().to_string())),
             Err(e) => {
                 warn!(surface_id, endpoint = %location.endpoint, error = %e, "Target Agent Card name rejected");
-                None
+                CardName::Read(None)
             }
         }
     }
 
-    fn store(
+    fn last_known_name(
         &self,
         surface_id: &str,
-        location: CardLocation,
-        name: Option<String>,
-    ) {
-        let (previous_name, previous_changed_at) = self
-            .cache
+        location: &CardLocation,
+    ) -> Option<String> {
+        self.cache
             .get(surface_id)
-            .map(|e| (e.name.clone(), e.changed_at))
-            .unwrap_or((None, None));
-        let changed = previous_name != name;
-        let changed_at = if changed {
-            Some(Utc::now())
-        } else {
-            previous_changed_at
-        };
-        self.cache.insert(
-            surface_id.to_string(),
-            CacheEntry {
-                location,
-                name,
-                checked_at: Instant::now(),
-                changed_at,
-            },
-        );
+            .filter(|(e, _)| e.location == *location)
+            .and_then(|(e, _)| e.name)
     }
 
     /// Surfaces whose target Agent Card name appeared, changed, or disappeared after `since`.
@@ -210,13 +178,7 @@ impl TargetCardNameService {
         since: DateTime<Utc>,
     ) -> Vec<String> {
         self.cache
-            .iter()
-            .filter(|e| {
-                e.changed_at
-                    .is_some_and(|t| t > since)
-            })
-            .map(|e| e.key().clone())
-            .collect()
+            .changed_since(since)
     }
 }
 
@@ -306,16 +268,28 @@ mod tests {
         location: &CardLocation,
     ) -> Option<String> {
         for _ in 0..200 {
-            if service.inflight.is_empty()
+            if service.cache.is_idle()
                 && service
                     .cache
-                    .contains_key(surface_id)
+                    .get(surface_id)
+                    .is_some()
             {
                 return service.lookup_or_spawn(surface_id, location);
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("target card lookup did not finish");
+    }
+
+    fn store(
+        service: &TargetCardNameService,
+        surface_id: &str,
+        location: CardLocation,
+        name: Option<String>,
+    ) {
+        service
+            .cache
+            .store(surface_id, CardEntry { location, name });
     }
 
     fn surface(
@@ -384,6 +358,83 @@ mod tests {
         assert_eq!(wait_for(&service, "s1", &loc).await, None);
     }
 
+    async fn refresh(
+        service: &Arc<TargetCardNameService>,
+        surface_id: &str,
+        location: &CardLocation,
+    ) -> Option<String> {
+        service
+            .cache
+            .expire(surface_id);
+        service.lookup_or_spawn(surface_id, location);
+        for _ in 0..200 {
+            if service.cache.is_idle() {
+                return service
+                    .cache
+                    .get(surface_id)
+                    .and_then(|(e, _)| e.name);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("target card refresh did not finish");
+    }
+
+    #[tokio::test]
+    async fn test_unreachable_card_keeps_last_known_name_without_change() {
+        let source = FakeSource::with_card(json!({"name": "DateTime Agent"}));
+        let service = Arc::new(TargetCardNameService::new(source.clone()));
+        let loc = location("http://localhost:9000");
+        service.lookup_or_spawn("s1", &loc);
+        wait_for(&service, "s1", &loc).await;
+
+        let since = Utc::now();
+        *source.card.lock().unwrap() = None;
+        assert_eq!(
+            refresh(&service, "s1", &loc)
+                .await
+                .as_deref(),
+            Some("DateTime Agent")
+        );
+        assert!(
+            service
+                .changed_since(since)
+                .is_empty()
+        );
+        assert_eq!(
+            source
+                .calls
+                .load(Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reachable_card_without_name_clears_last_known_name() {
+        let source = FakeSource::with_card(json!({"name": "DateTime Agent"}));
+        let service = Arc::new(TargetCardNameService::new(source.clone()));
+        let loc = location("http://localhost:9000");
+        service.lookup_or_spawn("s1", &loc);
+        wait_for(&service, "s1", &loc).await;
+
+        let since = Utc::now();
+        *source.card.lock().unwrap() = Some(json!({"description": "renamed away"}));
+        assert_eq!(refresh(&service, "s1", &loc).await, None);
+        assert_eq!(service.changed_since(since), vec!["s1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_unreachable_card_at_new_location_does_not_reuse_old_name() {
+        let source = FakeSource::with_card(json!({"name": "Old Agent"}));
+        let service = Arc::new(TargetCardNameService::new(source.clone()));
+        let old = location("http://localhost:9000");
+        service.lookup_or_spawn("s1", &old);
+        wait_for(&service, "s1", &old).await;
+
+        *source.card.lock().unwrap() = None;
+        let new = location("http://localhost:9100");
+        assert_eq!(refresh(&service, "s1", &new).await, None);
+    }
+
     #[tokio::test]
     async fn test_location_change_hides_stale_name_and_refetches() {
         let source = FakeSource::with_card(json!({"name": "Old Agent"}));
@@ -434,18 +485,18 @@ mod tests {
         let source = FakeSource::with_card(json!({"name": "DateTime Agent"}));
         let service = Arc::new(TargetCardNameService::new(source));
         let before = Utc::now();
-        service.store("named", location("http://a"), Some("DateTime Agent".into()));
-        service.store("unnamed", location("http://b"), None);
+        store(&service, "named", location("http://a"), Some("DateTime Agent".into()));
+        store(&service, "unnamed", location("http://b"), None);
         assert_eq!(service.changed_since(before), vec!["named".to_string()]);
 
         let after = Utc::now();
-        service.store("named", location("http://a"), Some("DateTime Agent".into()));
+        store(&service, "named", location("http://a"), Some("DateTime Agent".into()));
         assert!(
             service
                 .changed_since(after)
                 .is_empty()
         );
-        service.store("named", location("http://a"), None);
+        store(&service, "named", location("http://a"), None);
         assert_eq!(service.changed_since(after), vec!["named".to_string()]);
     }
 }

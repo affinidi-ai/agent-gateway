@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tracing::warn;
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 use super::IdentityStore;
 use super::filesystem::{AgentIdentityRecord, IdentityOrigin};
@@ -23,6 +24,8 @@ pub enum DisplayNameError {
     Empty,
     #[error("display name contains a control character")]
     ControlCharacter,
+    #[error("display name contains an invisible format character")]
+    FormatCharacter,
     #[error("display name has {0} characters; maximum is {DISPLAY_NAME_MAX_CHARS}")]
     TooManyChars(usize),
     #[error("display name has {0} bytes; maximum is {DISPLAY_NAME_MAX_BYTES}")]
@@ -45,6 +48,9 @@ impl DisplayName {
         {
             return Err(DisplayNameError::ControlCharacter);
         }
+        if trimmed.chars().any(is_format) {
+            return Err(DisplayNameError::FormatCharacter);
+        }
         let chars = trimmed.chars().count();
         if chars > DISPLAY_NAME_MAX_CHARS {
             return Err(DisplayNameError::TooManyChars(chars));
@@ -60,6 +66,12 @@ impl DisplayName {
     }
 }
 
+/// Unicode `Cf` characters, such as zero-width spaces and bidirectional overrides, which
+/// render invisibly or reorder text and so let a name visually impersonate another.
+fn is_format(c: char) -> bool {
+    get_general_category(c) == GeneralCategory::Format
+}
+
 pub fn sanitize_description(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     if trimmed.is_empty() {
@@ -67,9 +79,9 @@ pub fn sanitize_description(raw: Option<&str>) -> Option<String> {
     }
     if trimmed
         .chars()
-        .any(char::is_control)
+        .any(|c| c.is_control() || is_format(c))
     {
-        warn!("Dropping description containing control characters");
+        warn!("Dropping description containing control or format characters");
         return None;
     }
     if trimmed.len() > DESCRIPTION_MAX_BYTES {
@@ -415,6 +427,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_format_characters() {
+        for raw in [
+            "zero\u{200B}width",
+            "joiner\u{200D}",
+            "rtl\u{202E}override",
+            "isolate\u{2066}x\u{2069}",
+            "\u{FEFF}bom",
+            "soft\u{AD}hyphen",
+            "tag\u{E0041}",
+        ] {
+            assert_eq!(DisplayName::parse(raw), Err(DisplayNameError::FormatCharacter), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_non_format_unicode() {
+        for raw in ["Café Agent", "代理 Agent", "Agent \u{1F600}", "Агент"] {
+            assert_eq!(
+                DisplayName::parse(raw)
+                    .unwrap()
+                    .as_str(),
+                raw
+            );
+        }
+    }
+
+    #[test]
     fn parse_rejects_empty_and_whitespace() {
         assert_eq!(DisplayName::parse(""), Err(DisplayNameError::Empty));
         assert_eq!(DisplayName::parse("   \t "), Err(DisplayNameError::Empty));
@@ -432,6 +471,8 @@ mod tests {
         assert_eq!(sanitize_description(None), None);
         assert_eq!(sanitize_description(Some("   ")), None);
         assert_eq!(sanitize_description(Some("bad\u{0}")), None);
+        assert_eq!(sanitize_description(Some("pay \u{202E}evil")), None);
+        assert_eq!(sanitize_description(Some("zero\u{200B}width")), None);
         assert_eq!(
             sanitize_description(Some(&"d".repeat(DESCRIPTION_MAX_BYTES))),
             Some("d".repeat(DESCRIPTION_MAX_BYTES))

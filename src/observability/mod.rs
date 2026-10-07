@@ -13,6 +13,7 @@ pub mod opentelemetry;
 pub mod otlp_health;
 pub mod payload_capture;
 pub mod policy_audit;
+pub mod refresh_cache;
 pub mod simple_format;
 pub mod span_filter;
 pub mod system_metrics;

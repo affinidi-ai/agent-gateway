@@ -194,8 +194,9 @@ with a placeholder.
 
 A display name is an unverified, human-readable label for a DID
 ([`display_name.rs`](../src/identity/display_name.rs)). Valid names are trimmed, keep
-their case, contain no control characters, and fit in 128 characters and 256 UTF-8
-bytes. An invalid or empty name is skipped with a warning, and the DID is shown
+their case, contain no control characters or invisible Unicode format (`Cf`) characters
+such as zero-width spaces and bidirectional overrides, and fit in 128 characters and
+256 UTF-8 bytes. Descriptions are dropped when they contain either kind of character. An invalid or empty name is skipped with a warning, and the DID is shown
 instead. Falling back to the DID is display-only: no reference field, context or VC
 name is ever published with the DID as the name.
 
@@ -232,8 +233,11 @@ never looked up.
 
 Lookups are cached per surface for 300 seconds and are re-read when the target endpoint
 or card path changes, with a 5-second timeout for each card URL tried. The dashboard
-never waits: until its first lookup finishes, and whenever the card is unreachable or
-has no valid `name`, a row shows the surface name.
+never waits: until its first lookup finishes, and whenever the card has no valid `name`,
+a row shows the surface name. When the card cannot be read (unreachable, blocked by
+egress policy, a non-success status, an oversized body, or a non-JSON body), the row keeps
+the last name read from the same target and card path, and the next lookup is retried
+after the cache period; with no earlier name, it shows the surface name.
 
 The card name is self-asserted by the target and never verified. The target is trusted
 to serve traffic, not to choose what the gateway's Issuer signs, so the card name never

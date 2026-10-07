@@ -1,4 +1,4 @@
-branch: feat/human-readable-metadata
+branch: feat/human-friendly-metadata
 changes:
   added:
     - timestamp: '2026-10-05T14:39:32.000Z'
@@ -42,7 +42,9 @@ changes:
         "unverified" marker. The name is self-asserted by the target, so it is never
         signed into the identity VC or published to Trust Recorder context or trust
         registries, and card lookups never block requests. The card is cached for five
-        minutes per surface; an unreachable card or invalid name shows the surface name.
+        minutes per surface. A card that cannot be read keeps the last name read from the same
+        target, so a target outage does not flip the row back to the surface name; a
+        card without a valid name shows the surface name.
   changed:
     - timestamp: '2026-10-06T10:00:00.000Z'
       title: Rename the Identities Status column to Origin
@@ -79,9 +81,23 @@ changes:
         records showed the gateway as the authority. It now stores the Issuer's own
         DID. Entries saved with the old value show as Custom until re-selected.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Reject invisible Unicode format characters in display names
+      description: >-
+        Display names and descriptions now reject Unicode format (Cf) characters such as
+        zero-width spaces, bidirectional overrides and tag characters, as well as control
+        characters. Names read from remote Agent Cards, signed into VCs or published to
+        trust registries can no longer visually impersonate another agent's name.
   breaking: []
   internal:
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Share one background refresh cache between caller and target card names
+      description: >-
+        Caller names and target Agent Card names now use a single RefreshCache for TTL
+        checks, one in-flight refresh per key, bounded concurrency and change tracking,
+        instead of two copies of that logic. Each service keeps its own value type and
+        change rule; behaviour is unchanged.
     - timestamp: '2026-10-05T14:39:32.000Z'
       title: Enable the agent-names feature of the DID resolver SDK
       description: >-

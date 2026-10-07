@@ -78,6 +78,7 @@ futures = "0.3.31"
 tower = { version = "0.5.3", features = ["util"] }
 tracing-appender = "0.2"
 notify = "8.2.0"
+unicode-general-category = "1.1"
 
 # Axum web framework
 axum = { version = "0.8.8", features = ["json", "tokio", "ws", "multipart"] }

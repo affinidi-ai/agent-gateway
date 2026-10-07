@@ -8,17 +8,16 @@
 //! and refreshes it in the background.
 
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::identity::display_name::DisplayName;
+use crate::observability::refresh_cache::RefreshCache;
 
 pub const CALLER_NAME_TTL: Duration = Duration::from_secs(300);
 pub const MAX_AGENT_NAME_CANDIDATES: usize = 4;
@@ -84,31 +83,23 @@ impl CallerLookup {
     }
 }
 
-struct CacheEntry {
-    name: Option<CallerName>,
-    checked_at: Instant,
-    changed_at: Option<DateTime<Utc>>,
-}
-
 pub struct CallerNameService {
-    cache: DashMap<String, CacheEntry>,
-    inflight: DashSet<String>,
-    permits: Semaphore,
-    ttl: Duration,
+    cache: Arc<RefreshCache<Option<CallerName>>>,
     resolution_timeout: Duration,
     sources: Arc<dyn CallerNameSources>,
 }
 
-struct InflightGuard<'a> {
-    inflight: &'a DashSet<String>,
-    did: String,
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        self.inflight
-            .remove(&self.did);
-    }
+/// A caller's first finished lookup is a change, as is any later difference in its name,
+/// source, or verification.
+fn caller_name_changed(
+    previous: Option<&Option<CallerName>>,
+    name: &Option<CallerName>,
+) -> bool {
+    let key = |n: &Option<CallerName>| {
+        n.as_ref()
+            .map(|n| (n.name.clone(), n.source, n.verified))
+    };
+    previous.is_none_or(|previous| key(previous) != key(name))
 }
 
 impl CallerNameService {
@@ -126,10 +117,7 @@ impl CallerNameService {
         ttl: Duration,
     ) -> Self {
         Self {
-            cache: DashMap::new(),
-            inflight: DashSet::new(),
-            permits: Semaphore::new(MAX_CONCURRENT_RESOLUTIONS),
-            ttl,
+            cache: Arc::new(RefreshCache::new(ttl, MAX_CONCURRENT_RESOLUTIONS, caller_name_changed)),
             resolution_timeout: DID_RESOLUTION_TIMEOUT,
             sources,
         }
@@ -142,78 +130,20 @@ impl CallerNameService {
         did: &str,
     ) -> CallerLookup {
         let (cached, fresh) = match self.cache.get(did) {
-            Some(entry) => (CallerLookup::Resolved(entry.name.clone()), entry.checked_at.elapsed() < self.ttl),
+            Some((name, fresh)) => (CallerLookup::Resolved(name), fresh),
             None => (CallerLookup::Pending, false),
         };
         if !fresh {
-            self.spawn_refresh(did);
+            let service = Arc::clone(self);
+            let owned_did = did.to_string();
+            self.cache
+                .spawn_refresh(did, move || async move {
+                    service
+                        .resolve(&owned_did)
+                        .await
+                });
         }
         cached
-    }
-
-    fn spawn_refresh(
-        self: &Arc<Self>,
-        did: &str,
-    ) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        if !self
-            .inflight
-            .insert(did.to_string())
-        {
-            return;
-        }
-        let service = Arc::clone(self);
-        let did = did.to_string();
-        handle.spawn(async move {
-            let _guard = InflightGuard {
-                inflight: &service.inflight,
-                did: did.clone(),
-            };
-            let Ok(_permit) = service
-                .permits
-                .acquire()
-                .await
-            else {
-                return;
-            };
-            let name = service.resolve(&did).await;
-            service.store(&did, name);
-        });
-    }
-
-    fn store(
-        &self,
-        did: &str,
-        name: Option<CallerName>,
-    ) {
-        let previous = self
-            .cache
-            .get(did)
-            .map(|e| (e.name.clone(), e.changed_at));
-        let first_lookup = previous.is_none();
-        let (previous_name, previous_changed_at) = previous.unwrap_or((None, None));
-        let changed = first_lookup
-            || previous_name
-                .as_ref()
-                .map(|n| (&n.name, n.source, n.verified))
-                != name
-                    .as_ref()
-                    .map(|n| (&n.name, n.source, n.verified));
-        let changed_at = if changed {
-            Some(Utc::now())
-        } else {
-            previous_changed_at
-        };
-        self.cache.insert(
-            did.to_string(),
-            CacheEntry {
-                name,
-                checked_at: Instant::now(),
-                changed_at,
-            },
-        );
     }
 
     pub async fn resolve(
@@ -334,13 +264,7 @@ impl CallerNameService {
         since: DateTime<Utc>,
     ) -> Vec<String> {
         self.cache
-            .iter()
-            .filter(|e| {
-                e.changed_at
-                    .is_some_and(|t| t > since)
-            })
-            .map(|e| e.key().clone())
-            .collect()
+            .changed_since(since)
     }
 }
 
@@ -479,6 +403,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
     use tokio::sync::Notify;
 
     const DID: &str = "did:web:acme.com:billing";
@@ -801,10 +726,8 @@ mod tests {
         did: &str,
     ) -> CallerName {
         for _ in 0..200 {
-            if let Some(entry) = service.cache.get(did)
-                && let Some(name) = &entry.name
-            {
-                return name.clone();
+            if let Some((Some(name), _)) = service.cache.get(did) {
+                return name;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -863,7 +786,7 @@ mod tests {
 
         service.lookup_or_spawn(DID);
         wait_for_name(&service, DID).await;
-        while !service.inflight.is_empty() {
+        while !service.cache.is_idle() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(
@@ -889,7 +812,9 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_or_spawn_reports_finished_lookup_without_name_as_resolved() {
         let service = Arc::new(service_with(FakeSources::default()));
-        service.store("did:example:unnamed", None);
+        service
+            .cache
+            .store("did:example:unnamed", None);
         assert_eq!(service.lookup_or_spawn("did:example:unnamed"), CallerLookup::Resolved(None));
         assert_eq!(service.lookup_or_spawn("did:example:other"), CallerLookup::Pending);
     }
@@ -898,8 +823,10 @@ mod tests {
     async fn test_changed_since_reports_first_lookups_and_changed_names() {
         let service = service_with(FakeSources::default());
         let before = Utc::now() - chrono::Duration::seconds(1);
-        service.store("did:example:unnamed", None);
-        service.store(
+        service
+            .cache
+            .store("did:example:unnamed", None);
+        service.cache.store(
             DID,
             Some(CallerName {
                 name: "Billing Bot".into(),
@@ -913,8 +840,10 @@ mod tests {
         assert_eq!(changed, vec!["did:example:unnamed".to_string(), DID.to_string()]);
 
         let after = Utc::now() + chrono::Duration::seconds(1);
-        service.store("did:example:unnamed", None);
-        service.store(
+        service
+            .cache
+            .store("did:example:unnamed", None);
+        service.cache.store(
             DID,
             Some(CallerName {
                 name: "Billing Bot".into(),
