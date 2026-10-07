@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post, put};
+use axum::routing::{MethodRouter, delete, get, post, put};
 use axum::{Extension, Router};
 
 use crate::auth_manager::middleware::{RbacGuard, maybe_gate};
@@ -38,9 +38,28 @@ pub fn create_access_tokens_router(
         )
         .route(
             "/api/v1/access-tokens/{id}/rotate",
-            maybe_gate(guard.as_ref(), post(handlers::rotate_access_token), Feature::AccessTokensEdit),
+            maybe_gate(
+                guard.as_ref(),
+                with_user_storage(guard.as_ref(), post(handlers::rotate_access_token)),
+                Feature::AccessTokensEdit,
+            ),
         )
         .layer(Extension(tenancy_config))
         .layer(Extension(rbac_config))
         .with_state(store)
+}
+
+/// Hands the guard's user storage to a handler that checks the caller's role
+/// itself. Without a guard the route is denied before the handler runs.
+fn with_user_storage<S>(
+    guard: Option<&RbacGuard>,
+    method_router: MethodRouter<S>,
+) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    match guard {
+        Some(guard) => method_router.layer(Extension(guard.storage.clone())),
+        None => method_router,
+    }
 }

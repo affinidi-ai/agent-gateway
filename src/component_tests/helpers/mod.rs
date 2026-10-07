@@ -4,6 +4,7 @@
 //! lightweight axum mock target server and exposes the channel listen address for
 //! test assertions.
 
+pub(crate) mod audit_events;
 pub mod jwt;
 
 use std::collections::HashMap;

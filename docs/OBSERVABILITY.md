@@ -109,6 +109,26 @@ allows are DEBUG.
 The gateway propagates `X-Gateway-Trace-Id` to a Target where the request path creates that trace
 identifier, allowing gateway and managed-agent logs to be correlated.
 
+## Access token rotation events
+
+`POST /api/v1/access-tokens/{id}/rotate` emits structured tracing events on the `audit` target.
+They are log events only: they are not written to `delegation-audit.jsonl` and are not forwarded
+to Governance Audit integrations, so ship the `audit` target off the appliance to keep them. See
+[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#token-contract) for the rotation contract.
+
+| Event | Level | Fields |
+| --- | --- | --- |
+| `access_token.rotated` | INFO, or WARN when `rotated_for_other_user` is true | `token_id`, `owner_user_id`, `caller_user_id`, `caller_auth_method`, `caller_token_id`, `rotated_for_other_user`, `rotation_generation` |
+| `access_token.rotate_denied` | WARN | `token_id`, `caller_user_id`, `caller_auth_method`, `caller_token_id`, `status`, `reason` |
+
+`caller_auth_method` is `access_token` for a PAT caller and `session` otherwise; `caller_token_id`
+is the calling PAT's id and empty for a session caller. `access_token.rotate_denied` carries no
+owner and covers only refusals made by the handler: `401` for a request with no authenticated
+caller, `403` for a non-administrator rotating another user's token or a PAT caller outside its
+lineage or using a resource-scoped PAT, `404` for an unknown token id, and `409` for a revoked,
+expired, inactive-lineage or concurrently rotated token. Requests refused by the authentication
+or `access_tokens.edit` route checks before the handler runs emit neither event.
+
 ## Governance audit forwarding
 
 Every record the VP Audit Log appends to `delegation-audit.jsonl` is also handed to the

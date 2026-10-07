@@ -3,7 +3,7 @@ changes:
   added:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Add access token rotation endpoint
-      description: POST /api/v1/access-tokens/{id}/rotate issues a new secret for an active token and keeps its id, scopes and expiry. Rotation needs access_tokens.edit and the old secret stops working at once. Every rotation and every denied attempt is emitted as a structured log event on the audit target, with the token owner and the caller.
+      description: POST /api/v1/access-tokens/{id}/rotate issues a new secret for an active token and keeps its id, scopes and expiry. Rotation needs access_tokens.edit, rotating another user's token also needs the Administrator role, and the old secret stops working at once. Every rotation is emitted as a structured log event on the audit target with the token owner and the caller. A rotation the handler refuses (no authenticated caller, a non-administrator rotating another user's token, a PAT caller outside its lineage or using a resource-scoped PAT, an unknown token id, or a revoked, expired, inactive-lineage or concurrently rotated token) is emitted with the caller, status and reason; requests refused by the authentication or access_tokens.edit route checks are not.
   changed:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Send no-store on access token create and rotate responses
@@ -11,7 +11,10 @@ changes:
   security:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Write access token files atomically with owner-only permissions
-      description: Token files are written to a temporary file with mode 0600 and then renamed, so they are never readable by other users or left half written.
+      description: Token files are written to a temporary file with mode 0600, renamed into place and the directory synced, so they are never readable by other users, left half written, or rolled back by a power loss after a successful response. Existing token files readable by group or others are set to 0600 when the store loads; a failure is logged and startup continues.
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Stop returning storage error details from access token endpoints
+      description: Create, update and revoke no longer include the underlying IO error text in 500 responses; the error is logged instead.
   internal:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Add tests and docs for access token rotation

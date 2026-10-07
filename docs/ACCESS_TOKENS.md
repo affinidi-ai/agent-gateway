@@ -27,25 +27,32 @@ the old hash leaves the authentication index immediately and only the new hash i
 persisted. The record tracks `rotation_generation`, `rotated_at`, and `rotated_by`,
 and `last_used_at` resets. Rotation returns `409` for a revoked or expired token, a
 token whose lineage is no longer valid, or a concurrent rotation that lost the race.
-Rotating returns a working secret that authenticates as the token's owner, so access to
-rotate is the same as access to `access_tokens.edit` (administrator by default). A caller
-with `access_tokens.edit` may rotate any active token, including one owned by another user,
-and the new secret acts as that owner. A PAT caller can rotate only itself and its
-descendants, never with a resource-scoped PAT. Rotation is appliance-wide and is not limited
-by tenant. Responses that carry a secret are sent with `Cache-Control: no-store`.
+Rotating returns a working secret that authenticates as the token's owner. Any caller with
+`access_tokens.edit` (administrator by default) may rotate a token they own. Rotating a token
+owned by another user also requires the `Administrator` role, even when `rbac.json` grants
+`access_tokens.edit` to a lower role, and the new secret acts as that owner; otherwise the
+request is refused with `403`. A PAT caller can rotate only itself and its descendants, never
+with a resource-scoped PAT. Rotation is appliance-wide and is not limited by tenant.
+Responses that carry a secret are sent with `Cache-Control: no-store`.
 
 Each rotation is emitted as a structured log event on the `audit` tracing target
 (`access_token.rotated`, with the token id, owner, caller, auth method, and
-`rotated_for_other_user`, logged at `warn` when the caller is not the owner). A refused
-attempt is emitted as `access_token.rotate_denied` with the token id, caller, auth method,
-and reason. These events are not stored in the delegation audit store, so operators should
-ship the `audit` target off the appliance. `rotated_by`, `rotated_at`, and
-`rotation_generation` are returned to anyone with `access_tokens.view`.
+`rotated_for_other_user`, logged at `warn` when the caller is not the owner). A rotation
+refused by the handler is emitted as `access_token.rotate_denied` with the token id, caller,
+auth method, status, and reason, but not the owner: a request with no authenticated caller
+(`401`), a non-administrator rotating another user's token, a PAT caller rotating outside
+its lineage or with a resource-scoped PAT (`403`), an unknown token id (`404`), and a
+revoked, expired, inactive-lineage, or concurrently rotated token (`409`). Requests refused
+by the authentication or `access_tokens.edit` route checks before the handler runs emit no
+rotation event. These events are not stored in the delegation audit store or forwarded to
+Governance Audit integrations, so operators should ship the `audit` target off the appliance
+(see [`OBSERVABILITY.md`](OBSERVABILITY.md#access-token-rotation-events)). `rotated_by`,
+`rotated_at`, and `rotation_generation` are returned to anyone with `access_tokens.view`.
 
 Operator advice:
 
-- Keep `access_tokens.edit` administrator-only. Rotating an administrator-owned full-role
-  token hands the caller that token's access.
+- Keep `access_tokens.edit` administrator-only. A lower role granted it can rotate its own
+  tokens but not another user's.
 - On a suspected leak, revoke the parent token instead of rotating it. Revoke cascades to
   descendants, while rotation does not touch them.
 

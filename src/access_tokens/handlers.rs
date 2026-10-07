@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{error, info, warn};
 
+use crate::auth::storage::PasskeyStorage;
+use crate::auth::types::UserRole;
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext};
 use crate::auth_manager::resource_scope::{self, RequiredHeader};
@@ -391,6 +393,7 @@ pub async fn revoke_access_token(
 
 pub async fn rotate_access_token(
     State(store): State<Arc<FsAccessTokenStore>>,
+    Extension(users): Extension<Arc<PasskeyStorage>>,
     Path(id): Path<String>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
@@ -398,9 +401,6 @@ pub async fn rotate_access_token(
     let caller_id = caller
         .map(|Extension(auth)| auth.0)
         .unwrap_or_default();
-    if caller_id.is_empty() {
-        return Err((StatusCode::UNAUTHORIZED, "no authenticated caller".into()));
-    }
     let caller_auth_method = if delegation.is_some() {
         "access_token"
     } else {
@@ -423,6 +423,9 @@ pub async fn rotate_access_token(
         );
         (status, reason.to_string())
     };
+    if caller_id.is_empty() {
+        return Err(deny(StatusCode::UNAUTHORIZED, "no authenticated caller"));
+    }
     validate_target_authority(
         &store,
         delegation
@@ -432,8 +435,24 @@ pub async fn rotate_access_token(
     )
     .map_err(|(status, message)| deny(status, &message))?;
     let Some(existing) = store.get(&id) else {
-        return Err((StatusCode::NOT_FOUND, "access token not found".into()));
+        return Err(deny(StatusCode::NOT_FOUND, "access token not found"));
     };
+    // Defense-in-depth: a rotated secret acts as the token owner, so rotating
+    // another user's token requires Administrator even if the RBAC config
+    // grants access_tokens.edit to a lower role.
+    if existing.user_id != caller_id {
+        let caller_role = users
+            .load_user_by_id(&caller_id)
+            .await
+            .map_err(|error| {
+                error!(token_id = %id, %error, "Failed to load caller for access token rotation");
+                (StatusCode::INTERNAL_SERVER_ERROR, "failed to rotate access token".to_string())
+            })?
+            .map(|user| user.role);
+        if caller_role != Some(UserRole::Administrator) {
+            return Err(deny(StatusCode::FORBIDDEN, "only administrators can rotate another user's access token"));
+        }
+    }
     if existing.revoked_at.is_some() {
         return Err(deny(StatusCode::CONFLICT, "cannot rotate a revoked token"));
     }
@@ -477,7 +496,7 @@ pub async fn rotate_access_token(
                 }),
             ))
         }
-        Ok(RotateOutcome::NotFound) => Err((StatusCode::NOT_FOUND, "access token not found".into())),
+        Ok(RotateOutcome::NotFound) => Err(deny(StatusCode::NOT_FOUND, "access token not found")),
         Ok(RotateOutcome::Inactive) => {
             Err(deny(StatusCode::CONFLICT, "access token is inactive or its parent token is no longer valid"))
         }
@@ -728,6 +747,49 @@ mod tests {
         );
     }
 
+    async fn user_storage(users: &[(&str, UserRole)]) -> (Arc<PasskeyStorage>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = PasskeyStorage::new(
+            directory
+                .path()
+                .join("users")
+                .to_string_lossy()
+                .into_owned(),
+            directory
+                .path()
+                .join("avatars")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        for (user_id, role) in users {
+            storage
+                .save_user(&crate::auth::storage::UserData {
+                    user_id: (*user_id).to_string(),
+                    username: (*user_id).to_string(),
+                    passkeys: Vec::new(),
+                    role: role.clone(),
+                    status: crate::auth::types::UserStatus::Approved,
+                    is_primary: false,
+                    first_name: None,
+                    last_name: None,
+                    email: None,
+                    department: None,
+                    job_title: None,
+                    avatar_path: None,
+                    created_at: now,
+                    updated_at: now,
+                    last_logged_in: None,
+                    saml_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        (Arc::new(storage), directory)
+    }
+
     #[tokio::test]
     async fn rotate_returns_new_secret_and_keeps_token_identity() {
         let directory = tempfile::tempdir().unwrap();
@@ -736,6 +798,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let (users, _users_directory) = user_storage(&[("user-1", UserRole::User)]).await;
         store
             .create(token("root", None, 0))
             .await
@@ -743,6 +806,7 @@ mod tests {
 
         let (headers, Json(response)) = rotate_access_token(
             State(store.clone()),
+            Extension(users.clone()),
             Path("root".into()),
             Some(Extension(AuthGuardOk("user-1".into()))),
             delegation("root"),
@@ -779,6 +843,7 @@ mod tests {
 
         let (_, Json(second)) = rotate_access_token(
             State(store.clone()),
+            Extension(users.clone()),
             Path("root".into()),
             Some(Extension(AuthGuardOk("user-1".into()))),
             None,
@@ -809,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_lets_a_session_caller_rotate_another_users_token() {
+    async fn rotate_lets_an_administrator_rotate_another_users_token() {
         use crate::auth_manager::pat::PatAuthenticator;
 
         let directory = tempfile::tempdir().unwrap();
@@ -818,6 +883,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let (users, _users_directory) =
+            user_storage(&[("user-1", UserRole::User), ("user-2", UserRole::Administrator)]).await;
         store
             .create(token("root", None, 0))
             .await
@@ -825,6 +892,7 @@ mod tests {
 
         let (headers, Json(response)) = rotate_access_token(
             State(store.clone()),
+            Extension(users.clone()),
             Path("root".into()),
             Some(Extension(AuthGuardOk("user-2".into()))),
             None,
@@ -859,7 +927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_requires_an_authenticated_caller() {
+    async fn rotate_refuses_a_non_administrator_rotating_another_users_token() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
             FsAccessTokenStore::new(directory.path())
@@ -870,10 +938,44 @@ mod tests {
             .create(token("root", None, 0))
             .await
             .unwrap();
+        let (users, _users_directory) = user_storage(&[("power-1", UserRole::PowerUser)]).await;
+
+        for caller in ["power-1", "unknown-user"] {
+            assert!(matches!(
+                rotate_access_token(
+                    State(store.clone()),
+                    Extension(users.clone()),
+                    Path("root".into()),
+                    Some(Extension(AuthGuardOk(caller.into()))),
+                    None,
+                )
+                .await,
+                Err((StatusCode::FORBIDDEN, message)) if message.contains("administrators")
+            ));
+        }
+        let stored = store.get("root").unwrap();
+        assert_eq!(stored.token_hash, hash_secret("agpat_root"));
+        assert_eq!(stored.rotation_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn rotate_requires_an_authenticated_caller() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            FsAccessTokenStore::new(directory.path())
+                .await
+                .unwrap(),
+        );
+        let (users, _users_directory) = user_storage(&[("user-1", UserRole::User)]).await;
+        store
+            .create(token("root", None, 0))
+            .await
+            .unwrap();
 
         for caller in [None, Some(Extension(AuthGuardOk(String::new())))] {
             assert!(matches!(
-                rotate_access_token(State(store.clone()), Path("root".into()), caller, None).await,
+                rotate_access_token(State(store.clone()), Extension(users.clone()), Path("root".into()), caller, None)
+                    .await,
                 Err((StatusCode::UNAUTHORIZED, _))
             ));
         }
@@ -890,6 +992,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let (users, _users_directory) = user_storage(&[("user-1", UserRole::User)]).await;
         store
             .create(token("root", None, 0))
             .await
@@ -916,6 +1019,7 @@ mod tests {
         let rotate = |id: &str, caller: Option<Extension<PatDelegationContext>>| {
             rotate_access_token(
                 State(store.clone()),
+                Extension(users.clone()),
                 Path(id.into()),
                 Some(Extension(AuthGuardOk("user-1".into()))),
                 caller,
@@ -947,6 +1051,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let (users, _users_directory) = user_storage(&[("user-1", UserRole::User)]).await;
         store
             .create(token("root", None, 0))
             .await
@@ -958,6 +1063,7 @@ mod tests {
 
         let (_, Json(rotated)) = rotate_access_token(
             State(store.clone()),
+            Extension(users.clone()),
             Path("child".into()),
             Some(Extension(AuthGuardOk("user-1".into()))),
             delegation("root"),
@@ -981,6 +1087,7 @@ mod tests {
         assert!(matches!(
             rotate_access_token(
                 State(store.clone()),
+                Extension(users.clone()),
                 Path("root".into()),
                 Some(Extension(AuthGuardOk("user-1".into()))),
                 scoped

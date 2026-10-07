@@ -6,7 +6,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use tokio::fs;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth_manager::pat::{PatAuthenticator, PatPrincipal};
 use crate::auth_manager::resource_scope::{self, CompiledResourceScope, RequiredHeader};
@@ -78,6 +78,8 @@ impl FsAccessTokenStore {
             if extension != Some("json") {
                 continue;
             }
+            #[cfg(unix)]
+            Self::restrict_to_owner(&path).await;
             match fs::read(&path).await {
                 Ok(bytes) => match serde_json::from_slice::<AccessToken>(&bytes) {
                     Ok(token) => {
@@ -101,6 +103,28 @@ impl FsAccessTokenStore {
             mutation_locks: Arc::new(DashMap::new()),
             delegation_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Sets a token file written before owner-only writes to mode 0o600.
+    /// A failure is logged and loading continues.
+    #[cfg(unix)]
+    async fn restrict_to_owner(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = match fs::metadata(path).await {
+            Ok(metadata) => metadata.permissions().mode() & 0o777,
+            Err(error) => {
+                warn!(?path, %error, "Failed to read access-token file permissions");
+                return;
+            }
+        };
+        if mode & 0o077 == 0 {
+            return;
+        }
+        match fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await {
+            Ok(()) => info!(?path, previous_mode = format!("{mode:o}"), "Restricted access-token file to owner"),
+            Err(error) => warn!(?path, %error, "Failed to restrict access-token file to owner"),
+        }
     }
 
     fn mutation_lock(
@@ -631,6 +655,30 @@ mod tests {
         assert_eq!(leftovers, 0);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loading_restricts_an_existing_world_readable_token_file_to_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("ag-access-tokens-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = record(&hash_secret("agpat_legacy_mode"), Vec::new());
+        let path = dir.join(format!("{}.json", token.id));
+        std::fs::write(&path, serde_json::to_vec(&token).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = FsAccessTokenStore::new(&dir)
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(store.get(&token.id).is_some());
+    }
+
     #[tokio::test]
     async fn loading_removes_leftover_temporary_files() {
         let dir = std::env::temp_dir().join(format!("ag-access-tokens-{}", uuid::Uuid::new_v4()));
@@ -1071,22 +1119,25 @@ mod tests {
     async fn rotation_rejects_an_active_child_whose_lineage_is_broken() {
         let store = store().await;
 
-        let mut expiring_parent = record(&hash_secret("agpat_expiring_parent"), vec!["secrets.view".into()]);
-        expiring_parent.expires_at = Some(Utc::now() + Duration::milliseconds(200));
-        let expiring_parent_id = expiring_parent.id.clone();
+        let expired_parent = record(&hash_secret("agpat_expired_parent"), vec!["secrets.view".into()]);
+        let expired_parent_id = expired_parent.id.clone();
         store
-            .create(expiring_parent)
+            .create(expired_parent)
             .await
             .unwrap();
         let mut orphan = record(&hash_secret("agpat_expired_parent_child"), vec!["secrets.view".into()]);
-        orphan.parent_token_id = Some(expiring_parent_id);
+        orphan.parent_token_id = Some(expired_parent_id.clone());
         orphan.delegation_depth = 1;
         let orphan_id = orphan.id.clone();
         store
             .create(orphan)
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        store
+            .cache
+            .get_mut(&expired_parent_id)
+            .unwrap()
+            .expires_at = Some(Utc::now() - Duration::minutes(1));
         assert!(
             store
                 .get(&orphan_id)
