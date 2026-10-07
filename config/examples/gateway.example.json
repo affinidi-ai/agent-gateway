@@ -1119,6 +1119,13 @@
       "lockout_secs": 300
     }
   },
+  "cli_login_throttle": {
+    "enabled": true,
+    "per_ip": {
+      "requests": 20,
+      "window_secs": 60
+    }
+  },
   "logging": {
     "level": "debug",
     "json": false,

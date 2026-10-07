@@ -13,7 +13,10 @@ changes:
   security:
     - timestamp: '2026-10-06T00:00:02.000Z'
       title: Harden CLI login requests
-      description: CLI login rejects ports below 1024, checks PKCE challenge and verifier lengths, caps pending codes globally and per session, requires an approved user to consent, and sends no-store headers on responses that carry a code or token. A code is issued only after the signed-in user approves on a confirmation page, through a same-origin JSON request.
+      description: CLI login rejects ports below 1024, checks PKCE challenge and verifier lengths, caps pending codes globally and per session, limits each endpoint to 20 requests per source address per minute by default (cli_login_throttle in gateway.json, 429 with Retry-After past that), requires an approved user to consent, and sends no-store headers on responses that carry a code or token. A code is issued only after the signed-in user approves on a confirmation page, through a same-origin JSON request.
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Bound outstanding SAML sign-ins
+      description: /api/saml/login allows 20 sign-ins per source address per minute by default (login_throttle in saml.json) and answers 429 with Retry-After past that. The gateway also tracks at most 1000 unfinished SAML sign-ins and answers 503 past that, instead of holding them without limit. The post-login return target stays on the gateway and RelayState carries only a short one-time key.
   breaking: []
   internal:
     - timestamp: '2026-10-06T00:00:03.000Z'

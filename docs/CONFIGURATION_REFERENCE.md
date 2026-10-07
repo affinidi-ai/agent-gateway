@@ -171,6 +171,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `webauthn` | Relying-party ID and external origin for passkey registration |
 | `integration` | Notification and webhook integration settings |
 | `sts` | Security Token Service runtime settings. See [`STS.md`](STS.md). |
+| `cli_login_throttle` | Per-source-address limit on each `fabric` CLI login endpoint: `enabled` (default `true`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). |
 | `facilitator_mode` | x402 facilitator behaviour |
 | `cors` | Permitted dashboard origins |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
@@ -270,6 +271,7 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 | Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_slo_url`, `idp_cert_path` |
 | Service provider | `sp_entity_id`, `sp_acs_url`, `sp_key_path`, `sp_cert_path` |
 | Security | `sign_requests`, `require_encrypted_assertions` |
+| Sign-in throttle | `login_throttle`: `enabled` (default `true`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) for `/saml/login` |
 | Claims | `attribute_mapping` from SAML claim URI to user field |
 | Roles | `role_mapping` from identity-provider role to gateway role |
 | Directory | `graph_api` for Microsoft Entra ID group and profile lookup |

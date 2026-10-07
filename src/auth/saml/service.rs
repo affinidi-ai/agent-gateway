@@ -1,21 +1,37 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use dashmap::DashMap;
 use openssl::pkey::PKey;
 use openssl::x509::X509;
 use samael::schema::{Assertion, Conditions, Response};
 use std::collections::HashMap;
 use std::fs;
-use tracing::info;
+use tracing::{info, warn};
 
+use super::pending_requests::PendingRequests;
+use super::relay_state::ReturnTargetStore;
 use crate::auth::auth_config::SamlConfig;
 
-/// How long an SP-initiated AuthnRequest stays outstanding, waiting for a
-/// matching response's InResponseTo.
-const AUTHN_REQUEST_TTL: Duration = Duration::minutes(5);
+/// How long an SP-initiated AuthnRequest, and the return target kept for it,
+/// stays outstanding, waiting for a matching response's InResponseTo.
+pub(super) const AUTHN_REQUEST_TTL: Duration = Duration::minutes(5);
 
 /// Clock skew tolerance applied to assertion NotBefore/NotOnOrAfter checks.
 const CLOCK_SKEW: Duration = Duration::seconds(180);
+
+/// Too many AuthnRequests are outstanding to start another sign-in.
+#[derive(Debug)]
+pub struct TooManyPendingAuthnRequests;
+
+impl std::fmt::Display for TooManyPendingAuthnRequests {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.write_str("too many SAML sign-ins are in progress")
+    }
+}
+
+impl std::error::Error for TooManyPendingAuthnRequests {}
 
 /// SAML Service Provider implementation
 pub struct SamlService {
@@ -35,10 +51,11 @@ pub struct SamlService {
     /// SP certificate (if sign_requests = true)
     sp_cert: Option<X509>,
 
-    /// IDs of outstanding SP-initiated AuthnRequests, keyed to their
-    /// expiry, so a response's InResponseTo can be matched and consumed
-    /// (single-use) against a request this service actually sent.
-    pending_requests: DashMap<String, DateTime<Utc>>,
+    /// Outstanding SP-initiated AuthnRequests, matched once against a response's InResponseTo.
+    pending_requests: PendingRequests,
+
+    /// Post-login return targets, keyed by the one-time `RelayState` sent with the request.
+    return_targets: ReturnTargetStore,
 }
 
 impl SamlService {
@@ -93,7 +110,8 @@ impl SamlService {
             idp_cert_thumbprints,
             sp_key,
             sp_cert,
-            pending_requests: DashMap::new(),
+            pending_requests: PendingRequests::default(),
+            return_targets: ReturnTargetStore::default(),
         })
     }
 
@@ -136,10 +154,13 @@ impl SamlService {
         Ok(metadata)
     }
 
-    /// Create an authentication request (for SP-initiated flow).
-    pub fn create_authn_request_with_relay_state(
+    /// Create an authentication request (for SP-initiated flow). Fails with
+    /// [`TooManyPendingAuthnRequests`] when too many requests are still outstanding. A return
+    /// target is kept on the gateway and only its one-time key is sent as `RelayState`; when that
+    /// store is full the request goes without one, so the sign-in lands on the dashboard root.
+    pub fn create_authn_request(
         &self,
-        relay_state: Option<&str>,
+        return_target: Option<&str>,
     ) -> Result<String> {
         use uuid::Uuid;
 
@@ -148,10 +169,12 @@ impl SamlService {
         let issue_instant = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let now = Utc::now();
-        self.pending_requests
-            .retain(|_, expiry| *expiry > now);
-        self.pending_requests
-            .insert(request_id.clone(), now + AUTHN_REQUEST_TTL);
+        if !self
+            .pending_requests
+            .register(request_id.clone(), now)
+        {
+            return Err(TooManyPendingAuthnRequests.into());
+        }
 
         // Create AuthnRequest XML
         let authn_request = format!(
@@ -187,12 +210,31 @@ impl SamlService {
 
         // Create redirect URL
         let mut redirect_url = format!("{}?SAMLRequest={}", self.config.idp_sso_url, encoded_url);
-        if let Some(relay) = relay_state {
-            redirect_url.push_str(&format!("&RelayState={}", urlencoding::encode(relay)));
+        let relay_state = return_target.and_then(|target| {
+            let key = self
+                .return_targets
+                .insert(target, now);
+            if key.is_none() {
+                warn!("Too many pending SAML return targets; sending the AuthnRequest without RelayState");
+            }
+            key
+        });
+        if let Some(key) = relay_state {
+            redirect_url.push_str(&format!("&RelayState={key}"));
         }
 
         info!("Created SAML AuthnRequest (signed: {})", self.config.sign_requests);
         Ok(redirect_url)
+    }
+
+    /// Returns the return target stored for a `RelayState` key, once. Unknown, expired and
+    /// already used keys return `None`.
+    pub fn take_return_target(
+        &self,
+        relay_state: &str,
+    ) -> Option<String> {
+        self.return_targets
+            .take(relay_state, Utc::now())
     }
 
     /// Sign an AuthnRequest XML
@@ -455,7 +497,7 @@ fn reject_multiple_assertions(xml: &str) -> Result<()> {
 fn check_response_structure(
     response: &Response,
     sp_acs_url: &str,
-    pending_requests: &DashMap<String, DateTime<Utc>>,
+    pending_requests: &PendingRequests,
     now: DateTime<Utc>,
 ) -> Result<()> {
     let status = response
@@ -483,8 +525,8 @@ fn check_response_structure(
         .in_response_to
         .as_ref()
         .context("SAML response missing InResponseTo (unsolicited responses are not accepted)")?;
-    match pending_requests.remove(in_response_to) {
-        Some((_, expiry)) if expiry > now => {}
+    match pending_requests.consume(in_response_to) {
+        Some(expiry) if expiry > now => {}
         Some(_) => anyhow::bail!("SAML response's AuthnRequest has expired"),
         None => {
             anyhow::bail!("SAML response does not match an outstanding AuthnRequest (possible replay)")
@@ -722,8 +764,8 @@ mod tests {
     #[test]
     fn accepts_matching_pending_request_and_consumes_it() {
         let now = Utc::now();
-        let pending = DashMap::new();
-        pending.insert("req-1".to_string(), now + Duration::minutes(5));
+        let pending = PendingRequests::default();
+        assert!(pending.register("req-1".to_string(), now));
         let response = response_with(Some(SUCCESS), Some(ACS_URL), Some("req-1"));
 
         assert!(check_response_structure(&response, ACS_URL, &pending, now).is_ok());
@@ -733,7 +775,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_in_response_to() {
-        let pending = DashMap::new();
+        let pending = PendingRequests::default();
         let response = response_with(Some(SUCCESS), Some(ACS_URL), Some("unknown"));
         assert!(check_response_structure(&response, ACS_URL, &pending, Utc::now()).is_err());
     }
@@ -741,15 +783,15 @@ mod tests {
     #[test]
     fn rejects_expired_pending_request() {
         let now = Utc::now();
-        let pending = DashMap::new();
-        pending.insert("req-1".to_string(), now - Duration::seconds(1));
+        let pending = PendingRequests::default();
+        assert!(pending.register("req-1".to_string(), now - AUTHN_REQUEST_TTL - Duration::seconds(1)));
         let response = response_with(Some(SUCCESS), Some(ACS_URL), Some("req-1"));
         assert!(check_response_structure(&response, ACS_URL, &pending, now).is_err());
     }
 
     #[test]
     fn rejects_missing_in_response_to() {
-        let pending = DashMap::new();
+        let pending = PendingRequests::default();
         let response = response_with(Some(SUCCESS), Some(ACS_URL), None);
         assert!(check_response_structure(&response, ACS_URL, &pending, Utc::now()).is_err());
     }
@@ -757,8 +799,8 @@ mod tests {
     #[test]
     fn rejects_missing_status() {
         let now = Utc::now();
-        let pending = DashMap::new();
-        pending.insert("req-1".to_string(), now + Duration::minutes(5));
+        let pending = PendingRequests::default();
+        assert!(pending.register("req-1".to_string(), now));
         let response = response_with(None, Some(ACS_URL), Some("req-1"));
         assert!(check_response_structure(&response, ACS_URL, &pending, now).is_err());
     }
@@ -766,8 +808,8 @@ mod tests {
     #[test]
     fn rejects_failure_status_code() {
         let now = Utc::now();
-        let pending = DashMap::new();
-        pending.insert("req-1".to_string(), now + Duration::minutes(5));
+        let pending = PendingRequests::default();
+        assert!(pending.register("req-1".to_string(), now));
         let response =
             response_with(Some("urn:oasis:names:tc:SAML:2.0:status:Requester"), Some(ACS_URL), Some("req-1"));
         assert!(check_response_structure(&response, ACS_URL, &pending, now).is_err());
@@ -776,8 +818,8 @@ mod tests {
     #[test]
     fn rejects_missing_destination() {
         let now = Utc::now();
-        let pending = DashMap::new();
-        pending.insert("req-1".to_string(), now + Duration::minutes(5));
+        let pending = PendingRequests::default();
+        assert!(pending.register("req-1".to_string(), now));
         let response = response_with(Some(SUCCESS), None, Some("req-1"));
         assert!(check_response_structure(&response, ACS_URL, &pending, now).is_err());
     }
@@ -785,8 +827,8 @@ mod tests {
     #[test]
     fn rejects_wrong_destination() {
         let now = Utc::now();
-        let pending = DashMap::new();
-        pending.insert("req-1".to_string(), now + Duration::minutes(5));
+        let pending = PendingRequests::default();
+        assert!(pending.register("req-1".to_string(), now));
         let response = response_with(Some(SUCCESS), Some("https://evil.example/acs"), Some("req-1"));
         assert!(check_response_structure(&response, ACS_URL, &pending, now).is_err());
     }

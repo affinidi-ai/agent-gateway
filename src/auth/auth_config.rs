@@ -61,6 +61,10 @@ pub struct SamlConfig {
     /// Microsoft Graph API configuration for fetching user avatars (optional)
     #[serde(default)]
     pub graph_api: Option<GraphApiConfig>,
+
+    /// Per-source-address limit on starting a SAML sign-in.
+    #[serde(default)]
+    pub login_throttle: crate::config::types::LoginThrottleConfig,
 }
 
 /// Microsoft Graph API configuration

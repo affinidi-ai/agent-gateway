@@ -376,7 +376,13 @@ After onboarding, payload capture lets you watch the traffic at every stage. See
 ## Managing the gateway
 
 Everything is managed from a web dashboard, signed into with a passkey or, for enterprise
-deployments, SAML single sign-on.
+deployments, SAML single sign-on. A SAML sign-in must return from the identity provider within
+five minutes and is accepted once. `/api/saml/login` allows 20 sign-ins per source address per
+minute by default (`login_throttle` in `saml.json`) and answers 429 with `Retry-After` past
+that. The source address is read from `X-Forwarded-For` or `Forwarded`, which a caller can set
+unless a proxy overwrites it, so a request without one is not limited per address. The backstop
+is a cap of 1000 unfinished SAML sign-ins for the whole gateway; past that, `/api/saml/login`
+answers 503 until older ones expire.
 
 The `fabric` CLI signs in through the browser. It opens `/api/auth/cli/authorize` with a
 loopback port and a PKCE challenge. After the dashboard sign-in (passkey or SAML) the browser
@@ -388,12 +394,21 @@ be 1024 or higher, the challenge is a 43 character S256 value, and the verifier 
 characters as defined in RFC 7636. The consent page and its API must be served from the same
 origin: the consent request is accepted only when `Sec-Fetch-Site` is `same-origin`, or when
 `Origin` equals `Host` for clients that do not send it. The user must also be approved. After
-sign-in, the browser returns only to the dashboard root or the CLI authorize path, and for SAML
-that return target travels in `RelayState`. A session holds at most three pending codes, and a
-new request replaces the oldest.
+sign-in, the browser returns only to the dashboard root or the CLI authorize path. For SAML the
+gateway keeps that return target for five minutes and sends only a one-time 32 character key as
+`RelayState`, within the 80 byte limit of the HTTP-Redirect binding. The assertion consumer
+service uses the key once and checks the target again; an unknown, expired or reused key lands
+on the dashboard root. A session holds at most three pending codes, and a new request replaces
+the oldest. The authorize, consent and exchange endpoints each allow 20 requests per source
+address per minute by default (`cli_login_throttle` in `gateway.json`). Past that they answer
+429 with `Retry-After` before any code is issued or redeemed, and exchange answers in JSON. The
+source address comes from `X-Forwarded-For` or `Forwarded`, which a caller can set unless a
+proxy overwrites it, so a request without one is not limited per address. Codes stay safe
+regardless, because each is random, single use, expires in two minutes and needs the PKCE
+verifier.
 
-Known limitations: the login hands the CLI the browser's own session, and the code store is in
-memory so it works with one gateway instance.
+Known limitations: the login hands the CLI the browser's own session, and the code store and the
+SAML return targets are in memory, so the login works with one gateway instance.
 
 Surfaces are built on a canvas by dragging in elements. Adding a caller context element
 extracts the JWT claims a user presents to their agent from an identity provider such as

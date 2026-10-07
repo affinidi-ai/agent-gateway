@@ -1626,7 +1626,7 @@ fn grant_label(grant_type: Option<&str>) -> &'static str {
 
 /// The client source address for throttling, resolved from proxy-forwarded
 /// headers (`X-Forwarded-For` first entry, then RFC 7239 `Forwarded for=`).
-fn client_source_ip(headers: &HeaderMap) -> Option<String> {
+pub(super) fn client_source_ip(headers: &HeaderMap) -> Option<String> {
     first_forwarded_token(headers, "x-forwarded-for").or_else(|| forwarded_directive(headers, "for"))
 }
 
@@ -1673,7 +1673,7 @@ fn emit_issuance_audit(
     );
 }
 
-fn now_secs() -> u64 {
+pub(super) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

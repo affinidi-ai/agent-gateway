@@ -1404,6 +1404,35 @@ pub struct StsRuntimeConfig {
     pub mcp_replay: crate::sts::replay::McpReplayConfig,
 }
 
+/// Per-source-address throttle for a sign-in endpoint (SAML login, CLI login). The source is read
+/// from `X-Forwarded-For` / `Forwarded`; a request without either is not throttled per address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginThrottleConfig {
+    /// Master switch for the throttle.
+    #[serde(default = "sts_throttle_default_true")]
+    pub enabled: bool,
+    /// Per-source-address limit. A source over it waits until its window rolls off.
+    #[serde(default = "default_login_throttle_per_ip")]
+    pub per_ip: RateLimitConfig,
+}
+
+impl Default for LoginThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: sts_throttle_default_true(),
+            per_ip: default_login_throttle_per_ip(),
+        }
+    }
+}
+
+fn default_login_throttle_per_ip() -> RateLimitConfig {
+    RateLimitConfig {
+        requests: 20,
+        window_secs: 60,
+        burst: None,
+    }
+}
+
 /// Selects the replay-protection backend by name. The built-in backend is
 /// `in_process`; additional backends may be registered at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]

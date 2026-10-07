@@ -1,5 +1,6 @@
 //! Throttle for the token endpoint: bounds repeated attempts per client id and
-//! per source address so credential guessing is rate-limited.
+//! per source address so credential guessing is rate-limited. SAML and CLI login
+//! reuse it per source address only, with a bound on tracked addresses.
 //!
 //! Process-local, like the other runtime caches. Counters roll over a
 //! configurable window; a key that exceeds its limit is blocked for a
@@ -7,12 +8,17 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use axum::http::HeaderMap;
 use dashmap::DashMap;
 
-use crate::config::types::{RateLimitConfig, TokenEndpointThrottleConfig};
+use super::handlers::{client_source_ip, now_secs};
+use crate::config::types::{LoginThrottleConfig, RateLimitConfig, TokenEndpointThrottleConfig};
 
 /// Soft cap on retained keys before a sweep of inactive entries.
 const PRUNE_THRESHOLD: usize = 100_000;
+
+/// Caps how many source addresses a sign-in throttle tracks at once.
+const MAX_TRACKED_LOGIN_SOURCES: usize = 10_000;
 
 #[derive(Clone, Copy)]
 struct Limit {
@@ -44,6 +50,8 @@ pub struct TokenEndpointThrottle {
     per_ip: Limit,
     lockout_secs: u64,
     keep_secs: u64,
+    /// New keys past this many are not tracked, so their attempts are not limited.
+    max_keys: usize,
     state: DashMap<String, KeyState>,
     inserts: AtomicUsize,
 }
@@ -62,9 +70,50 @@ impl TokenEndpointThrottle {
                 .window_secs
                 .max(per_ip.window_secs)
                 .max(cfg.lockout_secs),
+            max_keys: usize::MAX,
             state: DashMap::new(),
             inserts: AtomicUsize::new(0),
         }
+    }
+
+    /// A sign-in throttle that only limits source addresses, blocking a source until its window
+    /// rolls off. It tracks about 10,000 sources at most; past that a new source is not limited.
+    pub fn per_source_address(cfg: &LoginThrottleConfig) -> Self {
+        Self::tracking_at_most(cfg, MAX_TRACKED_LOGIN_SOURCES)
+    }
+
+    /// Once `max_keys` sources are tracked and none can be pruned, a new source is let through
+    /// untracked, so the map stays near `max_keys` (concurrent requests can overshoot it by at
+    /// most their own number).
+    fn tracking_at_most(
+        cfg: &LoginThrottleConfig,
+        max_keys: usize,
+    ) -> Self {
+        let per_ip = Limit::from(&cfg.per_ip);
+        Self {
+            enabled: cfg.enabled,
+            failed_attempts_only: false,
+            per_client: per_ip,
+            per_ip,
+            lockout_secs: 0,
+            keep_secs: per_ip.window_secs,
+            max_keys,
+            state: DashMap::new(),
+            inserts: AtomicUsize::new(0),
+        }
+    }
+
+    /// Records one attempt for the request's source address and returns how long it must wait
+    /// when it is over its limit. `None` when the request carries no `X-Forwarded-For` /
+    /// `Forwarded` address, so such a request is never throttled here.
+    pub fn record_source_attempt(
+        &self,
+        headers: &HeaderMap,
+    ) -> Option<u64> {
+        let ip = client_source_ip(headers)?;
+        let now = now_secs();
+        self.record(None, Some(&ip), now);
+        self.retry_after(None, Some(&ip), now)
     }
 
     /// Whether only failed client authentications should be recorded (vs every request).
@@ -140,6 +189,12 @@ impl TokenEndpointThrottle {
         limit: Limit,
         now: u64,
     ) {
+        if self.state.len() >= self.max_keys && !self.state.contains_key(&key) {
+            self.prune(now);
+            if self.state.len() >= self.max_keys {
+                return;
+            }
+        }
         let mut st = self
             .state
             .entry(key)
@@ -254,6 +309,59 @@ mod tests {
             t.retry_after(Some("c1"), None, 45)
                 .is_none(),
             "once the window rolls off the key is free again"
+        );
+    }
+
+    fn login_limit(requests: u32) -> LoginThrottleConfig {
+        LoginThrottleConfig {
+            enabled: true,
+            per_ip: RateLimitConfig {
+                requests,
+                window_secs: 60,
+                burst: None,
+            },
+        }
+    }
+
+    #[test]
+    fn per_source_address_blocks_until_the_window_rolls_off() {
+        let t = TokenEndpointThrottle::per_source_address(&login_limit(2));
+        for _ in 0..3 {
+            t.record(None, Some("203.0.113.7"), 1_000);
+        }
+
+        assert_eq!(t.retry_after(None, Some("203.0.113.7"), 1_000), Some(60));
+        assert_eq!(t.retry_after(None, Some("203.0.113.8"), 1_000), None);
+        assert_eq!(t.retry_after(None, Some("203.0.113.7"), 1_060), None);
+    }
+
+    #[test]
+    fn per_source_address_tracks_at_most_max_keys_sources() {
+        let t = TokenEndpointThrottle::tracking_at_most(&login_limit(1), 2);
+        for ip in ["a", "b", "c"] {
+            t.record(None, Some(ip), 1_000);
+            t.record(None, Some(ip), 1_000);
+        }
+
+        assert_eq!(t.state.len(), 2);
+        assert!(
+            t.retry_after(None, Some("c"), 1_000)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn per_source_address_tracks_a_new_source_once_inactive_ones_are_pruned() {
+        let t = TokenEndpointThrottle::tracking_at_most(&login_limit(1), 2);
+        for ip in ["a", "b"] {
+            t.record(None, Some(ip), 1_000);
+        }
+        t.record(None, Some("c"), 1_060);
+        t.record(None, Some("c"), 1_060);
+
+        assert!(
+            t.retry_after(None, Some("c"), 1_060)
+                .is_some()
         );
     }
 

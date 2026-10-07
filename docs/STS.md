@@ -261,7 +261,9 @@ grant). With `failed_attempts_only=true` only `invalid_client` rejections (bad
 or missing client credentials) count toward the limit; otherwise every request
 counts. `TokenEndpointThrottle` is a `DashMap` of per-key windows
 (`from_config` / `retry_after` / `record`) with opportunistic pruning. Enabled by
-default with conservative limits; `enabled=false` disables it entirely.
+default with conservative limits; `enabled=false` disables it entirely. SAML and
+CLI login reuse it through `per_source_address` and `record_source_attempt`, which
+limit source addresses only and track at most about 10,000 of them.
 
 ## Observability
 

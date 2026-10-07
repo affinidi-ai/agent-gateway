@@ -64,6 +64,10 @@ pub struct NetworkConfig {
     /// STS (`/oauth2/token`) runtime controls (replay-protection backend, throttle).
     #[serde(default)]
     pub sts: crate::config::types::StsRuntimeConfig,
+
+    /// Per-source-address limit on each `fabric` CLI login endpoint.
+    #[serde(default)]
+    pub cli_login_throttle: crate::config::types::LoginThrottleConfig,
 }
 
 /// DID configuration

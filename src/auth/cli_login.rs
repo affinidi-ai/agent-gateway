@@ -2,8 +2,8 @@
 //!
 //! The session token is returned only on the back-channel exchange, never in a browser URL.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -25,6 +25,8 @@ use uuid::Uuid;
 use crate::auth::session::{SessionManager, TermsSessionGate};
 use crate::auth::storage::PasskeyStorage;
 use crate::auth_manager::middleware::{extract_session_token_from_headers, user_is_approved};
+use crate::config::types::LoginThrottleConfig;
+use crate::sts::throttle::TokenEndpointThrottle;
 
 /// Dashboard page that asks the signed-in user to approve the CLI login.
 const CONSENT_PAGE_PATH: &str = "/cli-consent";
@@ -59,6 +61,9 @@ struct PendingCliAuth {
 pub struct CliLoginStore {
     entries: DashMap<String, PendingCliAuth>,
     next_sequence: AtomicU64,
+    /// Held across cleanup, eviction, the cap check and the insert, so concurrent creates cannot
+    /// all see room below a cap and then overshoot it.
+    create_lock: Mutex<()>,
 }
 
 impl CliLoginStore {
@@ -71,6 +76,10 @@ impl CliLoginStore {
         code_challenge: String,
         session_token: String,
     ) -> Option<String> {
+        let _guard = self
+            .create_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         self.entries
             .retain(|_, pending| pending.expires_at > now);
@@ -144,9 +153,28 @@ impl CliLoginStore {
     }
 }
 
+/// Per-source-address limits, one per endpoint, so a source's authorize retries do not use up
+/// its exchange budget. A request without `X-Forwarded-For` / `Forwarded` is not limited here.
+pub struct CliLoginThrottles {
+    authorize: TokenEndpointThrottle,
+    consent: TokenEndpointThrottle,
+    exchange: TokenEndpointThrottle,
+}
+
+impl CliLoginThrottles {
+    pub fn new(config: &LoginThrottleConfig) -> Self {
+        Self {
+            authorize: TokenEndpointThrottle::per_source_address(config),
+            consent: TokenEndpointThrottle::per_source_address(config),
+            exchange: TokenEndpointThrottle::per_source_address(config),
+        }
+    }
+}
+
 pub fn cli_login_router(
     session_manager: Arc<SessionManager>,
     user_storage: Arc<PasskeyStorage>,
+    throttle: &LoginThrottleConfig,
 ) -> Router {
     Router::new()
         .route("/auth/cli/authorize", get(authorize))
@@ -155,6 +183,21 @@ pub fn cli_login_router(
         .layer(Extension(session_manager))
         .layer(Extension(user_storage))
         .layer(Extension(Arc::new(CliLoginStore::new())))
+        .layer(Extension(Arc::new(CliLoginThrottles::new(throttle))))
+}
+
+const THROTTLED_MESSAGE: &str = "too many CLI login requests; retry later";
+
+/// `429` with `Retry-After`, never cached.
+fn throttled(
+    retry_after: u64,
+    body: impl IntoResponse,
+) -> Response {
+    let mut response = no_store((StatusCode::TOO_MANY_REQUESTS, body).into_response());
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,8 +219,15 @@ fn is_valid_login_request(
 pub async fn authorize(
     headers: HeaderMap,
     Extension(session_manager): Extension<Arc<SessionManager>>,
+    Extension(throttles): Extension<Arc<CliLoginThrottles>>,
     Query(query): Query<AuthorizeQuery>,
 ) -> Response {
+    if let Some(retry_after) = throttles
+        .authorize
+        .record_source_attempt(&headers)
+    {
+        return throttled(retry_after, THROTTLED_MESSAGE);
+    }
     if !is_valid_login_request(query.port, &query.state, &query.challenge) {
         return (StatusCode::BAD_REQUEST, "invalid CLI login request").into_response();
     }
@@ -217,8 +267,15 @@ pub async fn consent(
     Extension(session_manager): Extension<Arc<SessionManager>>,
     Extension(user_storage): Extension<Arc<PasskeyStorage>>,
     Extension(store): Extension<Arc<CliLoginStore>>,
+    Extension(throttles): Extension<Arc<CliLoginThrottles>>,
     body: Bytes,
 ) -> Response {
+    if let Some(retry_after) = throttles
+        .consent
+        .record_source_attempt(&headers)
+    {
+        return throttled(retry_after, THROTTLED_MESSAGE);
+    }
     if !is_same_origin_request(&headers) {
         return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
     }
@@ -301,10 +358,22 @@ pub struct ExchangeResponse {
     pub session_token: String,
 }
 
+/// A throttled source gets a JSON error and its code is left untouched, so the CLI can retry.
 pub async fn exchange(
+    headers: HeaderMap,
     Extension(store): Extension<Arc<CliLoginStore>>,
+    Extension(throttles): Extension<Arc<CliLoginThrottles>>,
     Json(request): Json<ExchangeRequest>,
 ) -> Response {
+    if let Some(retry_after) = throttles
+        .exchange
+        .record_source_attempt(&headers)
+    {
+        return throttled(
+            retry_after,
+            Json(serde_json::json!({ "error": "too_many_requests", "error_description": THROTTLED_MESSAGE })),
+        );
+    }
     if request.code.len() != CODE_LEN || !is_valid_verifier(&request.verifier) {
         return (StatusCode::BAD_REQUEST, "invalid exchange request").into_response();
     }
@@ -606,6 +675,58 @@ mod tests {
         );
     }
 
+    const CONCURRENT_CREATES: usize = 32;
+
+    fn create_concurrently(
+        store: &CliLoginStore,
+        session_for: impl Fn(usize) -> String + Sync,
+    ) -> usize {
+        let barrier = std::sync::Barrier::new(CONCURRENT_CREATES);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..CONCURRENT_CREATES)
+                .map(|index| {
+                    let barrier = &barrier;
+                    let session_for = &session_for;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store
+                            .create("ch".to_string(), session_for(index))
+                            .is_some()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|created| *created)
+                .count()
+        })
+    }
+
+    #[test]
+    fn concurrent_creates_for_one_session_stay_within_its_cap() {
+        let store = CliLoginStore::new();
+
+        create_concurrently(&store, |_| "session-abc".to_string());
+
+        assert_eq!(store.entries.len(), MAX_PENDING_CODES_PER_SESSION);
+    }
+
+    #[test]
+    fn concurrent_creates_never_exceed_the_pending_cap() {
+        let store = CliLoginStore::new();
+        for index in 0..(MAX_PENDING_CODES - 1) {
+            store
+                .create("ch".to_string(), format!("session-{index}"))
+                .unwrap();
+        }
+
+        let created = create_concurrently(&store, |index| format!("burst-{index}"));
+
+        assert_eq!(created, 1);
+        assert_eq!(store.entries.len(), MAX_PENDING_CODES);
+    }
+
     #[test]
     fn the_oldest_code_of_a_full_session_stops_working() {
         let store = CliLoginStore::new();
@@ -678,7 +799,115 @@ mod tests {
         let token = manager
             .create_session("alice".to_string(), "user-1".to_string())
             .await;
-        (cli_login_router(manager, storage), token, dir)
+        (cli_login_router(manager, storage, &LoginThrottleConfig::default()), token, dir)
+    }
+
+    fn default_throttles() -> Arc<CliLoginThrottles> {
+        Arc::new(CliLoginThrottles::new(&LoginThrottleConfig::default()))
+    }
+
+    fn throttle_of(
+        enabled: bool,
+        requests: u32,
+    ) -> LoginThrottleConfig {
+        LoginThrottleConfig {
+            enabled,
+            per_ip: crate::config::types::RateLimitConfig {
+                requests,
+                window_secs: 60,
+                burst: None,
+            },
+        }
+    }
+
+    struct ThrottledApp {
+        router: Router,
+        token: String,
+        store: Arc<CliLoginStore>,
+        _storage_dir: tempfile::TempDir,
+    }
+
+    async fn throttled_app(throttle: LoginThrottleConfig) -> ThrottledApp {
+        let (storage, storage_dir) = test_storage(UserStatus::Approved).await;
+        let manager = Arc::new(SessionManager::new());
+        let token = manager
+            .create_session("alice".to_string(), "user-1".to_string())
+            .await;
+        let store = Arc::new(CliLoginStore::new());
+        let router = Router::new()
+            .route("/auth/cli/authorize", get(authorize))
+            .route("/auth/cli/consent", post(consent))
+            .route("/auth/cli/exchange", post(exchange))
+            .layer(Extension(manager))
+            .layer(Extension(storage))
+            .layer(Extension(store.clone()))
+            .layer(Extension(Arc::new(CliLoginThrottles::new(&throttle))));
+        ThrottledApp {
+            router,
+            token,
+            store,
+            _storage_dir: storage_dir,
+        }
+    }
+
+    async fn authorize_from(
+        router: &Router,
+        ip: &str,
+    ) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(authorize_uri(52111))
+                    .header("x-forwarded-for", ip)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn exchange_from(
+        router: &Router,
+        ip: Option<&str>,
+        code: &str,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/cli/exchange")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(ip) = ip {
+            request = request.header("x-forwarded-for", ip);
+        }
+        router
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(serde_json::json!({ "code": code, "verifier": TEST_VERIFIER }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn assert_throttled(response: &Response) {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after), "{retry_after}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
     }
 
     async fn approved_app() -> (Router, String, tempfile::TempDir) {
@@ -846,7 +1075,8 @@ mod tests {
             .route("/auth/cli/consent", post(consent))
             .layer(Extension(manager))
             .layer(Extension(storage))
-            .layer(Extension(store));
+            .layer(Extension(store))
+            .layer(Extension(default_throttles()));
 
         let response = post_consent(&router, consent_body(52111), Some(&token), &SAME_ORIGIN_JSON).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -873,7 +1103,8 @@ mod tests {
             .route("/auth/cli/consent", post(consent))
             .layer(Extension(manager))
             .layer(Extension(storage))
-            .layer(Extension(store.clone()));
+            .layer(Extension(store.clone()))
+            .layer(Extension(default_throttles()));
 
         let response = post_consent(&router, consent_body(52111), Some(&token), &SAME_ORIGIN_JSON).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -1097,5 +1328,110 @@ mod tests {
 
         let second = post_exchange(&router, &code, TEST_VERIFIER).await;
         assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn authorize_lets_a_source_under_its_limit_through() {
+        let app = throttled_app(throttle_of(true, 2)).await;
+
+        for _ in 0..2 {
+            assert!(
+                authorize_from(&app.router, "203.0.113.7")
+                    .await
+                    .status()
+                    .is_redirection()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_answers_429_with_retry_after_for_a_source_over_its_limit() {
+        let app = throttled_app(throttle_of(true, 1)).await;
+        authorize_from(&app.router, "203.0.113.7").await;
+
+        let response = authorize_from(&app.router, "203.0.113.7").await;
+
+        assert_throttled(&response);
+        assert!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .is_none()
+        );
+        assert!(app.store.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_cli_login_limit_counts_each_source_separately() {
+        let app = throttled_app(throttle_of(true, 1)).await;
+        authorize_from(&app.router, "203.0.113.7").await;
+        authorize_from(&app.router, "203.0.113.7").await;
+
+        assert!(
+            authorize_from(&app.router, "198.51.100.4")
+                .await
+                .status()
+                .is_redirection()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throttled_consent_issues_no_code() {
+        let app = throttled_app(throttle_of(true, 1)).await;
+        let headers = [SAME_ORIGIN_JSON[0], SAME_ORIGIN_JSON[1], ("x-forwarded-for", "203.0.113.7")];
+        let first = post_consent(&app.router, consent_body(52111), Some(&app.token), &headers).await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = post_consent(&app.router, consent_body(52111), Some(&app.token), &headers).await;
+
+        assert_throttled(&second);
+        assert_eq!(app.store.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_throttled_exchange_answers_json_and_leaves_the_code_redeemable() {
+        let app = throttled_app(throttle_of(true, 1)).await;
+        let code = app
+            .store
+            .create(test_challenge(), app.token.clone())
+            .unwrap();
+        let unknown_code = Uuid::new_v4().to_string();
+        assert_eq!(
+            exchange_from(&app.router, Some("203.0.113.7"), &unknown_code)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let throttled_response = exchange_from(&app.router, Some("203.0.113.7"), &code).await;
+
+        assert_throttled(&throttled_response);
+        let body = throttled_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "too_many_requests");
+        assert_eq!(
+            exchange_from(&app.router, None, &code)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_cli_login_throttle_limits_no_source() {
+        let app = throttled_app(throttle_of(false, 1)).await;
+
+        for _ in 0..5 {
+            assert!(
+                authorize_from(&app.router, "203.0.113.7")
+                    .await
+                    .status()
+                    .is_redirection()
+            );
+        }
     }
 }
