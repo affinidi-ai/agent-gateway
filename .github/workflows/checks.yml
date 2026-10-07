@@ -1,0 +1,84 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # A daily run re-checks `main` against the current advisory database, so an
+  # advisory published after a PR merges is still caught by audit / cargo-deny /
+  # rust-scan rather than never being seen again. Off the hour to dodge the
+  # scheduler rush. `workflow_dispatch` re-runs on demand (e.g. to confirm a fix).
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a new PR push stops the old one.
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  audit:
+    uses: affinidi/pipeline-rust/.github/workflows/audit.yaml@beb4367431eec87376121b50d1f0a295aa203fe5 # main 2026-10-01
+    with:
+      auditIgnore: ''
+
+  cargo-deny:
+    uses: affinidi/pipeline-rust/.github/workflows/cargo-deny.yaml@beb4367431eec87376121b50d1f0a295aa203fe5 # main 2026-10-01
+
+  fmt:
+    uses: affinidi/pipeline-rust/.github/workflows/fmt.yaml@beb4367431eec87376121b50d1f0a295aa203fe5 # main 2026-10-01
+    with:
+      toolchain: '1.95.0'
+      rustflags: '-D warnings --cfg tracing_unstable'
+      ubuntu-rust-deps: "build-essential libdbus-1-dev libssl-dev libsasl2-dev libsasl2-modules cmake libcurl4-openssl-dev libxml2-dev libxmlsec1-dev xmlsec1 libclang-dev pkg-config protobuf-compiler"
+
+  rust-scan:
+    uses: affinidi/pipeline-security/.github/workflows/rust-scanner.yml@3aeeb2ceac5c60e12ebddf3ae7bdf9cae56c78b5 # main 2026-09-23
+    with:
+      repo-path: '.'
+    secrets: inherit
+
+  clippy-all-targets:
+    name: Clippy - all targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-dev libcurl4-openssl-dev libdbus-1-dev \
+            libsasl2-dev libsasl2-modules libssl-dev libxml2-dev libxmlsec1-dev \
+            pkg-config protobuf-compiler xmlsec1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.95.0
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-dev
+
+      - name: Lint gateway binary
+        run: cargo clippy --bin agent-gateway --all-features -- -D warnings
+
+      - name: Lint g2g BDD target
+        run: cargo clippy --test g2g_bdd --all-features -- -D warnings
+
+      - name: Lint g2g BDD support target
+        run: cargo clippy --test g2g_bdd_support --all-features -- -D warnings
+
+      - name: Lint surface BDD target
+        run: cargo clippy --test surface_bdd --all-features -- -D warnings
+
+      - name: Lint surface BDD support target
+        run: cargo clippy --test surface_bdd_support --all-features -- -D warnings

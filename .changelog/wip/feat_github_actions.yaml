@@ -1,0 +1,12 @@
+branch: feat/github_actions
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
+  security:
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Pin GitHub Actions and reusable workflows
+      description: Pin CI dependencies to immutable commits and scope checks to read-only repository access.

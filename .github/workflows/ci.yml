@@ -1,0 +1,380 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Static Rust checks live in checks.yml. This workflow owns frontend, docs,
+  # Gherkin linting, changelog fragments, runtime tests, coverage, BDD, and
+  # smoke validation.
+  frontend:
+    name: Frontend - format, lint, test, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: www/default
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: www/default/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        # Non-blocking: a newly-published advisory should not break unrelated PRs.
+        continue-on-error: true
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        env:
+          CI: true
+        run: npm test -- --watch=false
+
+      - name: Build
+        run: npm run build
+
+  docs:
+    name: Documentation references
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate local links and documented Make targets
+        run: python3 .github/scripts/check_docs.py
+
+  gherkin:
+    name: BDD Gherkin lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check the linter itself
+        run: |
+          python3 -m py_compile scripts/bdd-gherkin.py
+          python3 scripts/bdd-gherkin.py --self-test
+
+      - name: Lint feature files and step bindings
+        run: python3 scripts/bdd-gherkin.py --lint
+
+  changelog:
+    name: Changelog fragment validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.x'
+
+      - name: Install validator dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Test changelog fragment validation
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
+      - name: Validate release PR changelog
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')
+        run: python3 .github/scripts/changelog.py check
+
+      - name: Require a changelog fragment change on pull requests
+        if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && !startsWith(github.head_ref, 'release/')
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          fragment=".changelog/wip/${HEAD_REF//\//_}.yaml"
+          if ! git diff --name-status --find-renames --diff-filter=AMR \
+            "origin/${BASE_REF}...HEAD" | awk -F '\t' -v expected="${fragment}" '
+              ($1 == "A" || $1 == "M") && $2 == expected { found = 1 }
+              $1 ~ /^R[0-9]+$/ && $3 == expected { found = 1 }
+              END { exit !found }
+            '; then
+            echo "::error::Pull requests must add, modify, or rename ${fragment}."
+            exit 1
+          fi
+          python3 .github/scripts/changelog.py check --require "${HEAD_REF}"
+
+  test:
+    name: Test - unit and component
+    runs-on: ubuntu-latest
+    # Owned here rather than via pipeline-rust/test.yaml: that workflow runs a
+    # bare `cargo test`, which builds six copies of this 260k-LOC crate at once
+    # (the bin, the bin under cfg(test), and four BDD binaries) and is
+    # OOM-killed. Scoping to the single bin target is what keeps it in memory.
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-dev libcurl4-openssl-dev libdbus-1-dev \
+            libsasl2-dev libsasl2-modules libssl-dev libxml2-dev libxmlsec1-dev \
+            pkg-config protobuf-compiler xmlsec1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.95.0
+
+      # One cache for every dev-profile job. Per-job caches each hold a
+      # multi-GB target dir and evict one another out of the repository's 10 GB
+      # budget, so every job rebuilds from cold.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-dev
+
+      - name: Prepare test environment
+        run: make config-test
+
+      # Compiling and running are separate steps so an OOM is attributable to
+      # the build rather than to a test.
+      - name: Build test binary
+        run: cargo test --bin agent-gateway --all-features --no-run
+
+      - name: Run unit and component tests
+        run: cargo test --bin agent-gateway --all-features --no-fail-fast
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    # TEMPORARY: runs on pull requests while the job is being proven. Once a
+    # real run confirms the threshold holds, restrict it with
+    # `if: github.event_name != 'pull_request'` to keep PR wall-clock down.
+    env:
+      # Matches the floor the GitLab pipeline enforced for this service.
+      COVERAGE_THRESHOLD: "37"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-dev libcurl4-openssl-dev libdbus-1-dev \
+            libsasl2-dev libsasl2-modules libssl-dev libxml2-dev libxmlsec1-dev \
+            pkg-config protobuf-compiler xmlsec1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.95.0
+          components: llvm-tools-preview
+
+      # Separate from rust-dev: llvm-cov builds instrumented artifacts.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@80466ef8efa80486cdfbddf929453a4f3565c791 # v2.62.34
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Prepare test environment
+        run: make config-test
+
+      # Scoped to the binary target for the same memory reason as the test job;
+      # the summary is written even when the threshold check fails.
+      - name: Measure line coverage
+        run: |
+          set +e
+          set -o pipefail
+          cargo llvm-cov --bin agent-gateway --all-features --summary-only \
+            --fail-under-lines "${COVERAGE_THRESHOLD}" 2>&1 | tee coverage.txt
+          status=$?
+          {
+            echo "### Coverage (threshold ${COVERAGE_THRESHOLD}% lines)"
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+
+      - name: Upload coverage summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-summary
+          path: coverage.txt
+          if-no-files-found: warn
+
+  surface-bdd:
+    name: BDD - surface suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-dev libcurl4-openssl-dev libdbus-1-dev \
+            libsasl2-dev libsasl2-modules libssl-dev libxml2-dev libxmlsec1-dev \
+            pkg-config protobuf-compiler xmlsec1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-dev
+
+      # Each scenario spawns the real gateway binary on a dynamically reserved
+      # port and self-signs its own certificates, so no prepared environment or
+      # mediator is needed. Concurrency defaults to min(cpus, 4); lower it with
+      # BDD_MAX_CONCURRENT_SCENARIOS if scenarios start timing out.
+      - name: Run surface BDD scenarios
+        run: cargo test --test surface_bdd
+
+  g2g-bdd:
+    name: BDD - gateway-to-gateway suite
+    # arm64 because the mediator image is published for linux/arm64 only, with no
+    # multi-arch manifest on any tag. GitLab ran this suite on arm64 runners for
+    # the same reason.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      # Each scenario owns a mediator container plus two gateway processes, so
+      # two scenarios fit the 4-vCPU runner without delaying federation past
+      # its readiness timeout. The Makefile default is 8.
+      G2G_BDD_PARALLELISM: "1"
+      # Preserve per-gateway temp dirs so gateway.log survives for the artifact.
+      BDD_KEEP_TEMP_DIRS: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-dev libcurl4-openssl-dev libdbus-1-dev \
+            libsasl2-dev libsasl2-modules libssl-dev libxml2-dev libxmlsec1-dev \
+            pkg-config protobuf-compiler xmlsec1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-dev
+
+      # Four scenario setups otherwise race to pull these images on a cold
+      # runner, which can exceed the public registry rate limit.
+      - name: Pull BDD images
+        run: scripts/g2g-mediator.sh --print-images | xargs -n 1 docker pull
+
+      # The harness starts a DIDComm mediator per scenario from the public
+      # image in scripts/g2g-mediator.sh, which needs no registry credentials.
+      # The runner's own Docker daemon is used directly, so no port bridging is
+      # required.
+      - name: Run gateway-to-gateway BDD scenarios
+        run: make gw-e2e
+
+      - name: Upload gateway logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: g2g-gateway-logs
+          path: tmp/g2g-gw*/gateway.log
+          if-no-files-found: ignore
+
+  smoke:
+    name: Smoke - backend boots and reports healthy
+    runs-on: ubuntu-latest
+    # Exercises the documented Linux quick start (build -> prepare env -> boot
+    # -> GET /api/v1/health).
+    # PROVISIONAL: non-blocking until a real pipeline run proves it green.
+    # Remove continue-on-error once verified so it gates merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake jq libclang-dev libcurl4-openssl-dev libdbus-1-dev \
+            libsasl2-dev libsasl2-modules libssl-dev libxml2-dev libxmlsec1-dev \
+            pkg-config protobuf-compiler xmlsec1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-dev
+
+      - name: Build gateway binary
+        run: cargo build --bin agent-gateway
+
+      - name: Prepare local environment (non-interactive)
+        run: make config-debug-dev
+
+      - name: Boot gateway and check readiness
+        run: |
+          export AG_IDENTITY_HASH_PEPPER="$(cat envs/identity_hash_pepper)"
+          export AG_BACKUP_ENCRYPTION_KEY="$(cat envs/backup_encryption_key)"
+          cd envs/local
+          "${GITHUB_WORKSPACE}/target/debug/agent-gateway" --config config/config.toml &
+          gateway_pid=$!
+          cd "${GITHUB_WORKSPACE}"
+          trap 'kill "${gateway_pid}" 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do
+            if response="$(curl -ksS --fail-with-body --write-out $'\n%{content_type}' https://localhost:8443/api/v1/health 2>/dev/null)"; then
+              content_type="${response##*$'\n'}"
+              body="${response%$'\n'*}"
+              if [[ "${content_type}" == application/json* ]] && \
+                jq -e '.status == "OK"' <<<"${body}" >/dev/null; then
+                echo "Gateway reported healthy after ${i}s."
+                exit 0
+              fi
+            fi
+            if ! kill -0 "${gateway_pid}" 2>/dev/null; then
+              echo "::error::Gateway process exited before becoming healthy."
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::Gateway did not report healthy within 60s."
+          exit 1
