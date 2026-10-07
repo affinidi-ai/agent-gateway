@@ -259,9 +259,8 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   `outbound_handler.rs::fetch_agent_card`, so it shares the forward step's
   policy: loopback and private targets are allowed, cloud metadata is blocked,
   and redirects are not followed. The fetch has a 5-second timeout and a 64 KiB
-  limit. Credential issuance and Trust Recorder publishing wait for the first
-  fetch of a surface; later fetches run in the background. See
-  [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-names).
+  limit and always runs in the background for the dashboard, never on the
+  request path. See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#agent-card-names).
 - The dashboard's **caller Agent Card fetch**
   (`src/observability/caller_names.rs`) reads a URL taken from the caller's own
   DID document, so the caller chooses it. It goes through
@@ -287,7 +286,7 @@ by default:
 
 The common guard is the address check: a host that is, or resolves to, a loopback,
 private-network, carrier-grade NAT or link-local address (cloud metadata included)
-is refused, and redirects are not followed. Each method also refuses some names
+is refused, and DID document fetches do not follow redirects. Each method also refuses some names
 before resolving them. `did:web` refuses `localhost`, `*.localhost` and `*.local`.
 `did:webvh` also refuses `*.internal`, `home.arpa` and single-label names, so
 `did:webvh:…:mediator` is refused by name, while `did:web:mediator` is refused only
@@ -317,6 +316,33 @@ through the egress guard would need a resolver hook the SDK does not offer, and 
 setting that allows private hosts but keeps link-local refused would have to come
 from the SDK.
 
+#### Agent name resolution
+
+The dashboard's caller naming (`src/observability/caller_names.rs`) also verifies
+agent names: up to four `alsoKnownAs` entries of the form `host/@name` in the caller's
+own DID document, so the caller chooses the hosts. Each entry is resolved through the
+SDK's `agent-names` feature (`HttpRedirectResolver` from the `agent-names` crate), which
+fetches `https://<host>/@<name>` and follows the redirect it serves to a DID. The
+resolved DID must be the caller's own and list the name in its `alsoKnownAs`.
+
+This path does not use the DID resolution host policy above or `src/egress.rs`:
+
+- The resolver has its own HTTP client. `[did_cache] allow_private_hosts` does not
+  apply, and non-public addresses are always refused.
+- Before each request it resolves the host and refuses it if any address is
+  loopback, private-network, carrier-grade NAT, link-local (cloud metadata
+  included), or another special-purpose range. IP literals are checked the same way.
+- It follows at most five redirects by hand and re-checks the address on every hop.
+  Only `https` is accepted, on the first request and on every redirect, on any port.
+- The gateway caps each entry at 10 seconds, below the resolver's own 20-second
+  timeout.
+- Lookups run in the background with at most four concurrent resolutions. Results
+  are cached per DID for 300 seconds, so a dashboard refresh, including every
+  WebSocket tick and `/v1/dashboard/stats`, serves the cache and starts at most one
+  refresh per stale DID.
+- The connection is not pinned to the checked address, so it is open to DNS
+  rebinding (see [Known limitations](#known-limitations)).
+
 ### Known limitations
 
 These are current, unmitigated coverage gaps in the egress controls. They are
@@ -328,6 +354,13 @@ documented here so operators can assess exposure.
   naming `169.254.169.254` is fetched. Keep the flag off wherever an instance
   metadata service is reachable. See
   [DID resolution host policy](#did-resolution-host-policy).
+- **Agent name resolution is open to DNS rebinding.** The `agent-names` resolver
+  checks the host's addresses and then connects through its own client without
+  pinning one, so a caller-controlled host whose DNS answer changes between the
+  check and the connection can reach an internal HTTPS endpoint. The gateway sees
+  only whether a DID came back, so this is a blind request. Closing it needs a
+  resolver that honours `HostPolicy` or pins the checked address, injected through
+  the SDK. See [Agent name resolution](#agent-name-resolution).
 
 - **The legacy stored-MCP-proxy runtime path is not pinned.** A stored MCP Proxy
   serving `2024-11-05` is an `rmcp_openapi` `Server` (`src/mcp_proxies/handlers.rs::McpServerManager`);

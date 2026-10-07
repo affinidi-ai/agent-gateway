@@ -273,7 +273,8 @@ managed agent's name. They are resolved in the background, cached for 300 second
 this order:
 
 1. A verified agent name: a `host/@local` entry in the caller's `alsoKnownAs` that the
-   DID resolver verifies back to the same DID. At most four entries are tried.
+   DID resolver verifies back to the same DID. At most four entries are tried. Their
+   egress controls are in [`POLICY.md`](POLICY.md#agent-name-resolution).
 2. The `name` of the caller's Agent Card, marked unverified. The card is found through a
    DID-document service of type `AgentCard` or `A2AAgentCard`, or whose id ends in
    `#agent-card`. It is fetched under the strict egress policy with a 5-second timeout
