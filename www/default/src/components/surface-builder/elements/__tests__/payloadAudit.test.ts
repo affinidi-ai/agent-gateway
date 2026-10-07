@@ -42,17 +42,21 @@ describe('payload audit (element + slot paths must resolve to AgentSurface field
     expect(isKnownAgentSurfacePath('mcp_legacy_metadata_output')).toBe(true);
   });
 
-  it('recognizes endpoint-local MCP protocol and HTTP settings', () => {
-    for (const path of [
-      'mcp_protocol_mode',
-      'mcp_http',
-      'transit.points[*].mcp_protocol_mode',
-      'transit.points[*].mcp_http',
-    ]) {
+  it('recognizes endpoint-local MCP HTTP settings', () => {
+    for (const path of ['mcp_http', 'transit.points[*].mcp_http']) {
       expect(isKnownAgentSurfacePath(path)).toBe(true);
     }
-    expect(isKnownAgentSurfacePath('target.mcp_protocol_mode')).toBe(false);
     expect(isKnownAgentSurfacePath('access_point.mcp_http')).toBe(false);
+  });
+
+  it('does not recognize the removed MCP protocol mode setting', () => {
+    for (const path of [
+      'mcp_protocol_mode',
+      'transit.points[*].mcp_protocol_mode',
+      'target.mcp_protocol_mode',
+    ]) {
+      expect(isKnownAgentSurfacePath(path)).toBe(false);
+    }
   });
 
   it('every element with a payloadPath writes to a known AgentSurface field', () => {

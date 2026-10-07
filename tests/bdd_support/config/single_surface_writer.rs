@@ -176,9 +176,6 @@ fn write_single_surface_config_inner(
     if let Some(gating) = &surface_config.mcp_tool_gating {
         surface_fixture = surface_fixture.with_mcp_tool_gating(gating.clone());
     }
-    if let Some(mode) = &surface_config.mcp_protocol_mode {
-        surface_fixture = surface_fixture.with_mcp_protocol_mode(mode);
-    }
     if let Some(mcp_http) = &surface_config.mcp_http {
         surface_fixture = surface_fixture.with_mcp_http(mcp_http.clone());
     }

@@ -72,21 +72,13 @@ fn fabric_route_probe_uses_source_protocol_route_and_api_key_headers() {
 fn fabric_route_probe_reaches_an_external_upstream_without_waiting_for_a_mock() {
     let mut target = target_surface();
     target.external_target = true;
-    let (mut topology, link) = topology_with_link("mcp", target);
-    topology
-        .plans
-        .get_mut(&1)
-        .expect("gateway 1 plan")
-        .surfaces
-        .first_mut()
-        .expect("source surface")
-        .mcp_protocol_mode = Some("dual".to_string());
+    let (topology, link) = topology_with_link("mcp", target);
 
     let probe =
         fabric_route_probe(&topology, &link, FabricRouteProbeStage::AfterPolicies).expect("probe should be built");
 
     assert_eq!(probe.body["method"], "tools/list");
-    // A dual surface is probed as modern.
+    // An MCP surface in front of an external upstream is probed as modern.
     assert!(
         probe.body["params"]
             .get("_meta")
@@ -102,16 +94,8 @@ fn fabric_route_probe_reaches_an_external_upstream_without_waiting_for_a_mock() 
 }
 
 #[test]
-fn a_dual_surface_in_front_of_a_mock_target_is_probed_with_legacy_mcp() {
-    let (mut topology, link) = topology_with_link("mcp", target_surface());
-    topology
-        .plans
-        .get_mut(&1)
-        .expect("gateway 1 plan")
-        .surfaces
-        .first_mut()
-        .expect("source surface")
-        .mcp_protocol_mode = Some("dual".to_string());
+fn an_mcp_surface_in_front_of_a_mock_target_is_probed_with_legacy_mcp() {
+    let (topology, link) = topology_with_link("mcp", target_surface());
 
     let probe =
         fabric_route_probe(&topology, &link, FabricRouteProbeStage::AfterPolicies).expect("probe should be built");
@@ -252,16 +236,14 @@ fn write_fabric_gateway_config_seeds_mcp_tool_policy_definition() {
 }
 
 #[test]
-fn write_fabric_gateway_config_writes_protocol_mode_with_the_gateway_origins() {
+fn write_fabric_gateway_config_writes_the_gateway_origins_on_mcp_surfaces() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
-    let mut surface = target_surface();
-    surface.mcp_protocol_mode = Some("dual".to_string());
 
     write_fabric_gateway_config(
         temp_dir.path(),
         32006,
         None,
-        &[surface, SurfaceSpec::new("bravo", "/bravo", "mcp", "http://bravo.example")],
+        &[target_surface(), SurfaceSpec::new("bravo", "/bravo", "a2a", "http://bravo.example")],
     );
 
     let read = |id: &str| -> serde_json::Value {
@@ -275,21 +257,18 @@ fn write_fabric_gateway_config_writes_protocol_mode_with_the_gateway_origins() {
         )
         .expect("parse surface json")
     };
-    let dual = read("alpha");
-    assert_eq!(dual["mcp_protocol_mode"], "dual");
+    let mcp = read("alpha");
+    assert!(
+        mcp.get("mcp_protocol_mode")
+            .is_none()
+    );
     assert_eq!(
-        dual["mcp_http"]["allowed_origins"],
+        mcp["mcp_http"]["allowed_origins"],
         serde_json::json!(["http://localhost:32006", "http://127.0.0.1:32006"])
     );
-    let legacy = read("bravo");
+    let a2a = read("bravo");
     assert!(
-        legacy
-            .get("mcp_protocol_mode")
-            .is_none_or(serde_json::Value::is_null)
-    );
-    assert!(
-        legacy
-            .get("mcp_http")
+        a2a.get("mcp_http")
             .is_none_or(serde_json::Value::is_null)
     );
 }

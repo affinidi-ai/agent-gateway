@@ -157,13 +157,11 @@ fn build_surface_fixture(
     if let Some(proxy) = &surface.mcp_proxy {
         fixture = fixture.with_mcp_proxy_id(proxy.proxy_id.clone());
     }
-    if let Some(mode) = &surface.mcp_protocol_mode {
-        // A modern endpoint checks Origin, so it accepts the gateway's own
+    if surface.protocol == "mcp" {
+        // An MCP endpoint checks Origin, so it accepts the gateway's own
         // origin under both loopback names callers use.
         let loopback = listen_address.replacen("localhost", "127.0.0.1", 1);
-        fixture = fixture
-            .with_mcp_protocol_mode(mode.clone())
-            .with_mcp_http(serde_json::json!({ "allowed_origins": [listen_address, loopback] }));
+        fixture = fixture.with_mcp_http(serde_json::json!({ "allowed_origins": [listen_address, loopback] }));
     }
     if let Some(target_auth) = &surface.target_auth {
         fixture = fixture.with_target_auth(static_secret_target_auth_json(

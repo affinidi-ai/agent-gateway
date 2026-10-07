@@ -99,17 +99,17 @@ const accessPoint = (route) => ({
   terminate_trace_id: false,
 });
 const target = (endpoint) => ({ endpoint, mcp_tool_policies_enabled: false, identity_injection: { inject_vp: false } });
-const dual = (origin) => ({ mcp_protocol_mode: 'dual', mcp_http: { allowed_origins: [origin] } });
+const mcpHttp = (origin) => ({ mcp_http: { allowed_origins: [origin] } });
 
 const surfaces = [
   {
     surface_id: 'conformance-forwarding',
     name: 'Conformance forwarding',
-    description: 'Dual MCP Access Point and Transit Point fronting the reference server',
+    description: 'MCP Access Point and Transit Point fronting the reference server',
     status: 'active',
     access_point: accessPoint('/conformance/mcp'),
     target: target(upstream),
-    ...dual(inbound),
+    ...mcpHttp(inbound),
     transit: {
       points: [
         {
@@ -121,7 +121,7 @@ const surfaces = [
           identity_injection: { inject_vp: false },
           listen_path: '/transit/conformance-mcp',
           require_transit_token: false,
-          ...dual(outbound),
+          ...mcpHttp(outbound),
         },
       ],
       outbound_listen_address: outbound,
@@ -132,19 +132,20 @@ const surfaces = [
   {
     surface_id: 'conformance-proxy-surface',
     name: 'Conformance proxy surface',
-    description: 'Dual MCP Access Point dispatching to the gateway-owned Proxy',
+    description: 'MCP Access Point dispatching to the gateway-owned Proxy',
     status: 'active',
     access_point: accessPoint('/conformance/owned-mcp'),
     target: target('proxy://conformance-owned'),
-    ...dual(inbound),
+    ...mcpHttp(inbound),
   },
   {
     surface_id: 'conformance-legacy',
     name: 'Conformance legacy',
-    description: 'MCP Access Point without a protocol mode, fronting the reference server',
+    description: 'MCP Access Point whose record still carries the retired protocol mode, fronting the reference server',
     status: 'active',
     access_point: accessPoint('/conformance/legacy-mcp'),
     target: target(upstream),
+    mcp_protocol_mode: 'legacy',
   },
 ];
 fs.mkdirSync(path.join(storageDir, 'agent_surfaces'), { recursive: true });
@@ -166,7 +167,7 @@ const ownedProxy = {
   channel_prefix: '/owned',
   endpoint_path: '/api',
   flatten_post_params: false,
-  ...dual(inbound),
+  ...mcpHttp(inbound),
   created_at: now,
   updated_at: now,
 };

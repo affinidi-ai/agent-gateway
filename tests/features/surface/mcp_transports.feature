@@ -16,14 +16,6 @@ Feature: MCP transport contracts
     Then both calls receive a reply as an SSE message event
     And REST API "bravo" received exactly 2 requests
 
-  Scenario: Legacy SSE stays available on a dual-era surface
-    Given REST API "bravo" exposes a Weather OpenAPI
-    And MCP surface "alpha" exists for route "/example" targeting an MCP proxy endpoint backed by REST API "bravo"
-    And the surface uses "dual" MCP protocol mode
-    When the caller sends two MCP tool calls over Legacy SSE on the same session
-    Then both calls receive a reply as an SSE message event
-    And REST API "bravo" received exactly 2 requests
-
   Scenario: Streamable HTTP initialize response is SSE-wrapped and carries Mcp-Session-Id
     Given MCP surface "alpha" targets MCP server "bravo"
     And MCP server "bravo" supports initialization
@@ -34,7 +26,6 @@ Feature: MCP transport contracts
 
   Scenario Outline: A modern tool call completes without a protocol session
     Given MCP surface "alpha" targets MCP server "bravo"
-    And the surface uses "dual" MCP protocol mode
     And MCP server "bravo" supports modern tool invocation with "<content_type>" responses
     When the caller invokes MCP tool "echo" using protocol version "2026-07-28" without a protocol session
     Then the response status is 200
@@ -54,7 +45,6 @@ Feature: MCP transport contracts
 
   Scenario: Modern progress reaches the caller before the tool completes
     Given MCP surface "alpha" targets MCP server "bravo"
-    And the surface uses "dual" MCP protocol mode
     And MCP server "bravo" reports progress while MCP tool "echo" is still running
     When the caller invokes MCP tool "echo" using protocol version "2026-07-28" without a protocol session
     Then the response status is 200
@@ -64,9 +54,8 @@ Feature: MCP transport contracts
     And the MCP response result matches MCP server "bravo" response result
     And the MCP response stream closes after the final response
 
-  Scenario: An untrusted Origin cannot invoke a tool on a dual-era surface
+  Scenario: An untrusted Origin cannot invoke a tool on an MCP surface
     Given MCP surface "alpha" targets MCP server "bravo"
-    And the surface uses "dual" MCP protocol mode
     And the surface accepts MCP Origin "https://allowed.example"
     And MCP server "bravo" supports modern tool invocation with "application/json" responses
     When the caller invokes MCP tool "echo" using protocol version "2026-07-28" with Origin "https://untrusted.example"
@@ -75,7 +64,6 @@ Feature: MCP transport contracts
 
   Scenario: Disconnecting a quiet modern response cancels tool work
     Given MCP surface "alpha" targets MCP server "bravo"
-    And the surface uses "dual" MCP protocol mode
     And MCP server "bravo" keeps MCP tool "echo" running without progress messages
     And the caller has an open modern MCP response stream for tool "echo"
     When the caller closes the MCP response stream

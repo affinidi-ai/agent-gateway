@@ -1002,9 +1002,6 @@ fn retain_mcp_settings(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
 ) {
-    surface.mcp_protocol_mode = surface
-        .mcp_protocol_mode
-        .or(existing.mcp_protocol_mode);
     retain_mcp_http(&mut surface.mcp_http, existing.mcp_http.as_ref());
     let retain_points = |points: &mut [crate::config::agent_surface::TransitPoint],
                          stored: &[crate::config::agent_surface::TransitPoint]| {
@@ -1013,9 +1010,6 @@ fn retain_mcp_settings(
                 .iter()
                 .find(|previous| previous.id == point.id)
             {
-                point.mcp_protocol_mode = point
-                    .mcp_protocol_mode
-                    .or(previous.mcp_protocol_mode);
                 retain_mcp_http(&mut point.mcp_http, previous.mcp_http.as_ref());
             }
         }
@@ -2171,7 +2165,7 @@ mod validation_tests {
             outbound_credentials: Vec::new(),
             identity_slots: Default::default(),
             mcp_legacy_metadata_output: None,
-            mcp_protocol_mode: None,
+            _retired_protocol_mode: Default::default(),
             mcp_http: None,
         }
     }

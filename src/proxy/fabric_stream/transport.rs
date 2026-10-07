@@ -871,7 +871,6 @@ mod tests {
                 request.clone(),
                 limits,
                 crate::mcp::modern::ForwardingSupport::for_endpoint(
-                    Some(crate::config::McpProtocolMode::Dual),
                     false,
                     crate::mcp::request_validation::McpPathKind::FabricReceive,
                 ),
@@ -1236,7 +1235,6 @@ mod tests {
                         },
                         crate::mcp::modern_sse::SseLimits::from(&crate::config::McpHttpConfig::default()),
                         crate::mcp::modern::ForwardingSupport::for_endpoint(
-                            Some(crate::config::McpProtocolMode::Dual),
                             false,
                             crate::mcp::request_validation::McpPathKind::FabricReceive,
                         ),

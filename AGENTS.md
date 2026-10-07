@@ -108,10 +108,9 @@ let OPA decide instead: Trust Check, and caller source authentication. A surface
 reject unauthenticated callers needs a policy denying `input.source_auth.method == "failed"`.
 See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
-**MCP revisions are admitted per transport path and per endpoint.** `2026-07-28` is
-admitted alongside `2024-11-05` on endpoints set to `dual`; `legacy` and
-unset endpoints admit only `2024-11-05`. Resolve versions through `runtime_policy_for` /
-`endpoint_version_policy` ([`src/mcp/request_validation.rs`](src/mcp/request_validation.rs)),
+**MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`
+alongside `2024-11-05`. Resolve versions through `runtime_policy_for` /
+`admission_policy_for_target` ([`src/mcp/request_validation.rs`](src/mcp/request_validation.rs)),
 never an appliance-wide constant. See [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md).
 
 ### Where the detail lives
@@ -124,7 +123,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Policy planes, egress and SSRF, policy audit logging                           | [`docs/POLICY.md`](docs/POLICY.md)                                   |
 | Protocol revisions, A2A version negotiation, validation boundaries, AP2 gating | [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)                             |
 | MCP metadata contract and the tool-gating firewall                             | [`docs/MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md)                 |
-| MCP 2026-07-28, protocol modes, `mcp_http`, Resource Server, conformance       | [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md)                       |
+| MCP 2026-07-28, modern admission, `mcp_http`, Resource Server, conformance     | [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md)                       |
 | Fabric, peer issuer DIDs, envelope replay                                      | [`docs/FABRIC.md`](docs/FABRIC.md)                                   |
 | Token exchange and ID-JAG                                                      | [`docs/STS.md`](docs/STS.md)                                         |
 | Management tokens and tenant ownership                                         | [`docs/ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md)                     |

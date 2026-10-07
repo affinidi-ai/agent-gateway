@@ -82,11 +82,11 @@ Feature: HTTP MCP surface forwarding
     And MCP server "bravo" was not called
 
   Scenario: Unsupported modern MCP requests do not enter legacy processing
-    When the caller asks the MCP surface for available tools using protocol version "2026-07-28"
+    When the caller asks the MCP surface for available tools using protocol version "2025-11-25"
     Then the response status is 400
     And the MCP response is a JSON-RPC error with code -32022
     And the MCP response id matches the request id
-    And the MCP unsupported-version error requests "2026-07-28" and supports only "2024-11-05"
+    And the MCP unsupported-version error requests "2025-11-25" and supports only "2024-11-05, 2026-07-28"
     And MCP server "bravo" was not called
 
   Scenario: Mismatched modern MCP method metadata is rejected

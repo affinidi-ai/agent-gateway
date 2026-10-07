@@ -335,7 +335,6 @@ pub struct ForwardingSupport<'support> {
 
 impl ForwardingSupport<'static> {
     pub fn for_endpoint(
-        mode: Option<crate::config::McpProtocolMode>,
         fabric: bool,
         path: super::request_validation::McpPathKind,
     ) -> Self {
@@ -348,7 +347,7 @@ impl ForwardingSupport<'static> {
                 .ok()
                 .is_some_and(|runtime| runtime.supports_subscriptions());
         Self {
-            versions: super::request_validation::endpoint_version_policy(mode, path),
+            versions: super::request_validation::runtime_policy_for(path),
             request_streams: transport,
             subscriptions: transport && subscriptions,
             capabilities: &["tools", "prompts", "resources", "completions", "logging"],
@@ -661,13 +660,8 @@ mod tests {
 
     #[test]
     fn forwarded_discovery_never_exceeds_the_selected_peer_subscription_support() {
-        let support = || {
-            ForwardingSupport::for_endpoint(
-                Some(crate::config::McpProtocolMode::Dual),
-                false,
-                crate::mcp::request_validation::McpPathKind::DirectAccessPoint,
-            )
-        };
+        let support =
+            || ForwardingSupport::for_endpoint(false, crate::mcp::request_validation::McpPathKind::DirectAccessPoint);
         assert!(support().subscriptions);
         assert!(
             !support()
@@ -686,12 +680,8 @@ mod tests {
         );
         // The installed Fabric stream runtime advertises subscriptions.
         assert!(
-            ForwardingSupport::for_endpoint(
-                Some(crate::config::McpProtocolMode::Dual),
-                true,
-                crate::mcp::request_validation::McpPathKind::FabricSend,
-            )
-            .subscriptions
+            ForwardingSupport::for_endpoint(true, crate::mcp::request_validation::McpPathKind::FabricSend,)
+                .subscriptions
         );
     }
 

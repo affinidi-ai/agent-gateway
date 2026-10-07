@@ -2,22 +2,19 @@
 
 Trust Gateway supports canonical MCP metadata and the historical Affinidi
 metadata format. This is a metadata migration, not a protocol-era bridge.
-`2024-11-05` is active and advertised on every MCP endpoint. `2026-07-28` is
-admitted and advertised alongside it only on endpoints whose
-`mcp_protocol_mode` is `dual`. On `legacy` endpoints and endpoints without a
-mode (the default), valid modern requests are rejected with HTTP `400`,
-JSON-RPC `-32022`, `data.requested: "2026-07-28"`, and
-`data.supported: ["2024-11-05"]`.
+`2024-11-05` and `2026-07-28` are both active and advertised on every MCP
+endpoint: Access Points, Transit Points, standalone MCP Proxies and Fabric
+framed streams. A revision the gateway does not model is rejected with HTTP
+`400`, JSON-RPC `-32022`, `data.requested` echoing it, and `data.supported`
+listing the revisions the path admits.
 
 The accepted and advertised revisions are resolved per transport path
 (`McpPathKind`: direct Access Point, gateway-owned Proxy, Transit Point, Fabric
 receive, Fabric send), not from one appliance-wide value. Every path admits
-`2026-07-28` on dual endpoints, and one path can be returned to legacy-only
-without affecting the others. An endpoint's `mcp_protocol_mode` gates whether
-a path's policy applies at all: `legacy` is always legacy-only. Tests pin each
-path's posture for dual, `legacy` and unset endpoints, that a path never
-advertises a revision it will not accept, and that returning one path to
-legacy-only leaves the rest unchanged.
+`2026-07-28`, and one path can be returned to legacy-only without affecting the
+others. Tests pin each path's posture, that a path never advertises a revision
+it will not accept, and that returning one path to legacy-only leaves the rest
+unchanged.
 
 On Fabric, `2026-07-28` travels only as framed streams (`proxy::fabric_stream`),
 whose local capabilities advertise request streams and subscriptions; the
@@ -67,54 +64,32 @@ Both official MCP schemas put request and notification metadata in
 `params._meta`. Top-level request metadata is an Affinidi compatibility shape,
 not standard legacy MCP.
 
-## Protocol Mode Intent
+## Modern MCP Admission
 
-MCP Agent Surfaces, individual MCP Transit Points, and standalone MCP Proxies
-accept optional `mcp_protocol_mode: "legacy" | "dual"`. Absence means legacy
-and remains absent when serialized. Other Access Point and Transit Point
-protocols reject this setting. A dual Access Point does not enable its Transit
-Points, and an A2A Access Point may independently contain a dual MCP Transit
-Point. Surface variants inherit the Access Point setting; their Transit Point
-catalogs carry independent settings.
+After the HTTP security and size checks below, every MCP endpoint admits
+`2026-07-28` alongside `2024-11-05` on direct Access Points, gateway-owned
+Proxies, Transit Points and, as framed streams, both Fabric paths. There is no
+per-endpoint opt-out. No initialize exchange, session identifier, or
+metadata-output preference changes which revisions an endpoint admits.
 
-**Only dual endpoints execute modern MCP.** After the HTTP security and size
-checks below, a dual endpoint admits `2026-07-28` alongside `2024-11-05` on
-direct Access Points, gateway-owned Proxies, Transit Points and, as framed
-streams, both Fabric paths. A `legacy` endpoint, or one without a mode, answers
-otherwise valid modern traffic with HTTP `400` / `-32022` and only
-`2024-11-05` listed as supported. No initialize exchange, session identifier,
-or metadata-output preference changes that choice.
+The gateway forwards an admitted modern request and validates the answer as a
+modern result, which needs `resultType` and, for lists, cache hints. A
+legacy-only upstream's answer fails that check, so the modern caller gets HTTP
+`502`, while `2024-11-05` callers on the same endpoint are unaffected.
 
-Set `dual` only where the upstream serves `2026-07-28`. The gateway forwards an
-admitted modern request and validates the answer as a modern result, which
-needs `resultType` and, for lists, cache hints. A legacy-only upstream's answer
-fails that check, so the modern caller gets HTTP `502`, while `2024-11-05`
-callers on the same endpoint are unaffected.
+**Compatibility note.** `mcp_protocol_mode` is no longer a setting. Stored
+records and API payloads for surfaces, Transit Points and MCP Proxies that
+still carry it, with any value, load and are accepted; the value is ignored,
+never returned, and dropped the next time the record is saved.
 
-Surface POST uses the supplied mode. PUT retains an omitted or null mode,
-including matching Transit Points in the base and variant catalogs by stable
-IDs; an explicit enum replaces it. Merge PATCH removes the Access Point mode
-with null. To clear a Transit Point mode through RFC 7396, replace its points
-array with the desired records without that field, since arrays merge
-wholesale. Proxy POST and PUT use the same default and omission rules; select
-explicit `legacy` to restore legacy intent through the proxy PUT API. Existing
-tenant authorization and hot reload remain in force.
-
-A variant's Transit Point override keeps its own `mcp_protocol_mode`: setting
-the base Transit Point to `legacy` leaves a variant override that says `dual`
-admitting `2026-07-28` on that variant's traffic. To opt a Transit Point out
-everywhere, set `legacy` on the base record and on the matching record in
-every `variants[].overrides.transit.points` array, then check the GET readback
-for both. (Variants follow the Access Point mode, not their own.)
-
-A surface, Transit Point or MCP Proxy that never sets `mcp_protocol_mode` or
-`mcp_http` is stored exactly as a release without these fields wrote it, so an
-upgrade rewrites no records. To roll back to such a release, first PATCH both
-fields to `null` on every surface that sets them, replace each Transit Point
-array (base and variant) with records that omit them, and verify the GET
-readback. Older binaries reject either field on a surface and skip that whole
-surface at load; on Transit Points and standalone MCP Proxies they ignore both
-fields and drop them the next time they save the record. No older binary
+A surface, Transit Point or MCP Proxy that never sets `mcp_http` is stored
+exactly as a release without that field wrote it, so an upgrade rewrites no
+records. To roll back to such a release, first PATCH `mcp_http` to `null` on
+every surface that sets it, replace each Transit Point array (base and
+variant) with records that omit it, and verify the GET readback. Older
+binaries reject the field on a surface and skip that whole surface at load; on
+Transit Points and standalone MCP Proxies they ignore it and drop it the next
+time they save the record. No older binary
 enforces `mcp_http.authorization`: clearing `mcp_http` removes that requirement
 from a surface's Access Point and from each Transit Point, and a Transit Point
 or MCP Proxy that still carries it is served without it. Protect every endpoint
@@ -158,14 +133,17 @@ quiet cancellation. Route-shape changes still require listener rebuilding.
 
 ## HTTP Endpoint Admission
 
-Optional `mcp_http` config belongs alongside `mcp_protocol_mode` on each MCP
-surface, Transit Point, and standalone MCP Proxy. It is inherited with the
-Access Point by surface variants, not from the Access Point to Transit Points.
-Its omission/null PUT preservation, surface PATCH removal and rollback follow
-the same rules as protocol mode. Explicit `{}` restores default HTTP settings.
+Optional `mcp_http` config belongs on each MCP surface, Transit Point, and
+standalone MCP Proxy. It is inherited with the Access Point by surface
+variants, not from the Access Point to Transit Points. Surface POST uses the
+supplied value; PUT retains an omitted or null value, including matching
+Transit Points in the base and variant catalogs by stable IDs; merge PATCH
+removes the Access Point value with null. To clear a Transit Point value
+through RFC 7396, replace its points array with records without that field,
+since arrays merge wholesale. Explicit `{}` restores default HTTP settings.
 `authorization` is preserved on its own: a PUT that sends an `mcp_http` block
-without it leaves the stored requirement in place, because it is enforced in
-every mode and an unrelated edit must not silently unauthenticate the endpoint.
+without it leaves the stored requirement in place, because an unrelated edit
+must not silently unauthenticate the endpoint.
 Removing it takes a PATCH that sets `mcp_http.authorization` (or `mcp_http`) to
 `null`.
 
@@ -186,25 +164,21 @@ Stream timeouts require idle <= maximum lifetime <= 86400 seconds. Modern
 upstream header acquisition uses the resolved network request timeout (30
 seconds when absent), separately from response-stream deadlines. Modern direct
 calls are not automatically retried after an ambiguous failure.
-Non-MCP endpoints reject the config. `authorization` is enforced in every mode;
-the Origin, size and response settings apply only to dual endpoints and do not
-affect legacy-mode routes. They key off the configured mode, not off the
-revision a request carries, so a dual endpoint applies them to its legacy
-traffic too. Setting `dual` therefore also changes legacy behaviour: existing
-legacy clients on that endpoint can start receiving `403` (Origin), `431`
-(header budget) or `413` (body limit). Size the limits and allowlist the
-origins before switching a live endpoint to `dual`. On dual endpoints the
-configured public HTTP(S)
-listener origins and explicit allowlist are trusted; request Host/Forwarded
-headers and CORS do not grant Origin authority. The Fabric receiver
+Non-MCP endpoints reject the config. Every setting applies to every MCP
+endpoint, whichever revision a request carries, so `2024-11-05` clients also
+receive `403` (Origin), `431` (header budget) or `413` (body limit, 1 MiB by
+default). Size the limits and allowlist browser origins for each endpoint. The
+configured public HTTP(S) listener origins and explicit allowlist are trusted;
+a public endpoint given as a bare listen address (for example `0.0.0.0:8443`)
+names no HTTP(S) origin and adds nothing to the allowlist. Request
+Host/Forwarded headers and CORS do not grant Origin authority. The Fabric receiver
 independently uses its stored Access Point URL and allowlist, so a browser
 Origin that reaches a `fabric://` Access Point must be allowlisted on the
 receiving surface too. A framed request the receiver refuses this way is
 answered on the stream with the same status and JSON-RPC error a direct endpoint
 returns, so the caller gets `403`, not a timeout. Missing Origin is
 allowed for non-browser callers. Present `null`, duplicate, malformed, or
-untrusted Origins return HTTP `403`. These checks also apply to legacy POSTs
-sent to an opted-in endpoint.
+untrusted Origins return HTTP `403`. These checks also apply to legacy POSTs.
 
 Each mounted entry point resolves accepted and advertised revisions from its
 own transport path: the Access Point router uses the direct Access Point
@@ -236,7 +210,7 @@ admitted modern messages. Notifications do not inherit request-only
 Accept requirements; extension notification acceptance is a separate dispatch
 decision.
 
-On dual endpoints, GET/DELETE with an explicit single
+GET/DELETE with an explicit single
 `MCP-Protocol-Version: 2026-07-28` return `405` with `Allow: POST`, even with an
 attached legacy session ID. Unmarked or legacy-version GET/DELETE retain the
 existing route behavior, including legacy GET-SSE. This rule applies to direct
@@ -430,11 +404,9 @@ allow if {
 }
 ```
 
-A policy sees a modern `protocol_version` only on dual endpoints. `legacy`
-endpoints and endpoints without a mode reject modern requests before policy or
-forwarding, so installing that example on a legacy route does not enable
-modern traffic. Test fixtures use an explicit local version policy, never a
-production bypass.
+A policy sees a modern `protocol_version` only for admitted `2026-07-28`
+requests; unmodelled revisions are rejected before policy or forwarding. Test
+fixtures use an explicit local version policy, never a production bypass.
 
 ### Common Modern Message Helpers
 
@@ -487,7 +459,7 @@ No network access is needed during their tests.
 
 Standalone MCP Proxies and surface-backed `proxy://` targets have a modern
 dispatcher for `server/discover`, `tools/list`, `tools/call`, and streaming
-`subscriptions/listen`, reached only through dual endpoints. Discovery
+`subscriptions/listen`, reached by admitted modern requests. Discovery
 advertises tools with `listChanged: true` and the accepted endpoint versions,
 with `resultType: complete`, private zero-TTL cache hints, and server
 information in `result._meta.io.modelcontextprotocol/serverInfo`. Unsupported
@@ -525,8 +497,8 @@ original local pointers. Explicit schema resources retain their `$id`, `$defs`
 and reference scope. Unresolvable external references are never fetched or
 advertised as enforceable tools.
 
-For explicitly dual Proxies whose source schemas the legacy OpenAPI converter
-cannot load, a separate modern routing catalog uses the library only for
+For Proxies whose source schemas the legacy OpenAPI converter cannot load, the
+Proxy registers with a modern-only catalog instead of failing: a separate modern routing catalog uses the library only for
 operation and parameter mapping; original schemas remain authoritative for
 modern validation. That routing catalog is never used by legacy calls, and
 discovery omits legacy support when no legacy catalog exists. Both catalogs
@@ -657,7 +629,7 @@ test-local policy; complete encrypted-route authorization remains a separate
 check.
 
 The full Transit Point handler has a corresponding signed subscription fixture
-on an A2A parent with an independently dual MCP Transit Point. Its own resource
+on an A2A parent with an MCP Transit Point. Its own resource
 audience/scopes and token expiry are enforced before Target work, ingress tokens
 and session headers are stripped, and only the verified delegated credential
 is forwarded. The managed agent has a registered signing key for the existing
@@ -700,7 +672,7 @@ direct, Transit Point and Fabric receive modern request branches use this
 service for gateway-originated consent (MRTR), which needs both
 `[mcp.continuations]` in the bootstrap config (below) and `sts.mcp_issuer`
 (see [MCP Resource Authorization](#mcp-resource-authorization)). A modern
-request to a dual endpoint that has `outbound_credentials` while
+request to an endpoint that has `outbound_credentials` while
 `[mcp.continuations]` is not configured fails with HTTP `503`, JSON-RPC
 `-32603` ("MCP credential service unavailable"); there is no legacy consent
 fallback. Full cross-gateway delivery and callback conformance is not verified.
@@ -1084,8 +1056,8 @@ it, the caller gets `429` and other callers are unaffected. It is counted per
 process, so with DynamoDB each replica applies it separately; with the
 embedded backend it must not exceed `capacity`.
 Unknown backends, bad limits and failed probes never fall back to memory.
-These settings initialize storage and keys only; which revisions an endpoint
-admits follows its `mcp_protocol_mode`, not this section.
+These settings initialize storage and keys only; they do not change which
+revisions an endpoint admits.
 
 Replica-consistent credential storage and refresh locking are not verified,
 and end-to-end MRTR admission/dispatch coverage is incomplete.
@@ -1237,7 +1209,7 @@ Access Points, Transit Points and standalone Proxies; Fabric negative coverage
 proves unavailable receiver authority cannot be bypassed. Complete positive
 Fabric authorization, distributed replay and lifecycle conformance are not
 verified. These opt-in OAuth settings do not change which revisions an
-endpoint admits; that follows its `mcp_protocol_mode`.
+endpoint admits.
 
 ### Tool Parameter Headers
 
@@ -1330,15 +1302,14 @@ The additive DIDComm message types under
 `https://affinidi.com/atm/forward-stream/1.0/` are `frame`,
 `capabilities-query`, and `capabilities-disclose`. Existing `ForwardRequest`
 and `ForwardResponse` messages retain their buffered, legacy-only contract.
-Local stream capabilities advertise request streams and subscriptions; a
-receiving surface admits a framed modern request only when its endpoint is
-`dual`.
+Local stream capabilities advertise request streams and subscriptions; any
+active MCP surface admits a framed modern request.
 
 Capability offers and disclosures are nonce-correlated and bound to the
 authenticated peer, recipient, Connection Point and live listener generation.
 An Open frame identifies its offer, surface and optional variant separately.
 Incoming preparation requires an active configured peer, permitted surface,
-active dual MCP endpoint, an envelope `expires_time` that is present, in the
+active MCP surface, an envelope `expires_time` that is present, in the
 future and at most one hour ahead (as for a `forward-request`), unexpired
 deadline and negotiated limits. It retains
 the resolved surface snapshot for the request lifetime. Every request still
@@ -1356,7 +1327,7 @@ response deadline. The frame says why:
 | Code | Refusal | Sender |
 | --- | --- | --- |
 | `stale_offer` | The Open names no live capability offer, for example after the receiver restarted or the offer expired | Drops its agreement, so the next request negotiates again |
-| `legacy_only` | The surface is active MCP but not `dual` | Answers the caller as a `legacy` endpoint would: `400` / `-32022` listing `2024-11-05` |
+| `legacy_only` | Sent by an older peer whose surface does not admit modern MCP | Answers the caller as a legacy-only endpoint would: `400` / `-32022` listing `2024-11-05` |
 | `unavailable` | Anything else: route, exposure, tenant, limits, envelope times, admission timeout | Keeps its agreement and answers `502` |
 
 Only a stale offer makes the sender negotiate again, so a route the peer
@@ -1548,12 +1519,13 @@ from that partner is refused with `502` until one ends. Two partners at eight
 each fill a receiving surface's 16 slots. Because the per-peer cap applies
 first over Fabric, the 16-per-caller listen limit cannot be reached there.
 
-**Enable `dual` on single-tenant or trusted deployments first.** Gateway-wide
-tables and signals are still shared across tenants and peers: subscription
-invalidation is process-wide, the capability offer and Open replay tables have
-no per-peer or per-tenant caps, and there are no per-tenant limits. Do not
-enable `dual` on a multi-tenant or internet-facing gateway until these are
-scoped. See [Fabric: modern MCP activation](FABRIC.md#modern-mcp-activation).
+**Modern MCP is active on every MCP endpoint, so weigh shared state before
+exposing a multi-tenant or internet-facing gateway.** Gateway-wide tables and
+signals are shared across tenants and peers: subscription invalidation is
+process-wide, the capability offer and Open replay tables have no per-peer or
+per-tenant caps, and there are no per-tenant limits. Prefer single-tenant or
+trusted deployments, or restrict who can reach MCP endpoints and which peers
+are paired, until these are scoped. See [Fabric: modern MCP activation](FABRIC.md#modern-mcp-activation).
 
 ## Configuration Lifecycle
 
@@ -1627,17 +1599,17 @@ scored scenario list comes from
 
 **Binary.** Both phases run the ordinary gateway binary, each on its own
 generated env. The modern phase first probes that the Access Point admits
-`2026-07-28`; every gateway endpoint the suite measures is `dual`. Fabric is
+`2026-07-28`; every gateway endpoint admits it. Fabric is
 measured through a two-gateway topology (the `fabric` target below).
 
 | Target | Endpoint | Scenarios | Baseline |
 | --- | --- | --- | --- |
 | `direct` | The reference server, without the gateway | Full requirement set | `direct.yaml` |
-| `access-point` | Dual Access Point forwarding to the reference server | Full requirement set | `forwarding.yaml` |
-| `transit` | Dual Transit Point on the outbound listener, same upstream | Full requirement set | `forwarding.yaml` |
-| `owned-proxy` | Standalone dual MCP Proxy over an OpenAPI REST fixture | `tools-list`, `tools-call-simple-text`, `caching` | `owned.yaml` |
-| `proxy-surface` | Dual Access Point whose Target is that Proxy (`proxy://`) | Same subset | `owned.yaml` |
-| `fabric` | Dual Access Point on gateway 1 whose Target is `fabric://` gateway 2, whose dual surface forwards to the reference server | Full requirement set | `fabric.yaml` |
+| `access-point` | Access Point forwarding to the reference server | Full requirement set | `forwarding.yaml` |
+| `transit` | Transit Point on the outbound listener, same upstream | Full requirement set | `forwarding.yaml` |
+| `owned-proxy` | Standalone MCP Proxy over an OpenAPI REST fixture | `tools-list`, `tools-call-simple-text`, `caching` | `owned.yaml` |
+| `proxy-surface` | Access Point whose Target is that Proxy (`proxy://`) | Same subset | `owned.yaml` |
+| `fabric` | Access Point on gateway 1 whose Target is `fabric://` gateway 2, whose surface forwards to the reference server | Full requirement set | `fabric.yaml` |
 
 Only the forwarding targets show that the gateway does not alter messages in
 transit. The owned targets run a subset because an OpenAPI-backed Proxy offers
@@ -1681,13 +1653,15 @@ times streamed messages is fixture behaviour.
 
 **Legacy compatibility.** `compat.mjs` runs a `2024-11-05` client session
 (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`) in
-both phases. The Access Point, Transit Point and a surface without a protocol
-mode must return the same results as the reference server directly, and the
-standalone and `proxy://` owned endpoints must return the fixture's text with
-equal results. In the modern phase every dual endpoint must admit
-`2026-07-28` and the surface without a mode must reject it. In the legacy
-phase the surface without a mode must answer `2026-07-28` with HTTP `400`,
-`-32022`, `supported: ["2024-11-05"]` and the request id echoed.
+both phases. The Access Point, Transit Point and the `legacy-surface` Access
+Point, whose stored record deliberately still carries the retired
+`mcp_protocol_mode: "legacy"`, must return the same results as the reference
+server directly, and the standalone and `proxy://` owned endpoints must return
+the fixture's text with equal results. In the modern phase every endpoint,
+`legacy-surface` included, must admit `2026-07-28`. In the legacy phase every
+endpoint must answer the unmodelled `2025-11-25` with HTTP `400`, `-32022`, a
+`supported` list that includes `2024-11-05` and not the requested revision, and
+the request id echoed.
 
 **Running.** `make mcp-conformance` runs both phases, `ARGS=--unit-tests` also
 runs the full binary test suite, and `make mcp-conformance-legacy` runs only
@@ -1711,16 +1685,15 @@ schedule also needs that rule relaxed.
 **Fabric.** The suite speaks HTTP to one URL, so the `fabric` target puts that
 URL in front of a Fabric route. `scripts/mcp-conformance/fabric.feature` runs
 through the g2g BDD runner: two gateways paired over a
-managed mediator in Docker, a dual Access Point on gateway 1 whose Target is
-`fabric://` gateway 2, and a dual surface on gateway 2 forwarding to the shim.
+managed mediator in Docker, an Access Point on gateway 1 whose Target is
+`fabric://` gateway 2, and a surface on gateway 2 forwarding to the shim.
 A step runs the suite against gateway 1, so every request crosses both Fabric
 paths as a framed stream. Gateway 2 allowlists gateway 1's origins, because the
 Fabric receiver checks a forwarded Origin against its own allowlist (see
 [HTTP Endpoint Admission](#http-endpoint-admission)). The feature sits outside
 `tests/features/g2g`, so `make gw-e2e` does not run it, and the CI job leaves
-the target out because it has no Docker daemon. The legacy Fabric posture, a
-surface without a protocol mode rejecting `2026-07-28` before it enters the
-Fabric, keeps its own `make gw-e2e` scenario.
+the target out because it has no Docker daemon. A `make gw-e2e` scenario
+checks that an unmodelled revision is rejected before it enters the Fabric.
 
 ## Implementation Invariants
 
@@ -1728,21 +1701,21 @@ Engineering invariants for the modern MCP work, kept with the MCP contract.
 
 ### Admission, transports and owned dispatch
 
-MCP policy builders carry optional `protocol_version`, `client_capabilities`, and `client_info` from the admitted modern classification through direct, Transit Point, Fabric, Trust Check and per-tool policy inputs. Legacy serialized input stays unchanged. Modern methods and raw params remain extensible; client declarations never establish authenticated identity. Modern context reaches policy only for requests admitted on dual endpoints; explicit unit/component fixtures and the conformance harness described below exercise it. See `docs/MCP_METADATA.md` for the policy contract.
+MCP policy builders carry optional `protocol_version`, `client_capabilities`, and `client_info` from the admitted modern classification through direct, Transit Point, Fabric, Trust Check and per-tool policy inputs. Legacy serialized input stays unchanged. Modern methods and raw params remain extensible; client declarations never establish authenticated identity. Modern context reaches policy only for admitted modern requests; explicit unit/component fixtures and the conformance harness described below exercise it. See `docs/MCP_METADATA.md` for the policy contract.
 
-`mcp_protocol_mode` is an optional `legacy` (default) or `dual` intent on an MCP Agent Surface, each MCP Transit Point independently, and a standalone MCP Proxy. Surface variants inherit the Access Point mode; Transit Point catalogs retain their independent settings. Non-MCP Access Points and Transit Points reject the field. Ordinary PUT saves retain omitted settings by stable surface/variant/Transit Point IDs; surface merge PATCH null removes them. Storing `dual` admits and advertises `2026-07-28` alongside `2024-11-05` on that endpoint; `legacy` or an absent mode admits only `2024-11-05`, and `mcp_legacy_metadata_output` remains independent. `dual` also changes legacy behaviour: `mcp_http`'s Origin, header and body limits key off the configured mode rather than off the request's revision, so legacy clients on a dual endpoint can begin receiving `403`/`431`/`413` (see `docs/MCP_METADATA.md`). Records that do not set these fields save byte-identically to releases without them: `component_tests::mcp_record_compat` loads and re-saves surface, MCP Proxy, vault token and credential provider fixtures (`tests/fixtures/records/`) written by such a release. Before downgrading, PATCH `mcp_protocol_mode` and `mcp_http` to `null` on every surface and rewrite Transit Point arrays without them: older binaries skip a surface that carries either field (`AgentSurface` is `deny_unknown_fields`) and silently ignore, then drop on save, both fields on Transit Points and MCP Proxies. No older binary enforces `mcp_http.authorization`: clearing `mcp_http` removes it from surfaces and Transit Points, and a Transit Point or MCP Proxy that keeps it is served without it, so protect or disable every endpoint that relies on it before downgrading (see `docs/MCP_METADATA.md`). Accepted/advertised revisions resolve **per transport path** (`McpPathKind` in `src/mcp/request_validation.rs`: `DirectAccessPoint`, `OwnedProxy`, `TransitPoint`, `FabricReceive`, `FabricSend`) via `runtime_policy_for`/`endpoint_version_policy`, not from one appliance-wide constant, so one path can be returned to legacy-only without affecting Fabric or any other path. Every path admits `2026-07-28` for dual endpoints, the Fabric legs as framed streams only. The mounted Access Point router, outbound Transit listener and framed Fabric receive each use their own path policy. `admission_policy_for_target` narrows a `fabric://` Access Point or Transit Point Target to the `FabricSend` policy, so a modern request that leg cannot carry (for a `legacy` endpoint, any modern request) gets `400` / `-32022` at admission, before payment, OPA or consent. Buffered Fabric `ForwardRequest` receive is legacy-only; modern MCP crosses Fabric only as framed streams. Unit tests pin each path's posture for dual, `legacy` and unset endpoints, pin that a path never advertises a revision it will not admit, and pin that returning one path to legacy-only leaves the others admitting modern; tests that send `2026-07-28` through a live entry point branch on that path's `runtime_policy_for`, and tests that only need a rejected revision use the unmodelled `2025-11-25`. `no_mcp_surface_scenario_is_a_draft_while_modern_mcp_is_admitted` fails the unit tests if any `tests/features/surface/mcp_*.feature` file contains `@wip` while a path admits modern.
+Every MCP endpoint (Agent Surface, Transit Point, standalone MCP Proxy, Fabric framed stream) admits and advertises `2026-07-28` alongside `2024-11-05`; `mcp_legacy_metadata_output` remains independent. `mcp_protocol_mode` is retired: `RetiredSetting` (`src/config/types.rs`, used as `AgentSurface::_retired_protocol_mode`) accepts any stored or submitted value under `deny_unknown_fields`, discards it and never serializes it, and Transit Points and MCP Proxies ignore the field. `mcp_http`'s Origin, header and body limits apply to every MCP endpoint and every revision. Records that do not set `mcp_http` save byte-identically to releases without it: `component_tests::mcp_record_compat` loads and re-saves surface, MCP Proxy, vault token and credential provider fixtures (`tests/fixtures/records/`) written by such a release. Before downgrading, PATCH `mcp_http` to `null` on every surface and rewrite Transit Point arrays without it: older binaries skip a surface that carries it (`AgentSurface` is `deny_unknown_fields`) and silently ignore, then drop on save, the field on Transit Points and MCP Proxies. No older binary enforces `mcp_http.authorization`: clearing `mcp_http` removes it from surfaces and Transit Points, and a Transit Point or MCP Proxy that keeps it is served without it, so protect or disable every endpoint that relies on it before downgrading (see `docs/MCP_METADATA.md`). Accepted/advertised revisions resolve **per transport path** (`McpPathKind` in `src/mcp/request_validation.rs`: `DirectAccessPoint`, `OwnedProxy`, `TransitPoint`, `FabricReceive`, `FabricSend`) via `runtime_policy_for`, not from one appliance-wide constant, so one path can be returned to legacy-only without affecting Fabric or any other path. Every path admits `2026-07-28`, the Fabric legs as framed streams only. The mounted Access Point router, outbound Transit listener and framed Fabric receive each use their own path policy. `admission_policy_for_target` narrows a `fabric://` Access Point or Transit Point Target to the `FabricSend` policy, so a modern request that leg cannot carry gets `400` / `-32022` at admission, before payment, OPA or consent. Buffered Fabric `ForwardRequest` receive is legacy-only; modern MCP crosses Fabric only as framed streams. Unit tests pin each path's posture, pin that a path never advertises a revision it will not admit, and pin that returning one path to legacy-only leaves the others admitting modern; tests that send `2026-07-28` through a live entry point branch on that path's `runtime_policy_for`, and tests that only need a rejected revision use the unmodelled `2025-11-25`. `no_mcp_surface_scenario_is_a_draft_while_modern_mcp_is_admitted` fails the unit tests if any `tests/features/surface/mcp_*.feature` file contains `@wip` while a path admits modern.
 
-The MCP conformance harness (`scripts/mcp-conformance/`, `make mcp-conformance`) runs the published suite (`@modelcontextprotocol/conformance`, pinned exactly by its lockfile, frozen `2026-07-28` requirement set) against the ordinary gateway binary, used for both phases: the pinned reference server directly, a dual Access Point and Transit Point forwarding to it, a dual owned MCP Proxy standalone and behind `proxy://` (`tools-list`, `tools-call-simple-text` and `caching` only), and a `fabric` target: `scripts/mcp-conformance/fabric.feature` through the g2g BDD runner (Docker mediator), a dual Access Point on gateway 1 targeting `fabric://` gateway 2, which forwards to the reference server; the suite runs from a step. Expected failures live in `scripts/mcp-conformance/expected-failures/*.yaml`, one `<scenario>:<check-id>` with a one-line reason each; the suite fails a run on an unlisted failure or warning and on a listed check that passes, so remove an entry in the change that fixes it and never list a gateway defect. `check-results.mjs` adds caching parity with the reference server, real owned tool results and result completeness; `compat.mjs` checks a `2024-11-05` session on every endpoint in both phases, modern admission on dual endpoints (and rejection on the surface without a mode) in the modern phase, and `-32022` with `["2024-11-05"]` from the surface without a protocol mode in the legacy phase. Envs are generated under the ignored `target/mcp-conformance/` from `--generate-bootstrap`, a generated certificate and an `openssl rand` backup key held only in the gateway's environment; nothing is copied from `envs/`. The `test:mcp-conformance` CI job runs only when `MCP_CONFORMANCE` is `"true"`, passes the `build:rust` binary to both phases and tolerates only exit `3` (dependency fetch failure). Modern MCP crosses Fabric only as framed streams; the CI job leaves out the `fabric` target (no Docker daemon). See `docs/MCP_METADATA.md` (Conformance Harness).
+The MCP conformance harness (`scripts/mcp-conformance/`, `make mcp-conformance`) runs the published suite (`@modelcontextprotocol/conformance`, pinned exactly by its lockfile, frozen `2026-07-28` requirement set) against the ordinary gateway binary, used for both phases: the pinned reference server directly, an Access Point and Transit Point forwarding to it, an owned MCP Proxy standalone and behind `proxy://` (`tools-list`, `tools-call-simple-text` and `caching` only), and a `fabric` target: `scripts/mcp-conformance/fabric.feature` through the g2g BDD runner (Docker mediator), an Access Point on gateway 1 targeting `fabric://` gateway 2, which forwards to the reference server; the suite runs from a step. Expected failures live in `scripts/mcp-conformance/expected-failures/*.yaml`, one `<scenario>:<check-id>` with a one-line reason each; the suite fails a run on an unlisted failure or warning and on a listed check that passes, so remove an entry in the change that fixes it and never list a gateway defect. `check-results.mjs` adds caching parity with the reference server, real owned tool results and result completeness; `compat.mjs` checks a `2024-11-05` session on every endpoint in both phases, `2026-07-28` admission on every endpoint (including `legacy-surface`, whose record still carries the retired `mcp_protocol_mode`) in the modern phase, and `-32022` for the unmodelled `2025-11-25` with a `supported` list offering `2024-11-05` on every endpoint in the legacy phase. Envs are generated under the ignored `target/mcp-conformance/` from `--generate-bootstrap`, a generated certificate and an `openssl rand` backup key held only in the gateway's environment; nothing is copied from `envs/`. The `test:mcp-conformance` CI job runs only when `MCP_CONFORMANCE` is `"true"`, passes the `build:rust` binary to both phases and tolerates only exit `3` (dependency fetch failure). Modern MCP crosses Fabric only as framed streams; the CI job leaves out the `fabric` target (no Docker daemon). See `docs/MCP_METADATA.md` (Conformance Harness).
 
-`mcp_http` holds endpoint-local `allowed_origins`, `max_request_bytes` (default 1 MiB), `max_header_bytes` (16 KiB), `max_accept_ranges` (32), the modern response bounds below, and an optional `authorization`. `mcp_http.authorization` (Resource Server tokens; see the STS section) is enforced in every mode. The Origin, size and response settings apply only to dual endpoints, which enforce Origin and size checks through `mcp::modern_http::EndpointHttpPolicy`; absent/legacy endpoints otherwise retain their previous behavior. Direct, Transit Point, standalone proxy POST, and independent Fabric receive paths use the shared admission wrapper. Origin authority comes only from configured public listener origins and exact allowlisted origins, never request forwarding headers or CORS; missing Origin is allowed, invalid present Origin is `403`. Body/header budgets return `413`/`431`. The existing wire validator precedes modern media checks and rejects every modern revision on `legacy` and unset endpoints. Standalone proxy raw-body validation runs before legacy session lookup. See `docs/MCP_METADATA.md` for defaults, errors and lifecycle semantics.
+`mcp_http` holds endpoint-local `allowed_origins`, `max_request_bytes` (default 1 MiB), `max_header_bytes` (16 KiB), `max_accept_ranges` (32), the modern response bounds below, and an optional `authorization`. `mcp_http.authorization` (Resource Server tokens; see the STS section) and the Origin, size and response settings apply to every MCP endpoint and every revision; Origin and size checks run through `mcp::modern_http::EndpointHttpPolicy`. A public endpoint given as a bare listen address has no HTTP(S) origin and adds nothing to the Origin allowlist. Direct, Transit Point, standalone proxy POST, and independent Fabric receive paths use the shared admission wrapper. Origin authority comes only from configured public listener origins and exact allowlisted origins, never request forwarding headers or CORS; missing Origin is allowed, invalid present Origin is `403`. Body/header budgets return `413`/`431`. The existing wire validator precedes modern media checks and rejects every revision the path does not admit. Standalone proxy raw-body validation runs before legacy session lookup. See `docs/MCP_METADATA.md` for defaults, errors and lifecycle semantics.
 
-Dual GET/DELETE with an explicit `2026-07-28` version return `405` / `Allow: POST` without consulting a legacy session; unmarked legacy routes remain unchanged. Modern response config additionally bounds JSON/SSE events (`max_response_bytes`, 1 MiB), source chunks (`max_chunk_bytes`, 256 KiB), idle time (60s) and lifetime (3600s; maximum 86400s). Direct/Transit modern response branches use the shared bounded adapter and existing complete-result processing, skip legacy fallback/session synthesis, and keep metrics/cleanup on response-body lifetime. Admitted modern requests on dual Access Points and Transit Points reach these branches; unit tests use explicit admitted fixtures, and the conformance harness exercises them on the mounted routes. Real TCP adapter tests cover incremental progress and quiet upstream cancellation. Result-only header production after SSE has started remains fail-closed, never silently dropped or injected into nonfinal results.
+GET/DELETE with an explicit `2026-07-28` version return `405` / `Allow: POST` without consulting a legacy session; unmarked legacy routes remain unchanged. Modern response config additionally bounds JSON/SSE events (`max_response_bytes`, 1 MiB), source chunks (`max_chunk_bytes`, 256 KiB), idle time (60s) and lifetime (3600s; maximum 86400s). Direct/Transit modern response branches use the shared bounded adapter and existing complete-result processing, skip legacy fallback/session synthesis, and keep metrics/cleanup on response-body lifetime. Admitted modern requests on Access Points and Transit Points reach these branches; unit tests use explicit admitted fixtures, and the conformance harness exercises them on the mounted routes. Real TCP adapter tests cover incremental progress and quiet upstream cancellation. Result-only header production after SSE has started remains fail-closed, never silently dropped or injected into nonfinal results.
 
-Owned modern MCP dispatch (`mcp_proxies/handlers.rs`) handles discovery, deterministic tool catalogs and tool calls behind the `OwnedProxy` version policy, which admits `2026-07-28` only for dual Proxies and surfaces. Standalone dispatch precedes legacy sessions; modern surface-backed `proxy://` dispatch follows the shared request gates and feeds the common final-response path. Catalogs preserve available schemas/annotations and calls preserve structured results; tools are cloned before execution so catalog locks do not span network work. `mcp::tool_headers` validates bounded, properties-only `x-mcp-header` annotations and exact mirrored values, using the shared Base64 rules and exact safe-integer comparisons. Invalid tools are individually excluded; header mismatches return `400` / `-32020` before execution. Modern schema construction restores OpenAPI source schemas lost by the library and rejects unsafe flattening. The modern-only `mcp_proxies::modern_rest` adapter retains library parameter extraction/validation while using no-redirect, byte-bounded HTTP, authority-preserving path encoding, protected Target headers and bounded JSON/form/text/multipart encoding. Catalogs and execution select the same media type and only resolve bounded local OpenAPI references. Legacy conversion and execution remain unchanged. Full schema fidelity and complete client-security conformance are not verified, and the conformance harness scores owned endpoints only on its tool subset; see `docs/MCP_METADATA.md`.
+Owned modern MCP dispatch (`mcp_proxies/handlers.rs`) handles discovery, deterministic tool catalogs and tool calls behind the `OwnedProxy` version policy, which admits `2026-07-28` for every Proxy and surface. Standalone dispatch precedes legacy sessions; modern surface-backed `proxy://` dispatch follows the shared request gates and feeds the common final-response path. Catalogs preserve available schemas/annotations and calls preserve structured results; tools are cloned before execution so catalog locks do not span network work. `mcp::tool_headers` validates bounded, properties-only `x-mcp-header` annotations and exact mirrored values, using the shared Base64 rules and exact safe-integer comparisons. Invalid tools are individually excluded; header mismatches return `400` / `-32020` before execution. Modern schema construction restores OpenAPI source schemas lost by the library and rejects unsafe flattening. The modern-only `mcp_proxies::modern_rest` adapter retains library parameter extraction/validation while using no-redirect, byte-bounded HTTP, authority-preserving path encoding, protected Target headers and bounded JSON/form/text/multipart encoding. Catalogs and execution select the same media type and only resolve bounded local OpenAPI references. Legacy conversion and execution remain unchanged. Full schema fidelity and complete client-security conformance are not verified, and the conformance harness scores owned endpoints only on its tool subset; see `docs/MCP_METADATA.md`.
 
-`proxy::fabric_stream` is the additive framed Fabric transport that carries modern MCP between gateways: nonce-bound capability offers, authcrypt peer/recipient/Connection Point/listener-generation/thread binding, bounded bidirectional credits and reordering, Open replay protection and listener-owned receiving and outgoing tasks. Typed input preserves bytes, repeated headers and resolved variant snapshots through independent receiver admission. Direct and Transit senders use the negotiated transport after request gates; both ends reuse JSON/SSE and complete-result processing, including receiver-owned `proxy://` dispatch. Every frame observes its registered negotiated limits; dropping an HTTP body signals cancellation even while quiet, while normal EOF reports completion separately. Framed response sends require an exact peer-bound EndAck after sealing their final byte/sequence boundary, including empty responses; byte credit alone is not completion. Transport-owned metrics report only peer-acknowledged bytes and release connection guards on success, failure or drop. After a validated MCP final result, Direct and Transit adapters explicitly hand the response lease to the listener driver for a bounded End handshake; ordinary body drops still cancel. Peer consumption is not final HTTP-client delivery. Legacy ForwardRequest/ForwardResponse stay buffered. `a2a.fabric_stream_max_envelope_bytes` bounds actual encrypted payloads before sending; it is optional and range checked (64 KiB to 1 MiB, within `a2a.sdk_inbound_cache_bytes`) only when set, and `A2aConfig::stream_envelope_limit` otherwise uses 128 KiB capped at the SDK cache, so configs without it load whatever their cache size. `DidCommFrameSink` packs and sends every frame like `pack_and_send_message`, stamping `created_time`/`expires_time` so the receiver checks an Open's envelope times as it checks a `forward-request`'s (`envelope_replay::validate_envelope_times`); the Open's replay record is kept by the stream registry. Local capabilities advertise request streams and subscriptions; a receiving surface admits a framed modern request only when it is `dual`. The conformance harness `fabric` target covers the complete route over one Docker mediator; framed streams are not supported across mediator federation, where each gateway uses its own mediator. See `docs/MCP_METADATA.md`.
+`proxy::fabric_stream` is the additive framed Fabric transport that carries modern MCP between gateways: nonce-bound capability offers, authcrypt peer/recipient/Connection Point/listener-generation/thread binding, bounded bidirectional credits and reordering, Open replay protection and listener-owned receiving and outgoing tasks. Typed input preserves bytes, repeated headers and resolved variant snapshots through independent receiver admission. Direct and Transit senders use the negotiated transport after request gates; both ends reuse JSON/SSE and complete-result processing, including receiver-owned `proxy://` dispatch. Every frame observes its registered negotiated limits; dropping an HTTP body signals cancellation even while quiet, while normal EOF reports completion separately. Framed response sends require an exact peer-bound EndAck after sealing their final byte/sequence boundary, including empty responses; byte credit alone is not completion. Transport-owned metrics report only peer-acknowledged bytes and release connection guards on success, failure or drop. After a validated MCP final result, Direct and Transit adapters explicitly hand the response lease to the listener driver for a bounded End handshake; ordinary body drops still cancel. Peer consumption is not final HTTP-client delivery. Legacy ForwardRequest/ForwardResponse stay buffered. `a2a.fabric_stream_max_envelope_bytes` bounds actual encrypted payloads before sending; it is optional and range checked (64 KiB to 1 MiB, within `a2a.sdk_inbound_cache_bytes`) only when set, and `A2aConfig::stream_envelope_limit` otherwise uses 128 KiB capped at the SDK cache, so configs without it load whatever their cache size. `DidCommFrameSink` packs and sends every frame like `pack_and_send_message`, stamping `created_time`/`expires_time` so the receiver checks an Open's envelope times as it checks a `forward-request`'s (`envelope_replay::validate_envelope_times`); the Open's replay record is kept by the stream registry. Local capabilities advertise request streams and subscriptions; any active MCP surface admits a framed modern request; a `legacy_only` refusal comes only from older peers that do not admit modern MCP. The conformance harness `fabric` target covers the complete route over one Docker mediator; framed streams are not supported across mediator federation, where each gateway uses its own mediator. See `docs/MCP_METADATA.md`.
 
-Owned modern catalogs validate their advertised source input and JSON output schemas offline as Draft 2020-12, retain bounded transitive component references and explicitly scoped local definitions, and reject invalid successful results as tool errors. A dual Proxy may have a separate modern routing catalog when legacy conversion cannot load its schemas; that projection never validates or executes legacy calls. Discovery reflects catalog availability. Legacy and modern catalogs publish as one snapshot after successful construction, and failed reloads preserve the prior snapshot. Do not treat these focused checks as proof of all schema or route conformance.
+Owned modern catalogs validate their advertised source input and JSON output schemas offline as Draft 2020-12, retain bounded transitive component references and explicitly scoped local definitions, and reject invalid successful results as tool errors. A Proxy whose schemas legacy conversion cannot load registers a modern-only routing catalog instead of failing; that projection never validates or executes legacy calls. Discovery reflects catalog availability. Legacy and modern catalogs publish as one snapshot after successful construction, and failed reloads preserve the prior snapshot. Do not treat these focused checks as proof of all schema or route conformance.
 
 Modern notification forwarding accepts only an empty HTTP `202` or an HTTP error with an optional bounded ID-less JSON-RPC error. Notification responses bypass result enrichment and continuation finalization, preserve byte/deadline limits, and never create legacy sessions. Direct, independent receiver and Transit Point adapter tests cover this transport behavior; owned dispatch still rejects unimplemented notification methods.
 
@@ -1752,7 +1725,7 @@ Modern admission validates optional request log levels and string/number progres
 
 ### Discovery, subscriptions and variants
 
-Modern MCP discovery and subscriptions run for admitted modern requests on dual Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams; `legacy` and unset endpoints never reach them. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Surface/policy/API-key lifecycle changes invalidate subscriptions conservatively appliance-wide; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
+Modern MCP discovery and subscriptions run for admitted modern requests on Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Surface/policy/API-key lifecycle changes invalidate subscriptions conservatively appliance-wide; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
 
 JWT strategy mutations/reload, provider mutations and explicit vault revocation also invalidate local subscription lifetimes; vault invalidation remains inside the owned mutation task so cancellation cannot release it early. Reads do not invalidate access. Access Points, Transit Points and independent Fabric receivers capture the configured vault's durable revocation epoch before credential evaluation and recheck it every second, with a one-second read timeout even on quiet streams. Changed, corrupt or unavailable state closes the stream; initial read failure returns correlated `503`. Separate-process local-filesystem tests cover revocation without a local signal. Remote-filesystem visibility, other credential kinds, cross-process configuration changes and full resource-policy conformance remain required.
 
@@ -1764,7 +1737,7 @@ Resolved Access Point, Transit Point and Fabric requests retain their selected s
 
 The opt-in `sts.mcp_issuer` profile uses a configured HTTPS origin and root or `/api` identity mount ending `/oauth2/mcp`. It shares STS signing, clients, policy, Trust Check and throttling, preserves legacy DID endpoints, and implements managed token-exchange/ID-JAG grants only. Its forms reject duplicate parameters, token exchange rejects subject and actor tokens whose JOSE `typ` is the ID-JAG media type whatever type the client declares (`declares_id_jag_typ`) and any the gateway signed under its DID or the profile issuer, resources/scopes require explicit client allowlists, ID-JAG `aud` and `resource` stay distinct, and access tokens use `at+jwt`. `sts.mcp_replay` is bounded embedded or conditional DynamoDB storage without fallback. Endpoint-local `mcp_http.authorization` enforces resource tokens for all request eras, supplies path-specific metadata and `401`/`403` challenges, feeds verified policy identity, and strips bearer tokens before forwarding. Fabric receive must enforce its own resource independently. No new browser AS flow follows from these settings, and they do not change which revisions an endpoint admits; full route/distributed conformance is not verified.
 
-MCP Resource Server alignment must reuse the existing `src/sts/` architecture. It adds no gateway-hosted browser login, authorization-code grant or PKCE authorization endpoint. Preserve existing DID-issued flows and do not claim compatibility with authorization-code-only clients. `mcp::continuations` provides bounded mandatory AEAD state, authorization/request and vault-identity/scope binding, atomic embedded and DynamoDB stores, monotonic retry rounds and single-use dispatch claims. URL elicitation requires the request-local capability, and decline/cancel persists denial. Modern third-party consent references an existing JWT strategy through `CredentialProvider.consent_identity_strategy_id`, with tenant/PAT and ownership-reference checks. The existing provider callback verifies a nonce-bound OIDC ID token's signature, issuer, client audience, expiry and deterministic issuer/subject match to the initiating STS principal; no account-link registry, email matching, new hosted login or browser-held MCP bearer establishes consent. Callback tickets bind current surface/provider/strategy snapshots. Verified credentials are staged invisibly to ordinary vault lookup, then activated only after a ready retry wins its single-use claim. A vault revocation epoch and composite credential version prevent stale publication across filesystem instances; any revocation conservatively invalidates outstanding staged consents. Client acceptance and legacy vault records never establish modern readiness. Modern gateway consent (MRTR) needs `[mcp.continuations]` in the bootstrap config and `sts.mcp_issuer`; a modern request to a dual endpoint with `outbound_credentials` while continuations are not configured fails with `503` / `-32603` ("MCP credential service unavailable"), never falling back to legacy consent. Full callback-route coverage, remote-filesystem conformance and distributed refresh coordination are not verified; see `docs/MCP_METADATA.md`.
+MCP Resource Server alignment must reuse the existing `src/sts/` architecture. It adds no gateway-hosted browser login, authorization-code grant or PKCE authorization endpoint. Preserve existing DID-issued flows and do not claim compatibility with authorization-code-only clients. `mcp::continuations` provides bounded mandatory AEAD state, authorization/request and vault-identity/scope binding, atomic embedded and DynamoDB stores, monotonic retry rounds and single-use dispatch claims. URL elicitation requires the request-local capability, and decline/cancel persists denial. Modern third-party consent references an existing JWT strategy through `CredentialProvider.consent_identity_strategy_id`, with tenant/PAT and ownership-reference checks. The existing provider callback verifies a nonce-bound OIDC ID token's signature, issuer, client audience, expiry and deterministic issuer/subject match to the initiating STS principal; no account-link registry, email matching, new hosted login or browser-held MCP bearer establishes consent. Callback tickets bind current surface/provider/strategy snapshots. Verified credentials are staged invisibly to ordinary vault lookup, then activated only after a ready retry wins its single-use claim. A vault revocation epoch and composite credential version prevent stale publication across filesystem instances; any revocation conservatively invalidates outstanding staged consents. Client acceptance and legacy vault records never establish modern readiness. Modern gateway consent (MRTR) needs `[mcp.continuations]` in the bootstrap config and `sts.mcp_issuer`; a modern request to an endpoint with `outbound_credentials` while continuations are not configured fails with `503` / `-32603` ("MCP credential service unavailable"), never falling back to legacy consent. Full callback-route coverage, remote-filesystem conformance and distributed refresh coordination are not verified; see `docs/MCP_METADATA.md`.
 
 The direct modern branch uses shared `proxy::credential_delegation::modern` preparation after current policy checks and before local/delegated payment. The Transit Point branch reuses it at the post-policy credential step, bound to that endpoint's independently verified resource token, agent DID and alias; prepared credentials are applied after caller-header filtering. Both require verified vault provenance, authenticate gateway continuation kinds, and protect opaque upstream state plus requested input keys without prefix-based ownership guesses. JSON/SSE terminal finalization wraps continuations separately from complete-only enrichment. Explicit test-local admission exercises direct forwarding and concurrent retries, while admitted Transit Point steps cover resource binding, credential delivery and replay. Payment retry/idempotency, distributed refresh coordination, full routed consent and Fabric consent conformance are not verified.
 

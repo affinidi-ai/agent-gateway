@@ -1107,7 +1107,6 @@ mod tests {
             fixture_request(method),
             limits(65536),
             super::super::modern::ForwardingSupport::for_endpoint(
-                Some(crate::config::McpProtocolMode::Dual),
                 false,
                 crate::mcp::request_validation::McpPathKind::DirectAccessPoint,
             ),

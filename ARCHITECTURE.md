@@ -242,7 +242,7 @@ sequenceDiagram
 ```
 
 This is the buffered forward: one `forward-request` and one `forward-response`, used for
-legacy MCP, A2A and HTTP. Modern (`2026-07-28`) MCP on a `dual` route crosses Fabric as a
+legacy MCP, A2A and HTTP. Modern (`2026-07-28`) MCP crosses Fabric as a
 framed stream instead, so responses and subscriptions can stream:
 
 ```mermaid
@@ -270,8 +270,8 @@ draws frames directly between the gateways for brevity. The negotiated capabilit
 cached per peer for 5 minutes, so later streams skip the query. Each
 direction has its own byte credit, and a refused Open is answered with an `Error` frame
 saying why rather than left to time out: a stale offer makes the sender negotiate again,
-and a surface that is not `dual` reaches the caller as `-32022`, as from a `legacy`
-endpoint.
+and an older peer whose surface does not admit modern MCP reaches the caller as `-32022`,
+as from a legacy-only endpoint.
 
 | Direction | Entry point |
 | --- | --- |

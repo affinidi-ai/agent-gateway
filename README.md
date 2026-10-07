@@ -163,7 +163,7 @@ differ, repository documentation describes this source revision exactly.
 | A2A `1.0` | Active |
 | A2A `0.3` | Accepted while `a2a_legacy_compatibility` is on, the default |
 | MCP `2024-11-05` | Active |
-| MCP `2026-07-28` | Active on endpoints set to `dual`; `legacy` and unset endpoints reject it |
+| MCP `2026-07-28` | Active on every MCP endpoint |
 | DIDComm v2.1 | Available for Fabric transport |
 | TRQP | Available for Trust Check |
 | x402 and MPP | Available when configured |

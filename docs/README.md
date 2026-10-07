@@ -41,7 +41,7 @@ adds procedures for deploying and operating an appliance, operator guides, and F
 | [Credential delegation](CREDENTIAL_DELEGATION.md)  | Credential providers, surface bindings, consent modes, the OAuth flow, and the delegation vault                             |
 | [Terms and consent](TERMS_AND_CONSENT.md)          | Terms documents and versions, who must accept what, acceptance records, and consent-pending sessions                        |
 | [Integrations](INTEGRATIONS.md)                    | Email, Slack, webhook, and stream publishers, the event catalogue, trigger configuration, and template variables            |
-| [MCP metadata and 2026-07-28](MCP_METADATA.md)     | Metadata aliases, modern MCP admission, protocol modes, and the conformance harness                                         |
+| [MCP metadata and 2026-07-28](MCP_METADATA.md)     | Metadata aliases, modern MCP admission, `mcp_http`, and the conformance harness                                             |
 | [Observability internals](OBSERVABILITY.md)        | Dashboard event contracts, buffering, request correlation, governance audit forwarding, and the A2A protocol-version metric |
 | [Management RBAC](RBAC.md)                         | Middleware enforcement and permissions response contract                                                                    |
 | [Management access tokens](ACCESS_TOKENS.md)       | PAT contract, resource-pattern grammar, delegation, and tenant ownership                                                    |

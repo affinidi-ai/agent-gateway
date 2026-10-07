@@ -301,15 +301,6 @@ pub async fn gateway_has_surface_targeting_conformance_reference_server(
         .insert(surface_name, (gw_index, surface_id));
 }
 
-#[given(expr = "surface {string} uses {string} MCP protocol mode")]
-pub async fn surface_uses_mcp_protocol_mode(
-    world: &mut G2gWorld,
-    surface_name: String,
-    mode: String,
-) {
-    surface_spec_mut(world, &surface_name).mcp_protocol_mode = Some(mode);
-}
-
 #[given(expr = "surface {string} accepts MCP Origins of gateway {int}")]
 pub async fn surface_accepts_mcp_origins_of_gateway(
     world: &mut G2gWorld,

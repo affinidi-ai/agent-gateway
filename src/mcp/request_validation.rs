@@ -98,8 +98,7 @@ impl McpPathKind {
 const LEGACY_SUPPORTED_VERSIONS: &[&str] = &[MCP_LEGACY_VERSION];
 pub const LEGACY_ONLY_POLICY: McpVersionPolicy<'static> = McpVersionPolicy::new(&[], LEGACY_SUPPORTED_VERSIONS);
 
-/// Admits `2026-07-28` alongside `2024-11-05`. A path uses it only for endpoints
-/// set to `dual`; `legacy` endpoints use [`LEGACY_ONLY_POLICY`].
+/// Admits `2026-07-28` alongside `2024-11-05`.
 const MODERN_CAPABLE_POLICY: McpVersionPolicy<'static> =
     McpVersionPolicy::new(&[super::MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, super::MCP_MODERN_VERSION]);
 
@@ -121,26 +120,15 @@ pub const fn runtime_policy_for(path: McpPathKind) -> McpVersionPolicy<'static> 
     }
 }
 
-pub fn endpoint_version_policy(
-    mode: Option<crate::config::McpProtocolMode>,
-    path: McpPathKind,
-) -> McpVersionPolicy<'static> {
-    match mode.unwrap_or_default() {
-        crate::config::McpProtocolMode::Legacy => LEGACY_ONLY_POLICY,
-        crate::config::McpProtocolMode::Dual => runtime_policy_for(path),
-    }
-}
-
 /// Narrows an entry point's policy to the Fabric send policy when its Target
 /// is `fabric://`, so the request is rejected at admission rather than after
 /// payment, policy and consent work for a leg that cannot carry it.
 pub fn admission_policy_for_target<'a>(
     policy: McpVersionPolicy<'a>,
-    mode: Option<crate::config::McpProtocolMode>,
     target_endpoint: &str,
 ) -> McpVersionPolicy<'a> {
     if target_endpoint.starts_with("fabric://") {
-        policy.within(endpoint_version_policy(mode, McpPathKind::FabricSend))
+        policy.within(runtime_policy_for(McpPathKind::FabricSend))
     } else {
         policy
     }
@@ -304,9 +292,8 @@ impl McpRequestValidationError {
         })
     }
 
-    /// The answer to a modern request whose endpoint serves legacy MCP only,
-    /// as a `legacy` endpoint gives it: `400` / `-32022` listing `2024-11-05`.
-    /// A Fabric peer whose surface is not `dual` is answered the same way.
+    /// The answer to a modern request that a Fabric peer refuses because it
+    /// serves legacy MCP only: `400` / `-32022` listing `2024-11-05`.
     pub fn legacy_only(id: Option<JsonValue>) -> Box<Self> {
         Self::unsupported(id, super::MCP_MODERN_VERSION, LEGACY_ONLY_POLICY)
     }
@@ -841,24 +828,12 @@ mod tests {
         McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
 
     #[test]
-    fn every_transport_path_admits_modern_only_on_dual_endpoints() {
-        use crate::config::McpProtocolMode;
-
+    fn every_transport_path_admits_modern_alongside_legacy() {
         for path in McpPathKind::ALL {
-            for (endpoint, policy, admits) in [
-                ("runtime", runtime_policy_for(path), true),
-                ("dual", endpoint_version_policy(Some(McpProtocolMode::Dual), path), true),
-                ("legacy", endpoint_version_policy(Some(McpProtocolMode::Legacy), path), false),
-                ("unset", endpoint_version_policy(None, path), false),
-            ] {
-                let supported: &[&str] = if admits {
-                    &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]
-                } else {
-                    &[MCP_LEGACY_VERSION]
-                };
-                assert_eq!(policy.supports_modern(MCP_MODERN_VERSION), admits, "{path:?} {endpoint} admission");
-                assert_eq!(policy.supported_versions(), supported, "{path:?} {endpoint} advertisement");
-            }
+            let policy = runtime_policy_for(path);
+            assert!(policy.supports_modern(MCP_MODERN_VERSION), "{path:?} admission");
+            assert!(!policy.supports_modern("2025-11-25"), "{path:?} admitted an unmodelled revision");
+            assert_eq!(policy.supported_versions(), [MCP_LEGACY_VERSION, MCP_MODERN_VERSION], "{path:?} advertisement");
         }
     }
 
@@ -957,30 +932,22 @@ mod tests {
 
     #[test]
     fn admission_narrows_only_fabric_targets_to_the_fabric_send_policy() {
-        use crate::config::McpProtocolMode;
-
-        for mode in [None, Some(McpProtocolMode::Legacy), Some(McpProtocolMode::Dual)] {
-            let fabric_send = endpoint_version_policy(mode, McpPathKind::FabricSend);
-            for target in ["fabric://gateway/channel", "fabric://gateway/channel$variant"] {
-                assert_eq!(
-                    version_sets(admission_policy_for_target(TEST_POLICY, mode, target)),
-                    version_sets(fabric_send),
-                    "{mode:?} {target}"
-                );
-                assert_eq!(
-                    version_sets(admission_policy_for_target(LEGACY_ONLY_POLICY, mode, target)),
-                    version_sets(LEGACY_ONLY_POLICY),
-                    "{mode:?} {target} widened a legacy-only entry point"
-                );
-            }
-            for target in ["https://agent.example/mcp", "http://127.0.0.1:9/mcp", "proxy://owned-tools"] {
-                for policy in [TEST_POLICY, LEGACY_ONLY_POLICY] {
-                    assert_eq!(
-                        version_sets(admission_policy_for_target(policy, mode, target)),
-                        version_sets(policy),
-                        "{mode:?} {target}"
-                    );
-                }
+        let fabric_send = runtime_policy_for(McpPathKind::FabricSend);
+        for target in ["fabric://gateway/channel", "fabric://gateway/channel$variant"] {
+            assert_eq!(
+                version_sets(admission_policy_for_target(TEST_POLICY, target)),
+                version_sets(fabric_send),
+                "{target}"
+            );
+            assert_eq!(
+                version_sets(admission_policy_for_target(LEGACY_ONLY_POLICY, target)),
+                version_sets(LEGACY_ONLY_POLICY),
+                "{target} widened a legacy-only entry point"
+            );
+        }
+        for target in ["https://agent.example/mcp", "http://127.0.0.1:9/mcp", "proxy://owned-tools"] {
+            for policy in [TEST_POLICY, LEGACY_ONLY_POLICY] {
+                assert_eq!(version_sets(admission_policy_for_target(policy, target)), version_sets(policy), "{target}");
             }
         }
     }

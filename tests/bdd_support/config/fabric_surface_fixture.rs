@@ -29,8 +29,6 @@ pub struct SurfaceSpec {
     pub managed_identity: bool,
     pub mcp_tool_policy: Option<McpToolPolicySpec>,
     pub mcp_proxy: Option<McpProxySpec>,
-    /// `mcp_protocol_mode` of the surface; `None` leaves it unset (legacy).
-    pub mcp_protocol_mode: Option<String>,
     /// The target is a real upstream serving one path, not a harness mock.
     pub external_target: bool,
     pub transit_points: Vec<TransitPointSpec>,
@@ -101,7 +99,6 @@ impl SurfaceSpec {
             managed_identity: false,
             mcp_tool_policy: None,
             mcp_proxy: None,
-            mcp_protocol_mode: None,
             external_target: false,
             transit_points: Vec::new(),
         }

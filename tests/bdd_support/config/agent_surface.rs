@@ -14,7 +14,6 @@ pub struct AgentSurfaceFixture {
     pub transit: Option<Value>,
     pub identity_slots: HashMap<String, Value>,
     pub transit_points: HashMap<String, TransitPointFixture>,
-    pub mcp_protocol_mode: Option<String>,
     pub mcp_http: Option<Value>,
 }
 
@@ -148,7 +147,6 @@ impl AgentSurfaceFixture {
             transit: None,
             identity_slots: HashMap::new(),
             transit_points: HashMap::new(),
-            mcp_protocol_mode: None,
             mcp_http: None,
         }
     }
@@ -264,14 +262,6 @@ impl AgentSurfaceFixture {
         gating: Value,
     ) -> Self {
         self.target.mcp_tool_gating = Some(gating);
-        self
-    }
-
-    pub fn with_mcp_protocol_mode(
-        mut self,
-        mode: impl Into<String>,
-    ) -> Self {
-        self.mcp_protocol_mode = Some(mode.into());
         self
     }
 
@@ -453,9 +443,6 @@ impl AgentSurfaceFixture {
         if let Some(transit) = &self.transit {
             surface["transit"] = transit.clone();
         }
-        if let Some(mode) = &self.mcp_protocol_mode {
-            surface["mcp_protocol_mode"] = json!(mode);
-        }
         if let Some(mcp_http) = &self.mcp_http {
             surface["mcp_http"] = mcp_http.clone();
         }
@@ -555,7 +542,6 @@ impl Default for AgentSurfaceFixture {
             transit: None,
             identity_slots: HashMap::new(),
             transit_points: HashMap::new(),
-            mcp_protocol_mode: None,
             mcp_http: None,
         }
     }

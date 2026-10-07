@@ -437,7 +437,7 @@ impl McpServerManager {
                     modern: server,
                 }
             }
-            Err(error) if proxy.mcp_protocol_mode == Some(crate::config::McpProtocolMode::Dual) => {
+            Err(error) => {
                 let original = server.openapi_spec.clone();
                 server.openapi_spec = super::modern_rest::routing_spec(&original).map_err(|error| error.to_string())?;
                 server
@@ -450,7 +450,6 @@ impl McpServerManager {
                     modern: Arc::new(RwLock::new(server)),
                 }
             }
-            Err(error) => return Err(format!("Failed to load OpenAPI spec: {error}")),
         };
         self.servers
             .write()
@@ -1088,7 +1087,6 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
         .direct_access
         .unwrap_or(true);
     proxy.managed_by = managed_by;
-    proxy.mcp_protocol_mode = request.mcp_protocol_mode;
     if let Some(config) = &request.mcp_http {
         config
             .validate()
@@ -1224,9 +1222,6 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
     }
     if request.managed_by.is_some() {
         proxy.managed_by = normalise_managed_by(request.managed_by)?;
-    }
-    if let Some(mode) = request.mcp_protocol_mode {
-        proxy.mcp_protocol_mode = Some(mode);
     }
     if let Some(config) = request.mcp_http {
         config
@@ -2229,7 +2224,6 @@ pub(crate) async fn handle_modern_surface_request(
     crate::mcp::modern::require_active_version(request, versions)?;
     let mut proxy = proxy.clone();
     proxy.mcp_http = surface.mcp_http.clone();
-    proxy.mcp_protocol_mode = surface.mcp_protocol_mode;
     let manager = McpServerManager::new();
     manager
         .create_server(&proxy)
@@ -2326,7 +2320,6 @@ pub async fn handle_mcp_get<S: McpProxyStore>(
             }
         }
         let policy = crate::mcp::modern_http::EndpointHttpPolicy::new(
-            proxy.mcp_protocol_mode,
             proxy.mcp_http.as_ref(),
             &network.get_inbound_external_urls(),
             crate::mcp::request_validation::McpPathKind::OwnedProxy,
@@ -2415,7 +2408,6 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
     Path(path): Path<String>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    use axum::RequestExt;
     use axum::extract::FromRequest;
     use axum::response::IntoResponse;
 
@@ -2449,7 +2441,6 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
         headers.remove(axum::http::header::AUTHORIZATION);
     }
     let policy = crate::mcp::modern_http::EndpointHttpPolicy::new(
-        proxy.mcp_protocol_mode,
         proxy.mcp_http.as_ref(),
         &network.get_inbound_external_urls(),
         crate::mcp::request_validation::McpPathKind::OwnedProxy,
@@ -2458,11 +2449,6 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
     if let Err(error) = policy.validate_headers(&headers) {
         return Ok(error.into_response(None));
     }
-    let request = if proxy.mcp_protocol_mode == Some(crate::config::McpProtocolMode::Dual) {
-        request
-    } else {
-        request.with_limited_body()
-    };
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, policy.body_limit()).await {
         Ok(body) => body,
@@ -2482,10 +2468,7 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
             &proxy,
             &manager,
             &request,
-            crate::mcp::request_validation::endpoint_version_policy(
-                proxy.mcp_protocol_mode,
-                crate::mcp::request_validation::McpPathKind::OwnedProxy,
-            ),
+            crate::mcp::request_validation::runtime_policy_for(crate::mcp::request_validation::McpPathKind::OwnedProxy),
             &headers,
         )
         .await;
@@ -3557,7 +3540,7 @@ mod tests {
             "$defs": {"Proof": {"type": "string", "minLength": 5}},
             "properties": {"proof": {"$ref": "#/$defs/Proof"}}, "required": ["proof"]
         });
-        let mut proxy = McpProxy::new(
+        let proxy = McpProxy::new(
             "Schema resource".into(),
             String::new(),
             target.url(),
@@ -3571,7 +3554,6 @@ mod tests {
             "/mcp".into(),
             "/resource".into(),
         );
-        proxy.mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
         let manager = super::McpServerManager::new();
         manager
             .create_server(&proxy)
@@ -4016,7 +3998,7 @@ mod tests {
             "/owned".into(),
         );
         let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface-tools", "name": "Surface tools", "mcp_protocol_mode": "dual",
+            "surface_id": "surface-tools", "name": "Surface tools",
             "access_point": {"listen_address": "https://gateway.example", "route": "/tools", "protocol": "mcp"},
             "target": {"endpoint": format!("proxy://{}", proxy.id)}
         }))
@@ -4106,7 +4088,7 @@ mod tests {
             "/owned".into(),
         );
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface-subscriptions", "name": "Surface subscriptions", "mcp_protocol_mode": "dual",
+            "surface_id": "surface-subscriptions", "name": "Surface subscriptions",
             "mcp_http": {"max_response_bytes": 1},
             "access_point": {"listen_address": "https://gateway.example", "route": "/tools", "protocol": "mcp"},
             "target": {"endpoint": format!("proxy://{}", proxy.id)}
@@ -4540,9 +4522,7 @@ mod tests {
         assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
     }
 
-    async fn standalone_mcp_router(
-        mode: Option<crate::config::McpProtocolMode>
-    ) -> (axum::Router, super::SseSessionManager, tempfile::TempDir) {
+    async fn standalone_mcp_router() -> (axum::Router, super::SseSessionManager, tempfile::TempDir) {
         use crate::mcp_proxies::McpProxyStore;
 
         let directory = tempfile::tempdir().unwrap();
@@ -4561,7 +4541,6 @@ mod tests {
             "/mcp".into(),
             "/owned".into(),
         );
-        proxy.mcp_protocol_mode = mode;
         proxy.mcp_http = Some(
             serde_json::from_value(
                 serde_json::json!({"allowed_origins": ["https://console.example"], "max_request_bytes": 1024}),
@@ -4598,71 +4577,55 @@ mod tests {
     async fn standalone_mcp_http_non_post_ownership_preserves_legacy_sse() {
         use tower::ServiceExt;
 
-        for mode in [None, Some(crate::config::McpProtocolMode::Dual)] {
-            let (router, _sessions, _directory) = standalone_mcp_router(mode).await;
-            for method in [axum::http::Method::GET, axum::http::Method::DELETE] {
-                let response = router
-                    .clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method(method.clone())
-                            .uri("/mcp/owned")
-                            .header("mcp-protocol-version", "2026-07-28")
-                            .header("mcp-session-id", "legacy-session")
-                            .body(axum::body::Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                if mode.is_some() {
-                    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-                    assert_eq!(response.headers()["allow"], "POST");
-                } else if method == axum::http::Method::DELETE {
-                    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-                    assert_eq!(response.headers()["allow"], "GET,HEAD,POST");
-                } else {
-                    assert_eq!(response.status(), StatusCode::OK);
-                }
-            }
-            let sse = router
+        let (router, _sessions, _directory) = standalone_mcp_router().await;
+        for method in [axum::http::Method::GET, axum::http::Method::DELETE] {
+            let response = router
                 .clone()
                 .oneshot(
                     axum::http::Request::builder()
-                        .uri("/mcp/owned/sse")
+                        .method(method.clone())
+                        .uri("/mcp/owned")
+                        .header("mcp-protocol-version", "2026-07-28")
+                        .header("mcp-session-id", "legacy-session")
                         .body(axum::body::Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(sse.status(), StatusCode::OK);
-            assert_eq!(sse.headers()["content-type"], "text/event-stream");
-            drop(sse);
-            let invalid_origin = router
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri("/mcp/owned/sse")
-                        .header("origin", "https://untrusted.example")
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                invalid_origin.status(),
-                if mode.is_some() {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::OK
-                }
-            );
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(response.headers()["allow"], "POST");
         }
+        let sse = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/mcp/owned/sse")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        assert_eq!(sse.headers()["content-type"], "text/event-stream");
+        drop(sse);
+        let invalid_origin = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/mcp/owned/sse")
+                    .header("origin", "https://untrusted.example")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_origin.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn standalone_mcp_http_validates_raw_posts_before_legacy_sessions() {
         use tower::ServiceExt;
 
-        let (router, sessions, _directory) = standalone_mcp_router(Some(crate::config::McpProtocolMode::Dual)).await;
+        let (router, sessions, _directory) = standalone_mcp_router().await;
         let (session_id, _stream) = sessions
             .create_session()
             .await;
@@ -4722,7 +4685,7 @@ mod tests {
         use crate::mcp::admission_cases::{admission_cases, assert_rejected};
         use tower::ServiceExt;
 
-        let (router, _sessions, _directory) = standalone_mcp_router(Some(crate::config::McpProtocolMode::Dual)).await;
+        let (router, _sessions, _directory) = standalone_mcp_router().await;
         for case in admission_cases() {
             let mut request = axum::http::Request::builder()
                 .method("POST")
@@ -4754,91 +4717,75 @@ mod tests {
     async fn standalone_mcp_http_keeps_legacy_initialization_notifications_and_sse() {
         use tower::ServiceExt;
 
-        for mode in [None, Some(crate::config::McpProtocolMode::Dual)] {
-            let (router, sessions, _directory) = standalone_mcp_router(mode).await;
-            let (session_id, _stream) = sessions
-                .create_session()
-                .await;
-            for (path, method, expected_status) in [
-                ("/mcp/owned".to_string(), "initialize", StatusCode::OK),
-                ("/mcp/owned".to_string(), "notifications/initialized", StatusCode::NO_CONTENT),
-                (format!("/mcp/owned/mcp/messages?session_id={session_id}"), "initialize", StatusCode::ACCEPTED),
-            ] {
-                let mut body = serde_json::json!({"jsonrpc": "2.0", "method": method});
-                if method == "initialize" {
-                    body["id"] = serde_json::json!(1);
-                }
-                let response = router
-                    .clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri(path)
-                            .header("content-type", "application/json")
-                            .body(axum::body::Body::from(body.to_string()))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), expected_status);
-                let body = axum::body::to_bytes(response.into_body(), 8192)
-                    .await
-                    .unwrap();
-                if expected_status == StatusCode::OK {
-                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
-                    assert!(
-                        body["result"]
-                            .get("resultType")
-                            .is_none()
-                    );
-                } else {
-                    assert!(body.is_empty());
-                }
+        let (router, sessions, _directory) = standalone_mcp_router().await;
+        let (session_id, _stream) = sessions
+            .create_session()
+            .await;
+        for (path, method, expected_status) in [
+            ("/mcp/owned".to_string(), "initialize", StatusCode::OK),
+            ("/mcp/owned".to_string(), "notifications/initialized", StatusCode::NO_CONTENT),
+            (format!("/mcp/owned/mcp/messages?session_id={session_id}"), "initialize", StatusCode::ACCEPTED),
+        ] {
+            let mut body = serde_json::json!({"jsonrpc": "2.0", "method": method});
+            if method == "initialize" {
+                body["id"] = serde_json::json!(1);
             }
             let response = router
                 .clone()
                 .oneshot(
                     axum::http::Request::builder()
                         .method("POST")
-                        .uri("/mcp/owned")
+                        .uri(path)
                         .header("content-type", "application/json")
-                        .header("origin", "https://untrusted.example")
-                        .body(axum::body::Body::from(
-                            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).to_string(),
-                        ))
+                        .body(axum::body::Body::from(body.to_string()))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                response.status(),
-                if mode.is_some() {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::OK
-                }
-            );
-            let oversized = router
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method("POST")
-                        .uri("/mcp/owned")
-                        .header("content-type", "application/json")
-                        .body(axum::body::Body::from(" ".repeat(1025)))
-                        .unwrap(),
-                )
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), 8192)
                 .await
                 .unwrap();
-            assert_eq!(
-                oversized.status(),
-                if mode.is_some() {
-                    StatusCode::PAYLOAD_TOO_LARGE
-                } else {
-                    StatusCode::BAD_REQUEST
-                }
-            );
+            if expected_status == StatusCode::OK {
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+                assert!(
+                    body["result"]
+                        .get("resultType")
+                        .is_none()
+                );
+            } else {
+                assert!(body.is_empty());
+            }
         }
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp/owned")
+                    .header("content-type", "application/json")
+                    .header("origin", "https://untrusted.example")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let oversized = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp/owned")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(" ".repeat(1025)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

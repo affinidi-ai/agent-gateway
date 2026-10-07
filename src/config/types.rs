@@ -40,12 +40,16 @@ pub enum McpLegacyMetadataOutput {
     Canonical,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum McpProtocolMode {
-    #[default]
-    Legacy,
-    Dual,
+/// Accepts a retired setting that stored records and API payloads may still
+/// carry, so they keep loading under `deny_unknown_fields`. Any value is
+/// discarded, and a field of this type must be `skip_serializing`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetiredSetting;
+
+impl<'de> Deserialize<'de> for RetiredSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| Self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

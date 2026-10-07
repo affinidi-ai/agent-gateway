@@ -1881,13 +1881,8 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
-    let mcp_versions = crate::mcp::request_validation::admission_policy_for_target(
-        mcp_versions,
-        state
-            .surface
-            .mcp_protocol_mode,
-        &state.surface.target.endpoint,
-    );
+    let mcp_versions =
+        crate::mcp::request_validation::admission_policy_for_target(mcp_versions, &state.surface.target.endpoint);
     let mcp_http = if state
         .surface
         .channel_protocol()
@@ -1895,9 +1890,6 @@ async fn proxy_handler_with_mcp_runtime(
     {
         Some(
             crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-                state
-                    .surface
-                    .mcp_protocol_mode,
                 state
                     .surface
                     .mcp_http
@@ -1955,9 +1947,7 @@ async fn proxy_handler_with_mcp_runtime(
             });
         }
         // Connection guard will automatically decrement when dropped
-        if let Some(policy) = &mcp_http
-            && policy.body_limit() != usize::MAX
-        {
+        if let Some(policy) = &mcp_http {
             return (*policy.body_read_error(e)).into_response();
         }
         create_error_response(StatusCode::BAD_REQUEST, "Failed to read request body")
@@ -7333,9 +7323,6 @@ async fn proxy_handler_with_mcp_runtime(
     let discovery_support = crate::mcp::modern::ForwardingSupport {
         versions: mcp_versions,
         ..crate::mcp::modern::ForwardingSupport::for_endpoint(
-            state
-                .surface
-                .mcp_protocol_mode,
             false,
             crate::mcp::request_validation::McpPathKind::DirectAccessPoint,
         )
@@ -11957,9 +11944,6 @@ async fn handle_fabric_request(
     let response_channel_name = channel_name.to_string();
     let modern_response_peer_did = remote_gateway_did.clone();
     let discovery_support = crate::mcp::modern::ForwardingSupport::for_endpoint(
-        state
-            .surface
-            .mcp_protocol_mode,
         true,
         crate::mcp::request_validation::McpPathKind::FabricSend,
     )
@@ -15570,14 +15554,14 @@ mod tests {
         )
         .await;
         let surface = serde_json::from_value(json!({
-            "surface_id": "router-variants", "name": "Router variants", "mcp_protocol_mode": "dual",
+            "surface_id": "router-variants", "name": "Router variants",
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": target.url()}
         }))
         .unwrap();
         let router = direct_router_state(state, surface);
         let mut broken: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "router-broken-default", "name": "Router broken default", "mcp_protocol_mode": "dual",
+            "surface_id": "router-broken-default", "name": "Router broken default",
             "access_point": {"listen_address": "https://gateway.example", "route": "/broken", "protocol": "mcp"},
             "target": {"endpoint": target.url()}
         }))
@@ -15688,7 +15672,7 @@ mod tests {
         )
         .await;
         let surface = serde_json::from_value(json!({
-            "surface_id": "mounted-policy", "name": "Mounted policy", "mcp_protocol_mode": "dual",
+            "surface_id": "mounted-policy", "name": "Mounted policy",
             "access_point": {"listen_address": "https://gateway.example", "route": "/mounted", "protocol": "mcp"},
             "target": {"endpoint": target.url()}
         }))
@@ -15718,54 +15702,49 @@ mod tests {
     async fn direct_access_point_caps_legacy_initialize(state: &crate::state::ProxyState) {
         use serde_json::json;
 
-        for mode in [None, Some("dual")] {
-            let target = crate::component_tests::helpers::MockServer::start_with_response(
-                json!({"jsonrpc": "2.0", "id": 1, "result": {
-                    "protocolVersion": crate::mcp::MCP_LEGACY_VERSION, "capabilities": {},
-                    "serverInfo": {"name": "target", "version": "1"}
-                }})
-                .to_string(),
-            )
-            .await;
-            let mut surface = json!({
-                "surface_id": "initialize-cap", "name": "Initialize cap",
-                "access_point": {"listen_address": "https://gateway.example", "route": "/initialize", "protocol": "mcp"},
-                "target": {"endpoint": target.url()}
-            });
-            if let Some(mode) = mode {
-                surface["mcp_protocol_mode"] = json!(mode);
-            }
-            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-                "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
-            }});
-            let request = axum::http::Request::builder()
-                .method("POST")
-                .uri("/initialize")
-                .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream")
-                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap();
-            let response = super::multi_channel_proxy_handler(
-                axum::extract::ConnectInfo(
-                    "127.0.0.1:12345"
-                        .parse()
-                        .unwrap(),
-                ),
-                axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
-                request,
-            )
-            .await;
-            assert_eq!(response.status(), axum::http::StatusCode::OK, "mode {mode:?}");
-            let forwarded = target
-                .last_request_rx
-                .borrow()
-                .clone()
-                .expect("initialize reached the Target");
-            let forwarded: serde_json::Value = serde_json::from_str(&forwarded.body).unwrap();
-            assert_eq!(forwarded["method"], "initialize");
-            assert_eq!(forwarded["params"]["protocolVersion"], crate::mcp::MCP_LEGACY_VERSION, "mode {mode:?}");
-            assert_eq!(forwarded["params"]["clientInfo"], body["params"]["clientInfo"]);
-        }
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "protocolVersion": crate::mcp::MCP_LEGACY_VERSION, "capabilities": {},
+                "serverInfo": {"name": "target", "version": "1"}
+            }})
+            .to_string(),
+        )
+        .await;
+        let surface = json!({
+            "surface_id": "initialize-cap", "name": "Initialize cap",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/initialize", "protocol": "mcp"},
+            "target": {"endpoint": target.url()}
+        });
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+        }});
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/initialize")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = super::multi_channel_proxy_handler(
+            axum::extract::ConnectInfo(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+            ),
+            axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
+            request,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let forwarded = target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("initialize reached the Target");
+        let forwarded: serde_json::Value = serde_json::from_str(&forwarded.body).unwrap();
+        assert_eq!(forwarded["method"], "initialize");
+        assert_eq!(forwarded["params"]["protocolVersion"], crate::mcp::MCP_LEGACY_VERSION);
+        assert_eq!(forwarded["params"]["clientInfo"], body["params"]["clientInfo"]);
     }
 
     /// The direct Access Point is a transparent proxy for the modern routing
@@ -15782,7 +15761,7 @@ mod tests {
         )
         .await;
         let surface = serde_json::from_value(json!({
-            "surface_id": "routing-headers", "name": "Routing headers", "mcp_protocol_mode": "dual",
+            "surface_id": "routing-headers", "name": "Routing headers",
             "access_point": {"listen_address": "https://gateway.example", "route": "/routing", "protocol": "mcp"},
             "target": {"endpoint": target.url()}
         }))
@@ -15889,7 +15868,7 @@ mod tests {
             ..state.clone()
         };
         let surface = serde_json::from_value(json!({
-            "surface_id": "proxy-discovery", "name": "Proxy discovery", "mcp_protocol_mode": "dual",
+            "surface_id": "proxy-discovery", "name": "Proxy discovery",
             "access_point": {"listen_address": "https://gateway.example", "route": "/proxy-discovery", "protocol": "mcp"},
             "target": {"endpoint": format!("proxy://{}", proxy.id)}
         }))
@@ -15985,7 +15964,7 @@ mod tests {
             });
             let target = crate::component_tests::helpers::MockServer::start_with_response(upstream.to_string()).await;
             let surface = serde_json::from_value(json!({
-                "surface_id": "extensions", "name": "Extensions", "mcp_protocol_mode": "dual",
+                "surface_id": "extensions", "name": "Extensions",
                 "access_point": {"listen_address": "https://gateway.example", "route": "/extensions", "protocol": "mcp"},
                 "target": {"endpoint": target.url()}
             }))
@@ -16051,7 +16030,7 @@ mod tests {
         }});
         let target = crate::component_tests::helpers::MockServer::start_with_response(not_found.to_string()).await;
         let surface = serde_json::from_value(json!({
-            "surface_id": "resource-errors", "name": "Resource errors", "mcp_protocol_mode": "dual",
+            "surface_id": "resource-errors", "name": "Resource errors",
             "access_point": {"listen_address": "https://gateway.example", "route": "/resources", "protocol": "mcp"},
             "target": {"endpoint": target.url()}
         }))
@@ -16100,50 +16079,45 @@ mod tests {
     async fn legacy_resource_subscriptions_are_forwarded_unchanged(state: &crate::state::ProxyState) {
         use serde_json::json;
 
-        for mode in [None, Some("dual")] {
-            for method in ["resources/subscribe", "resources/unsubscribe"] {
-                let target = crate::component_tests::helpers::MockServer::start_with_response(
-                    json!({"jsonrpc": "2.0", "id": 5, "result": {}}).to_string(),
-                )
-                .await;
-                let mut surface = json!({
-                    "surface_id": "legacy-subscribe", "name": "Legacy subscribe",
-                    "access_point": {"listen_address": "https://gateway.example", "route": "/legacy-subscribe", "protocol": "mcp"},
-                    "target": {"endpoint": target.url()}
-                });
-                if let Some(mode) = mode {
-                    surface["mcp_protocol_mode"] = json!(mode);
-                }
-                let body =
-                    json!({"jsonrpc": "2.0", "id": 5, "method": method, "params": {"uri": "file:///docs/readme.md"}});
-                let request = axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/legacy-subscribe")
-                    .header("content-type", "application/json")
-                    .header("accept", "application/json, text/event-stream")
-                    .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
-                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap();
-                let response = super::multi_channel_proxy_handler(
-                    axum::extract::ConnectInfo(
-                        "127.0.0.1:12345"
-                            .parse()
-                            .unwrap(),
-                    ),
-                    axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
-                    request,
-                )
-                .await;
-                assert_eq!(response.status(), axum::http::StatusCode::OK, "{method} mode {mode:?}");
-                let forwarded = target
-                    .last_request_rx
-                    .borrow()
-                    .clone()
-                    .expect("the request reached the upstream");
-                let forwarded: serde_json::Value = serde_json::from_str(&forwarded.body).unwrap();
-                assert_eq!(forwarded["method"], method);
-                assert_eq!(forwarded["params"], body["params"], "{method} mode {mode:?}");
-            }
+        for method in ["resources/subscribe", "resources/unsubscribe"] {
+            let target = crate::component_tests::helpers::MockServer::start_with_response(
+                json!({"jsonrpc": "2.0", "id": 5, "result": {}}).to_string(),
+            )
+            .await;
+            let surface = json!({
+                "surface_id": "legacy-subscribe", "name": "Legacy subscribe",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/legacy-subscribe", "protocol": "mcp"},
+                "target": {"endpoint": target.url()}
+            });
+            let body =
+                json!({"jsonrpc": "2.0", "id": 5, "method": method, "params": {"uri": "file:///docs/readme.md"}});
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/legacy-subscribe")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let response = super::multi_channel_proxy_handler(
+                axum::extract::ConnectInfo(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                ),
+                axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
+                request,
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{method}");
+            let forwarded = target
+                .last_request_rx
+                .borrow()
+                .clone()
+                .expect("the request reached the upstream");
+            let forwarded: serde_json::Value = serde_json::from_str(&forwarded.body).unwrap();
+            assert_eq!(forwarded["method"], method);
+            assert_eq!(forwarded["params"], body["params"], "{method}");
         }
     }
 
@@ -16171,7 +16145,7 @@ mod tests {
             ("proxy:// Access Point", "proxy://negative-cases".to_string()),
         ] {
             let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-                "surface_id": "admission-cases", "name": "Admission cases", "mcp_protocol_mode": "dual",
+                "surface_id": "admission-cases", "name": "Admission cases",
                 "mcp_http": {"allowed_origins": [ALLOWED_ORIGIN]},
                 "access_point": {"listen_address": "https://gateway.example", "route": "/negative", "protocol": "mcp"},
                 "target": {"endpoint": endpoint}
@@ -16333,7 +16307,7 @@ mod tests {
             )
             .await;
             let surface = serde_json::from_value(json!({
-                "surface_id": "preservation", "name": "Preservation", "mcp_protocol_mode": "dual",
+                "surface_id": "preservation", "name": "Preservation",
                 "access_point": {"listen_address": "https://gateway.example", "route": "/preserved", "protocol": "mcp"},
                 "target": {"endpoint": target.url()}
             }))
@@ -16384,7 +16358,7 @@ mod tests {
         )
         .await;
         let surface = serde_json::from_value(json!({
-            "surface_id": "preservation", "name": "Preservation", "mcp_protocol_mode": "dual",
+            "surface_id": "preservation", "name": "Preservation",
             "access_point": {"listen_address": "https://gateway.example", "route": "/preserved", "protocol": "mcp"},
             "target": {"endpoint": target.url()}
         }))
@@ -16464,7 +16438,7 @@ mod tests {
             let _ = closed_tx.send(closed);
         });
         let surface = serde_json::from_value(json!({
-            "surface_id": "disconnect", "name": "Disconnect", "mcp_protocol_mode": "dual",
+            "surface_id": "disconnect", "name": "Disconnect",
             "access_point": {"listen_address": "https://gateway.example", "route": "/disconnect", "protocol": "mcp"},
             "target": {"endpoint": format!("http://{address}")}
         }))
@@ -16512,52 +16486,6 @@ mod tests {
                 .expect("the upstream connection must close after the caller disconnects")
                 .unwrap()
         );
-    }
-
-    async fn legacy_fabric_access_points_reject_modern_requests_at_admission(state: &crate::state::ProxyState) {
-        use serde_json::json;
-
-        let surface = serde_json::from_value(json!({
-            "surface_id": "fabric-admission", "name": "Fabric admission", "mcp_protocol_mode": "legacy",
-            "access_point": {"listen_address": "https://gateway.example", "route": "/fabric", "protocol": "mcp"},
-            "target": {"endpoint": "fabric://gw/ch"}
-        }))
-        .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
-        // Every Fabric send reads the listener manager, so holding its write
-        // lock proves admission answered without reaching the Fabric leg.
-        let listener = state
-            .listener_manager
-            .write()
-            .await;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
-                "127.0.0.1:12345"
-                    .parse()
-                    .unwrap(),
-                direct_router_state(state, surface),
-                modern_tools_list_request("/fabric", "fabric-admission"),
-                versions,
-                None,
-            )),
-        )
-        .await
-        .expect("a modern fabric:// request must not wait for the Fabric listener");
-        drop(listener);
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
-        let response: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), 16384)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(response["id"], "fabric-admission");
-        assert_eq!(response["error"]["code"], crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
-        assert_eq!(response["error"]["data"]["supported"], json!([crate::mcp::MCP_LEGACY_VERSION]));
     }
 
     async fn forwarded_discovery_narrows_unsupported_version_errors(state: &crate::state::ProxyState) {
@@ -16609,7 +16537,7 @@ mod tests {
             .await;
             let route = format!("/discovery-{name}");
             let surface = serde_json::from_value(json!({
-                "surface_id": format!("discovery-{name}"), "name": name, "mcp_protocol_mode": "dual",
+                "surface_id": format!("discovery-{name}"), "name": name,
                 "access_point": {"listen_address": "https://gateway.example", "route": route, "protocol": "mcp"},
                 "target": {"endpoint": target.url()}
             }))
@@ -16685,7 +16613,7 @@ mod tests {
             let target = crate::component_tests::helpers::MockServer::start_with_response(upstream.to_string()).await;
             let route = format!("/cache-{name}");
             let mut surface = json!({
-                "surface_id": format!("cache-{name}"), "name": name, "mcp_protocol_mode": "dual",
+                "surface_id": format!("cache-{name}"), "name": name,
                 "access_point": {"listen_address": "https://gateway.example", "route": route, "protocol": "mcp"},
                 "target": {"endpoint": target.url()}
             });
@@ -16880,7 +16808,7 @@ mod tests {
                 .unwrap(),
         );
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "consent-surface", "name": "Consent Surface", "mcp_protocol_mode": "dual",
+            "surface_id": "consent-surface", "name": "Consent Surface",
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": "http://127.0.0.1:9/api", "payment_policy": {
                 "type": "x402", "enabled": true, "provider": "agent_pay",
@@ -16959,7 +16887,6 @@ mod tests {
         modern_access_point_router_keeps_legacy_variant_fallback(&state).await;
         mounted_access_point_uses_the_direct_access_point_policy(&state).await;
         direct_access_point_caps_legacy_initialize(&state).await;
-        legacy_fabric_access_points_reject_modern_requests_at_admission(&state).await;
         access_point_admission_rejects_every_negative_case(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;
         direct_access_point_preserves_every_result_field(&state).await;

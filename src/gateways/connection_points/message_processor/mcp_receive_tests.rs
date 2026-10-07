@@ -187,7 +187,7 @@ async fn modern_fabric_response_reuses_final_processing_in_json_and_sse() {
             let count = called.clone();
             let response = super::process_modern_fabric_response(upstream, headers, (*request).clone(),
                 crate::mcp::modern_sse::SseLimits::from(&crate::config::McpHttpConfig::default()),
-                processing_headers, crate::mcp::modern::ForwardingSupport::for_endpoint(Some(crate::config::McpProtocolMode::Dual), false, crate::mcp::request_validation::McpPathKind::FabricReceive), None, move |body, headers| async move {
+                processing_headers, crate::mcp::modern::ForwardingSupport::for_endpoint(false, crate::mcp::request_validation::McpPathKind::FabricReceive), None, move |body, headers| async move {
                     count.fetch_add(1, Ordering::SeqCst);
                     let body = crate::mcp::meta::normalize_text(&body, metadata).unwrap();
                     ProcessingResult::RequiresResponse {
@@ -292,7 +292,6 @@ async fn modern_fabric_response_preserves_every_result_field() {
                 crate::mcp::modern_sse::SseLimits::from(&crate::config::McpHttpConfig::default()),
                 processing_headers,
                 crate::mcp::modern::ForwardingSupport::for_endpoint(
-                    Some(crate::config::McpProtocolMode::Dual),
                     false,
                     crate::mcp::request_validation::McpPathKind::FabricReceive,
                 ),
@@ -482,7 +481,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             Some(json!(7)),
         ),
         (
-            "unsupported modern version",
+            "modern request on the buffered Fabric leg",
             modern_body.clone(),
             modern_headers.clone(),
             -32022,
@@ -671,7 +670,6 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     configured
         .access_point
         .listen_address = "https://receiver.example".to_string();
-    configured.mcp_protocol_mode = Some(crate::config::McpProtocolMode::Dual);
     configured.mcp_http = Some(
         serde_json::from_value(json!({
             "allowed_origins": ["https://console.example"], "max_request_bytes": 1024, "max_header_bytes": 512
@@ -1174,7 +1172,7 @@ async fn fabric_consent_flow() {
         .await
         .unwrap();
     let mut surface: AgentSurface = serde_json::from_value(json!({
-        "surface_id": "fabric-consent", "name": "Fabric consent", "mcp_protocol_mode": "dual",
+        "surface_id": "fabric-consent", "name": "Fabric consent",
         "access_point": {"listen_address": "https://receiver.example", "route": "/mcp", "protocol": "mcp"},
         "target": {"endpoint": format!("http://{target_address}/json")},
         "mcp_http": {"authorization": {"resource": "https://receiver.example/mcp", "scopes": ["read"]}},

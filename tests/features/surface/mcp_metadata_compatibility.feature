@@ -80,11 +80,3 @@ Feature: Backward-compatible MCP metadata
     Then the response status is 200
     And MCP server "bravo" received MCP metadata key "io.affinidi.fabric/agent-identity-binding" only in "params._meta"
     And MCP server "bravo" did not receive MCP _meta key "https://fabric.affinidi.io/extensions/agent-identity-binding/v1"
-
-  Scenario: Canonical metadata output does not enable modern protocol execution
-    Given the surface uses "canonical" MCP metadata output
-    When the caller asks the MCP surface for available tools using protocol version "2026-07-28"
-    Then the response status is 400
-    And the MCP response is a JSON-RPC error with code -32022
-    And the MCP unsupported-version error requests "2026-07-28" and supports only "2024-11-05"
-    And MCP server "bravo" was not called

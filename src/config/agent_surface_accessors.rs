@@ -709,7 +709,7 @@ mod tests {
             outbound_credentials: vec![],
             identity_slots: Default::default(),
             mcp_legacy_metadata_output: None,
-            mcp_protocol_mode: None,
+            _retired_protocol_mode: Default::default(),
             mcp_http: None,
         }
     }

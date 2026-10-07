@@ -4187,11 +4187,8 @@ async fn process_forward_request_with_mcp_runtime(
     }
 
     let mut mcp_verified_binding = None;
-    let (mcp_metadata_context, mcp_classification) = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp
-        && (method.eq_ignore_ascii_case("POST") || surface.mcp_protocol_mode == Some(crate::config::McpProtocolMode::Dual))
-    {
+    let (mcp_metadata_context, mcp_classification) = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
         let http_policy = match crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-            surface.mcp_protocol_mode,
             surface.mcp_http.as_ref(),
             std::slice::from_ref(&surface.access_point.listen_address),
             mcp_versions,
@@ -4202,7 +4199,7 @@ async fn process_forward_request_with_mcp_runtime(
                 return axum_response_to_forward_result(crate::a2a::create_error_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Invalid MCP HTTP configuration")).await;
             }
         };
-        if stream_request.is_none() && surface.mcp_protocol_mode == Some(crate::config::McpProtocolMode::Dual) {
+        if stream_request.is_none() {
             for (name, value) in headers.iter().flat_map(|headers| headers.iter()) {
                 if matches!(name.to_ascii_lowercase().as_str(), "origin" | "accept" | "content-type")
                     && value.as_str().and_then(|value| axum::http::HeaderValue::from_str(value).ok()).is_none()
@@ -5456,8 +5453,7 @@ async fn process_forward_request_with_mcp_runtime(
         };
         let execute = crate::mcp_proxies::handlers::handle_modern_surface_http_request(
             &proxy, &surface, request, prepared, &client,
-            crate::mcp::request_validation::endpoint_version_policy(
-                surface.mcp_protocol_mode,
+            crate::mcp::request_validation::runtime_policy_for(
                 crate::mcp::request_validation::McpPathKind::FabricReceive,
             ),
         );
@@ -5633,7 +5629,6 @@ async fn process_forward_request_with_mcp_runtime(
             let audit_trace_owned = audit_trace_id.map(str::to_string);
             let identity_rules_owned = identity_ext_rules.cloned();
             let discovery_support = crate::mcp::modern::ForwardingSupport::for_endpoint(
-                surface.mcp_protocol_mode,
                 false,
                 crate::mcp::request_validation::McpPathKind::FabricReceive,
             )
