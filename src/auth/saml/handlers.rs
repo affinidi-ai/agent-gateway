@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 
 use super::service::{SamlService, TooManyPendingAuthnRequests};
 use super::user_provisioning::provision_user_from_saml;
+use crate::auth::cli_login::CLI_AUTHORIZE_PATH;
 use crate::auth::session::SessionManager;
 use crate::auth::session_finalizer::{
     AuthenticatedPrincipal, SessionFinalizationError, SessionFinalizer, SessionManagerFinalizer,
@@ -75,8 +76,6 @@ pub struct SamlUserInfo {
 pub struct SamlLoginQuery {
     pub next: Option<String>,
 }
-
-const CLI_AUTHORIZE_PATH: &str = "/api/auth/cli/authorize";
 
 /// Only the dashboard root and the CLI authorize path (with its query) may be a return target.
 /// Anything else, including off-origin and protocol-relative targets, an encoded slash or

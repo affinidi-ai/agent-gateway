@@ -19,7 +19,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tracing::debug;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::session::{SessionManager, TermsSessionGate};
@@ -30,6 +30,14 @@ use crate::sts::throttle::TokenEndpointThrottle;
 
 /// Dashboard page that asks the signed-in user to approve the CLI login.
 const CONSENT_PAGE_PATH: &str = "/cli-consent";
+
+/// Authorize route inside the identity API router.
+const AUTHORIZE_ROUTE: &str = "/auth/cli/authorize";
+
+/// The authorize path as the browser reaches it, used for the post-login return target. The
+/// identity API is nested under its `identity_api` route prefix in `gateway.json`; the dashboard
+/// calls that API at `/api` throughout, so the CLI login assumes the same prefix.
+pub const CLI_AUTHORIZE_PATH: &str = "/api/auth/cli/authorize";
 
 const CODE_TTL: Duration = Duration::from_secs(120);
 
@@ -53,6 +61,7 @@ const MAX_PENDING_CODES_PER_SESSION: usize = 3;
 struct PendingCliAuth {
     code_challenge: String,
     session_token: String,
+    user_id: String,
     expires_at: Instant,
     sequence: u64,
 }
@@ -75,6 +84,7 @@ impl CliLoginStore {
         &self,
         code_challenge: String,
         session_token: String,
+        user_id: String,
     ) -> Option<String> {
         let _guard = self
             .create_lock
@@ -93,6 +103,7 @@ impl CliLoginStore {
             PendingCliAuth {
                 code_challenge,
                 session_token,
+                user_id,
                 expires_at: now + CODE_TTL,
                 sequence: self
                     .next_sequence
@@ -128,13 +139,18 @@ impl CliLoginStore {
     }
 
     /// The code is consumed even when the verifier is wrong, so it cannot be guessed against.
+    /// Every outcome is logged with the user id where known, never with the code or verifier.
     fn redeem(
         &self,
         code: &str,
         verifier: &str,
     ) -> Option<String> {
-        let (_, pending) = self.entries.remove(code)?;
+        let Some((_, pending)) = self.entries.remove(code) else {
+            warn!("CLI login code redemption failed: unknown or already used code");
+            return None;
+        };
         if Instant::now() >= pending.expires_at {
+            warn!(user_id = %pending.user_id, "CLI login code redemption failed: code expired");
             return None;
         }
         let expected = pkce_challenge_s256(verifier);
@@ -147,8 +163,10 @@ impl CliLoginStore {
             )
             .into();
         if !matches {
+            warn!(user_id = %pending.user_id, "CLI login code redemption failed: PKCE verifier mismatch");
             return None;
         }
+        info!(user_id = %pending.user_id, "CLI login code redeemed");
         Some(pending.session_token)
     }
 }
@@ -177,7 +195,7 @@ pub fn cli_login_router(
     throttle: &LoginThrottleConfig,
 ) -> Router {
     Router::new()
-        .route("/auth/cli/authorize", get(authorize))
+        .route(AUTHORIZE_ROUTE, get(authorize))
         .route("/auth/cli/consent", post(consent))
         .route("/auth/cli/exchange", post(exchange))
         .layer(Extension(session_manager))
@@ -307,10 +325,10 @@ pub async fn consent(
         return (StatusCode::BAD_REQUEST, "invalid CLI login request").into_response();
     }
 
-    let Some(code) = store.create(request.challenge, token) else {
+    let Some(code) = store.create(request.challenge, token, session.user_id.clone()) else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many pending CLI logins").into_response();
     };
-    debug!("Issued CLI login code for loopback port {}", request.port);
+    info!(user_id = %session.user_id, port = request.port, "Issued CLI login code after user consent");
     no_store(
         Json(ConsentResponse {
             redirect_url: build_loopback_redirect(request.port, &code, &request.state),
@@ -429,7 +447,8 @@ fn build_login_bounce(
     challenge: &str,
 ) -> String {
     let next = format!(
-        "/api/auth/cli/authorize?port={}&state={}&challenge={}",
+        "{}?port={}&state={}&challenge={}",
+        CLI_AUTHORIZE_PATH,
         port,
         urlencoding::encode(state),
         urlencoding::encode(challenge),
@@ -469,6 +488,8 @@ mod tests {
 
     const TEST_VERIFIER: &str = "verifier-value-that-is-long-enough-1234567890";
 
+    const TEST_USER_ID: &str = "user-1";
+
     fn test_challenge() -> String {
         pkce_challenge_s256(TEST_VERIFIER)
     }
@@ -486,7 +507,7 @@ mod tests {
         let store = CliLoginStore::new();
         let verifier = "verifier-value-that-is-long-enough-1234567890";
         let code = store
-            .create(pkce_challenge_s256(verifier), "session-abc".to_string())
+            .create(pkce_challenge_s256(verifier), "session-abc".to_string(), TEST_USER_ID.to_string())
             .unwrap();
 
         assert_eq!(
@@ -502,7 +523,7 @@ mod tests {
         let store = CliLoginStore::new();
         let verifier = "verifier-value-that-is-long-enough-1234567890";
         let code = store
-            .create(pkce_challenge_s256(verifier), "session-abc".to_string())
+            .create(pkce_challenge_s256(verifier), "session-abc".to_string(), TEST_USER_ID.to_string())
             .unwrap();
 
         assert!(
@@ -521,7 +542,11 @@ mod tests {
     fn redeem_rejects_wrong_verifier() {
         let store = CliLoginStore::new();
         let code = store
-            .create(pkce_challenge_s256("the-real-verifier-1234567890abcdef"), "session-abc".to_string())
+            .create(
+                pkce_challenge_s256("the-real-verifier-1234567890abcdef"),
+                "session-abc".to_string(),
+                TEST_USER_ID.to_string(),
+            )
             .unwrap();
 
         assert!(
@@ -539,13 +564,14 @@ mod tests {
             PendingCliAuth {
                 code_challenge: "ch".to_string(),
                 session_token: "session-old".to_string(),
+                user_id: TEST_USER_ID.to_string(),
                 expires_at: Instant::now() - Duration::from_secs(1),
                 sequence: 0,
             },
         );
 
         store
-            .create("ch".to_string(), "session-new".to_string())
+            .create("ch".to_string(), "session-new".to_string(), TEST_USER_ID.to_string())
             .unwrap();
 
         assert!(
@@ -566,6 +592,7 @@ mod tests {
             PendingCliAuth {
                 code_challenge: pkce_challenge_s256(verifier),
                 session_token: "session-abc".to_string(),
+                user_id: TEST_USER_ID.to_string(),
                 expires_at: Instant::now() - Duration::from_secs(1),
                 sequence: 0,
             },
@@ -594,6 +621,32 @@ mod tests {
             .unwrap();
         let decoded = urlencoding::decode(next).unwrap();
         assert_eq!(decoded, "/api/auth/cli/authorize?port=52111&state=st&challenge=ch");
+    }
+
+    #[test]
+    fn cli_authorize_path_is_the_authorize_route_under_the_dashboard_api_prefix() {
+        assert_eq!(CLI_AUTHORIZE_PATH, format!("/api{AUTHORIZE_ROUTE}"));
+    }
+
+    #[test]
+    fn a_state_with_slashes_survives_the_login_bounce_and_the_return_target_check() {
+        let state = "a/b\\c+=";
+        let bounce = build_login_bounce(52111, state, &test_challenge());
+        let next = urlencoding::decode(
+            bounce
+                .strip_prefix("/login?next=")
+                .unwrap(),
+        )
+        .unwrap()
+        .into_owned();
+
+        assert!(next.contains("&state=a%2Fb%5Cc%2B%3D&"), "{next}");
+        assert!(crate::auth::saml::is_allowed_return_target(&next), "{next}");
+        let query = next
+            .strip_prefix(&format!("{CLI_AUTHORIZE_PATH}?"))
+            .unwrap();
+        let parsed: AuthorizeQuery = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(parsed.state, state);
     }
 
     #[test]
@@ -634,13 +687,13 @@ mod tests {
         for index in 0..MAX_PENDING_CODES {
             assert!(
                 store
-                    .create("ch".to_string(), format!("session-{index}"))
+                    .create("ch".to_string(), format!("session-{index}"), TEST_USER_ID.to_string())
                     .is_some()
             );
         }
         assert!(
             store
-                .create("ch".to_string(), "session-extra".to_string())
+                .create("ch".to_string(), "session-extra".to_string(), TEST_USER_ID.to_string())
                 .is_none()
         );
         assert_eq!(store.entries.len(), MAX_PENDING_CODES);
@@ -652,7 +705,7 @@ mod tests {
         for _ in 0..(MAX_PENDING_CODES_PER_SESSION * 4) {
             assert!(
                 store
-                    .create("ch".to_string(), "spammer".to_string())
+                    .create("ch".to_string(), "spammer".to_string(), TEST_USER_ID.to_string())
                     .is_some()
             );
         }
@@ -664,13 +717,13 @@ mod tests {
         let store = CliLoginStore::new();
         for _ in 0..(MAX_PENDING_CODES * 2) {
             store
-                .create("ch".to_string(), "spammer".to_string())
+                .create("ch".to_string(), "spammer".to_string(), TEST_USER_ID.to_string())
                 .unwrap();
         }
 
         assert!(
             store
-                .create("ch".to_string(), "honest".to_string())
+                .create("ch".to_string(), "honest".to_string(), TEST_USER_ID.to_string())
                 .is_some()
         );
     }
@@ -690,7 +743,7 @@ mod tests {
                     scope.spawn(move || {
                         barrier.wait();
                         store
-                            .create("ch".to_string(), session_for(index))
+                            .create("ch".to_string(), session_for(index), TEST_USER_ID.to_string())
                             .is_some()
                     })
                 })
@@ -717,13 +770,71 @@ mod tests {
         let store = CliLoginStore::new();
         for index in 0..(MAX_PENDING_CODES - 1) {
             store
-                .create("ch".to_string(), format!("session-{index}"))
+                .create("ch".to_string(), format!("session-{index}"), TEST_USER_ID.to_string())
                 .unwrap();
         }
 
         let created = create_concurrently(&store, |index| format!("burst-{index}"));
 
         assert_eq!(created, 1);
+        assert_eq!(store.entries.len(), MAX_PENDING_CODES);
+    }
+
+    fn codes_of(
+        store: &CliLoginStore,
+        session_token: &str,
+    ) -> usize {
+        store
+            .entries
+            .iter()
+            .filter(|entry| entry.session_token == session_token)
+            .count()
+    }
+
+    #[test]
+    fn a_full_store_still_rotates_a_full_session_without_refusing_it() {
+        let store = CliLoginStore::new();
+        for _ in 0..MAX_PENDING_CODES_PER_SESSION {
+            store
+                .create("ch".to_string(), "session-abc".to_string(), TEST_USER_ID.to_string())
+                .unwrap();
+        }
+        for index in MAX_PENDING_CODES_PER_SESSION..MAX_PENDING_CODES {
+            store
+                .create("ch".to_string(), format!("session-{index}"), TEST_USER_ID.to_string())
+                .unwrap();
+        }
+
+        assert!(
+            store
+                .create("ch".to_string(), "session-abc".to_string(), TEST_USER_ID.to_string())
+                .is_some()
+        );
+        assert_eq!(codes_of(&store, "session-abc"), MAX_PENDING_CODES_PER_SESSION);
+        assert_eq!(store.entries.len(), MAX_PENDING_CODES);
+    }
+
+    #[test]
+    fn a_full_store_refuses_a_session_below_its_cap_without_dropping_its_codes() {
+        let store = CliLoginStore::new();
+        let held = MAX_PENDING_CODES_PER_SESSION - 1;
+        for _ in 0..held {
+            store
+                .create("ch".to_string(), "session-abc".to_string(), TEST_USER_ID.to_string())
+                .unwrap();
+        }
+        for index in held..MAX_PENDING_CODES {
+            store
+                .create("ch".to_string(), format!("session-{index}"), TEST_USER_ID.to_string())
+                .unwrap();
+        }
+
+        assert!(
+            store
+                .create("ch".to_string(), "session-abc".to_string(), TEST_USER_ID.to_string())
+                .is_none()
+        );
+        assert_eq!(codes_of(&store, "session-abc"), held);
         assert_eq!(store.entries.len(), MAX_PENDING_CODES);
     }
 
@@ -734,7 +845,7 @@ mod tests {
         let codes: Vec<String> = (0..=MAX_PENDING_CODES_PER_SESSION)
             .map(|_| {
                 store
-                    .create(pkce_challenge_s256(verifier), "session-abc".to_string())
+                    .create(pkce_challenge_s256(verifier), "session-abc".to_string(), TEST_USER_ID.to_string())
                     .unwrap()
             })
             .collect();
@@ -771,7 +882,7 @@ mod tests {
         let now = chrono::Utc::now();
         storage
             .save_user(&UserData {
-                user_id: "user-1".to_string(),
+                user_id: TEST_USER_ID.to_string(),
                 username: "alice".to_string(),
                 passkeys: Vec::new(),
                 role: UserRole::User,
@@ -797,7 +908,7 @@ mod tests {
         let (storage, dir) = test_storage(status).await;
         let manager = Arc::new(SessionManager::new());
         let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
+            .create_session("alice".to_string(), TEST_USER_ID.to_string())
             .await;
         (cli_login_router(manager, storage, &LoginThrottleConfig::default()), token, dir)
     }
@@ -831,7 +942,7 @@ mod tests {
         let (storage, storage_dir) = test_storage(UserStatus::Approved).await;
         let manager = Arc::new(SessionManager::new());
         let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
+            .create_session("alice".to_string(), TEST_USER_ID.to_string())
             .await;
         let store = Arc::new(CliLoginStore::new());
         let router = Router::new()
@@ -1063,12 +1174,12 @@ mod tests {
         let (storage, _storage_dir) = test_storage(UserStatus::Approved).await;
         let manager = Arc::new(SessionManager::new());
         let token = manager
-            .create_session("alice".to_string(), "user-1".to_string())
+            .create_session("alice".to_string(), TEST_USER_ID.to_string())
             .await;
         let store = Arc::new(CliLoginStore::new());
         for index in 0..MAX_PENDING_CODES {
             store
-                .create("ch".to_string(), format!("session-{index}"))
+                .create("ch".to_string(), format!("session-{index}"), TEST_USER_ID.to_string())
                 .unwrap();
         }
         let router = Router::new()
@@ -1096,7 +1207,11 @@ mod tests {
         let (storage, _storage_dir) = test_storage(UserStatus::Approved).await;
         let manager = Arc::new(SessionManager::new());
         let token = manager
-            .create_session_with_terms_gate("alice".to_string(), "user-1".to_string(), TermsSessionGate::ConsentPending)
+            .create_session_with_terms_gate(
+                "alice".to_string(),
+                TEST_USER_ID.to_string(),
+                TermsSessionGate::ConsentPending,
+            )
             .await;
         let store = Arc::new(CliLoginStore::new());
         let router = Router::new()
@@ -1392,7 +1507,7 @@ mod tests {
         let app = throttled_app(throttle_of(true, 1)).await;
         let code = app
             .store
-            .create(test_challenge(), app.token.clone())
+            .create(test_challenge(), app.token.clone(), TEST_USER_ID.to_string())
             .unwrap();
         let unknown_code = Uuid::new_v4().to_string();
         assert_eq!(

@@ -405,7 +405,8 @@ address per minute by default (`cli_login_throttle` in `gateway.json`). Past tha
 source address comes from `X-Forwarded-For` or `Forwarded`, which a caller can set unless a
 proxy overwrites it, so a request without one is not limited per address. Codes stay safe
 regardless, because each is random, single use, expires in two minutes and needs the PKCE
-verifier.
+verifier. The gateway logs each issued code, each redemption and each failed redemption with
+the user id where known, never with the code or verifier.
 
 Known limitations: the login hands the CLI the browser's own session, and the code store and the
 SAML return targets are in memory, so the login works with one gateway instance.

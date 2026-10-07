@@ -166,3 +166,15 @@ interface:
 - The resource-pattern editor enforces the same canonical grammar described under
   [Resource patterns and required headers](#resource-patterns-and-required-headers). A
   pattern the editor refuses is one the API would also refuse.
+
+### CLI browser login
+
+The `fabric` CLI does not use a management token. It signs in through the dashboard:
+`/api/auth/cli/authorize` sends the browser through the normal passkey or SAML sign-in to a
+consent page, `/api/auth/cli/consent` issues a single-use code once the signed-in, approved
+user allows it, and the CLI redeems that code with its PKCE verifier at
+`/api/auth/cli/exchange`. What the CLI receives is the browser's own dashboard session, so it
+carries the user's full role, ends when the user signs out in the browser, and cannot be
+revoked on its own. Pending codes live in memory for two minutes, so CLI login works with one
+gateway instance. Limits and the full flow are in
+[`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway).

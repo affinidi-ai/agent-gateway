@@ -3,22 +3,19 @@ changes:
   added:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Add browser sign-in for the fabric CLI
-      description: The fabric CLI can now sign in through the browser using passkey or SAML. A confirmation page asks the user to allow the CLI before a one-time code is issued, and the code is exchanged over a PKCE-protected back channel so the session token never appears in a URL.
+      description: The fabric CLI can now sign in through the browser using passkey or SAML. A confirmation page asks the signed-in, approved user to allow the CLI, through a same-origin JSON request, before a one-time code is issued. The code is exchanged over a PKCE-protected back channel so the session token never appears in a URL. Requests must use a loopback port of 1024 or higher and PKCE challenge and verifier lengths from RFC 7636. Pending codes are capped globally and per session, each endpoint allows 20 requests per source address per minute by default (cli_login_throttle in gateway.json, 429 with Retry-After past that), responses that carry a code or token are never cached, and issued and redeemed codes are logged with the user id.
     - timestamp: '2026-10-06T00:00:01.000Z'
-      title: Return to the requested page after dashboard sign-in
-      description: The login page and SAML sign-in now honor a next target limited to the dashboard root and the CLI authorize path, so users land back on the page that asked them to sign in.
+      title: Return to the CLI login flow after dashboard sign-in
+      description: The login page and SAML sign-in honor a next target limited to the dashboard root and the CLI authorize path, so a CLI login continues after the user signs in. For SAML the gateway keeps that target and sends only a short one-time key as RelayState.
   changed: []
   fixed: []
   removed: []
   security:
-    - timestamp: '2026-10-06T00:00:02.000Z'
-      title: Harden CLI login requests
-      description: CLI login rejects ports below 1024, checks PKCE challenge and verifier lengths, caps pending codes globally and per session, limits each endpoint to 20 requests per source address per minute by default (cli_login_throttle in gateway.json, 429 with Retry-After past that), requires an approved user to consent, and sends no-store headers on responses that carry a code or token. A code is issued only after the signed-in user approves on a confirmation page, through a same-origin JSON request.
     - timestamp: '2026-10-07T00:00:00.000Z'
       title: Bound outstanding SAML sign-ins
-      description: /api/saml/login allows 20 sign-ins per source address per minute by default (login_throttle in saml.json) and answers 429 with Retry-After past that. The gateway also tracks at most 1000 unfinished SAML sign-ins and answers 503 past that, instead of holding them without limit. The post-login return target stays on the gateway and RelayState carries only a short one-time key.
+      description: /api/saml/login allows 20 sign-ins per source address per minute by default (login_throttle in saml.json) and answers 429 with Retry-After past that. The gateway also tracks at most 1000 unfinished SAML sign-ins and answers 503 past that, instead of holding them without limit.
   breaking: []
   internal:
     - timestamp: '2026-10-06T00:00:03.000Z'
       title: Add tests and docs for CLI browser login
-      description: Adds unit tests for the code store, the authorize, consent and exchange endpoints and the safe redirect check, and documents the flow in the capabilities guide.
+      description: Adds unit tests for the code store, the authorize, consent and exchange endpoints and the safe redirect check, and documents the flow in the capabilities, access token and architecture guides.
