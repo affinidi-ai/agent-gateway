@@ -8,14 +8,19 @@ changes:
         An MCP Proxy whose OpenAPI spec the legacy catalog converter cannot load now registers a
         modern-only catalog instead of failing, and its request body limit always comes from
         `mcp_http`. Its create and update responses carry a `warnings` entry naming the converter
-        error, because `2024-11-05` clients of that Proxy get `500`.
+        error, because `2024-11-05` clients of that Proxy get `500`; the dashboard's create
+        wizard and edit page display those warnings. Updates that do not rebuild the catalogs
+        still return the warning until a rebuild loads the legacy catalog. Management tool
+        discovery reads the modern catalog, so it lists that Proxy's tools instead of returning
+        `500`.
     - timestamp: '2026-10-07T02:15:14.000Z'
       title: Trust the sending gateway's Origin check on buffered Fabric receive
       description: >-
         A buffered Fabric `ForwardRequest` no longer rechecks the caller's browser Origin against
         the receiving surface's `mcp_http.allowed_origins`, so a legacy browser client admitted by
         the sending gateway is not refused with `403` by its peer. Header and body limits still
-        apply, and framed streams still check Origin on receive.
+        apply, with the forwarded Origin counted toward the header budget, and framed streams
+        still check Origin on receive.
   fixed: []
   removed: []
   security: []
@@ -61,3 +66,9 @@ changes:
         AGENTS.md, ARCHITECTURE.md, CONTEXT.md, README and the MCP, protocol, Fabric and
         conformance docs describe modern MCP as admitted on every MCP endpoint, with a short
         compatibility note for the retired setting.
+    - timestamp: '2026-10-07T10:00:00.000Z'
+      title: Require saving every surface before downgrading to an older release
+      description: >-
+        The MCP rollback steps now PATCH `{"mcp_http": null}` onto every surface, even when GET
+        shows neither field, and verify the stored records rather than GET, because GET hides a
+        retired `mcp_protocol_mode` that only a save removes and that older releases reject.
