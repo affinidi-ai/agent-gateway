@@ -19,7 +19,7 @@ SHELL := /bin/bash
         config-certs config-debug config-debug-dev config-debug-x config-test config-release install-deps install-rust-deps verify-rust-deps install-git-hooks setup-vscode \
         docker-build-local docker-build-local-dev docker-rebuild-local docker-rebuild-local-dev docker-run docker-run-dev docker-shell docker-network \
         config-docker \
-	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci node-local rust-local local audit-www-all audit-fix-www-all license-check \
+	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
         www www-dev \
         clean clean-all clear-storage clear-storage-local \
 		demo-multi-tenancy \
@@ -505,6 +505,13 @@ audit-fix-www-all: ## Update Rust and frontend deps to patched versions (all app
 		(cd $$dir && npm install --silent && npm audit fix --omit=dev 2>/dev/null) || true; \
 	done
 	@echo "$(GREEN)✅ Security audit fixed!$(NC)"
+
+browserslist-update: ## Refresh Browserslist data (caniuse-lite) in every frontend app's package-lock.json
+	@for dir in $(WWW_DIRS); do \
+		echo "$(BLUE)🌐 Updating Browserslist data in $$dir...$(NC)"; \
+		(cd $$dir && npx --yes update-browserslist-db@latest) || exit 1; \
+	done
+	@echo "$(GREEN)✅ Browserslist data updated! Commit the package-lock.json changes.$(NC)"
 
 # ==============================================================================
 # Quality Gates

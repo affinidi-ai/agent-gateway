@@ -1,0 +1,14 @@
+branch: feat/browserslist-update
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: "2026-10-07T09:00:00.000Z"
+      title: Add make browserslist-update to refresh stale caniuse-lite data
+      description: >-
+        The frontend build warned that Browserslist data was months old. The new target runs
+        update-browserslist-db in every frontend app so the lockfile can be refreshed in one step.
