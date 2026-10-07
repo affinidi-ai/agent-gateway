@@ -2,11 +2,13 @@ branch: feat/github_actions
 changes:
   added: []
   changed: []
-  fixed: []
   removed: []
-  security: []
   breaking: []
   security:
     - timestamp: '2026-10-07T00:00:00.000Z'
       title: Pin GitHub Actions and reusable workflows
       description: Pin CI dependencies to immutable commits and scope checks to read-only repository access.
+  fixed:
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Pull G2G BDD images from workflow version variables
+      description: Fix the gateway-to-gateway CI image pre-pull step by using explicit mediator and Valkey version variables.

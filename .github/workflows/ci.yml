@@ -273,6 +273,8 @@ jobs:
       # two scenarios fit the 4-vCPU runner without delaying federation past
       # its readiness timeout. The Makefile default is 8.
       G2G_BDD_PARALLELISM: "1"
+      MEDIATOR_VERSION: v0.33.1
+      VALKEY_VERSION: 8.1.4
       # Preserve per-gateway temp dirs so gateway.log survives for the artifact.
       BDD_KEEP_TEMP_DIRS: "1"
     steps:
@@ -299,7 +301,9 @@ jobs:
       # Four scenario setups otherwise race to pull these images on a cold
       # runner, which can exceed the public registry rate limit.
       - name: Pull BDD images
-        run: scripts/g2g-mediator.sh --print-images | xargs -n 1 docker pull
+        run: |
+          docker pull "public.ecr.aws/affinidi/messaging-mediator:${MEDIATOR_VERSION}"
+          docker pull "valkey/valkey:${VALKEY_VERSION}"
 
       # The harness starts a DIDComm mediator per scenario from the public
       # image in scripts/g2g-mediator.sh, which needs no registry credentials.
