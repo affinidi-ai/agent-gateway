@@ -53,6 +53,13 @@ changes:
         modern request to a legacy-only upstream gets `502`. Buffered Fabric `ForwardRequest`
         stays `2024-11-05`-only.
   internal:
+    - timestamp: '2026-10-07T09:00:00.000Z'
+      title: Narrow the MCP Origin-check skip to crate-internal Fabric receive
+      description: >-
+        `EndpointHttpPolicy::without_origin_check` is now `pub(crate)` and documented as only for
+        buffered Fabric `ForwardRequest` receive. The skip lives on `EndpointHttpPolicy` and the
+        `admit_post` helper is private, so `OriginPolicy` always enforces its allowlist and that
+        method is the only way to skip it.
     - timestamp: '2026-10-07T02:15:14.000Z'
       title: Remove protocol mode from tests, BDD fixtures, conformance and dashboard
       description: >-

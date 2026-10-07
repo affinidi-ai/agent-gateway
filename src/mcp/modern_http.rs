@@ -27,7 +27,7 @@ impl From<&crate::config::McpHttpConfig> for HttpLimits {
 
 #[derive(Debug, Clone)]
 pub struct EndpointHttpPolicy {
-    origins: OriginPolicy,
+    origins: Option<OriginPolicy>,
     limits: HttpLimits,
     versions: McpVersionPolicy<'static>,
 }
@@ -49,14 +49,17 @@ impl EndpointHttpPolicy {
         let defaults = crate::config::McpHttpConfig::default();
         let config = config.unwrap_or(&defaults);
         Ok(Self {
-            origins: OriginPolicy::new(public_endpoints, &config.allowed_origins)?,
+            origins: Some(OriginPolicy::new(public_endpoints, &config.allowed_origins)?),
             limits: config.into(),
             versions,
         })
     }
 
-    pub fn without_origin_check(mut self) -> Self {
-        self.origins = OriginPolicy { allowed: None };
+    /// Skips the Origin allowlist while keeping the header and body limits.
+    /// Only for buffered Fabric `ForwardRequest` receive, whose Origin the
+    /// sending gateway already checked; never for a browser-reachable route.
+    pub(crate) fn without_origin_check(mut self) -> Self {
+        self.origins = None;
         self
     }
 
@@ -71,7 +74,9 @@ impl EndpointHttpPolicy {
         headers: &HeaderMap,
     ) -> Result<(), HttpAdmissionError> {
         validate_header_budget(headers, self.limits)?;
-        self.origins.validate(headers)
+        self.origins
+            .as_ref()
+            .map_or(Ok(()), |origins| origins.validate(headers))
     }
 
     pub fn admit_post(
@@ -80,7 +85,7 @@ impl EndpointHttpPolicy {
         body: &[u8],
         session: LegacySessionEvidence,
     ) -> Result<McpRequestClassification, Box<McpRequestValidationError>> {
-        admit_post(headers, body, session, self.versions, &self.origins, self.limits)
+        admit_post(headers, body, session, self.versions, self.origins.as_ref(), self.limits)
     }
 
     /// Caps an admitted legacy `initialize` to a revision this endpoint serves;
@@ -199,12 +204,12 @@ pub fn strip_protocol_session_headers(headers: &mut HeaderMap) {
     headers.remove("last-event-id");
 }
 
-pub fn admit_post(
+fn admit_post(
     headers: &HeaderMap,
     body: &[u8],
     session: LegacySessionEvidence,
     versions: McpVersionPolicy<'_>,
-    origins: &OriginPolicy,
+    origins: Option<&OriginPolicy>,
     limits: HttpLimits,
 ) -> Result<McpRequestClassification, Box<McpRequestValidationError>> {
     let transport_error = |error: HttpAdmissionError| {
@@ -219,9 +224,11 @@ pub fn admit_post(
         error.into_validation_error(id)
     };
     validate_header_budget(headers, limits).map_err(transport_error)?;
-    origins
-        .validate(headers)
-        .map_err(transport_error)?;
+    if let Some(origins) = origins {
+        origins
+            .validate(headers)
+            .map_err(transport_error)?;
+    }
     if body.len() > limits.max_request_bytes.get() {
         return Err(transport_error(BODY_TOO_LARGE));
     }
@@ -241,7 +248,7 @@ pub fn admit_post(
 
 #[derive(Debug, Clone)]
 pub struct OriginPolicy {
-    allowed: Option<HashSet<String>>,
+    allowed: HashSet<String>,
 }
 
 fn parsed_origin(value: &str) -> Option<String> {
@@ -306,16 +313,13 @@ impl OriginPolicy {
             }
             allowed.insert(origin.clone());
         }
-        Ok(Self { allowed: Some(allowed) })
+        Ok(Self { allowed })
     }
 
     pub fn validate(
         &self,
         headers: &HeaderMap,
     ) -> Result<(), HttpAdmissionError> {
-        let Some(allowed) = &self.allowed else {
-            return Ok(());
-        };
         let mut values = headers
             .get_all(header::ORIGIN)
             .iter();
@@ -325,7 +329,8 @@ impl OriginPolicy {
         let origin = value
             .to_str()
             .map_err(|_| INVALID_ORIGIN)?;
-        if values.next().is_some() || parsed_origin(origin).as_deref() != Some(origin) || !allowed.contains(origin) {
+        if values.next().is_some() || parsed_origin(origin).as_deref() != Some(origin) || !self.allowed.contains(origin)
+        {
             return Err(INVALID_ORIGIN);
         }
         Ok(())
@@ -535,7 +540,7 @@ mod tests {
                 "notifications": notifications, "_meta": {"io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
                     "io.modelcontextprotocol/clientCapabilities": {}}
             }})).unwrap();
-            let result = admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, &origins, limits);
+            let result = admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits);
             if notifications.is_object() {
                 assert!(matches!(result, Ok(McpRequestClassification::Modern(_))));
             } else {
@@ -548,7 +553,7 @@ mod tests {
                 &body,
                 LegacySessionEvidence::Absent,
                 super::super::request_validation::LEGACY_ONLY_POLICY,
-                &origins,
+                Some(&origins),
                 limits,
             )
             .unwrap_err();
@@ -1003,7 +1008,7 @@ mod tests {
         let mut legacy_headers = HeaderMap::new();
         let legacy = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
         assert_eq!(
-            admit_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions, &origins, limits()),
+            admit_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions, Some(&origins), limits()),
             validate_mcp_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions)
         );
         legacy_headers.insert(
@@ -1013,7 +1018,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            admit_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions, &origins, limits())
+            admit_post(&legacy_headers, legacy, LegacySessionEvidence::Absent, versions, Some(&origins), limits())
                 .unwrap_err()
                 .status,
             StatusCode::FORBIDDEN
@@ -1021,7 +1026,7 @@ mod tests {
         let body = modern_body();
         let headers = modern_headers();
         assert!(matches!(
-            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, &origins, limits()),
+            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits()),
             Ok(McpRequestClassification::Modern(_))
         ));
         let error = admit_post(
@@ -1029,7 +1034,7 @@ mod tests {
             &body,
             LegacySessionEvidence::Absent,
             super::super::request_validation::LEGACY_ONLY_POLICY,
-            &origins,
+            Some(&origins),
             limits(),
         )
         .unwrap_err();
@@ -1058,12 +1063,12 @@ mod tests {
         headers.remove(header::ACCEPT);
         let body = modern_body();
         let error =
-            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, &origins, limits()).unwrap_err();
+            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits()).unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
         assert_eq!(error.id, Some(serde_json::json!("admission")));
         headers.remove(header::ORIGIN);
         let error =
-            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, &origins, limits()).unwrap_err();
+            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits()).unwrap_err();
         assert_eq!(error.code, super::super::error_codes::HEADER_MISMATCH);
         headers.insert(
             "mcp-method",
@@ -1072,7 +1077,7 @@ mod tests {
                 .unwrap(),
         );
         let error =
-            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, &origins, limits()).unwrap_err();
+            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits()).unwrap_err();
         assert_eq!(error.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         headers.insert(
             header::CONTENT_TYPE,
@@ -1081,7 +1086,7 @@ mod tests {
                 .unwrap(),
         );
         let error =
-            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, &origins, limits()).unwrap_err();
+            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits()).unwrap_err();
         assert_eq!(error.status, StatusCode::NOT_ACCEPTABLE);
         assert_eq!(error.id, Some(serde_json::json!("admission")));
     }
@@ -1094,9 +1099,10 @@ mod tests {
         let headers = modern_headers();
         let mut limits = limits();
         limits.max_request_bytes = NonZeroUsize::new(body.len()).unwrap();
-        assert!(admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, &origins, limits).is_ok());
+        assert!(admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits).is_ok());
         limits.max_request_bytes = NonZeroUsize::new(body.len() - 1).unwrap();
-        let error = admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, &origins, limits).unwrap_err();
+        let error =
+            admit_post(&headers, &body, LegacySessionEvidence::Absent, versions, Some(&origins), limits).unwrap_err();
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error.id, None);
     }
