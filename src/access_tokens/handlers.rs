@@ -446,7 +446,7 @@ pub async fn rotate_access_token(
             .await
             .map_err(|error| {
                 error!(token_id = %id, %error, "Failed to load caller for access token rotation");
-                (StatusCode::INTERNAL_SERVER_ERROR, "failed to rotate access token".to_string())
+                deny(StatusCode::INTERNAL_SERVER_ERROR, "failed to rotate access token")
             })?
             .map(|user| user.role);
         if caller_role != Some(UserRole::Administrator) {
@@ -505,7 +505,7 @@ pub async fn rotate_access_token(
         }
         Err(source) => {
             error!(token_id = %id, error = %source, "Failed to rotate management access token");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to rotate access token".into()))
+            Err(deny(StatusCode::INTERNAL_SERVER_ERROR, "failed to rotate access token"))
         }
     }
 }

@@ -126,7 +126,9 @@ is the calling PAT's id and empty for a session caller. `access_token.rotate_den
 owner and covers only refusals made by the handler: `401` for a request with no authenticated
 caller, `403` for a non-administrator rotating another user's token or a PAT caller outside its
 lineage or using a resource-scoped PAT, `404` for an unknown token id, and `409` for a revoked,
-expired, inactive-lineage or concurrently rotated token. Requests refused by the authentication
+expired, inactive-lineage or concurrently rotated token. It is also emitted with status `500`
+when loading the caller or saving the rotated token fails; the error detail is logged only on
+the default target. Requests refused by the authentication
 or `access_tokens.edit` route checks before the handler runs emit neither event.
 
 ## Governance audit forwarding

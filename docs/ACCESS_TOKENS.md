@@ -42,7 +42,10 @@ refused by the handler is emitted as `access_token.rotate_denied` with the token
 auth method, status, and reason, but not the owner: a request with no authenticated caller
 (`401`), a non-administrator rotating another user's token, a PAT caller rotating outside
 its lineage or with a resource-scoped PAT (`403`), an unknown token id (`404`), and a
-revoked, expired, inactive-lineage, or concurrently rotated token (`409`). Requests refused
+revoked, expired, inactive-lineage, or concurrently rotated token (`409`). A rotation that
+fails because the caller cannot be loaded or the token cannot be saved is also emitted as
+`access_token.rotate_denied` with status `500`; the error detail is logged only on the default
+target. Requests refused
 by the authentication or `access_tokens.edit` route checks before the handler runs emit no
 rotation event. These events are not stored in the delegation audit store or forwarded to
 Governance Audit integrations, so operators should ship the `audit` target off the appliance
