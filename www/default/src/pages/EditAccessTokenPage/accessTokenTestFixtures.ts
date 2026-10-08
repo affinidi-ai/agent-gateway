@@ -10,6 +10,7 @@ export const accessToken: AccessTokenMeta = {
   required_headers: [],
   created_by: 'admin-1',
   created_at: '2026-09-08T10:00:00Z',
+  rotation_generation: 0,
   active: true,
 };
 

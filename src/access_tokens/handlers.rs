@@ -358,12 +358,12 @@ pub async fn update_access_token(
         .await
     {
         Ok(Some(token)) => {
-            info!(token_id = %id, "Updated management access token");
+            info!(token_id = id.as_str(), "Updated management access token");
             Ok(Json(AccessTokenMeta::from_token(&token, Utc::now())))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, "access token not found".into())),
         Err(error) => {
-            error!(token_id = %id, %error, "Failed to update management access token");
+            error!(token_id = id.as_str(), %error, "Failed to update management access token");
             Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to update token".into()))
         }
     }
@@ -385,7 +385,7 @@ pub async fn revoke_access_token(
         Ok(Some(_)) => Ok(StatusCode::NO_CONTENT),
         Ok(None) => Err((StatusCode::NOT_FOUND, "access token not found".into())),
         Err(error) => {
-            error!(token_id = %id, %error, "Failed to revoke management access token");
+            error!(token_id = id.as_str(), %error, "Failed to revoke management access token");
             Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to revoke token".into()))
         }
     }
@@ -413,7 +413,7 @@ pub async fn rotate_access_token(
         warn!(
             target: "audit",
             event = "access_token.rotate_denied",
-            token_id = %id,
+            token_id = id.as_str(),
             caller_user_id = %caller_id,
             caller_auth_method,
             caller_token_id,
@@ -445,7 +445,7 @@ pub async fn rotate_access_token(
             .load_user_by_id(&caller_id)
             .await
             .map_err(|error| {
-                error!(token_id = %id, %error, "Failed to load caller for access token rotation");
+                error!(token_id = id.as_str(), %error, "Failed to load caller for access token rotation");
                 deny(StatusCode::INTERNAL_SERVER_ERROR, "failed to rotate access token")
             })?
             .map(|user| user.role);
@@ -472,7 +472,7 @@ pub async fn rotate_access_token(
                     $level!(
                         target: "audit",
                         event = "access_token.rotated",
-                        token_id = %id,
+                        token_id = id.as_str(),
                         owner_user_id = %token.user_id,
                         caller_user_id = %caller_id,
                         caller_auth_method,
@@ -504,7 +504,7 @@ pub async fn rotate_access_token(
             Err(deny(StatusCode::CONFLICT, "access token was rotated concurrently; fetch it and retry"))
         }
         Err(source) => {
-            error!(token_id = %id, error = %source, "Failed to rotate management access token");
+            error!(token_id = id.as_str(), error = %source, "Failed to rotate management access token");
             Err(deny(StatusCode::INTERNAL_SERVER_ERROR, "failed to rotate access token"))
         }
     }
