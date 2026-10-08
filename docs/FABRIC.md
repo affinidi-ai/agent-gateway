@@ -63,7 +63,8 @@ Framed stream messages (`forward-stream/1.0` frames and capability queries) also
 listener. It answers a capability query only from a registered, active peer gateway, and answers an
 Open it refuses with an `Error` frame to that peer saying why: `stale_offer` (the sender negotiates
 again), `legacy_only` (sent only by an older peer whose surface does not admit modern MCP; the
-sender's caller gets `-32022`, as from a legacy-only endpoint) or `unavailable`. An Open's
+sender's caller gets `-32022`, as from a legacy-only endpoint), `capacity_reached` (a framed-stream
+cap is full; the sender's caller gets `429` with `Retry-After`) or `unavailable`. An Open's
 envelope must carry a valid `expires_time`, as a `forward-request`'s must. See the Framed Fabric Transport section of
 [`MCP_METADATA.md`](MCP_METADATA.md#framed-fabric-transport).
 
@@ -250,8 +251,8 @@ multi-tenant or internet-facing gateway: some gateway-wide tables and signals
 are shared across tenants and peers (appliance-wide access changes still end
 every subscription, and the capability offer and Open replay tables are shared), and the limits are per caller,
 per peer or per surface, never per tenant. Framed streams are capped at 8 per peer and 16 per surface,
-so a partner's long-lived listens can use up its slots; past a cap the sending
-caller gets `502`, not `429`. The full list of limits is in
+with listens counted apart from request streams, so a partner's long-lived listens do not use up its
+request slots; past a cap the sending caller gets `429` with `Retry-After: 5`. The full list of limits is in
 [Framed Fabric limits](MCP_METADATA.md#framed-fabric-limits). A buffered `ForwardRequest` receiver
 does not recheck the caller's browser Origin against its own `mcp_http.allowed_origins`; it trusts
 the paired sending gateway's check, as it trusts that peer for every other forwarded header.

@@ -1,0 +1,30 @@
+branch: fix/fabric-stream-cap-429
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-08T08:53:14.000Z'
+      title: Answer Fabric stream-cap refusals with 429 and Retry-After
+      description: >-
+        A modern MCP request refused because a framed Fabric stream cap is full, on the sending or
+        the receiving gateway, now gets `429` with `Retry-After: 5` and a JSON-RPC error body on
+        both Access Points and Transit Points, instead of `502` or `UpstreamConnectionFailed`. The
+        receiving gateway names the refusal with a new `capacity_reached` stream error code, so the
+        sender can tell a full cap from a transport failure, which keeps its current status. A
+        sender built before this code does not recognise it and waits for its response deadline.
+    - timestamp: '2026-10-08T08:53:14.000Z'
+      title: Give forwarded Fabric listens their own per-peer and per-surface budget
+      description: >-
+        Forwarded `subscriptions/listen` streams now count against their own caps (8 per peer, 16
+        per surface) apart from request streams, so a partner's long-lived listens no longer use
+        up the slots its other modern MCP requests need. The total of 128 streams per direction
+        still counts both.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-08T08:53:14.000Z'
+      title: Fix the access token component test for token rotation fields
+      description: >-
+        The scoped-token helper in the access token component tests now sets the rotation fields
+        added with token rotation, so the test target compiles again.

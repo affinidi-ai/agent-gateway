@@ -701,6 +701,8 @@ mod tests {
             max_streams: 4,
             max_peer_streams: 4,
             max_surface_streams: 4,
+            max_peer_listens: 4,
+            max_surface_listens: 4,
         })
         .unwrap()
     }

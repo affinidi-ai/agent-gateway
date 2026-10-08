@@ -139,6 +139,9 @@ pub(crate) enum OutboundPipelineError {
     #[error("Upstream connection failed: {0}")]
     UpstreamConnectionFailed(String),
 
+    #[error("Upstream Fabric stream capacity reached")]
+    UpstreamCapacityReached(Option<serde_json::Value>),
+
     #[error("Failed to read upstream response")]
     UpstreamResponseReadFailed,
 
@@ -179,7 +182,7 @@ impl OutboundPipelineError {
 
             Self::ExtensionValidationFailed(_) | Self::ProtocolMismatch { .. } => StatusCode::UNPROCESSABLE_ENTITY,
 
-            Self::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+            Self::RateLimitExceeded | Self::UpstreamCapacityReached(_) => StatusCode::TOO_MANY_REQUESTS,
 
             Self::TransitTokenInvalid(_) | Self::ConsentRequired(_) => StatusCode::UNAUTHORIZED,
 
@@ -222,6 +225,9 @@ impl IntoResponse for OutboundPipelineError {
         }
         if let Self::McpValidation(error) = self {
             return (*error).into_response();
+        }
+        if let Self::UpstreamCapacityReached(id) = self {
+            return crate::proxy::fabric_forward::capacity_response(id);
         }
         if let Self::McpMetadata { error, body, response } = self {
             return error.into_response(
@@ -4190,21 +4196,19 @@ async fn step_forward_request_fabric(
         .await
         .map_err(|error| {
             warn!(request_id = %ctx.request_id, %error, "Modern outbound Fabric forward failed");
+            let request_id = match ctx
+                .mcp_classification
+                .as_ref()
+            {
+                Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => request.id.clone(),
+                _ => None,
+            };
             match error {
                 FabricForwardError::NoResponse(_) => OutboundPipelineError::UpstreamTimeout,
                 FabricForwardError::RemoteLegacyOnly => OutboundPipelineError::McpValidation(
-                    crate::mcp::request_validation::McpRequestValidationError::legacy_only(
-                        match ctx
-                            .mcp_classification
-                            .as_ref()
-                        {
-                            Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => {
-                                request.id.clone()
-                            }
-                            _ => None,
-                        },
-                    ),
+                    crate::mcp::request_validation::McpRequestValidationError::legacy_only(request_id),
                 ),
+                FabricForwardError::CapacityReached => OutboundPipelineError::UpstreamCapacityReached(request_id),
                 _ => OutboundPipelineError::UpstreamConnectionFailed(
                     "Modern Fabric transport is unavailable".to_string(),
                 ),
@@ -5134,6 +5138,33 @@ fn step_record_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_peer_stream_cap_refusal_is_a_retryable_429_not_a_connection_failure() {
+        let error = OutboundPipelineError::UpstreamCapacityReached(Some(json!("request-1")));
+        assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "5"
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["id"], "request-1");
+        assert!(body["error"]["code"].is_i64());
+        assert_eq!(
+            OutboundPipelineError::UpstreamConnectionFailed("transport".into()).status_code(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
 
     /// The Transit Point's agent-card fetch reads within its response bounds and
     /// returns a redirect rather than following it.

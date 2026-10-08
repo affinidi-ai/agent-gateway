@@ -11581,6 +11581,13 @@ async fn handle_fabric_request(
                     )
                     .into_response();
                 }
+                crate::proxy::fabric_forward::FabricForwardError::CapacityReached => {
+                    return crate::proxy::fabric_forward::capacity_response(
+                        modern_request
+                            .as_ref()
+                            .and_then(|request| request.id.clone()),
+                    );
+                }
                 crate::proxy::fabric_forward::FabricForwardError::NoResponse(_) => StatusCode::GATEWAY_TIMEOUT,
                 _ => StatusCode::BAD_GATEWAY,
             };

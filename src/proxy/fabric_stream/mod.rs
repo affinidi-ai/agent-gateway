@@ -19,6 +19,16 @@ use registry::{ReceiveRegistry, RegistryLimits};
 pub(crate) const INSTANCE_CONTEXT: &str = "fabric_stream_listener_instance";
 const RECIPIENT_CONTEXT: &str = "fabric_stream_recipient";
 
+/// Framed-stream caps. Per-peer caps sit below the surface caps, so one peer
+/// cannot fill a surface, and listens have a budget apart from request streams.
+const STREAM_LIMITS: RegistryLimits = RegistryLimits {
+    max_streams: 128,
+    max_peer_streams: 8,
+    max_surface_streams: 16,
+    max_peer_listens: 8,
+    max_surface_listens: 16,
+};
+
 type StreamTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 struct ActiveListener {
@@ -43,12 +53,7 @@ impl StreamRuntime {
 
     fn with_capabilities(local_capabilities: StreamCapabilities) -> Result<Arc<Self>, String> {
         Ok(Arc::new(Self {
-            registry: ReceiveRegistry::new(RegistryLimits {
-                max_streams: 128,
-                // Below the surface cap, so one peer cannot fill a surface.
-                max_peer_streams: 8,
-                max_surface_streams: 16,
-            })?,
+            registry: ReceiveRegistry::new(STREAM_LIMITS)?,
             peers: PeerCapabilities::new(local_capabilities.clone()),
             local_capabilities,
             listeners: Mutex::new(HashMap::new()),
@@ -291,11 +296,17 @@ impl StreamRuntime {
             .err()
             .map(|error| error.into_validation_error(None));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining_ms as u64);
+        let kind = registry::StreamKind::for_method(
+            headers
+                .get("mcp-method")
+                .and_then(|value| value.to_str().ok()),
+        );
         let (receiver, sender) = self
             .registry
             .open_with_capabilities(
                 frame.stream_id,
                 binding.clone(),
+                kind,
                 wire::MAX_CHUNK_BYTES,
                 request.response_window_bytes as usize,
                 deadline,
@@ -532,6 +543,17 @@ impl OpenRefusal {
 impl From<String> for OpenRefusal {
     fn from(reason: String) -> Self {
         Self::new(wire::StreamErrorCode::Unavailable, reason)
+    }
+}
+
+impl From<registry::RegisterError> for OpenRefusal {
+    fn from(error: registry::RegisterError) -> Self {
+        match error {
+            registry::RegisterError::CapacityReached(reason) => {
+                Self::new(wire::StreamErrorCode::CapacityReached, reason)
+            }
+            registry::RegisterError::Refused(reason) => reason.into(),
+        }
     }
 }
 
@@ -806,6 +828,8 @@ mod tests {
                 max_streams: 4,
                 max_peer_streams: 4,
                 max_surface_streams: 4,
+                max_peer_listens: 2,
+                max_surface_listens: 2,
             })
             .unwrap(),
             peers: PeerCapabilities::new(capabilities.clone()),
@@ -1101,6 +1125,49 @@ mod tests {
                 .code,
             wire::StreamErrorCode::LegacyOnly
         );
+        // Listens have their own budget: a peer holding all of its listens
+        // still opens request streams, and an Open past a full cap is refused
+        // with a reason the sender answers with 429.
+        let listen_message = || {
+            let mut next = fresh_message();
+            next.message_body["payload"]["request"]["headers"]["mcp-method"] = json!(["subscriptions/listen"]);
+            next
+        };
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(
+                runtime
+                    .prepare_incoming_with_versions(&listen_message(), &connection, &peer, versions)
+                    .await
+                    .expect("a listen within the peer's listen budget"),
+            );
+        }
+        assert_eq!(
+            runtime
+                .prepare_incoming_with_versions(&listen_message(), &connection, &peer, versions)
+                .await
+                .err()
+                .expect("a listen past the peer's listen budget")
+                .code,
+            wire::StreamErrorCode::CapacityReached
+        );
+        held.push(
+            runtime
+                .prepare_incoming_with_versions(&fresh_message(), &connection, &peer, versions)
+                .await
+                .expect("a request stream while the peer holds all of its listens"),
+        );
+        let refusal = loop {
+            match runtime
+                .prepare_incoming_with_versions(&fresh_message(), &connection, &peer, versions)
+                .await
+            {
+                Ok(incoming) => held.push(incoming),
+                Err(refusal) => break refusal,
+            }
+        };
+        assert_eq!(refusal.code, wire::StreamErrorCode::CapacityReached, "{refusal}");
+        drop(held);
         for change in ["disabled", "other-protocol", "empty-variant-catalog"] {
             let mut changed = surface.clone();
             match change {
@@ -1754,6 +1821,26 @@ mod tests {
     }
 
     #[test]
+    fn a_full_stream_cap_is_refused_with_its_own_wire_reason() {
+        let refusal = OpenRefusal::from(registry::RegisterError::CapacityReached("full"));
+        assert_eq!(refusal.code, wire::StreamErrorCode::CapacityReached);
+        assert_eq!(refusal.to_string(), "full");
+        assert_eq!(
+            OpenRefusal::from(registry::RegisterError::Refused("refused".into())).code,
+            wire::StreamErrorCode::Unavailable
+        );
+        let frame = wire::StreamFrame {
+            stream_id: Uuid::new_v4(),
+            payload: wire::FramePayload::Error {
+                code: wire::StreamErrorCode::CapacityReached,
+            },
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["payload"]["code"], "capacity_reached");
+        assert_eq!(wire::StreamFrame::parse(value).unwrap(), frame);
+    }
+
+    #[test]
     fn stream_message_types_round_trip_separately_from_legacy_forwarding() {
         for kind in
             [MessageType::ForwardStreamFrame, MessageType::ForwardStreamQuery, MessageType::ForwardStreamDisclose]
@@ -1903,6 +1990,8 @@ mod tests {
                 max_streams: 4,
                 max_peer_streams: 4,
                 max_surface_streams: 4,
+                max_peer_listens: 4,
+                max_surface_listens: 4,
             })
             .unwrap(),
             peers: PeerCapabilities::new(capabilities.clone()),
@@ -2076,6 +2165,8 @@ mod tests {
                 max_streams: 4,
                 max_peer_streams: 4,
                 max_surface_streams: 4,
+                max_peer_listens: 4,
+                max_surface_listens: 4,
             })
             .unwrap(),
             peers: PeerCapabilities::new(capabilities.clone()),

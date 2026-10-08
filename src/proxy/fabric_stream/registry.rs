@@ -61,42 +61,115 @@ impl StreamBinding {
     }
 }
 
+/// What a stream carries. A listen holds its slot for the life of a
+/// subscription, so listens count against their own peer and surface budget
+/// and cannot use up the request streams of the same peer or surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamKind {
+    Request,
+    Listen,
+}
+
+impl StreamKind {
+    pub fn for_method(method: Option<&str>) -> Self {
+        if method == Some("subscriptions/listen") {
+            Self::Listen
+        } else {
+            Self::Request
+        }
+    }
+}
+
+/// Why a stream was not registered. `CapacityReached` is a full stream cap,
+/// which the caller is told to retry; anything else is a refusal.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RegisterError {
+    #[error("{0}")]
+    Refused(String),
+    #[error("{0}")]
+    CapacityReached(&'static str),
+}
+
+impl From<String> for RegisterError {
+    fn from(reason: String) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+impl From<&str> for RegisterError {
+    fn from(reason: &str) -> Self {
+        Self::Refused(reason.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RegistryLimits {
     pub max_streams: usize,
     pub max_peer_streams: usize,
     pub max_surface_streams: usize,
+    pub max_peer_listens: usize,
+    pub max_surface_listens: usize,
 }
 
 impl RegistryLimits {
-    /// Whether a new stream is refused, given the number of registered streams
-    /// and, for each, whether it shares the new stream's peer and surface.
+    /// Whether a new stream of `kind` is refused, given the number of
+    /// registered streams and, for each, whether it shares the new stream's
+    /// peer and surface budget.
     fn reached(
         &self,
+        kind: StreamKind,
         registered: usize,
         shared: impl Iterator<Item = (bool, bool)>,
     ) -> bool {
+        let (max_peer, max_surface) = match kind {
+            StreamKind::Request => (self.max_peer_streams, self.max_surface_streams),
+            StreamKind::Listen => (self.max_peer_listens, self.max_surface_listens),
+        };
         let (peer, surface) = shared.fold((0, 0), |(peer, surface), (same_peer, same_surface)| {
             (peer + usize::from(same_peer), surface + usize::from(same_surface))
         });
-        registered >= self.max_streams || peer >= self.max_peer_streams || surface >= self.max_surface_streams
+        registered >= self.max_streams || peer >= max_peer || surface >= max_surface
     }
+
+    fn validate(&self) -> Result<(), String> {
+        if [
+            self.max_streams,
+            self.max_peer_streams,
+            self.max_surface_streams,
+            self.max_peer_listens,
+            self.max_surface_listens,
+        ]
+        .contains(&0)
+        {
+            return Err("Fabric stream registry limits must be positive".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// How a registered stream is counted: its binding, whether a peer opened it
+/// here (inbound), and its kind.
+#[derive(Clone, Copy)]
+struct Counted<'binding> {
+    binding: &'binding StreamBinding,
+    inbound: bool,
+    kind: StreamKind,
 }
 
 /// Whether a registered stream counts against a new one's peer and surface
 /// limits. Streams a peer opened here (inbound) and streams this gateway
 /// opened to a peer (outbound) are counted apart, so neither uses up the
-/// other's slots. An inbound stream's surface is local, shared by every peer;
-/// an outbound stream's is the peer's own channel, so it is counted per peer.
+/// other's slots, and so are listens and request streams. An inbound stream's
+/// surface is local, shared by every peer; an outbound stream's is the peer's
+/// own channel, so it is counted per peer.
 fn shared_limits(
-    registered: &StreamBinding,
-    registered_inbound: bool,
-    new: &StreamBinding,
-    new_inbound: bool,
+    registered: Counted<'_>,
+    new: Counted<'_>,
 ) -> (bool, bool) {
-    if registered_inbound != new_inbound {
+    if registered.inbound != new.inbound || registered.kind != new.kind {
         return (false, false);
     }
+    let (registered, new, new_inbound) = (registered.binding, new.binding, new.inbound);
     let same_peer = registered.peer_did == new.peer_did;
     let same_surface = registered.surface_id == new.surface_id && (new_inbound || same_peer);
     (same_peer, same_surface)
@@ -121,6 +194,7 @@ struct ReceiveState {
 struct ReceiveEntry {
     binding: StreamBinding,
     direction: StreamDirection,
+    kind: StreamKind,
     capabilities: StreamCapabilities,
     state: Mutex<ReceiveState>,
     notify: Notify,
@@ -130,6 +204,7 @@ struct ReceiveEntry {
 struct SendEntry {
     binding: StreamBinding,
     direction: StreamDirection,
+    kind: StreamKind,
     capabilities: StreamCapabilities,
     credit: SendCredit,
 }
@@ -148,9 +223,7 @@ pub(crate) struct ReceiveRegistry {
 
 impl ReceiveRegistry {
     pub fn new(limits: RegistryLimits) -> Result<Arc<Self>, String> {
-        if limits.max_streams == 0 || limits.max_peer_streams == 0 || limits.max_surface_streams == 0 {
-            return Err("Fabric stream registry limits must be positive".to_string());
-        }
+        limits.validate()?;
         Ok(Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             senders: Mutex::new(HashMap::new()),
@@ -167,10 +240,11 @@ impl ReceiveRegistry {
         request_window: usize,
         response_window: usize,
         deadline: tokio::time::Instant,
-    ) -> Result<(ReceiveLease, SendLease), String> {
+    ) -> Result<(ReceiveLease, SendLease), RegisterError> {
         self.open_with_capabilities(
             stream_id,
             binding,
+            StreamKind::Request,
             request_window,
             response_window,
             deadline,
@@ -213,19 +287,20 @@ impl ReceiveRegistry {
         self: &Arc<Self>,
         stream_id: Uuid,
         binding: StreamBinding,
+        kind: StreamKind,
         request_window: usize,
         response_window: usize,
         deadline: tokio::time::Instant,
         replayable_until: tokio::time::Instant,
         capabilities: &StreamCapabilities,
-    ) -> Result<(ReceiveLease, SendLease), String> {
+    ) -> Result<(ReceiveLease, SendLease), RegisterError> {
         binding.validate(stream_id)?;
         let now = tokio::time::Instant::now();
         if deadline <= now || deadline.duration_since(now) > std::time::Duration::from_secs(86_400) {
-            return Err("Fabric stream deadline is outside the accepted lifetime".to_string());
+            return Err("Fabric stream deadline is outside the accepted lifetime".into());
         }
         if replayable_until <= now {
-            return Err("Fabric stream Open is no longer admissible".to_string());
+            return Err("Fabric stream Open is no longer admissible".into());
         }
         let mut opened = self
             .opened
@@ -235,7 +310,7 @@ impl ReceiveRegistry {
             .get(&stream_id)
             .is_some_and(|until| *until > now)
         {
-            return Err("Fabric stream Open was already accepted".to_string());
+            return Err("Fabric stream Open was already accepted".into());
         }
         let capacity = self
             .limits
@@ -245,11 +320,12 @@ impl ReceiveRegistry {
             opened.retain(|_, until| *until > now);
         }
         if opened.len() >= capacity {
-            return Err("Fabric open replay-protection capacity reached".to_string());
+            return Err(RegisterError::CapacityReached("Fabric open replay-protection capacity reached"));
         }
         let receiver = self.register_negotiated(
             stream_id,
             binding.clone(),
+            kind,
             StreamDirection::Request,
             request_window,
             capabilities,
@@ -257,6 +333,7 @@ impl ReceiveRegistry {
         let sender = self.register_sender_negotiated(
             stream_id,
             binding,
+            kind,
             StreamDirection::Response,
             response_window,
             capabilities,
@@ -272,18 +349,26 @@ impl ReceiveRegistry {
         binding: StreamBinding,
         direction: StreamDirection,
         window_bytes: usize,
-    ) -> Result<ReceiveLease, String> {
-        self.register_negotiated(stream_id, binding, direction, window_bytes, &StreamCapabilities::local(true, true))
+    ) -> Result<ReceiveLease, RegisterError> {
+        self.register_negotiated(
+            stream_id,
+            binding,
+            StreamKind::Request,
+            direction,
+            window_bytes,
+            &StreamCapabilities::local(true, true),
+        )
     }
 
     pub fn register_negotiated(
         self: &Arc<Self>,
         stream_id: Uuid,
         binding: StreamBinding,
+        kind: StreamKind,
         direction: StreamDirection,
         window_bytes: usize,
         capabilities: &StreamCapabilities,
-    ) -> Result<ReceiveLease, String> {
+    ) -> Result<ReceiveLease, RegisterError> {
         binding.validate(stream_id)?;
         validate_registered_limits(window_bytes, capabilities)?;
         let state = ReceiveState {
@@ -298,21 +383,34 @@ impl ReceiveRegistry {
             .lock()
             .map_err(|_| "Fabric stream registry is unavailable")?;
         if entries.contains_key(&stream_id) {
-            return Err("Fabric stream identifier is already registered".to_string());
+            return Err("Fabric stream identifier is already registered".into());
         }
-        let inbound = direction == StreamDirection::Request;
+        let new = Counted {
+            binding: &binding,
+            inbound: direction == StreamDirection::Request,
+            kind,
+        };
         if self.limits.reached(
+            kind,
             entries.len(),
             entries.values().map(|entry| {
-                shared_limits(&entry.binding, entry.direction == StreamDirection::Request, &binding, inbound)
+                shared_limits(
+                    Counted {
+                        binding: &entry.binding,
+                        inbound: entry.direction == StreamDirection::Request,
+                        kind: entry.kind,
+                    },
+                    new,
+                )
             }),
         ) {
-            return Err("Fabric stream concurrency limit reached".to_string());
+            return Err(RegisterError::CapacityReached("Fabric stream concurrency limit reached"));
         }
         let (closed, _) = watch::channel(None);
         let entry = Arc::new(ReceiveEntry {
             binding,
             direction,
+            kind,
             capabilities: capabilities.clone(),
             state: Mutex::new(state),
             notify: Notify::new(),
@@ -335,10 +433,11 @@ impl ReceiveRegistry {
         binding: StreamBinding,
         direction: StreamDirection,
         window_bytes: usize,
-    ) -> Result<SendLease, String> {
+    ) -> Result<SendLease, RegisterError> {
         self.register_sender_negotiated(
             stream_id,
             binding,
+            StreamKind::Request,
             direction,
             window_bytes,
             &StreamCapabilities::local(true, true),
@@ -349,10 +448,11 @@ impl ReceiveRegistry {
         self: &Arc<Self>,
         stream_id: Uuid,
         binding: StreamBinding,
+        kind: StreamKind,
         direction: StreamDirection,
         window_bytes: usize,
         capabilities: &StreamCapabilities,
-    ) -> Result<SendLease, String> {
+    ) -> Result<SendLease, RegisterError> {
         binding.validate(stream_id)?;
         validate_registered_limits(window_bytes, capabilities)?;
         let credit = SendCredit::new(window_bytes)?;
@@ -361,20 +461,33 @@ impl ReceiveRegistry {
             .lock()
             .map_err(|_| "Fabric sender registry is unavailable")?;
         if senders.contains_key(&stream_id) {
-            return Err("Fabric stream sender is already registered".to_string());
+            return Err("Fabric stream sender is already registered".into());
         }
-        let inbound = direction == StreamDirection::Response;
+        let new = Counted {
+            binding: &binding,
+            inbound: direction == StreamDirection::Response,
+            kind,
+        };
         if self.limits.reached(
+            kind,
             senders.len(),
             senders.values().map(|entry| {
-                shared_limits(&entry.binding, entry.direction == StreamDirection::Response, &binding, inbound)
+                shared_limits(
+                    Counted {
+                        binding: &entry.binding,
+                        inbound: entry.direction == StreamDirection::Response,
+                        kind: entry.kind,
+                    },
+                    new,
+                )
             }),
         ) {
-            return Err("Fabric sender concurrency limit reached".to_string());
+            return Err(RegisterError::CapacityReached("Fabric sender concurrency limit reached"));
         }
         let entry = Arc::new(SendEntry {
             binding,
             direction,
+            kind,
             capabilities: capabilities.clone(),
             credit,
         });
@@ -805,6 +918,8 @@ mod tests {
             max_streams: 3,
             max_peer_streams: 2,
             max_surface_streams: 2,
+            max_peer_listens: 2,
+            max_surface_listens: 2,
         })
         .unwrap()
     }
@@ -817,10 +932,24 @@ mod tests {
         capabilities.max_chunk_bytes = 4;
         capabilities.max_window_bytes = MAX_CHUNK_BYTES as u32;
         let mut receiver = registry
-            .register_negotiated(id, binding(), StreamDirection::Request, MAX_CHUNK_BYTES, &capabilities)
+            .register_negotiated(
+                id,
+                binding(),
+                StreamKind::Request,
+                StreamDirection::Request,
+                MAX_CHUNK_BYTES,
+                &capabilities,
+            )
             .unwrap();
         let sender = registry
-            .register_sender_negotiated(id, binding(), StreamDirection::Response, MAX_CHUNK_BYTES, &capabilities)
+            .register_sender_negotiated(
+                id,
+                binding(),
+                StreamKind::Request,
+                StreamDirection::Response,
+                MAX_CHUNK_BYTES,
+                &capabilities,
+            )
             .unwrap();
         let frame = StreamFrame {
             stream_id: id,
@@ -869,6 +998,7 @@ mod tests {
                 .register_negotiated(
                     Uuid::new_v4(),
                     binding(),
+                    StreamKind::Request,
                     StreamDirection::Response,
                     MAX_CHUNK_BYTES * 2,
                     &capabilities
@@ -884,7 +1014,14 @@ mod tests {
         let mut capabilities = StreamCapabilities::local(true, true);
         capabilities.max_header_bytes = 8;
         let mut receiver = registry
-            .register_negotiated(id, binding(), StreamDirection::Response, MAX_CHUNK_BYTES, &capabilities)
+            .register_negotiated(
+                id,
+                binding(),
+                StreamKind::Request,
+                StreamDirection::Response,
+                MAX_CHUNK_BYTES,
+                &capabilities,
+            )
             .unwrap();
         let frame = StreamFrame {
             stream_id: id,
@@ -953,6 +1090,7 @@ mod tests {
                 .open_with_capabilities(
                     id,
                     binding(),
+                    StreamKind::Request,
                     MAX_CHUNK_BYTES,
                     MAX_CHUNK_BYTES,
                     run,
@@ -965,7 +1103,16 @@ mod tests {
         let later = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         assert!(
             registry
-                .open_with_capabilities(id, binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, later, later, &capabilities)
+                .open_with_capabilities(
+                    id,
+                    binding(),
+                    StreamKind::Request,
+                    MAX_CHUNK_BYTES,
+                    MAX_CHUNK_BYTES,
+                    later,
+                    later,
+                    &capabilities
+                )
                 .is_err(),
             "a replayed Open is refused after its run ends while its offer is live"
         );
@@ -978,6 +1125,7 @@ mod tests {
                 .open_with_capabilities(
                     expired,
                     binding(),
+                    StreamKind::Request,
                     MAX_CHUNK_BYTES,
                     MAX_CHUNK_BYTES,
                     short,
@@ -999,6 +1147,8 @@ mod tests {
             max_streams: 128,
             max_peer_streams: 16,
             max_surface_streams: 16,
+            max_peer_listens: 16,
+            max_surface_listens: 16,
         })
         .unwrap();
         let capabilities = StreamCapabilities::local(true, true);
@@ -1009,6 +1159,7 @@ mod tests {
                     .open_with_capabilities(
                         Uuid::new_v4(),
                         binding(),
+                        StreamKind::Request,
                         MAX_CHUNK_BYTES,
                         MAX_CHUNK_BYTES,
                         now + std::time::Duration::from_secs(3600),
@@ -1030,6 +1181,7 @@ mod tests {
             .open_with_capabilities(
                 id,
                 binding(),
+                StreamKind::Request,
                 MAX_CHUNK_BYTES,
                 MAX_CHUNK_BYTES,
                 now + std::time::Duration::from_secs(3600),
@@ -1042,7 +1194,16 @@ mod tests {
         let later = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         assert!(
             registry
-                .open_with_capabilities(id, binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, later, later, &capabilities)
+                .open_with_capabilities(
+                    id,
+                    binding(),
+                    StreamKind::Request,
+                    MAX_CHUNK_BYTES,
+                    MAX_CHUNK_BYTES,
+                    later,
+                    later,
+                    &capabilities
+                )
                 .is_err(),
             "a repeated Open never replaces a live stream"
         );
@@ -1056,6 +1217,8 @@ mod tests {
             max_streams: 1,
             max_peer_streams: 1,
             max_surface_streams: 1,
+            max_peer_listens: 1,
+            max_surface_listens: 1,
         })
         .unwrap();
         let id = Uuid::new_v4();
@@ -1618,6 +1781,8 @@ mod tests {
             max_streams: 16,
             max_peer_streams: 2,
             max_surface_streams: 3,
+            max_peer_listens: 2,
+            max_surface_listens: 3,
         })
         .unwrap();
         let register = |binding: StreamBinding, inbound: bool| {
@@ -1653,6 +1818,8 @@ mod tests {
             max_streams: 16,
             max_peer_streams: 1,
             max_surface_streams: 1,
+            max_peer_listens: 1,
+            max_surface_listens: 1,
         })
         .unwrap();
         let _response = registry
@@ -1666,5 +1833,127 @@ mod tests {
                 .register_sender(Uuid::new_v4(), binding(), StreamDirection::Response, MAX_CHUNK_BYTES)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn listens_have_a_budget_apart_from_request_streams() {
+        let registry = ReceiveRegistry::new(RegistryLimits {
+            max_streams: 16,
+            max_peer_streams: 2,
+            max_surface_streams: 3,
+            max_peer_listens: 1,
+            max_surface_listens: 2,
+        })
+        .unwrap();
+        let register = |binding: StreamBinding, kind: StreamKind| {
+            registry.register_negotiated(
+                Uuid::new_v4(),
+                binding,
+                kind,
+                StreamDirection::Request,
+                MAX_CHUNK_BYTES,
+                &StreamCapabilities::local(true, true),
+            )
+        };
+        let _listen = register(bound("did:example:a", "default"), StreamKind::Listen).unwrap();
+        assert_eq!(
+            register(bound("did:example:a", "default"), StreamKind::Listen).err(),
+            Some(RegisterError::CapacityReached("Fabric stream concurrency limit reached"))
+        );
+        // A peer holding all of its listens still opens request streams, up
+        // to its request cap.
+        let _requests: Vec<_> = (0..2)
+            .map(|_| register(bound("did:example:a", "default"), StreamKind::Request).unwrap())
+            .collect();
+        assert!(matches!(
+            register(bound("did:example:a", "default"), StreamKind::Request),
+            Err(RegisterError::CapacityReached(_))
+        ));
+        // Listens fill their surface budget without touching request slots.
+        let _second_listen = register(bound("did:example:b", "default"), StreamKind::Listen).unwrap();
+        assert!(register(bound("did:example:c", "default"), StreamKind::Listen).is_err());
+        let _request = register(bound("did:example:c", "default"), StreamKind::Request).unwrap();
+        assert!(register(bound("did:example:d", "default"), StreamKind::Request).is_err());
+    }
+
+    #[test]
+    fn listen_senders_have_their_own_budget() {
+        let registry = ReceiveRegistry::new(RegistryLimits {
+            max_streams: 16,
+            max_peer_streams: 1,
+            max_surface_streams: 1,
+            max_peer_listens: 1,
+            max_surface_listens: 1,
+        })
+        .unwrap();
+        let register = |kind: StreamKind| {
+            registry.register_sender_negotiated(
+                Uuid::new_v4(),
+                binding(),
+                kind,
+                StreamDirection::Request,
+                MAX_CHUNK_BYTES,
+                &StreamCapabilities::local(true, true),
+            )
+        };
+        let _listen = register(StreamKind::Listen).unwrap();
+        let _request = register(StreamKind::Request).unwrap();
+        assert_eq!(
+            register(StreamKind::Listen).err(),
+            Some(RegisterError::CapacityReached("Fabric sender concurrency limit reached"))
+        );
+        assert!(matches!(register(StreamKind::Request), Err(RegisterError::CapacityReached(_))));
+    }
+
+    #[test]
+    fn the_total_cap_counts_both_kinds_and_other_refusals_are_not_capacity() {
+        let registry = ReceiveRegistry::new(RegistryLimits {
+            max_streams: 1,
+            max_peer_streams: 1,
+            max_surface_streams: 1,
+            max_peer_listens: 1,
+            max_surface_listens: 1,
+        })
+        .unwrap();
+        let id = Uuid::new_v4();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let _listen = registry
+            .open_with_capabilities(
+                id,
+                binding(),
+                StreamKind::Listen,
+                MAX_CHUNK_BYTES,
+                MAX_CHUNK_BYTES,
+                deadline,
+                deadline,
+                &StreamCapabilities::local(true, true),
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.open(Uuid::new_v4(), binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline),
+            Err(RegisterError::CapacityReached(_))
+        ));
+        assert!(matches!(
+            registry.open(id, binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline),
+            Err(RegisterError::Refused(_))
+        ));
+        assert!(
+            ReceiveRegistry::new(RegistryLimits {
+                max_streams: 4,
+                max_peer_streams: 2,
+                max_surface_streams: 2,
+                max_peer_listens: 0,
+                max_surface_listens: 2,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn only_a_listen_method_selects_the_listen_budget() {
+        assert_eq!(StreamKind::for_method(Some("subscriptions/listen")), StreamKind::Listen);
+        for method in [Some("tools/call"), Some("subscriptions/listen/extra"), Some("SUBSCRIPTIONS/LISTEN"), None] {
+            assert_eq!(StreamKind::for_method(method), StreamKind::Request, "{method:?}");
+        }
     }
 }

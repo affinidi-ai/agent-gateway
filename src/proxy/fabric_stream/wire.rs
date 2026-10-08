@@ -73,6 +73,10 @@ pub(crate) enum StreamErrorCode {
     /// as a legacy-only endpoint would.
     #[error("Fabric stream surface serves legacy MCP only")]
     LegacyOnly,
+    /// A stream cap on the receiver is full, so the sender's caller is told
+    /// to retry rather than that the transport failed.
+    #[error("Fabric stream capacity reached")]
+    CapacityReached,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
