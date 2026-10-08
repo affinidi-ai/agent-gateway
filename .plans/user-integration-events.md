@@ -12,7 +12,7 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 |---|---|---|
 | 1 | Allow-listed user event state (no passkeys, SAML id or profile PII) | Done |
 | 2 | Server-side validation of user and identity trigger mappings; `/v1/integrations` fails closed without an RBAC guard | Done |
-| 3 | Dashboard: attach on select, no swallowed errors, event types required | Not started |
+| 3 | Dashboard: attach on select, no swallowed errors, event types required | Done |
 | 4 | Minimal Agent Watch `user` template | Not started |
 | 5 | SAML: `user.created` and role-change `user.updated` | Not started |
 | 6 | SAML: keep the primary administrator's role (security fix) | Not started |
@@ -131,3 +131,7 @@ state, environment), and fix the cause rather than retrying.
   gateway, connection point, mediator.
 - SAML sign-in writes the session token into `sessionStorage` from an inline script.
 - Identity events are never sent: `trigger_identity_integrations` is a stub.
+- The dashboard offers event types from the `user`/`identity` category metadata in
+  `gateway.json`; the built-in default categories carry none, so a `gateway.json` without
+  them leaves no way to satisfy the required event types. Serve the list from the code-level
+  `USER_MAPPING_RULES`/`IDENTITY_MAPPING_RULES` instead.

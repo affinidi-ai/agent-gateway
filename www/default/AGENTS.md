@@ -304,6 +304,24 @@ The Audit Log header shows `audit-forward-button` beside Refresh for users with
 - The Edit page starts only after the integration has loaded, so stored content is never
   replaced on open.
 
+## Attaching integrations to events
+
+`components/connection-points/IntegrationsStep.tsx` attaches integrations to a resource's
+events on the gateway, connection point, user, and identity pages.
+
+- Choosing an integration in the selector (`data-testid="integrations-step-select"`)
+  attaches it at once with its template's custom (`_`-prefixed) variables set empty, opens
+  its card, and drops it from the selector. Event checkboxes carry
+  `data-testid="integration-<index>-event-<event type>"`.
+- Missing custom variables are judged against the integration's template, not only the
+  stored values.
+- `requireEventTypes` (user and identity pages) blocks saving until every attached
+  integration names an event, matching the API, which refuses a new mapping without one.
+- The user and identity pages show a failed load as an error with no editor, so an empty
+  list can never be saved over the stored mappings, and a failed save as an error, never as
+  success. Save buttons are `user-integrations-save-button` and
+  `identity-integrations-save-button`.
+
 ## Validation
 
 After frontend edits, prefer these checks when relevant:

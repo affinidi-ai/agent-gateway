@@ -2,7 +2,16 @@ branch: fix-user-integration
 changes:
   added: []
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-08T16:20:00.000Z'
+      title: ⭐ Attach an integration to events as soon as it is selected
+      description: Choosing an integration on the gateway, connection point, user and identity integration pages did nothing, so Save stayed disabled and no events could be wired up. Selecting one now attaches it with its template's custom variables, opens it to choose events, and removes it from the selector.
+    - timestamp: '2026-10-08T16:21:00.000Z'
+      title: Show load and save failures on user and identity integration pages
+      description: Both pages reported a failed save as success and showed a failed load as an empty list that could then be saved over the stored mappings. Failures now show the server's message, and a failed load offers no editor.
+    - timestamp: '2026-10-08T16:22:00.000Z'
+      title: Require an event for each integration on user and identity pages
+      description: Save stays disabled until every attached integration names at least one event, matching the API, and missing custom variables are checked against the integration's template.
   removed: []
   security:
     - timestamp: '2026-10-08T15:10:00.000Z'
@@ -22,6 +31,9 @@ changes:
       description: User events (created, approved, updated, deleted, login, accessed) put the whole user record into OLD_STATE and NEW_STATE, including passkey credentials, the SAML subject, email, names, department, job title and avatar path. They now carry only user_id, role, status, is_primary, created_at and updated_at, and trigger logs name the user by id instead of username.
   breaking: []
   internal:
+    - timestamp: '2026-10-08T16:00:00.000Z'
+      title: Describe the allow-listed user state in the example gateway config
+      description: The example config's per-event user state descriptions still listed the whole user record.
     - timestamp: '2026-10-08T12:20:00.000Z'
       title: Set rotation fields on the scoped PAT component test token
       description: The scoped-token helper in the access-token component tests built an AccessToken without the rotation fields added with token rotation, so the test binary did not compile.
