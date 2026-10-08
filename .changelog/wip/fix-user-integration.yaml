@@ -20,6 +20,9 @@ changes:
       description: Save stays disabled until every attached integration names at least one event, matching the API, and missing custom variables are checked against the integration's template.
   removed: []
   security:
+    - timestamp: '2026-10-08T17:40:00.000Z'
+      title: ⭐ Keep the primary administrator's role across SAML sign-ins
+      description: Every SAML sign-in overwrote the stored role with the identity provider's, so the primary administrator, made Administrator on first sign-in, was demoted to User on the next sign-in whenever the identity provider sent no administrator role. The primary administrator now keeps the role, and a sign-in that would have changed it logs a warning.
     - timestamp: '2026-10-08T15:10:00.000Z'
       title: Refuse integration API requests when no RBAC guard is mounted
       description: The /v1/integrations routes were served without any permission check when the router was built without an RBAC guard, while neighbouring admin routes refused such requests. They now fail closed with 403. Deployments always mount the guard, so this is hardening against a future wiring change.

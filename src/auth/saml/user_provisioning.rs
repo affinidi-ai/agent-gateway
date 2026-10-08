@@ -138,7 +138,11 @@ pub async fn provision_user_from_saml(
         user.last_name = last_name;
         user.department = department;
         user.job_title = job_title;
-        user.role = role;
+        if !user.is_primary {
+            user.role = role;
+        } else if role != UserRole::Administrator {
+            warn!(user_id = %user.user_id, idp_role = %role, "Kept the primary administrator's role over the IdP role");
+        }
         user.updated_at = chrono::Utc::now();
         user.last_logged_in = Some(chrono::Utc::now());
         info!(user_id = %user.user_id, "Updated SAML user");
@@ -571,5 +575,28 @@ mod tests {
         let events = sign_in_events(&provisioned);
 
         assert!(matches!(events.as_slice(), [SignInEvent::Login(_)]));
+    }
+
+    #[tokio::test]
+    async fn the_primary_administrator_keeps_the_role_whatever_the_idp_sends() {
+        let dir = tempdir().unwrap();
+        let (storage, avatars) = user_storage(&dir).await;
+        let config = test_saml_config();
+        let first = provision_user_from_saml(&storage, &saml_attributes("saml-admin", "admin"), &config, &avatars)
+            .await
+            .unwrap();
+        assert!(first.user.is_primary);
+        assert_eq!(first.user.role, UserRole::Administrator);
+
+        for attributes in
+            [saml_attributes("saml-admin", "admin"), with_role(saml_attributes("saml-admin", "admin"), "user")]
+        {
+            let again = provision_user_from_saml(&storage, &attributes, &config, &avatars)
+                .await
+                .unwrap();
+
+            assert_eq!(again.user.role, UserRole::Administrator);
+            assert!(again.user.is_primary);
+        }
     }
 }

@@ -15,7 +15,7 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 | 3 | Dashboard: attach on select, no swallowed errors, event types required | Done |
 | 4 | Minimal Agent Watch `user` template | Done (gateway side; Agent Watch docs pending, see follow-ups) |
 | 5 | SAML: `user.created` and role-change `user.updated` | Done |
-| 6 | SAML: keep the primary administrator's role (security fix) | Not started |
+| 6 | SAML: keep the primary administrator's role (security fix) | Done |
 | 7 | Fix `component_tests::mcp_record_compat` failing in the full suite | Not started |
 
 Every phase is test-first: write the failing test, run it and see it fail for the expected

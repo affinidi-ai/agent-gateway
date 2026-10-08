@@ -282,6 +282,12 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 unexpected identity-provider role to `administrator` grants full management access, so
 treat it as a security-relevant setting rather than a convenience.
 
+Each SAML sign-in sets the user's role from the identity provider, with one exception: the
+first user to sign in becomes the primary administrator and keeps that role whatever the
+identity provider sends later, so a missing or changed role claim cannot remove the only
+guaranteed administrator. A sign-in that would have changed it logs a warning instead
+([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
 ## `x402.json` and `x402-proxy.json`
 
 `x402.json` configures payment networks, assets, and facilitator behaviour for the x402
