@@ -234,11 +234,6 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
 - The switch carries `data-testid="settings-flag-<flag>"`, `role="switch"`, and
   `aria-labelledby` pointing at the row's flag-name cell, so its accessible name is the
   flag key.
-- `a2a_legacy_compatibility` is default on, and every reader uses
-  `isA2aLegacyCompatibilityOn` (`utils/a2aLegacyCompatibility.ts`), where unset counts as
-  on, the gateway's rule. On, surfaces accept A2A 1.0 and 0.3 and generated agent cards list
-  both. Off, they serve 1.0 only, and a 0.3 or version-less call gets an
-  unsupported-version error.
 
 ## Schema capture and A2A versions
 
@@ -247,10 +242,25 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
   known A2A method in either spelling (v0.3 slash-form or v1.0 PascalCase) or a
   `params.message` envelope is A2A; any other JSON-RPC method is MCP.
 - The A2A method table mirrors `src/a2a/methods.rs`. Keep them in step.
+- A2A versions and message validation are per surface, not feature flags. The Access Point
+  panel of an A2A surface has an **A2A Protocol** section (`access-point-a2a-protocol`): a
+  checkbox per version (`access-point-a2a-version-0.3`, `-1.0`, both checked by default) and
+  **Validate messages** (`access-point-a2a-validate-messages`, unchecked by default), each
+  with field help. The node keeps them flat as `a2a_accepted_versions` and
+  `a2a_validate_messages`; `access-point/a2aSettings.ts` maps them to and from the payload's
+  `access_point.a2a`, which every A2A and AP2 save sends.
+- With no version checked, the section shows `access-point-a2a-versions-error` and a
+  blocking dependency error stops the save.
+- When the Target is an `a2a-proxy://` endpoint, the section is disabled, shows 1.0 only and
+  validation off, and explains why (`access-point-a2a-proxy-locked`); the payload sends those
+  fixed values whatever the node holds.
+- When the Managed Agent element targets an A2A proxy, its panel shows
+  `managed-agent-a2a-proxy-protocol-hint`: the proxy serves A2A 1.0 only, without message
+  validation, callers must send `A2A-Version: 1.0`, and the Access Point's A2A Protocol
+  settings are locked to those values.
 - The A2A proxy **Agent Card** tab (`a2a-proxy-agent-card-version`) states that the
-  generated card is A2A 1.0 and, following the current `a2a_legacy_compatibility` value,
-  that it also carries the 0.3 fields (on) or is 1.0 only (off). It does not follow
-  `[a2a] default_version`.
+  generated card and the proxy's replies are A2A 1.0 only, so a surface targeting the proxy
+  accepts 1.0 callers only. It does not follow `[a2a] default_version`.
 
 ## Governance Audit integrations
 

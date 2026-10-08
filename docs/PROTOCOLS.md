@@ -9,7 +9,7 @@ revision-specific behavior and limitations of the checked-out source.
 | Protocol | Status in this revision | Implementation note |
 | --- | --- | --- |
 | A2A `1.0` | Active, advertised | JSON-RPC messaging, discovery, identity extensions, policy, and proxy targets; implemented against spec revision [`1.0.1`](https://a2a-protocol.org/v1.0.1/specification/) |
-| A2A `0.3` | Accepted | Accepted while the `a2a_legacy_compatibility` feature flag is on (the default); see [A2A Protocol Versions](#a2a-protocol-versions) |
+| A2A `0.3` | Accepted | Accepted on each A2A surface that selects it, which is the default; never on an A2A proxy surface. See [A2A Protocol Versions](#a2a-protocol-versions) |
 | MCP `2024-11-05` | Active | Admitted and advertised on every MCP endpoint |
 | MCP `2026-07-28` | Active | Admitted and advertised alongside `2024-11-05` on every MCP endpoint |
 | AP2 | Experimental | Disabled by default; production proof signing is not implemented |
@@ -92,9 +92,10 @@ Relevant implementation:
 
 ## A2A Protocol Versions
 
-The Gateway serves A2A `1.0` and accepts `0.3` callers while legacy compatibility is on. It does
-not translate between versions: the request is forwarded as sent, so a caller and the Managed Agent
-it reaches must share a version.
+The Gateway serves A2A `1.0` and `0.3`. Each A2A surface chooses the versions it accepts, and
+whether it validates messages, on its Access Point (see [A2A surface settings](#a2a-surface-settings)).
+The Gateway does not translate between versions: the request is forwarded as sent, so a caller and
+the Managed Agent it reaches must share a version.
 
 ### Version negotiation
 
@@ -109,7 +110,8 @@ the rest of this Gateway's pipeline (egress check, body-size limit, Trust Check,
 upstream), so a request it paid for can still be refused there.
 
 Negotiation runs on every request that reaches that point, whatever the HTTP method, and applies
-to Managed Agent and `a2a-proxy://` targets alike; there is no per-surface opt-out. Requests that
+to Managed Agent and `a2a-proxy://` targets alike, each against its surface's accepted versions.
+Requests that
 return earlier are not negotiated: agent-card discovery (`/.well-known/agent-card.json` and
 `/.well-known/agent.json`), the DID Auth `/authenticate` endpoints on a `did_auth` surface, and
 onboarding surfaces. `fabric://` targets skip negotiation and validation (see
@@ -122,9 +124,35 @@ onboarding surfaces. `fabric://` targets skip negotiation and validation (see
 | A patch revision such as `1.0.1` | Its `Major.Minor` (`1.0`) |
 | Anything else | Rejected with `-32009` |
 
-The accepted set is `0.3` and `1.0`, narrowed to `1.0` when `a2a_legacy_compatibility` is off. The
-flag changes only what is accepted, never how the header is read: an absent header still resolves
-to `0.3` and is then refused.
+The accepted set is the surface's `access_point.a2a.accepted_versions`: `0.3` and `1.0` by default,
+and `1.0` only on an A2A proxy surface. It changes only what is accepted, never how the header is
+read: an absent header still resolves to `0.3`, and a surface that does not accept `0.3` then refuses
+it.
+
+### A2A surface settings
+
+An A2A Access Point carries its A2A settings in `access_point.a2a`, set in the dashboard on the
+Access Point of an A2A surface (**A2A Protocol**):
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `accepted_versions` | `["0.3", "1.0"]` | The versions [negotiation](#version-negotiation) accepts. At least one; each must be `0.3` or `1.0`. |
+| `validate_messages` | `false` | Whether the JSON-RPC envelope and the A2A request shape are [validated](#error-mapping) before forwarding. |
+
+```json
+"access_point": { "protocol": "a2a", "a2a": { "accepted_versions": ["1.0"], "validate_messages": true } }
+```
+
+- A surface without the block uses the defaults. The surface API stores the block explicitly on
+  every save; a `PUT` that omits it keeps the stored one, and a `PATCH` with `null` resets it to the
+  defaults.
+- An `a2a-proxy://` Target always serves `1.0` only without validation, whatever is stored, and the
+  API refuses a block on such a surface that says otherwise. The dashboard locks both fields to
+  those values when the Target is an A2A proxy. This applies to a variant that points the Target at
+  an A2A proxy too.
+- The block is surface-level: variants cannot override it. It is valid on A2A and AP2 Access Points
+  only.
+- Changes take effect when the surface is saved, without a restart.
 
 ### Error mapping
 
@@ -140,8 +168,9 @@ is contacted:
 
 `data.requested` on `-32009` is the trimmed header when it names no known version (`2.0`), and the
 resolved `Major.Minor` otherwise, so an absent header, `0.3` or `0.3.x` refused under v1.0-only
-answers `"requested": "0.3"`. The last three rows need `[a2a] validate_messages` (on by default) and a
-non-empty body.
+answers `"requested": "0.3"`, and `data.supported` lists the surface's accepted versions. The last
+three rows need the surface's `access_point.a2a.validate_messages` (off by default) and a non-empty
+body.
 
 ### Method names
 
@@ -220,18 +249,18 @@ allow if input.a2a.message.parts[_].text
 `metadata`, `extensions`, and `messageId` are the same in both versions, so rules that read them,
 including the agent identity extension, need no change.
 
-Two gaps remain. With `[a2a] validate_messages` off, a JSON-RPC batch or a non-string `method`
-reaches policy with neither `input.a2a.method` nor `input.a2a.method_canonical`, so no rule keyed on
-the method sees it; keep validation on, which refuses both with `-32600`. On a `fabric://` surface
-the request is never validated, so the same applies whatever the setting.
+Two gaps remain. On a surface that does not validate messages, the default, a JSON-RPC batch or a
+non-string `method` reaches policy with neither `input.a2a.method` nor `input.a2a.method_canonical`,
+so no rule keyed on the method sees it; turn validation on for the surface, which refuses both with
+`-32600`. On a `fabric://` surface the request is never validated, so the same applies whatever the
+setting.
 
 The allow-list and message-shape patterns are pinned against the policy engine by the tests in
 [`src/surface_context/mod.rs`](../src/surface_context/mod.rs).
 
 ### Request-shape validation
 
-Under `validate_messages`, requests to a Managed Agent target are checked against what A2A itself
-requires, and the problems found are reported together in one `-32602` response, up to 20
+On a surface that validates messages, requests are checked against what A2A itself requires, and the problems found are reported together in one `-32602` response, up to 20
 of them: validation stops walking `parts` at the cap and sets `data.truncated: true` (the key is
 absent otherwise), and a caller-supplied `kind` echoed in a message is quoted and cut to 64
 characters, so a large body cannot inflate the error:
@@ -245,32 +274,31 @@ characters, so a large body cannot inflate the error:
 
 Both eras are accepted throughout, and field-name casing is not enforced (`message_id` passes), so
 conformant generated clients are not refused. Responses are never inspected. A surface whose target
-is `a2a-proxy://` is exempt: the proxy is the implementation rather than a pass-through, needs only
-`params.message` and text parts, and has no downstream agent that would refuse a looser message.
+is `a2a-proxy://` never validates: the proxy is the implementation rather than a pass-through, needs
+only `params.message` and text parts, and has no downstream agent that would refuse a looser message.
 
 ### Generated agent cards
 
 The cards the Gateway generates (the synthesized A2A-proxy card and the onboarding card) are valid
-`1.0` documents:
+`1.0` documents. Each lists the versions its endpoint accepts: the A2A proxy card `1.0` only, since
+an A2A proxy surface serves `1.0` only, and the onboarding card, which belongs to no surface, both.
 
-- `protocolVersion` is `[a2a] default_version` (default `1.0`; see
-  [A2A settings](CONFIGURATION_RELOAD.md#a2a-settings)) while the Gateway accepts it, and otherwise the
-  first version it does accept.
-- `supportedInterfaces[]` lists one entry per accepted version, the advertised version first, all
-  with the same URL and `protocolBinding: "JSONRPC"`. With legacy compatibility off it lists only
-  `1.0`.
+- `supportedInterfaces[]` lists one entry per accepted version, the preferred version first, all
+  with the same URL and `protocolBinding: "JSONRPC"`. The preferred version is `[a2a]
+  default_version` (default `1.0`; see [A2A settings](CONFIGURATION_RELOAD.md#a2a-settings)) when it
+  is accepted, and otherwise the first version that is.
 - `provider.organization` and `capabilities.extendedAgentCard` carry the provider and
   extended-card flag; `capabilities.stateTransitionHistory` is not emitted.
-- While legacy compatibility is on, the v0.3 fields `url`, `preferredTransport`, `agentProvider`
-  and `supportsAuthenticatedExtendedCard` are emitted as well, each derived from its `1.0`
-  counterpart, so a v0.3 client can act on the card. With it off they are omitted. `protocolVersion`
-  and `supportedInterfaces[0]` name `default_version` while the Gateway accepts it, and otherwise
-  the first version it does accept, so pinning `"0.3"` with legacy compatibility off yields `1.0`.
+- When `0.3` is accepted (the onboarding card), the v0.3 fields `protocolVersion`, `url`,
+  `preferredTransport`, `agentProvider` and `supportsAuthenticatedExtendedCard` are emitted as
+  well, each derived from its `1.0` counterpart, so a v0.3 client can act on the card. The A2A proxy
+  card has none of them: it is a `1.0`-only card.
 
 Field mapping from v0.3 to v1.0 in generated cards:
 
 | v0.3 field | v1.0 field | In the generated card |
 | --- | --- | --- |
+| `protocolVersion` (top level) | `supportedInterfaces[].protocolVersion` | v1.0 field always; the v0.3 field too while `0.3` is accepted |
 | `url` and `preferredTransport` | `supportedInterfaces[]`, ordered | v1.0 field always; the v0.3 pair too while `0.3` is accepted |
 | `additionalInterfaces[]` | Folded into `supportedInterfaces[]` | Not emitted |
 | `transport` | `protocolBinding` | `protocolBinding`, value `"JSONRPC"` (previously the incorrect `"HTTP+JSON"`) |
@@ -281,8 +309,8 @@ Field mapping from v0.3 to v1.0 in generated cards:
 The dual-emitted v0.3 fields are deprecated. Card consumers should read the v1.0 fields.
 
 An explicit `[a2a] default_version = "0.3"`, as in a configuration copied from an older example,
-takes effect: generated cards then advertise `0.3` and list the `0.3` interface first while `0.3`
-is accepted. Remove the line or set `"1.0"` to advertise `1.0`.
+takes effect on the onboarding card, which then lists the `0.3` interface first. It never changes the
+A2A proxy card, which accepts `1.0` only. Remove the line or set `"1.0"` to prefer `1.0`.
 
 A Managed Agent's own card is served at the agent's `protocolVersion` and never translated to
 another version. On agent-card discovery requests the Gateway changes it in two ways: its endpoint
@@ -295,33 +323,36 @@ encodes preference. An extended card returned as a JSON-RPC result (`GetExtended
 `agent/getAuthenticatedExtendedCard`) is forwarded as the agent sent it, without URL rewriting.
 
 A surface's agent card (the synthesized A2A-proxy card or a Managed Agent's rewritten card) is
-served as `application/a2a+json` only when the caller's `A2A-Version` resolves to `1.0` or the
-caller lists that type in `Accept`; every other caller receives `application/json`. The response carries
+served as `application/a2a+json` only when the caller's `A2A-Version` resolves to `1.0` and the
+surface accepts `1.0`, or the caller lists that type in `Accept`; every other caller receives `application/json`. The response carries
 `Vary: A2A-Version, Accept`, so a shared cache stores each variant separately. The onboarding
 card served by the identity API (`/onboard/{uuid}/.well-known/agent-card.json`) is always served as
 `application/json`.
 
-### Legacy compatibility
+### Accepting A2A 0.3
 
-The `a2a_legacy_compatibility` feature flag (dashboard **Settings → System → Feature Flags**)
-controls whether `0.3` is accepted. Unset counts as on, so an upgrade never starts refusing callers
-by itself. Off serves `1.0` only: a `0.3` request, including one with no `A2A-Version` header, is
-answered with `-32009` and `"supported": ["1.0"]`, and generated cards drop the `0.3` interface and
-the v0.3 fields. Off reaches every negotiated request (see [Version negotiation](#version-negotiation)):
-a GET, or a call to an `a2a-proxy://` surface, that carries no `A2A-Version` header gets HTTP `400`
-`-32009` as well, and no surface can opt out. Agent-card discovery is not negotiated, so a headerless
-client can still fetch the card; a generated card then lists only `1.0` in `supportedInterfaces[]`,
-while a Managed Agent's card lists whatever the agent published. The flag is read from settings on
-each request and takes effect without a restart.
-Before switching it off, check `agent_gateway_a2a_protocol_version_total` (see
+Whether a surface accepts `0.3` is its `access_point.a2a.accepted_versions` (see
+[A2A surface settings](#a2a-surface-settings)); both versions are accepted by default. A surface that
+does not accept `0.3` answers a `0.3` request, including one with no `A2A-Version` header, with
+`-32009` and `"supported": ["1.0"]`. That reaches every negotiated request (see
+[Version negotiation](#version-negotiation)): a GET that carries no `A2A-Version` header gets HTTP
+`400` `-32009` as well. Agent-card discovery is not negotiated, so a headerless client can still
+fetch the card; a Managed Agent's card lists whatever the agent published.
+
+An A2A proxy surface never accepts `0.3`: its callers must send `A2A-Version: 1.0`.
+
+Before removing `0.3` from a surface, check `agent_gateway_a2a_protocol_version_total` (see
 [Observability Internals](OBSERVABILITY.md#a2a-protocol-version-metric)) for remaining `0.3`
-traffic, bearing in mind it does not count [fabric traffic](#fabric-coverage-gap). Once it is off,
-refused callers are counted with `negotiated_version="rejected"`.
+traffic, bearing in mind it does not count [fabric traffic](#fabric-coverage-gap). Refused callers
+are counted with `negotiated_version="rejected"`.
+
+The retired `a2a_legacy_compatibility` dashboard flag is no longer read: a surface stored before
+per-surface settings existed accepts both versions without message validation, the defaults.
 
 ### Guidance for callers
 
 - Send `A2A-Version: 1.0` on every call. A request without the header counts as `0.3`, and is
-  refused once an operator switches legacy compatibility off.
+  refused by a surface that does not accept `0.3`, including every A2A proxy surface.
 - Read the endpoint from `supportedInterfaces[0].url`, the preferred interface, and fall back to
   the top-level `url` only for v0.3 cards.
 - Confirm the Managed Agent behind a surface speaks v1.0 before switching, because the Gateway
@@ -329,7 +360,7 @@ refused callers are counted with `negotiated_version="rejected"`.
 
 What stays the same:
 
-1. Conformant v0.3 callers keep working while legacy compatibility is on, the default.
+1. Conformant v0.3 callers keep working on surfaces that accept `0.3`, the default.
 2. Both method spellings are accepted whatever version was negotiated, so a partly migrated client
    is not refused.
 3. A Managed Agent's card is served at its own version; only its endpoint URLs and identity
@@ -369,7 +400,7 @@ the [fabric receive pipeline](FABRIC.md#fabric-receive-pipeline) does not run th
 both G2G legs:
 
 - a `0.3` request, an unsupported `A2A-Version` and a malformed A2A request all reach the remote
-  Target, even with `a2a_legacy_compatibility` off, and the remote agent decides;
+  Target, whatever the surface's A2A settings, and the remote agent decides;
 - `agent_gateway_a2a_protocol_version_total` does not count the traffic, so it cannot show `0.3`
   callers on G2G surfaces.
 
@@ -406,8 +437,9 @@ Relevant implementation:
   a client that picks a `GRPC` or `HTTP+JSON` entry reaches the Gateway's JSON-RPC endpoint and
   fails, and one that picks a per-version path is forwarded to the surface's target endpoint rather
   than that path.
-- **Reply shape:** the A2A proxy runtime (`src/a2a_proxies/runtime.rs`) and the onboarding agent
-  answer in the v0.3 shape (`kind`, `role: "agent"`) whatever version the caller negotiated.
+- **Reply shape:** the onboarding agent answers in the v0.3 shape (`kind`, `role: "agent"`)
+  whatever version the caller negotiated. The A2A proxy answers in the `1.0` shape
+  (`result.message`, `ROLE_AGENT`, parts without `kind`), the only version it accepts.
 
 ## Upstream Response Bounds
 

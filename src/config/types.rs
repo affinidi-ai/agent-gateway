@@ -520,30 +520,13 @@ pub struct A2aConfig {
     #[serde(default = "default_a2a_version")]
     pub default_version: String,
 
-    /// Whether to validate inbound A2A requests before forwarding them.
+    /// Deprecated and ignored: message validation is set per A2A Access Point
+    /// (`access_point.a2a.validate_messages`, off by default).
     ///
-    /// Covers two layers:
-    ///
-    /// 1. The **JSON-RPC envelope**: the body parses as JSON and carries
-    ///    `jsonrpc: "2.0"` plus a string `method`. Rejects with `-32700` or
-    ///    `-32600`.
-    /// 2. The **A2A request shape** (`a2a::validation`): on the message-carrying
-    ///    methods, `params`/`params.message`, a non-empty `messageId`, a
-    ///    recognised `role`, non-empty `parts` and exactly one content member per
-    ///    part; on the task methods, a non-empty `params.id`; on `ListTasks`, the
-    ///    optional `status` filter. Rejects with `-32602` naming each bad field,
-    ///    up to `a2a::validation::MAX_FIELD_ERRORS`.
-    ///
-    /// The second layer applies to **managed-agent targets only** — an
-    /// `a2a-proxy://` target is the implementation rather than a pass-through, so
-    /// there is no downstream agent whose rejection we would be pre-empting.
-    ///
-    /// Both layers accept either protocol era. Turning this off forwards
-    /// everything and leaves the agent to decide, which is what A2A expects of an
-    /// agent in any case: the specification puts validation on servers, not on
-    /// intermediaries.
-    #[serde(default = "default_true")]
-    pub validate_messages: bool,
+    /// Still accepted so an existing config file starts; a startup warning
+    /// names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate_messages: Option<bool>,
 
     /// Maximum request body size in bytes; also caps a buffered upstream
     /// response on Access Points and Transit Points.
@@ -597,7 +580,7 @@ impl Default for A2aConfig {
     fn default() -> Self {
         Self {
             default_version: default_a2a_version(),
-            validate_messages: true,
+            validate_messages: None,
             max_body_size: default_max_body_size(),
             timeout_seconds: default_timeout(),
             fabric_gateway_timeout_ms: default_fabric_timeout_ms(),
@@ -3828,6 +3811,23 @@ mod outbound_config_tests {
 #[cfg(test)]
 mod a2a_validate_tests {
     use super::*;
+
+    #[test]
+    fn the_deprecated_validate_messages_key_is_still_accepted() {
+        let config: A2aConfig = toml::from_str("validate_messages = false").unwrap();
+        assert_eq!(config.validate_messages, Some(false));
+        assert_eq!(config.validate(), Ok(()));
+
+        let config: A2aConfig = toml::from_str("").unwrap();
+        assert_eq!(config.validate_messages, None);
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("validate_messages")
+                .is_none(),
+            "an unset deprecated key is not written back"
+        );
+    }
 
     #[test]
     fn explicit_fabric_stream_envelope_limit_is_bounded_by_range_and_sdk_cache() {

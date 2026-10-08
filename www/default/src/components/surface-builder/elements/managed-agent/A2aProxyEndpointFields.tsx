@@ -56,6 +56,18 @@ const A2aProxyEndpointFields: React.FC<A2aProxyEndpointFieldsProps> = ({
       <div
         className="alert alert-info py-2 mb-2"
         style={{ fontSize: '10px' }}
+        data-testid="managed-agent-a2a-proxy-protocol-hint"
+      >
+        <div className="fw-semibold mb-1">A2A 1.0 only, without message validation.</div>
+        <div>
+          An A2A proxy serves A2A 1.0, so callers must send the <code>A2A-Version: 1.0</code>{' '}
+          header. Message validation is off, so lenient callers keep working. The Access
+          Point&apos;s A2A Protocol settings are locked to these values.
+        </div>
+      </div>
+      <div
+        className="alert alert-info py-2 mb-2"
+        style={{ fontSize: '10px' }}
         data-testid="managed-agent-a2a-proxy-identity-hint"
       >
         <div className="fw-semibold mb-1">Identity comes from the selected A2A Proxy.</div>

@@ -4,8 +4,6 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { apiClient } from '../api';
 import InfoBanner from '../components/shared/InfoBanner';
 import { DOCS_URL } from '../config/docs';
-import { useApp } from '../context/AppContext';
-import { isA2aLegacyCompatibilityOn } from '../utils/a2aLegacyCompatibility';
 import AgentCardTab from './A2aProxyPage/AgentCardTab';
 import BackendTab from './A2aProxyPage/BackendTab';
 import OverviewTab from './A2aProxyPage/OverviewTab';
@@ -18,8 +16,6 @@ import {
 import type { A2aProxy, A2aProxyFormData, SecretOption } from './A2aProxyPage/types';
 
 const EditA2aProxyPage: React.FC = () => {
-  const { state } = useApp();
-  const legacyCompatibility = isA2aLegacyCompatibilityOn(state.settings?.feature_flags);
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
   const isEditMode = !!id;
@@ -216,11 +212,7 @@ const EditA2aProxyPage: React.FC = () => {
                   </>
                 }
               >
-                <AgentCardTab
-                  formData={formData}
-                  onChange={handleChange}
-                  legacyCompatibility={legacyCompatibility}
-                />
+                <AgentCardTab formData={formData} onChange={handleChange} />
               </Tab>
             </Tabs>
           </div>

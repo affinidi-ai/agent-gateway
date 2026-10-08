@@ -3,6 +3,12 @@ import type { NodeDefinition } from '../types';
 import { normalizeRoute } from '../validators';
 import AccessPointPanel from './AccessPointPanel';
 import { DOCS_URL } from '../../../../config/docs';
+import {
+  DEFAULT_A2A_SETTINGS,
+  a2aSettingsForPayload,
+  isA2aProxyEndpoint,
+  selectedA2aVersions,
+} from './a2aSettings';
 
 export const accessPointDefinition: NodeDefinition = {
   type: 'access-point',
@@ -42,6 +48,18 @@ export const accessPointDefinition: NodeDefinition = {
   requires: {},
   incompleteReason: config => (!config.route ? 'Route path is required' : null),
   validate: () => [],
+  featureDependencies: [
+    {
+      description: 'An A2A surface accepts at least one A2A version',
+      // An A2A proxy Target serves A2A 1.0 whatever is selected, so the
+      // disabled checkboxes there never block a save.
+      condition: (_config, ctx) =>
+        ctx.protocol === 'a2a' && !isA2aProxyEndpoint(ctx.target?.endpoint),
+      check: config => selectedA2aVersions(config).length > 0,
+      severity: 'error',
+      message: 'Select at least one supported A2A version',
+    },
+  ],
   help: {
     title: 'Access Point',
     docLink: DOCS_URL.accessPointElement,
@@ -89,6 +107,18 @@ export const accessPointDefinition: NodeDefinition = {
     delete c.header_metadata_mapping;
     if (Array.isArray(slice?.supported_extensions)) {
       c.supported_extensions = slice.supported_extensions.slice();
+    }
+    // Always set explicitly, so a stale canvas-blob copy cannot reappear on load.
+    delete c.a2a;
+    if (slice?.protocol === 'a2a' || slice?.protocol === 'ap2') {
+      const a2a = slice?.a2a ?? {};
+      c.a2a_accepted_versions = Array.isArray(a2a.accepted_versions)
+        ? a2a.accepted_versions.slice()
+        : [...DEFAULT_A2A_SETTINGS.accepted_versions];
+      c.a2a_validate_messages =
+        typeof a2a.validate_messages === 'boolean'
+          ? a2a.validate_messages
+          : DEFAULT_A2A_SETTINGS.validate_messages;
     }
     return c;
   },
@@ -153,6 +183,9 @@ export const accessPointDefinition: NodeDefinition = {
     }
     if (typeof c.name === 'string' && c.name.trim()) {
       ap.name = c.name.trim();
+    }
+    if (ap.protocol === 'a2a' || ap.protocol === 'ap2') {
+      ap.a2a = a2aSettingsForPayload(c, ctx.firstNodeOfType('target')?.config?.endpoint);
     }
     return [{ path: 'access_point', value: ap }];
   },

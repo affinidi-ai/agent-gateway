@@ -272,5 +272,5 @@ Pair only with peers you would trust with those tokens, and remove `outbound_cre
 A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 `agent_gateway_a2a_protocol_version_total` metric do not run on either G2G leg. The sending gateway
 skips them for a `fabric://` target, and the receive pipeline above does not run them. So
-A2A `0.3` traffic crosses the fabric even with `a2a_legacy_compatibility` off; see
+A2A `0.3` traffic crosses the fabric whatever the surface's accepted A2A versions; see
 [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap).

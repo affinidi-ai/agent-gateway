@@ -253,6 +253,7 @@ mod tests {
                 response_custom_metadata: None,
                 didwebvh_identity: None,
                 terminate_trace_id: false,
+                a2a: None,
             },
             target: Target {
                 endpoint: "http://upstream.example/".to_string(),

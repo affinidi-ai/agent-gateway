@@ -29,6 +29,29 @@ fn a2a_request_body() -> serde_json::Value {
     })
 }
 
+/// A managed-agent A2A surface that accepts both versions but explicitly
+/// validates no messages (`access_point.a2a.validate_messages = false`).
+fn surface_without_message_validation() -> crate::config::agent_surface::AgentSurface {
+    let mut surface = helpers::build_minimal_channel();
+    surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
+        validate_messages: false,
+        ..Default::default()
+    });
+    surface
+}
+
+/// The same surface with message validation switched on
+/// (`access_point.a2a.validate_messages = true`); it is off by default.
+fn with_message_validation(
+    mut surface: crate::config::agent_surface::AgentSurface
+) -> crate::config::agent_surface::AgentSurface {
+    surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
+        validate_messages: true,
+        ..Default::default()
+    });
+    surface
+}
+
 /// Realistic A2A JSON-RPC response returned by the mock target.
 fn a2a_response_body() -> serde_json::Value {
     json!({
@@ -510,7 +533,7 @@ async fn inbound_a2a_invalid_json_rejected() {
     // Given — a plain A2A channel (validate_messages defaults to true)
     //
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -564,7 +587,7 @@ async fn inbound_a2a_missing_jsonrpc_field_rejected() {
     // Given
     //
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -625,7 +648,7 @@ async fn inbound_a2a_missing_method_field_rejected() {
     // Given
     //
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -1272,7 +1295,7 @@ async fn inbound_a2a_malformed_message_rejected_before_forwarding() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -1324,7 +1347,7 @@ async fn inbound_a2a_v1_send_message_missing_required_fields_rejected() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -1375,7 +1398,7 @@ async fn inbound_a2a_many_bad_parts_get_a_bounded_error() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -1455,10 +1478,7 @@ async fn inbound_a2a_validation_disabled_passes_malformed_through() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config
-            .a2a
-            .validate_messages = false;
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![surface_without_message_validation()];
     })
     .await;
 
@@ -1494,6 +1514,35 @@ async fn inbound_a2a_validation_disabled_passes_malformed_through() {
     assert_eq!(received.body, r#"{"hello": "world"}"#);
 }
 
+/// Message validation is off unless the surface turns it on, so a surface that
+/// stores no `access_point.a2a` forwards a malformed message unchecked.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_messages_are_not_validated_by_default() {
+    let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
+
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+    })
+    .await;
+
+    let request_str = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{}}}"#;
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .body(request_str)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200, "an unvalidated surface forwards the malformed message");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("response is not JSON");
+    assert_eq!(body["result"], "ok", "the upstream's response should come back, got {body}");
+    assert_mock_received_request(&h.mock, request_str);
+}
+
 /// With `validate_messages = false` the A2A message-shape check is skipped too, so
 /// a v1.0 `SendMessage` missing every required message field reaches the upstream.
 #[tokio::test(flavor = "multi_thread")]
@@ -1501,10 +1550,7 @@ async fn inbound_a2a_validation_disabled_forwards_v1_message_missing_required_fi
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config
-            .a2a
-            .validate_messages = false;
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![surface_without_message_validation()];
     })
     .await;
 
@@ -1535,10 +1581,7 @@ async fn inbound_a2a_validation_disabled_still_rejects_unsupported_version() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config
-            .a2a
-            .validate_messages = false;
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![surface_without_message_validation()];
     })
     .await;
 
@@ -1653,6 +1696,119 @@ async fn inbound_mcp_body_on_a2a_access_point_rejected() {
     );
 }
 
+// ── Per-surface accepted versions ────────────────────────────────────────────
+
+/// The minimal surface accepting only `versions`, on `route`.
+fn surface_accepting(
+    route: &str,
+    versions: &[&str],
+) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = helpers::build_minimal_channel();
+    surface.name = format!("surface{}", route.replace('/', "-"));
+    surface.surface_id = surface.name.clone();
+    surface.access_point.route = route.to_string();
+    surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
+        accepted_versions: versions
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
+        ..Default::default()
+    });
+    surface
+}
+
+async fn post_with_version(
+    url: &str,
+    version: Option<&str>,
+) -> (u16, serde_json::Value) {
+    let mut request = reqwest::Client::new()
+        .post(url)
+        .header("content-type", "application/json")
+        .json(&a2a_request_body());
+    if let Some(version) = version {
+        request = request.header("A2A-Version", version);
+    }
+    let response = request
+        .send()
+        .await
+        .expect("request failed");
+    let status = response.status().as_u16();
+    let text = response
+        .text()
+        .await
+        .expect("response body");
+    (status, serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+}
+
+/// A surface that accepts 1.0 only refuses v0.3, including a caller that sends
+/// no `A2A-Version` (which A2A defines as 0.3), and names only 1.0 as supported.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_1_0_only_surface_refuses_v0_3_and_lists_only_1_0() {
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![surface_accepting("/smoke", &["1.0"])];
+    })
+    .await;
+
+    for version in [None, Some("0.3")] {
+        let (status, body) = post_with_version(&h.gateway_url, version).await;
+        assert_eq!(status, 400, "{version:?}");
+        assert_eq!(body["error"]["code"], -32009, "{version:?}");
+        assert_eq!(body["error"]["data"]["requested"], "0.3");
+        assert_eq!(body["error"]["data"]["supported"], json!(["1.0"]));
+    }
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "a refused request never reaches the agent"
+    );
+
+    let (status, body) = post_with_version(&h.gateway_url, Some("1.0")).await;
+    assert_eq!(status, 200, "1.0 is served, got {body}");
+    assert_eq!(body["result"]["messageId"], "msg-resp-001");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_0_3_only_surface_refuses_v1_0() {
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![surface_accepting("/smoke", &["0.3"])];
+    })
+    .await;
+
+    let (status, body) = post_with_version(&h.gateway_url, Some("1.0")).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], -32009);
+    assert_eq!(body["error"]["data"]["supported"], json!(["0.3"]));
+
+    let (status, body) = post_with_version(&h.gateway_url, None).await;
+    assert_eq!(status, 200, "an absent header is 0.3, which this surface serves, got {body}");
+}
+
+/// Accepted versions are per surface: two surfaces on one gateway negotiate
+/// the same request differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_surfaces_negotiate_with_their_own_accepted_versions() {
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, bootstrap| {
+        helpers::configure_gateway_route_prefixes(
+            bootstrap,
+            &[("smoke", "smoke", "/smoke"), ("v1only", "v1only", "/v1only")],
+        );
+        gw_config.surfaces = vec![surface_accepting("/smoke", &["0.3", "1.0"]), surface_accepting("/v1only", &["1.0"])];
+    })
+    .await;
+
+    let (status, body) = post_with_version(&h.gateway_url, None).await;
+    assert_eq!(status, 200, "the surface accepting both serves a header-less caller, got {body}");
+
+    let (status, body) = post_with_version(&format!("{}/v1only/rpc", h.gateway_base), None).await;
+    assert_eq!(status, 400, "the 1.0-only surface refuses the same caller, got {body}");
+    assert_eq!(body["error"]["data"]["supported"], json!(["1.0"]));
+}
+
 // ── Refusals ahead of delegated payment ──────────────────────────────────────
 
 const DELEGATION_MISCONFIGURED: &str = "payment delegation misconfigured";
@@ -1743,7 +1899,7 @@ async fn inbound_a2a_unsupported_version_refused_before_delegated_payment() {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_malformed_message_refused_before_delegated_payment() {
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![agent_pay_surface("prepay-shape", None)];
+        gw_config.surfaces = vec![with_message_validation(agent_pay_surface("prepay-shape", None))];
     })
     .await;
 
@@ -1764,7 +1920,7 @@ async fn inbound_a2a_malformed_message_refused_before_delegated_payment() {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_invalid_envelope_refused_before_delegated_payment() {
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![agent_pay_surface("prepay-envelope", None)];
+        gw_config.surfaces = vec![with_message_validation(agent_pay_surface("prepay-envelope", None))];
     })
     .await;
 

@@ -161,7 +161,7 @@ differ, repository documentation describes this source revision exactly.
 | Protocol | Status in this source revision |
 | --- | --- |
 | A2A `1.0` | Active |
-| A2A `0.3` | Accepted while `a2a_legacy_compatibility` is on, the default |
+| A2A `0.3` | Accepted on each A2A surface that selects it, the default; not on A2A proxy surfaces |
 | MCP `2024-11-05` | Active |
 | MCP `2026-07-28` | Active on every MCP endpoint |
 | DIDComm v2.1 | Available for Fabric transport |

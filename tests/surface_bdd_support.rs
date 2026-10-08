@@ -107,6 +107,36 @@ fn write_config_uses_configured_surface_name() {
 }
 
 #[test]
+fn write_config_writes_the_access_point_a2a_settings() {
+    let temp_dir = TempDir::new().unwrap();
+    let a2a = serde_json::json!({ "accepted_versions": ["1.0"], "validate_messages": true });
+    let surface_config = SurfaceConfigBuilder {
+        protocol: "a2a".to_string(),
+        a2a_settings: Some(a2a.clone()),
+        ..SurfaceConfigBuilder::default()
+    };
+
+    config::single_surface_writer::write_single_surface_config(
+        temp_dir.path(),
+        32020,
+        "http://127.0.0.1:9",
+        &surface_config,
+        None,
+    );
+
+    let surface_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join("_storage/agent_surfaces/bdd-surface.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(surface_json["access_point"]["a2a"], a2a);
+}
+
+#[test]
 fn write_config_seeds_api_key_provider_source_auth_fixture() {
     let temp_dir = TempDir::new().unwrap();
     let surface_config = SurfaceConfigBuilder {

@@ -26,68 +26,33 @@ pub const VERSION_1_0: &str = "1.0";
 
 /// Every protocol version this gateway is capable of serving.
 ///
-/// What it *accepts* at runtime is [`accepted_versions`], which narrows this to
-/// v1.0 alone when an operator turns legacy compatibility off.
+/// What a surface *accepts* is its own subset, configured on its A2A Access
+/// Point (`access_point.a2a.accepted_versions`) and resolved by [`accepted_set`].
 pub const SUPPORTED_VERSIONS: &[&str] = &[VERSION_0_3, VERSION_1_0];
 
-/// The accepted set when v0.3 compatibility is switched off.
-const VERSIONS_1_0_ONLY: &[&str] = &[VERSION_1_0];
+/// The accepted set of a surface that serves A2A 1.0 only, which includes every
+/// `a2a-proxy://` surface.
+pub const VERSIONS_1_0_ONLY: &[&str] = &[VERSION_1_0];
 
-/// Dashboard feature flag enabling legacy compatibility with A2A v0.3.
-///
-/// **On means accept v0.3**, off means serve v1.0 only. Unset is treated as
-/// **on**, so upgrading a gateway never silently starts refusing the v0.3
-/// callers it served yesterday; restricting traffic stays a deliberate act.
-/// That is why this flag reads `!= false` rather than the `== true` used by
-/// flags that reveal a new feature.
-///
-/// Read per request from settings rather than cached at startup, so the
-/// dashboard's "changes take effect immediately" holds, the same way
-/// `ap2_experimental` is resolved.
-pub const FLAG_A2A_LEGACY_COMPATIBILITY: &str = "a2a_legacy_compatibility";
+/// The accepted set of a surface that serves A2A 0.3 only.
+pub const VERSIONS_0_3_ONLY: &[&str] = &[VERSION_0_3];
 
-/// Resolve the flag from a settings feature-flag map. Split out from
-/// [`legacy_v0_3_enabled`] so it is testable without global settings.
+/// The accepted set for a surface's configured versions, in
+/// [`SUPPORTED_VERSIONS`] order.
 ///
-/// Absent means enabled: see [`FLAG_A2A_LEGACY_COMPATIBILITY`].
-pub fn legacy_compatibility_from_flags(feature_flags: Option<&std::collections::HashMap<String, bool>>) -> bool {
-    feature_flags
-        .and_then(|flags| {
-            flags
-                .get(FLAG_A2A_LEGACY_COMPATIBILITY)
-                .copied()
-        })
-        .unwrap_or(true)
-}
-
-/// Whether the gateway currently accepts A2A v0.3 callers.
-///
-/// True unless an operator has turned legacy compatibility off, so an existing
-/// deployment is unaffected until someone opts out.
-pub fn legacy_v0_3_enabled() -> bool {
-    crate::storage::settings_store::global_settings()
-        .map(|settings| legacy_compatibility_from_flags(Some(&settings.feature_flags)))
-        .unwrap_or_else(|| {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!("Settings store unavailable; treating a2a_legacy_compatibility as enabled");
-            });
-            true
-        })
-}
-
-/// The protocol versions the gateway accepts from callers right now.
-///
-/// The A2A specification requires an agent that does not support the requested
-/// version to answer with `VersionNotSupportedError`, so declining v0.3 is a
-/// supported posture rather than a deviation. The *interpretation* of an absent header is
-/// not configurable: it always means v0.3 (see [`negotiate_version`]). What the
-/// toggle changes is whether v0.3 is then accepted or refused.
-pub fn accepted_versions() -> &'static [&'static str] {
-    if legacy_v0_3_enabled() {
-        SUPPORTED_VERSIONS
-    } else {
-        VERSIONS_1_0_ONLY
+/// Entries the gateway cannot serve are ignored, and a list naming none it can
+/// serve falls back to every supported version; surface validation refuses both
+/// on save, so neither reaches a request.
+pub fn accepted_set(configured: &[String]) -> &'static [&'static str] {
+    let has = |version: &str| {
+        configured
+            .iter()
+            .any(|v| v == version)
+    };
+    match (has(VERSION_0_3), has(VERSION_1_0)) {
+        (true, false) => VERSIONS_0_3_ONLY,
+        (false, true) => VERSIONS_1_0_ONLY,
+        _ => SUPPORTED_VERSIONS,
     }
 }
 
@@ -136,8 +101,9 @@ pub fn init_advertised_version(configured: &str) {
 /// otherwise. Cards belonging to a managed agent are unaffected: they are always
 /// served at the upstream's own `protocolVersion`.
 ///
-/// It does not change which versions are *accepted* — [`SUPPORTED_VERSIONS`]
-/// governs that, and both eras are accepted regardless of what is advertised.
+/// It does not change which versions are *accepted*: each surface's accepted set
+/// governs that, and a generated card never names a version outside it (see
+/// [`effective_advertised_version`]).
 pub fn advertised_version() -> &'static str {
     CONFIGURED_ADVERTISED_VERSION
         .get()
@@ -180,10 +146,16 @@ fn accepts_a2a_json(headers: &HeaderMap) -> bool {
 /// caller signals 1.0 — either via `A2A-Version: 1.0` or by asking for it in
 /// `Accept`. Every other caller keeps `application/json`.
 ///
+/// `accepted` is the surface's accepted set: a `1.0` header only counts when the
+/// surface serves 1.0.
+///
 /// (Once v0.3 traffic has faded this can be simplified to always returning
 /// [`MEDIA_TYPE_A2A_JSON`].)
-pub fn agent_card_content_type(headers: &HeaderMap) -> &'static str {
-    if accepts_a2a_json(headers) || matches!(negotiate_from_headers(headers), Ok(VERSION_1_0)) {
+pub fn agent_card_content_type(
+    headers: &HeaderMap,
+    accepted: &[&str],
+) -> &'static str {
+    if accepts_a2a_json(headers) || matches!(negotiate_from_headers(headers, accepted), Ok(VERSION_1_0)) {
         MEDIA_TYPE_A2A_JSON
     } else {
         MEDIA_TYPE_JSON
@@ -214,18 +186,14 @@ fn major_minor(raw: &str) -> &str {
     }
 }
 
-/// Negotiate the A2A protocol version for a request from a raw header value.
+/// Negotiate the A2A protocol version for a request from a raw header value,
+/// against the surface's accepted set.
 ///
-/// Returns the supported version on success. An absent or empty value resolves to
-/// [`VERSION_0_3`] per the spec. A recognised-but-unsupported version returns
-/// `Err(raw)` so the caller can answer with [`ERR_VERSION_NOT_SUPPORTED`].
-pub fn negotiate_version(raw: Option<&str>) -> Result<&'static str, String> {
-    negotiate_version_in(raw, accepted_versions())
-}
-
-/// [`negotiate_version`] against an explicit accepted set, so the refusal rules
-/// are testable without installing the process-global legacy-compatibility flag.
-pub(crate) fn negotiate_version_in(
+/// Returns the accepted version on success. An absent or empty value resolves to
+/// [`VERSION_0_3`] per the spec. A version the gateway does not recognise, or one
+/// outside `accepted`, returns `Err` so the caller can answer with
+/// [`ERR_VERSION_NOT_SUPPORTED`].
+pub fn negotiate_version(
     raw: Option<&str>,
     accepted: &[&str],
 ) -> Result<&'static str, String> {
@@ -249,13 +217,48 @@ pub(crate) fn negotiate_version_in(
     }
 }
 
-/// Negotiate the A2A protocol version from request headers.
+/// Negotiate the A2A protocol version from request headers, against the
+/// surface's accepted set.
 /// A missing or non-UTF-8 header is treated as absent (⇒ [`VERSION_0_3`]).
-pub fn negotiate_from_headers(headers: &HeaderMap) -> Result<&'static str, String> {
+pub fn negotiate_from_headers(
+    headers: &HeaderMap,
+    accepted: &[&str],
+) -> Result<&'static str, String> {
     let raw = headers
         .get(A2A_VERSION_HEADER)
         .and_then(|v| v.to_str().ok());
-    negotiate_version(raw)
+    negotiate_version(raw, accepted)
+}
+
+/// Operator-facing reason a request was refused with [`ERR_VERSION_NOT_SUPPORTED`],
+/// naming what the surface accepts and, when the caller sent no `A2A-Version`
+/// header, that it was read as `0.3`.
+pub fn version_refusal_reason(
+    headers: &HeaderMap,
+    requested: &str,
+    accepted: &[&str],
+    a2a_proxy_target: bool,
+) -> String {
+    let header_sent = headers
+        .get(A2A_VERSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.trim().is_empty());
+    let requested = super::clip_for_log(requested);
+    let request = if header_sent {
+        format!("A2A-Version '{requested}'")
+    } else {
+        format!("no A2A-Version header (read as {requested})")
+    };
+    let surface = if a2a_proxy_target {
+        "the A2A proxy target serves"
+    } else {
+        "the surface accepts"
+    };
+    format!(
+        "{request} is not accepted: {surface} {}; the caller must send A2A-Version: {}",
+        accepted.join(", "),
+        accepted.join(" or ")
+    )
 }
 
 /// `negotiated_version` label value for the protocol-version metric: the
@@ -282,52 +285,89 @@ mod tests {
     fn negotiated_version_label_reports_a_refused_request_as_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert(A2A_VERSION_HEADER, "2.0".parse().unwrap());
-        let negotiation = negotiate_from_headers(&headers);
+        let negotiation = negotiate_from_headers(&headers, SUPPORTED_VERSIONS);
 
         assert_eq!(negotiation, Err("2.0".to_string()));
         assert_eq!(negotiated_version_label(&negotiation), "rejected");
     }
 
     #[test]
+    fn a_refusal_without_a_header_says_it_was_read_as_0_3() {
+        let mut empty = HeaderMap::new();
+        empty.insert(A2A_VERSION_HEADER, " ".parse().unwrap());
+        for headers in [HeaderMap::new(), empty] {
+            assert_eq!(
+                version_refusal_reason(&headers, VERSION_0_3, VERSIONS_1_0_ONLY, true),
+                "no A2A-Version header (read as 0.3) is not accepted: the A2A proxy target serves 1.0; \
+                 the caller must send A2A-Version: 1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_of_a_sent_version_names_the_surface_accepted_versions() {
+        let mut headers = HeaderMap::new();
+        headers.insert(A2A_VERSION_HEADER, "2.0".parse().unwrap());
+        assert_eq!(
+            version_refusal_reason(&headers, "2.0", SUPPORTED_VERSIONS, false),
+            "A2A-Version '2.0' is not accepted: the surface accepts 0.3, 1.0; \
+             the caller must send A2A-Version: 0.3 or 1.0"
+        );
+    }
+
+    #[test]
+    fn a_refusal_cuts_a_long_version_value() {
+        let long = "9".repeat(5_000);
+        let mut headers = HeaderMap::new();
+        headers.insert(A2A_VERSION_HEADER, long.parse().unwrap());
+        let reason = version_refusal_reason(&headers, &long, SUPPORTED_VERSIONS, false);
+        assert!(
+            reason.starts_with(&format!("A2A-Version '{}…' is not accepted", "9".repeat(crate::a2a::MAX_LOGGED_CHARS))),
+            "{reason}"
+        );
+        assert!(reason.len() < 200, "{reason}");
+    }
+
+    #[test]
     fn absent_or_empty_version_means_0_3() {
         // Spec: agents MUST interpret an empty value as 0.3.
-        assert_eq!(negotiate_version(None), Ok(VERSION_0_3));
-        assert_eq!(negotiate_version(Some("")), Ok(VERSION_0_3));
-        assert_eq!(negotiate_version(Some("   ")), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(None, SUPPORTED_VERSIONS), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(Some(""), SUPPORTED_VERSIONS), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(Some("   "), SUPPORTED_VERSIONS), Ok(VERSION_0_3));
     }
 
     #[test]
     fn accepts_supported_versions() {
-        assert_eq!(negotiate_version(Some("0.3")), Ok(VERSION_0_3));
-        assert_eq!(negotiate_version(Some("1.0")), Ok(VERSION_1_0));
-        assert_eq!(negotiate_version(Some(" 1.0 ")), Ok(VERSION_1_0));
+        assert_eq!(negotiate_version(Some("0.3"), SUPPORTED_VERSIONS), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(Some("1.0"), SUPPORTED_VERSIONS), Ok(VERSION_1_0));
+        assert_eq!(negotiate_version(Some(" 1.0 "), SUPPORTED_VERSIONS), Ok(VERSION_1_0));
     }
 
     #[test]
     fn patch_versions_negotiate_on_major_minor() {
         // Patch numbers are excluded from negotiation.
-        assert_eq!(negotiate_version(Some("1.0.1")), Ok(VERSION_1_0));
-        assert_eq!(negotiate_version(Some("0.3.0")), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(Some("1.0.1"), SUPPORTED_VERSIONS), Ok(VERSION_1_0));
+        assert_eq!(negotiate_version(Some("0.3.0"), SUPPORTED_VERSIONS), Ok(VERSION_0_3));
     }
 
     #[test]
     fn rejects_unsupported_versions() {
-        assert_eq!(negotiate_version(Some("2.0")), Err("2.0".to_string()));
-        assert_eq!(negotiate_version(Some("0.2")), Err("0.2".to_string()));
-        assert_eq!(negotiate_version(Some("banana")), Err("banana".to_string()));
+        assert_eq!(negotiate_version(Some("2.0"), SUPPORTED_VERSIONS), Err("2.0".to_string()));
+        assert_eq!(negotiate_version(Some("0.2"), SUPPORTED_VERSIONS), Err("0.2".to_string()));
+        assert_eq!(negotiate_version(Some("banana"), SUPPORTED_VERSIONS), Err("banana".to_string()));
     }
 
     #[test]
     fn negotiates_from_headers() {
         let mut headers = HeaderMap::new();
         // No header at all → 0.3 (spec default).
-        assert_eq!(negotiate_from_headers(&headers), Ok(VERSION_0_3));
+        assert_eq!(negotiate_from_headers(&headers, SUPPORTED_VERSIONS), Ok(VERSION_0_3));
 
         headers.insert(A2A_VERSION_HEADER, "1.0".parse().unwrap());
-        assert_eq!(negotiate_from_headers(&headers), Ok(VERSION_1_0));
+        assert_eq!(negotiate_from_headers(&headers, SUPPORTED_VERSIONS), Ok(VERSION_1_0));
 
         headers.insert(A2A_VERSION_HEADER, "0.3".parse().unwrap());
-        assert_eq!(negotiate_from_headers(&headers), Ok(VERSION_0_3));
+        assert_eq!(negotiate_from_headers(&headers, SUPPORTED_VERSIONS), Ok(VERSION_0_3));
     }
 
     #[test]
@@ -335,7 +375,11 @@ mod tests {
         for empty in ["", "   "] {
             let mut headers = HeaderMap::new();
             headers.insert(A2A_VERSION_HEADER, axum::http::HeaderValue::from_static(empty));
-            assert_eq!(negotiate_from_headers(&headers), Ok(VERSION_0_3), "{empty:?} must mean 0.3");
+            assert_eq!(
+                negotiate_from_headers(&headers, SUPPORTED_VERSIONS),
+                Ok(VERSION_0_3),
+                "{empty:?} must mean 0.3"
+            );
         }
     }
 
@@ -343,28 +387,28 @@ mod tests {
     fn unsupported_header_version_is_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert(A2A_VERSION_HEADER, "3.1".parse().unwrap());
-        assert_eq!(negotiate_from_headers(&headers), Err("3.1".to_string()));
+        assert_eq!(negotiate_from_headers(&headers, SUPPORTED_VERSIONS), Err("3.1".to_string()));
     }
 
     #[test]
     fn card_media_type_defaults_to_application_json() {
         // No 1.0 signal at all → 0.3 clients and tools keep application/json.
         let headers = HeaderMap::new();
-        assert_eq!(agent_card_content_type(&headers), MEDIA_TYPE_JSON);
+        assert_eq!(agent_card_content_type(&headers, SUPPORTED_VERSIONS), MEDIA_TYPE_JSON);
     }
 
     #[test]
     fn card_media_type_upgrades_on_version_header() {
         let mut headers = HeaderMap::new();
         headers.insert(A2A_VERSION_HEADER, "1.0".parse().unwrap());
-        assert_eq!(agent_card_content_type(&headers), MEDIA_TYPE_A2A_JSON);
+        assert_eq!(agent_card_content_type(&headers, SUPPORTED_VERSIONS), MEDIA_TYPE_A2A_JSON);
     }
 
     #[test]
     fn card_media_type_stays_json_for_v0_3_caller() {
         let mut headers = HeaderMap::new();
         headers.insert(A2A_VERSION_HEADER, "0.3".parse().unwrap());
-        assert_eq!(agent_card_content_type(&headers), MEDIA_TYPE_JSON);
+        assert_eq!(agent_card_content_type(&headers, SUPPORTED_VERSIONS), MEDIA_TYPE_JSON);
     }
 
     #[test]
@@ -376,7 +420,7 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        assert_eq!(agent_card_content_type(&headers), MEDIA_TYPE_A2A_JSON);
+        assert_eq!(agent_card_content_type(&headers, SUPPORTED_VERSIONS), MEDIA_TYPE_A2A_JSON);
 
         // Also when listed among several types, and case-insensitively.
         headers.insert(
@@ -385,7 +429,16 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        assert_eq!(agent_card_content_type(&headers), MEDIA_TYPE_A2A_JSON);
+        assert_eq!(agent_card_content_type(&headers, SUPPORTED_VERSIONS), MEDIA_TYPE_A2A_JSON);
+    }
+
+    /// A `1.0` header only upgrades the card on a surface that serves 1.0.
+    #[test]
+    fn card_media_type_follows_the_surface_accepted_set() {
+        let mut headers = HeaderMap::new();
+        headers.insert(A2A_VERSION_HEADER, "1.0".parse().unwrap());
+        assert_eq!(agent_card_content_type(&headers, VERSIONS_1_0_ONLY), MEDIA_TYPE_A2A_JSON);
+        assert_eq!(agent_card_content_type(&headers, VERSIONS_0_3_ONLY), MEDIA_TYPE_JSON);
     }
 
     #[test]
@@ -397,7 +450,7 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        assert_eq!(agent_card_content_type(&headers), MEDIA_TYPE_JSON);
+        assert_eq!(agent_card_content_type(&headers, SUPPORTED_VERSIONS), MEDIA_TYPE_JSON);
     }
 
     #[test]
@@ -489,77 +542,73 @@ pub(crate) fn run_isolated_from_other_tests() -> bool {
 }
 
 #[cfg(test)]
-mod legacy_compatibility_tests {
+mod accepted_set_tests {
     use super::*;
 
-    #[test]
-    fn compatibility_defaults_to_enabled_so_nothing_changes_on_upgrade() {
-        assert!(legacy_v0_3_enabled());
-        assert_eq!(accepted_versions(), SUPPORTED_VERSIONS);
-    }
-
-    /// Unset must mean enabled, so upgrading a gateway never silently starts
-    /// refusing the v0.3 callers it served yesterday.
-    #[test]
-    fn legacy_compatibility_is_on_unless_explicitly_turned_off() {
-        use std::collections::HashMap;
-
-        assert!(legacy_compatibility_from_flags(None), "no settings means keep accepting v0.3");
-        assert!(legacy_compatibility_from_flags(Some(&HashMap::new())), "unset means keep accepting v0.3");
-
-        let mut on = HashMap::new();
-        on.insert(FLAG_A2A_LEGACY_COMPATIBILITY.to_string(), true);
-        assert!(legacy_compatibility_from_flags(Some(&on)));
-
-        let mut off = HashMap::new();
-        off.insert(FLAG_A2A_LEGACY_COMPATIBILITY.to_string(), false);
-        assert!(!legacy_compatibility_from_flags(Some(&off)), "explicit false restricts to v1.0");
-
-        let mut unrelated = HashMap::new();
-        unrelated.insert("something_else".to_string(), true);
-        assert!(legacy_compatibility_from_flags(Some(&unrelated)), "an unrelated flag must not restrict A2A");
-    }
-
-    /// With compatibility off the gateway serves v1.0 only. The *interpretation*
-    /// of the header is unchanged — an absent header still means v0.3 — but that
-    /// version is then refused, which is what the A2A specification prescribes for
-    /// a version an interface does not support.
-    #[test]
-    fn disabling_compatibility_refuses_v0_3_including_an_absent_header() {
-        let only_1_0 = VERSIONS_1_0_ONLY;
-
-        assert_eq!(negotiate_version_in(Some("1.0"), only_1_0), Ok(VERSION_1_0));
-        assert_eq!(negotiate_version_in(Some("1.0.1"), only_1_0), Ok(VERSION_1_0));
-
-        // Explicit v0.3, and the absent/empty header that A2A defines as v0.3.
-        assert_eq!(negotiate_version_in(Some("0.3"), only_1_0), Err("0.3".to_string()));
-        assert_eq!(negotiate_version_in(None, only_1_0), Err("0.3".to_string()));
-        assert_eq!(negotiate_version_in(Some(""), only_1_0), Err("0.3".to_string()));
+    fn configured(versions: &[&str]) -> Vec<String> {
+        versions
+            .iter()
+            .map(|v| v.to_string())
+            .collect()
     }
 
     #[test]
-    fn a_version_we_never_serve_is_refused_whatever_the_toggle_says() {
-        for accepted in [SUPPORTED_VERSIONS, VERSIONS_1_0_ONLY] {
-            assert_eq!(negotiate_version_in(Some("2.0"), accepted), Err("2.0".to_string()));
+    fn a_configured_list_maps_onto_a_fixed_set_in_supported_order() {
+        assert_eq!(accepted_set(&configured(&["0.3", "1.0"])), SUPPORTED_VERSIONS);
+        assert_eq!(accepted_set(&configured(&["1.0", "0.3"])), SUPPORTED_VERSIONS);
+        assert_eq!(accepted_set(&configured(&["1.0"])), VERSIONS_1_0_ONLY);
+        assert_eq!(accepted_set(&configured(&["0.3"])), VERSIONS_0_3_ONLY);
+    }
+
+    #[test]
+    fn an_unusable_list_falls_back_to_every_supported_version() {
+        assert_eq!(accepted_set(&[]), SUPPORTED_VERSIONS);
+        assert_eq!(accepted_set(&configured(&["2.0"])), SUPPORTED_VERSIONS);
+        assert_eq!(accepted_set(&configured(&["2.0", "1.0"])), VERSIONS_1_0_ONLY);
+    }
+
+    /// A 1.0-only surface still reads an absent header as v0.3, as A2A requires,
+    /// and then refuses it: that is what the specification prescribes for a
+    /// version an interface does not support.
+    #[test]
+    fn a_1_0_only_surface_refuses_v0_3_including_an_absent_header() {
+        assert_eq!(negotiate_version(Some("1.0"), VERSIONS_1_0_ONLY), Ok(VERSION_1_0));
+        assert_eq!(negotiate_version(Some("1.0.1"), VERSIONS_1_0_ONLY), Ok(VERSION_1_0));
+
+        assert_eq!(negotiate_version(Some("0.3"), VERSIONS_1_0_ONLY), Err("0.3".to_string()));
+        assert_eq!(negotiate_version(None, VERSIONS_1_0_ONLY), Err("0.3".to_string()));
+        assert_eq!(negotiate_version(Some(""), VERSIONS_1_0_ONLY), Err("0.3".to_string()));
+    }
+
+    #[test]
+    fn a_0_3_only_surface_refuses_v1_0_and_serves_an_absent_header() {
+        assert_eq!(negotiate_version(None, VERSIONS_0_3_ONLY), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(Some("0.3"), VERSIONS_0_3_ONLY), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(Some("1.0"), VERSIONS_0_3_ONLY), Err("1.0".to_string()));
+    }
+
+    #[test]
+    fn a_version_the_gateway_never_serves_is_refused_whatever_the_surface_accepts() {
+        for accepted in [SUPPORTED_VERSIONS, VERSIONS_1_0_ONLY, VERSIONS_0_3_ONLY] {
+            assert_eq!(negotiate_version(Some("2.0"), accepted), Err("2.0".to_string()));
         }
     }
 
     #[test]
-    fn with_compatibility_on_both_eras_are_accepted() {
-        assert_eq!(negotiate_version_in(None, SUPPORTED_VERSIONS), Ok(VERSION_0_3));
-        assert_eq!(negotiate_version_in(Some("0.3"), SUPPORTED_VERSIONS), Ok(VERSION_0_3));
-        assert_eq!(negotiate_version_in(Some("1.0"), SUPPORTED_VERSIONS), Ok(VERSION_1_0));
+    fn a_surface_accepting_both_serves_both_eras() {
+        assert_eq!(negotiate_version(None, SUPPORTED_VERSIONS), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(Some("0.3"), SUPPORTED_VERSIONS), Ok(VERSION_0_3));
+        assert_eq!(negotiate_version(Some("1.0"), SUPPORTED_VERSIONS), Ok(VERSION_1_0));
     }
 }
 
 /// The protocol version a card the gateway **generates** names as preferred:
 /// `supportedInterfaces[0]` and the top-level `protocolVersion`.
 ///
-/// The accepted set is operator-controlled at runtime, so the configured
-/// [`advertised_version`] can fall outside it. Never advertise a version the
-/// gateway would refuse: fall back to the first version actually on offer.
-pub fn effective_advertised_version() -> &'static str {
-    let accepted = accepted_versions();
+/// `accepted` is the accepted set of the surface the card describes, so the
+/// configured [`advertised_version`] can fall outside it. Never advertise a
+/// version the surface would refuse: fall back to the first version on offer.
+pub fn effective_advertised_version(accepted: &[&'static str]) -> &'static str {
     if accepted.contains(&advertised_version()) {
         advertised_version()
     } else {
@@ -574,17 +623,18 @@ pub fn effective_advertised_version() -> &'static str {
 /// **generates** (the synthesized A2A-proxy card and the onboarding card).
 ///
 /// A2A 1.0 lets an agent expose the same transport at more than one protocol
-/// version, and order encodes client preference. So when the gateway accepts
-/// both eras, it advertises both: [`effective_advertised_version`] first as the preferred
-/// one, then every other version in [`accepted_versions`]. Without the second
-/// entry a caller has no way to discover that v0.3 is still served, and would
-/// reasonably conclude from the card that it is not.
+/// version, and order encodes client preference. So when the surface accepts
+/// both eras, the card advertises both: [`effective_advertised_version`] first
+/// as the preferred one, then every other version in `accepted`. Without the
+/// second entry a caller has no way to discover that v0.3 is still served, and
+/// would reasonably conclude from the card that it is not.
 ///
-/// With legacy compatibility off, only the advertised version is
-/// listed, which is then also the only one accepted.
-pub fn generated_supported_interfaces(url: &str) -> Vec<serde_json::Value> {
-    let accepted = accepted_versions();
-    let preferred = effective_advertised_version();
+/// A surface accepting one version lists only that one.
+pub fn generated_supported_interfaces(
+    url: &str,
+    accepted: &[&'static str],
+) -> Vec<serde_json::Value> {
+    let preferred = effective_advertised_version(accepted);
     let interface = |version: &str| {
         serde_json::json!({
             "url": url,
@@ -607,77 +657,62 @@ pub fn generated_supported_interfaces(url: &str) -> Vec<serde_json::Value> {
 mod generated_interface_tests {
     use super::*;
 
-    #[test]
-    fn advertises_every_accepted_version_preferred_first() {
-        let interfaces = generated_supported_interfaces("https://gw.example/a2a");
-
-        assert_eq!(
-            interfaces[0]["protocolVersion"],
-            effective_advertised_version(),
-            "the advertised version must come first, since order encodes preference"
-        );
-
-        let listed: Vec<&str> = interfaces
+    fn listed_versions(interfaces: &[serde_json::Value]) -> Vec<&str> {
+        interfaces
             .iter()
             .map(|i| {
                 i["protocolVersion"]
                     .as_str()
                     .unwrap()
             })
-            .collect();
-        let accepted: Vec<&str> = accepted_versions().to_vec();
+            .collect()
+    }
+
+    #[test]
+    fn advertises_every_accepted_version_preferred_first() {
+        let interfaces = generated_supported_interfaces("https://gw.example/a2a", SUPPORTED_VERSIONS);
+
         assert_eq!(
-            listed.len(),
-            accepted.len(),
-            "every accepted version should be discoverable from the card, got {listed:?}"
+            listed_versions(&interfaces),
+            vec![VERSION_1_0, VERSION_0_3],
+            "the advertised version comes first, since order encodes preference, and every accepted version is listed"
         );
-        for version in accepted {
-            assert!(listed.contains(&version), "{version} is accepted but not advertised");
-        }
+    }
+
+    #[test]
+    fn a_single_version_surface_advertises_only_that_version() {
+        assert_eq!(
+            listed_versions(&generated_supported_interfaces("https://gw.example/a2a", VERSIONS_1_0_ONLY)),
+            vec![VERSION_1_0]
+        );
+        assert_eq!(
+            listed_versions(&generated_supported_interfaces("https://gw.example/a2a", VERSIONS_0_3_ONLY)),
+            vec![VERSION_0_3],
+            "a card never names a version its surface refuses"
+        );
     }
 
     #[test]
     fn effective_version_is_the_advertised_one_by_default() {
-        assert_eq!(effective_advertised_version(), advertised_version());
-        assert_eq!(effective_advertised_version(), VERSION_1_0);
+        assert_eq!(effective_advertised_version(SUPPORTED_VERSIONS), advertised_version());
+        assert_eq!(effective_advertised_version(SUPPORTED_VERSIONS), VERSION_1_0);
+        assert_eq!(effective_advertised_version(VERSIONS_0_3_ONLY), VERSION_0_3);
     }
 
     #[test]
-    fn effective_version_keeps_a_configured_version_that_is_accepted() {
+    fn effective_version_keeps_a_configured_version_the_surface_accepts_and_falls_back_otherwise() {
         if !run_isolated_from_other_tests() {
             return;
         }
         init_advertised_version("0.3");
-        assert!(legacy_v0_3_enabled());
 
-        assert_eq!(effective_advertised_version(), VERSION_0_3);
-    }
-
-    #[test]
-    fn effective_version_falls_back_when_the_configured_version_is_refused() {
-        if !run_isolated_from_other_tests() {
-            return;
-        }
-        use crate::storage::settings_store::{DashboardSettings, SettingsStore, set_global_settings_store};
-
-        init_advertised_version("0.3");
-        let store = SettingsStore::new("unused-settings-dir");
-        store
-            .update(DashboardSettings {
-                feature_flags: [(FLAG_A2A_LEGACY_COMPATIBILITY.to_string(), false)].into(),
-                ..DashboardSettings::default()
-            })
-            .expect("default settings are valid");
-        set_global_settings_store(std::sync::Arc::new(store));
-        assert_eq!(advertised_version(), VERSION_0_3);
-        assert!(!legacy_v0_3_enabled(), "the flag must be off for this test to mean anything");
-
-        assert_eq!(effective_advertised_version(), VERSION_1_0);
+        assert_eq!(effective_advertised_version(SUPPORTED_VERSIONS), VERSION_0_3);
+        assert_eq!(effective_advertised_version(VERSIONS_1_0_ONLY), VERSION_1_0);
     }
 
     #[test]
     fn every_interface_points_at_the_same_endpoint_and_binding() {
-        let interfaces = generated_supported_interfaces("https://gw.example/a2a");
+        let interfaces = generated_supported_interfaces("https://gw.example/a2a", SUPPORTED_VERSIONS);
         for interface in &interfaces {
             assert_eq!(interface["url"], "https://gw.example/a2a");
             assert_eq!(interface["protocolBinding"], PROTOCOL_BINDING_JSONRPC);
@@ -686,15 +721,15 @@ mod generated_interface_tests {
 }
 
 /// The v0.3 fields to merge into a card the gateway **generates**, or `None`
-/// when legacy compatibility is off.
+/// when the surface's accepted set does not include v0.3.
 ///
 /// A v0.3 client does not understand `supportedInterfaces[]` or
 /// `provider.organization`, so without these it can read the card but not act on
 /// it. Emitting them is what makes "we accept v0.3" true at the discovery step as
 /// well as the request step.
 ///
-/// Gating matters in both directions. With compatibility **off** the gateway
-/// serves v1.0 only, and publishing `url` + `preferredTransport` would invite a
+/// Gating matters in both directions. A surface without v0.3 serves v1.0 only,
+/// and publishing `url` + `preferredTransport` would invite a
 /// v0.3 client to connect to an endpoint that then refuses it with
 /// `VersionNotSupportedError`. The card must describe what the gateway will
 /// actually serve.
@@ -708,12 +743,18 @@ pub fn legacy_v0_3_card_fields(
     url: &str,
     provider: &serde_json::Value,
     extended_agent_card: bool,
+    accepted: &[&'static str],
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    if !legacy_v0_3_enabled() {
+    if !accepted.contains(&VERSION_0_3) {
         return None;
     }
 
     let mut fields = serde_json::Map::new();
+    // v1.0 moved the version onto each `supportedInterfaces[]` entry.
+    fields.insert(
+        "protocolVersion".to_string(),
+        serde_json::Value::String(effective_advertised_version(accepted).to_string()),
+    );
     // v1.0 collapsed these into `supportedInterfaces[]`.
     fields.insert("url".to_string(), serde_json::Value::String(url.to_string()));
     fields.insert("preferredTransport".to_string(), serde_json::Value::String(PROTOCOL_BINDING_JSONRPC.to_string()));
@@ -734,10 +775,11 @@ mod legacy_card_field_tests {
     }
 
     #[test]
-    fn emits_the_fields_a_v0_3_reader_needs_while_compatibility_is_on() {
-        let fields = legacy_v0_3_card_fields("https://gw.example/a2a", &provider(), false)
-            .expect("compatibility is on by default");
+    fn emits_the_fields_a_v0_3_reader_needs_when_the_surface_accepts_v0_3() {
+        let fields = legacy_v0_3_card_fields("https://gw.example/a2a", &provider(), false, SUPPORTED_VERSIONS)
+            .expect("the surface accepts v0.3");
 
+        assert_eq!(fields["protocolVersion"], effective_advertised_version(SUPPORTED_VERSIONS));
         assert_eq!(fields["url"], "https://gw.example/a2a");
         assert_eq!(fields["preferredTransport"], PROTOCOL_BINDING_JSONRPC);
         assert_eq!(fields["agentProvider"], provider());
@@ -747,14 +789,19 @@ mod legacy_card_field_tests {
     /// The legacy flag must track the 1.0 capability, not a hardcoded value.
     #[test]
     fn the_extended_card_flag_mirrors_the_1_0_capability() {
-        let fields = legacy_v0_3_card_fields("https://gw.example/a2a", &provider(), true).unwrap();
+        let fields = legacy_v0_3_card_fields("https://gw.example/a2a", &provider(), true, SUPPORTED_VERSIONS).unwrap();
         assert_eq!(fields["supportsAuthenticatedExtendedCard"], true);
+    }
+
+    #[test]
+    fn a_surface_without_v0_3_gets_no_legacy_fields() {
+        assert!(legacy_v0_3_card_fields("https://gw.example/a2a", &provider(), false, VERSIONS_1_0_ONLY).is_none());
     }
 
     /// Removed in 1.0 with no successor and no information to convey.
     #[test]
     fn does_not_resurrect_state_transition_history() {
-        let fields = legacy_v0_3_card_fields("https://gw.example/a2a", &provider(), false).unwrap();
+        let fields = legacy_v0_3_card_fields("https://gw.example/a2a", &provider(), false, SUPPORTED_VERSIONS).unwrap();
         assert!(!fields.contains_key("stateTransitionHistory"));
     }
 }

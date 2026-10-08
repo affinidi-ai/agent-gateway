@@ -77,8 +77,8 @@ A request later refused by delegated payment, the egress guard or the request-bo
 | `method_era` | The era of the JSON-RPC method name: `0.3` (slash-form), `1.0` (PascalCase), `unknown` (not an A2A method), or `none` (no method) |
 
 The two version labels can differ, because either method era is accepted whatever version was
-negotiated; a `negotiated_version="0.3"` series shows callers that would be refused with legacy
-compatibility off. After it is switched off, refused callers appear as `negotiated_version="rejected"`,
+negotiated; a `negotiated_version="0.3"` series shows callers that would be refused if the surface
+stopped accepting `0.3`. Callers a surface refuses appear as `negotiated_version="rejected"`,
 with `method_era` showing which method names they send. Requests later refused by JSON-RPC or
 request-shape validation are counted under their negotiated version. `fabric://` traffic is never counted (see
 [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap)).

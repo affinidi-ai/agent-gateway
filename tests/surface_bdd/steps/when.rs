@@ -673,13 +673,46 @@ fn build_a2a_message_send_body_with_parts(parts: Vec<serde_json::Value>) -> serd
     })
 }
 
+/// Send an A2A request to an A2A-proxy surface. Such a surface serves A2A 1.0
+/// only, so the request negotiates 1.0 unless the scenario sets `A2A-Version`
+/// itself.
 async fn send_a2a_proxy_request_and_record(
+    world: &mut SurfaceWorld,
+    body: serde_json::Value,
+    mut headers: Vec<(String, String)>,
+) {
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("A2A-Version"))
+    {
+        headers.push(("A2A-Version".to_string(), "1.0".to_string()));
+    }
+    send_a2a_proxy_request_without_version_and_record(world, body, headers).await;
+}
+
+async fn send_a2a_proxy_request_without_version_and_record(
     world: &mut SurfaceWorld,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
 ) {
     let path = format!("{}/rpc", world.surface_config.route);
     send_json_request_to_path_and_record(world, &path, body, headers).await;
+}
+
+#[when(expr = "the caller sends an A2A message\\/send request to surface {string} without an A2A-Version header")]
+async fn caller_sends_a2a_message_send_without_version(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+) {
+    assert!(
+        world
+            .actors
+            .surface(&surface_name)
+            .is_some(),
+        "unknown surface '{surface_name}'"
+    );
+    let body = build_a2a_message_send_body_with_parts(vec![serde_json::json!({ "kind": "text", "text": "hello" })]);
+    send_a2a_proxy_request_without_version_and_record(world, body, Vec::new()).await;
 }
 
 #[when(expr = "the caller fetches the agent card for surface {string}")]
@@ -1283,6 +1316,17 @@ async fn valid_surface_create_request_submitted(
     route: String,
 ) {
     create_valid_surface_for_route(world, &route).await;
+}
+
+#[when(expr = "the operator attempts to create an A2A surface for route {string} that accepts no A2A versions")]
+async fn surface_without_a2a_versions_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["access_point"]["a2a"] = serde_json::json!({ "accepted_versions": [] });
+    create_surface(world, payload).await;
 }
 
 #[when(expr = "the operator attempts to create a surface for route {string} with invalid configuration")]

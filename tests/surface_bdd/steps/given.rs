@@ -3635,3 +3635,27 @@ async fn caller_has_open_modern_mcp_stream(
     }
     panic!("the upstream never received the tool call");
 }
+
+fn surface_a2a_settings(world: &mut SurfaceWorld) -> &mut serde_json::Value {
+    world
+        .surface_config
+        .a2a_settings
+        .get_or_insert_with(|| serde_json::json!({ "accepted_versions": ["0.3", "1.0"], "validate_messages": false }))
+}
+
+#[given(expr = "the surface accepts A2A versions {string}")]
+fn surface_accepts_a2a_versions(
+    world: &mut SurfaceWorld,
+    versions: String,
+) {
+    let versions: Vec<&str> = versions
+        .split(',')
+        .map(str::trim)
+        .collect();
+    surface_a2a_settings(world)["accepted_versions"] = serde_json::json!(versions);
+}
+
+#[given("the surface validates A2A messages")]
+fn surface_validates_a2a_messages(world: &mut SurfaceWorld) {
+    surface_a2a_settings(world)["validate_messages"] = serde_json::json!(true);
+}

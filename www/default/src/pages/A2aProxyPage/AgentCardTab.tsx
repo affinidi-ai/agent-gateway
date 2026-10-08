@@ -8,11 +8,9 @@ import type { A2aProxyFormData } from './types';
 interface AgentCardTabProps {
   formData: A2aProxyFormData;
   onChange: (patch: Partial<A2aProxyFormData>) => void;
-  /** Whether A2A legacy compatibility is on; see `isA2aLegacyCompatibilityOn`. */
-  legacyCompatibility: boolean;
 }
 
-const AgentCardTab: React.FC<AgentCardTabProps> = ({ formData, onChange, legacyCompatibility }) => {
+const AgentCardTab: React.FC<AgentCardTabProps> = ({ formData, onChange }) => {
   const isCopilotDirectLine = formData.backend.kind === 'copilot_direct_line';
 
   return (
@@ -27,9 +25,8 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ formData, onChange, legacyC
           profile describing what an agent can do. This proxy generates one automatically.
         </p>
         <p data-testid="a2a-proxy-agent-card-version">
-          {legacyCompatibility
-            ? 'The generated card uses A2A version 1.0. A2A legacy compatibility is on, so it also carries the version 0.3 fields and clients built on either version can read it.'
-            : 'The generated card uses A2A version 1.0 only. A2A legacy compatibility is off (Settings, System, Feature Flags), so version 0.3 clients are refused.'}
+          The generated card uses A2A version 1.0 only, and the proxy answers in A2A 1.0: an Agent
+          Surface that targets this proxy accepts A2A 1.0 callers only.
         </p>
         <p className="mb-0">
           Leave the fields below blank to reuse the name and description of the Agent Surface that

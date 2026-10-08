@@ -395,6 +395,7 @@ async fn a2a_proxy_text_message_send_reaches_direct_line_and_returns_a2a_text_re
 
     let response = client
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .header("x-from-caller", "do-not-forward")
         .json(&request)
@@ -409,11 +410,19 @@ async fn a2a_proxy_text_message_send_reaches_direct_line_and_returns_a2a_text_re
         .expect("A2A proxy response JSON");
     assert_eq!(body["jsonrpc"], "2.0");
     assert_eq!(body["id"], 7);
-    assert_eq!(body["result"]["kind"], "message");
-    assert_eq!(body["result"]["role"], "agent");
-    assert_eq!(body["result"]["contextId"], "ctx-001");
-    assert_eq!(body["result"]["parts"][0]["kind"], "text");
-    assert_eq!(body["result"]["parts"][0]["text"], "Hello from Copilot");
+    // The A2A 1.0 `SendMessageResponse`: the reply is the `message` member,
+    // `ROLE_AGENT`, with text parts and no 0.3 `kind`.
+    let message = &body["result"]["message"];
+    assert_eq!(message["role"], "ROLE_AGENT");
+    assert_eq!(message["contextId"], "ctx-001");
+    assert_eq!(message["parts"], serde_json::json!([{ "text": "Hello from Copilot" }]));
+    assert!(
+        body["result"]
+            .get("kind")
+            .is_none()
+            && message.get("kind").is_none(),
+        "got {body}"
+    );
 
     let requests = fake_direct_line.requests();
     assert_eq!(requests.len(), 3, "create conversation, post activity, poll activities");
@@ -451,6 +460,7 @@ async fn a2a_proxy_generate_token_mode_exchanges_direct_line_secret_for_token() 
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()
@@ -462,7 +472,7 @@ async fn a2a_proxy_generate_token_mode_exchanges_direct_line_secret_for_token() 
         .json()
         .await
         .expect("A2A proxy response JSON");
-    assert_eq!(body["result"]["parts"][0]["text"], "Hello with token");
+    assert_eq!(body["result"]["message"]["parts"][0]["text"], "Hello with token");
 
     let requests = fake_direct_line.requests();
     let token_request = requests
@@ -528,7 +538,15 @@ async fn a2a_proxy_target_synthesizes_public_agent_card_without_calling_direct_l
     let expected_url = h
         .gateway_base
         .replace("127.0.0.1", "localhost");
-    assert_eq!(card["url"], format!("{expected_url}/smoke/rpc"));
+    assert_eq!(
+        card["supportedInterfaces"],
+        serde_json::json!([{ "url": format!("{expected_url}/smoke/rpc"), "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }]),
+        "an A2A-proxy card is a 1.0-only card"
+    );
+    for legacy in ["protocolVersion", "url", "preferredTransport", "agentProvider", "supportsAuthenticatedExtendedCard"]
+    {
+        assert!(card.get(legacy).is_none(), "`{legacy}` is a v0.3 card field, got {card}");
+    }
     assert_eq!(card["capabilities"]["streaming"], false);
     assert_eq!(card["defaultInputModes"][0], "text/plain");
     assert_eq!(card["skills"][0]["id"], "message-send-text");
@@ -580,6 +598,7 @@ async fn a2a_proxy_target_trust_check_uses_synthesized_agent_card_before_dispatc
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()
@@ -611,6 +630,7 @@ async fn a2a_proxy_multiple_text_parts_are_joined_deterministically() {
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()
@@ -640,6 +660,7 @@ async fn a2a_proxy_missing_record_returns_target_unavailable_before_backend_call
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()
@@ -670,6 +691,7 @@ async fn a2a_proxy_disabled_record_returns_target_unavailable_before_backend_cal
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()
@@ -700,6 +722,7 @@ async fn a2a_proxy_direct_line_without_bot_reply_returns_target_timeout() {
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()
@@ -735,6 +758,7 @@ async fn a2a_proxy_non_text_parts_are_rejected_before_backend_call() {
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()
@@ -768,6 +792,7 @@ async fn a2a_proxy_unsupported_methods_are_rejected_before_backend_call() {
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()
@@ -789,8 +814,46 @@ async fn a2a_proxy_unsupported_methods_are_rejected_before_backend_call() {
     );
 }
 
-/// Request-shape validation applies to **managed agents only**, never to an
-/// A2A-proxy target.
+/// An A2A-proxy surface serves A2A 1.0 only. A caller that sends no
+/// `A2A-Version` negotiates 0.3, as A2A requires, and is refused before the
+/// backend is contacted, with 1.0 named as the supported version.
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_proxy_refuses_a_caller_that_does_not_negotiate_1_0() {
+    let fake_direct_line = FakeDirectLine::start("should not be called").await;
+    let h = start_a2a_proxy_harness(&fake_direct_line).await;
+
+    for version in [None, Some("0.3")] {
+        let mut request = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .json(&a2a_text_request(vec![json!({ "kind": "text", "text": "hello" })]));
+        if let Some(version) = version {
+            request = request.header("A2A-Version", version);
+        }
+        let response = request
+            .send()
+            .await
+            .expect("send request through gateway");
+
+        assert_eq!(response.status(), 400, "{version:?}");
+        let body: Value = response
+            .json()
+            .await
+            .expect("JSON error");
+        assert_eq!(body["error"]["code"], -32009, "{version:?}: {body}");
+        assert_eq!(body["error"]["data"]["requested"], "0.3");
+        assert_eq!(body["error"]["data"]["supported"], json!(["1.0"]));
+    }
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0,
+        "a refused request must not reach Direct Line"
+    );
+}
+
+/// An A2A-proxy surface never validates messages, whatever its stored settings.
 ///
 /// A managed agent validates its own payloads, so checking at the gateway fails
 /// a bad request sooner and names the field. An A2A proxy is different: it is
@@ -816,6 +879,7 @@ async fn a2a_proxy_accepts_a_message_a_managed_agent_would_refuse() {
 
     let response = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("A2A-Version", "1.0")
         .header("content-type", "application/json")
         .json(&request)
         .send()

@@ -364,6 +364,72 @@ describe('useVariantSnapshots', () => {
       expect((v2Wire.overrides?.access_point as any)?.route).toBeUndefined();
     });
 
+    it('shares the A2A settings across variants and keeps them on the base payload', () => {
+      const { result } = renderHook(() => useVariantSnapshots());
+      act(() => {
+        result.current.hydrateFromPayload(urlPayload);
+      });
+      const a2a = { accepted_versions: ['1.0'], validate_messages: true };
+      const editedV1 = {
+        access_point: { ...urlPayload.access_point, a2a },
+        target: { endpoint: 'https://base/x', auth: { kind: 'none' } },
+      };
+      let v2Payload: any;
+      act(() => {
+        v2Payload = result.current.switchVariant('v2', editedV1);
+      });
+      expect(v2Payload.access_point.a2a).toEqual(a2a);
+      expect(v2Payload.access_point.rate_limit).toEqual({ rpm: 99 });
+
+      const wire = result.current.buildVariantsWireSlice(v2Payload);
+      expect(wire.basePayload.access_point.a2a).toEqual(a2a);
+      const v2Wire = wire.variants.find(v => v.id === 'v2')!;
+      expect((v2Wire.overrides?.access_point as any)?.a2a).toBeUndefined();
+    });
+
+    it('syncs the A2A settings inside every variant canvas blob', () => {
+      const { result } = renderHook(() => useVariantSnapshots());
+      const apCanvasConfig = (versions: string[], validate: boolean) => ({
+        listen_address: '0.0.0.0:8443',
+        route: '/agents/a',
+        protocol: 'a2a',
+        a2a_accepted_versions: versions,
+        a2a_validate_messages: validate,
+      });
+      const canvasBlob = (versions: string[], validate: boolean) => ({
+        version: 1,
+        nodes: [
+          { id: 'access-point', type: 'access-point', config: apCanvasConfig(versions, validate) },
+        ],
+      });
+      act(() => {
+        result.current.hydrateFromPayload({
+          access_point: { listen_address: '0.0.0.0:8443', route: '/agents/a', protocol: 'a2a' },
+          canvas: canvasBlob(['0.3', '1.0'], false),
+          variants: [
+            {
+              id: 'v2',
+              alias: 'fast',
+              name: 'Fast',
+              overrides: { complete: true, canvas: canvasBlob(['0.3', '1.0'], false) },
+            },
+          ],
+          default_variant_id: 'v2',
+        });
+      });
+      act(() => {
+        result.current.switchVariant(BASE_VARIANT_ID, {
+          access_point: { listen_address: '0.0.0.0:8443', route: '/agents/a', protocol: 'a2a' },
+          canvas: canvasBlob(['1.0'], true),
+        });
+      });
+      const baseAp = result.current
+        .getSnapshot(BASE_VARIANT_ID)
+        .canvas.nodes.find((n: any) => n.id === 'access-point');
+      expect(baseAp.config.a2a_accepted_versions).toEqual(['1.0']);
+      expect(baseAp.config.a2a_validate_messages).toBe(true);
+    });
+
     it('syncs the access-point config inside every variant canvas blob (incl. route_prefix/suffix)', () => {
       const { result } = renderHook(() => useVariantSnapshots());
       // Base + one variant, each carrying its own canvas blob with an
