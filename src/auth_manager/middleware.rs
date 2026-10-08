@@ -608,7 +608,7 @@ fn feature_guard_middleware(
 
 /// An access token restricted to explicit scopes allows only those scopes;
 /// a session or an unrestricted token defers to the caller's role.
-fn pat_scope_allows(
+pub(crate) fn pat_scope_allows(
     pat: Option<&crate::auth_manager::pat::PatContext>,
     feature: &crate::rbac::Feature,
 ) -> bool {

@@ -594,3 +594,239 @@ async fn token_info_rejects_a_revoked_pat() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+async fn new_user_storage(
+    role: crate::auth::types::UserRole
+) -> (Arc<crate::auth::storage::PasskeyStorage>, String, tempfile::TempDir) {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let users_dir = directory.path().join("users");
+    let avatars_dir = directory
+        .path()
+        .join("avatars");
+    std::fs::create_dir_all(&users_dir).expect("users dir");
+    std::fs::create_dir_all(&avatars_dir).expect("avatars dir");
+    std::fs::write(avatars_dir.join("default.png"), b"").expect("avatar");
+
+    let user_id = uuid::Uuid::new_v4().to_string();
+    let user = crate::auth::storage::UserData {
+        user_id: user_id.clone(),
+        username: "pat-owner".to_string(),
+        passkeys: vec![],
+        role,
+        status: crate::auth::types::UserStatus::Approved,
+        is_primary: false,
+        first_name: None,
+        last_name: None,
+        email: None,
+        department: None,
+        job_title: None,
+        avatar_path: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_logged_in: None,
+        saml_id: None,
+    };
+    std::fs::write(users_dir.join(format!("{user_id}.json")), serde_json::to_string(&user).expect("user json"))
+        .expect("write user");
+    let storage = crate::auth::storage::PasskeyStorage::new(
+        users_dir
+            .to_string_lossy()
+            .into_owned(),
+        avatars_dir
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .await
+    .expect("user storage");
+    (Arc::new(storage), user_id, directory)
+}
+
+async fn create_owned_token(
+    store: &FsAccessTokenStore,
+    user_id: &str,
+    scopes: &[&str],
+) -> String {
+    let (id, secret) = generate_token();
+    store
+        .create(AccessToken {
+            id,
+            name: "scoped token".to_string(),
+            description: String::new(),
+            token_hash: hash_secret(&secret),
+            user_id: user_id.to_string(),
+            scopes: scopes
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            resource_pattern: None,
+            required_headers: Vec::new(),
+            created_by: user_id.to_string(),
+            parent_token_id: None,
+            delegation_depth: 0,
+            created_at: Utc::now(),
+            last_used_at: None,
+            expires_at: None,
+            revoked_at: None,
+        })
+        .await
+        .expect("create token");
+    secret
+}
+
+#[tokio::test]
+async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
+    let (users, user_id, _users_dir) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
+    let sessions = Arc::new(SessionManager::new());
+    let store = new_store().await;
+    let secret = create_owned_token(&store, &user_id, &["secrets.view", "issuers.view"]).await;
+
+    let auth =
+        AuthGuardState::new(sessions.clone(), Some(users.clone()), Arc::new(crate::terms::TermsManager::disabled()))
+            .with_pat_authenticator(Some(store));
+    let app = Router::new()
+        .route("/v1/permissions", get(crate::auth_manager::permissions::get_permissions))
+        .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+        .layer(middleware::from_fn_with_state(auth, require_session_auth))
+        .layer(Extension(sessions))
+        .layer(Extension(users))
+        .layer(Extension(Arc::new(crate::rbac::RbacConfig::default())));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/permissions")
+                .header("Authorization", format!("Bearer {secret}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .expect("cache-control"),
+        "no-store"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("vary")
+            .expect("vary"),
+        "Authorization, Cookie"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let permissions: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let granted: Vec<&str> = permissions
+        .as_object()
+        .expect("object")
+        .iter()
+        .filter(|(_, value)| value.as_bool() == Some(true))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let mut expected = vec!["departments.view", "issuers.view", "secrets.view"];
+    let mut granted = granted;
+    granted.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(granted, expected);
+}
+
+struct JwtStrategiesApp {
+    app: Router,
+    store: Arc<FsAccessTokenStore>,
+    sessions: Arc<SessionManager>,
+    user_id: String,
+    // Held so the temp directories are removed when the test ends.
+    _users_dir: tempfile::TempDir,
+    _strategies_dir: tempfile::TempDir,
+}
+
+async fn jwt_strategies_app() -> JwtStrategiesApp {
+    let (users, user_id, users_dir) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
+    let sessions = Arc::new(SessionManager::new());
+    let store = new_store().await;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let strategies = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(directory.path().to_path_buf())
+        .await
+        .expect("strategy store");
+
+    let auth =
+        AuthGuardState::new(sessions.clone(), Some(users.clone()), Arc::new(crate::terms::TermsManager::disabled()))
+            .with_pat_authenticator(Some(store.clone()));
+    let app = crate::jwt_bearer::router::create_jwt_verification_strategies_router(Arc::new(strategies))
+        .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+        .layer(middleware::from_fn_with_state(auth, require_session_auth))
+        .layer(Extension(sessions.clone()))
+        .layer(Extension(users))
+        .layer(Extension(Arc::new(crate::rbac::RbacConfig::default())));
+    JwtStrategiesApp {
+        app,
+        store,
+        sessions,
+        user_id,
+        _users_dir: users_dir,
+        _strategies_dir: directory,
+    }
+}
+
+#[tokio::test]
+async fn jwt_strategy_list_refuses_a_pat_without_the_view_scope() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["secrets.view"]).await;
+
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/jwt-verification-strategies", Some(&secret), None).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_list_accepts_a_pat_with_the_view_scope() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
+
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/jwt-verification-strategies", Some(&secret), None).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_delete_refuses_a_pat_without_the_delete_scope() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
+
+    assert_eq!(
+        request(&fixture.app, "DELETE", "/v1/jwt-verification-strategies/missing", Some(&secret), None).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_delete_lets_a_pat_with_the_delete_scope_reach_the_handler() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.delete"]).await;
+
+    assert_eq!(
+        request(&fixture.app, "DELETE", "/v1/jwt-verification-strategies/missing", Some(&secret), None).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_list_accepts_a_session_login_on_role_alone() {
+    let fixture = jwt_strategies_app().await;
+    let session = fixture
+        .sessions
+        .create_session("pat-owner".to_string(), fixture.user_id.clone())
+        .await;
+
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/jwt-verification-strategies", Some(&session), None).await,
+        StatusCode::OK
+    );
+}

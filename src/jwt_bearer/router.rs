@@ -1,6 +1,7 @@
 //! JWT verification strategy router
 //!
-//! Registers the five CRUD endpoints under `/api/v1/jwt-verification-strategies`.
+//! Registers the five CRUD endpoints and the JWKS URI probe under
+//! `/v1/jwt-verification-strategies`.
 
 use axum::{
     Router,
