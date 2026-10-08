@@ -1,0 +1,12 @@
+branch: fix-user-integration
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-08T12:20:00.000Z'
+      title: Set rotation fields on the scoped PAT component test token
+      description: The scoped-token helper in the access-token component tests built an AccessToken without the rotation fields added with token rotation, so the test binary did not compile.
