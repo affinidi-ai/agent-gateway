@@ -5,7 +5,9 @@
 //! test assertions.
 
 pub(crate) mod audit_events;
+pub(crate) mod formatted_logs;
 pub mod jwt;
+pub(crate) mod thread_subscriber;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;

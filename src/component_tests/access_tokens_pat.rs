@@ -17,7 +17,11 @@ use crate::auth_manager::middleware::{AuthGuardState, RbacGuard, require_session
 use crate::auth_manager::pat::PatResourceScope;
 use crate::auth_manager::resource_scope::RequiredHeader;
 use crate::component_tests::helpers::audit_events::AuditEvents;
+use crate::component_tests::helpers::formatted_logs::FormattedLogs;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource};
+
+const OUTSIDE_LINEAGE_REASON: &str = "an access token may manage only itself or its descendants";
+const RESOURCE_SCOPED_REASON: &str = "a resource-scoped access token cannot delegate or modify access tokens";
 
 async fn gateway_get(
     context: Option<Extension<PatTenantContext>>,
@@ -329,7 +333,13 @@ async fn rotation_app() -> RotationApp {
 }
 
 async fn rotation_app_with_rbac(rbac: crate::rbac::RbacConfig) -> RotationApp {
-    let store = new_store().await;
+    rotation_app_with_store(rbac, new_store().await).await
+}
+
+async fn rotation_app_with_store(
+    rbac: crate::rbac::RbacConfig,
+    store: Arc<FsAccessTokenStore>,
+) -> RotationApp {
     let user_directory = tempfile::tempdir().expect("tempdir");
     let users = Arc::new(
         PasskeyStorage::new(
@@ -383,28 +393,73 @@ async fn rotate(
     id: &str,
     bearer: Option<&str>,
 ) -> (StatusCode, serde_json::Value) {
+    let (status, _, body) = rotate_with_headers(app, id, bearer, None).await;
+    (status, body)
+}
+
+async fn rotate_with_headers(
+    app: &Router,
+    id: &str,
+    bearer: Option<&str>,
+    account: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
     let mut builder = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/access-tokens/{id}/rotate"));
     if let Some(bearer) = bearer {
         builder = builder.header("Authorization", format!("Bearer {bearer}"));
     }
+    if let Some(account) = account {
+        builder = builder.header("x-external-account", account);
+    }
+    send(
+        app,
+        builder
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await
+}
+
+async fn manage(
+    app: &Router,
+    method: &str,
+    id: &str,
+    bearer: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(format!("/api/v1/access-tokens/{id}"))
+        .header("Authorization", format!("Bearer {bearer}"));
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())),
+        None => builder.body(Body::empty()),
+    }
+    .expect("request");
+    let (status, _, body) = send(app, request).await;
+    (status, body)
+}
+
+async fn send(
+    app: &Router,
+    request: Request<Body>,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
     let response = app
         .clone()
-        .oneshot(
-            builder
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(request)
         .await
         .expect("response");
     let status = response.status();
+    let headers = response.headers().clone();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
     let json = serde_json::from_slice(&body)
         .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&body).into_owned()));
-    (status, json)
+    (status, headers, json)
 }
 
 #[tokio::test]
@@ -412,9 +467,10 @@ async fn rotation_through_the_api_swaps_the_pat_secret_in_place() {
     let fixture = rotation_app().await;
     let (id, old_secret) = create_token(&fixture.store, None, Vec::new()).await;
 
-    let (status, body) = rotate(&fixture.app, &id, Some(&old_secret)).await;
+    let (status, headers, body) = rotate_with_headers(&fixture.app, &id, Some(&old_secret), None).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers[axum::http::header::CACHE_CONTROL], "no-store");
     assert_eq!(body["id"], id);
     assert_eq!(body["name"], "component token");
     let new_secret = body["token"]
@@ -567,11 +623,16 @@ async fn a_non_administrator_granted_access_tokens_edit_rotates_their_own_token(
         .insert("access_tokens.edit".to_string(), "poweruser".to_string());
     let fixture = rotation_app_with_rbac(rbac).await;
     let (own_token_id, _) = create_token_owned_by(&fixture.store, "power-1", None, Vec::new()).await;
+    let audit = AuditEvents::capture();
 
     let (status, body) = rotate(&fixture.app, &own_token_id, Some(&fixture.power_user_session)).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rotated_by"], "power-1");
+    let rotated = audit.named("access_token.rotated");
+    assert_eq!(rotated.len(), 1);
+    assert_eq!(rotated[0].level, tracing::Level::INFO);
+    assert_eq!(rotated[0]["rotated_for_other_user"], "false");
 }
 
 #[tokio::test]
@@ -586,6 +647,7 @@ async fn an_administrator_rotates_another_users_token() {
     assert_eq!(body["rotated_by"], "admin-1");
     let rotated = audit.named("access_token.rotated");
     assert_eq!(rotated.len(), 1);
+    assert_eq!(rotated[0].level, tracing::Level::WARN);
     assert_eq!(rotated[0]["owner_user_id"], "user-1");
     assert_eq!(rotated[0]["rotated_for_other_user"], "true");
     assert_eq!(
@@ -595,7 +657,7 @@ async fn an_administrator_rotates_another_users_token() {
 }
 
 #[tokio::test]
-async fn rotating_a_revoked_token_is_a_conflict() {
+async fn rotating_a_revoked_token_is_a_conflict_and_emits_rotate_denied() {
     let fixture = rotation_app().await;
     let (id, _) = create_token(&fixture.store, None, Vec::new()).await;
     fixture
@@ -603,12 +665,285 @@ async fn rotating_a_revoked_token_is_a_conflict() {
         .revoke(&id)
         .await
         .expect("revoke");
+    let audit = AuditEvents::capture();
 
     assert_eq!(
         rotate(&fixture.app, &id, Some(&fixture.admin_session))
             .await
             .0,
         StatusCode::CONFLICT
+    );
+
+    let denied = audit.named("access_token.rotate_denied");
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0].level, tracing::Level::WARN);
+    assert_eq!(denied[0]["token_id"], id);
+    assert_eq!(denied[0]["status"], "409");
+    assert_eq!(denied[0]["reason"], "cannot rotate a revoked token");
+}
+
+#[tokio::test]
+async fn a_rotation_that_cannot_be_saved_is_a_server_error_and_emits_rotate_denied() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let store_dir = directory
+        .path()
+        .join("access-tokens");
+    let store = Arc::new(
+        FsAccessTokenStore::new(&store_dir)
+            .await
+            .expect("token store"),
+    );
+    let fixture = rotation_app_with_store(crate::rbac::RbacConfig::default(), store).await;
+    let (id, old_secret) = create_token(&fixture.store, None, Vec::new()).await;
+    // A file in place of the store directory fails the write even for a privileged user.
+    std::fs::remove_dir_all(&store_dir).expect("remove store directory");
+    std::fs::write(&store_dir, b"").expect("replace store directory with a file");
+    let audit = AuditEvents::capture();
+
+    let (status, body) = rotate(&fixture.app, &id, Some(&fixture.admin_session)).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body, "failed to rotate access token");
+    let denied = audit.named("access_token.rotate_denied");
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0].level, tracing::Level::WARN);
+    assert_eq!(denied[0]["token_id"], id);
+    assert_eq!(denied[0]["status"], "500");
+    assert!(
+        audit
+            .named("access_token.rotated")
+            .is_empty()
+    );
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/gateways/gateway-global", Some(&old_secret), None).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn rotation_keeps_expiry_resource_pattern_and_required_headers() {
+    let fixture = rotation_app().await;
+    let (id, secret) = generate_token();
+    let expires_at = Utc::now() + chrono::Duration::days(30);
+    let resource_pattern = "TENANT:${x-external-account}:gateways:gateway-a";
+    fixture
+        .store
+        .create(AccessToken {
+            id: id.clone(),
+            name: "scoped rotation token".to_string(),
+            description: String::new(),
+            token_hash: hash_secret(&secret),
+            user_id: "user-1".to_string(),
+            scopes: Vec::new(),
+            resource_pattern: Some(resource_pattern.to_string()),
+            required_headers: tenant_selector_header(),
+            created_by: "user-1".to_string(),
+            parent_token_id: None,
+            delegation_depth: 0,
+            created_at: Utc::now(),
+            last_used_at: None,
+            expires_at: Some(expires_at),
+            revoked_at: None,
+            rotation_generation: 0,
+            rotated_at: None,
+            rotated_by: None,
+        })
+        .await
+        .expect("create token");
+
+    let (status, body) = rotate(&fixture.app, &id, Some(&fixture.admin_session)).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["resource_pattern"], resource_pattern);
+    assert_eq!(body["required_headers"], serde_json::to_value(tenant_selector_header()).expect("headers"));
+    let stored = fixture
+        .store
+        .get(&id)
+        .expect("rotated token");
+    assert_eq!(stored.expires_at, Some(expires_at));
+    assert_eq!(
+        stored
+            .resource_pattern
+            .as_deref(),
+        Some(resource_pattern)
+    );
+    assert_eq!(stored.required_headers, tenant_selector_header());
+    assert_eq!(stored.rotation_generation, 1);
+    let new_secret = body["token"]
+        .as_str()
+        .expect("new secret");
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/gateways/gateway-a", Some(new_secret), Some("tenant-a")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/gateways/gateway-b", Some(new_secret), Some("tenant-a")).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_resource_pattern_pat_is_refused_before_the_rotate_handler() {
+    let fixture = rotation_app().await;
+    let (id, secret) = create_token_with_scopes(
+        &fixture.store,
+        Some("TENANT:${x-external-account}:gateways:gateway-a"),
+        tenant_selector_header(),
+        vec!["access_tokens.edit".to_string()],
+    )
+    .await;
+    let audit = AuditEvents::capture();
+
+    let (status, _, body) = rotate_with_headers(&fixture.app, &id, Some(&secret), Some("tenant-a")).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        audit
+            .named("access_token.rotate_denied")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_header_scoped_pat_reaches_the_rotate_handler_and_is_refused() {
+    let fixture = rotation_app().await;
+    let (id, secret) = create_token_with_scopes(
+        &fixture.store,
+        None,
+        tenant_selector_header(),
+        vec!["access_tokens.edit".to_string()],
+    )
+    .await;
+    let audit = AuditEvents::capture();
+
+    let (status, _, body) = rotate_with_headers(&fixture.app, &id, Some(&secret), Some("tenant-a")).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, RESOURCE_SCOPED_REASON);
+    let denied = audit.named("access_token.rotate_denied");
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0]["token_id"], id);
+    assert_eq!(denied[0]["caller_auth_method"], "access_token");
+    assert_eq!(denied[0]["caller_token_id"], id);
+    assert_eq!(denied[0]["status"], "403");
+    assert_eq!(denied[0]["reason"], RESOURCE_SCOPED_REASON);
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/gateways/gateway-global", Some(&secret), Some("tenant-a")).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_pat_rotating_an_unknown_token_id_is_forbidden_not_not_found() {
+    let fixture = rotation_app().await;
+    let (root_id, _) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
+    let (_, child_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], Some(&root_id)).await;
+    let audit = AuditEvents::capture();
+
+    let (status, body) = rotate(&fixture.app, "agat_missing", Some(&child_secret)).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let denied = audit.named("access_token.rotate_denied");
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0]["token_id"], "agat_missing");
+    assert_eq!(denied[0]["status"], "403");
+    assert_eq!(denied[0]["reason"], OUTSIDE_LINEAGE_REASON);
+}
+
+#[tokio::test]
+async fn a_pat_updating_an_unknown_token_id_is_forbidden_not_not_found() {
+    let fixture = rotation_app().await;
+    let (root_id, _) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
+    let (_, child_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], Some(&root_id)).await;
+
+    let (status, body) = manage(
+        &fixture.app,
+        "PUT",
+        "agat_missing",
+        &child_secret,
+        Some(serde_json::json!({ "name": "renamed", "scopes": ["access_tokens.edit"] })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, OUTSIDE_LINEAGE_REASON);
+}
+
+#[tokio::test]
+async fn a_pat_revoking_an_unknown_token_id_is_forbidden_not_not_found() {
+    let fixture = rotation_app().await;
+    let (root_id, _) = create_managed_token(&fixture.store, &["access_tokens.delete"], None).await;
+    let (_, child_secret) = create_managed_token(&fixture.store, &["access_tokens.delete"], Some(&root_id)).await;
+
+    let (status, body) = manage(&fixture.app, "DELETE", "agat_missing", &child_secret, None).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, OUTSIDE_LINEAGE_REASON);
+}
+
+#[tokio::test]
+async fn a_newline_in_the_rotated_token_id_stays_on_one_plain_log_line() {
+    let fixture = rotation_app().await;
+    let logs = FormattedLogs::capture();
+
+    let (status, body) = rotate(&fixture.app, "a%0Aevent=forged", Some(&fixture.admin_session)).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let text = logs.text();
+    let denied: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("access_token.rotate_denied"))
+        .collect();
+    assert_eq!(denied.len(), 1, "{text}");
+    assert!(denied[0].contains(r#"token_id="a\nevent=forged""#), "{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.starts_with("event=forged")),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_child_pat_cannot_rotate_its_parent_or_a_sibling() {
+    let fixture = rotation_app().await;
+    let (root_id, root_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], None).await;
+    let (_, first_child_secret) = create_managed_token(&fixture.store, &["access_tokens.edit"], Some(&root_id)).await;
+    let (second_child_id, second_child_secret) =
+        create_managed_token(&fixture.store, &["access_tokens.edit"], Some(&root_id)).await;
+    let audit = AuditEvents::capture();
+
+    assert_eq!(
+        rotate(&fixture.app, &root_id, Some(&first_child_secret))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        rotate(&fixture.app, &second_child_id, Some(&first_child_secret))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+
+    let denied = audit.named("access_token.rotate_denied");
+    assert_eq!(denied.len(), 2);
+    for target_id in [&root_id, &second_child_id] {
+        let event = denied
+            .iter()
+            .find(|event| event.get("token_id") == Some(target_id.as_str()))
+            .expect("rotate_denied for the target");
+        assert_eq!(event["status"], "403");
+        assert_eq!(event["reason"], OUTSIDE_LINEAGE_REASON);
+    }
+
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/gateways/gateway-global", Some(&root_secret), None).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&fixture.app, "GET", "/v1/gateways/gateway-global", Some(&second_child_secret), None).await,
+        StatusCode::OK
     );
 }
 
@@ -1051,6 +1386,9 @@ async fn create_owned_token(
             last_used_at: None,
             expires_at: None,
             revoked_at: None,
+            rotation_generation: 0,
+            rotated_at: None,
+            rotated_by: None,
         })
         .await
         .expect("create token");

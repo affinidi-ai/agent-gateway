@@ -32,23 +32,32 @@ Rotating returns a working secret that authenticates as the token's owner. Any c
 owned by another user also requires the `Administrator` role, even when `rbac.json` grants
 `access_tokens.edit` to a lower role, and the new secret acts as that owner; otherwise the
 request is refused with `403`. A PAT caller can rotate only itself and its descendants, never
-with a resource-scoped PAT. Rotation is appliance-wide and is not limited by tenant.
-Responses that carry a secret are sent with `Cache-Control: no-store`.
+with a resource-scoped PAT. On rotate, update, and revoke, a PAT caller gets `403` for any
+token id it does not control, including an id that does not exist, so it cannot probe which ids
+exist; `404` for an unknown id is returned only to session callers.
+`GET /api/v1/access-tokens/{id}` returns `404` to a PAT caller in both cases. The access-token
+routes are not a resource-scoped path family, so a PAT with a `resource_pattern` is refused
+with `403` by the authentication middleware before the rotate handler runs; only a PAT scoped
+by `required_headers` alone reaches the handler's refusal. Rotation is appliance-wide and is
+not limited by tenant. Responses that carry a secret are sent with `Cache-Control: no-store`.
 
 Each rotation is emitted as a structured log event on the `audit` tracing target
 (`access_token.rotated`, with the token id, owner, caller, auth method, and
 `rotated_for_other_user`, logged at `warn` when the caller is not the owner). A rotation
 refused by the handler is emitted as `access_token.rotate_denied` with the token id, caller,
 auth method, status, and reason, but not the owner: a request with no authenticated caller
-(`401`), a non-administrator rotating another user's token, a PAT caller rotating outside
-its lineage or with a resource-scoped PAT (`403`), an unknown token id (`404`), and a
-revoked, expired, inactive-lineage, or concurrently rotated token (`409`). A rotation that
-fails because the caller cannot be loaded or the token cannot be saved is also emitted as
+(`401`), a non-administrator rotating another user's token, a PAT caller rotating a token
+id outside its lineage (including an unknown id) or using a PAT scoped by `required_headers`
+alone (`403`), a session caller naming an unknown token id (`404`), and a revoked, expired,
+inactive-lineage, or concurrently rotated token (`409`). A rotation that fails because the
+caller cannot be loaded or the token cannot be saved is also emitted as
 `access_token.rotate_denied` with status `500`; the error detail is logged only on the default
-target. Requests refused
-by the authentication or `access_tokens.edit` route checks before the handler runs emit no
-rotation event. These events are not stored in the delegation audit store or forwarded to
-Governance Audit integrations, so operators should ship the `audit` target off the appliance
+target. Requests refused before the handler runs emit no rotation event: the
+`access_tokens.edit` route check and any refusal by the authentication middleware, for example
+a missing or invalid credential, the `403` it returns to a PAT with a `resource_pattern`, a
+required header that does not match, or Terms the token owner has not accepted. These events
+are not stored in the delegation audit store or forwarded to Governance Audit integrations, so
+operators should ship the `audit` target off the appliance
 (see [`OBSERVABILITY.md`](OBSERVABILITY.md#access-token-rotation-events)). `rotated_by`,
 `rotated_at`, and `rotation_generation` are returned to anyone with `access_tokens.view`.
 
