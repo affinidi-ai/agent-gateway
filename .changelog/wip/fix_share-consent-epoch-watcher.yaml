@@ -1,0 +1,18 @@
+branch: fix/share-consent-epoch-watcher
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Read each vault's consent epoch once per second for all its subscriptions
+      description: >-
+        MCP subscriptions on the same delegation vault now share one consent-epoch watcher
+        instead of each re-reading the epoch every second, so vault reads (and kms:Decrypt
+        calls with the aws_kms backend) no longer grow with the number of open subscriptions.
+        A changed, corrupt or unreadable epoch still ends every subscription on that vault
+        within the recheck interval, and the watcher stops when the last subscription on the
+        vault closes.
+  removed: []
+  security: []
+  breaking: []
+  internal: []
