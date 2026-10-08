@@ -631,14 +631,21 @@ credential evaluation and recheck it once per second, including while upstream
 is quiet. One reference-counted watcher per vault instance reads the epoch for
 every subscription on that vault, so vault reads (and `kms:Decrypt` calls with
 the `aws_kms` backend) stay flat as subscriptions grow; it stops when the last
-subscription on the vault closes. The read has a one-second timeout, and a
-changed epoch, unavailable or corrupt state closes every stream on the vault. An initial failure returns a correlated
-HTTP `503` before dispatch; vault adapters that cannot provide a revision fail
-closed. Local-filesystem tests revoke in a separate process with the local watch
-signal disconnected and verify quiet-stream closure, read stability and corrupt
-state handling. This does not establish remote-filesystem visibility. Other
-credential kinds, cross-process configuration notifications, external token
-revocation and full resource-policy revalidation are not verified.
+subscription on the vault closes. The read has a one-second timeout. A changed
+epoch closes every stream started under an earlier epoch. The appliance shares
+one vault across surfaces and tenants, so a single failed read, such as one
+throttled or slow `kms:Decrypt`, closes every subscription on the appliance;
+each counts in `agent_gateway_mcp_subscription_epoch_unavailable_total`. A
+subscription whose epoch differs from the watcher's last reading reads the
+epoch once more before joining, so a stream started under a newer epoch, or
+after the vault recovers, is not closed by an older reading. An initial or
+joining failure returns a correlated HTTP `503` before dispatch; vault adapters
+that cannot provide a revision fail closed. Local-filesystem tests revoke in a
+separate process with the local watch signal disconnected and verify
+quiet-stream closure, read stability and corrupt state handling. This does not
+establish remote-filesystem visibility. Other credential kinds, cross-process
+configuration notifications, external token revocation and full resource-policy
+revalidation are not verified.
 
 An isolated signed Access Point handler fixture verifies missing, wrong-audience,
 insufficient-scope and expired Resource Server tokens stop before the subscription
@@ -1758,7 +1765,7 @@ Modern admission validates optional request log levels and string/number progres
 
 Modern MCP discovery and subscriptions run for admitted modern requests on Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Access changes end only the subscriptions on the changed surface or tenant, and appliance-wide changes (gateway and global policy, API keys, vault revocation, appliance-global resources) end all; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
 
-JWT strategy mutations/reload, provider mutations and explicit vault revocation also invalidate local subscription lifetimes; vault invalidation remains inside the owned mutation task so cancellation cannot release it early. Reads do not invalidate access. Access Points, Transit Points and independent Fabric receivers capture the configured vault's durable revocation epoch before credential evaluation and recheck it every second through one shared watcher per vault, with a one-second read timeout even on quiet streams. Changed, corrupt or unavailable state closes the stream; initial read failure returns correlated `503`. Separate-process local-filesystem tests cover revocation without a local signal. Remote-filesystem visibility, other credential kinds, cross-process configuration changes and full resource-policy conformance remain required.
+JWT strategy mutations/reload, provider mutations and explicit vault revocation also invalidate local subscription lifetimes; vault invalidation remains inside the owned mutation task so cancellation cannot release it early. Reads do not invalidate access. Access Points, Transit Points and independent Fabric receivers capture the configured vault's durable revocation epoch before credential evaluation and recheck it every second through one shared watcher per vault, with a one-second read timeout even on quiet streams. A changed epoch closes streams started under an earlier one; corrupt or unavailable state closes every subscription on the vault; initial read failure returns correlated `503`. Separate-process local-filesystem tests cover revocation without a local signal. Remote-filesystem visibility, other credential kinds, cross-process configuration changes and full resource-policy conformance remain required.
 
 When a Transit Point requires a Transit token, admitted modern requests revalidate it after MCP admission: one header, configured validator, matching surface ID and permitted Transit Point, nonempty token ID, and strict issue/expiry times. Missing authority, duplicates, cross-surface tokens and expiry fail before identity or Target work. The subscription lifetime is capped to that token's expiry; reconnect must pass current checks. Legacy Transit-token validation is unchanged.
 
