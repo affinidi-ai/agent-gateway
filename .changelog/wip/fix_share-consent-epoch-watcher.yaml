@@ -1,0 +1,35 @@
+branch: fix/share-consent-epoch-watcher
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Close every MCP subscription on the vault when one consent epoch read fails
+      description: >-
+        One unreadable, timed-out or corrupt consent-epoch read now ends every MCP subscription
+        on the appliance's delegation vault within the recheck interval, where before it ended
+        only the stream that made the read. The vault is shared across surfaces and tenants, so
+        a single throttled or slow kms:Decrypt closes all subscriptions; each such read is
+        counted in agent_gateway_mcp_subscription_epoch_unavailable_total so correlated mass
+        closes are visible.
+  fixed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Read each vault's consent epoch once per second for all its subscriptions
+      description: >-
+        MCP subscriptions on the same delegation vault now share one consent-epoch watcher
+        instead of each re-reading the epoch every second, so vault reads (and kms:Decrypt
+        calls with the aws_kms backend) no longer grow with the number of open subscriptions.
+        A changed epoch ends the subscriptions started under an earlier one. A subscription
+        whose epoch differs from the watcher's last reading reads the epoch once more before
+        joining, so one started under a newer epoch, or after the vault recovers, is not
+        closed by a stale reading. The watcher stops when the last subscription on the vault
+        closes.
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Test consent epoch watcher joins on paused time with exact closure errors
+      description: >-
+        The shared-watcher tests run on tokio's paused clock (test-util dev feature) with
+        exact read counts, assert which error closes each stream, and cover joining with a
+        newer epoch, joining during and after an outage, and joining with a stale epoch.

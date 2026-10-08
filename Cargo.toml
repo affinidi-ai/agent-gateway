@@ -281,7 +281,7 @@ rustls-pki-types = "1"
 tempfile = "3.24.0"
 ts-rs = "11.0"
 cucumber = { version = "0.23", features = ["macros"] }
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["full", "test-util"] }
 rcgen = "0.14"
 time = "0.3"
 rsa = { version = "0.9", features = ["pem", "getrandom"] }

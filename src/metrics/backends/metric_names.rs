@@ -62,6 +62,9 @@ pub mod prom {
     // Governance audit records forwarded to audit integrations.
     pub const AUDIT_FORWARD_TOTAL: &str = "agent_gateway_audit_forward_total";
 
+    // Consent epoch reads that failed, each closing every MCP subscription on the vault.
+    pub const MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE_TOTAL: &str = "agent_gateway_mcp_subscription_epoch_unavailable_total";
+
     pub const AFFINIDI_TERMS_REFRESH_TOTAL: &str = "agent_gateway_affinidi_terms_refresh_total";
     pub const AFFINIDI_TERMS_REFRESH_DURATION_SECONDS: &str = "agent_gateway_affinidi_terms_refresh_duration_seconds";
     pub const AFFINIDI_TERMS_CACHE_AGE_SECONDS: &str = "agent_gateway_affinidi_terms_cache_age_seconds";
