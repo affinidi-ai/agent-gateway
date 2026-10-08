@@ -16,6 +16,7 @@ use crate::bdd_support::json_rpc::{
     modern_mcp_request_headers,
 };
 use crate::bdd_support::mcp_consent::build_consent_capable_tool_call_body;
+use crate::bdd_support::mediator::Mediator as _;
 use crate::world::{ConcurrentResponse, ConformanceRun, G2gWorld};
 
 const CONCURRENT_MCP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -361,6 +362,63 @@ pub async fn gateway_pings_gateway(
     world
         .ping_results
         .insert((from_gw, to_gw), success);
+}
+
+async fn accept_pending_oob(
+    world: &mut G2gWorld,
+    gateway: usize,
+    acceptor_mediator_id: Option<&str>,
+) {
+    let oob_url = world
+        .pending_oob_url
+        .clone()
+        .expect("no pending OOB invitation published for this scenario");
+    let did_method = world
+        .harness()
+        .mediator()
+        .did_method()
+        .to_string();
+    let admin = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .clone();
+    let response = admin
+        .connect_via_oob_recorded(
+            &oob_url,
+            "g2g-bdd-negative-secret",
+            "negative-path acceptor view",
+            "negative-path acceptor view",
+            &did_method,
+            acceptor_mediator_id,
+        )
+        .await
+        .expect("connect-via-oob request should complete at the transport layer");
+    world.response_status = Some(response.status);
+    world.response_body = Some(response.body);
+}
+
+#[when(regex = r#"^gateway (\d+) accepts the invitation using mediator "([^"]+)"$"#)]
+pub async fn gateway_accepts_invitation_using_mediator(
+    world: &mut G2gWorld,
+    gateway: usize,
+    mediator_name: String,
+) {
+    let mediator_id = world
+        .named_mediators
+        .get(&mediator_name)
+        .unwrap_or_else(|| panic!("mediator '{mediator_name}' not declared"))
+        .clone();
+    accept_pending_oob(world, gateway, Some(mediator_id.as_str())).await;
+}
+
+#[when(regex = r"^gateway (\d+) accepts the invitation using an unknown mediator id$")]
+pub async fn gateway_accepts_invitation_using_unknown_mediator(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let unknown_id = uuid::Uuid::new_v4().to_string();
+    accept_pending_oob(world, gateway, Some(unknown_id.as_str())).await;
 }
 
 #[when(regex = r#"^the caller asks gateway (\d+) surface "([^"]+)" for available MCP tools with a valid API key$"#)]

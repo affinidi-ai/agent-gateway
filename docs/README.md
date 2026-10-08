@@ -31,23 +31,24 @@ adds procedures for deploying and operating an appliance, operator guides, and F
 
 ## Implementation References
 
-| Document                                           | Revision-specific scope                                                                                                     |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| [Policy planes and egress](POLICY.md)              | OPA packages, versioned policy definitions, appliance-wide enforcement, and SSRF/egress controls                            |
-| [Fabric internals](FABRIC.md)                      | DIDComm listener lifecycle, legacy wire names, and receive pipeline                                                         |
-| [Protocol behavior](PROTOCOLS.md)                  | Active revisions, validation boundaries, compatibility, and limitations                                                     |
-| [MCP tool gating](MCP_TOOL_GATING.md)              | MCP metadata contract, request-boundary invariant, and the tool-gating firewall                                             |
-| [Source auth and managed identity](SOURCE_AUTH.md) | Inbound authentication methods, agent-DID derivation, and the Trust Recorder                                                |
-| [Credential delegation](CREDENTIAL_DELEGATION.md)  | Credential providers, surface bindings, consent modes, the OAuth flow, and the delegation vault                             |
-| [Terms and consent](TERMS_AND_CONSENT.md)          | Terms documents and versions, who must accept what, acceptance records, and consent-pending sessions                        |
-| [Integrations](INTEGRATIONS.md)                    | Email, Slack, webhook, and stream publishers, the event catalogue, trigger configuration, and template variables            |
-| [MCP metadata and 2026-07-28](MCP_METADATA.md)     | Metadata aliases, modern MCP admission, `mcp_http`, and the conformance harness                                             |
-| [Observability internals](OBSERVABILITY.md)        | Dashboard event contracts, buffering, request correlation, governance audit forwarding, and the A2A protocol-version metric |
-| [Management RBAC](RBAC.md)                         | Middleware enforcement and permissions response contract                                                                    |
-| [Management access tokens](ACCESS_TOKENS.md)       | PAT contract, resource-pattern grammar, delegation, and tenant ownership                                                    |
-| [Security Token Service](STS.md)                   | RFC 8693 token exchange, ID-JAG issuance/redemption, and issuance gates                                                     |
-| [Onboarding capture](AGENT_ONBOARDING_CAPTURE.md)  | Capture security boundary, lifetime, and emitted events                                                                     |
-| [Rust design patterns](DESIGN_PATTERNS.md)         | Internal concurrency, lifecycle, and storage patterns                                                                       |
+| Document                                                              | Revision-specific scope                                                                                                     |
+| --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| [Policy planes and egress](POLICY.md)                                 | OPA packages, versioned policy definitions, appliance-wide enforcement, and SSRF/egress controls                            |
+| [Fabric internals](FABRIC.md)                                         | DIDComm listener lifecycle, legacy wire names, and receive pipeline                                                         |
+| [Per-gateway mediator federation](PER_GATEWAY_MEDIATOR_FEDERATION.md) | Selecting the acceptor's own mediator on OOB connect, forward-wrapped sends, and cross-mediator relay setup                 |
+| [Protocol behavior](PROTOCOLS.md)                                     | Active revisions, validation boundaries, compatibility, and limitations                                                     |
+| [MCP tool gating](MCP_TOOL_GATING.md)                                 | MCP metadata contract, request-boundary invariant, and the tool-gating firewall                                             |
+| [Source auth and managed identity](SOURCE_AUTH.md)                    | Inbound authentication methods, agent-DID derivation, and the Trust Recorder                                                |
+| [Credential delegation](CREDENTIAL_DELEGATION.md)                     | Credential providers, surface bindings, consent modes, the OAuth flow, and the delegation vault                             |
+| [Terms and consent](TERMS_AND_CONSENT.md)                             | Terms documents and versions, who must accept what, acceptance records, and consent-pending sessions                        |
+| [Integrations](INTEGRATIONS.md)                                       | Email, Slack, webhook, and stream publishers, the event catalogue, trigger configuration, and template variables            |
+| [MCP metadata and 2026-07-28](MCP_METADATA.md)                        | Metadata aliases, modern MCP admission, `mcp_http`, and the conformance harness                                             |
+| [Observability internals](OBSERVABILITY.md)                           | Dashboard event contracts, buffering, request correlation, governance audit forwarding, and the A2A protocol-version metric |
+| [Management RBAC](RBAC.md)                                            | Middleware enforcement and permissions response contract                                                                    |
+| [Management access tokens](ACCESS_TOKENS.md)                          | PAT contract, resource-pattern grammar, delegation, and tenant ownership                                                    |
+| [Security Token Service](STS.md)                                      | RFC 8693 token exchange, ID-JAG issuance/redemption, and issuance gates                                                     |
+| [Onboarding capture](AGENT_ONBOARDING_CAPTURE.md)                     | Capture security boundary, lifetime, and emitted events                                                                     |
+| [Rust design patterns](DESIGN_PATTERNS.md)                            | Internal concurrency, lifecycle, and storage patterns                                                                       |
 
 ## Coverage
 

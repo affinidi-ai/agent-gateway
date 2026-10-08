@@ -1,12 +1,27 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { apiClient } from '../../api';
 import { AppButton } from '../shared/AppButton';
+import { useApp } from '../../context/AppContext';
+
+interface Mediator {
+  id: string;
+  name: string;
+  our_did?: string;
+  status: 'active' | 'disabled';
+}
 
 interface EnterDetailsStepProps {
-  onNext: (name: string, description: string, didMethod: string) => void;
+  onNext: (
+    name: string,
+    description: string,
+    didMethod: string,
+    acceptorMediatorId: string
+  ) => void;
   onCancel: () => void;
   initialName?: string;
   initialDescription?: string;
   initialDidMethod?: string;
+  initialAcceptorMediatorId?: string;
 }
 
 const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
@@ -15,11 +30,28 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
   initialName = '',
   initialDescription = '',
   initialDidMethod = 'web',
+  initialAcceptorMediatorId = '',
 }) => {
   const [name, setName] = useState(initialName);
   const [description, setDescription] = useState(initialDescription);
   const [didMethod, setDidMethod] = useState(initialDidMethod);
+  const [acceptorMediatorId, setAcceptorMediatorId] = useState(initialAcceptorMediatorId);
+  const [mediators, setMediators] = useState<Mediator[]>([]);
   const [error, setError] = useState('');
+  const { state } = useApp();
+  const mediatorFederationEnabled = state.settings?.feature_flags?.mediator_federation === true;
+
+  useEffect(() => {
+    if (!mediatorFederationEnabled) return;
+    apiClient
+      .get('/mediators')
+      .then(response => setMediators(response.data))
+      .catch(() => setMediators([]));
+  }, [mediatorFederationEnabled]);
+
+  // Only a mediator already registered on this gateway (our_did present) can
+  // be selected — the backend rejects an unregistered mediator with a 400.
+  const registeredMediators = mediators.filter(m => m.our_did && m.status === 'active');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,7 +61,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
       return;
     }
 
-    onNext(name.trim(), description.trim(), didMethod);
+    onNext(name.trim(), description.trim(), didMethod, acceptorMediatorId);
   };
 
   return (
@@ -106,6 +138,30 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
               The DID method used to generate the identity for this connection.
             </small>
           </div>
+
+          {mediatorFederationEnabled && (
+            <div className="mb-3">
+              <label htmlFor="acceptorMediatorId">Mediator for this connection (Optional)</label>
+              <select
+                className="form-select"
+                id="acceptorMediatorId"
+                value={acceptorMediatorId}
+                onChange={e => setAcceptorMediatorId(e.target.value)}
+              >
+                <option value="">Use the inviter's mediator (default)</option>
+                {registeredMediators.map(m => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
+              <small className="form-text text-muted">
+                By default the permanent connection is homed on the inviter's mediator. Select one
+                of your own registered mediators to keep this gateway's traffic on its own mediator
+                instead (cross-mediator federation).
+              </small>
+            </div>
+          )}
 
           <div className="d-flex justify-content-between">
             <AppButton

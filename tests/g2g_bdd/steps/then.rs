@@ -845,6 +845,22 @@ pub async fn response_status_is(
     );
 }
 
+#[then(expr = "the response says {string}")]
+pub async fn response_says(
+    world: &mut G2gWorld,
+    expected: String,
+) {
+    let body = world
+        .response_body
+        .as_ref()
+        .expect("a When must record the response body before this Then");
+    let text = match body {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    assert!(text.contains(&expected), "response body {text:?} does not contain {expected:?}");
+}
+
 #[then(regex = r"^all (\d+) responses have status (\d+)$")]
 pub async fn all_concurrent_responses_have_status(
     world: &mut G2gWorld,

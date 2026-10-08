@@ -191,10 +191,12 @@ pub async fn approve_gateway<
             .mediator_id
             .clone();
 
-        // Extract mediator URL from DID
-        use crate::gateways::connection_points::handlers::extract_mediator_url;
-        let gw_mediator_url = extract_mediator_url(&gw_mediator_did)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to extract mediator URL: {}", e)))?;
+        // Prefer the mediator's own DID document (its real, possibly-http service
+        // endpoint) over the DID-string-derived guess, which always assumes https
+        // and is wrong for locally-hosted/plaintext mediators.
+        use crate::gateways::connection_points::handlers::resolve_mediator_endpoint;
+        let gw_mediator_url = resolve_mediator_endpoint(&gw_mediator_did, mediator.did_document.as_ref())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resolve mediator URL: {}", e)))?;
 
         info!("  Using mediator from OOB connection point: {}", gw_mediator_did);
 

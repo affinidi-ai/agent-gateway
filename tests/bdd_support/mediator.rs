@@ -30,6 +30,21 @@ pub trait Mediator: std::fmt::Debug + Send + Sync {
     fn did_document(&self) -> Option<&Value>;
     fn did_method(&self) -> &str;
 
+    /// Docker container name of the mediator, if the mediator is running as
+    /// a Docker container. Returned by [`ScenarioDockerMediator`]; `None`
+    /// for other transports. Consumers use this to attach sibling containers
+    /// to the mediator's netns via `network_mode: container:<name>`.
+    fn container_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Docker-compose network name the mediator's compose project owns.
+    /// Default empty string for transports that don't run under
+    /// docker-compose.
+    fn docker_network(&self) -> &str {
+        ""
+    }
+
     /// Port the mediator listens on **inside** its netns — what sibling
     /// containers using `network_mode: container:<mediator>` see on
     /// `127.0.0.1`. Default `0` for transports that don't publish a
@@ -52,6 +67,7 @@ pub struct ScenarioDockerMediator {
     did_method: String,
     compose_dir: PathBuf,
     label: String,
+    network_name: String,
     port: u16,
     bridges: Vec<MediatorPortBridge>,
     _port_reservations: Vec<ReservedPort>,
@@ -90,7 +106,17 @@ impl ScenarioDockerMediator {
     }
 
     pub async fn start() -> Result<Self> {
-        Self::start_impl().await
+        Self::start_impl(false).await
+    }
+
+    /// Start the mediator on a dynamically-reserved free port, bypassing the
+    /// fixed-port fast path `mediator_port` otherwise takes when
+    /// `G2G_BDD_PARALLELISM` <= 1. Used to spin up a *second* independent
+    /// mediator in the same test process (per-gateway mediator federation)
+    /// so it never collides with a first mediator already bound to the
+    /// default/fixed port.
+    pub async fn start_with_free_port() -> Result<Self> {
+        Self::start_impl(true).await
     }
 
     /// Empties the mediator's store while the mediator keeps running, so every
@@ -103,9 +129,9 @@ impl ScenarioDockerMediator {
             .with_context(|| format!("flush the store of mediator {}", self.label))
     }
 
-    async fn start_impl() -> Result<Self> {
+    async fn start_impl(force_free_port: bool) -> Result<Self> {
         let parallelism = configured_parallelism().map_err(anyhow::Error::msg)?;
-        let mut port = mediator_port(parallelism)?;
+        let mut port = mediator_port(parallelism, force_free_port)?;
         let label =
             format!("g2g-bdd-mediator-{}-{}", std::process::id(), NEXT_MEDIATOR_ID.fetch_add(1, Ordering::Relaxed));
         let temp_dir = mediator_temp_dir(&label)?;
@@ -153,6 +179,7 @@ impl ScenarioDockerMediator {
             did_document,
             did_method,
             compose_dir: temp_dir.path().to_path_buf(),
+            network_name: format!("{label}_mediatornet"),
             label,
             port: port.number,
             bridges,
@@ -207,6 +234,16 @@ impl Mediator for ScenarioDockerMediator {
 
     fn did_method(&self) -> &str {
         &self.did_method
+    }
+
+    /// `scripts/g2g-mediator.sh` names the mediator container after the
+    /// compose project (`G2G_MEDIATOR_NAME`, set to this mediator's label).
+    fn container_name(&self) -> Option<&str> {
+        Some(&self.label)
+    }
+
+    fn docker_network(&self) -> &str {
+        &self.network_name
     }
 
     fn internal_port(&self) -> u16 {
@@ -317,6 +354,166 @@ impl Drop for MediatorPortBridge {
     }
 }
 
+/// Bridges cross-mediator relay traffic between two `ScenarioDockerMediator`
+/// instances that each own an isolated Docker bridge network.
+///
+/// Per-gateway mediator federation gives every mediator its own compose
+/// project and its own `<label>_mediatornet` bridge network, so a container
+/// on mediator A's network cannot resolve mediator B's advertised
+/// `http://localhost:<port>` service endpoint (that hostname/port only means
+/// something inside B's own netns). The endpoint string itself cannot change:
+/// it is baked into the peer mediator's DID document, and the mediator
+/// software rejects relay traffic whose destination does not literally match
+/// its own configured `local_endpoints` (self-authority matching).
+///
+/// The fix runs entirely at the network layer: a short-lived sidecar
+/// container joins mediator A's netns via `network_mode: container:<A>` and
+/// listens on `127.0.0.1:<B's port>` inside that shared netns, forwarding to
+/// B's bridge-network gateway IP — which routes to the same Docker
+/// daemon/host every mediator container publishes its port on. From inside
+/// A's own container, `localhost:<B's port>` now resolves through the
+/// sidecar to the real B. [`bridge_mediator_pairs`] wires one such sidecar
+/// per ordered pair so relay works symmetrically. Uses a plain `alpine`
+/// base with `socat` installed at start (rather than a third-party
+/// pre-built socat image) to keep the pipeline's image surface to the same
+/// well-known base already pulled by CI runners.
+pub struct MediatorCrossBridge {
+    sidecar_name: String,
+}
+
+impl MediatorCrossBridge {
+    async fn start(
+        attach_to_container: &str,
+        attach_to_network: &str,
+        peer_port: u16,
+        label: &str,
+    ) -> Result<Self> {
+        let gateway_ip = network_gateway_ip(attach_to_network).await?;
+        let sidecar_name = format!("{label}-xbridge-{peer_port}");
+
+        // Clean up a stale sidecar from a prior failed run before starting a
+        // fresh one under the same name.
+        let _ = TokioCommand::new("docker")
+            .args(["rm", "-f", &sidecar_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+
+        let socat_cmd = format!(
+            "apk add --no-cache socat >/dev/null 2>&1 && exec socat TCP-LISTEN:{peer_port},fork,reuseaddr TCP:{gateway_ip}:{peer_port}"
+        );
+        let output = TokioCommand::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                &sidecar_name,
+                "--network",
+                &format!("container:{attach_to_container}"),
+                "alpine:3",
+                "sh",
+                "-c",
+                &socat_cmd,
+            ])
+            .output()
+            .await
+            .with_context(|| format!("start mediator cross-bridge sidecar {sidecar_name}"))?;
+
+        if !output.status.success() {
+            bail!(
+                "docker run failed for mediator cross-bridge sidecar {sidecar_name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(Self { sidecar_name })
+    }
+}
+
+impl std::fmt::Debug for MediatorCrossBridge {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("MediatorCrossBridge")
+            .field("sidecar_name", &self.sidecar_name)
+            .finish()
+    }
+}
+
+impl Drop for MediatorCrossBridge {
+    fn drop(&mut self) {
+        let status = Command::new("docker")
+            .args(["stop", "-t", "1", &self.sidecar_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Err(error) = status {
+            eprintln!("[harness] failed to stop mediator cross-bridge sidecar {}: {error}", self.sidecar_name);
+        }
+    }
+}
+
+/// Resolves a Docker bridge network's gateway IP — the address any
+/// container on that network uses to reach the host's other published
+/// ports. Every mediator's isolated `mediatornet` routes through the same
+/// underlying Docker daemon, so this IP works uniformly on Docker Desktop
+/// and on Linux/dind (CI runners): no `host.docker.internal` DNS name is
+/// required (which additionally cannot be combined with
+/// `network_mode: container:*` at the Docker API level).
+async fn network_gateway_ip(network: &str) -> Result<String> {
+    let output = TokioCommand::new("docker")
+        .args(["network", "inspect", network, "--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}"])
+        .output()
+        .await
+        .with_context(|| format!("inspect docker network {network}"))?;
+
+    if !output.status.success() {
+        bail!("docker network inspect {network} failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let ip = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_string();
+    if ip.is_empty() {
+        bail!("docker network {network} has no gateway IP in its IPAM config");
+    }
+    Ok(ip)
+}
+
+/// Bridges every ordered pair of Docker-backed mediators so relay traffic
+/// from one mediator's own container reaches its peer's real published
+/// port instead of the sender's own loopback. A no-op for a single mediator
+/// (the historical, most common case) and for any mediator transport that
+/// does not run as a Docker container (`container_name()`/`docker_network()`
+/// unset). See [`MediatorCrossBridge`] for why this is needed.
+pub async fn bridge_mediator_pairs(mediators: &[&dyn Mediator]) -> Result<Vec<MediatorCrossBridge>> {
+    let mut bridges = Vec::new();
+    for (i, a) in mediators.iter().enumerate() {
+        let (Some(a_name), a_network) = (a.container_name(), a.docker_network()) else {
+            continue;
+        };
+        if a_network.is_empty() {
+            continue;
+        }
+        for (j, b) in mediators.iter().enumerate() {
+            if i == j || b.container_name().is_none() {
+                continue;
+            }
+            let peer_port = b.internal_port();
+            if peer_port == 0 {
+                continue;
+            }
+            let label = format!("{a_name}-{j}");
+            let bridge = MediatorCrossBridge::start(a_name, a_network, peer_port, &label).await?;
+            bridges.push(bridge);
+        }
+    }
+    Ok(bridges)
+}
+
 pub fn configured_parallelism() -> std::result::Result<usize, String> {
     match std::env::var(PARALLELISM_ENV) {
         Ok(value) => {
@@ -348,8 +545,11 @@ fn fixed_mediator_port_env() -> Option<(&'static str, String)> {
         })
 }
 
-fn mediator_port(parallelism: usize) -> Result<MediatorPort> {
-    if parallelism > 1 {
+fn mediator_port(
+    parallelism: usize,
+    force_free_port: bool,
+) -> Result<MediatorPort> {
+    if parallelism > 1 || force_free_port {
         let (port, reservation) = reserve_free_port("g2g mediator");
         return Ok(MediatorPort {
             number: port,

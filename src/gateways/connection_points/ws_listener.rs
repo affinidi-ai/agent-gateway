@@ -3162,6 +3162,94 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
         }
     }
 }
+/// The permanent secure DID may be homed on a different mediator than the
+/// temporary handshake DID (per-gateway mediator selection). Prefer the
+/// mediator recorded alongside the secure DID when the pending-connection
+/// cache must be recovered from the temporary connection point's metadata,
+/// falling back to the temp CP's own (inviter) mediator for connections
+/// created before this field existed.
+fn resolve_recovered_secure_mediator_did(
+    oob_message: &serde_json::Value,
+    fallback_mediator_id: &str,
+) -> String {
+    oob_message
+        .get("secure_mediator_did")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback_mediator_id.to_string())
+}
+
+/// Checks the mediator a cache-miss recovery would home the permanent
+/// connection point on. In shared-mediator mode it is the temporary connection
+/// point's own mediator, which the handshake already used, so it is accepted
+/// without a store lookup; the acceptor need not have it registered. A
+/// different mediator (one selected with `acceptor_mediator_id`) must be a
+/// known, Active record in the acceptor's store, and recovery fails closed when
+/// there is no store.
+async fn validate_recovered_mediator(
+    mediator_store: Option<&crate::mediators::FileSystemMediatorStore>,
+    recovered_did: &str,
+    temp_cp_mediator_did: &str,
+    connection_point_id: &str,
+) -> Result<(), String> {
+    if recovered_did == temp_cp_mediator_did {
+        return Ok(());
+    }
+    let mediator_store = mediator_store.ok_or_else(|| {
+        format!(
+            "Mediator store unavailable; cannot validate recovered secure_mediator_did '{}' for connection {}",
+            recovered_did, connection_point_id
+        )
+    })?;
+    let mediators = list_mediators(mediator_store)
+        .await
+        .map_err(|e| {
+            format!("Failed to validate recovered secure_mediator_did '{}' against MediatorStore: {}", recovered_did, e)
+        })?;
+    if !recovered_mediator_is_known_active(&mediators, recovered_did) {
+        return Err(format!(
+            "Recovered secure_mediator_did '{}' does not resolve to a known, Active mediator; refusing to finalize \
+             connection {}",
+            recovered_did, connection_point_id
+        ));
+    }
+    Ok(())
+}
+
+/// True when `recovered_did` matches a currently `Active` mediator in
+/// `mediators`. A mediator that is unknown, deleted, or disabled does not
+/// validate.
+fn recovered_mediator_is_known_active(
+    mediators: &[crate::mediators::types::Mediator],
+    recovered_did: &str,
+) -> bool {
+    mediators
+        .iter()
+        .any(|m| m.did == recovered_did && m.status == crate::mediators::types::MediatorStatus::Active)
+}
+
+/// Lists all mediators from the store; there is no indexed by-DID lookup.
+async fn list_mediators(
+    mediator_store: &crate::mediators::FileSystemMediatorStore
+) -> Result<Vec<crate::mediators::types::Mediator>, String> {
+    use crate::mediators::filesystem::MediatorStore;
+    mediator_store
+        .list_all()
+        .await
+        .map_err(|e| format!("Failed to list mediators: {}", e))
+}
+
+/// Finds a single mediator by DID via a full-store scan (see [`list_mediators`]).
+async fn find_mediator_by_did(
+    mediator_store: &crate::mediators::FileSystemMediatorStore,
+    did: &str,
+) -> Result<Option<crate::mediators::types::Mediator>, String> {
+    Ok(list_mediators(mediator_store)
+        .await?
+        .into_iter()
+        .find(|m| m.did == did))
+}
+
 /// Finalize OOB connection as ACCEPTOR after receiving connection-accepted
 async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::ConnectionPointStore>(
     inviter_temporary_did: &str,
@@ -3174,7 +3262,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     cp_store: &Arc<CS>,
     listener_manager: &Arc<ConnectionPointListenerManager>,
     current_connection_point: Option<&super::types::GatewayConnectionPoint>,
-    mediator_did: &str,
+    _mediator_did: &str,
     _mediator_url: &str,
 ) -> Result<crate::gateways::types::Gateway, String> {
     info!("🔧 Finalizing OOB connection as ACCEPTOR");
@@ -3309,6 +3397,21 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
+            let recovered_secure_mediator_did = resolve_recovered_secure_mediator_did(
+                &temp_connection_point.oob_message,
+                &temp_connection_point.mediator_id,
+            );
+
+            validate_recovered_mediator(
+                listener_manager
+                    .mediator_store
+                    .as_deref(),
+                &recovered_secure_mediator_did,
+                &temp_connection_point.mediator_id,
+                &temp_connection_point.id,
+            )
+            .await?;
+
             crate::gateways::PendingOOBConnection {
                 id: pending_gateway.id.clone(),
                 invitation_id: pending_gateway.id.clone(),
@@ -3319,9 +3422,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                 their_temporary_did: inviter_temporary_did.to_string(),
                 their_secure_did: None,
                 their_issuer_did: None,
-                mediator_did: temp_connection_point
-                    .mediator_id
-                    .clone(),
+                mediator_did: recovered_secure_mediator_did,
                 connection_point_id: String::new(),
                 role: crate::gateways::ConnectionRole::Acceptor,
                 state: crate::gateways::ConnectionState::WaitingForResponse,
@@ -3447,6 +3548,41 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     // IMPORTANT: Use the SAME DID that we sent in the connection-setup message!
     info!("🎧 Creating gateway listener endpoint...");
 
+    // Use the mediator recorded on the pending connection: our own permanent
+    // mediator when one was selected at accept time, otherwise the inviter's
+    // mediator (shared-mediator fallback). This is deliberately NOT the
+    // mediator_did/_mediator_url parameters above, which are the temporary
+    // handshake listener's mediator (always the inviter's).
+    let connection_mediator_did = pending_conn
+        .mediator_did
+        .clone();
+    info!("   Using mediator from connection: {}", connection_mediator_did);
+
+    // Prefer the mediator's own DID document (its real, possibly-http service
+    // endpoint) over the DID-string-derived guess, which always assumes https
+    // and is wrong for locally-hosted/plaintext mediators.
+    use super::handlers::resolve_mediator_endpoint;
+    let connection_mediator_doc = if let Some(mediator_store) = listener_manager
+        .mediator_store
+        .as_ref()
+    {
+        match find_mediator_by_did(mediator_store, &connection_mediator_did).await {
+            Ok(mediator) => mediator.and_then(|m| m.did_document),
+            Err(e) => {
+                warn!(
+                    mediator_did = %connection_mediator_did,
+                    error = %e,
+                    "Mediator store read failed; resolving the listener endpoint from the mediator DID instead"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let connection_mediator_url = resolve_mediator_endpoint(&connection_mediator_did, connection_mediator_doc.as_ref())
+        .map_err(|e| format!("Failed to resolve mediator URL: {}", e))?;
+
     // Extract the UUID from our_secure_did (format: did:web:domain:connection-points:{UUID})
     let cp_id = pending_conn
         .secure_cp_id
@@ -3475,7 +3611,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                     .storage_paths
                     .connection_points,
             ),
-            _mediator_url,
+            &connection_mediator_url,
             &super::types::ConnectionPointDidMethod::Peer,
             #[cfg(feature = "didwebvh")]
             None,
@@ -3496,7 +3632,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
 
     let mut connection_point = super::types::GatewayConnectionPoint::new(
         gateway.id.clone(),
-        mediator_did.to_string(),
+        connection_mediator_did.clone(),
         cp_did.clone(),
         format!("Listener for {}", gateway.name),
         "Gateway listener endpoint (acceptor side)".to_string(),
@@ -3520,23 +3656,9 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
 
     info!("   ✓ Gateway listener endpoint {} created", connection_point.id);
 
-    // Step 4.5: Authenticate secure DID with mediator
-    info!("🔐 Authenticating secure DID with mediator...");
-
-    // Use the mediator from the pending connection (set during OOB handshake)
-    // NOT the default mediator for this gateway!
-    let connection_mediator_did = pending_conn
-        .mediator_did
-        .clone();
-    info!("   Using mediator from connection: {}", connection_mediator_did);
-
-    // Extract mediator URL from the mediator DID
-    use super::handlers::extract_mediator_url;
-    let connection_mediator_url =
-        extract_mediator_url(&connection_mediator_did).map_err(|e| format!("Failed to extract mediator URL: {}", e))?;
-
-    // Start listener for this gateway using the connection's mediator
-    // We start the listener AFTER setting ACLs
+    // Step 4.5: Start listener for this gateway using the connection's mediator.
+    // Mediator-side ACLs (if any) are managed by the mediator itself and are
+    // not a precondition set by this gateway before starting the listener.
     info!("🎧 Starting gateway listener...");
 
     match listener_manager.request_start_listener(
@@ -4879,6 +5001,139 @@ mod tests {
         for queued in [MessageType::ForwardRequest, MessageType::GatewayIssuerRequest] {
             assert!(!dispatches_inline(&queued.to_string()), "{queued}");
         }
+    }
+
+    #[test]
+    fn recovered_secure_mediator_prefers_recorded_field() {
+        let oob_message = serde_json::json!({
+            "secure_did": "did:web:acceptor.example.com:connection-points:abc",
+            "secure_mediator_did": "did:web:m2.example.com:.well-known",
+        });
+        assert_eq!(
+            super::resolve_recovered_secure_mediator_did(&oob_message, "did:web:m1.example.com:.well-known"),
+            "did:web:m2.example.com:.well-known"
+        );
+    }
+
+    #[test]
+    fn recovered_secure_mediator_falls_back_when_field_absent() {
+        // Connections created before per-gateway mediator selection existed have
+        // no "secure_mediator_did" in their temp CP metadata; the recovery path
+        // must fall back to the temp CP's own (inviter) mediator, not error out.
+        let oob_message = serde_json::json!({
+            "secure_did": "did:web:acceptor.example.com:connection-points:abc",
+        });
+        assert_eq!(
+            super::resolve_recovered_secure_mediator_did(&oob_message, "did:web:m1.example.com:.well-known"),
+            "did:web:m1.example.com:.well-known"
+        );
+    }
+
+    fn mediator(
+        did: &str,
+        status: crate::mediators::types::MediatorStatus,
+    ) -> crate::mediators::types::Mediator {
+        let now = chrono::Utc::now();
+        crate::mediators::types::Mediator {
+            id: format!("mediator-{did}"),
+            tenant_id: None,
+            name: "test-mediator".to_string(),
+            description: String::new(),
+            did: did.to_string(),
+            did_document: None,
+            status,
+            our_did: None,
+            our_secrets: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn recovered_mediator_is_known_active_accepts_matching_active_mediator() {
+        let mediators =
+            vec![mediator("did:web:m1.example.com:.well-known", crate::mediators::types::MediatorStatus::Active)];
+        assert!(super::recovered_mediator_is_known_active(&mediators, "did:web:m1.example.com:.well-known"));
+    }
+
+    #[test]
+    fn recovered_mediator_is_known_active_rejects_unknown_mediator() {
+        let mediators =
+            vec![mediator("did:web:m1.example.com:.well-known", crate::mediators::types::MediatorStatus::Active)];
+        assert!(!super::recovered_mediator_is_known_active(&mediators, "did:web:attacker.example.com:.well-known"));
+    }
+
+    #[test]
+    fn recovered_mediator_is_known_active_rejects_disabled_mediator() {
+        let mediators =
+            vec![mediator("did:web:m1.example.com:.well-known", crate::mediators::types::MediatorStatus::Disabled)];
+        assert!(!super::recovered_mediator_is_known_active(&mediators, "did:web:m1.example.com:.well-known"));
+    }
+
+    async fn mediator_store_with(
+        root: &std::path::Path,
+        mediators: &[crate::mediators::types::Mediator],
+    ) -> crate::mediators::FileSystemMediatorStore {
+        use crate::mediators::store::MediatorStore;
+        let store = crate::mediators::FileSystemMediatorStore::new(root.join("mediators"))
+            .await
+            .unwrap();
+        for mediator in mediators {
+            store
+                .create(mediator)
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn shared_mode_recovery_needs_no_registered_inviter_mediator() {
+        let root = tempfile::tempdir().unwrap();
+        let empty_store = mediator_store_with(root.path(), &[]).await;
+        let inviter_mediator = "did:web:m1.example.com:.well-known";
+
+        assert!(
+            super::validate_recovered_mediator(Some(&empty_store), inviter_mediator, inviter_mediator, "cp-1")
+                .await
+                .is_ok()
+        );
+        assert!(
+            super::validate_recovered_mediator(None, inviter_mediator, inviter_mediator, "cp-1")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_onto_a_different_mediator_requires_a_known_active_record() {
+        let root = tempfile::tempdir().unwrap();
+        let inviter_mediator = "did:web:m1.example.com:.well-known";
+        let own_mediator = "did:web:m2.example.com:.well-known";
+
+        assert!(
+            super::validate_recovered_mediator(None, own_mediator, inviter_mediator, "cp-1")
+                .await
+                .is_err()
+        );
+        let empty_store = mediator_store_with(root.path(), &[]).await;
+        assert!(
+            super::validate_recovered_mediator(Some(&empty_store), own_mediator, inviter_mediator, "cp-1")
+                .await
+                .is_err()
+        );
+
+        let other_root = tempfile::tempdir().unwrap();
+        let store = mediator_store_with(
+            other_root.path(),
+            &[mediator(own_mediator, crate::mediators::types::MediatorStatus::Active)],
+        )
+        .await;
+        assert!(
+            super::validate_recovered_mediator(Some(&store), own_mediator, inviter_mediator, "cp-1")
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

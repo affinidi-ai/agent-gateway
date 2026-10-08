@@ -7,9 +7,88 @@ changes:
         The Secrets list now has an Updated column next to Created, showing the
         secret's updated_at timestamp. That timestamp advances on both value and
         metadata changes.
-  changed: []
-  fixed: []
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Add a mediator_federation feature flag for per-gateway mediators
+      description: >-
+        A new `mediator_federation` feature flag (Settings › System › Feature Flags) turns on
+        per-gateway mediator federation (docs/PER_GATEWAY_MEDIATOR_FEDERATION.md). It is off
+        by default, and while it is off gateways behave as before. Request traffic between
+        gateways on different mediators is not yet relayed: those BDD scenarios stay
+        @known-bug.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Let the OOB acceptor home its permanent connection on its own mediator
+      description: >-
+        With `mediator_federation` on, the OOB connect request takes an optional
+        `acceptor_mediator_id`. When it is set, the acceptor's permanent connection point is
+        homed on that mediator instead of the inviter's. The named mediator must be within the
+        caller's tenant and token scope, Active, and registered (`our_did`/`our_secrets`),
+        otherwise the request fails with 400. With the flag off, the field is refused with
+        400. Leaving the field out keeps the shared-mediator behavior.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Add a mediator picker to the Connect via OOB wizard
+      description: >-
+        With `mediator_federation` on, the Enter Details step can select one of this gateway's
+        own active, registered mediators, which sends `acceptor_mediator_id`.
+  changed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Wrap gateway messages in a routing forward when mediator federation is on
+      description: >-
+        With `mediator_federation` on, `pack_and_send_message` wraps each send in a
+        `routing/2.0/forward` addressed to the sender's own mediator when the sending profile
+        has one. That mediator then relays to recipients homed on another mediator, or
+        delivers locally, so every mediator must list its own public URL in
+        `server.local_endpoints` before the flag is turned on. The primary fabric forward call
+        in `handle_fabric_request` now goes through this helper as well. Fabric stream frames
+        and the x402 facilitator still send directly. With the flag off, sends are unchanged.
+  fixed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Resolve connection-point mediator endpoints from the mediator's DID document
+      description: >-
+        The inviter's approve flow and the acceptor's finalize and recovery paths used to
+        guess an https origin from the mediator DID string, which is wrong for plaintext
+        mediators and for mediators whose endpoint has a path. They now use
+        `resolve_mediator_endpoint`, which prefers the stored mediator DID document. A failed
+        mediator store read during finalize is now logged before falling back to the guess.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Scope and validate the acceptor mediator selection
+      description: >-
+        `acceptor_mediator_id` goes through the same tenant and resource-scope check as every
+        other mediator lookup. An unknown mediator and one outside the caller's scope get the
+        same 400, so a scoped caller cannot learn that it exists. An in-scope mediator that is
+        disabled or unregistered gets one generic 400 that names neither the mediator nor its
+        state; the detail is logged server-side. On the acceptor's cache-miss recovery path, a
+        recovered mediator other than the temporary connection point's own must resolve to a
+        known Active mediator, and recovery fails closed when no mediator store is available.
+        Shared-mediator recovery needs no registered inviter mediator.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Keep mediator send errors out of fabric forward responses
+      description: >-
+        When a fabric ForwardRequest fails to send, every client-facing path (the inbound
+        fabric proxy, outbound fabric forwards, A2A agent-card fetches and x402 payment
+        delegation) returns a generic message. The underlying SDK or mediator error is logged
+        only.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Keep send and lookup errors out of gateway management responses
+      description: >-
+        Connection setup, ping, retry ping, surface discovery and the acceptor mediator lookup
+        now return a generic message when the send or lookup fails, and log the underlying
+        error server-side instead of returning it to the client.
   breaking: []
-  internal: []
+  internal:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Add a two-mediator g2g BDD harness and mediator_federation.feature
+      description: >-
+        A g2g scenario can give each gateway its own mediator (`gateway N uses mediator "M"`)
+        and turn on `mediator_federation` per gateway. Each mediator has its own Docker
+        network, so a socat sidecar bridges every mediator pair. Negative scenarios cover the
+        flag being off, a disabled and an unknown `acceptor_mediator_id`, and assert the
+        response message; unit tests cover out-of-scope, disabled and unregistered mediators
+        and shared-mediator recovery with an empty mediator store.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Declare the g2g BDD mediator's own URL in local_endpoints
+      description: >-
+        scripts/g2g-mediator.sh now runs reconcile-mediator-config.sh on every run, including
+        for a cached config, to set `server.local_endpoints` to the mediator's
+        `http://localhost:<port>` URL, which scenarios that turn on `mediator_federation` need.

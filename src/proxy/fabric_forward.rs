@@ -46,8 +46,10 @@ pub(crate) enum FabricForwardError {
     GatewayNotConnected(String),
     #[error("DID for remote gateway '{0}' not found")]
     GatewayDidNotFound(String),
-    #[error("Failed to send message to remote gateway '{0}': {1}")]
-    SendFailed(String, String),
+    /// The send detail is logged where this error is created and is kept out
+    /// of `Display`, because callers turn this error into client responses.
+    #[error("Failed to send message to remote gateway '{0}'")]
+    SendFailed(String),
     #[error("No response from remote gateway '{0}' within timeout")]
     NoResponse(String),
     #[error("Unexpected message type from remote gateway: {0}")]
@@ -583,7 +585,10 @@ pub(crate) async fn forward_via_fabric(
         .client
         .pack_and_send_message(&forward_request_msg, &remote_gateway_did, &gateway_listener.gateway_did)
         .await
-        .map_err(|e| FabricForwardError::SendFailed(gateway_id.to_string(), e))?;
+        .map_err(|e| {
+            warn!(gateway_id, error = %e, "Fabric forward: failed to send ForwardRequest");
+            FabricForwardError::SendFailed(gateway_id.to_string())
+        })?;
 
     let deadline = std::time::Instant::now() + req.timeout;
     let response_msg = loop {

@@ -387,6 +387,17 @@ pub async fn recorded_response(response: reqwest::Response) -> Result<RecordedRe
     Ok(RecordedResponse { status, headers, body })
 }
 
+/// Like [`recorded_response`], but keeps a non-JSON body (such as a plain-text
+/// error) as a JSON string instead of dropping it.
+pub async fn recorded_response_keeping_text(response: reqwest::Response) -> Result<RecordedResponse> {
+    let status = response.status().as_u16();
+    let headers = collect_headers(response.headers());
+    let text = response.text().await?;
+    let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+
+    Ok(RecordedResponse { status, headers, body })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum SurfacePolicySlot {
     Request,
@@ -513,6 +524,26 @@ impl GatewayAdminClient {
             .await?;
         if !(200..300).contains(&response.status) {
             bail!("enable trust-check audit failed with status {}: {}", response.status, response.body);
+        }
+        Ok(())
+    }
+
+    /// Set the system feature flags (`POST /v1/settings`). Replaces the whole
+    /// flag map, so pass every flag the scenario needs.
+    pub async fn set_feature_flags(
+        &self,
+        flags: &[(&str, bool)],
+    ) -> Result<()> {
+        let flags: serde_json::Map<String, Value> = flags
+            .iter()
+            .map(|(name, enabled)| ((*name).to_string(), Value::Bool(*enabled)))
+            .collect();
+        let response = self
+            .client
+            .send_recorded_json(Method::POST, "/v1/settings", Some(&serde_json::json!({ "feature_flags": flags })))
+            .await?;
+        if !(200..300).contains(&response.status) {
+            bail!("set feature flags failed with status {}: {}", response.status, response.body);
         }
         Ok(())
     }
@@ -663,6 +694,7 @@ impl GatewayAdminClient {
         name: &str,
         description: &str,
         did_method: &str,
+        acceptor_mediator_id: Option<&str>,
     ) -> Result<GatewayRecord> {
         let response: ConnectViaOobResponse = self
             .send_json(
@@ -674,10 +706,64 @@ impl GatewayAdminClient {
                     name: name.to_string(),
                     description: description.to_string(),
                     did_method: Some(did_method.to_string()),
+                    acceptor_mediator_id: acceptor_mediator_id.map(str::to_string),
                 }),
             )
             .await?;
         Ok(response.gateway)
+    }
+
+    /// Like `connect_via_oob`, but returns the raw status/body instead of
+    /// failing on a non-2xx response, so a rejected accept can be asserted on.
+    pub async fn connect_via_oob_recorded(
+        &self,
+        oob_url: &str,
+        secret: &str,
+        name: &str,
+        description: &str,
+        did_method: &str,
+        acceptor_mediator_id: Option<&str>,
+    ) -> Result<RecordedResponse> {
+        let url = self
+            .client
+            .admin_url("/v1/gateways/connect-via-oob");
+        let response = self
+            .client
+            .send_request(
+                Method::POST,
+                &url,
+                Some(&ConnectViaOobRequest {
+                    oob_url: oob_url.to_string(),
+                    secret: secret.to_string(),
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    did_method: Some(did_method.to_string()),
+                    acceptor_mediator_id: acceptor_mediator_id.map(str::to_string),
+                }),
+            )
+            .await?;
+        recorded_response_keeping_text(response).await
+    }
+
+    /// `PUT /v1/mediators/{id}` with just a status change (e.g. disabling a
+    /// mediator for negative-path BDD coverage).
+    pub async fn update_mediator_status(
+        &self,
+        mediator_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .send_recorded_json(
+                Method::PUT,
+                &format!("/v1/mediators/{mediator_id}"),
+                Some(&serde_json::json!({ "status": status })),
+            )
+            .await?;
+        if !(200..300).contains(&response.status) {
+            bail!("update mediator {mediator_id} status failed with status {}: {}", response.status, response.body);
+        }
+        Ok(())
     }
 
     pub async fn approve_gateway(
@@ -1233,6 +1319,8 @@ struct ConnectViaOobRequest {
     description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     did_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptor_mediator_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

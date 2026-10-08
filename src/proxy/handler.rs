@@ -11867,34 +11867,23 @@ async fn handle_fabric_request(
         );
 
         async {
-        let packed = gateway_listener.client.atm().pack_encrypted(
+        // Sent through the shared helper so mediator federation applies here too.
+        gateway_listener.client.pack_and_send_message(
         &forward_request_msg,
         &remote_gateway_did,
-        Some(&gateway_listener.gateway_did),
-        Some(&gateway_listener.gateway_did),
+        &gateway_listener.gateway_did,
     ).await
     .map_err(|e| {
         crate::proxy::fabric_response_waiter::remove_forward_response_waiter(&forward_request_msg.id);
-        channel_error!(config_id, "Failed to pack ForwardRequest to gateway {} (DID: {}): {:?}", gateway_id, remote_gateway_did, e);
+        channel_error!(config_id, "Failed to send ForwardRequest to gateway {} (DID: {}): {:?}", gateway_id, remote_gateway_did, e);
         channel_warn!(config_id, "If the error mentions DID resolution, the remote gateway may be offline or its DID document unreachable");
         channel_warn!(config_id, "Consider checking if a cached DID document exists but is expired");
+        // The underlying pack/send error stays in the channel log above; the
+        // client only gets a generic message so mediator/SDK internals don't leak.
         create_error_response(
             StatusCode::BAD_GATEWAY,
-            &format!("Failed to pack message for remote gateway '{}': {}. Gateway may be offline if DID resolution failed.", gateway_id, e)
+            &format!("Failed to send message to remote gateway '{}'. Gateway may be offline if DID resolution failed.", gateway_id)
         )
-    })?;
-
-    gateway_listener.client.atm().send_message(
-        gateway_listener.client.profile(),
-        &packed.0,
-        &forward_request_msg.id,
-        false, // Don't wait for response here
-        false, // Don't auto-delete
-    ).await
-    .map_err(|e| {
-        crate::proxy::fabric_response_waiter::remove_forward_response_waiter(&forward_request_msg.id);
-        channel_error!(config_id, "Failed to send ForwardRequest: {:?}", e);
-        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to send message")
     })?;
 
         debug!("ForwardRequest sent, waiting for response via WebSocket...");

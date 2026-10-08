@@ -16,6 +16,7 @@ interface WizardState {
   name: string | null;
   description: string | null;
   didMethod: string;
+  acceptorMediatorId: string;
   oobLink: string | null;
   secret: string | null;
   gateway: any;
@@ -29,6 +30,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
     name: null,
     description: null,
     didMethod: 'web',
+    acceptorMediatorId: '',
     oobLink: null,
     secret: null,
     gateway: null,
@@ -63,8 +65,13 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
     }
   };
 
-  const handleDetailsEntered = (name: string, description: string, didMethod: string) => {
-    setWizardState(prev => ({ ...prev, name, description, didMethod }));
+  const handleDetailsEntered = (
+    name: string,
+    description: string,
+    didMethod: string,
+    acceptorMediatorId: string
+  ) => {
+    setWizardState(prev => ({ ...prev, name, description, didMethod, acceptorMediatorId }));
     nextStep();
   };
 
@@ -103,6 +110,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
             initialName={wizardState.name || ''}
             initialDescription={wizardState.description || ''}
             initialDidMethod={wizardState.didMethod}
+            initialAcceptorMediatorId={wizardState.acceptorMediatorId}
           />
         );
       case 'enter-link':
@@ -123,6 +131,7 @@ const AddGatewayViaOOBWizardPage: React.FC = () => {
             name={wizardState.name || ''}
             description={wizardState.description || ''}
             didMethod={wizardState.didMethod}
+            acceptorMediatorId={wizardState.acceptorMediatorId}
             onConnected={handleConnected}
             onBack={prevStep}
             onCancel={handleCancel}

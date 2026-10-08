@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use reqwest::Method;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
+use tracing::debug;
 
 use super::mediator::{
     MediatorAuthTestResult, MediatorTrustPingResult, cache_did_document, cache_did_document_in_tdk_state,
@@ -208,10 +209,41 @@ impl DIDCommClient {
             .await
             .map_err(|e| format!("Failed to pack message: {:?}", e))?;
 
-        self.atm
-            .send_message(&self.profile, &packed.0, &message.id, false, false)
-            .await
-            .map_err(|e| format!("Failed to send message: {:?}", e))?;
+        // With mediator federation on, send a routing/2.0/forward to our own
+        // mediator so it can relay to a recipient on another mediator
+        // (docs/PER_GATEWAY_MEDIATOR_FEDERATION.md §5.3).
+        let own_mediator = self
+            .profile
+            .inner
+            .mediator
+            .as_ref()
+            .as_ref()
+            .filter(|_| crate::mediators::federation::mediator_federation_enabled());
+        match own_mediator {
+            Some(mediator) => {
+                debug!("Forwarding message {} via own mediator {} to recipient {}", message.id, mediator.did, to_did);
+                self.atm
+                    .forward_and_send_message(
+                        &self.profile,
+                        false,
+                        &packed.0,
+                        Some(&message.id),
+                        &mediator.did,
+                        to_did,
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to send message: {:?}", e))?;
+            }
+            None => {
+                self.atm
+                    .send_message(&self.profile, &packed.0, &message.id, false, false)
+                    .await
+                    .map_err(|e| format!("Failed to send message: {:?}", e))?;
+            }
+        }
 
         Ok(())
     }

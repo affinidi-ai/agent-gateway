@@ -6,6 +6,7 @@ use cucumber::given;
 use serde_json::Value;
 
 use crate::bdd_support::actors::TargetActorKind;
+use crate::bdd_support::admin_client::ExternalMediatorBlob;
 use crate::bdd_support::config::fabric_surface_fixture::{
     McpProxySpec, McpToolPolicySpec, SourceAuthSpec, SurfaceSpec, TargetAuthSpec,
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
@@ -14,6 +15,7 @@ use crate::bdd_support::config::modern_consent::ModernConsentFixture;
 use crate::bdd_support::json_rpc::{IdentityBindingProof, build_mcp_echo_response_body, build_target_ok_response};
 use crate::bdd_support::mcp_consent::{ConsentRequest, complete_consent, open_consent_callback_with_tampered_state};
 use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
+use crate::bdd_support::mediator::Mediator as _;
 use crate::bdd_support::policies::{
     build_gateway_deny_all_policy, build_gateway_deny_unverified_source_auth_policy, build_mcp_tool_allow_policy,
     build_surface_identity_binding_issuer_policy,
@@ -143,6 +145,37 @@ pub async fn gateway_admits_only_legacy_mcp_over_fabric(
         .topology
         .plan_mut(gw_index)
         .legacy_only_fabric_receive = true;
+}
+
+#[given(regex = r"^mediator federation is enabled on gateway (\d+)$")]
+pub async fn mediator_federation_is_enabled_on_gateway(
+    world: &mut G2gWorld,
+    gw_index: usize,
+) {
+    world.topology.gateway_count = world
+        .topology
+        .gateway_count
+        .max(gw_index);
+    world
+        .topology
+        .mediator_federation_gateways
+        .insert(gw_index);
+}
+
+#[given(regex = r#"^gateway (\d+) uses mediator "([^"]+)"$"#)]
+pub async fn gateway_uses_mediator(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    mediator_alias: String,
+) {
+    world.topology.gateway_count = world
+        .topology
+        .gateway_count
+        .max(gw_index);
+    world
+        .topology
+        .gateway_mediator_alias
+        .insert(gw_index, mediator_alias);
 }
 
 #[given(expr = "gateway {int} surface {string} uses {string} MCP metadata output")]
@@ -827,12 +860,79 @@ pub async fn managed_agent_has_obtained_identity_presentation(
     world.response_body = None;
 }
 
+#[given(regex = r#"^gateway (\d+) has a disabled mediator "([^"]+)"$"#)]
+pub async fn gateway_has_a_disabled_mediator(
+    world: &mut G2gWorld,
+    gateway: usize,
+    mediator_name: String,
+) {
+    world.start().await;
+    let admin = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .clone();
+    let mediator = admin
+        .create_mediator(
+            &format!("bdd-disabled-mediator-{mediator_name}"),
+            "disabled mediator for negative-path BDD coverage",
+            &ExternalMediatorBlob {
+                did: format!("did:key:z6MkBddDisabledMediator{}", uuid::Uuid::new_v4()),
+                did_document: None,
+            },
+        )
+        .await
+        .expect("create mediator");
+    admin
+        .update_mediator_status(&mediator.id, "disabled")
+        .await
+        .expect("disable mediator");
+    world
+        .named_mediators
+        .insert(mediator_name, mediator.id);
+}
+
+#[given(regex = r"^gateway (\d+) has published an OOB invitation for gateway (\d+)$")]
+pub async fn gateway_has_published_an_oob_invitation_for_gateway(
+    world: &mut G2gWorld,
+    inviter: usize,
+    acceptor: usize,
+) {
+    world.start().await;
+    let did_method = world
+        .harness()
+        .mediator()
+        .did_method()
+        .to_string();
+    let inviter_node = world.harness().gw(inviter);
+    let admin = inviter_node.admin.clone();
+    let mediator_id = inviter_node
+        .mediator_id
+        .clone();
+    let inviter_self = admin
+        .find_self_gateway()
+        .await
+        .expect("locate inviter self gateway");
+    let connection_point = admin
+        .create_connection_point(
+            &inviter_self.id,
+            &mediator_id,
+            &format!("g2g-bdd-negative-cp-gw{inviter}-to-gw{acceptor}"),
+            &format!("gateway {inviter} negative-path invitation for gateway {acceptor}"),
+            "g2g-bdd-negative-secret",
+            &did_method,
+        )
+        .await
+        .expect("create OOB invitation");
+    world.pending_oob_url = Some(connection_point.oob_url);
+}
+
 #[given(expr = "the mediator has lost every account it held")]
 pub async fn mediator_lost_every_account(world: &mut G2gWorld) {
     world.start().await;
     world
         .harness()
-        .mediator
+        .mediator()
         .flush_store()
         .await
         .unwrap_or_else(|error| panic!("{error:#}"));
