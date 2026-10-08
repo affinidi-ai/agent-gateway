@@ -1799,6 +1799,32 @@ pub struct X402PaymentRequirement {
     pub extra: Option<serde_json::Value>,
 }
 
+impl X402PaymentRequirement {
+    /// Token contract address, or `None` when the requirement is for the network's native currency
+    pub fn token_address(&self) -> Option<&str> {
+        if self.asset.is_empty() || self.asset == "native" {
+            None
+        } else {
+            Some(&self.asset)
+        }
+    }
+
+    /// Asset transfer method from `extra` (`assetTransferMethod`, or legacy `asset_transfer_method`),
+    /// defaulting to `transaction`
+    pub fn asset_transfer_method(&self) -> String {
+        self.extra
+            .as_ref()
+            .and_then(|extra| {
+                extra
+                    .get("assetTransferMethod")
+                    .or_else(|| extra.get("asset_transfer_method"))
+            })
+            .and_then(|v| v.as_str())
+            .unwrap_or("transaction")
+            .to_string()
+    }
+}
+
 /// x402 payment provider — who enforces the paywall.
 ///
 /// `Local` (default) means this gateway runs the x402 challenge / verify /
@@ -3463,6 +3489,14 @@ pub struct EvmTestEndpointConfig {
 
     /// Payment method (e.g., "eip3009", "permit2")
     pub payment_method: String,
+
+    /// Token EIP-712 domain name (e.g., "USDC"), issued as `extra.name`; required for EIP-3009
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_name: Option<String>,
+
+    /// Token EIP-712 domain version (e.g., "2"), issued as `extra.version`; required for EIP-3009
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_version: Option<String>,
 }
 
 /// Solana test endpoint configuration

@@ -1,0 +1,30 @@
+branch: fix/x402-bind-caller-identity
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: ⭐ Verify x402 payments against the surface's configured requirements
+      description: x402 verification now requires a credential's `accepted` object to name one of the payment requirements the surface issued, exactly in scheme, network, asset, recipient, amount, asset transfer method and EIP-712 domain, and rejects it in every verification mode otherwise. Signature, on-chain and facilitator checks take their expected values from that requirement, embedded and external facilitators receive it as `paymentRequirements`, and the transaction record and settlement use it. Previously a credential was checked only against its own `accepted` object. Deferred settlement records written by earlier builds settle only if they still name one of the surface's current requirements, and are marked failed otherwise.
+  breaking:
+    - timestamp: '2026-10-07T00:00:01.000Z'
+      title: Require the payment requirement in fabric x402 verify-requests
+      description: In `fabric_gateway` verification mode the requesting gateway sends its resolved requirement as `payment_requirement`, and the facilitator gateway verifies against it and rejects a verify-request without one. Upgrade requesting gateways first; an upgraded facilitator rejects every verify-request from a requester on an earlier build.
+    - timestamp: '2026-10-07T00:00:02.000Z'
+      title: Accept no x402 payment on a surface without payment requirements
+      description: A surface with x402 enabled and an empty `payment_requirements` list, or a requirement whose `amount` is not a number (such as one created from the x402 Payment Wall template before an amount is set), rejects every payment.
+    - timestamp: '2026-10-07T00:00:03.000Z'
+      title: Take x402 signature-check fields from the configured requirement
+      description: Clients no longer supply the transfer method or EIP-712 domain. For signature checks, an `eip3009` requirement needs `extra.assetTransferMethod`, `extra.name` and `extra.version`, and a `permit2` requirement needs `extra.assetTransferMethod`. A client must echo the issued requirement, including those fields, and an `upto` payment must authorise exactly the configured amount, as must every signed authorization.
+    - timestamp: '2026-10-07T00:00:04.000Z'
+      title: Refuse SPL token requirements on Solana transaction-hash verification
+      description: Solana transaction-hash verification checks native SOL lamports only, so a requirement for an SPL token is refused there and must use the `spl_transfer` method. A transaction that is not JSON-encoded is refused rather than checked without its recipient.
+    - timestamp: '2026-10-07T00:00:05.000Z'
+      title: Require token_name and token_version for the EIP-3009 x402 test endpoint
+      description: The x402 test endpoints issue and verify one requirement built from test-endpoints.json. `/protected` (EIP-3009) needs the new optional `token_name` and `token_version` fields in the `evm` entry, since the EIP-712 domain is no longer taken from the client.
+  internal:
+    - timestamp: '2026-10-07T00:00:06.000Z'
+      title: Test x402 requirement binding across verification modes and facilitators
+      description: Covers requirement resolution (recipient, amount, scheme, network, asset, transfer method, EIP-712 domain, EVM and Solana address case), rejection before any facilitator call in every verification mode, the requirement sent to external and fabric facilitators with a handler-level fabric test, real EIP-3009 signatures checked against the configured domain and amount, Solana lamport checks, and settlement of records written before requirement binding. Documents the behaviour in PROTOCOLS.md, ARCHITECTURE.md and CONFIGURATION_REFERENCE.md, including that `mock` verification is for tests only.

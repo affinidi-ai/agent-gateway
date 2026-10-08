@@ -2,15 +2,20 @@
 
 use axum::http::HeaderMap;
 use base64::Engine;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::{PaymentPayload, PaymentResponse, TransactionStore};
-use crate::config::types::{X402Config, X402VerificationMode};
+use crate::config::types::{X402Config, X402PaymentRequirement, X402VerificationMode};
 use crate::gateways::ConnectionPointListenerManager;
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 use std::sync::Arc;
 
 /// Verify x402 payment
+///
+/// The caller's `accepted` only selects which of the surface's payment requirements the payment
+/// is for; it is rejected unless it names one of them (see [`resolve_payment_requirement`]).
+/// Every check then takes its expected values from that resolved requirement, and the returned
+/// payload carries it as `accepted`, so settlement acts on the surface's configuration.
 /// Returns (payload, correlation_id) on success
 #[allow(dead_code)]
 pub async fn verify_payment(
@@ -63,6 +68,15 @@ pub async fn verify_payment(
         payload.accepted.asset
     );
 
+    let resolved = resolve_payment_requirement(&payload.accepted, &super::issued_payment_requirements(config).await);
+    let bound_payload = match &resolved {
+        Ok(requirement) => PaymentPayload {
+            accepted: requirement.clone(),
+            ..payload.clone()
+        },
+        Err(_) => payload.clone(),
+    };
+
     // Determine verification_mode string for transaction record
     let verification_mode_str = match config.verification_mode {
         X402VerificationMode::Mock => "Mock",
@@ -80,7 +94,7 @@ pub async fn verify_payment(
                 channel_id.to_string(),
                 channel_name.to_string(),
                 resource_url.to_string(),
-                payload.clone(),
+                bound_payload.clone(),
                 verification_mode_str.to_string(),
                 config
                     .facilitator_gateway_id
@@ -92,28 +106,33 @@ pub async fn verify_payment(
         return Err(e);
     }
 
+    let requirement = match resolved {
+        Ok(requirement) => requirement,
+        Err(e) => {
+            channel_warn!(
+                channel_id,
+                "Payment rejected: accepted requirement not issued for this resource scheme={} network={} asset={} pay_to={} amount={}",
+                payload.scheme(),
+                payload.network(),
+                payload.accepted.asset,
+                payload.pay_to(),
+                payload.amount()
+            );
+            return Err(fail_verification(&transaction_store, &correlation_id, channel_id, &payload, e).await);
+        }
+    };
+
     // Verify based on configured mode
-    match config.verification_mode {
+    let result = match config.verification_mode {
         X402VerificationMode::Mock => {
             channel_info!(channel_id, "Mock verification mode - accepting payment");
-
-            // Complete verification in transaction store
-            if let Some(store) = &transaction_store
-                && let Err(e) = store
-                    .complete_verification(&correlation_id)
-                    .await
-            {
-                channel_warn!(channel_id, "Failed to update transaction record: {}", e);
-            }
-
-            Ok((payload, correlation_id))
+            Ok(())
         }
         X402VerificationMode::Local => {
-            verify_local_payment(&payload, &correlation_id, config, channel_name, channel_id, &transaction_store).await
+            verify_local_payment(&payload, &requirement, config, channel_name, channel_id).await
         }
         X402VerificationMode::ExternalFacilitator => {
-            verify_facilitator_payment(&payload, &correlation_id, config, channel_name, channel_id, &transaction_store)
-                .await
+            verify_facilitator_payment(&payload, &requirement, config, channel_name).await
         }
         X402VerificationMode::FabricGateway => {
             // Gateway-to-gateway DIDComm verification via facilitator service
@@ -151,60 +170,16 @@ pub async fn verify_payment(
 
             // Send verification request via gateway facilitator service
             // This now waits synchronously for the DIDComm response (like fabric:// forwarding)
-            match crate::x402::verify_via_facilitator_gateway(
+            crate::x402::verify_via_facilitator_gateway(
                 &facilitator_did,
                 payment_header,
-                payload.network(),
+                &requirement,
                 channel_id.to_string(),
                 format!("/resource/{}", channel_name), // TODO: get actual resource path
             )
             .await
-            {
-                Ok(payment_json) => {
-                    // Parse the returned payment payload
-                    let verified_payment: PaymentPayload = serde_json::from_str(&payment_json)
-                        .map_err(|e| format!("Failed to parse payment response: {}", e))?;
-
-                    channel_info!(channel_id, "Payment verified successfully via gateway facilitator");
-
-                    // Complete verification in transaction store
-                    if let Some(store) = &transaction_store
-                        && let Err(e) = store
-                            .complete_verification(&correlation_id)
-                            .await
-                    {
-                        channel_warn!(channel_id, "Failed to update transaction record: {}", e);
-                    }
-
-                    Ok((verified_payment, correlation_id))
-                }
-                Err(e) => {
-                    channel_warn!(channel_id, "Gateway facilitator verification failed: {}", e);
-
-                    // Mark verification as failed in transaction store
-                    if let Some(store) = &transaction_store
-                        && let Err(err) = store
-                            .fail_verification(&correlation_id, e.clone())
-                            .await
-                    {
-                        channel_warn!(channel_id, "Failed to update transaction record: {}", err);
-                    }
-
-                    // Trigger integration alerts for verification failure
-                    crate::integrations::trigger_transaction_verification_failed(
-                        &correlation_id,
-                        channel_id,
-                        &payload
-                            .tx_hash()
-                            .unwrap_or_default(),
-                        &e,
-                    )
-                    .await;
-
-                    // Return the error - don't fall back to local
-                    Err(e)
-                }
-            }
+            .inspect(|()| channel_info!(channel_id, "Payment verified successfully via gateway facilitator"))
+            .inspect_err(|e| channel_warn!(channel_id, "Gateway facilitator verification failed: {}", e))
         }
         X402VerificationMode::Signature => {
             // Signature-based verification (EIP-3009 / Permit2)
@@ -214,11 +189,12 @@ pub async fn verify_payment(
                 "Signature verification mode - cryptographic verification only (no blockchain state checks)"
             );
 
-            let transfer_method = payload.asset_transfer_method();
-
-            let result = match transfer_method.as_str() {
-                "eip3009" => verify_eip3009_signature(&payload, config, channel_id).await,
-                "permit2" => verify_permit2_signature(&payload, config, channel_id).await,
+            match requirement
+                .asset_transfer_method()
+                .as_str()
+            {
+                "eip3009" => verify_eip3009_signature(&payload, &requirement, channel_id).await,
+                "permit2" => verify_permit2_signature(&payload, &requirement, channel_id).await,
                 _ => {
                     channel_warn!(
                         channel_id,
@@ -226,61 +202,119 @@ pub async fn verify_payment(
                     );
                     Err("Signature mode requires EIP-3009 or Permit2 payment method".to_string())
                 }
-            };
-
-            match result {
-                Ok(verified_payload) => {
-                    // Complete verification in transaction store
-                    if let Some(store) = &transaction_store
-                        && let Err(e) = store
-                            .complete_verification(&correlation_id)
-                            .await
-                    {
-                        channel_warn!(channel_id, "Failed to update transaction record: {}", e);
-                    }
-                    Ok((verified_payload, correlation_id))
-                }
-                Err(e) => {
-                    // Mark verification as failed in transaction store
-                    if let Some(store) = &transaction_store
-                        && let Err(err) = store
-                            .fail_verification(&correlation_id, e.clone())
-                            .await
-                    {
-                        channel_warn!(channel_id, "Failed to update transaction record: {}", err);
-                    }
-
-                    // Trigger integration alerts for verification failure
-                    crate::integrations::trigger_transaction_verification_failed(
-                        &correlation_id,
-                        channel_id,
-                        &payload
-                            .tx_hash()
-                            .unwrap_or_default(),
-                        &e,
-                    )
-                    .await;
-
-                    Err(e)
-                }
             }
         }
+    };
+
+    match result {
+        Ok(()) => {
+            // Complete verification in transaction store
+            if let Some(store) = &transaction_store
+                && let Err(e) = store
+                    .complete_verification(&correlation_id)
+                    .await
+            {
+                channel_warn!(channel_id, "Failed to update transaction record: {}", e);
+            }
+            Ok((bound_payload, correlation_id))
+        }
+        Err(e) => Err(fail_verification(&transaction_store, &correlation_id, channel_id, &payload, e).await),
     }
+}
+
+/// Resolve which of the surface's issued payment requirements a caller's `accepted` refers to.
+///
+/// `accepted` is caller-controlled. It must name an issued requirement exactly in everything
+/// verification and settlement act on: scheme, network, asset, recipient, amount, asset transfer
+/// method, and the EIP-712 domain `name` and `version` in `extra`. The amount must equal the
+/// configured one for both `exact` and `upto`, since `upto` settles the amount the payer
+/// authorised as the maximum. EVM addresses compare case-insensitively, as the 402 challenge
+/// issues them lowercased.
+pub(crate) fn resolve_payment_requirement(
+    accepted: &X402PaymentRequirement,
+    issued: &[X402PaymentRequirement],
+) -> Result<X402PaymentRequirement, String> {
+    let mut accepted = accepted.clone();
+    super::normalize_requirement_addresses(&mut accepted);
+    issued
+        .iter()
+        .find(|requirement| {
+            matches!(requirement.scheme.as_str(), "exact" | "upto")
+                && requirement.scheme == accepted.scheme
+                && requirement.network == accepted.network
+                && requirement.asset == accepted.asset
+                && requirement.pay_to == accepted.pay_to
+                && same_amount(&accepted.amount, &requirement.amount)
+                && requirement.asset_transfer_method() == accepted.asset_transfer_method()
+                && eip712_domain_of(requirement) == eip712_domain_of(&accepted)
+        })
+        .cloned()
+        .ok_or_else(|| "Payment does not match any payment requirement issued for this resource".to_string())
+}
+
+fn same_amount(
+    offered: &str,
+    required: &str,
+) -> bool {
+    use alloy::primitives::U256;
+    matches!(
+        (U256::from_str_radix(offered, 10), U256::from_str_radix(required, 10)),
+        (Ok(offered), Ok(required)) if offered == required
+    )
+}
+
+fn eip712_domain_of(requirement: &X402PaymentRequirement) -> (Option<&str>, Option<&str>) {
+    let field = |name: &str| {
+        requirement
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get(name))
+            .and_then(|value| value.as_str())
+    };
+    (field("name"), field("version"))
+}
+
+/// Mark a transaction's verification as failed and raise the integration alert; returns `error`
+async fn fail_verification(
+    transaction_store: &Option<Arc<TransactionStore>>,
+    correlation_id: &str,
+    channel_id: &str,
+    payload: &PaymentPayload,
+    error: String,
+) -> String {
+    if let Some(store) = transaction_store
+        && let Err(e) = store
+            .fail_verification(correlation_id, error.clone())
+            .await
+    {
+        channel_warn!(channel_id, "Failed to update transaction record: {}", e);
+    }
+
+    crate::integrations::trigger_transaction_verification_failed(
+        correlation_id,
+        channel_id,
+        &payload
+            .tx_hash()
+            .unwrap_or_default(),
+        &error,
+    )
+    .await;
+
+    error
 }
 
 /// Verify payment locally via blockchain RPC
 async fn verify_local_payment(
     payload: &PaymentPayload,
-    correlation_id: &str,
+    requirement: &X402PaymentRequirement,
     config: &X402Config,
     channel_name: &str,
     channel_id: &str,
-    transaction_store: &Option<Arc<TransactionStore>>,
-) -> Result<(PaymentPayload, String), String> {
+) -> Result<(), String> {
     // Check asset transfer method to determine verification type
     // First check explicit config, then auto-detect from payload structure
     let transfer_method = {
-        let configured = payload.asset_transfer_method();
+        let configured = requirement.asset_transfer_method();
         if configured != "transaction" {
             configured
         } else {
@@ -304,8 +338,8 @@ async fn verify_local_payment(
                 .payload
                 .get("transaction")
                 .is_some()
-                && payload
-                    .network()
+                && requirement
+                    .network
                     .starts_with("solana:")
             {
                 channel_info!(
@@ -319,7 +353,7 @@ async fn verify_local_payment(
         }
     };
 
-    channel_debug!(channel_id, "Payment assetTransferMethod={} network={}", transfer_method, payload.network());
+    channel_debug!(channel_id, "Payment assetTransferMethod={} network={}", transfer_method, requirement.network);
 
     // Route to appropriate verification method
     match transfer_method.as_str() {
@@ -392,59 +426,19 @@ async fn verify_local_payment(
                 })?;
 
             // Convert payload to x402 VerifyRequest
-            let verify_request = super::x402rs_adapter::to_verify_request(payload).map_err(|e| {
+            let verify_request = super::x402rs_adapter::to_verify_request(payload, requirement).map_err(|e| {
                 channel_error!(channel_id, "Failed to convert to x402 request: {}", e);
                 format!("Failed to convert payment to x402 format: {}", e)
             })?;
 
-            // Call embedded facilitator for verification
-            let result = facilitator
+            // Call embedded facilitator for verification. The proto::VerifyResponse is an enum of
+            // v1/v2 responses; a response without an error is a valid payment.
+            facilitator
                 .verify(verify_request)
-                .await;
-
-            // Handle result and update transaction store
-            match result {
-                Ok(_verify_response) => {
-                    // The proto::VerifyResponse is an enum of v1/v2 responses
-                    // We need to check if verification was successful
-                    // For now, if no error was returned, consider it valid
-                    channel_info!(channel_id, "Payment verified successfully via embedded facilitator");
-
-                    // Update transaction store
-                    if let Some(store) = transaction_store
-                        && let Err(e) = store
-                            .complete_verification(correlation_id)
-                            .await
-                    {
-                        channel_warn!(channel_id, "Failed to update transaction record: {}", e);
-                    }
-
-                    return Ok((payload.clone(), correlation_id.to_string()));
-                }
-                Err(e) => {
-                    // Mark verification as failed in transaction store
-                    if let Some(store) = transaction_store
-                        && let Err(err) = store
-                            .fail_verification(correlation_id, e.to_string())
-                            .await
-                    {
-                        channel_warn!(channel_id, "Failed to update transaction record: {}", err);
-                    }
-
-                    // Trigger integration alerts for verification failure
-                    crate::integrations::trigger_transaction_verification_failed(
-                        correlation_id,
-                        channel_id,
-                        &payload
-                            .tx_hash()
-                            .unwrap_or_default(),
-                        &e,
-                    )
-                    .await;
-
-                    return Err(e.to_string());
-                }
-            }
+                .await
+                .map_err(|e| e.to_string())?;
+            channel_info!(channel_id, "Payment verified successfully via embedded facilitator");
+            return Ok(());
         }
         _ => {
             // Traditional transaction hash verification
@@ -455,9 +449,10 @@ async fn verify_local_payment(
     // Get RPC endpoint for this network
     // Channel payment_policy typically doesn't include rpc_endpoints,
     // so fall back to the global x402.json config
+    let network = requirement.network.as_str();
     let rpc_url = if let Some(url) = config
         .rpc_endpoints
-        .get(payload.network())
+        .get(network)
     {
         url.clone()
     } else {
@@ -470,97 +465,46 @@ async fn verify_local_payment(
             })?;
         global_config
             .rpc_endpoints
-            .get(payload.network())
+            .get(network)
             .cloned()
-            .ok_or_else(|| format!("No RPC endpoint configured for network: {}", payload.network()))?
+            .ok_or_else(|| format!("No RPC endpoint configured for network: {}", network))?
     };
 
-    channel_debug!(channel_id, "Verifying payment on-chain network={} rpc_url={}", payload.network(), rpc_url);
+    channel_debug!(channel_id, "Verifying payment on-chain network={} rpc_url={}", network, rpc_url);
 
     // Get transaction hash
     let tx_hash = payload
         .tx_hash()
         .ok_or_else(|| "Transaction hash required for local verification".to_string())?;
 
-    channel_info!(
-        channel_id,
-        "Verifying payment on-chain network={} rpc_url={} tx_hash={}",
-        payload.network(),
-        rpc_url,
-        tx_hash
-    );
+    channel_info!(channel_id, "Verifying payment on-chain network={} rpc_url={} tx_hash={}", network, rpc_url, tx_hash);
 
     // Verify based on network type (CAIP-2 format: namespace:reference)
     // EVM chains use eip155 namespace, Solana uses solana namespace
-    let result = if payload
-        .network()
-        .starts_with("eip155:")
-    {
-        verify_evm_transaction(payload, &tx_hash, &rpc_url, config, channel_name, channel_id).await
-    } else if payload
-        .network()
-        .starts_with("solana:")
-    {
-        verify_solana_transaction(payload, &tx_hash, &rpc_url, channel_name, channel_id).await
+    if network.starts_with("eip155:") {
+        verify_evm_transaction(requirement, &tx_hash, &rpc_url, config, channel_id).await
+    } else if network.starts_with("solana:") {
+        verify_solana_transaction(requirement, &tx_hash, &rpc_url, channel_name).await
     } else {
         // Fallback for legacy non-CAIP-2 network identifiers
-        match payload.network() {
+        match network {
             "ethereum" | "base" | "optimism" | "arbitrum" | "polygon" | "avalanche" => {
-                verify_evm_transaction(payload, &tx_hash, &rpc_url, config, channel_name, channel_id).await
+                verify_evm_transaction(requirement, &tx_hash, &rpc_url, config, channel_id).await
             }
-            "solana" => verify_solana_transaction(payload, &tx_hash, &rpc_url, channel_name, channel_id).await,
+            "solana" => verify_solana_transaction(requirement, &tx_hash, &rpc_url, channel_name).await,
             network => Err(format!("Unsupported network for local verification: {}", network)),
-        }
-    };
-
-    // Update transaction store and return with correlation_id
-    match result {
-        Ok(verified_payload) => {
-            // Update transaction store
-            if let Some(store) = transaction_store
-                && let Err(e) = store
-                    .complete_verification(correlation_id)
-                    .await
-            {
-                channel_warn!(channel_id, "Failed to update transaction record: {}", e);
-            }
-            Ok((verified_payload, correlation_id.to_string()))
-        }
-        Err(e) => {
-            // Mark verification as failed in transaction store
-            if let Some(store) = transaction_store
-                && let Err(err) = store
-                    .fail_verification(correlation_id, e.clone())
-                    .await
-            {
-                channel_warn!(channel_id, "Failed to update transaction record: {}", err);
-            }
-
-            // Trigger integration alerts for verification failure
-            crate::integrations::trigger_transaction_verification_failed(
-                correlation_id,
-                channel_id,
-                &payload
-                    .tx_hash()
-                    .unwrap_or_default(),
-                &e,
-            )
-            .await;
-
-            Err(e)
         }
     }
 }
 
 /// Verify EVM transaction (Ethereum, Base, etc.)
 async fn verify_evm_transaction(
-    payload: &PaymentPayload,
+    requirement: &X402PaymentRequirement,
     tx_hash: &str,
     rpc_url: &str,
     config: &X402Config,
-    _channel_name: &str,
     channel_id: &str,
-) -> Result<PaymentPayload, String> {
+) -> Result<(), String> {
     use alloy::providers::{Provider, ProviderBuilder};
 
     // Create provider (we'll wrap RPC calls with timeout to prevent hanging)
@@ -618,8 +562,16 @@ async fn verify_evm_transaction(
                     .map_err(|e| format!("Failed to get transaction: {}", e))?
                     .ok_or_else(|| "Transaction not found".to_string())?;
 
-                return verify_evm_transaction_details(receipt, tx, payload, &provider, tx_hash, config, channel_id)
-                    .await;
+                return verify_evm_transaction_details(
+                    receipt,
+                    tx,
+                    requirement,
+                    &provider,
+                    tx_hash,
+                    config,
+                    channel_id,
+                )
+                .await;
             }
             Ok(Ok(None)) => {
                 last_error = format!("Transaction not found on blockchain (attempt {}/{})", attempt, max_retries);
@@ -690,12 +642,12 @@ async fn verify_evm_transaction(
 async fn verify_evm_transaction_details(
     receipt: alloy::rpc::types::TransactionReceipt,
     tx: alloy::rpc::types::Transaction,
-    payload: &PaymentPayload,
+    requirement: &X402PaymentRequirement,
     provider: &impl alloy::providers::Provider,
     tx_hash: &str,
     config: &X402Config,
     channel_id: &str,
-) -> Result<PaymentPayload, String> {
+) -> Result<(), String> {
     use alloy::consensus::Transaction as ConsensusTx;
 
     // Check confirmations first (applies to both token and native payments)
@@ -723,12 +675,8 @@ async fn verify_evm_transaction_details(
         ));
     }
 
-    // Check if this is a token payment or native currency payment
-    let is_token_payment = payload.asset().is_some();
-
-    if is_token_payment {
+    if let Some(token_address) = requirement.token_address() {
         // ERC-20 Token Payment Verification
-        let token_address = payload.asset().unwrap();
 
         // For token transfers, tx.to should be the token contract
         let contract_to = tx
@@ -781,8 +729,8 @@ async fn verify_evm_transaction_details(
             .skip(24) // Skip first 24 hex chars (12 bytes of padding)
             .collect::<String>();
 
-        let expected_to = payload
-            .pay_to()
+        let expected_to = requirement
+            .pay_to
             .trim_start_matches("0x")
             .to_lowercase();
         if recipient_addr != expected_to {
@@ -815,13 +763,13 @@ async fn verify_evm_transaction_details(
             u128::from_be_bytes(bytes)
         };
 
-        let expected_amount: u128 = payload
-            .amount()
+        let expected_amount: u128 = requirement
+            .amount
             .parse()
             .map_err(|_| "Invalid amount format".to_string())?;
 
         // Verify amount based on scheme
-        match payload.scheme() {
+        match requirement.scheme.as_str() {
             "exact" => {
                 if actual_amount != expected_amount {
                     return Err(format!(
@@ -853,11 +801,11 @@ async fn verify_evm_transaction_details(
             confirmations
         );
 
-        Ok(payload.clone())
+        Ok(())
     } else {
         // Native Currency (ETH/MATIC) Payment Verification
-        let expected_to = payload
-            .pay_to()
+        let expected_to = requirement
+            .pay_to
             .trim_start_matches("0x")
             .to_lowercase();
         let actual_to = tx
@@ -876,13 +824,13 @@ async fn verify_evm_transaction_details(
         }
 
         // Verify amount
-        let expected_amount: u128 = payload
-            .amount()
+        let expected_amount: u128 = requirement
+            .amount
             .parse()
             .map_err(|_| "Invalid amount format".to_string())?;
         let actual_amount = tx.inner.value().to::<u128>();
 
-        match payload.scheme() {
+        match requirement.scheme.as_str() {
             "exact" => {
                 if actual_amount != expected_amount {
                     return Err(format!(
@@ -915,22 +863,32 @@ async fn verify_evm_transaction_details(
             confirmations
         );
 
-        Ok(payload.clone())
+        Ok(())
     }
 }
 
 /// Verify Solana transaction
+///
+/// Only native SOL payments can be checked from a transaction hash: the recipient's lamport
+/// balance change is compared with the requirement. A requirement for an SPL token is refused
+/// here, because lamports say nothing about a token transfer.
 async fn verify_solana_transaction(
-    payload: &PaymentPayload,
+    requirement: &X402PaymentRequirement,
     tx_hash: &str,
     rpc_url: &str,
     channel_name: &str,
-    _channel_id: &str,
-) -> Result<PaymentPayload, String> {
+) -> Result<(), String> {
     use solana_client::rpc_client::RpcClient;
     use solana_sdk::signature::Signature;
     use solana_transaction_status::UiTransactionEncoding;
     use std::str::FromStr;
+
+    if let Some(mint) = requirement.token_address() {
+        return Err(format!(
+            "Solana transaction-hash verification supports native SOL only; asset {} needs the spl_transfer method",
+            mint
+        ));
+    }
 
     // Create RPC client
     let client = RpcClient::new(rpc_url.to_string());
@@ -954,12 +912,6 @@ async fn verify_solana_transaction(
         return Err("Solana transaction failed".to_string());
     }
 
-    // Parse amount from transaction (in lamports)
-    let expected_amount: u64 = payload
-        .amount()
-        .parse()
-        .map_err(|_| "Invalid amount format".to_string())?;
-
     // Get metadata
     let meta = tx
         .transaction
@@ -967,147 +919,77 @@ async fn verify_solana_transaction(
         .as_ref()
         .ok_or_else(|| "Transaction metadata not found".to_string())?;
 
-    // Get account keys from the transaction
-    // The EncodedTransaction contains account keys in different formats
     let account_keys: Vec<String> = match &tx.transaction.transaction {
-        solana_transaction_status::EncodedTransaction::Json(ui_tx) => {
-            // Extract account keys from the message
-            match &ui_tx.message {
-                solana_transaction_status::UiMessage::Parsed(parsed_msg) => parsed_msg
-                    .account_keys
-                    .iter()
-                    .map(|k| k.pubkey.clone())
-                    .collect(),
-                solana_transaction_status::UiMessage::Raw(raw_msg) => raw_msg.account_keys.clone(),
-            }
-        }
-        _ => {
-            // For non-JSON encodings, we can't easily extract account keys
-            // Fall back to balance change verification only
-            warn!(channel = channel_name, "Solana transaction encoding not JSON, using simplified verification");
-            Vec::new()
-        }
+        solana_transaction_status::EncodedTransaction::Json(ui_tx) => match &ui_tx.message {
+            solana_transaction_status::UiMessage::Parsed(parsed_msg) => parsed_msg
+                .account_keys
+                .iter()
+                .map(|k| k.pubkey.clone())
+                .collect(),
+            solana_transaction_status::UiMessage::Raw(raw_msg) => raw_msg.account_keys.clone(),
+        },
+        _ => return Err("Solana transaction is not JSON-encoded; cannot verify the recipient".to_string()),
     };
 
-    // Expected recipient address
-    let expected_recipient = payload.pay_to();
+    let credited = check_solana_lamport_payment(requirement, &account_keys, &meta.pre_balances, &meta.post_balances)?;
 
-    // Verify recipient is in the transaction (if we have account keys)
-    if !account_keys.is_empty() {
-        let recipient_found = account_keys
-            .iter()
-            .any(|key| key == expected_recipient);
+    info!(
+        channel = channel_name,
+        signature = %tx_hash,
+        recipient = %requirement.pay_to,
+        amount = %credited,
+        "Solana payment verified successfully"
+    );
 
-        if !recipient_found {
-            return Err(format!("Payment recipient {} not found in transaction", expected_recipient));
-        }
+    Ok(())
+}
 
-        // Find recipient index in account keys for balance verification
-        let recipient_index = account_keys
-            .iter()
-            .position(|key| key == expected_recipient)
-            .ok_or_else(|| "Recipient not found in account keys".to_string())?;
-
-        // Get balance change for recipient
-        let pre_balance = meta
-            .pre_balances
-            .get(recipient_index)
+/// Check the lamports a Solana transaction credited to the requirement's `pay_to` against its
+/// amount; returns the credited lamports
+fn check_solana_lamport_payment(
+    requirement: &X402PaymentRequirement,
+    account_keys: &[String],
+    pre_balances: &[u64],
+    post_balances: &[u64],
+) -> Result<u64, String> {
+    let expected_amount: u64 = requirement
+        .amount
+        .parse()
+        .map_err(|_| "Invalid amount format".to_string())?;
+    let recipient = requirement.pay_to.as_str();
+    let index = account_keys
+        .iter()
+        .position(|key| key == recipient)
+        .ok_or_else(|| format!("Payment recipient {} not found in transaction", recipient))?;
+    let balance = |balances: &[u64]| {
+        balances
+            .get(index)
             .copied()
-            .unwrap_or(0);
-        let post_balance = meta
-            .post_balances
-            .get(recipient_index)
-            .copied()
-            .unwrap_or(0);
-        let actual_amount = post_balance.saturating_sub(pre_balance);
+            .unwrap_or(0)
+    };
+    let credited = balance(post_balances).saturating_sub(balance(pre_balances));
 
-        match payload.scheme() {
-            "exact" => {
-                if actual_amount != expected_amount {
-                    return Err(format!(
-                        "Solana payment amount mismatch: expected {} lamports, got {} lamports (recipient: {})",
-                        expected_amount, actual_amount, expected_recipient
-                    ));
-                }
-            }
-            "upto" => {
-                if actual_amount < expected_amount {
-                    return Err(format!(
-                        "Solana payment amount too low: expected at least {} lamports, got {} lamports (recipient: {})",
-                        expected_amount, actual_amount, expected_recipient
-                    ));
-                }
-            }
-            scheme => {
-                return Err(format!("Unsupported payment scheme: {}", scheme));
-            }
-        }
-
-        info!(
-            channel = channel_name,
-            signature = %tx_hash,
-            recipient = %expected_recipient,
-            amount = %actual_amount,
-            "Solana payment verified successfully"
-        );
-    } else {
-        // If we couldn't extract account keys, just verify based on maximum balance increase
-        // This is less secure but better than nothing
-        let balance_changes: Vec<_> = meta
-            .post_balances
-            .iter()
-            .zip(meta.pre_balances.iter())
-            .map(|(post, pre)| post.saturating_sub(*pre))
-            .collect();
-
-        let max_increase = balance_changes
-            .iter()
-            .max()
-            .copied()
-            .unwrap_or(0);
-
-        match payload.scheme() {
-            "exact" => {
-                if max_increase != expected_amount {
-                    return Err(format!(
-                        "Solana payment amount mismatch: expected {} lamports, got {} lamports (simplified check)",
-                        expected_amount, max_increase
-                    ));
-                }
-            }
-            "upto" => {
-                if max_increase < expected_amount {
-                    return Err(format!(
-                        "Solana payment amount too low: expected at least {} lamports, got {} lamports (simplified check)",
-                        expected_amount, max_increase
-                    ));
-                }
-            }
-            scheme => {
-                return Err(format!("Unsupported payment scheme: {}", scheme));
-            }
-        }
-
-        warn!(
-            channel = channel_name,
-            signature = %tx_hash,
-            amount = %max_increase,
-            "Solana payment verified with simplified check (recipient not verified)"
-        );
+    match requirement.scheme.as_str() {
+        "exact" if credited != expected_amount => Err(format!(
+            "Solana payment amount mismatch: expected {} lamports, got {} lamports (recipient: {})",
+            expected_amount, credited, recipient
+        )),
+        "upto" if credited < expected_amount => Err(format!(
+            "Solana payment amount too low: expected at least {} lamports, got {} lamports (recipient: {})",
+            expected_amount, credited, recipient
+        )),
+        "exact" | "upto" => Ok(credited),
+        scheme => Err(format!("Unsupported payment scheme: {}", scheme)),
     }
-
-    Ok(payload.clone())
 }
 
 /// Verify payment via external facilitator using x402-rs
 async fn verify_facilitator_payment(
     payload: &PaymentPayload,
-    correlation_id: &str,
+    requirement: &X402PaymentRequirement,
     config: &X402Config,
     channel_name: &str,
-    channel_id: &str,
-    transaction_store: &Option<Arc<TransactionStore>>,
-) -> Result<(PaymentPayload, String), String> {
+) -> Result<(), String> {
     use super::remote_facilitator::RemoteFacilitator;
 
     let facilitator_url = config
@@ -1119,47 +1001,10 @@ async fn verify_facilitator_payment(
     let facilitator = RemoteFacilitator::new(facilitator_url).await?;
 
     // Verify payment using x402-rs protocol
-    let result = facilitator
-        .verify(payload, channel_name)
-        .await;
-
-    // Update transaction store and return with correlation_id
-    match result {
-        Ok(_) => {
-            // Update transaction store
-            if let Some(store) = transaction_store
-                && let Err(e) = store
-                    .complete_verification(correlation_id)
-                    .await
-            {
-                channel_warn!(channel_id, "Failed to update transaction record: {}", e);
-            }
-            Ok((payload.clone(), correlation_id.to_string()))
-        }
-        Err(e) => {
-            // Mark verification as failed in transaction store
-            if let Some(store) = transaction_store
-                && let Err(err) = store
-                    .fail_verification(correlation_id, e.clone())
-                    .await
-            {
-                channel_warn!(channel_id, "Failed to update transaction record: {}", err);
-            }
-
-            // Trigger integration alerts for verification failure
-            crate::integrations::trigger_transaction_verification_failed(
-                correlation_id,
-                channel_id,
-                &payload
-                    .tx_hash()
-                    .unwrap_or_default(),
-                &e,
-            )
-            .await;
-
-            Err(e)
-        }
-    }
+    facilitator
+        .verify(payload, requirement, channel_name)
+        .await
+        .map(|_| ())
 }
 
 /// Create payment response header
@@ -1258,9 +1103,9 @@ pub fn extract_payment_signature_with_mcp(
 /// Verify EIP-3009 transferWithAuthorization signature
 async fn verify_eip3009_signature(
     payload: &PaymentPayload,
-    _config: &X402Config,
+    requirement: &X402PaymentRequirement,
     channel_id: &str,
-) -> Result<PaymentPayload, String> {
+) -> Result<(), String> {
     use alloy::primitives::{Address, B256, U256, keccak256};
     use alloy::signers::Signature as AlloySignature;
     use alloy::sol_types::eip712_domain;
@@ -1369,17 +1214,17 @@ async fn verify_eip3009_signature(
     }
 
     // Verify amount matches requirement
-    let required_amount: U256 = payload
-        .amount()
+    let required_amount: U256 = requirement
+        .amount
         .parse()
         .map_err(|_| "Invalid required amount".to_string())?;
-    if value < required_amount {
-        return Err(format!("Insufficient payment amount: {} < {}", value, required_amount));
+    if value != required_amount {
+        return Err(format!("Payment amount mismatch: {} != {}", value, required_amount));
     }
 
     // Verify recipient matches
-    let expected_to: Address = payload
-        .pay_to()
+    let expected_to: Address = requirement
+        .pay_to
         .parse()
         .map_err(|_| "Invalid payTo address".to_string())?;
     if to_addr != expected_to {
@@ -1387,9 +1232,9 @@ async fn verify_eip3009_signature(
     }
 
     // Get token contract address from asset field
-    channel_debug!(channel_id, "Looking for asset in accepted: {:?}", payload.accepted.asset);
-    let token_addr: Address = payload
-        .asset()
+    channel_debug!(channel_id, "Looking for asset in payment requirement: {:?}", requirement.asset);
+    let token_addr: Address = requirement
+        .token_address()
         .ok_or_else(|| "Asset address required".to_string())?
         .parse()
         .map_err(|e| format!("Invalid token address: {}", e))?;
@@ -1406,8 +1251,7 @@ async fn verify_eip3009_signature(
 
     // Get token name and version from payment requirements extra field
     // These come from the channel config and should match the actual token contract's name() and version()
-    let token_name = payload
-        .accepted
+    let token_name = requirement
         .extra
         .as_ref()
         .and_then(|extra| extra.get("name"))
@@ -1418,8 +1262,7 @@ async fn verify_eip3009_signature(
                 .to_string()
         })?;
 
-    let token_version = payload
-        .accepted
+    let token_version = requirement
         .extra
         .as_ref()
         .and_then(|extra| extra.get("version"))
@@ -1438,14 +1281,14 @@ async fn verify_eip3009_signature(
     );
 
     // Parse chain_id from network (CAIP-2 format: "eip155:84532" -> 84532)
-    let chain_id = payload
-        .network()
+    let chain_id = requirement
+        .network
         .strip_prefix("eip155:")
-        .ok_or_else(|| format!("Invalid network format (expected eip155:chainId): {}", payload.network()))?
+        .ok_or_else(|| format!("Invalid network format (expected eip155:chainId): {}", requirement.network))?
         .parse::<u64>()
-        .map_err(|e| format!("Invalid chain_id in network {}: {}", payload.network(), e))?;
+        .map_err(|e| format!("Invalid chain_id in network {}: {}", requirement.network, e))?;
 
-    channel_info!(channel_id, "EIP3009 Parsed chain_id={} from network={}", chain_id, payload.network());
+    channel_info!(channel_id, "EIP3009 Parsed chain_id={} from network={}", chain_id, requirement.network);
 
     // Define the domain separator for the token contract
     let domain = eip712_domain! {
@@ -1502,7 +1345,7 @@ async fn verify_eip3009_signature(
         "EIP3009 Debug - Domain: name={} version={} chainId={} contract={}",
         token_name,
         token_version,
-        84532,
+        chain_id,
         token_addr
     );
 
@@ -1565,7 +1408,7 @@ async fn verify_eip3009_signature(
         recovered_addr
     );
 
-    Ok(payload.clone())
+    Ok(())
 }
 
 /// Verify EIP-3009 payment with on-chain state checks (for local verification mode)
@@ -1579,9 +1422,9 @@ async fn verify_eip3009_signature(
 /// Verify Permit2 permitWitnessTransferFrom signature
 async fn verify_permit2_signature(
     payload: &PaymentPayload,
-    _config: &X402Config,
+    requirement: &X402PaymentRequirement,
     channel_id: &str,
-) -> Result<PaymentPayload, String> {
+) -> Result<(), String> {
     use alloy::primitives::{Address, U256, keccak256};
     use alloy::signers::Signature as AlloySignature;
     use alloy::sol_types::eip712_domain;
@@ -1667,17 +1510,17 @@ async fn verify_permit2_signature(
     }
 
     // Verify amount matches requirement
-    let required_amount: U256 = payload
-        .amount()
+    let required_amount: U256 = requirement
+        .amount
         .parse()
         .map_err(|_| "Invalid required amount".to_string())?;
-    if amount < required_amount {
-        return Err(format!("Insufficient payment amount: {} < {}", amount, required_amount));
+    if amount != required_amount {
+        return Err(format!("Payment amount mismatch: {} != {}", amount, required_amount));
     }
 
     // Verify recipient matches (via witness)
-    let expected_to: Address = payload
-        .pay_to()
+    let expected_to: Address = requirement
+        .pay_to
         .parse()
         .map_err(|_| "Invalid payTo address".to_string())?;
     if witness_to != expected_to {
@@ -1685,8 +1528,8 @@ async fn verify_permit2_signature(
     }
 
     // Verify token matches
-    let expected_token_addr: Address = payload
-        .asset()
+    let expected_token_addr: Address = requirement
+        .token_address()
         .ok_or_else(|| "Asset address required".to_string())?
         .parse()
         .map_err(|_| "Invalid asset address".to_string())?;
@@ -1701,14 +1544,14 @@ async fn verify_permit2_signature(
         .unwrap();
 
     // Parse chain_id from network (CAIP-2 format: "eip155:84532" -> 84532)
-    let chain_id = payload
-        .network()
+    let chain_id = requirement
+        .network
         .strip_prefix("eip155:")
-        .ok_or_else(|| format!("Invalid network format (expected eip155:chainId): {}", payload.network()))?
+        .ok_or_else(|| format!("Invalid network format (expected eip155:chainId): {}", requirement.network))?
         .parse::<u64>()
-        .map_err(|e| format!("Invalid chain_id in network {}: {}", payload.network(), e))?;
+        .map_err(|e| format!("Invalid chain_id in network {}: {}", requirement.network, e))?;
 
-    channel_info!(channel_id, "Permit2 Using chain_id={} from network={}", chain_id, payload.network());
+    channel_info!(channel_id, "Permit2 Using chain_id={} from network={}", chain_id, requirement.network);
 
     // Define domain separator for Permit2
     // Permit2 uses a static domain across all networks (only chain_id varies)
@@ -1794,7 +1637,7 @@ async fn verify_permit2_signature(
         recovered_addr
     );
 
-    Ok(payload.clone())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1802,34 +1645,561 @@ mod tests {
     use super::*;
     use crate::config::types::X402VerificationMode;
     use base64::Engine;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
-    fn payment_header() -> String {
-        let payload_json = r#"{
+    const MERCHANT: &str = "0x00000000000000000000000000000000000000AA";
+    const ATTACKER: &str = "0x00000000000000000000000000000000000000BB";
+    const TOKEN: &str = "0x00000000000000000000000000000000000000CC";
+
+    fn requirement(
+        scheme: &str,
+        pay_to: &str,
+        amount: &str,
+    ) -> X402PaymentRequirement {
+        X402PaymentRequirement {
+            scheme: scheme.to_string(),
+            network: "eip155:1".to_string(),
+            amount: amount.to_string(),
+            asset: TOKEN.to_string(),
+            recipient_id: String::new(),
+            pay_to: pay_to.to_string(),
+            max_timeout_seconds: 300,
+            extra: Some(serde_json::json!({"name": "USDC", "version": "2", "assetTransferMethod": "eip3009"})),
+        }
+    }
+
+    fn configured() -> X402PaymentRequirement {
+        requirement("exact", MERCHANT, "1000000")
+    }
+
+    fn config(mode: X402VerificationMode) -> X402Config {
+        X402Config {
+            verification_mode: mode,
+            payment_requirements: vec![configured()],
+            ..Default::default()
+        }
+    }
+
+    fn payment_header_for(
+        accepted: &X402PaymentRequirement,
+        nonce: &str,
+    ) -> String {
+        let payload = serde_json::json!({
             "x402Version": 2,
             "resource": {"url": "/test", "description": "test", "mimeType": "application/json"},
-            "accepted": {
-                "scheme": "exact",
-                "network": "eip155:1",
-                "amount": "1000",
-                "asset": "0x123",
-                "payTo": "0x456",
-                "maxTimeoutSeconds": 300
-            },
+            "accepted": accepted,
             "payload": {
                 "authorization": {
-                    "from": "0xabc",
-                    "to": "0x456",
-                    "value": "1000",
+                    "from": ATTACKER,
+                    "to": accepted.pay_to,
+                    "value": accepted.amount,
                     "validAfter": "0",
-                    "validBefore": "999999999",
-                    "nonce": "0x123"
+                    "validBefore": "999999999999",
+                    "nonce": nonce
                 },
                 "signature": "0xsig"
             }
-        }"#;
+        });
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&payload).unwrap())
+    }
 
-        base64::engine::general_purpose::STANDARD.encode(payload_json.as_bytes())
+    fn payment_header() -> String {
+        payment_header_for(&configured(), "0x01")
+    }
+
+    const NOT_ISSUED: &str = "Payment does not match any payment requirement issued for this resource";
+
+    fn issued(requirements: &[X402PaymentRequirement]) -> Vec<X402PaymentRequirement> {
+        requirements
+            .iter()
+            .cloned()
+            .map(|mut requirement| {
+                crate::x402::normalize_requirement_addresses(&mut requirement);
+                requirement
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolves_accepted_echoing_the_issued_requirement() {
+        let issued = issued(&[configured()]);
+
+        let resolved = resolve_payment_requirement(&issued[0], &issued).unwrap();
+
+        assert_eq!(resolved.pay_to, MERCHANT.to_lowercase());
+        assert_eq!(resolved.asset, TOKEN.to_lowercase());
+        assert_eq!(resolved.amount, "1000000");
+    }
+
+    #[test]
+    fn resolves_evm_addresses_case_insensitively() {
+        let resolved = resolve_payment_requirement(&configured(), &issued(&[configured()])).unwrap();
+
+        assert_eq!(resolved.pay_to, MERCHANT.to_lowercase());
+    }
+
+    #[test]
+    fn resolution_returns_the_issued_requirement_not_the_callers() {
+        let mut accepted = configured();
+        accepted.max_timeout_seconds = 1;
+        accepted.extra =
+            Some(serde_json::json!({"name": "USDC", "version": "2", "assetTransferMethod": "eip3009", "decimals": 99}));
+
+        let resolved = resolve_payment_requirement(&accepted, &issued(&[configured()])).unwrap();
+
+        assert_eq!(resolved.max_timeout_seconds, 300);
+        assert_eq!(resolved.extra, configured().extra);
+    }
+
+    #[test]
+    fn rejects_accepted_naming_another_eip712_domain_or_transfer_method() {
+        let with_extra = |extra: serde_json::Value| {
+            let mut accepted = configured();
+            accepted.extra = Some(extra);
+            accepted
+        };
+
+        for accepted in [
+            with_extra(serde_json::json!({"name": "Forged", "version": "2", "assetTransferMethod": "eip3009"})),
+            with_extra(serde_json::json!({"name": "USDC", "version": "9", "assetTransferMethod": "eip3009"})),
+            with_extra(serde_json::json!({"name": "USDC", "version": "2", "assetTransferMethod": "permit2"})),
+            with_extra(serde_json::json!({"assetTransferMethod": "eip3009"})),
+        ] {
+            assert_eq!(
+                resolve_payment_requirement(&accepted, &issued(&[configured()])).unwrap_err(),
+                NOT_ISSUED,
+                "{:?}",
+                accepted.extra
+            );
+        }
+    }
+
+    #[test]
+    fn selects_among_requirements_that_differ_only_in_transfer_method() {
+        let mut permit2 = configured();
+        permit2.extra = Some(serde_json::json!({"name": "USDC", "version": "2", "assetTransferMethod": "permit2"}));
+        let issued = issued(&[configured(), permit2.clone()]);
+
+        let resolved_eip3009 = resolve_payment_requirement(&configured(), &issued).unwrap();
+        let resolved_permit2 = resolve_payment_requirement(&permit2, &issued).unwrap();
+
+        assert_eq!(resolved_eip3009.asset_transfer_method(), "eip3009");
+        assert_eq!(resolved_permit2.asset_transfer_method(), "permit2");
+    }
+
+    #[test]
+    fn keeps_solana_addresses_case_sensitive() {
+        let solana = X402PaymentRequirement {
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
+            asset: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+            pay_to: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            ..configured()
+        };
+        let issued = issued(std::slice::from_ref(&solana));
+        let mut lowercased = solana.clone();
+        lowercased.pay_to = solana.pay_to.to_lowercase();
+
+        assert_eq!(issued[0].pay_to, solana.pay_to);
+        assert_eq!(issued[0].asset, solana.asset);
+        assert!(resolve_payment_requirement(&solana, &issued).is_ok());
+        assert_eq!(resolve_payment_requirement(&lowercased, &issued).unwrap_err(), NOT_ISSUED);
+    }
+
+    #[test]
+    fn rejects_accepted_naming_another_recipient() {
+        let accepted = requirement("exact", ATTACKER, "1000000");
+
+        let error = resolve_payment_requirement(&accepted, &issued(&[configured()])).unwrap_err();
+
+        assert_eq!(error, NOT_ISSUED);
+    }
+
+    #[test]
+    fn rejects_exact_amount_other_than_configured() {
+        for amount in ["1", "999999", "1000001", "not-a-number", ""] {
+            let accepted = requirement("exact", MERCHANT, amount);
+            assert_eq!(
+                resolve_payment_requirement(&accepted, &issued(&[configured()])).unwrap_err(),
+                NOT_ISSUED,
+                "amount {amount}"
+            );
+        }
+    }
+
+    #[test]
+    fn upto_requires_the_configured_amount() {
+        let issued = issued(&[requirement("upto", MERCHANT, "1000000")]);
+
+        let resolved = resolve_payment_requirement(&requirement("upto", MERCHANT, "1000000"), &issued);
+
+        assert_eq!(resolved.unwrap().amount, "1000000");
+        for amount in ["999999", "1000001"] {
+            assert_eq!(
+                resolve_payment_requirement(&requirement("upto", MERCHANT, amount), &issued).unwrap_err(),
+                NOT_ISSUED,
+                "amount {amount}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_accepted_with_another_scheme_network_or_asset() {
+        let mut other_scheme = configured();
+        other_scheme.scheme = "upto".to_string();
+        let mut other_network = configured();
+        other_network.network = "eip155:8453".to_string();
+        let mut other_asset = configured();
+        other_asset.asset = ATTACKER.to_string();
+        let mut unknown_scheme = configured();
+        unknown_scheme.scheme = "stream".to_string();
+        let issued = issued(&[configured(), unknown_scheme.clone()]);
+
+        for accepted in [other_scheme, other_network, other_asset, unknown_scheme] {
+            assert_eq!(resolve_payment_requirement(&accepted, &issued).unwrap_err(), NOT_ISSUED);
+        }
+    }
+
+    #[test]
+    fn rejects_any_accepted_when_no_requirement_is_issued() {
+        assert_eq!(resolve_payment_requirement(&configured(), &[]).unwrap_err(), NOT_ISSUED);
+    }
+
+    #[test]
+    fn selects_the_requirement_matching_the_offered_recipient() {
+        let issued = issued(&[requirement("exact", ATTACKER, "5"), configured()]);
+
+        let resolved = resolve_payment_requirement(&configured(), &issued).unwrap();
+
+        assert_eq!(resolved.pay_to, MERCHANT.to_lowercase());
+        assert_eq!(resolved.amount, "1000000");
+    }
+
+    #[tokio::test]
+    async fn rejects_unissued_requirement_in_every_verification_mode() {
+        let self_payment = requirement("exact", ATTACKER, "1");
+        let modes = [
+            X402VerificationMode::Mock,
+            X402VerificationMode::Local,
+            X402VerificationMode::Signature,
+            X402VerificationMode::ExternalFacilitator,
+            X402VerificationMode::FabricGateway,
+        ];
+
+        for (index, mode) in modes.into_iter().enumerate() {
+            let temp_dir = tempdir().unwrap();
+            let store = Arc::new(
+                TransactionStore::new(temp_dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let header = payment_header_for(&self_payment, &format!("0x{index:02x}"));
+
+            let error = verify_payment(
+                &header,
+                &config(mode.clone()),
+                "Test Channel",
+                "channel-1",
+                "/test",
+                None,
+                Some(Arc::clone(&store)),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error, NOT_ISSUED, "{mode:?}");
+            let transactions = store.list_all().await;
+            assert_eq!(transactions.len(), 1, "{mode:?}");
+            assert_eq!(
+                transactions[0]
+                    .verification
+                    .status,
+                crate::x402::transaction_store::VerificationStatus::Failed,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_payload_carries_the_configured_requirement() {
+        let mut accepted = configured();
+        accepted.max_timeout_seconds = 1;
+        accepted.extra = Some(
+            serde_json::json!({"name": "USDC", "version": "2", "assetTransferMethod": "eip3009", "symbol": "FORGED"}),
+        );
+        let temp_dir = tempdir().unwrap();
+        let store = Arc::new(
+            TransactionStore::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+
+        let (payload, correlation_id) = verify_payment(
+            &payment_header_for(&accepted, "0x02"),
+            &config(X402VerificationMode::Mock),
+            "Test Channel",
+            "channel-1",
+            "/test",
+            None,
+            Some(Arc::clone(&store)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(payload.accepted.pay_to, MERCHANT.to_lowercase());
+        assert_eq!(
+            payload
+                .accepted
+                .max_timeout_seconds,
+            300
+        );
+        assert_eq!(payload.accepted.extra, configured().extra);
+        let stored = store
+            .get(&correlation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored
+                .payment_payload
+                .accepted
+                .extra,
+            configured().extra
+        );
+    }
+
+    alloy::sol! {
+        struct TransferWithAuthorization {
+            address from;
+            address to;
+            uint256 value;
+            uint256 validAfter;
+            uint256 validBefore;
+            bytes32 nonce;
+        }
+    }
+
+    fn signed_eip3009_header(
+        signer: &alloy_signer_local::PrivateKeySigner,
+        accepted: &X402PaymentRequirement,
+        domain_name: &str,
+        value: &str,
+    ) -> String {
+        use alloy::primitives::{Address, B256, U256};
+        use alloy::sol_types::{SolStruct, eip712_domain};
+        use alloy_signer::SignerSync;
+
+        let nonce = B256::repeat_byte(7);
+        let valid_before = 4_000_000_000u64;
+        let authorization = TransferWithAuthorization {
+            from: signer.address(),
+            to: accepted
+                .pay_to
+                .parse()
+                .unwrap(),
+            value: U256::from_str_radix(value, 10).unwrap(),
+            validAfter: U256::ZERO,
+            validBefore: U256::from(valid_before),
+            nonce,
+        };
+        let domain = eip712_domain! {
+            name: domain_name.to_string(),
+            version: "2",
+            chain_id: 1,
+            verifying_contract: TOKEN.parse::<Address>().unwrap(),
+        };
+        let signature = signer
+            .sign_hash_sync(&authorization.eip712_signing_hash(&domain))
+            .unwrap();
+        let payload = serde_json::json!({
+            "x402Version": 2,
+            "accepted": accepted,
+            "payload": {
+                "authorization": {
+                    "from": signer.address().to_string(),
+                    "to": accepted.pay_to,
+                    "value": value,
+                    "validAfter": "0",
+                    "validBefore": valid_before.to_string(),
+                    "nonce": nonce.to_string()
+                },
+                "signature": format!("0x{}", hex::encode(signature.as_bytes()))
+            }
+        });
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&payload).unwrap())
+    }
+
+    async fn verify_in_signature_mode(header: &str) -> Result<(PaymentPayload, String), String> {
+        verify_payment(
+            header,
+            &config(X402VerificationMode::Signature),
+            "Test Channel",
+            "channel-1",
+            "/test",
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn signature_mode_accepts_honest_eip3009_credential() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+
+        let result = verify_in_signature_mode(&signed_eip3009_header(&signer, &configured(), "USDC", "1000000")).await;
+
+        assert_eq!(
+            result
+                .unwrap()
+                .0
+                .accepted
+                .pay_to,
+            MERCHANT.to_lowercase()
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_mode_takes_eip712_domain_from_configured_requirement() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+
+        let error = verify_in_signature_mode(&signed_eip3009_header(&signer, &configured(), "Forged", "1000000"))
+            .await
+            .unwrap_err();
+
+        assert!(error.starts_with("Signature verification failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn signature_mode_rejects_authorised_value_other_than_configured() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+
+        let error = verify_in_signature_mode(&signed_eip3009_header(&signer, &configured(), "USDC", "1000001"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "Payment amount mismatch: 1000001 != 1000000");
+    }
+
+    fn solana_native(amount: &str) -> X402PaymentRequirement {
+        X402PaymentRequirement {
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
+            asset: String::new(),
+            pay_to: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            extra: None,
+            ..requirement("exact", MERCHANT, amount)
+        }
+    }
+
+    #[test]
+    fn solana_lamport_payment_must_credit_the_configured_recipient_and_amount() {
+        let requirement = solana_native("5000");
+        let keys = vec!["Payer1111111111111111111111111111111111111".to_string(), requirement.pay_to.clone()];
+
+        assert_eq!(check_solana_lamport_payment(&requirement, &keys, &[90_000, 10_000], &[85_000, 15_000]), Ok(5000));
+        assert_eq!(
+            check_solana_lamport_payment(&requirement, &keys, &[90_000, 10_000], &[86_000, 14_000]).unwrap_err(),
+            format!(
+                "Solana payment amount mismatch: expected 5000 lamports, got 4000 lamports (recipient: {})",
+                requirement.pay_to
+            )
+        );
+        assert_eq!(
+            check_solana_lamport_payment(&requirement, &keys[..1], &[90_000], &[85_000]).unwrap_err(),
+            format!("Payment recipient {} not found in transaction", requirement.pay_to)
+        );
+    }
+
+    #[tokio::test]
+    async fn solana_transaction_hash_path_refuses_token_requirements() {
+        let requirement = X402PaymentRequirement {
+            asset: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+            ..solana_native("1000000")
+        };
+
+        let error = verify_solana_transaction(&requirement, "not-a-signature", "http://127.0.0.1:9", "Test Channel")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Solana transaction-hash verification supports native SOL only; asset 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU needs the spl_transfer method"
+        );
+    }
+
+    async fn mock_facilitator() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/verify",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(body);
+                async { axum::Json(serde_json::json!({"isValid": true, "payer": ATTACKER})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (format!("http://{address}"), requests)
+    }
+
+    #[tokio::test]
+    async fn external_facilitator_is_not_called_for_unissued_requirement() {
+        let (url, requests) = mock_facilitator().await;
+        let config = X402Config {
+            facilitator_url: Some(url),
+            ..config(X402VerificationMode::ExternalFacilitator)
+        };
+
+        let error = verify_payment(
+            &payment_header_for(&requirement("exact", ATTACKER, "1"), "0x03"),
+            &config,
+            "Test Channel",
+            "channel-1",
+            "/test",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, NOT_ISSUED);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn external_facilitator_receives_the_configured_requirement() {
+        let (url, requests) = mock_facilitator().await;
+        let config = X402Config {
+            facilitator_url: Some(url),
+            ..config(X402VerificationMode::ExternalFacilitator)
+        };
+
+        let (payload, _) =
+            verify_payment(&payment_header(), &config, "Test Channel", "channel-1", "/test", None, None, None)
+                .await
+                .unwrap();
+
+        assert_eq!(payload.accepted.pay_to, MERCHANT.to_lowercase());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0]["paymentRequirements"];
+        assert_eq!(sent["payTo"], MERCHANT.to_lowercase());
+        assert_eq!(sent["asset"], TOKEN.to_lowercase());
+        assert_eq!(sent["amount"], "1000000");
+        assert_eq!(requests[0]["paymentPayload"]["accepted"]["payTo"], MERCHANT);
     }
 
     #[tokio::test]
@@ -1840,10 +2210,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let config = X402Config {
-            verification_mode: X402VerificationMode::Mock,
-            ..Default::default()
-        };
+        let config = config(X402VerificationMode::Mock);
         let payment_header = payment_header();
 
         let first_result = verify_payment(
@@ -1877,10 +2244,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let config = Arc::new(X402Config {
-            verification_mode: X402VerificationMode::Mock,
-            ..Default::default()
-        });
+        let config = Arc::new(config(X402VerificationMode::Mock));
         let payment_header = Arc::new(payment_header());
 
         let tasks = (0..8)

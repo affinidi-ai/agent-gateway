@@ -938,6 +938,7 @@ pub async fn run_axum_proxy(
                 // Worker checks facilitator_gateway_id to determine what to settle
                 info!("Starting crash recovery for unsettled payments...");
                 let txn_store_rec = Arc::clone(&store_arc);
+                let recovery_bootstrap_config = Arc::clone(&bootstrap_config);
                 let facilitator_enabled = config
                     .facilitator_mode
                     .facilitator_via_fabric
@@ -947,7 +948,7 @@ pub async fn run_axum_proxy(
                 tokio::spawn(async move {
                     crate::x402::recover_unsettled_on_startup(
                         txn_store_rec,
-                        None, // No settlement_backend needed
+                        recovery_bootstrap_config,
                         facilitator_enabled,
                     )
                     .await;

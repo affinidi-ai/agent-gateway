@@ -25,6 +25,7 @@ The bootstrap TOML is the entry point. Everything else is named from it.
 | `saml.json` | SAML identity provider, when `auth_mode = "saml"` | Startup |
 | `x402.json` | x402 payment networks, assets, and facilitator settings | Startup |
 | `x402-proxy.json` | Networks and wallets for the x402 proxy | Startup |
+| `test-endpoints.json` | Payment requirements for the x402 test endpoints, when `facilitator_mode.enable_test_endpoints` is on | Startup |
 | `agent_surface_templates/` | Surface templates seeded into the template store | Startup |
 
 **No configuration file is re-read after startup.** `POST /v1/config/reload` rebuilds the
@@ -297,6 +298,14 @@ logs a warning and starts neither.
 
 Transaction records are always kept on the filesystem; other keys in these sections are
 ignored.
+
+`test-endpoints.json` (`[config_files].test_endpoints`) feeds the unauthenticated x402 test
+endpoints, which are mounted only when `facilitator_mode.enable_test_endpoints` is on. Its `evm`,
+`solana_devnet`, and `solana_mainnet` entries each give a `network`, `rpc_endpoint`,
+`token_address`, `recipient`, and `amount`; each endpoint issues and verifies against one `exact`
+requirement built from them. The `evm` entry also takes `payment_method`, and optional `token_name`
+and `token_version`, issued as the EIP-712 `extra.name` and `extra.version` that `/protected`
+(EIP-3009) needs.
 
 Both reach live payment infrastructure. A network entry pointing at mainnet moves real
 value. The demo scripts and a worked walkthrough are in
