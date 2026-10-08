@@ -1350,7 +1350,8 @@ dropped before it creates an offer, because the offer table is shared by every
 peer. An Open that preparation refuses, or that times out in admission, is
 answered with an `Error` frame when it comes from an active peer on this
 listener, so the sending gateway fails at once instead of waiting for its
-response deadline. The frame says why:
+response deadline. Past 16 refusals awaiting an answer, further refusals go
+unanswered (see [Framed Fabric limits](#framed-fabric-limits)). The frame says why:
 
 | Code | Refusal | Sender |
 | --- | --- | --- |
@@ -1536,7 +1537,7 @@ process.
 | Stream progress | `stream_idle_timeout_secs` (default 60 s) bounds an upload and the Credit and EndAck waits while frames are outstanding; a quiet subscription has nothing outstanding and is not affected | The stream ends |
 | Opens per peer | 50/s, burst 100, per listener | The Open is refused before any lookup |
 | Capability queries per sender | 10/s, burst 20, per listener | The query is dropped |
-| Refused Opens being answered | 16 at a time, off the listener's reader loop | Further refusals are not answered; the sender waits for its response deadline |
+| Refused Opens being answered | 16 at a time per listener, across all peers, off the listener's reader loop | Further refusals are not answered and are logged at `warn`; the sender waits for its response deadline and its caller gets `504` |
 | `subscriptions/listen` per caller | 16 (the authenticated principal, or the client IP or peer DID when unauthenticated) | `429` |
 | `subscriptions/listen` per surface | 256 across callers | `429` |
 | Pending consent continuations per caller | 64 by default (`mcp.continuations.max_pending_per_principal`) | `429` for that caller only |
@@ -1552,7 +1553,21 @@ cap applies first over Fabric, the 16-per-caller listen limit cannot be
 reached there. The receiver picks the budget from the Open's `Mcp-Method`
 header before the body arrives, so a paired peer that labels other requests
 as listens can hold up to 16 streams; the per-surface and total caps still
-bound it.
+bound it. Counting listens apart doubles the effective ceilings: one peer can
+hold 16 inbound streams (8 request streams and 8 listens) and one surface 32
+(16 and 16); only the total of 128 counts both.
+
+**A full sending cap answers listens with `Retry-After: 5` too.** A listen
+slot may stay held for up to an hour, so a slot is unlikely to free within
+5 s, but the sending gateway checks its own caps before it sends an Open, so a
+caller retrying on that interval costs local work only and sends nothing to
+the peer.
+
+**Cap refusals are logged.** Each registration refused by a full cap is logged
+at `warn` as `Fabric stream cap reached`, with `peer_did`, `surface_id`,
+`kind` (`Request` or `Listen`), `direction`, and `cap`: `total`, `per_peer`,
+`per_surface`, or `open_replay` for a full Open replay table. The receiver's
+`Rejecting Fabric Open` warning also carries the sending peer's DID.
 
 **Modern MCP is active on every MCP endpoint, so weigh shared state before
 exposing a multi-tenant or internet-facing gateway.** Gateway-wide tables and

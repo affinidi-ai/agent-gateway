@@ -253,8 +253,9 @@ multi-tenant or internet-facing gateway: some gateway-wide tables and signals
 are shared across tenants and peers (appliance-wide access changes still end
 every subscription, and the capability offer and Open replay tables are shared), and the limits are per caller,
 per peer or per surface, never per tenant. Framed streams are capped at 8 per peer and 16 per surface,
-with listens counted apart from request streams, so a partner's long-lived listens do not use up its
-request slots. Past a cap on the sending gateway the caller gets `429` with `Retry-After: 5`; past a cap
+with listens counted apart from request streams under their own caps of the same size, so a partner's
+long-lived listens do not use up its request slots. One peer can therefore hold 16 inbound streams and
+one surface 32; only the total of 128 counts both. Past a cap on the sending gateway the caller gets `429` with `Retry-After: 5`; past a cap
 on the receiving gateway it gets `502`, because the receiver refuses with `unavailable`. The full list of limits is in
 [Framed Fabric limits](MCP_METADATA.md#framed-fabric-limits). A buffered `ForwardRequest` receiver
 does not recheck the caller's browser Origin against its own `mcp_http.allowed_origins`; it trusts

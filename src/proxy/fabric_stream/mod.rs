@@ -1167,6 +1167,12 @@ mod tests {
         assert_eq!(refusal.code, wire::StreamErrorCode::Unavailable, "{refusal}");
         assert_eq!(refusal.to_string(), "Fabric stream concurrency limit reached");
         drop(held);
+        drop(
+            runtime
+                .prepare_incoming_with_versions(&listen_message(), &connection, &peer, versions)
+                .await
+                .expect("a listen once the held streams end"),
+        );
         for change in ["disabled", "other-protocol", "empty-variant-catalog"] {
             let mut changed = surface.clone();
             match change {

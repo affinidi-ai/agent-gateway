@@ -4203,16 +4203,7 @@ async fn step_forward_request_fabric(
                 Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => request.id.clone(),
                 _ => None,
             };
-            match error {
-                FabricForwardError::NoResponse(_) => OutboundPipelineError::UpstreamTimeout,
-                FabricForwardError::RemoteLegacyOnly => OutboundPipelineError::McpValidation(
-                    crate::mcp::request_validation::McpRequestValidationError::legacy_only(request_id),
-                ),
-                FabricForwardError::CapacityReached => OutboundPipelineError::UpstreamCapacityReached(request_id),
-                _ => OutboundPipelineError::UpstreamConnectionFailed(
-                    "Modern Fabric transport is unavailable".to_string(),
-                ),
-            }
+            modern_fabric_failure(error, request_id)
         })?;
         return Ok(UpstreamResponse::FabricStream(response));
     }
@@ -5133,11 +5124,48 @@ fn step_record_metrics(
     }
 }
 
+fn modern_fabric_failure(
+    error: crate::proxy::fabric_forward::FabricForwardError,
+    request_id: Option<serde_json::Value>,
+) -> OutboundPipelineError {
+    use crate::proxy::fabric_forward::FabricForwardError;
+    match error {
+        FabricForwardError::NoResponse(_) => OutboundPipelineError::UpstreamTimeout,
+        FabricForwardError::RemoteLegacyOnly => OutboundPipelineError::McpValidation(
+            crate::mcp::request_validation::McpRequestValidationError::legacy_only(request_id),
+        ),
+        FabricForwardError::CapacityReached => OutboundPipelineError::UpstreamCapacityReached(request_id),
+        _ => OutboundPipelineError::UpstreamConnectionFailed("Modern Fabric transport is unavailable".to_string()),
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modern_fabric_failures_map_to_their_pipeline_errors() {
+        use crate::proxy::fabric_forward::FabricForwardError;
+
+        assert!(matches!(
+            modern_fabric_failure(FabricForwardError::CapacityReached, Some(json!("request-1"))),
+            OutboundPipelineError::UpstreamCapacityReached(Some(id)) if id == json!("request-1")
+        ));
+        assert!(matches!(
+            modern_fabric_failure(FabricForwardError::StreamingUnavailable, Some(json!("request-1"))),
+            OutboundPipelineError::UpstreamConnectionFailed(_)
+        ));
+        assert!(matches!(
+            modern_fabric_failure(FabricForwardError::NoResponse("gw".into()), None),
+            OutboundPipelineError::UpstreamTimeout
+        ));
+        assert!(matches!(
+            modern_fabric_failure(FabricForwardError::RemoteLegacyOnly, Some(json!(7))),
+            OutboundPipelineError::McpValidation(_)
+        ));
+    }
 
     #[tokio::test]
     async fn a_peer_stream_cap_refusal_is_a_retryable_429_not_a_connection_failure() {

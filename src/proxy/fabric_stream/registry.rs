@@ -112,15 +112,15 @@ pub(crate) struct RegistryLimits {
 }
 
 impl RegistryLimits {
-    /// Whether a new stream of `kind` is refused, given the number of
-    /// registered streams and, for each, whether it shares the new stream's
-    /// peer and surface budget.
+    /// The cap that refuses a new stream of `kind`, if any, given the number
+    /// of registered streams and, for each, whether it shares the new
+    /// stream's peer and surface budget.
     fn reached(
         &self,
         kind: StreamKind,
         registered: usize,
         shared: impl Iterator<Item = (bool, bool)>,
-    ) -> bool {
+    ) -> Option<&'static str> {
         let (max_peer, max_surface) = match kind {
             StreamKind::Request => (self.max_peer_streams, self.max_surface_streams),
             StreamKind::Listen => (self.max_peer_listens, self.max_surface_listens),
@@ -128,7 +128,15 @@ impl RegistryLimits {
         let (peer, surface) = shared.fold((0, 0), |(peer, surface), (same_peer, same_surface)| {
             (peer + usize::from(same_peer), surface + usize::from(same_surface))
         });
-        registered >= self.max_streams || peer >= max_peer || surface >= max_surface
+        if registered >= self.max_streams {
+            Some("total")
+        } else if peer >= max_peer {
+            Some("per_peer")
+        } else if surface >= max_surface {
+            Some("per_surface")
+        } else {
+            None
+        }
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -145,6 +153,22 @@ impl RegistryLimits {
         }
         Ok(())
     }
+}
+
+fn log_cap_reached(
+    binding: &StreamBinding,
+    kind: StreamKind,
+    direction: StreamDirection,
+    cap: &'static str,
+) {
+    tracing::warn!(
+        peer_did = %binding.peer_did,
+        surface_id = %binding.surface_id,
+        ?kind,
+        ?direction,
+        cap,
+        "Fabric stream cap reached"
+    );
 }
 
 /// How a registered stream is counted: its binding, whether a peer opened it
@@ -320,6 +344,13 @@ impl ReceiveRegistry {
             opened.retain(|_, until| *until > now);
         }
         if opened.len() >= capacity {
+            tracing::warn!(
+                peer_did = %binding.peer_did,
+                surface_id = %binding.surface_id,
+                ?kind,
+                cap = "open_replay",
+                "Fabric stream cap reached"
+            );
             return Err(RegisterError::CapacityReached("Fabric open replay-protection capacity reached"));
         }
         let receiver = self.register_negotiated(
@@ -390,7 +421,7 @@ impl ReceiveRegistry {
             inbound: direction == StreamDirection::Request,
             kind,
         };
-        if self.limits.reached(
+        if let Some(cap) = self.limits.reached(
             kind,
             entries.len(),
             entries.values().map(|entry| {
@@ -404,6 +435,7 @@ impl ReceiveRegistry {
                 )
             }),
         ) {
+            log_cap_reached(&binding, kind, direction, cap);
             return Err(RegisterError::CapacityReached("Fabric stream concurrency limit reached"));
         }
         let (closed, _) = watch::channel(None);
@@ -468,7 +500,7 @@ impl ReceiveRegistry {
             inbound: direction == StreamDirection::Response,
             kind,
         };
-        if self.limits.reached(
+        if let Some(cap) = self.limits.reached(
             kind,
             senders.len(),
             senders.values().map(|entry| {
@@ -482,6 +514,7 @@ impl ReceiveRegistry {
                 )
             }),
         ) {
+            log_cap_reached(&binding, kind, direction, cap);
             return Err(RegisterError::CapacityReached("Fabric sender concurrency limit reached"));
         }
         let entry = Arc::new(SendEntry {
