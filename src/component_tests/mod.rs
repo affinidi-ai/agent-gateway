@@ -13,6 +13,7 @@ mod mcp_outbound_e2e;
 mod mcp_policy_e2e;
 mod mcp_record_compat;
 mod mcp_sandbox_e2e;
+mod mcp_subscription_scope;
 mod mtls;
 mod tr_naming_e2e;
 mod trust_check_e2e;

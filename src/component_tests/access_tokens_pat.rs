@@ -1051,6 +1051,9 @@ async fn create_owned_token(
             last_used_at: None,
             expires_at: None,
             revoked_at: None,
+            rotation_generation: 0,
+            rotated_at: None,
+            rotated_by: None,
         })
         .await
         .expect("create token");

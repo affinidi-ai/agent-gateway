@@ -1,0 +1,26 @@
+branch: fix/scope-mcp-subscription-invalidation
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: End only the MCP subscriptions on the changed surface or tenant
+      description: >-
+        Saving or deleting one surface, or changing its surface policy, now ends only the open
+        MCP subscriptions on that surface, and changes to a tenant's MCP proxies, JWT
+        verification strategies or credential providers end only that tenant's subscriptions.
+        Previously any of these ended every open subscription on the gateway, so one tenant's
+        configuration writes disconnected every other tenant's subscribers. Gateway and global
+        policy changes, API-key changes, delegation vault revocation, JWT strategy reload, policy
+        updates on surfaces with a response policy (whose engine is shared by definition) and
+        changes to appliance-global or re-owned resources still end every subscription. A
+        subscription that falls more than 1024 changes behind ends on the next change.
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Fix the access token fixture in the PAT component tests
+      description: >-
+        The PAT component test fixture now sets the access token rotation fields, so the test
+        binary compiles again.

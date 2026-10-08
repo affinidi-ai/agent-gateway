@@ -247,8 +247,8 @@ Modern MCP (`2026-07-28`) is active on every MCP surface and crosses Fabric only
 as framed streams, which any active MCP surface on the receiving gateway serves.
 Pair single-tenant or trusted deployments first, and do not pair a
 multi-tenant or internet-facing gateway: some gateway-wide tables and signals
-are shared across tenants and peers (process-wide subscription invalidation,
-the capability offer and Open replay tables), and the limits are per caller,
+are shared across tenants and peers (appliance-wide access changes still end
+every subscription, and the capability offer and Open replay tables are shared), and the limits are per caller,
 per peer or per surface, never per tenant. Framed streams are capped at 8 per peer and 16 per surface,
 so a partner's long-lived listens can use up its slots; past a cap the sending
 caller gets `502`, not `429`. The full list of limits is in

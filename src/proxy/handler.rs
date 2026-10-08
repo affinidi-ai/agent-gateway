@@ -2085,6 +2085,16 @@ async fn proxy_handler_with_mcp_runtime(
             return Ok(crate::mcp::subscriptions::listen_limit_error(request).into_response());
         };
         subscription_access.hold(slot);
+        subscription_access.record_owner(
+            state
+                .surface
+                .surface_id
+                .clone(),
+            state
+                .surface
+                .tenant_id
+                .as_deref(),
+        );
         if let Some(vault) = &state.delegation_vault_store
             && subscription_access
                 .watch_vault(vault.clone())

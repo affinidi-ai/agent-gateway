@@ -393,7 +393,7 @@ impl ApiKeyStore for FileSystemApiKeyStore {
 
         self.save_record(&record)
             .await?;
-        crate::mcp::subscriptions::invalidate_access();
+        crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Appliance);
 
         info!(
             agent_id = %agent_id,
@@ -441,7 +441,7 @@ impl ApiKeyStore for FileSystemApiKeyStore {
             self.unindex_secret_hash(agent_id, old);
         }
         self.index_secret_hash(&record);
-        crate::mcp::subscriptions::invalidate_access();
+        crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Appliance);
 
         info!(
             agent_id = %agent_id,
@@ -477,7 +477,7 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         if let Some(ref hash) = record.secret_hash {
             self.unindex_secret_hash(agent_id, hash);
         }
-        crate::mcp::subscriptions::invalidate_access();
+        crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Appliance);
 
         info!(
             actor = %actor,

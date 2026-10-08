@@ -57,7 +57,9 @@ impl CredentialProviderStorage for FileSystemCredentialProviderStore {
         &self,
         provider: CredentialProvider,
     ) -> Result<CredentialProvider> {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change = crate::mcp::subscriptions::AccessChange::begin(
+            crate::mcp::subscriptions::AccessScope::owned_by(provider.tenant_id.as_deref()),
+        );
         self.storage
             .save(&provider)
             .await
@@ -88,7 +90,17 @@ impl CredentialProviderStorage for FileSystemCredentialProviderStore {
         &self,
         provider: CredentialProvider,
     ) -> Result<CredentialProvider> {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let previous = self
+            .storage
+            .get(&provider.id)
+            .await?;
+        let _access_change =
+            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::reowned(
+                previous
+                    .as_ref()
+                    .map_or(provider.tenant_id.as_deref(), |previous| previous.tenant_id.as_deref()),
+                provider.tenant_id.as_deref(),
+            ));
         self.storage
             .save(&provider)
             .await
@@ -107,13 +119,12 @@ impl CredentialProviderStorage for FileSystemCredentialProviderStore {
         id: &str,
     ) -> Result<bool> {
         // Check existence first since StorageBackend::delete returns ()
-        let exists = self
-            .storage
-            .get(id)
-            .await?
-            .is_some();
-        if exists {
-            let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let existing = self.storage.get(id).await?;
+        let exists = existing.is_some();
+        if let Some(existing) = existing {
+            let _access_change = crate::mcp::subscriptions::AccessChange::begin(
+                crate::mcp::subscriptions::AccessScope::owned_by(existing.tenant_id.as_deref()),
+            );
             self.storage
                 .delete(id)
                 .await?;

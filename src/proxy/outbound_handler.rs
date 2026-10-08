@@ -738,6 +738,12 @@ async fn outbound_proxy_handler_with_mcp_versions(
                     )))
                 })?;
             subscription_access.hold(slot);
+            subscription_access.record_owner(
+                ctx.surface.surface_id.clone(),
+                ctx.surface
+                    .tenant_id
+                    .as_deref(),
+            );
             if let Some(vault) = &state.delegation_vault_store {
                 subscription_access
                     .watch_vault(vault.clone())
