@@ -300,6 +300,7 @@ Breaking one of these is a correctness bug, not a style question.
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
+| x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 
 ## Module map
 

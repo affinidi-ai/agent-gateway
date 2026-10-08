@@ -48,11 +48,7 @@ impl PaymentPayload {
     /// Get the asset/token address from the accepted field
     #[allow(dead_code)]
     pub fn asset(&self) -> Option<&str> {
-        if self.accepted.asset.is_empty() || self.accepted.asset == "native" {
-            None
-        } else {
-            Some(&self.accepted.asset)
-        }
+        self.accepted.token_address()
     }
 
     /// Extract transaction hash from payload (scheme-specific)
@@ -92,20 +88,9 @@ impl PaymentPayload {
     }
 
     /// Get the asset transfer method (eip3009, permit2, or default to transaction)
-    /// Checks both camelCase (assetTransferMethod) and snake_case (asset_transfer_method) for backwards compatibility
     pub fn asset_transfer_method(&self) -> String {
         self.accepted
-            .extra
-            .as_ref()
-            .and_then(|extra| {
-                // Try camelCase first (new format)
-                extra
-                    .get("assetTransferMethod")
-                    .or_else(|| extra.get("asset_transfer_method")) // Fallback to snake_case (old format)
-            })
-            .and_then(|v| v.as_str())
-            .unwrap_or("transaction")
-            .to_string()
+            .asset_transfer_method()
     }
 
     /// Extract EIP-3009 authorization data

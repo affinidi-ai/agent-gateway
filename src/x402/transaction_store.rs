@@ -249,8 +249,16 @@ pub struct X402Transaction {
     /// Resource path being protected
     pub resource_path: String,
 
-    /// Original payment payload from client
+    /// Payment payload from the client. Once verification resolves it to one of the surface's
+    /// payment requirements, `accepted` is that requirement, which settlement acts on.
     pub payment_payload: PaymentPayload,
+
+    /// Set on every record this build creates: verification stores the payload bound to the
+    /// surface's payment requirement, and records created from a fabric peer's messages hold the
+    /// payload that peer bound. Records written by earlier builds read as `false` and carry the
+    /// caller's own `accepted`, so they are re-resolved before they settle.
+    #[serde(default)]
+    pub payment_requirement_bound: bool,
 
     /// Verification stage (always present)
     pub verification: VerificationStage,
@@ -308,6 +316,7 @@ impl X402Transaction {
             channel_name,
             resource_path,
             payment_payload,
+            payment_requirement_bound: true,
             verification: VerificationStage {
                 status: VerificationStatus::Pending,
                 verification_mode,

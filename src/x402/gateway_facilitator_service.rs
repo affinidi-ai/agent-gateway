@@ -15,6 +15,7 @@ use affinidi_messaging_didcomm::Message as DIDCommMessage;
 use affinidi_messaging_sdk::{ATM, profiles::ATMProfile};
 
 use super::PaymentPayload;
+use crate::config::types::X402PaymentRequirement;
 use crate::gateways::filesystem::GatewayStore;
 use crate::messages::message_types::MessageType;
 
@@ -47,6 +48,25 @@ pub async fn signal_settlement_response(
     } else {
         false
     }
+}
+
+/// Body of the `x402/verify-request` a requesting gateway sends its facilitator gateway, carrying
+/// the surface payment requirement the payment was resolved to
+pub(crate) fn verify_request_body(
+    verification_id: &str,
+    payment_signature: &str,
+    payment_requirement: &X402PaymentRequirement,
+    channel_id: &str,
+    resource_path: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "verification_id": verification_id,
+        "payment_signature": payment_signature,
+        "payment_requirement": payment_requirement,
+        "network": payment_requirement.network,
+        "channel_id": channel_id,
+        "resource": resource_path,
+    })
 }
 
 /// Gateway facilitator service state
@@ -85,17 +105,16 @@ impl GatewayFacilitatorService {
         info!("Gateway facilitator service initialized with ATM infrastructure");
     }
 
-    /// Send verification request to facilitator gateway
-    ///
-    /// Returns verification ID if async mode, or verified payment if sync mode
+    /// Send verification request to facilitator gateway, which verifies the payment against
+    /// `payment_requirement`, the surface requirement this gateway resolved for it
     pub async fn verify_via_facilitator(
         &self,
         facilitator_did: &str,
         payment_signature: &str,
-        network: &str,
+        payment_requirement: &X402PaymentRequirement,
         channel_id: String,
         resource_path: String,
-    ) -> Result<String, String> {
+    ) -> Result<(), String> {
         // Check if we have ATM infrastructure
         let atm = self
             .atm
@@ -128,14 +147,8 @@ impl GatewayFacilitatorService {
             "Creating x402 verify-request for facilitator gateway"
         );
 
-        // Build verify-request message body
-        let request_body = serde_json::json!({
-            "verification_id": verification_id,
-            "payment_signature": payment_signature,
-            "network": network,
-            "channel_id": channel_id,
-            "resource": resource_path,
-        });
+        let request_body =
+            verify_request_body(&verification_id, payment_signature, payment_requirement, &channel_id, &resource_path);
 
         // Create DIDComm message
         let message_id = Uuid::new_v4().to_string();
@@ -201,22 +214,11 @@ impl GatewayFacilitatorService {
                     .unwrap_or(false);
 
                 if valid {
-                    // Get payment payload from response (it's a JSON object, not a string)
-                    let payment_value = response_msg
-                        .body
-                        .get("payment")
-                        .ok_or("Missing payment in verification response")?;
-
-                    let payment: crate::x402::PaymentPayload = serde_json::from_value(payment_value.clone())
-                        .map_err(|e| format!("Failed to parse payment payload: {}", e))?;
-
                     info!(
                         verification_id = %verification_id,
                         "Payment verified successfully via gateway facilitator"
                     );
-
-                    // Return the actual payment payload (not verification_id)
-                    Ok(serde_json::to_string(&payment).map_err(|e| format!("Failed to serialize payment: {}", e))?)
+                    Ok(())
                 } else {
                     // Verification failed
                     let error = response_msg
@@ -455,10 +457,10 @@ pub async fn send_settle_request(
 pub async fn verify_via_facilitator_gateway(
     facilitator_did: &str,
     payment_signature: &str,
-    network: &str,
+    payment_requirement: &X402PaymentRequirement,
     channel_id: String,
     resource_path: String,
-) -> Result<String, String> {
+) -> Result<(), String> {
     let service_lock = get_gateway_facilitator_service()
         .await
         .ok_or_else(|| "Gateway facilitator service not initialized".to_string())?;
@@ -469,6 +471,6 @@ pub async fn verify_via_facilitator_gateway(
         .as_ref()
         .ok_or_else(|| "Gateway facilitator service not initialized".to_string())?;
 
-    svc.verify_via_facilitator(facilitator_did, payment_signature, network, channel_id, resource_path)
+    svc.verify_via_facilitator(facilitator_did, payment_signature, payment_requirement, channel_id, resource_path)
         .await
 }

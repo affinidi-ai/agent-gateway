@@ -5,6 +5,7 @@
 
 use super::PaymentPayload;
 use super::x402rs_adapter;
+use crate::config::types::X402PaymentRequirement;
 use reqwest::Url;
 use tracing::{debug, error, info};
 use x402_types::proto;
@@ -45,14 +46,15 @@ impl RemoteFacilitator {
         Ok(Self { base_url: target.url, client })
     }
 
-    /// Verify a payment via the remote facilitator
+    /// Verify a payment against the surface requirement it was resolved to
     pub async fn verify(
         &self,
         payload: &PaymentPayload,
+        requirement: &X402PaymentRequirement,
         channel_name: &str,
     ) -> Result<proto::VerifyResponse, String> {
         // Convert to x402-rs VerifyRequest
-        let verify_request = x402rs_adapter::to_verify_request(payload)?;
+        let verify_request = x402rs_adapter::to_verify_request(payload, requirement)?;
 
         // Serialize request for logging
         let request_json = serde_json::to_string(&verify_request).unwrap_or_else(|_| "Failed to serialize".to_string());

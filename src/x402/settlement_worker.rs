@@ -198,8 +198,13 @@ async fn process_pending_settlements(config: &SettlementWorkerConfig) -> Result<
             .as_ref()
             .unwrap_or(&config.x402_config);
 
+        let settlement_result = match crate::x402::settleable_payload(&txn, payment_policy.as_ref()).await {
+            Ok(payload) => execute_settlement(&txn, &payload, x402_config_to_use, &config.transaction_store).await,
+            Err(e) => Err(e),
+        };
+
         // Execute settlement based on settlement_method
-        match execute_settlement(&txn, x402_config_to_use, &config.transaction_store).await {
+        match settlement_result {
             Ok(tx_hash) => {
                 info!("✅ Deferred settlement completed correlation_id={} tx_hash={}", correlation_id, tx_hash);
 
@@ -252,6 +257,7 @@ async fn process_pending_settlements(config: &SettlementWorkerConfig) -> Result<
 /// Routes to appropriate execution based on settlement_method
 async fn execute_settlement(
     txn: &crate::x402::transaction_store::X402Transaction,
+    payload: &PaymentPayload,
     x402_config: &X402Config,
     transaction_store: &Arc<TransactionStore>,
 ) -> Result<String, String> {
@@ -260,7 +266,6 @@ async fn execute_settlement(
         .as_ref()
         .ok_or_else(|| "No settlement stage".to_string())?;
 
-    let payload = &txn.payment_payload;
     let correlation_id = &txn.id;
     let channel_id = &txn.surface_id;
     let channel_name = &txn.channel_name;
@@ -742,7 +747,7 @@ async fn process_pending_sync(
 }
 
 /// Load channel configuration and extract payment_policy
-async fn load_channel_payment_policy(
+pub(crate) async fn load_channel_payment_policy(
     channel_id: &str,
     bootstrap_config: &Arc<crate::config::BootstrapConfig>,
 ) -> Option<X402Config> {
