@@ -78,6 +78,19 @@ fn surface(
     .unwrap()
 }
 
+fn surface_with_response_policy(
+    id: &str,
+    tenant: &str,
+    definition_id: &str,
+) -> AgentSurface {
+    let mut surface = surface(id, tenant);
+    surface.target.response_policy = Some(crate::config::agent_surface::PolicyRef {
+        policy_definition_id: definition_id.into(),
+        require_agent_context: false,
+    });
+    surface
+}
+
 fn gateway() -> crate::gateways::types::Gateway {
     use crate::gateways::types::{Gateway, GatewayCreationType, GatewayOpaPolicyConfig, GatewayStatus, GatewayType};
     Gateway {
@@ -104,28 +117,36 @@ fn gateway() -> crate::gateways::types::Gateway {
     }
 }
 
-/// Runs in a child process so access changes made by tests running in
-/// parallel cannot end the subscriptions this test expects to stay open.
+/// Re-runs the calling test in a child process, so access changes made by
+/// tests running in parallel cannot end the subscriptions it expects to stay
+/// open. Returns true inside the child, where the test body should run.
+async fn in_isolated_child() -> bool {
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let test_name = std::thread::current()
+        .name()
+        .unwrap()
+        .to_string();
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(CHILD, "1")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated subscription scope test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn access_changes_end_only_subscriptions_in_their_scope() {
-    if std::env::var_os(CHILD).is_none() {
-        let test_name = std::thread::current()
-            .name()
-            .unwrap()
-            .to_string();
-        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test_name, "--nocapture"])
-            .env(CHILD, "1")
-            .kill_on_drop(true)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "isolated subscription scope test failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if !in_isolated_child().await {
         return;
     }
     let directory = tempfile::tempdir().unwrap();
@@ -271,5 +292,51 @@ async fn access_changes_end_only_subscriptions_in_their_scope() {
         .await;
     bravo_subscription
         .assert_ended("a gateway policy change ends bravo's subscriptions")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn surface_policy_updates_widen_to_the_appliance_only_for_shared_response_policies() {
+    if !in_isolated_child().await {
+        return;
+    }
+    let policies = crate::policies::SurfacePolicyManager::new();
+    let alpha = surface_with_response_policy("alpha-surface", "alpha", "shared-response");
+    let bravo = surface_with_response_policy("bravo-surface", "bravo", "shared-response");
+    let charlie = surface("charlie-surface", "charlie");
+    let delta = surface("delta-surface", "delta");
+
+    let alpha_subscription = OpenSubscription::on(&alpha);
+    let bravo_subscription = OpenSubscription::on(&bravo);
+    let charlie_subscription = OpenSubscription::on(&charlie);
+    policies
+        .update_channel_policy(&alpha)
+        .await
+        .unwrap();
+    alpha_subscription
+        .assert_ended("a policy update on a surface with a response policy ends its subscriptions")
+        .await;
+    bravo_subscription
+        .assert_ended("a shared response policy update ends subscriptions on other surfaces using it")
+        .await;
+    charlie_subscription
+        .assert_ended("a shared response policy update ends every subscription")
+        .await;
+
+    let charlie_subscription = OpenSubscription::on(&charlie);
+    let mut delta_subscription = OpenSubscription::on(&delta);
+    let mut bravo_subscription = OpenSubscription::on(&bravo);
+    policies
+        .update_channel_policy(&charlie)
+        .await
+        .unwrap();
+    charlie_subscription
+        .assert_ended("a policy update on a surface without a response policy ends its subscriptions")
+        .await;
+    delta_subscription
+        .assert_open("a policy update on a surface without a response policy leaves other surfaces open")
+        .await;
+    bravo_subscription
+        .assert_open("a policy update on a surface without a response policy leaves response-policy surfaces open")
         .await;
 }
