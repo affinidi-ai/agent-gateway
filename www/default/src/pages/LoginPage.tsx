@@ -9,19 +9,12 @@ import {
 import styles from './LoginPage.module.css';
 import { apiClient, sessionManager } from '../api';
 import { ROUTES } from '../routes';
-import { safeNextTarget } from '../utils/loginNextTarget';
+import { loginNextTarget } from '../utils/loginNextTarget';
 import { RegistrationTerms } from './RegistrationTerms';
 import { useRegistrationTerms } from './useRegistrationTerms';
 
 interface LoginPageProps {
   onLogin: () => void;
-}
-
-function nextTargetFromLocation(): string | null {
-  return safeNextTarget(
-    new URLSearchParams(window.location.search).get('next'),
-    window.location.origin
-  );
 }
 
 const COPY = {
@@ -195,7 +188,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
 
     if (authMode === 'saml') {
       await new Promise(resolve => setTimeout(resolve, 100));
-      const next = nextTargetFromLocation();
+      const next = loginNextTarget(window.location);
       window.location.href = next
         ? `/api/saml/login?next=${encodeURIComponent(next)}`
         : '/api/saml/login';
@@ -204,7 +197,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
 
     try {
       await authenticateWithPasskey(username);
-      const next = nextTargetFromLocation();
+      const next = loginNextTarget(window.location);
       if (next) {
         window.location.href = next;
         return;

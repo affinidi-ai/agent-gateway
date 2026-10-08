@@ -2,9 +2,11 @@
 //!
 //! The address comes from the TCP connection. `X-Forwarded-For` (or RFC 7239 `Forwarded` when
 //! `X-Forwarded-For` is absent) is only read when the connecting peer is in
-//! `client_auth.trusted_proxies`, and then from the right: trusted proxy hops are skipped and the
-//! first untrusted hop is the client. A value a client puts at the left of the header is never
-//! reached while a trusted proxy appends the real address after it.
+//! `client_ip.trusted_proxies` (`gateway.json`), and then from the right: trusted proxy hops are
+//! skipped and the first untrusted hop is the client. A value a client puts at the left of the
+//! header is never reached while a trusted proxy appends the real address after it. This list is
+//! separate from `tls.client_auth.trusted_proxies`, which only gates forwarded client
+//! certificates.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -16,18 +18,20 @@ use axum::response::Response;
 use ipnet::IpNet;
 
 use super::peer_cert::forwarded::ip_in_any;
-use crate::config::types::ClientAuthConfig;
+use tracing::warn;
+
+use crate::config::types::{ClientIpConfig, LoginThrottleConfig};
 
 /// The caller's IP address, inserted into request extensions by [`resolve_client_ip_layer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
 /// Middleware that inserts [`ClientIp`] for every request that carries `ConnectInfo`. Install
-/// with `axum::middleware::from_fn_with_state(Arc::new(client_auth_cfg), resolve_client_ip_layer)`
+/// with `axum::middleware::from_fn_with_state(Arc::new(client_ip_cfg), resolve_client_ip_layer)`
 /// on a server built with `into_make_service_with_connect_info`. Without `ConnectInfo` nothing is
 /// inserted.
 pub async fn resolve_client_ip_layer(
-    State(config): State<Arc<ClientAuthConfig>>,
+    State(config): State<Arc<ClientIpConfig>>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -41,6 +45,33 @@ pub async fn resolve_client_ip_layer(
             .insert(ClientIp(client_ip));
     }
     next.run(req).await
+}
+
+/// Whether a login throttle would count every caller behind a load balancer as one client: it is
+/// on, and no proxy is trusted to report caller addresses.
+pub fn login_throttle_shares_one_limit(
+    throttle: &LoginThrottleConfig,
+    client_ip: &ClientIpConfig,
+) -> bool {
+    throttle.enabled
+        && client_ip
+            .trusted_proxies
+            .is_empty()
+}
+
+/// Logs a startup warning for `throttle_name` when [`login_throttle_shares_one_limit`] holds.
+pub fn warn_if_login_throttle_shares_one_limit(
+    throttle_name: &str,
+    throttle: &LoginThrottleConfig,
+    client_ip: &ClientIpConfig,
+) {
+    if login_throttle_shares_one_limit(throttle, client_ip) {
+        warn!(
+            throttle = throttle_name,
+            "Login throttle is enabled but client_ip.trusted_proxies is empty; behind a load balancer every \
+             caller is counted as the balancer's address and shares one limit"
+        );
+    }
 }
 
 /// The client address for a request that arrived from `peer`. Forwarded headers are ignored
@@ -227,15 +258,26 @@ mod tests {
         assert_eq!(parse_hop("_hidden"), None);
     }
 
+    #[test]
+    fn an_enabled_login_throttle_without_trusted_proxies_shares_one_limit() {
+        let enabled = LoginThrottleConfig {
+            enabled: true,
+            ..LoginThrottleConfig::default()
+        };
+        let no_proxies = ClientIpConfig::default();
+        let with_proxy = ClientIpConfig { trusted_proxies: trusted() };
+
+        assert!(login_throttle_shares_one_limit(&enabled, &no_proxies));
+        assert!(!login_throttle_shares_one_limit(&enabled, &with_proxy));
+        assert!(!login_throttle_shares_one_limit(&LoginThrottleConfig::default(), &no_proxies));
+    }
+
     #[tokio::test]
     async fn the_layer_inserts_the_resolved_client_ip() {
         use axum::{Extension, Router, body::Body, routing::get};
         use tower::ServiceExt;
 
-        let config = Arc::new(ClientAuthConfig {
-            trusted_proxies: trusted(),
-            ..ClientAuthConfig::default()
-        });
+        let config = Arc::new(ClientIpConfig { trusted_proxies: trusted() });
         let app = Router::new()
             .route("/", get(|Extension(ClientIp(ip)): Extension<ClientIp>| async move { ip.to_string() }))
             .layer(axum::middleware::from_fn_with_state(config, resolve_client_ip_layer));

@@ -1517,6 +1517,11 @@ pub async fn run_axum_proxy(
                     )
                 })?;
 
+                crate::source_auth::client_ip::warn_if_login_throttle_shares_one_limit(
+                    "login_throttle",
+                    &saml_config.login_throttle,
+                    &network_config.client_ip,
+                );
                 match initialize_saml_state(&bootstrap_config, &saml_config, terms_manager.clone()).await {
                     Ok(state) => {
                         info!("SAML authentication enabled with IdP: {}", saml_config.idp_entity_id);

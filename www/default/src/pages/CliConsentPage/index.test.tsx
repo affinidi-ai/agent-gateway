@@ -97,13 +97,40 @@ test('shows an error and allows a retry when the endpoint fails', async () => {
   expect(screen.getByTestId('cli-consent-allow-button')).toBeEnabled();
 });
 
-test('Cancel shows the close tab message and never calls the consent endpoint', async () => {
+test('Cancel tells the CLI access was denied and never calls the consent endpoint', async () => {
   render(<CliConsentPage />);
 
   fireEvent.click(await screen.findByTestId('cli-consent-cancel-button'));
 
   expect(screen.getByTestId('cli-consent-cancelled')).toHaveTextContent('You can close this tab');
+  expect(window.location.href).toBe(
+    'http://127.0.0.1:52111/callback?error=access_denied&error_description=cancelled+by+the+user&state=state-123'
+  );
   expect(apiClient.cliConsent).not.toHaveBeenCalled();
+});
+
+test('a 403 from consent asks for administrator approval and tells the CLI access was denied', async () => {
+  (apiClient.cliConsent as jest.Mock).mockResolvedValue(
+    new Response('account is not approved', { status: 403 })
+  );
+  render(<CliConsentPage />);
+
+  fireEvent.click(await screen.findByTestId('cli-consent-allow-button'));
+
+  expect(await screen.findByTestId('cli-consent-not-approved')).toHaveTextContent(
+    'Ask an administrator to approve your account'
+  );
+  expect(window.location.href).toBe(
+    'http://127.0.0.1:52111/callback?error=access_denied&error_description=account+not+approved&state=state-123'
+  );
+});
+
+test('a signed-out check shows an error and keeps Allow disabled', async () => {
+  (apiClient.fetch as jest.Mock).mockResolvedValue(jsonResponse({ authenticated: false }));
+  render(<CliConsentPage />);
+
+  expect(await screen.findByTestId('cli-consent-error')).toHaveTextContent('You are not signed in');
+  expect(screen.getByTestId('cli-consent-allow-button')).toBeDisabled();
 });
 
 test.each([

@@ -10,7 +10,7 @@
   "sign_requests": true,
   "require_encrypted_assertions": false,
   "login_throttle": {
-    "enabled": true,
+    "enabled": false,
     "per_ip": {
       "requests": 20,
       "window_secs": 60

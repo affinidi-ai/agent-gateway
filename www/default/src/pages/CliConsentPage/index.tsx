@@ -38,6 +38,17 @@ const CliConsentPage: React.FC = () => {
         </>
       );
     }
+    if (status === 'not_approved') {
+      return (
+        <>
+          <h1 className={loginStyles.formHeading}>Your account is not approved yet</h1>
+          <p className={loginStyles.formSubtext} data-testid="cli-consent-not-approved">
+            Ask an administrator to approve your account, then run{' '}
+            <code>fabric agent-gateway login</code> again.
+          </p>
+        </>
+      );
+    }
     if (status === 'redirecting') {
       return (
         <>

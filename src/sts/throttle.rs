@@ -61,6 +61,9 @@ pub struct TokenEndpointThrottle {
     /// The window (`now / window_secs`, plus one) in which the last saturation warning was
     /// logged, so a full table logs at most once per window.
     saturation_warned_window: AtomicU64,
+    /// The second of the last prune a new key ran against a full table, so a stream of new keys
+    /// rescans the table at most once per second.
+    saturated_prune_second: AtomicU64,
 }
 
 impl TokenEndpointThrottle {
@@ -81,6 +84,7 @@ impl TokenEndpointThrottle {
             state: DashMap::new(),
             inserts: AtomicUsize::new(0),
             saturation_warned_window: AtomicU64::new(0),
+            saturated_prune_second: AtomicU64::new(0),
         }
     }
 
@@ -111,6 +115,7 @@ impl TokenEndpointThrottle {
             state: DashMap::new(),
             inserts: AtomicUsize::new(0),
             saturation_warned_window: AtomicU64::new(0),
+            saturated_prune_second: AtomicU64::new(0),
         }
     }
 
@@ -229,7 +234,7 @@ impl TokenEndpointThrottle {
     }
 
     /// Counts one attempt for `key`. Returns `false`, counting nothing, when `key` is new and
-    /// the table is still full after pruning.
+    /// the table is full. A full table is pruned at most once per second.
     fn bump(
         &self,
         key: String,
@@ -237,7 +242,9 @@ impl TokenEndpointThrottle {
         now: u64,
     ) -> bool {
         if self.state.len() >= self.max_keys && !self.state.contains_key(&key) {
-            self.prune(now);
+            if self.saturated_prune_due(now) {
+                self.prune(now);
+            }
             if self.state.len() >= self.max_keys {
                 return false;
             }
@@ -260,6 +267,16 @@ impl TokenEndpointThrottle {
             };
         }
         true
+    }
+
+    /// `true` for the first call in each second of `now`.
+    fn saturated_prune_due(
+        &self,
+        now: u64,
+    ) -> bool {
+        self.saturated_prune_second
+            .fetch_max(now, Ordering::Relaxed)
+            < now
     }
 
     fn prune(
@@ -449,6 +466,16 @@ mod tests {
             t.record_client_attempt_at(ip("203.0.113.3"), 1_060)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_full_table_is_pruned_at_most_once_per_second() {
+        let t = TokenEndpointThrottle::tracking_at_most(&login_limit(1), 2);
+
+        assert!(t.saturated_prune_due(1_000));
+        assert!(!t.saturated_prune_due(1_000));
+        assert!(!t.saturated_prune_due(999));
+        assert!(t.saturated_prune_due(1_001));
     }
 
     #[test]

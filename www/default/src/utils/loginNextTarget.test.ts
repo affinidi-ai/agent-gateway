@@ -1,4 +1,4 @@
-import { safeNextTarget } from './loginNextTarget';
+import { loginNextTarget, safeNextTarget } from './loginNextTarget';
 
 const ORIGIN = 'https://gateway.example';
 const CLI_TARGET = '/api/auth/cli/authorize?port=52111&state=st&challenge=ch';
@@ -46,4 +46,29 @@ test.each([
   ['a control character', '/api/auth/cli/authorize?port=1\n'],
 ])('rejects %s', (_label, value) => {
   expect(safeNextTarget(value, ORIGIN)).toBeNull();
+});
+
+describe('loginNextTarget', () => {
+  const at = (pathname: string, search: string) => ({ pathname, search, origin: ORIGIN });
+
+  test('uses a valid next parameter', () => {
+    expect(loginNextTarget(at('/login', `?next=${encodeURIComponent(CLI_TARGET)}`))).toBe(
+      CLI_TARGET
+    );
+  });
+
+  test('drops a hostile next parameter', () => {
+    expect(loginNextTarget(at('/login', '?next=https%3A%2F%2Fevil.example'))).toBeNull();
+  });
+
+  test('returns to the CLI authorize path from a signed-out consent page', () => {
+    expect(loginNextTarget(at('/cli-consent', '?port=52111&state=st&challenge=ch'))).toBe(
+      CLI_TARGET
+    );
+  });
+
+  test('ignores a consent page without a query and any other page', () => {
+    expect(loginNextTarget(at('/cli-consent', ''))).toBeNull();
+    expect(loginNextTarget(at('/settings', '?port=52111&state=st&challenge=ch'))).toBeNull();
+  });
 });

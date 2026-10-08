@@ -7,7 +7,30 @@ const MAX_LOOPBACK_PORT = 65535;
 const MAX_STATE_LENGTH = 256;
 const CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
-export type CliConsentStatus = 'loading' | 'ready' | 'submitting' | 'redirecting' | 'cancelled';
+export type CliConsentStatus =
+  | 'loading'
+  | 'ready'
+  | 'submitting'
+  | 'redirecting'
+  | 'cancelled'
+  | 'not_approved';
+
+/** The CLI's loopback callback for `port`, which is already checked to be 1024 to 65535. */
+export function loopbackCallbackUrl(port: number, params: Record<string, string>): string {
+  return `http://127.0.0.1:${port}/callback?${new URLSearchParams(params).toString()}`;
+}
+
+/**
+ * Tells the waiting CLI that the user did not grant access, the RFC 6749 section 4.1.2.1 error
+ * response, so it stops instead of waiting for its timeout.
+ */
+function accessDeniedUrl(request: CliLoginRequest, description: string): string {
+  return loopbackCallbackUrl(request.port, {
+    error: 'access_denied',
+    error_description: description,
+    state: request.state,
+  });
+}
 
 export function parseCliLoginRequest(search: string): CliLoginRequest | null {
   const params = new URLSearchParams(search);
@@ -71,13 +94,18 @@ export function useCliConsent(search: string) {
     setStatus('submitting');
     try {
       const response = await apiClient.cliConsent(request);
+      if (response.status === 403) {
+        setStatus('not_approved');
+        window.location.href = accessDeniedUrl(request, 'account not approved');
+        return;
+      }
       if (!response.ok) {
         setError(consentFailureMessage(response.status));
         setStatus('ready');
         return;
       }
       const { redirect_url: redirectUrl } = (await response.json()) as { redirect_url?: string };
-      if (!redirectUrl || !redirectUrl.startsWith(`http://127.0.0.1:${request.port}/callback?`)) {
+      if (!redirectUrl || !redirectUrl.startsWith(loopbackCallbackUrl(request.port, {}))) {
         setError(consentFailureMessage(500));
         setStatus('ready');
         return;
@@ -90,7 +118,11 @@ export function useCliConsent(search: string) {
     }
   }, [request]);
 
-  const cancel = useCallback(() => setStatus('cancelled'), []);
+  const cancel = useCallback(() => {
+    if (!request) return;
+    setStatus('cancelled');
+    window.location.href = accessDeniedUrl(request, 'cancelled by the user');
+  }, [request]);
 
   return { request, status, username, error, allow, cancel };
 }

@@ -193,6 +193,18 @@ fn saml_error_page(
     (status, Html(html)).into_response()
 }
 
+/// Where the ACS sends the signed-in browser: the target stored for the `RelayState` key, used
+/// once and checked against the return-target allowlist again, or the dashboard root.
+fn acs_return_target(
+    saml_service: &SamlService,
+    relay_state: Option<&str>,
+) -> String {
+    relay_state
+        .and_then(|key| saml_service.take_return_target(key))
+        .filter(|target| is_allowed_return_target(target))
+        .unwrap_or_else(|| "/".to_string())
+}
+
 fn acs_success_html(
     redirect_target: &str,
     session_token: &str,
@@ -314,22 +326,9 @@ pub async fn saml_acs(
 
     tracing::info!("Setting SAML session cookie");
 
-    let redirect_target = form
-        .relay_state
-        .as_deref()
-        .and_then(|relay_state| {
-            saml_state
-                .saml_service
-                .take_return_target(relay_state)
-        })
-        .filter(|target| is_allowed_return_target(target));
+    let redirect_target = acs_return_target(&saml_state.saml_service, form.relay_state.as_deref());
 
-    let html = acs_success_html(
-        redirect_target
-            .as_deref()
-            .unwrap_or("/"),
-        &finalized_session.session_token,
-    );
+    let html = acs_success_html(&redirect_target, &finalized_session.session_token);
 
     Ok((finalized_session.headers, Html(html)).into_response())
 }
@@ -623,13 +622,12 @@ mod tests {
             .route("/saml/login", axum::routing::get(saml_login))
             .with_state(state.clone())
             .layer(axum::middleware::from_fn_with_state(
-                Arc::new(crate::config::types::ClientAuthConfig {
+                Arc::new(crate::config::types::ClientIpConfig {
                     trusted_proxies: vec![
                         TRUSTED_PROXY_CIDR
                             .parse()
                             .unwrap(),
                     ],
-                    ..Default::default()
                 }),
                 crate::source_auth::client_ip::resolve_client_ip_layer,
             ));
@@ -745,8 +743,11 @@ mod tests {
     async fn saml_login_answers_503_when_too_many_sign_ins_are_outstanding() {
         let dir = tempfile::tempdir().unwrap();
         let state = saml_state(dir.path()).await;
-        for _ in 0..super::super::pending_requests::MAX_PENDING_AUTHN_REQUESTS {
-            login_location(state.clone(), None).await;
+        let pending = state
+            .saml_service
+            .pending_requests();
+        for index in 0..super::super::pending_requests::MAX_PENDING_AUTHN_REQUESTS {
+            assert!(pending.register(format!("req-{index}"), chrono::Utc::now()));
         }
 
         let response = login_from(&state, None).await;
@@ -864,19 +865,12 @@ mod tests {
             );
         }
 
-        for _ in 1..super::super::pending_requests::MAX_PENDING_AUTHN_REQUESTS {
-            assert!(
-                login_from(&state, None)
-                    .await
-                    .status()
-                    .is_redirection()
-            );
-        }
         assert_eq!(
-            login_from(&state, None)
-                .await
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            state
+                .saml_service
+                .pending_requests()
+                .len(),
+            1
         );
     }
 
@@ -914,10 +908,12 @@ mod tests {
     #[tokio::test]
     async fn rotating_fake_x_forwarded_for_values_cannot_fill_the_saml_sign_in_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let state = saml_state(dir.path()).await;
-        let limit = LoginThrottleConfig::default()
-            .per_ip
-            .requests;
+        let enabled = LoginThrottleConfig {
+            enabled: true,
+            ..LoginThrottleConfig::default()
+        };
+        let limit = enabled.per_ip.requests;
+        let state = saml_state_with_throttle(dir.path(), enabled).await;
         for index in 0..limit {
             login_request(&state, Some("203.0.113.7"), Some(&format!("192.0.2.{index}"))).await;
         }
@@ -942,5 +938,38 @@ mod tests {
                 .status()
                 .is_redirection()
         );
+    }
+    #[tokio::test]
+    async fn the_acs_returns_to_the_target_stored_for_a_known_key_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+        let location = login_location(state.clone(), Some(CLI_TARGET)).await;
+        let key = relay_state_key(&location);
+
+        assert_eq!(acs_return_target(&state.saml_service, Some(key)), CLI_TARGET);
+        assert_eq!(acs_return_target(&state.saml_service, Some(key)), "/");
+    }
+
+    #[tokio::test]
+    async fn the_acs_returns_to_the_root_for_an_unknown_or_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+
+        assert_eq!(acs_return_target(&state.saml_service, Some("0123456789abcdef0123456789abcdef")), "/");
+        assert_eq!(acs_return_target(&state.saml_service, Some(CLI_TARGET)), "/");
+        assert_eq!(acs_return_target(&state.saml_service, None), "/");
+    }
+
+    #[tokio::test]
+    async fn the_acs_rechecks_a_stored_target_against_the_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+        let key = state
+            .saml_service
+            .return_targets()
+            .insert("//evil.example/steal", chrono::Utc::now())
+            .unwrap();
+
+        assert_eq!(acs_return_target(&state.saml_service, Some(&key)), "/");
     }
 }

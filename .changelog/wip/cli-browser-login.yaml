@@ -3,7 +3,7 @@ changes:
   added:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Add browser sign-in for the fabric CLI
-      description: The fabric CLI can now sign in through the browser using passkey or SAML. A confirmation page asks the signed-in, approved user to allow the CLI, through a same-origin JSON request, before a one-time code is issued. The code is exchanged over a PKCE-protected back channel so the session token never appears in a URL. Requests must use a loopback port of 1024 or higher and PKCE challenge and verifier lengths from RFC 7636. Pending codes are capped globally and per session, each endpoint allows 20 requests per client IP per minute by default (cli_login_throttle in gateway.json, 429 with Retry-After past that), responses that carry a code or token are never cached, and issued and redeemed codes are logged with the user id.
+      description: The fabric CLI can now sign in through the browser using passkey or SAML. A confirmation page asks the signed-in, approved user to allow the CLI, through a same-origin JSON request, before a one-time code is issued. The code is exchanged over a PKCE-protected back channel so the session token never appears in a URL. Requests must use a loopback port of 1024 or higher and PKCE challenge and verifier lengths from RFC 7636. Pending codes are capped globally and per session. An opt-in limit of 20 requests per client IP per minute on each endpoint (cli_login_throttle in gateway.json, off by default, 429 with Retry-After past that) needs the new client_ip.trusted_proxies list in gateway.json behind a load balancer, or every user shares the balancer's limit. Responses that carry a code or token are never cached, and issued and redeemed codes are logged with the user id.
     - timestamp: '2026-10-06T00:00:01.000Z'
       title: Return to the CLI login flow after dashboard sign-in
       description: The login page and SAML sign-in honor a next target limited to the dashboard root and the CLI authorize path, so a CLI login continues after the user signs in. For SAML the gateway keeps that target and sends only a short one-time key as RelayState.
@@ -13,7 +13,7 @@ changes:
   security:
     - timestamp: '2026-10-07T00:00:00.000Z'
       title: Bound outstanding SAML sign-ins
-      description: /api/saml/login allows 20 sign-ins per client IP per minute by default (login_throttle in saml.json) and answers 429 with Retry-After past that. The gateway also tracks at most 1000 unfinished SAML sign-ins and answers 503 past that, instead of holding them without limit.
+      description: The gateway tracks at most 100,000 unfinished SAML sign-ins and answers 503 on /api/saml/login past that, instead of holding them without limit. An opt-in limit of 20 sign-ins per client IP per minute (login_throttle in saml.json, off by default, 429 with Retry-After past that) needs the new client_ip.trusted_proxies list in gateway.json behind a load balancer, or every user shares the balancer's limit.
   breaking: []
   internal:
     - timestamp: '2026-10-06T00:00:03.000Z'

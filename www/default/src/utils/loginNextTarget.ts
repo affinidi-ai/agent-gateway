@@ -40,3 +40,21 @@ export function safeNextTarget(next: string | null, origin: string): string | nu
   }
   return null;
 }
+
+/**
+ * The return target for the login page at `location`: its `?next=` when present, or, when the
+ * signed-out user opened the CLI consent page, the CLI authorize path with the consent query, so
+ * the CLI login continues after sign-in. Either way the target passes `safeNextTarget`.
+ */
+export function loginNextTarget(
+  location: Pick<Location, 'pathname' | 'search' | 'origin'>
+): string | null {
+  const next = new URLSearchParams(location.search).get('next');
+  if (next !== null) {
+    return safeNextTarget(next, location.origin);
+  }
+  if (location.pathname === ROUTES.CLI_CONSENT) {
+    return safeNextTarget(`${CLI_AUTHORIZE_PATH}${location.search}`, location.origin);
+  }
+  return null;
+}

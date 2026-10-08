@@ -59,8 +59,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   details box, then a warning `Alert` to only allow a login the user just started.
 - Actions are shared `AppButton`s side by side: **Cancel** (`secondary`) and **Allow**
   (`primary`), with `cli-consent-cancel-button` and `cli-consent-allow-button`.
-- Invalid link, loading, cancelled, and redirecting states replace the body in the same
-  card. Never show a code or token on the page.
+- Invalid link, loading, cancelled, not-approved, and redirecting states replace the body in
+  the same card. Never show a code or token on the page.
+- Cancel, and a `403` from consent (account not approved), send the browser to the CLI's
+  loopback callback with `error=access_denied`, built by `loopbackCallbackUrl`, so the CLI
+  stops waiting. The not-approved state tells the user to ask an administrator.
+- A signed-out user on `/cli-consent` gets the login page, which returns to the CLI authorize
+  path built from the consent query (`loginNextTarget`), so a SAML sign-in continues the flow.
 
 ## Surface Builder
 

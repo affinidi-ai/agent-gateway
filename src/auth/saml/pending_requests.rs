@@ -8,28 +8,68 @@ use chrono::{DateTime, Utc};
 
 use super::service::AUTHN_REQUEST_TTL;
 
-/// Caps memory held by AuthnRequests whose response never came back.
-pub(super) const MAX_PENDING_AUTHN_REQUESTS: usize = 1000;
+/// Caps memory held by AuthnRequests whose response never came back. An entry is an id and a
+/// timestamp, so the cap is about 10 MB. It is set high enough that the per-source login throttle
+/// (20 a minute, so about 100 entries per source over the 5-minute lifetime) stops one source long
+/// before the cap, and filling it takes about 1000 sources.
+pub(super) const MAX_PENDING_AUTHN_REQUESTS: usize = 100_000;
+
+/// Lets a store sweep out expired entries at most once per second, so a burst of inserts does not
+/// rescan a large map on every call.
+#[derive(Default)]
+pub(super) struct SweepGate {
+    last_second: Option<i64>,
+}
+
+impl SweepGate {
+    /// `true` for the first call in each second of `now`.
+    pub(super) fn due(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let second = now.timestamp();
+        if self
+            .last_second
+            .is_some_and(|last| second <= last)
+        {
+            return false;
+        }
+        self.last_second = Some(second);
+        true
+    }
+}
+
+#[derive(Default)]
+struct Entries {
+    expiries: HashMap<String, DateTime<Utc>>,
+    sweep: SweepGate,
+}
 
 #[derive(Default)]
 pub(super) struct PendingRequests {
-    expiries: Mutex<HashMap<String, DateTime<Utc>>>,
+    entries: Mutex<Entries>,
 }
 
 impl PendingRequests {
-    /// Records a request that expires after [`AUTHN_REQUEST_TTL`]. Expired requests are purged
-    /// first, and `false` is returned when the store is still full.
+    /// Records a request that expires after [`AUTHN_REQUEST_TTL`]. Expired requests are swept out
+    /// at most once per second, and `false` is returned when the store is full.
     pub(super) fn register(
         &self,
         request_id: String,
         now: DateTime<Utc>,
     ) -> bool {
-        let mut expiries = self.lock();
-        expiries.retain(|_, expiry| *expiry > now);
-        if expiries.len() >= MAX_PENDING_AUTHN_REQUESTS {
+        let mut entries = self.lock();
+        if entries.sweep.due(now) {
+            entries
+                .expiries
+                .retain(|_, expiry| *expiry > now);
+        }
+        if entries.expiries.len() >= MAX_PENDING_AUTHN_REQUESTS {
             return false;
         }
-        expiries.insert(request_id, now + AUTHN_REQUEST_TTL);
+        entries
+            .expiries
+            .insert(request_id, now + AUTHN_REQUEST_TTL);
         true
     }
 
@@ -38,11 +78,19 @@ impl PendingRequests {
         &self,
         request_id: &str,
     ) -> Option<DateTime<Utc>> {
-        self.lock().remove(request_id)
+        self.lock()
+            .expiries
+            .remove(request_id)
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, DateTime<Utc>>> {
-        self.expiries
+    /// How many requests are held, expired ones included until the next sweep.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.lock().expiries.len()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Entries> {
+        self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -51,6 +99,7 @@ impl PendingRequests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     fn fill(
         pending: &PendingRequests,
@@ -78,7 +127,7 @@ mod tests {
         fill(&pending, now);
 
         assert!(!pending.register("req-extra".to_string(), now));
-        assert_eq!(pending.lock().len(), MAX_PENDING_AUTHN_REQUESTS);
+        assert_eq!(pending.len(), MAX_PENDING_AUTHN_REQUESTS);
     }
 
     #[test]
@@ -88,7 +137,21 @@ mod tests {
         fill(&pending, now);
 
         assert!(pending.register("req-later".to_string(), now + AUTHN_REQUEST_TTL));
-        assert_eq!(pending.lock().len(), 1);
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn expired_requests_are_swept_at_most_once_per_second() {
+        let pending = PendingRequests::default();
+        let now = Utc::now();
+        assert!(pending.register("first".to_string(), now));
+        assert!(pending.register("already-expired".to_string(), now - AUTHN_REQUEST_TTL));
+
+        assert!(pending.register("same-second".to_string(), now));
+        assert_eq!(pending.len(), 3);
+        assert!(pending.register("next-second".to_string(), now + Duration::seconds(1)));
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending.consume("already-expired"), None);
     }
 
     #[test]
@@ -119,6 +182,6 @@ mod tests {
         });
 
         assert_eq!(registered, 1);
-        assert_eq!(pending.lock().len(), MAX_PENDING_AUTHN_REQUESTS);
+        assert_eq!(pending.len(), MAX_PENDING_AUTHN_REQUESTS);
     }
 }

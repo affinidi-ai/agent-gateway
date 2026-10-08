@@ -198,3 +198,35 @@ impl SamlConfig {
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse SAML config JSON: {}", e))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_saml_login_throttle_is_off_unless_saml_json_enables_it() {
+        let minimal = serde_json::json!({
+            "idp_entity_id": "idp",
+            "idp_sso_url": "https://idp.example/sso",
+            "sp_entity_id": "sp",
+            "sp_acs_url": "https://sp.example/acs",
+            "idp_cert_path": "idp.crt",
+            "sp_key_path": null,
+            "sp_cert_path": null,
+        });
+        let config: SamlConfig = serde_json::from_value(minimal.clone()).unwrap();
+        assert!(!config.login_throttle.enabled);
+
+        let mut enabled = minimal;
+        enabled["login_throttle"] = serde_json::json!({ "enabled": true });
+        let config: SamlConfig = serde_json::from_value(enabled).unwrap();
+        assert!(config.login_throttle.enabled);
+        assert_eq!(
+            config
+                .login_throttle
+                .per_ip
+                .requests,
+            20
+        );
+    }
+}

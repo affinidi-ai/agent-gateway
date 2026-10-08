@@ -140,19 +140,17 @@ impl CliLoginStore {
     }
 
     /// The code is consumed even when the verifier is wrong, so it cannot be guessed against.
-    /// Every outcome is logged with the user id where known, never with the code or verifier.
     fn redeem(
         &self,
         code: &str,
         verifier: &str,
-    ) -> Option<String> {
-        let Some((_, pending)) = self.entries.remove(code) else {
-            warn!("CLI login code redemption failed: unknown or already used code");
-            return None;
-        };
+    ) -> Result<RedeemedCliLogin, RedeemFailure> {
+        let (_, pending) = self
+            .entries
+            .remove(code)
+            .ok_or(RedeemFailure::UnknownCode)?;
         if Instant::now() >= pending.expires_at {
-            warn!(user_id = %pending.user_id, "CLI login code redemption failed: code expired");
-            return None;
+            return Err(RedeemFailure::Expired { user_id: pending.user_id });
         }
         let expected = pkce_challenge_s256(verifier);
         let matches: bool = expected
@@ -164,12 +162,27 @@ impl CliLoginStore {
             )
             .into();
         if !matches {
-            warn!(user_id = %pending.user_id, "CLI login code redemption failed: PKCE verifier mismatch");
-            return None;
+            return Err(RedeemFailure::VerifierMismatch { user_id: pending.user_id });
         }
-        info!(user_id = %pending.user_id, "CLI login code redeemed");
-        Some(pending.session_token)
+        Ok(RedeemedCliLogin {
+            session_token: pending.session_token,
+            user_id: pending.user_id,
+        })
     }
+}
+
+/// A code redeemed with the matching PKCE verifier.
+struct RedeemedCliLogin {
+    session_token: String,
+    user_id: String,
+}
+
+/// Why a redemption failed. Only the log tells these apart; the CLI gets one `invalid_grant`.
+#[derive(Debug, PartialEq, Eq)]
+enum RedeemFailure {
+    UnknownCode,
+    Expired { user_id: String },
+    VerifierMismatch { user_id: String },
 }
 
 /// Per-client-IP limits, one per endpoint, so a client's authorize retries do not use up its
@@ -291,9 +304,10 @@ pub async fn consent(
     client_ip: Option<Extension<ClientIp>>,
     body: Bytes,
 ) -> Response {
+    let client_ip = client_ip.map(|Extension(ClientIp(ip))| ip);
     if let Some(retry_after) = throttles
         .consent
-        .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
+        .record_client_attempt(client_ip)
     {
         return throttled(retry_after, THROTTLED_MESSAGE);
     }
@@ -331,7 +345,12 @@ pub async fn consent(
     let Some(code) = store.create(request.challenge, token, session.user_id.clone()) else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many pending CLI logins").into_response();
     };
-    info!(user_id = %session.user_id, port = request.port, "Issued CLI login code after user consent");
+    info!(
+        user_id = %session.user_id,
+        port = request.port,
+        client_ip = ?client_ip,
+        "Issued CLI login code after user consent"
+    );
     no_store(
         Json(ConsentResponse {
             redirect_url: build_loopback_redirect(request.port, &code, &request.state),
@@ -385,14 +404,16 @@ pub struct ExchangeResponse {
 /// leaves the code untouched, so the CLI can retry.
 pub async fn exchange(
     headers: HeaderMap,
+    Extension(session_manager): Extension<Arc<SessionManager>>,
     Extension(store): Extension<Arc<CliLoginStore>>,
     Extension(throttles): Extension<Arc<CliLoginThrottles>>,
     client_ip: Option<Extension<ClientIp>>,
     body: Bytes,
 ) -> Response {
+    let client_ip = client_ip.map(|Extension(ClientIp(ip))| ip);
     if let Some(retry_after) = throttles
         .exchange
-        .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
+        .record_client_attempt(client_ip)
     {
         return throttled(retry_after, exchange_error_body("too_many_requests", THROTTLED_MESSAGE));
     }
@@ -405,10 +426,42 @@ pub async fn exchange(
     if request.code.len() != CODE_LEN || !is_valid_verifier(&request.verifier) {
         return exchange_error(StatusCode::BAD_REQUEST, "invalid_request", "invalid exchange request");
     }
-    match store.redeem(&request.code, &request.verifier) {
-        Some(session_token) => no_store(Json(ExchangeResponse { session_token }).into_response()),
-        None => exchange_error(StatusCode::BAD_REQUEST, "invalid_grant", "invalid or expired authorization code"),
+    let invalid_grant =
+        || exchange_error(StatusCode::BAD_REQUEST, "invalid_grant", "invalid or expired authorization code");
+    let redeemed = match store.redeem(&request.code, &request.verifier) {
+        Ok(redeemed) => redeemed,
+        Err(RedeemFailure::UnknownCode) => {
+            warn!(client_ip = ?client_ip, "CLI login code redemption failed: unknown or already used code");
+            return invalid_grant();
+        }
+        Err(RedeemFailure::Expired { user_id }) => {
+            warn!(%user_id, client_ip = ?client_ip, "CLI login code redemption failed: code expired");
+            return invalid_grant();
+        }
+        Err(RedeemFailure::VerifierMismatch { user_id }) => {
+            warn!(%user_id, client_ip = ?client_ip, "CLI login code redemption failed: PKCE verifier mismatch");
+            return invalid_grant();
+        }
+    };
+    if session_manager
+        .validate_session(&redeemed.session_token)
+        .await
+        .is_none()
+    {
+        warn!(
+            user_id = %redeemed.user_id,
+            client_ip = ?client_ip,
+            "CLI login code redemption failed: the browser session has ended"
+        );
+        return invalid_grant();
     }
+    info!(user_id = %redeemed.user_id, client_ip = ?client_ip, "CLI login code redeemed");
+    no_store(
+        Json(ExchangeResponse {
+            session_token: redeemed.session_token,
+        })
+        .into_response(),
+    )
 }
 
 fn exchange_error_body(
@@ -504,7 +557,7 @@ mod tests {
     use super::*;
     use crate::auth::storage::UserData;
     use crate::auth::types::{UserRole, UserStatus};
-    use crate::config::types::ClientAuthConfig;
+    use crate::config::types::ClientIpConfig;
     use crate::source_auth::client_ip::resolve_client_ip_layer;
     use axum::{
         body::Body,
@@ -540,6 +593,8 @@ mod tests {
         assert_eq!(
             store
                 .redeem(&code, verifier)
+                .ok()
+                .map(|redeemed| redeemed.session_token)
                 .as_deref(),
             Some("session-abc")
         );
@@ -556,12 +611,12 @@ mod tests {
         assert!(
             store
                 .redeem(&code, verifier)
-                .is_some()
+                .is_ok()
         );
         assert!(
             store
                 .redeem(&code, verifier)
-                .is_none()
+                .is_err()
         );
     }
 
@@ -576,11 +631,32 @@ mod tests {
             )
             .unwrap();
 
-        assert!(
+        assert_eq!(
             store
                 .redeem(&code, "a-different-verifier-000000000000")
-                .is_none()
+                .err(),
+            Some(RedeemFailure::VerifierMismatch {
+                user_id: TEST_USER_ID.to_string()
+            })
         );
+    }
+
+    #[test]
+    fn a_new_code_expires_two_minutes_after_it_is_issued() {
+        let store = CliLoginStore::new();
+        let before = Instant::now();
+        let code = store
+            .create("ch".to_string(), "session-abc".to_string(), TEST_USER_ID.to_string())
+            .unwrap();
+        let after = Instant::now();
+
+        let expires_at = store
+            .entries
+            .get(&code)
+            .unwrap()
+            .expires_at;
+        let two_minutes = Duration::from_secs(120);
+        assert!(expires_at >= before + two_minutes && expires_at <= after + two_minutes);
     }
 
     #[test]
@@ -625,10 +701,13 @@ mod tests {
             },
         );
 
-        assert!(
+        assert_eq!(
             store
                 .redeem(&code, verifier)
-                .is_none()
+                .err(),
+            Some(RedeemFailure::Expired {
+                user_id: TEST_USER_ID.to_string()
+            })
         );
     }
 
@@ -880,12 +959,14 @@ mod tests {
         assert!(
             store
                 .redeem(&codes[0], verifier)
-                .is_none()
+                .is_err()
         );
         for code in &codes[1..] {
             assert_eq!(
                 store
                     .redeem(code, verifier)
+                    .ok()
+                    .map(|redeemed| redeemed.session_token)
                     .as_deref(),
                 Some("session-abc")
             );
@@ -981,13 +1062,12 @@ mod tests {
             .layer(Extension(store.clone()))
             .layer(Extension(Arc::new(CliLoginThrottles::new(&throttle))))
             .layer(axum::middleware::from_fn_with_state(
-                Arc::new(ClientAuthConfig {
+                Arc::new(ClientIpConfig {
                     trusted_proxies: vec![
                         TRUSTED_PROXY_CIDR
                             .parse()
                             .unwrap(),
                     ],
-                    ..ClientAuthConfig::default()
                 }),
                 resolve_client_ip_layer,
             ));
@@ -1636,10 +1716,12 @@ mod tests {
 
     #[tokio::test]
     async fn rotating_fake_x_forwarded_for_values_does_not_escape_the_limit() {
-        let app = throttled_app(LoginThrottleConfig::default()).await;
-        let limit = LoginThrottleConfig::default()
-            .per_ip
-            .requests;
+        let enabled = LoginThrottleConfig {
+            enabled: true,
+            ..LoginThrottleConfig::default()
+        };
+        let limit = enabled.per_ip.requests;
+        let app = throttled_app(enabled).await;
         for index in 0..limit {
             assert!(
                 authorize_from(&app.router, CLIENT, Some(&format!("192.0.2.{index}")))
@@ -1739,5 +1821,37 @@ mod tests {
             assert_eq!(json["error"], error, "case {index}");
             assert!(json["error_description"].is_string(), "case {index}");
         }
+    }
+    #[tokio::test]
+    async fn exchange_refuses_a_code_whose_browser_session_has_ended() {
+        let manager = Arc::new(SessionManager::new());
+        let token = manager
+            .create_session("alice".to_string(), TEST_USER_ID.to_string())
+            .await;
+        let store = Arc::new(CliLoginStore::new());
+        let code = store
+            .create(test_challenge(), token.clone(), TEST_USER_ID.to_string())
+            .unwrap();
+        manager
+            .remove_session(&token)
+            .await;
+        let router = Router::new()
+            .route("/auth/cli/exchange", post(exchange))
+            .layer(Extension(manager))
+            .layer(Extension(store.clone()))
+            .layer(Extension(default_throttles()));
+
+        let response = post_exchange(&router, &code, TEST_VERIFIER).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "invalid_grant");
+        assert!(store.entries.is_empty());
     }
 }

@@ -227,6 +227,18 @@ impl SamlService {
         Ok(redirect_url)
     }
 
+    /// The stored return targets, so tests can plant one the login handler would refuse.
+    #[cfg(test)]
+    pub(super) fn return_targets(&self) -> &ReturnTargetStore {
+        &self.return_targets
+    }
+
+    /// The outstanding AuthnRequests, so tests can fill or count them without a full login each.
+    #[cfg(test)]
+    pub(super) fn pending_requests(&self) -> &PendingRequests {
+        &self.pending_requests
+    }
+
     /// Returns the return target stored for a `RelayState` key, once. Unknown, expired and
     /// already used keys return `None`.
     pub fn take_return_target(

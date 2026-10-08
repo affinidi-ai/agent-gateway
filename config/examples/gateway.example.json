@@ -1119,8 +1119,11 @@
       "lockout_secs": 300
     }
   },
+  "client_ip": {
+    "trusted_proxies": []
+  },
   "cli_login_throttle": {
-    "enabled": true,
+    "enabled": false,
     "per_ip": {
       "requests": 20,
       "window_secs": 60

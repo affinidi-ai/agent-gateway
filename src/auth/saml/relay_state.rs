@@ -8,10 +8,13 @@ use std::sync::{Mutex, PoisonError};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use super::pending_requests::SweepGate;
 use super::service::AUTHN_REQUEST_TTL;
 
-/// Caps memory held by return targets whose sign-in never came back.
-const MAX_PENDING_RETURN_TARGETS: usize = 1000;
+/// Caps memory held by return targets whose sign-in never came back. Lower than the AuthnRequest
+/// cap, because a full store only drops the return target: the sign-in still succeeds and lands on
+/// the dashboard root.
+const MAX_PENDING_RETURN_TARGETS: usize = 10_000;
 
 /// The `RelayState` limit of the HTTP-Redirect binding.
 #[cfg(test)]
@@ -23,27 +26,37 @@ struct PendingReturnTarget {
 }
 
 #[derive(Default)]
+struct Entries {
+    targets: HashMap<String, PendingReturnTarget>,
+    sweep: SweepGate,
+}
+
+#[derive(Default)]
 pub(crate) struct ReturnTargetStore {
-    entries: Mutex<HashMap<String, PendingReturnTarget>>,
+    entries: Mutex<Entries>,
 }
 
 impl ReturnTargetStore {
-    /// Returns the key to send as `RelayState`: 32 hex characters. Expired targets are purged
-    /// first, and `None` is returned when the store is still full.
+    /// Returns the key to send as `RelayState`: 32 hex characters. Expired targets are swept out at
+    /// most once per second, and `None` is returned when the store is full.
     pub(crate) fn insert(
         &self,
         target: &str,
         now: DateTime<Utc>,
     ) -> Option<String> {
         let mut entries = self.lock();
-        entries.retain(|_, pending| pending.expires_at > now);
-        if entries.len() >= MAX_PENDING_RETURN_TARGETS {
+        if entries.sweep.due(now) {
+            entries
+                .targets
+                .retain(|_, pending| pending.expires_at > now);
+        }
+        if entries.targets.len() >= MAX_PENDING_RETURN_TARGETS {
             return None;
         }
         let key = Uuid::new_v4()
             .simple()
             .to_string();
-        entries.insert(
+        entries.targets.insert(
             key.clone(),
             PendingReturnTarget {
                 target: target.to_string(),
@@ -59,11 +72,14 @@ impl ReturnTargetStore {
         key: &str,
         now: DateTime<Utc>,
     ) -> Option<String> {
-        let pending = self.lock().remove(key)?;
+        let pending = self
+            .lock()
+            .targets
+            .remove(key)?;
         (pending.expires_at > now).then_some(pending.target)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingReturnTarget>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Entries> {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -168,7 +184,7 @@ mod tests {
                 .insert(TARGET, now)
                 .is_none()
         );
-        assert_eq!(store.lock().len(), MAX_PENDING_RETURN_TARGETS);
+        assert_eq!(store.lock().targets.len(), MAX_PENDING_RETURN_TARGETS);
     }
 
     #[test]
@@ -187,6 +203,6 @@ mod tests {
                 .insert(TARGET, later)
                 .is_some()
         );
-        assert_eq!(store.lock().len(), 1);
+        assert_eq!(store.lock().targets.len(), 1);
     }
 }
