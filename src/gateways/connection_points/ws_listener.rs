@@ -2173,7 +2173,7 @@ fn spawn_refused_open_answer(
     bootstrap_config: &Option<Arc<crate::config::BootstrapConfig>>,
 ) {
     let Ok(permit) = Arc::clone(pending).try_acquire_owned() else {
-        debug!(from = ?message.from_did, "Too many refused Fabric Opens awaiting an answer; leaving this one unanswered");
+        warn!(from = ?message.from_did, "Too many refused Fabric Opens awaiting an answer; leaving this one unanswered");
         return;
     };
     let client = client.clone();
@@ -2485,7 +2485,12 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                             stream_tasks.spawn(incoming.run(sink));
                         }
                         Ok(Err(refusal)) => {
-                            warn!(error = %refusal, code = ?refusal.code, "Rejecting Fabric Open");
+                            warn!(
+                                from = ?received_msg.from_did,
+                                error = %refusal,
+                                code = ?refusal.code,
+                                "Rejecting Fabric Open"
+                            );
                             spawn_refused_open_answer(
                                 &mut stream_tasks,
                                 &pending_open_refusals,

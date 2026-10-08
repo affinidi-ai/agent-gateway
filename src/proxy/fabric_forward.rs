@@ -56,6 +56,28 @@ pub(crate) enum FabricForwardError {
     StreamingUnavailable,
     #[error("The remote surface serves legacy MCP only")]
     RemoteLegacyOnly,
+    #[error("A Fabric stream cap is full")]
+    CapacityReached,
+}
+
+/// Seconds a caller refused by a full Fabric stream cap is told to wait.
+pub(crate) const CAPACITY_RETRY_AFTER_SECS: u64 = 5;
+
+/// The answer to a modern MCP request refused because a Fabric stream cap is
+/// full: `429` with `Retry-After` and a JSON-RPC error body.
+pub(crate) fn capacity_response(id: Option<serde_json::Value>) -> axum::response::Response {
+    let mut response = crate::mcp::request_validation::McpRequestValidationError {
+        status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+        id,
+        code: crate::mcp::errors::error_codes::INTERNAL_ERROR,
+        message: "Too many concurrent MCP requests over Fabric".into(),
+        data: None,
+    }
+    .into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(CAPACITY_RETRY_AFTER_SECS));
+    response
 }
 
 /// Parameters for a single fabric forward.
@@ -113,7 +135,10 @@ async fn forward_stream_with_runtime(
     request: FabricStreamForwardRequest<'_>,
     runtime: Arc<super::fabric_stream::StreamRuntime>,
 ) -> Result<axum::response::Response, FabricForwardError> {
-    use super::fabric_stream::{registry::StreamBinding, transport, wire};
+    use super::fabric_stream::{
+        registry::{StreamBinding, StreamKind},
+        transport, wire,
+    };
     if !runtime.supports_request_streams() {
         return Err(FabricForwardError::StreamingUnavailable);
     }
@@ -235,6 +260,7 @@ async fn forward_stream_with_runtime(
     {
         return Err(FabricForwardError::StreamingUnavailable);
     }
+    let kind = StreamKind::for_method(Some(method));
     let headers = wire::encode_headers(&request.headers).map_err(|_| FabricForwardError::StreamingUnavailable)?;
     let stream_id = uuid::Uuid::new_v4();
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -279,23 +305,25 @@ async fn forward_stream_with_runtime(
         .register_negotiated(
             stream_id,
             binding.clone(),
+            kind,
             wire::StreamDirection::Response,
             agreement
                 .capabilities
                 .max_window_bytes as usize,
             &agreement.capabilities,
         )
-        .map_err(|_| FabricForwardError::StreamingUnavailable)?;
+        .map_err(registration_failure)?;
     let sender = runtime
         .registry
         .register_sender_negotiated(
             stream_id,
             binding.clone(),
+            kind,
             wire::StreamDirection::Request,
             wire::MAX_CHUNK_BYTES,
             &agreement.capabilities,
         )
-        .map_err(|_| FabricForwardError::StreamingUnavailable)?;
+        .map_err(registration_failure)?;
     // Waits for the peer's Credit on the upload; the response itself may be
     // quiet for as long as the target takes.
     sender
@@ -334,6 +362,13 @@ async fn forward_stream_with_runtime(
     Ok(response)
 }
 
+fn registration_failure(error: super::fabric_stream::registry::RegisterError) -> FabricForwardError {
+    match error {
+        super::fabric_stream::registry::RegisterError::CapacityReached(_) => FabricForwardError::CapacityReached,
+        super::fabric_stream::registry::RegisterError::Refused(_) => FabricForwardError::StreamingUnavailable,
+    }
+}
+
 /// How the sender answers a stream that ended with `code`, and whether it drops
 /// its capability agreement so the next request negotiates again. Only a stale
 /// offer (the peer restarted, or the offer expired) does: other refusals keep
@@ -349,6 +384,7 @@ fn stream_failure(
         }
         super::fabric_stream::wire::StreamErrorCode::StaleOffer => (FabricForwardError::StreamingUnavailable, true),
         super::fabric_stream::wire::StreamErrorCode::LegacyOnly => (FabricForwardError::RemoteLegacyOnly, false),
+        super::fabric_stream::wire::StreamErrorCode::CapacityReached => (FabricForwardError::CapacityReached, false),
         _ => (FabricForwardError::StreamingUnavailable, false),
     }
 }
@@ -1442,18 +1478,60 @@ mod tests {
             stream_failure(StreamErrorCode::DeadlineExceeded, "gw"),
             (FabricForwardError::NoResponse(_), false)
         ));
+        assert!(matches!(
+            stream_failure(StreamErrorCode::CapacityReached, "gw"),
+            (FabricForwardError::CapacityReached, false)
+        ));
         for code in [
             StreamErrorCode::Unavailable,
             StreamErrorCode::InvalidFrame,
             StreamErrorCode::LimitExceeded,
             StreamErrorCode::UpstreamFailed,
             StreamErrorCode::Cancelled,
+            StreamErrorCode::Unknown,
         ] {
             assert!(
                 matches!(stream_failure(code, "gw"), (FabricForwardError::StreamingUnavailable, false)),
                 "{code:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_full_local_cap_is_a_capacity_failure() {
+        use crate::proxy::fabric_stream::registry::RegisterError;
+
+        assert!(matches!(
+            registration_failure(RegisterError::CapacityReached("full")),
+            FabricForwardError::CapacityReached
+        ));
+        assert!(matches!(
+            registration_failure(RegisterError::Refused("duplicate".into())),
+            FabricForwardError::StreamingUnavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_capacity_refusal_is_a_retryable_json_rpc_429() {
+        let response = capacity_response(Some(serde_json::json!(7)));
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "5"
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 7);
+        assert_eq!(body["error"]["code"], crate::mcp::errors::error_codes::INTERNAL_ERROR);
+        assert_eq!(body["error"]["message"], "Too many concurrent MCP requests over Fabric");
     }
 
     #[tokio::test]
