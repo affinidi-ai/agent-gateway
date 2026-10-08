@@ -1,0 +1,125 @@
+branch: feat/human-friendly-metadata
+changes:
+  added:
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: ⭐ Publish human-readable names for agents, Issuers and Authorities to TRs
+      description: >-
+        The gateway now publishes display names as trust-registry reference fields: the
+        managed agent's surface name, and the configured names for Issuers and
+        Authorities. Names are sent when an Issuer is created, retried or edited, when
+        an Authority is edited, when a surface is renamed, and by the Trust Recorder. Each
+        publish creates the field and updates it on conflict. Publishing runs in the
+        background and never blocks requests or record creation.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Attach the agent display name to new Trust Recorder records as context
+      description: >-
+        Records the Trust Recorder creates for a managed agent carry
+        {"displayName", "origin": "managed"} as context, taken once at creation. A DID
+        managed on more than one surface publishes no name.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Include the managed agent's display name in its identity VC
+      description: >-
+        Agent identity VCs carry credentialSubject.name, set to the managed agent's
+        surface name, on the legacy and SSI issuance paths. The next VC after a surface
+        rename carries the new name under the same DID.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Show identity origin, display names and surface links in Identities
+      description: >-
+        The Identities page shows a Managed Agent or External Caller badge, and each
+        name with its DID in monospace and a copy button. Each identity has its own row
+        and actions, so parallel managed agents behind one surface (for example one DID
+        per JWT claim value) each keep their Trust Score and policy. The page also adds an unnamed filter, a name-conflict marker, and the credential
+        principal. An identity without a name shows its DID as the primary line, and a
+        caller whose name is still being looked up shows "resolving…". Identities stored
+        before origins existed stay unnamed until the gateway next issues
+        their credential. External callers are
+        named by a verified alsoKnownAs agent name, then by their Agent Card name (marked unverified), then by their DID.
+    - timestamp: '2026-10-06T09:00:00.000Z'
+      title: Show managed agents' target Agent Card names, marked unverified
+      description: >-
+        On A2A and AP2 surfaces with an HTTP(S) target, the Identities page shows the
+        name in the managed agent's own Agent Card in place of the surface name, with an
+        "unverified" marker. The name is self-asserted by the target, so it is never
+        signed into the identity VC or published to Trust Recorder context or trust
+        registries, and card lookups never block requests. The card is cached for five
+        minutes per surface. A card that cannot be read keeps the last name read from the same
+        target, so a target outage does not flip the row back to the surface name; a
+        card without a valid name shows the surface name.
+  changed:
+    - timestamp: '2026-10-06T10:00:00.000Z'
+      title: Rename the Identities Status column to Origin
+      description: >-
+        The column shows whether an identity is a Managed Agent or an External Caller
+        (or LOCAL/REMOTE for older records), which is its origin rather than a status.
+        The header now matches the identity origin term used in the glossary and API.
+    - timestamp: '2026-10-05T17:00:00.000Z'
+      title: Name the authorities and Issuers that Trust Recorder records reference
+      description: >-
+        After writing its records, the Trust Recorder publishes an authority reference
+        field for each authority DID, named after the matching Authority or Issuer.
+        It also names an Issuer DID used as a record's entity. Trust registries can
+        now show the authority by name instead of only its DID. Only Authorities and
+        Issuers that are global or in the surface's tenant are named, so one tenant's
+        names are never published from another tenant's surface.
+  fixed:
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Keep other Identities rows expanded when a row is expanded via its link
+      description: >-
+        Expanding an identity row on the /identities/:did route no longer collapses rows
+        that were already expanded.
+    - timestamp: '2026-10-05T16:00:00.000Z'
+      title: Stop Trust Recorder custom resource inputs squeezing the selects
+      description: >-
+        In the Trust Recorder editor, the Action and Resource inputs of a custom
+        resource row now share the remaining width and can shrink. Entity Target and
+        Record Type keep fixed widths, and every column has a label so the row lines up.
+    - timestamp: '2026-10-05T16:30:00.000Z'
+      title: Record an Issuer's own DID when it is chosen as Trust Recorder authority
+      description: >-
+        Choosing an Issuer in the Trust Recorder Authority dropdown stored the
+        authority the Issuer was registered under, often the gateway's DID, so
+        records showed the gateway as the authority. It now stores the Issuer's own
+        DID. Entries saved with the old value show as Custom until re-selected.
+  removed: []
+  security:
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Reject invisible Unicode format characters in display names
+      description: >-
+        Display names and descriptions now reject Unicode format (Cf) characters such as
+        zero-width spaces, bidirectional overrides and tag characters, as well as control
+        characters. Names read from remote Agent Cards, signed into VCs or published to
+        trust registries can no longer visually impersonate another agent's name.
+  breaking: []
+  internal:
+    - timestamp: '2026-10-07T12:00:00.000Z'
+      title: Document that shared reference fields are last-writer-wins
+      description: >-
+        SOURCE_AUTH.md now states that a trust-registry reference field is shared by
+        every writer for its type and id, so gateways naming the same Authority
+        differently overwrite each other. Fields stay create-then-update so an operator
+        can still rename their own Authority or Issuer in registries that already hold it.
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Share one background refresh cache between caller and target card names
+      description: >-
+        Caller names and target Agent Card names now use a single RefreshCache for TTL
+        checks, one in-flight refresh per key, bounded concurrency and change tracking,
+        instead of two copies of that logic. Each service keeps its own value type and
+        change rule; behaviour is unchanged.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Enable the agent-names feature of the DID resolver SDK
+      description: >-
+        Turns on the affinidi-did-resolver-cache-sdk agent-names feature (agent-names
+        0.1.3), which caller-name verification needs. Its resolver follows redirects
+        with its own HTTP client, outside allow_private_hosts and src/egress.rs, so
+        POLICY.md now documents that egress path and its DNS-rebinding gap.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Record identity origin on identity records
+      description: >-
+        AgentIdentityRecord gains an optional origin (managed or external_caller),
+        stamped at DID issuance from the identity slot the DID came from. An inbound
+        request on a surface with no inbound slot derives the DID from the protected
+        slot, so it is stamped managed. Records without one deserialise unchanged.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Document display names, reference fields and caller naming
+      description: >-
+        Updates SOURCE_AUTH.md, CONTEXT.md, ARCHITECTURE.md and the dashboard AGENTS.md.

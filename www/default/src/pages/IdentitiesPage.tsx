@@ -4,7 +4,7 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
 import { usePermissions } from '../context/PermissionsContext';
 import { WS_NONE, WS_DASHBOARD } from '../utils/wsSubscriptions';
-import { formatDateTime, timeAgo, topAndTail } from '../utils/stringUtils';
+import { formatDateTime, timeAgo } from '../utils/stringUtils';
 import TrustScoreModal from '../components/didwebvh/TrustScoreModal';
 import VersionHistoryModal from '../components/didwebvh/VersionHistoryModal';
 import PolicyConfigModal from '../components/didwebvh/PolicyConfigModal';
@@ -14,6 +14,9 @@ import { EmptyState } from '../components/shared/EmptyState';
 import { Badge } from '../components/shared/Badge';
 import { DOCS_URL } from '../config/docs';
 import { CopyButton } from '../components/shared/CopyButton';
+import { CredentialPrincipalLabel, IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
+import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
+import { useIdentityRows } from './IdentitiesPage/useIdentityRows';
 import IssuersTab from './SettingsPage/IssuersTab';
 import AuthoritiesTab from './SettingsPage/AuthoritiesTab';
 
@@ -29,6 +32,7 @@ const IdentitiesPage: React.FC = () => {
   const [loadingDidDocument, setLoadingDidDocument] = useState(false);
   const identityRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
   const [searchTerm, setSearchTerm] = useState('');
+  const [showUnnamedOnly, setShowUnnamedOnly] = useState(false);
   const [issuersCount, setIssuersCount] = useState(0);
   const [authoritiesCount, setAuthoritiesCount] = useState(0);
 
@@ -142,30 +146,24 @@ const IdentitiesPage: React.FC = () => {
     return Array.from(didMap.values());
   }, [stats?.identities, didWebVhIdentities]);
 
-  // Filter identities based on search term
-  const filteredIdentities = useMemo(() => {
-    const trimmedSearch = searchTerm.trim();
-    if (!trimmedSearch) return identities;
-
-    const searchLower = trimmedSearch.toLowerCase();
-    return identities.filter(
-      identity =>
-        identity.name?.toLowerCase().includes(searchLower) ||
-        identity.did?.toLowerCase().includes(searchLower) ||
-        identity.channel_name?.toLowerCase().includes(searchLower) ||
-        identity.identity_hash?.toLowerCase().includes(searchLower)
-    );
-  }, [identities, searchTerm]);
+  const { filteredIdentities, hasNamingMetadata, unnamedCount, liveSurfaceNames, surfaceLinkFor } =
+    useIdentityRows({
+      identities,
+      channels: stats?.channels,
+      searchTerm,
+      showUnnamedOnly,
+    });
 
   // Handle deep linking to a specific identity
   useEffect(() => {
     if (didParam) {
       const decodedDid = decodeURIComponent(didParam);
-      // Expand the identity
-      setExpandedIdentityDids(new Set([decodedDid]));
-      setExpandedSections({
-        [decodedDid]: new Set(['summary']),
-      });
+      setExpandedIdentityDids(prev =>
+        prev.has(decodedDid) ? prev : new Set(prev).add(decodedDid)
+      );
+      setExpandedSections(prev =>
+        prev[decodedDid] ? prev : { ...prev, [decodedDid]: new Set(['summary']) }
+      );
 
       // Scroll to the identity after a short delay to ensure rendering
       setTimeout(() => {
@@ -177,32 +175,21 @@ const IdentitiesPage: React.FC = () => {
     }
   }, [didParam]);
 
-  // Toggle identity details expansion
   const toggleIdentityDetails = (did: string) => {
+    const isOpen = expandedIdentityDids.has(did);
     setExpandedIdentityDids(prev => {
-      const newSet = new Set(prev);
-      if (newSet.has(did)) {
-        newSet.delete(did);
-        // Clean up expanded sections for this identity
-        setExpandedSections(prevSections => {
-          const newSections = { ...prevSections };
-          delete newSections[did];
-          return newSections;
-        });
-        // Navigate back to identities list when closing
-        navigate('/identities');
-      } else {
-        newSet.add(did);
-        // Initialize with summary section open
-        setExpandedSections(prevSections => ({
-          ...prevSections,
-          [did]: new Set(['summary']),
-        }));
-        // Navigate to the deep link URL when expanding
-        navigate(`/identities/${encodeURIComponent(did)}`);
-      }
-      return newSet;
+      const next = new Set(prev);
+      if (isOpen) next.delete(did);
+      else next.add(did);
+      return next;
     });
+    setExpandedSections(prev => {
+      const next = { ...prev };
+      if (isOpen) delete next[did];
+      else next[did] = new Set(['summary']);
+      return next;
+    });
+    navigate(isOpen ? '/identities' : `/identities/${encodeURIComponent(did)}`);
   };
 
   // Toggle a specific section within an identity
@@ -403,6 +390,18 @@ const IdentitiesPage: React.FC = () => {
             placeholder="Filter Agent Identities, Issuers, Authorities..."
             width="384px"
           />
+          {hasNamingMetadata && activeTab === 'identities' && (
+            <button
+              type="button"
+              className={`btn btn-sm ms-2 ${showUnnamedOnly ? 'btn-primary' : 'btn-outline-secondary'}`}
+              aria-pressed={showUnnamedOnly}
+              onClick={() => setShowUnnamedOnly(prev => !prev)}
+              data-testid="identities-unnamed-filter-button"
+            >
+              <i className="fas fa-filter me-1" aria-hidden="true"></i>
+              Unnamed only ({unnamedCount})
+            </button>
+          )}
         </div>
       </div>
 
@@ -438,7 +437,11 @@ const IdentitiesPage: React.FC = () => {
                         value={filteredIdentities.length}
                         className="ms-2"
                         ariaLabel={`${filteredIdentities.length} agent identities`}
-                        suffix={searchTerm ? ` of ${identities.length}` : undefined}
+                        suffix={
+                          searchTerm || (hasNamingMetadata && showUnnamedOnly)
+                            ? ` of ${identities.length}`
+                            : undefined
+                        }
                       />
                     </h6>
                   </div>
@@ -453,7 +456,7 @@ const IdentitiesPage: React.FC = () => {
                         <table className="table table-hover table-sm">
                           <thead>
                             <tr>
-                              <th>DID</th>
+                              <th>{hasNamingMetadata ? 'Identity' : 'DID'}</th>
                               <th>Agent Surface</th>
                               <th>Trust Score</th>
                               <th>Attestation</th>
@@ -461,13 +464,14 @@ const IdentitiesPage: React.FC = () => {
                               <th>Created</th>
                               <th>Usage Count</th>
                               <th>Last Used</th>
-                              <th>Status</th>
+                              <th>Origin</th>
                               <th>Actions</th>
                             </tr>
                           </thead>
                           <tbody>
                             {filteredIdentities.map(identity => {
                               const isExpanded = expandedIdentityDids.has(identity.did);
+                              const surfaceLink = surfaceLinkFor(identity);
                               return (
                                 <React.Fragment key={identity.did}>
                                   <tr
@@ -476,19 +480,23 @@ const IdentitiesPage: React.FC = () => {
                                     }}
                                     style={{ cursor: 'pointer' }}
                                     onClick={() => toggleIdentityDetails(identity.did)}
+                                    aria-expanded={isExpanded}
+                                    data-testid={`identities-row-${identity.did}`}
                                   >
                                     <td>
                                       <div className="d-inline-flex align-items-center flex-nowrap">
                                         <i
                                           className={`fas fa-chevron-${isExpanded ? 'down' : 'right'} me-2`}
                                         ></i>
-                                        <code
-                                          style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}
-                                          title={identity.did}
-                                        >
-                                          {topAndTail(identity.did, 20, 16)}
-                                        </code>
-                                        <CopyButton text={identity.did} title="Copy DID" />
+                                        <IdentityNameCell
+                                          identity={identity}
+                                          showName={hasNamingMetadata}
+                                          liveSurfaceName={
+                                            identity.surface_id
+                                              ? liveSurfaceNames.get(identity.surface_id)
+                                              : undefined
+                                          }
+                                        />
                                       </div>
                                       {identity.version !== undefined &&
                                         identity.version !== null && (
@@ -503,21 +511,25 @@ const IdentitiesPage: React.FC = () => {
                                       )}
                                     </td>
                                     <td>
-                                      {identity.channel_name && identity.channel_config_id ? (
+                                      {surfaceLink ? (
                                         <button
                                           type="button"
                                           onClick={e => {
                                             e.stopPropagation();
-                                            navigate(`/surfaces/${identity.channel_config_id}`);
+                                            navigate(`/surfaces/${surfaceLink.id}`);
                                           }}
                                           className="btn btn-link p-0 align-baseline text-primary"
                                           style={{ fontSize: '0.75rem' }}
+                                          data-testid="identities-surface-link"
                                         >
-                                          {identity.channel_name}
+                                          {surfaceLink.name}
                                         </button>
                                       ) : (
                                         <span className="text-muted">-</span>
                                       )}
+                                      <CredentialPrincipalLabel
+                                        principal={identity.credential_principal}
+                                      />
                                     </td>
                                     <td>
                                       {identity.trust_score !== undefined ? (
@@ -620,7 +632,17 @@ const IdentitiesPage: React.FC = () => {
                                       </small>
                                     </td>
                                     <td>
-                                      {identity.is_local !== undefined ? (
+                                      {identity.origin ? (
+                                        <>
+                                          <IdentityOriginBadge origin={identity.origin} />
+                                          {identity.origin === 'external_caller' &&
+                                            identity.verified && (
+                                              <span className="badge text-bg-success ms-1">
+                                                VERIFIED
+                                              </span>
+                                            )}
+                                        </>
+                                      ) : identity.is_local !== undefined ? (
                                         <>
                                           <span
                                             className={`badge ${identity.is_local ? 'text-bg-info' : 'text-bg-warning'}`}
@@ -687,7 +709,7 @@ const IdentitiesPage: React.FC = () => {
                                       </div>
                                     </td>
                                   </tr>
-                                  {expandedIdentityDids.has(identity.did) && (
+                                  {isExpanded && (
                                     <tr className="expanded-detail-row">
                                       <td colSpan={10} className="p-0">
                                         <div className="p-3">
@@ -739,30 +761,53 @@ const IdentitiesPage: React.FC = () => {
                                                           <small>{identity.identity_hash}</small>
                                                         </div>
                                                       </div>
-                                                      {identity.channel_name &&
-                                                        identity.channel_config_id && (
-                                                          <div className="mb-2">
-                                                            <small className="font-weight-bold text-muted">
-                                                              Channel:
+                                                      {surfaceLink && (
+                                                        <div className="mb-2">
+                                                          <small className="font-weight-bold text-muted">
+                                                            {identity.surface_id
+                                                              ? 'Agent Surface:'
+                                                              : 'Channel:'}
+                                                          </small>
+                                                          <div>
+                                                            <small>
+                                                              <button
+                                                                type="button"
+                                                                onClick={e => {
+                                                                  e.stopPropagation();
+                                                                  navigate(
+                                                                    `/surfaces/${surfaceLink.id}`
+                                                                  );
+                                                                }}
+                                                                className="btn btn-link p-0 align-baseline text-primary"
+                                                              >
+                                                                {surfaceLink.name}
+                                                              </button>
                                                             </small>
-                                                            <div>
-                                                              <small>
-                                                                <button
-                                                                  type="button"
-                                                                  onClick={e => {
-                                                                    e.stopPropagation();
-                                                                    navigate(
-                                                                      `/surfaces/${identity.channel_config_id}`
-                                                                    );
-                                                                  }}
-                                                                  className="btn btn-link p-0 align-baseline text-primary"
-                                                                >
-                                                                  {identity.channel_name}
-                                                                </button>
-                                                              </small>
-                                                            </div>
                                                           </div>
-                                                        )}
+                                                        </div>
+                                                      )}
+                                                      {identity.credential_principal && (
+                                                        <div className="mb-2">
+                                                          <small className="font-weight-bold text-muted">
+                                                            Credential Principal:
+                                                          </small>
+                                                          <div>
+                                                            <small>
+                                                              {identity.credential_principal.name ||
+                                                                identity.credential_principal
+                                                                  .id}{' '}
+                                                              <span className="text-muted">
+                                                                (
+                                                                {identity.credential_principal
+                                                                  .kind === 'certificate'
+                                                                  ? 'certificate'
+                                                                  : 'API key'}{' '}
+                                                                {identity.credential_principal.id})
+                                                              </span>
+                                                            </small>
+                                                          </div>
+                                                        </div>
+                                                      )}
                                                     </div>
                                                     <div className="col-md-6">
                                                       <div className="mb-2">
@@ -930,311 +975,6 @@ const IdentitiesPage: React.FC = () => {
                                                         )}
                                                       </code>
                                                     </pre>
-                                                  </div>
-                                                )}
-                                              </div>
-                                            )}
-
-                                            {/* Agent DNA */}
-                                            {identity.metadata?.agentDNA && (
-                                              <div className="card mb-2">
-                                                <div
-                                                  className="card-header py-1 bg-light"
-                                                  style={{ cursor: 'pointer' }}
-                                                  onClick={() => toggleSection(identity.did, 'dna')}
-                                                >
-                                                  <small className="mb-0 text-muted">
-                                                    <i
-                                                      className={`fas fa-chevron-${isSectionExpanded(identity.did, 'dna') ? 'down' : 'right'} mr-2`}
-                                                    ></i>
-                                                    <i className="fas fa-dna"></i> Agent DNA
-                                                    <span
-                                                      className="badge badge-info ml-2"
-                                                      style={{ fontSize: '0.65rem' }}
-                                                    >
-                                                      UAI
-                                                    </span>
-                                                  </small>
-                                                </div>
-                                                {isSectionExpanded(identity.did, 'dna') && (
-                                                  <div className="card-body py-2 px-3">
-                                                    {(() => {
-                                                      const dna = identity.metadata.agentDNA;
-                                                      const copyUai = (e: React.MouseEvent) => {
-                                                        e.stopPropagation();
-                                                        navigator.clipboard.writeText(
-                                                          dna.uai || ''
-                                                        );
-                                                      };
-                                                      return (
-                                                        <>
-                                                          {/* UAI string */}
-                                                          <div className="mb-3 p-2 bg-light border rounded d-flex justify-content-between align-items-center">
-                                                            <div>
-                                                              <small className="font-weight-bold text-muted d-block">
-                                                                UAI
-                                                              </small>
-                                                              <code
-                                                                style={{
-                                                                  fontSize: '0.75rem',
-                                                                  wordBreak: 'break-all',
-                                                                }}
-                                                              >
-                                                                {dna.uai}
-                                                              </code>
-                                                            </div>
-                                                            <button
-                                                              className="btn btn-sm btn-outline-secondary ml-2"
-                                                              style={{ whiteSpace: 'nowrap' }}
-                                                              onClick={copyUai}
-                                                              title="Copy UAI"
-                                                            >
-                                                              <i className="fas fa-copy"></i>
-                                                            </button>
-                                                          </div>
-
-                                                          <div className="row">
-                                                            {/* Genesis */}
-                                                            <div className="col-md-6 mb-2">
-                                                              <small className="font-weight-bold text-primary">
-                                                                <i className="fas fa-seedling"></i>{' '}
-                                                                Genesis
-                                                              </small>
-                                                              <table
-                                                                className="table table-sm table-borderless mb-0"
-                                                                style={{ fontSize: '0.75rem' }}
-                                                              >
-                                                                <tbody>
-                                                                  <tr>
-                                                                    <td
-                                                                      className="text-muted py-0 pr-1"
-                                                                      style={{ width: '45%' }}
-                                                                    >
-                                                                      Provider
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      <code>
-                                                                        {
-                                                                          dna.genesis?.modelSpec
-                                                                            ?.provider
-                                                                        }
-                                                                      </code>
-                                                                    </td>
-                                                                  </tr>
-                                                                  <tr>
-                                                                    <td className="text-muted py-0">
-                                                                      Model
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      <code>
-                                                                        {
-                                                                          dna.genesis?.modelSpec
-                                                                            ?.model
-                                                                        }
-                                                                        {dna.genesis?.modelSpec
-                                                                          ?.version
-                                                                          ? ` v${dna.genesis.modelSpec.version}`
-                                                                          : ''}
-                                                                      </code>
-                                                                    </td>
-                                                                  </tr>
-                                                                  <tr>
-                                                                    <td className="text-muted py-0">
-                                                                      Genesis hash
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      <code>
-                                                                        {dna.genesis?.genesisHash?.slice(
-                                                                          0,
-                                                                          12
-                                                                        )}
-                                                                        …
-                                                                      </code>
-                                                                    </td>
-                                                                  </tr>
-                                                                </tbody>
-                                                              </table>
-                                                            </div>
-
-                                                            {/* Behavioral */}
-                                                            <div className="col-md-6 mb-2">
-                                                              <small className="font-weight-bold text-primary">
-                                                                <i className="fas fa-brain"></i>{' '}
-                                                                Behavioral
-                                                              </small>
-                                                              <table
-                                                                className="table table-sm table-borderless mb-0"
-                                                                style={{ fontSize: '0.75rem' }}
-                                                              >
-                                                                <tbody>
-                                                                  <tr>
-                                                                    <td
-                                                                      className="text-muted py-0"
-                                                                      style={{ width: '45%' }}
-                                                                    >
-                                                                      Fingerprint
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      <code>
-                                                                        {dna.behavioral?.behavioralHash?.slice(
-                                                                          0,
-                                                                          12
-                                                                        )}
-                                                                        …
-                                                                      </code>
-                                                                    </td>
-                                                                  </tr>
-                                                                  <tr>
-                                                                    <td className="text-muted py-0">
-                                                                      Measured
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      <small>
-                                                                        {dna.behavioral?.measuredAt
-                                                                          ? new Date(
-                                                                              dna.behavioral
-                                                                                .measuredAt
-                                                                            ).toLocaleDateString()
-                                                                          : '—'}
-                                                                      </small>
-                                                                    </td>
-                                                                  </tr>
-                                                                </tbody>
-                                                              </table>
-                                                            </div>
-
-                                                            {/* Operational */}
-                                                            <div className="col-md-6 mb-2">
-                                                              <small className="font-weight-bold text-primary">
-                                                                <i className="fas fa-server"></i>{' '}
-                                                                Operational
-                                                              </small>
-                                                              <table
-                                                                className="table table-sm table-borderless mb-0"
-                                                                style={{ fontSize: '0.75rem' }}
-                                                              >
-                                                                <tbody>
-                                                                  <tr>
-                                                                    <td
-                                                                      className="text-muted py-0"
-                                                                      style={{ width: '45%' }}
-                                                                    >
-                                                                      TEE
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      {dna.operational
-                                                                        ?.teeAttestation ? (
-                                                                        <span className="text-success">
-                                                                          <i className="fas fa-check-circle"></i>{' '}
-                                                                          Present
-                                                                        </span>
-                                                                      ) : (
-                                                                        <span className="text-muted">
-                                                                          —
-                                                                        </span>
-                                                                      )}
-                                                                    </td>
-                                                                  </tr>
-                                                                  <tr>
-                                                                    <td className="text-muted py-0">
-                                                                      Cloud
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      {dna.operational
-                                                                        ?.cloudAttestation ? (
-                                                                        <span className="text-success">
-                                                                          <i className="fas fa-check-circle"></i>{' '}
-                                                                          {dna.operational
-                                                                            .cloudAttestation
-                                                                            .provider || 'Present'}
-                                                                        </span>
-                                                                      ) : (
-                                                                        <span className="text-muted">
-                                                                          —
-                                                                        </span>
-                                                                      )}
-                                                                    </td>
-                                                                  </tr>
-                                                                  <tr>
-                                                                    <td className="text-muted py-0">
-                                                                      Op hash
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      <code>
-                                                                        {dna.operational?.operationalHash?.slice(
-                                                                          0,
-                                                                          12
-                                                                        )}
-                                                                        …
-                                                                      </code>
-                                                                    </td>
-                                                                  </tr>
-                                                                </tbody>
-                                                              </table>
-                                                            </div>
-
-                                                            {/* Attestations */}
-                                                            <div className="col-md-6 mb-2">
-                                                              <small className="font-weight-bold text-primary">
-                                                                <i className="fas fa-certificate"></i>{' '}
-                                                                Attestations
-                                                              </small>
-                                                              <table
-                                                                className="table table-sm table-borderless mb-0"
-                                                                style={{ fontSize: '0.75rem' }}
-                                                              >
-                                                                <tbody>
-                                                                  <tr>
-                                                                    <td
-                                                                      className="text-muted py-0"
-                                                                      style={{ width: '45%' }}
-                                                                    >
-                                                                      Count
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      <strong>
-                                                                        {dna.attestations?.count ??
-                                                                          '—'}
-                                                                      </strong>
-                                                                    </td>
-                                                                  </tr>
-                                                                  <tr>
-                                                                    <td className="text-muted py-0">
-                                                                      Merkle root
-                                                                    </td>
-                                                                    <td className="py-0">
-                                                                      <code>
-                                                                        {dna.attestations?.merkleRoot?.slice(
-                                                                          0,
-                                                                          12
-                                                                        )}
-                                                                        …
-                                                                      </code>
-                                                                    </td>
-                                                                  </tr>
-                                                                  {dna.attestations
-                                                                    ?.lastUpdated && (
-                                                                    <tr>
-                                                                      <td className="text-muted py-0">
-                                                                        Updated
-                                                                      </td>
-                                                                      <td className="py-0">
-                                                                        <small>
-                                                                          {new Date(
-                                                                            dna.attestations
-                                                                              .lastUpdated
-                                                                          ).toLocaleDateString()}
-                                                                        </small>
-                                                                      </td>
-                                                                    </tr>
-                                                                  )}
-                                                                </tbody>
-                                                              </table>
-                                                            </div>
-                                                          </div>
-                                                        </>
-                                                      );
-                                                    })()}
                                                   </div>
                                                 )}
                                               </div>

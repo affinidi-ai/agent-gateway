@@ -1820,6 +1820,166 @@ async fn inbound_from_api_key_derives_did() {
     assert!(did.starts_with("did:"), "did should start with 'did:', got: {did}");
 }
 
+fn stored_identity_origins(dir: &std::path::Path) -> Vec<(String, Option<String>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    entries
+        .filter_map(Result::ok)
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                return stored_identity_origins(&path);
+            }
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .filter(|record| {
+                    record
+                        .get("identity_hash")
+                        .is_some()
+                })
+                .and_then(|record| {
+                    let did = record["did"]
+                        .as_str()?
+                        .to_string();
+                    Some((
+                        did,
+                        record["origin"]
+                            .as_str()
+                            .map(String::from),
+                    ))
+                })
+                .into_iter()
+                .collect()
+        })
+        .collect()
+}
+
+fn stored_identity_origin(
+    dir: &std::path::Path,
+    did: &str,
+) -> Option<String> {
+    stored_identity_origins(dir)
+        .into_iter()
+        .find(|(stored, _)| stored == did)
+        .and_then(|(_, origin)| origin)
+}
+
+/// A protected `from_api_key` slot with no inbound slot falls back to the managed slot on
+/// inbound requests, so an inbound request reaching the surface first must still record its
+/// DID as the managed agent, and the outbound leg must keep using that DID.
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_api_key_identity_reached_inbound_first_stays_managed() {
+    let api_key_id = "atgk_e2e0000000000000000000000000003";
+    let agent_response = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "kind": "message",
+            "messageId": "msg-001",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "response"}],
+            "extensions": [AGENT_IDENTITY_URI],
+            "metadata": { AGENT_IDENTITY_URI: { "softwareInfo": { "name": "backend-agent", "version": "2.0" } } }
+        }
+    });
+    let mock = MockServer::start_with_response(agent_response.to_string()).await;
+    let mut base_dir = std::path::PathBuf::new();
+    let h = GatewayHarness::start_with_outbound_mock(mock, |dir, gw_config, _| {
+        base_dir = dir.to_path_buf();
+        let mut surface = helpers::build_api_key_identity_channel(api_key_id);
+        surface
+            .transit
+            .as_mut()
+            .expect("transit")
+            .points[0]
+            .identity_injection
+            .inject_vp = true;
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let message = json!({
+        "jsonrpc": "2.0",
+        "method": "message/send",
+        "id": 1,
+        "params": { "message": { "role": "user", "messageId": "msg-1", "parts": [{ "kind": "text", "text": "hi" }] } }
+    });
+
+    let inbound = client
+        .post(&h.gateway_url)
+        .json(&message)
+        .send()
+        .await
+        .expect("inbound request failed");
+    assert_eq!(inbound.status(), 200);
+    let inbound_body: serde_json::Value = inbound
+        .json()
+        .await
+        .expect("inbound response body is not JSON");
+    let did = inbound_body["result"]["metadata"][AGENT_IDENTITY_CREDENTIAL_URI]["did"]
+        .as_str()
+        .expect("response should carry the managed agent's DID")
+        .to_string();
+    assert_eq!(stored_identity_origin(&base_dir, &did).as_deref(), Some("managed"));
+
+    let outbound_url = h
+        .outbound_url
+        .as_ref()
+        .expect("outbound_url must be set");
+    let outbound = client
+        .post(format!("{outbound_url}/outbound/smoke/target/rpc"))
+        .json(&message)
+        .send()
+        .await
+        .expect("outbound request failed");
+    assert_eq!(outbound.status(), 200);
+    let received = h
+        .mock
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("mock did not receive the outbound request");
+    let forwarded: serde_json::Value = serde_json::from_str(&received.body).expect("forwarded body is not JSON");
+    let metadata = &forwarded["params"]["message"]["metadata"];
+    let outbound_credential = [AGENT_IDENTITY_CREDENTIAL_URI, IDENTITY_BINDING_URI]
+        .iter()
+        .map(|uri| &metadata[*uri])
+        .find(|credential| !credential.is_null())
+        .unwrap_or_else(|| panic!("forwarded request should carry an identity credential, got {metadata}"));
+    assert_eq!(outbound_credential["did"], did.as_str());
+    assert_eq!(stored_identity_origin(&base_dir, &did).as_deref(), Some("managed"));
+}
+
+/// A DID derived from the inbound slot belongs to the caller, so it is recorded as an
+/// external caller even though the same credential mode backs managed identities.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_slot_api_key_identity_is_recorded_as_external_caller() {
+    let inbound = json!({ "type": "from_api_key", "api_key_id": "atgk_e2e0000000000000000000000000004" });
+    let mut base_dir = std::path::PathBuf::new();
+    let h = GatewayHarness::start(|dir, gw_config, _| {
+        base_dir = dir.to_path_buf();
+        write_caller_verification_policies(dir);
+        gw_config.surfaces = vec![inbound_identity_surface(inbound, UNVERIFIED_CALLER_POLICY_ID)];
+    })
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .json(&a2a_request())
+        .send()
+        .await
+        .expect("inbound request failed");
+
+    assert_eq!(resp.status(), 200);
+    let origins: Vec<_> = stored_identity_origins(&base_dir)
+        .into_iter()
+        .map(|(_, origin)| origin)
+        .collect();
+    assert_eq!(origins, vec![Some("external_caller".to_string())]);
+}
+
 const STATIC_CALLER_DID: &str = "did:web:static-caller.example";
 const UNVERIFIED_CALLER_POLICY_ID: &str = "unverified-caller-policy";
 const VERIFIED_CALLER_POLICY_ID: &str = "verified-caller-policy";

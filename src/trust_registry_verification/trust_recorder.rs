@@ -12,13 +12,18 @@
 //! records. Both the direct and `fabric://` request pipelines fire it on
 //! discovery + response.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
 use crate::config::agent_surface::AgentSurface;
 use crate::config::types::{EntityTarget, TrustRecorderConfig, TrustRecorderEntry};
+use crate::identity::display_name::DisplayName;
 use crate::trust_registries::TrustRegistryListenerManager;
+use crate::trust_registries::reference_fields::{
+    ReferenceFieldPublisher, ReferenceFieldValue, authority_value_for_did, issuer_entity_value_for_did,
+};
 use crate::trust_registries::store::TrustRegistryStore;
 use crate::trust_registries::types::TrAdminRecordRequest;
 
@@ -48,6 +53,8 @@ pub async fn apply_trust_recorder(
     cfg: &TrustRecorderConfig,
     agent_did: &str,
     resolved_issuer_did: Option<&str>,
+    tenant_id: Option<&str>,
+    display_name: Option<&DisplayName>,
     tr_manager: Arc<TrustRegistryListenerManager>,
     tr_store: Arc<dyn TrustRegistryStore>,
 ) {
@@ -61,53 +68,22 @@ pub async fn apply_trust_recorder(
         cfg.entries.len()
     );
 
+    let mut targets = Vec::with_capacity(cfg.entries.len());
     for entry in &cfg.entries {
-        let authority_did = match resolve_authority_did(entry, resolved_issuer_did) {
-            Some(v) => v,
-            None => continue,
+        let Some(authority_did) = resolve_authority_did(entry, resolved_issuer_did) else {
+            continue;
         };
-
-        let tr = match tr_store
-            .get(&entry.trust_registry_id)
-            .await
-        {
-            Ok(Some(tr)) => tr,
-            Ok(None) => {
-                warn!(
-                    trust_registry_id = %entry.trust_registry_id,
-                    "Trust Recorder: TR not found, skipping entry"
-                );
-                continue;
-            }
-            Err(e) => {
-                warn!(
-                    trust_registry_id = %entry.trust_registry_id,
-                    error = %e,
-                    "Trust Recorder: TR lookup failed, skipping entry"
-                );
-                continue;
-            }
+        let Some(tr_did) = resolve_entry_tr_did(tr_store.as_ref(), &entry.trust_registry_id).await else {
+            continue;
         };
+        targets.push((entry, authority_did, tr_did));
+    }
 
-        let tr_did = match tr
-            .main_did
-            .as_deref()
-            .or(tr.registry_did.as_deref())
-            .or(tr.did.as_deref())
-        {
-            Some(d) => d.to_string(),
-            None => {
-                warn!(
-                    trust_registry_id = %entry.trust_registry_id,
-                    "Trust Recorder: TR has no resolved DID (not connected yet), skipping entry"
-                );
-                continue;
-            }
-        };
-
-        for record in build_records(entry, agent_did, &authority_did) {
+    let context = display_name.map(record_context);
+    for (entry, authority_did, tr_did) in &targets {
+        for record in build_records(entry, agent_did, authority_did, context.as_ref()) {
             match tr_manager
-                .create_record(&tr_did, &record)
+                .create_record(tr_did, &record)
                 .await
             {
                 Ok(_) => info!(
@@ -123,8 +99,10 @@ pub async fn apply_trust_recorder(
                     // response from the same managed agent — the recorder
                     // is idempotent by design. Drop these to debug so the
                     // warn stream stays actionable.
-                    let msg = e.to_string();
-                    if msg.contains("already exists") {
+                    if e.is_conflict()
+                        || e.to_string()
+                            .contains("already exists")
+                    {
                         debug!(
                             trust_registry_did = %tr_did,
                             action = %record.action,
@@ -144,6 +122,138 @@ pub async fn apply_trust_recorder(
             }
         }
     }
+
+    let authorities = crate::gateways::connection_points::get_authority_store();
+    let issuers = crate::gateways::connection_points::get_issuer_store();
+    let fields = recorder_reference_fields(
+        &targets,
+        agent_did,
+        display_name,
+        tenant_id,
+        authorities.as_deref(),
+        issuers.as_deref(),
+    )
+    .await;
+    let publisher = ReferenceFieldPublisher::global();
+    for (tr_did, value) in &fields {
+        publisher
+            .publish(tr_manager.as_ref(), tr_did, value)
+            .await;
+    }
+}
+
+/// Names for the DIDs the recorder wrote, per trust registry: the agent entity (when
+/// named), each authority, and each Issuer used as a record entity. Authorities and
+/// Issuers are named only when global or owned by the surface's `tenant_id`.
+async fn recorder_reference_fields(
+    targets: &[(&TrustRecorderEntry, String, String)],
+    agent_did: &str,
+    display_name: Option<&DisplayName>,
+    tenant_id: Option<&str>,
+    authorities: Option<&dyn crate::authorities::AuthorityStore>,
+    issuers: Option<&dyn crate::issuers::IssuerStore>,
+) -> Vec<(String, ReferenceFieldValue)> {
+    let mut fields: Vec<(String, ReferenceFieldValue)> = Vec::new();
+    let mut push = |tr_did: &str, value: ReferenceFieldValue| {
+        if !fields
+            .iter()
+            .any(|(t, v)| t == tr_did && v.field_type == value.field_type && v.id == value.id)
+        {
+            fields.push((tr_did.to_string(), value));
+        }
+    };
+    for (entry, authority_did, tr_did) in targets {
+        if let Some(name) = display_name {
+            push(tr_did, ReferenceFieldValue::entity(agent_did, name.clone()));
+        }
+        if let Some(value) = authority_value_for_did(authority_did, tenant_id, authorities, issuers).await {
+            push(tr_did, value);
+        }
+        let issuer_is_entity = entry
+            .custom_resources
+            .iter()
+            .any(|r| r.entity_target == EntityTarget::Issuer);
+        if issuer_is_entity
+            && let Some(value) = issuer_entity_value_for_did(&entry.issuer_did, tenant_id, issuers).await
+        {
+            push(tr_did, value);
+        }
+    }
+    fields
+}
+
+/// Resolve a Trust Recorder entry's `trust_registry_id` to the TR DID that
+/// `TrustRegistryListenerManager` addresses. Returns `None` (with a WARN)
+/// when the TR is unknown or not connected yet.
+async fn resolve_entry_tr_did(
+    tr_store: &dyn TrustRegistryStore,
+    trust_registry_id: &str,
+) -> Option<String> {
+    let tr = match tr_store
+        .get(trust_registry_id)
+        .await
+    {
+        Ok(Some(tr)) => tr,
+        Ok(None) => {
+            warn!(
+                trust_registry_id = %trust_registry_id,
+                "Trust Recorder: TR not found, skipping entry"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!(
+                trust_registry_id = %trust_registry_id,
+                error = %e,
+                "Trust Recorder: TR lookup failed, skipping entry"
+            );
+            return None;
+        }
+    };
+
+    let tr_did = tr
+        .main_did
+        .as_deref()
+        .or(tr.registry_did.as_deref())
+        .or(tr.did.as_deref())
+        .map(str::to_string);
+    if tr_did.is_none() {
+        warn!(
+            trust_registry_id = %trust_registry_id,
+            "Trust Recorder: TR has no resolved DID (not connected yet), skipping entry"
+        );
+    }
+    tr_did
+}
+
+/// Distinct TR DIDs a Trust Recorder configuration writes to.
+pub async fn recorder_registry_dids(
+    cfg: &TrustRecorderConfig,
+    tr_store: &dyn TrustRegistryStore,
+) -> BTreeSet<String> {
+    let mut dids = BTreeSet::new();
+    for entry in &cfg.entries {
+        if let Some(did) = resolve_entry_tr_did(tr_store, &entry.trust_registry_id).await {
+            dids.insert(did);
+        }
+    }
+    dids
+}
+
+/// Trust-record context snapshot naming a managed agent.
+pub fn record_context(name: &DisplayName) -> serde_json::Value {
+    serde_json::json!({ "displayName": name, "origin": "managed" })
+}
+
+async fn resolve_recorder_display_name(
+    agent_did: &str,
+    surface_id: &str,
+) -> Option<DisplayName> {
+    crate::gateways::connection_points::get_vc_issuer()?
+        .surface_display_name(agent_did, surface_id)
+        .await?
+        .publishable(agent_did)
+        .cloned()
 }
 
 /// Resolve `entry.authority_did` for the current write, expanding the
@@ -211,12 +321,24 @@ pub fn spawn_trust_recorder(
     let cfg = recorder_cfg.clone();
     let did = agent_did.to_string();
     let issuer_id = surface.issuer_id.clone();
+    let surface_id = surface.surface_id.clone();
+    let tenant_id = surface.tenant_id.clone();
     tokio::spawn(async move {
         let Some(store) = tr_manager.store().await else {
             return;
         };
         let resolved_issuer_did = resolve_surface_issuer_did(issuer_id.as_deref()).await;
-        apply_trust_recorder(&cfg, &did, resolved_issuer_did.as_deref(), tr_manager, store).await;
+        let display_name = resolve_recorder_display_name(&did, &surface_id).await;
+        apply_trust_recorder(
+            &cfg,
+            &did,
+            resolved_issuer_did.as_deref(),
+            tenant_id.as_deref(),
+            display_name.as_ref(),
+            tr_manager,
+            store,
+        )
+        .await;
     });
 }
 
@@ -254,10 +376,13 @@ async fn resolve_surface_issuer_did(issuer_id: Option<&str>) -> Option<String> {
 /// `authority_did` is the value passed to every emitted record — usually
 /// `entry.authority_did` verbatim, but the `{{ surface.issuer_did }}`
 /// template gets expanded upstream in [`resolve_authority_did`].
+///
+/// `context` is attached only to records whose entity is the agent itself.
 fn build_records(
     entry: &TrustRecorderEntry,
     agent_did: &str,
     authority_did: &str,
+    context: Option<&serde_json::Value>,
 ) -> Vec<TrAdminRecordRequest> {
     let mut out = Vec::new();
 
@@ -270,7 +395,7 @@ fn build_records(
             record_type: "recognition".to_string(),
             authorized: true,
             recognized: true,
-            context: None,
+            context: context.cloned(),
         });
     }
     for resource in &entry.custom_resources {
@@ -280,9 +405,9 @@ fn build_records(
         if action.is_empty() || res.is_empty() || record_type.is_empty() {
             continue;
         }
-        let entity_id = match resource.entity_target {
-            EntityTarget::Issuer => entry.issuer_did.clone(),
-            EntityTarget::Agent => agent_did.to_string(),
+        let (entity_id, record_context) = match resource.entity_target {
+            EntityTarget::Issuer => (entry.issuer_did.clone(), None),
+            EntityTarget::Agent => (agent_did.to_string(), context.cloned()),
         };
         out.push(TrAdminRecordRequest {
             authority_id: authority_did.to_string(),
@@ -292,7 +417,7 @@ fn build_records(
             record_type: record_type.to_string(),
             authorized: true,
             recognized: true,
-            context: None,
+            context: record_context,
         });
     }
 
@@ -303,6 +428,7 @@ fn build_records(
 mod tests {
     use super::*;
     use crate::config::types::CustomResource;
+    use crate::identity::display_name::ManagedDisplayName;
 
     fn base_entry() -> TrustRecorderEntry {
         TrustRecorderEntry {
@@ -314,17 +440,171 @@ mod tests {
         }
     }
 
+    async fn issuer_store_with(
+        issuers: &[crate::issuers::types::Issuer]
+    ) -> (crate::issuers::FileSystemIssuerStore, tempfile::TempDir) {
+        use crate::issuers::IssuerStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::issuers::FileSystemIssuerStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        for issuer in issuers {
+            store
+                .create(issuer)
+                .await
+                .unwrap();
+        }
+        (store, dir)
+    }
+
+    fn named_issuer(
+        did: &str,
+        name: &str,
+    ) -> crate::issuers::types::Issuer {
+        crate::issuers::types::Issuer::new(
+            format!("id-{did}"),
+            name.to_string(),
+            did.to_string(),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
+    }
+
+    fn summary(fields: &[(String, ReferenceFieldValue)]) -> Vec<(String, String, String, String)> {
+        fields
+            .iter()
+            .map(|(tr, v)| (tr.clone(), format!("{:?}", v.field_type), v.id.clone(), v.name.as_str().to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn recorder_reference_fields_name_the_agent_authority_and_issuer_entity() {
+        let issuer_did = "did:web:gw:issuers:abc";
+        let (issuers, _dir) = issuer_store_with(&[named_issuer(issuer_did, "ABC Issuer")]).await;
+        let mut entry = base_entry();
+        entry.issuer_did = issuer_did.into();
+        entry.custom_resources = vec![CustomResource {
+            action: "issue".into(),
+            resource: "credential".into(),
+            entity_target: EntityTarget::Issuer,
+            record_type: "authorization".into(),
+        }];
+        let targets = vec![(&entry, issuer_did.to_string(), "did:example:tr".to_string())];
+        let name = DisplayName::parse("OXYGEN").unwrap();
+
+        let fields =
+            recorder_reference_fields(&targets, "did:example:agent", Some(&name), None, None, Some(&issuers)).await;
+
+        assert_eq!(
+            summary(&fields),
+            vec![
+                ("did:example:tr".into(), "Entity".into(), "did:example:agent".into(), "OXYGEN".into()),
+                ("did:example:tr".into(), "Authority".into(), issuer_did.into(), "ABC Issuer".into()),
+                ("did:example:tr".into(), "Entity".into(), issuer_did.into(), "ABC Issuer".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recorder_reference_fields_skip_unknown_dids_and_unnamed_agents() {
+        let (issuers, _dir) = issuer_store_with(&[]).await;
+        let mut entry = base_entry();
+        entry.custom_resources = vec![CustomResource {
+            action: "issue".into(),
+            resource: "credential".into(),
+            entity_target: EntityTarget::Issuer,
+            record_type: "authorization".into(),
+        }];
+        let targets = vec![(&entry, "did:example:authority".to_string(), "did:example:tr".to_string())];
+
+        let fields = recorder_reference_fields(&targets, "did:example:agent", None, None, None, Some(&issuers)).await;
+
+        assert!(fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorder_reference_fields_skip_another_tenants_issuer() {
+        let issuer_did = "did:web:gw:issuers:abc";
+        let mut owned = named_issuer(issuer_did, "Tenant A Issuer");
+        owned.tenant_id = Some("tenant-a".to_string());
+        let (issuers, _dir) = issuer_store_with(&[owned]).await;
+        let mut entry = base_entry();
+        entry.issuer_did = issuer_did.into();
+        entry.custom_resources = vec![CustomResource {
+            action: "issue".into(),
+            resource: "credential".into(),
+            entity_target: EntityTarget::Issuer,
+            record_type: "authorization".into(),
+        }];
+        let targets = vec![(&entry, issuer_did.to_string(), "did:example:tr".to_string())];
+        let name = DisplayName::parse("OXYGEN").unwrap();
+
+        let other_tenant = recorder_reference_fields(
+            &targets,
+            "did:example:agent",
+            Some(&name),
+            Some("tenant-b"),
+            None,
+            Some(&issuers),
+        )
+        .await;
+        let same_tenant = recorder_reference_fields(
+            &targets,
+            "did:example:agent",
+            Some(&name),
+            Some("tenant-a"),
+            None,
+            Some(&issuers),
+        )
+        .await;
+
+        assert_eq!(
+            summary(&other_tenant),
+            vec![("did:example:tr".into(), "Entity".into(), "did:example:agent".into(), "OXYGEN".into())]
+        );
+        assert_eq!(
+            summary(&same_tenant),
+            vec![
+                ("did:example:tr".into(), "Entity".into(), "did:example:agent".into(), "OXYGEN".into()),
+                ("did:example:tr".into(), "Authority".into(), issuer_did.into(), "Tenant A Issuer".into()),
+                ("did:example:tr".into(), "Entity".into(), issuer_did.into(), "Tenant A Issuer".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recorder_reference_fields_publish_once_per_registry() {
+        let issuer_did = "did:web:gw:issuers:abc";
+        let (issuers, _dir) = issuer_store_with(&[named_issuer(issuer_did, "ABC Issuer")]).await;
+        let entry = base_entry();
+        let targets = vec![
+            (&entry, issuer_did.to_string(), "did:example:tr-1".to_string()),
+            (&entry, issuer_did.to_string(), "did:example:tr-1".to_string()),
+            (&entry, issuer_did.to_string(), "did:example:tr-2".to_string()),
+        ];
+
+        let fields = recorder_reference_fields(&targets, "did:example:agent", None, None, None, Some(&issuers)).await;
+
+        assert_eq!(
+            summary(&fields),
+            vec![
+                ("did:example:tr-1".into(), "Authority".into(), issuer_did.into(), "ABC Issuer".into()),
+                ("did:example:tr-2".into(), "Authority".into(), issuer_did.into(), "ABC Issuer".into()),
+            ]
+        );
+    }
+
     #[test]
     fn empty_entry_yields_no_records() {
         let e = base_entry();
-        assert!(build_records(&e, "did:example:agent", &e.authority_did).is_empty());
+        assert!(build_records(&e, "did:example:agent", &e.authority_did, None).is_empty());
     }
 
     #[test]
     fn owned_agent_uses_authority_did_and_agent_entity() {
         let mut e = base_entry();
         e.include_owned_agent = true;
-        let recs = build_records(&e, "did:example:agent", &e.authority_did);
+        let recs = build_records(&e, "did:example:agent", &e.authority_did, None);
         assert_eq!(recs.len(), 1);
         let r = &recs[0];
         assert_eq!(r.resource, "ownedAgent");
@@ -369,7 +649,7 @@ mod tests {
                 record_type: "  ".into(),
             },
         ];
-        let recs = build_records(&e, "did:example:agent", &e.authority_did);
+        let recs = build_records(&e, "did:example:agent", &e.authority_did, None);
         assert_eq!(recs.len(), 2);
 
         assert_eq!(recs[0].action, "is");
@@ -423,12 +703,71 @@ mod tests {
             record_type: "authorization".into(),
         }];
         let resolved = resolve_authority_did(&e, Some("did:example:issuer-runtime")).unwrap();
-        let recs = build_records(&e, "did:example:agent", &resolved);
+        let recs = build_records(&e, "did:example:agent", &resolved, None);
         assert_eq!(recs.len(), 2);
         // Both emitted records now carry the resolved DID as authority_id,
         // matching what a downstream Trust Check `authority = verified issuer`
         // query will look for.
         assert_eq!(recs[0].authority_id, "did:example:issuer-runtime");
         assert_eq!(recs[1].authority_id, "did:example:issuer-runtime");
+    }
+
+    fn oxygen() -> DisplayName {
+        DisplayName::parse("OXYGEN").unwrap()
+    }
+
+    #[test]
+    fn record_context_has_exact_shape() {
+        assert_eq!(record_context(&oxygen()), serde_json::json!({"displayName": "OXYGEN", "origin": "managed"}));
+        assert_eq!(
+            serde_json::to_string(&record_context(&oxygen())).unwrap(),
+            r#"{"displayName":"OXYGEN","origin":"managed"}"#
+        );
+    }
+
+    #[test]
+    fn context_is_attached_only_to_agent_entity_records() {
+        let mut e = base_entry();
+        e.include_owned_agent = true;
+        e.custom_resources = vec![
+            CustomResource {
+                action: "is".into(),
+                resource: "paymentAgent".into(),
+                entity_target: EntityTarget::Agent,
+                record_type: "recognition".into(),
+            },
+            CustomResource {
+                action: "register".into(),
+                resource: "agents".into(),
+                entity_target: EntityTarget::Issuer,
+                record_type: "authorization".into(),
+            },
+        ];
+        let context = record_context(&oxygen());
+
+        let recs = build_records(&e, "did:example:agent", &e.authority_did, Some(&context));
+
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].context.as_ref(), Some(&context));
+        assert_eq!(recs[1].context.as_ref(), Some(&context));
+        assert_eq!(recs[2].entity_id, "did:example:issuer");
+        assert_eq!(recs[2].context, None);
+    }
+
+    #[test]
+    fn conflict_yields_records_without_context() {
+        let mut e = base_entry();
+        e.include_owned_agent = true;
+        let conflict = ManagedDisplayName::Conflict {
+            surface_ids: vec!["s1".into(), "s2".into()],
+        };
+        let context = conflict
+            .publishable("did:example:agent")
+            .map(record_context);
+
+        let recs = build_records(&e, "did:example:agent", &e.authority_did, context.as_ref());
+
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].context, None);
     }
 }

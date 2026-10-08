@@ -1103,6 +1103,7 @@ async fn fabric_consent_flow() {
             did: Cow::Borrowed(&holder_did),
             identity_fields: Cow::Owned(HashMap::new()),
             workload_binding: None,
+            display_name: None,
         }))
         .await
         .unwrap();

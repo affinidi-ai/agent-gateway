@@ -658,6 +658,7 @@ mod tests {
             channel_config_id: Some(surface_id.to_string()),
             is_local,
             verified: true,
+            origin: None,
         }
     }
 

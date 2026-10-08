@@ -16,6 +16,8 @@ use crate::identity::ssi::vc_issuer::{AgentIdentity, IssueVcPayload, LocalVcIssu
 use crate::identity::ssi::verifier::{LocalVerifier, Verifier};
 use crate::identity::ssi::vp_issuer::{Credentials, LocalVpIssuer, LocalVpSigner, VpIssuer, VpIssuerPayload};
 
+use super::display_name::{DisplayName, ManagedDisplayName, SurfacesByDidCache, resolve_managed_display_name_in};
+use super::filesystem::IdentityOrigin;
 use super::{IdentityStore, VpChallengeStore};
 
 const IS_VP_CHALLENGE_REQUIRED_DEFAULT: bool = false;
@@ -120,6 +122,8 @@ pub struct VCIssuer {
     verifier: Arc<dyn Verifier>,
     issuer_store: Arc<RwLock<Option<Arc<dyn crate::issuers::IssuerStore>>>>,
     tr_listener_manager: Arc<RwLock<Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>>>,
+    surface_store: std::sync::OnceLock<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
+    surfaces_by_did: SurfacesByDidCache,
 }
 
 impl VCIssuer {
@@ -170,7 +174,25 @@ impl VCIssuer {
             verifier,
             issuer_store: Arc::new(RwLock::new(None)),
             tr_listener_manager: Arc::new(RwLock::new(None)),
+            surface_store: std::sync::OnceLock::new(),
+            surfaces_by_did: SurfacesByDidCache::default(),
         })
+    }
+
+    /// Use `store` instead of the process-global agent-surface store for VC names.
+    #[cfg(test)]
+    pub fn set_surface_store(
+        &self,
+        store: Arc<dyn crate::surfaces::AgentSurfaceStore>,
+    ) {
+        let _ = self.surface_store.set(store);
+    }
+
+    fn surface_store(&self) -> Option<Arc<dyn crate::surfaces::AgentSurfaceStore>> {
+        self.surface_store
+            .get()
+            .cloned()
+            .or_else(crate::gateways::connection_points::get_agent_surface_store)
     }
 
     /// Set the DID cache for this issuer (for caching DID resolution during VP verification)
@@ -741,6 +763,56 @@ impl VCIssuer {
         channel_config_id: Option<String>,
         issuer_id: Option<String>,
     ) -> Result<AgentIdentityResponse> {
+        self.issue_or_get_credential_with_origin(identity_fields, identity_hash, channel_config_id, issuer_id, None)
+            .await
+    }
+
+    /// [`Self::issue_or_get_credential`] for the managed agent of `channel_config_id`:
+    /// records the identity as managed and names the VC with its managed display name.
+    pub async fn issue_or_get_managed_credential(
+        &self,
+        identity_fields: std::collections::HashMap<String, serde_json::Value>,
+        identity_hash: Option<String>,
+        channel_config_id: Option<String>,
+        issuer_id: Option<String>,
+    ) -> Result<AgentIdentityResponse> {
+        self.issue_or_get_credential_with_origin(
+            identity_fields,
+            identity_hash,
+            channel_config_id,
+            issuer_id,
+            Some(IdentityOrigin::Managed),
+        )
+        .await
+    }
+
+    /// [`Self::issue_or_get_credential`] for a caller reaching the surface: records
+    /// the identity as an external caller. The VC carries no name.
+    pub async fn issue_or_get_caller_credential(
+        &self,
+        identity_fields: std::collections::HashMap<String, serde_json::Value>,
+        identity_hash: Option<String>,
+        channel_config_id: Option<String>,
+        issuer_id: Option<String>,
+    ) -> Result<AgentIdentityResponse> {
+        self.issue_or_get_credential_with_origin(
+            identity_fields,
+            identity_hash,
+            channel_config_id,
+            issuer_id,
+            Some(IdentityOrigin::ExternalCaller),
+        )
+        .await
+    }
+
+    async fn issue_or_get_credential_with_origin(
+        &self,
+        identity_fields: std::collections::HashMap<String, serde_json::Value>,
+        identity_hash: Option<String>,
+        channel_config_id: Option<String>,
+        issuer_id: Option<String>,
+        origin: Option<IdentityOrigin>,
+    ) -> Result<AgentIdentityResponse> {
         info!(
             "[TR-TRACE] issue_or_get_credential called: channel_config_id={:?}, issuer_id={:?}, identity_hash={:?}, field_count={}",
             channel_config_id,
@@ -766,9 +838,26 @@ impl VCIssuer {
                 .update_usage(&identity_hash, channel_config_id.clone())
                 .await?;
 
+            let effective_origin = match (record.origin, origin) {
+                (None, Some(requested)) => {
+                    if let Err(e) = self
+                        .identity_store
+                        .set_origin(&identity_hash, requested)
+                        .await
+                    {
+                        warn!(identity_hash = %identity_hash, error = %e, "Failed to record identity origin (non-fatal)");
+                    }
+                    Some(requested)
+                }
+                (existing, _) => existing,
+            };
+            let name = self
+                .managed_display_name(&record.did, effective_origin, channel_config_id.as_deref())
+                .await;
+
             // Return existing DID and generate a fresh VC
             let vc = self
-                .create_credential(&record.did, &identity_fields)
+                .create_credential(&record.did, &identity_fields, name.as_ref())
                 .await?;
 
             return Ok(AgentIdentityResponse {
@@ -792,15 +881,18 @@ impl VCIssuer {
         )
         .await?;
 
-        // Create VC
+        let name = self
+            .managed_display_name(&agent_did, origin, channel_config_id.as_deref())
+            .await;
         let vc = self
-            .create_credential(&agent_did, &identity_fields)
+            .create_credential(&agent_did, &identity_fields, name.as_ref())
             .await?;
 
         // Update the record with the actual identity_hash and fields before storing
         record.identity_hash = identity_hash.clone();
         record.identity_fields = identity_fields;
         record.channel_config_id = channel_config_id.clone();
+        record.origin = origin;
         let created_at = record.created_at;
         let channel_config_id_for_usage = channel_config_id;
         let _ = issuer_id; // no-op: agent-in-TR writes are owned by Trust Recorder now
@@ -836,11 +928,72 @@ impl VCIssuer {
         })
     }
 
+    /// Display name `surface_id` gives its managed agent `agent_did`; `None` when the
+    /// surface or the identity list is unavailable.
+    pub async fn surface_display_name(
+        &self,
+        agent_did: &str,
+        surface_id: &str,
+    ) -> Option<ManagedDisplayName> {
+        let surface_store = self.surface_store()?;
+        resolve_managed_display_name_in(
+            surface_store.as_ref(),
+            agent_did,
+            surface_id,
+            self.identity_store.as_ref(),
+            &self.surfaces_by_did,
+        )
+        .await
+    }
+
+    /// Display name for a managed identity (its surface name); `None` for callers, unknown origins, unnamed agents and DIDs shared by
+    /// several surfaces.
+    async fn managed_display_name(
+        &self,
+        agent_did: &str,
+        origin: Option<IdentityOrigin>,
+        surface_id: Option<&str>,
+    ) -> Option<DisplayName> {
+        if origin != Some(IdentityOrigin::Managed) {
+            return None;
+        }
+        self.surface_display_name(agent_did, surface_id?)
+            .await?
+            .publishable(agent_did)
+            .cloned()
+    }
+
+    async fn display_name_for_did(
+        &self,
+        agent_did: &str,
+    ) -> Option<DisplayName> {
+        let record = match self
+            .identity_store
+            .find_by_did(agent_did)
+            .await
+        {
+            Ok(record) => record?,
+            Err(e) => {
+                warn!(agent_did, error = %e, "Identity lookup for VC name failed (non-fatal)");
+                return None;
+            }
+        };
+        self.managed_display_name(
+            agent_did,
+            record.origin,
+            record
+                .channel_config_id
+                .as_deref(),
+        )
+        .await
+    }
+
     /// Create a verifiable credential for an agent identity
     async fn create_credential(
         &self,
         agent_did: &str,
         identity_fields: &std::collections::HashMap<String, serde_json::Value>,
+        name: Option<&DisplayName>,
     ) -> Result<String> {
         let config = self.config.read().await;
 
@@ -849,10 +1002,13 @@ impl VCIssuer {
 
         // Create credential subject with identity fields
         // The public key can be resolved from the channel's DID document at /channel/{id}/did.json
-        let credential_subject = serde_json::json!({
+        let mut credential_subject = serde_json::json!({
             "id": agent_did,
             "identityFields": identity_json,
         });
+        if let Some(name) = name {
+            credential_subject["name"] = json!(name);
+        }
 
         // Create JWT payload
         let now = chrono::Utc::now().timestamp();
@@ -1073,11 +1229,17 @@ impl VCIssuer {
         let agent_key = self
             .get_agent_key_by_did(agent_did)
             .await?;
+        let display_name = self
+            .display_name_for_did(agent_did)
+            .await;
 
         let agent_identity = AgentIdentity {
             did: Cow::Borrowed(agent_did),
             identity_fields: Cow::Borrowed(identity_fields),
             workload_binding,
+            display_name: display_name
+                .as_ref()
+                .map(|name| Cow::Borrowed(name.as_str())),
         };
         let vc = self
             .vc_issuer
@@ -2383,5 +2545,288 @@ mod tests {
                 .contains("Agent DID not found"),
             "unexpected error: {err}"
         );
+    }
+
+    mod display_names {
+        use super::*;
+        use crate::identity::test_helpers::test_vc_issuer;
+        use crate::surfaces::AgentSurfaceStore;
+
+        struct Fixture {
+            issuer: VCIssuer,
+            surfaces: Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
+            _issuer_dir: tempfile::TempDir,
+            _surface_dir: tempfile::TempDir,
+        }
+
+        impl Fixture {
+            async fn save_surface(
+                &self,
+                surface_id: &str,
+                name: &str,
+            ) {
+                self.surfaces
+                    .save(&crate::config::agent_surface::AgentSurface {
+                        surface_id: surface_id.to_string(),
+                        name: name.to_string(),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("save surface");
+            }
+        }
+
+        async fn fixture() -> Fixture {
+            let (issuer, issuer_dir) = test_vc_issuer().await;
+            let surface_dir = tempfile::tempdir().unwrap();
+            let surfaces = Arc::new(
+                crate::surfaces::FileSystemAgentSurfaceStore::new(
+                    surface_dir
+                        .path()
+                        .to_path_buf(),
+                )
+                .await
+                .unwrap(),
+            );
+            issuer.set_surface_store(surfaces.clone());
+            Fixture {
+                issuer,
+                surfaces,
+                _issuer_dir: issuer_dir,
+                _surface_dir: surface_dir,
+            }
+        }
+
+        fn jwt_subject(jwt: &str) -> serde_json::Value {
+            use base64::Engine;
+            let payload = jwt
+                .split('.')
+                .nth(1)
+                .expect("JWT payload segment");
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .expect("base64url payload");
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON payload")["credentialSubject"].clone()
+        }
+
+        fn fields(value: &str) -> HashMap<String, serde_json::Value> {
+            HashMap::from([("agent".to_string(), json!(value))])
+        }
+
+        async fn origin_of(
+            issuer: &VCIssuer,
+            did: &str,
+        ) -> Option<IdentityOrigin> {
+            issuer
+                .get_identity_store()
+                .find_by_did(did)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin
+        }
+
+        #[tokio::test]
+        async fn managed_credential_carries_surface_name_and_origin() {
+            let f = fixture().await;
+            f.save_surface("vc-name-managed", "OXYGEN")
+                .await;
+            let issuer = &f.issuer;
+
+            let response = issuer
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-managed".into()), None)
+                .await
+                .unwrap();
+
+            assert_eq!(jwt_subject(&response.credential)["name"], json!("OXYGEN"));
+            assert_eq!(origin_of(issuer, &response.did).await, Some(IdentityOrigin::Managed));
+        }
+
+        #[tokio::test]
+        async fn caller_credential_has_no_name() {
+            let f = fixture().await;
+            f.save_surface("vc-name-caller", "OXYGEN")
+                .await;
+            let issuer = &f.issuer;
+
+            let response = issuer
+                .issue_or_get_caller_credential(fields("a"), None, Some("vc-name-caller".into()), None)
+                .await
+                .unwrap();
+
+            assert!(
+                jwt_subject(&response.credential)
+                    .get("name")
+                    .is_none()
+            );
+            assert_eq!(origin_of(issuer, &response.did).await, Some(IdentityOrigin::ExternalCaller));
+        }
+
+        #[tokio::test]
+        async fn plain_credential_has_no_name_or_origin() {
+            let f = fixture().await;
+            f.save_surface("vc-name-plain", "OXYGEN")
+                .await;
+            let issuer = &f.issuer;
+
+            let response = issuer
+                .issue_or_get_credential(fields("a"), None, Some("vc-name-plain".into()), None)
+                .await
+                .unwrap();
+
+            assert!(
+                jwt_subject(&response.credential)
+                    .get("name")
+                    .is_none()
+            );
+            assert_eq!(origin_of(issuer, &response.did).await, None);
+        }
+
+        #[tokio::test]
+        async fn rename_reissues_with_new_name_and_same_did() {
+            let f = fixture().await;
+            f.save_surface("vc-name-rename", "OXYGEN")
+                .await;
+            let issuer = &f.issuer;
+            let first = issuer
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-rename".into()), None)
+                .await
+                .unwrap();
+
+            f.save_surface("vc-name-rename", "HELIUM")
+                .await;
+            let second = issuer
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-rename".into()), None)
+                .await
+                .unwrap();
+
+            assert_eq!(second.did, first.did);
+            assert!(!second.is_new);
+            assert_eq!(jwt_subject(&second.credential)["name"], json!("HELIUM"));
+        }
+
+        #[tokio::test]
+        async fn did_on_two_surfaces_gets_no_name() {
+            let f = fixture().await;
+            f.save_surface("vc-name-conflict-a", "OXYGEN")
+                .await;
+            f.save_surface("vc-name-conflict-b", "HELIUM")
+                .await;
+            let issuer = &f.issuer;
+            let first = issuer
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-conflict-a".into()), None)
+                .await
+                .unwrap();
+
+            let mut sibling =
+                crate::identity::test_helpers::test_surface_identity_record(&first.did, "vc-name-conflict-b");
+            sibling.identity_hash = "sibling".to_string();
+            sibling.origin = Some(IdentityOrigin::Managed);
+            issuer
+                .get_identity_store()
+                .create(sibling)
+                .await
+                .unwrap();
+
+            let second = issuer
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-conflict-a".into()), None)
+                .await
+                .unwrap();
+
+            assert_eq!(second.did, first.did);
+            assert!(
+                jwt_subject(&second.credential)
+                    .get("name")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn managed_wrapper_backfills_legacy_origin_without_overwriting() {
+            let f = fixture().await;
+            f.save_surface("vc-name-backfill", "OXYGEN")
+                .await;
+            let issuer = &f.issuer;
+            let legacy = issuer
+                .issue_or_get_credential(fields("legacy"), None, Some("vc-name-backfill".into()), None)
+                .await
+                .unwrap();
+            let caller = issuer
+                .issue_or_get_caller_credential(fields("caller"), None, Some("vc-name-backfill".into()), None)
+                .await
+                .unwrap();
+
+            let backfilled = issuer
+                .issue_or_get_managed_credential(fields("legacy"), None, Some("vc-name-backfill".into()), None)
+                .await
+                .unwrap();
+            let still_caller = issuer
+                .issue_or_get_managed_credential(fields("caller"), None, Some("vc-name-backfill".into()), None)
+                .await
+                .unwrap();
+
+            assert_eq!(backfilled.did, legacy.did);
+            assert_eq!(origin_of(issuer, &legacy.did).await, Some(IdentityOrigin::Managed));
+            assert_eq!(jwt_subject(&backfilled.credential)["name"], json!("OXYGEN"));
+            assert_eq!(origin_of(issuer, &caller.did).await, Some(IdentityOrigin::ExternalCaller));
+            assert!(
+                jwt_subject(&still_caller.credential)
+                    .get("name")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn display_name_for_did_follows_record_origin() {
+            let f = fixture().await;
+            f.save_surface("vc-name-vp", "OXYGEN")
+                .await;
+            let issuer = &f.issuer;
+            let managed = issuer
+                .issue_or_get_managed_credential(fields("m"), None, Some("vc-name-vp".into()), None)
+                .await
+                .unwrap();
+            let caller = issuer
+                .issue_or_get_caller_credential(fields("c"), None, Some("vc-name-vp".into()), None)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                issuer
+                    .display_name_for_did(&managed.did)
+                    .await,
+                Some(DisplayName::parse("OXYGEN").unwrap())
+            );
+            assert_eq!(
+                issuer
+                    .display_name_for_did(&caller.did)
+                    .await,
+                None
+            );
+            assert_eq!(
+                issuer
+                    .display_name_for_did("did:web:unknown")
+                    .await,
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn unknown_surface_issues_without_name() {
+            let f = fixture().await;
+            let issuer = &f.issuer;
+
+            let response = issuer
+                .issue_or_get_managed_credential(fields("a"), None, Some("vc-name-missing-surface".into()), None)
+                .await
+                .unwrap();
+
+            assert!(
+                jwt_subject(&response.credential)
+                    .get("name")
+                    .is_none()
+            );
+            assert_eq!(origin_of(issuer, &response.did).await, Some(IdentityOrigin::Managed));
+        }
     }
 }

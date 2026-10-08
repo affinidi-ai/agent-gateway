@@ -84,11 +84,9 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
     description: d.description || (d.did ? topAndTail(d.did, 16, 12) : undefined),
   }));
 
-  // Authority options: flatten the two sources (Authorities register +
-  // Issuer-derived authority DIDs) into a single FormSelect list.
-  // DIDs from the Authority register take precedence over the same DID
-  // derived from a Issuer. Source is disambiguated via the option
-  // description prefix.
+  // Authority options: Authorities register entries, then Issuers acting as
+  // the authority under their own DID. An Authority-register DID wins over
+  // the same Issuer DID; the description prefix marks Issuer entries.
   const authorityFromAuthorities: FormSelectOption<string>[] = authorities
     .filter(a => !!a.did)
     .map(a => ({
@@ -98,15 +96,12 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
     }));
   const authorityDidSet = new Set(authorityFromAuthorities.map(o => o.value));
   const authorityFromIssuers: FormSelectOption<string>[] = issuers
-    .filter(d => !!d.authority_did && !authorityDidSet.has(d.authority_did as string))
-    .map(d => {
-      const detail = d.description || topAndTail(d.authority_did as string, 16, 12);
-      return {
-        value: d.authority_did as string,
-        label: d.name,
-        description: `Via Issuer · ${detail}`,
-      };
-    });
+    .filter(d => !!d.did && !authorityDidSet.has(d.did))
+    .map(d => ({
+      value: d.did,
+      label: d.name,
+      description: `Issuer · ${d.description || topAndTail(d.did, 16, 12)}`,
+    }));
   const authorityOptions: FormSelectOption<string>[] = [
     ...authorityFromAuthorities,
     ...authorityFromIssuers,
@@ -247,7 +242,7 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
               />
               {saveAttempted && !explicitAuthority && (
                 <div className="invalid-feedback d-block">
-                  Select an Authority (or an Issuer authority) to act as the trust anchor.
+                  Select an Authority or an Issuer to act as the trust anchor.
                 </div>
               )}
               {issuersLoadError && (
@@ -332,26 +327,57 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
           </Form.Text>
         )}
         {entry.custom_resources.map((resource, resourceIdx) => (
-          <div key={resourceIdx} className="d-flex gap-2 mb-2 align-items-start">
-            <Form.Control
-              size="sm"
-              type="text"
-              placeholder="action (e.g. is)"
-              value={resource.action}
-              onChange={e => updateCustomResourceAt(index, resourceIdx, { action: e.target.value })}
-              data-testid={tid(`custom-resource-${resourceIdx}-action`)}
-            />
-            <Form.Control
-              size="sm"
-              type="text"
-              placeholder="resource (e.g. paymentAgent)"
-              value={resource.resource}
-              onChange={e =>
-                updateCustomResourceAt(index, resourceIdx, { resource: e.target.value })
-              }
-              data-testid={tid(`custom-resource-${resourceIdx}-resource`)}
-            />
-            <div style={{ maxWidth: '140px' }}>
+          <div key={resourceIdx} className="d-flex gap-2 mb-2 align-items-end">
+            <div
+              style={{ flex: '1 1 0', minWidth: 0 }}
+              data-testid={tid(`custom-resource-${resourceIdx}-action-column`)}
+            >
+              <Form.Label
+                htmlFor={tid(`custom-resource-${resourceIdx}-action`)}
+                className="text-muted mb-1 d-block"
+                style={{ fontSize: '10px' }}
+              >
+                Action
+              </Form.Label>
+              <Form.Control
+                id={tid(`custom-resource-${resourceIdx}-action`)}
+                size="sm"
+                type="text"
+                placeholder="action (e.g. is)"
+                value={resource.action}
+                onChange={e =>
+                  updateCustomResourceAt(index, resourceIdx, { action: e.target.value })
+                }
+                data-testid={tid(`custom-resource-${resourceIdx}-action`)}
+              />
+            </div>
+            <div
+              style={{ flex: '1 1 0', minWidth: 0 }}
+              data-testid={tid(`custom-resource-${resourceIdx}-resource-column`)}
+            >
+              <Form.Label
+                htmlFor={tid(`custom-resource-${resourceIdx}-resource`)}
+                className="text-muted mb-1 d-block"
+                style={{ fontSize: '10px' }}
+              >
+                Resource
+              </Form.Label>
+              <Form.Control
+                id={tid(`custom-resource-${resourceIdx}-resource`)}
+                size="sm"
+                type="text"
+                placeholder="resource (e.g. paymentAgent)"
+                value={resource.resource}
+                onChange={e =>
+                  updateCustomResourceAt(index, resourceIdx, { resource: e.target.value })
+                }
+                data-testid={tid(`custom-resource-${resourceIdx}-resource`)}
+              />
+            </div>
+            <div
+              style={{ flex: '0 0 140px' }}
+              data-testid={tid(`custom-resource-${resourceIdx}-target-column`)}
+            >
               <Form.Label
                 htmlFor={tid(`custom-resource-${resourceIdx}-target`)}
                 className="text-muted mb-1 d-block"
@@ -375,7 +401,10 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
                 <option value="issuer">Issuer DID</option>
               </Form.Select>
             </div>
-            <div style={{ maxWidth: '150px' }}>
+            <div
+              style={{ flex: '0 0 150px' }}
+              data-testid={tid(`custom-resource-${resourceIdx}-record-type-column`)}
+            >
               <Form.Label
                 htmlFor={tid(`custom-resource-${resourceIdx}-record-type`)}
                 className="text-muted mb-1 d-block"

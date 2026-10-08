@@ -1165,10 +1165,9 @@ async fn validate_and_save_surface(
 
     info!("Updated agent surface '{}' (surface_id={})", surface.name, surface.surface_id);
 
-    // Agent-in-TR writes are owned by the Trust Recorder stage now; the
-    // legacy `spawn_tr_issuer_sweep` was removed together with
-    // `VCIssuer::register_agent_in_trust_registry` / `deregister_agent_from_trust_registry`.
-    let _ = existing;
+    if existing.is_some_and(|existing| existing.name != surface.name) {
+        crate::trust_registries::reference_fields::spawn_surface_rename_publish(surface.clone());
+    }
 
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 

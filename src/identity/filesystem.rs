@@ -72,6 +72,15 @@ fn normalize_did_port(did: &str) -> String {
     did.to_string()
 }
 
+/// How an identity record entered the store: issued by this gateway for a managed surface,
+/// or recorded for an external caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityOrigin {
+    Managed,
+    ExternalCaller,
+}
+
 /// Represents a stored agent identity record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentIdentityRecord {
@@ -116,10 +125,25 @@ pub struct AgentIdentityRecord {
     /// True if VP/VC signature verification succeeded
     #[serde(default)]
     pub verified: bool,
+
+    /// Origin of this identity; `None` for records written before origin tracking
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<IdentityOrigin>,
 }
 
 fn default_is_local() -> bool {
     true // Default to local for backward compatibility
+}
+
+impl AgentIdentityRecord {
+    /// Stored origin, or `ExternalCaller` for legacy remote records; legacy local records stay unknown.
+    pub fn effective_origin(&self) -> Option<IdentityOrigin> {
+        match self.origin {
+            Some(origin) => Some(origin),
+            None if !self.is_local => Some(IdentityOrigin::ExternalCaller),
+            None => None,
+        }
+    }
 }
 
 /// Implement StorableEntity for AgentIdentityRecord to use generic filesystem storage
@@ -371,6 +395,10 @@ impl IdentityStore for FilesystemIdentityStore {
                 info!("Updated external DID {} to verified=true", did);
             }
 
+            if existing.origin.is_none() && !existing.is_local {
+                existing.origin = Some(IdentityOrigin::ExternalCaller);
+            }
+
             // Update identity fields if they're not empty and existing ones are empty
             if !identity_fields.is_empty()
                 && existing
@@ -408,9 +436,31 @@ impl IdentityStore for FilesystemIdentityStore {
             private_key: None, // No private key for external DIDs
             is_local: false,   // External DID is remote
             verified,          // Track whether VP/VC signature was verified
+            origin: Some(IdentityOrigin::ExternalCaller),
         };
 
         self.create(record).await
+    }
+
+    async fn set_origin(
+        &self,
+        identity_hash: &str,
+        origin: IdentityOrigin,
+    ) -> Result<()> {
+        let Some(mut record) = self
+            .storage
+            .get(identity_hash)
+            .await?
+        else {
+            anyhow::bail!("identity record not found: {}", identity_hash);
+        };
+        if record.origin == Some(origin) {
+            return Ok(());
+        }
+        record.origin = Some(origin);
+        self.storage
+            .save(&record)
+            .await
     }
 
     fn base_path(&self) -> Option<std::path::PathBuf> {
@@ -431,6 +481,44 @@ pub fn calculate_identity_hash(identity: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    fn origin_record(
+        origin: Option<IdentityOrigin>,
+        is_local: bool,
+    ) -> AgentIdentityRecord {
+        AgentIdentityRecord {
+            did: "did:web:origin".to_string(),
+            identity_hash: "hash".to_string(),
+            created_at: chrono::Utc::now(),
+            identity_fields: std::collections::HashMap::new(),
+            usage_count: 0,
+            last_used_at: None,
+            channel_usage: vec![],
+            private_key: None,
+            channel_config_id: None,
+            is_local,
+            verified: false,
+            origin,
+        }
+    }
+
+    #[test]
+    fn effective_origin_prefers_stored_origin() {
+        assert_eq!(
+            origin_record(Some(IdentityOrigin::Managed), false).effective_origin(),
+            Some(IdentityOrigin::Managed)
+        );
+        assert_eq!(
+            origin_record(Some(IdentityOrigin::ExternalCaller), true).effective_origin(),
+            Some(IdentityOrigin::ExternalCaller)
+        );
+    }
+
+    #[test]
+    fn effective_origin_infers_legacy_remote_as_caller_and_leaves_legacy_local_unknown() {
+        assert_eq!(origin_record(None, false).effective_origin(), Some(IdentityOrigin::ExternalCaller));
+        assert_eq!(origin_record(None, true).effective_origin(), None);
+    }
+
     #[tokio::test]
     async fn test_find_by_did_matches_webvh_record_from_legacy_web_form() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -450,6 +538,7 @@ mod tests {
             channel_config_id: None,
             is_local: true,
             verified: true,
+            origin: None,
         };
 
         store
@@ -516,5 +605,175 @@ mod tests {
     fn test_normalize_did_port_webvh_without_scid() {
         let did = "did:webvh:localhost%3A8081:channel:abc";
         assert_eq!(normalize_did_port(did), "did:web:localhost:8081:channel:abc");
+    }
+
+    fn local_record(identity_hash: &str) -> AgentIdentityRecord {
+        AgentIdentityRecord {
+            did: format!("did:web:example.com:{identity_hash}"),
+            identity_hash: identity_hash.to_string(),
+            created_at: chrono::Utc::now(),
+            identity_fields: std::collections::HashMap::new(),
+            usage_count: 0,
+            last_used_at: None,
+            channel_usage: vec![],
+            private_key: None,
+            channel_config_id: None,
+            is_local: true,
+            verified: true,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn test_legacy_record_without_origin_round_trips_without_key() {
+        let legacy = serde_json::json!({
+            "did": "did:web:example.com:legacy",
+            "identity_hash": "legacy",
+            "created_at": "2026-01-01T00:00:00Z",
+            "identity_fields": {}
+        });
+
+        let record: AgentIdentityRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(record.origin, None);
+
+        let reserialized = serde_json::to_value(&record).unwrap();
+        assert!(
+            reserialized
+                .get("origin")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_origin_serializes_snake_case() {
+        let mut record = local_record("h");
+        record.origin = Some(IdentityOrigin::ExternalCaller);
+        assert_eq!(serde_json::to_value(&record).unwrap()["origin"], "external_caller");
+        record.origin = Some(IdentityOrigin::Managed);
+        assert_eq!(serde_json::to_value(&record).unwrap()["origin"], "managed");
+    }
+
+    #[tokio::test]
+    async fn test_store_external_did_stamps_external_caller() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+
+        store
+            .store_external_did("did:web:caller.example", std::collections::HashMap::new(), Some("s1".into()), true)
+            .await
+            .unwrap();
+
+        let record = store
+            .find_by_did("did:web:caller.example")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller));
+        assert!(!record.is_local);
+    }
+
+    #[tokio::test]
+    async fn test_store_external_did_backfills_origin_on_legacy_external_record() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        let mut legacy = local_record("external:did:web:caller.example");
+        legacy.did = "did:web:caller.example".to_string();
+        legacy.is_local = false;
+        store
+            .create(legacy)
+            .await
+            .unwrap();
+
+        store
+            .store_external_did("did:web:caller.example", std::collections::HashMap::new(), None, false)
+            .await
+            .unwrap();
+
+        let record = store
+            .find_by_hash("external:did:web:caller.example")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller));
+        assert_eq!(record.usage_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_store_external_did_keeps_managed_origin() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        let mut managed = local_record("m");
+        managed.origin = Some(IdentityOrigin::Managed);
+        let did = managed.did.clone();
+        store
+            .create(managed)
+            .await
+            .unwrap();
+
+        store
+            .store_external_did(&did, std::collections::HashMap::new(), None, true)
+            .await
+            .unwrap();
+
+        let record = store
+            .find_by_hash("m")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+    }
+
+    #[tokio::test]
+    async fn test_set_origin_persists_across_store_instances() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(local_record("h1"))
+            .await
+            .unwrap();
+
+        store
+            .set_origin("h1", IdentityOrigin::Managed)
+            .await
+            .unwrap();
+
+        let reopened = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        let record = reopened
+            .find_by_hash("h1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(IdentityOrigin::Managed));
+    }
+
+    #[tokio::test]
+    async fn test_set_origin_unknown_hash_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+
+        let result = store
+            .set_origin("missing", IdentityOrigin::Managed)
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            store
+                .find_by_hash("missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

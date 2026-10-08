@@ -173,10 +173,133 @@ The only writer of agent-in-trust-registry records
 ([`trust_recorder.rs`](../src/trust_registry_verification/trust_recorder.rs)). It fires
 on the response leg and on discovery, and is idempotent.
 
+After writing its records, the Trust Recorder publishes a name for each authority it
+wrote. The name comes from the Authority register entry with that DID, or, failing that,
+from the Issuer with that DID, which covers the `{{ surface.issuer_did }}` template. An
+Issuer DID used as a record's entity is named after the Issuer too. A DID with no
+matching Authority or Issuer stays unnamed.
+
+When the managed agent has a display name (see [Display names](#display-names)), the
+Trust Recorder also publishes the agent DID's entity reference field and attaches
+`{"displayName": "<name>", "origin": "managed"}` as `context` on the records it creates
+for the agent DID. Context is a snapshot taken at creation and is never rewritten; the
+reference field carries the current name. A naming failure never skips record creation.
+
 `authority_did` accepts the template `{{ surface.issuer_did }}`, resolved at write time
 to the surface's configured Issuer DID. When the surface has no issuer configured the
 template does not resolve and the entry is skipped with a warning rather than written
 with a placeholder.
+
+## Display names
+
+A display name is an unverified, human-readable label for a DID
+([`display_name.rs`](../src/identity/display_name.rs)). Valid names are trimmed, keep
+their case, contain no control characters or invisible Unicode format (`Cf`) characters
+such as zero-width spaces and bidirectional overrides, and fit in 128 characters and
+256 UTF-8 bytes. Descriptions are dropped when they contain either kind of character. An invalid or empty name is skipped with a warning, and the DID is shown
+instead. Falling back to the DID is display-only: no reference field, context or VC
+name is ever published with the DID as the name.
+
+### Managed agents
+
+The managed agent's display name is its surface name. On A2A and AP2 surfaces with an
+`http` or `https` target, the dashboard shows the `name` in the target's Agent Card
+instead, marked unverified (see [Agent Card names](#agent-card-names)). Each identity record carries an
+origin (`managed` or `external_caller`), stamped when the gateway issues the DID. The
+origin follows the identity slot the DID came from, not the request leg: on a surface
+with no inbound slot, an inbound request that derives the DID from the protected slot
+(or legacy `target.identity_injection`) issues it as `managed`, the same as the
+outbound leg and the response path. A
+record written before origins existed has none until the gateway next issues its
+credential. Until then it is never published, and the dashboard shows it unnamed, in its
+own row, with the LOCAL or REMOTE badge instead of an origin badge. A record is not
+classified from the surface it links to: before origins existed, caller DIDs were also
+stored as local records linked to the surface, so a link does not prove a managed agent.
+Credential principals (the name of the backing certificate or secret) appear only in
+the dashboard and are never published.
+
+If one DID is managed on more than one surface, no name is published and the dashboard
+shows a name conflict.
+
+#### Agent Card names
+
+The Agent Card name ([`target_card_names.rs`](../src/identity/target_card_names.rs))
+is dashboard-only. It applies to every managed-identity mode, and the Identities page
+shows it in place of the surface name with an "unverified" marker. The card is read from
+`<target endpoint>/.well-known/agent-card.json`, then `/.well-known/agent.json`, or from
+the target origin plus the access point's `agent_card_path` when that is set. Surfaces of
+other protocols, such as MCP, and targets with another scheme, such as `fabric://`, are
+never looked up.
+
+Lookups are cached per surface for 300 seconds and are re-read when the target endpoint
+or card path changes, with a 5-second timeout for each card URL tried. The dashboard
+never waits: until its first lookup finishes, and whenever the card has no valid `name`,
+a row shows the surface name. When the card cannot be read (unreachable, blocked by
+egress policy, a non-success status, an oversized body, or a non-JSON body), the row keeps
+the last name read from the same target and card path, and the next lookup is retried
+after the cache period; with no earlier name, it shows the surface name.
+
+The card name is self-asserted by the target and never verified. The target is trusted
+to serve traffic, not to choose what the gateway's Issuer signs, so the card name never
+reaches the VC, Trust Recorder context, or trust-registry reference fields, and card
+lookups never sit on the request path. A name conflict shows no name, whatever the card
+says.
+
+The agent identity VC carries the surface name as `credentialSubject.name` on both the
+legacy and SSI paths. VCs are signed on each issuance, so the next VC after a surface
+rename carries the new name under the same DID.
+
+### Trust registry reference fields
+
+The gateway publishes names as trust-registry reference fields
+([`reference_fields.rs`](../src/trust_registries/reference_fields.rs)), never by
+rewriting trust records:
+
+| Trigger | Fields published |
+| --- | --- |
+| Issuer create, retry, or edit | Entity field for the Issuer DID, authority field for its Authority |
+| Authority edit | Authority field, to every registry an Issuer of that Authority uses |
+| Surface rename | Entity field for each managed DID of the surface, to each Trust Recorder registry |
+| Trust Recorder | Entity field for the agent DID; authority field for each record's authority (an Authority, else an Issuer with that DID); entity field for an Issuer DID used as a record's entity |
+
+An Authority or Issuer is either global or owned by one tenant, and an owned one is named
+only within its tenant.
+An Issuer publishes its Authority's name only when that Authority is global or in the
+Issuer's tenant. The Trust Recorder names an Authority or Issuer only when it is global
+or in the surface's tenant; a surface without a tenant names only global ones. A DID
+that fails this check gets no reference field, but its records are still written, so
+external DIDs keep working.
+
+Each publish sends `create-reference-field`. On the problem-report code
+`e.p.msg.conflict` it sends `update-reference-field`, and on a second conflict it
+resends the update once. Any other error is logged and retried on the next trigger.
+A reference field is shared by every writer for its type and id, so gateways that
+publish different names for the same Authority overwrite each other, and the last write
+wins. Fields are not create-only, so renaming an Authority or Issuer updates the name
+in every registry that already holds it.
+Successful publishes are cached per registry, field type, and id, so an unchanged name
+is not re-sent. Publishing runs in the background and never delays or fails an HTTP
+response, record creation, forwarding, or a TRQP query.
+
+### External callers
+
+Caller names appear only in the dashboard
+([`caller_names.rs`](../src/observability/caller_names.rs)) and never override a
+managed agent's name. They are resolved in the background, cached for 300 seconds, in
+this order:
+
+1. A verified agent name: a `host/@local` entry in the caller's `alsoKnownAs` that the
+   DID resolver verifies back to the same DID. At most four entries are tried. Their
+   egress controls are in [`POLICY.md`](POLICY.md#agent-name-resolution).
+2. The `name` of the caller's Agent Card, marked unverified. The card is found through a
+   DID-document service of type `AgentCard` or `A2AAgentCard`, or whose id ends in
+   `#agent-card`. It is fetched under the strict egress policy with a 5-second timeout
+   and a 64 KiB limit.
+3. The DID.
+
+Until the first lookup for a DID finishes, the dashboard row carries
+`display_name_pending` and shows "resolving…". A finished lookup that found no name, or
+that failed, shows the DID alone and is retried after the cache period.
 
 ## Related
 

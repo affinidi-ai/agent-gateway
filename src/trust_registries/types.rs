@@ -328,6 +328,40 @@ pub struct TrProblemReport {
     pub comment: String,
 }
 
+/// Kind of a TR reference field: the human-readable metadata attached to an id
+/// used in trust records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceFieldType {
+    Authority,
+    Entity,
+}
+
+/// Request body for TR Admin `create-reference-field`
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateReferenceFieldRequest {
+    pub id: String,
+    pub field_type: ReferenceFieldType,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+/// Request body for TR Admin `update-reference-field`; absent fields stay unchanged.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateReferenceFieldRequest {
+    pub id: String,
+    pub field_type: ReferenceFieldType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

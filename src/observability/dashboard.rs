@@ -9,9 +9,16 @@ use std::time::SystemTime;
 use tracing::error;
 
 use crate::identity::IdentityStore;
+use crate::identity::display_name::{ManagedDisplayName, resolve_managed_display_name, surfaces_by_did};
+use crate::identity::filesystem::IdentityOrigin;
+use crate::identity::target_card_names::{CardLocation, TargetCardNameService};
 use crate::integrations::filesystem::NotificationStore;
 use crate::mcp_proxies::filesystem::McpProxyStore;
 use crate::metrics::MetricsStore;
+use crate::observability::caller_names::{CallerNameService, DisplayNameSource};
+use crate::observability::identity_view::{
+    CredentialPrincipal, PrincipalNames, credential_principal, naming_for, with_target_card_name,
+};
 use crate::{config::GatewayConfig, observability::system_metrics::SystemInfo};
 
 // Store proxy start time
@@ -283,6 +290,28 @@ pub struct IdentityInfo {
     pub verified: bool,
     #[serde(default)]
     pub channel_usage: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<IdentityOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name_source: Option<DisplayNameSource>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub display_name_verified: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub display_name_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_principal: Option<CredentialPrincipal>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub name_conflict: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize, Deserialize)]
@@ -889,23 +918,15 @@ pub async fn compute_dashboard_delta(
     .map_err(|(_status, msg)| msg)?;
 
     if let Some(since) = since_timestamp {
-        // Include identities created OR last-used since the given timestamp.
-        // Newly issued identities have `last_used_at = None` until the
-        // first usage event, so falling back to `created_at` ensures the
-        // delta surfaces them on the very first request that creates them.
-        let modified_identities: Vec<IdentityInfo> = all_identities
+        let renamed: std::collections::HashSet<String> = CallerNameService::global()
+            .changed_since(since)
             .into_iter()
-            .filter(|id| {
-                let ts = id
-                    .last_used_at
-                    .as_deref()
-                    .unwrap_or(id.created_at.as_str());
-                DateTime::parse_from_rfc3339(ts)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc) > since)
-                    .unwrap_or(false)
-            })
             .collect();
+        let renamed_surfaces: std::collections::HashSet<String> = TargetCardNameService::global()
+            .changed_since(since)
+            .into_iter()
+            .collect();
+        let modified_identities = identities_changed_since(all_identities, since, &renamed, &renamed_surfaces);
 
         if !modified_identities.is_empty() {
             changes.identities = Some(IdentitiesDelta {
@@ -1927,36 +1948,85 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-/// Helper function to build identity list
+/// Identities created, last used, or whose caller or target Agent Card name changed after `since`.
+/// Newly issued identities have `last_used_at = None` until the first usage
+/// event, so falling back to `created_at` surfaces them on the very first
+/// request that creates them.
+pub(crate) fn identities_changed_since(
+    identities: Vec<IdentityInfo>,
+    since: DateTime<Utc>,
+    renamed_dids: &std::collections::HashSet<String>,
+    renamed_surfaces: &std::collections::HashSet<String>,
+) -> Vec<IdentityInfo> {
+    identities
+        .into_iter()
+        .filter(|id| {
+            let ts = id
+                .last_used_at
+                .as_deref()
+                .unwrap_or(id.created_at.as_str());
+            renamed_dids.contains(&id.did)
+                || id
+                    .surface_id
+                    .as_ref()
+                    .is_some_and(|surface_id| renamed_surfaces.contains(surface_id))
+                || DateTime::parse_from_rfc3339(ts)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc) > since)
+                    .unwrap_or(false)
+        })
+        .collect()
+}
+
 async fn build_identity_list(
     identity_store: &Arc<dyn IdentityStore>,
     current_config: &crate::config::GatewayConfig,
     metrics_store: &Arc<MetricsStore>,
     agent_surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
 ) -> Result<Vec<IdentityInfo>, (axum::http::StatusCode, String)> {
+    build_identity_list_with(
+        identity_store,
+        &current_config.surfaces,
+        metrics_store,
+        agent_surface_store,
+        CallerNameService::global(),
+        TargetCardNameService::global(),
+    )
+    .await
+}
+
+pub(crate) async fn build_identity_list_with(
+    identity_store: &Arc<dyn IdentityStore>,
+    config_surfaces: &[crate::config::agent_surface::AgentSurface],
+    metrics_store: &Arc<MetricsStore>,
+    agent_surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
+    caller_names: &Arc<CallerNameService>,
+    card_names: &Arc<TargetCardNameService>,
+) -> Result<Vec<IdentityInfo>, (axum::http::StatusCode, String)> {
     let records = identity_store
         .list_all()
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load identities: {}", e)))?;
 
-    // Build a map of config_id -> channel_name for quick lookup. Includes
-    // both legacy channels (from current_config.channels) and agent surfaces
-    // (loaded from the surface store) so identities bound to a surface
-    // display the surface name instead of an empty cell.
-    let mut config_id_to_name: std::collections::HashMap<String, String> = current_config
-        .surfaces
-        .iter()
-        .map(|s| (s.surface_id.clone(), s.name.clone()))
-        .collect();
-    if let Some(store) = agent_surface_store
-        && let Ok(surfaces) = crate::surfaces::AgentSurfaceStore::list_all(store.as_ref()).await
-    {
-        for s in surfaces {
-            config_id_to_name
-                .entry(s.surface_id.clone())
-                .or_insert(s.name);
-        }
+    // Includes both config surfaces and stored agent surfaces so identities
+    // bound to a surface display the surface name instead of an empty cell.
+    let stored_surfaces = match agent_surface_store {
+        Some(store) => crate::surfaces::AgentSurfaceStore::list_all(store.as_ref())
+            .await
+            .unwrap_or_default(),
+        None => vec![],
+    };
+    let mut surfaces_by_id: std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface> =
+        config_surfaces
+            .iter()
+            .map(|s| (s.surface_id.as_str(), s))
+            .collect();
+    for s in &stored_surfaces {
+        surfaces_by_id
+            .entry(s.surface_id.as_str())
+            .or_insert(s);
     }
+    let managed_surfaces_by_did = surfaces_by_did(&records);
 
     // Get metrics to compute actual usage counts and determine active channels
     let identity_stats = metrics_store
@@ -1983,7 +2053,8 @@ async fn build_identity_list(
         // but the first one encountered will generally be a good representative)
     }
 
-    Ok(records
+    let no_surfaces = std::collections::BTreeSet::new();
+    let mut identities: Vec<IdentityInfo> = records
         .into_iter()
         .map(|r| {
             // Determine channel: prefer the one from identity store (where created),
@@ -1997,13 +2068,48 @@ async fn build_identity_list(
                 .channel_config_id
                 .clone()
                 .or(metrics_channel_id);
-            let channel_name = channel_config_id
-                .as_ref()
+            let surface = channel_config_id
+                .as_deref()
                 .and_then(|id| {
-                    config_id_to_name
+                    surfaces_by_id
                         .get(id)
-                        .cloned()
+                        .copied()
                 });
+            let channel_name = surface.map(|s| s.name.clone());
+
+            let origin = r.effective_origin();
+            let managed_surface = surface.filter(|_| origin == Some(IdentityOrigin::Managed));
+            let card_name = managed_surface.and_then(|s| {
+                CardLocation::for_surface(s).and_then(|location| card_names.lookup_or_spawn(&s.surface_id, &location))
+            });
+            let managed_name: Option<ManagedDisplayName> = managed_surface.map(|s| {
+                resolve_managed_display_name(
+                    s,
+                    managed_surfaces_by_did
+                        .get(&r.did)
+                        .unwrap_or(&no_surfaces),
+                    card_name.as_deref(),
+                )
+            });
+            let caller_lookup =
+                (origin == Some(IdentityOrigin::ExternalCaller)).then(|| caller_names.lookup_or_spawn(&r.did));
+            let naming = with_target_card_name(
+                naming_for(origin, managed_name.as_ref(), caller_lookup.as_ref()),
+                origin,
+                card_name,
+            );
+            let is_managed = origin == Some(IdentityOrigin::Managed);
+            let surface_id = channel_config_id
+                .clone()
+                .filter(|_| is_managed);
+            let surface_name = managed_surface
+                .map(|s| s.name.trim().to_string())
+                .filter(|name| !name.is_empty());
+            let principal = if is_managed {
+                credential_principal(&r.identity_fields)
+            } else {
+                None
+            };
 
             IdentityInfo {
                 did: r.did.clone(),
@@ -2029,9 +2135,35 @@ async fn build_identity_list(
                         })
                     })
                     .collect(),
+                origin,
+                display_name: naming.display_name,
+                display_name_source: naming.display_name_source,
+                display_name_verified: naming.display_name_verified,
+                display_name_pending: naming.display_name_pending,
+                surface_id,
+                surface_name,
+                credential_principal: principal,
+                name_conflict: naming.name_conflict,
             }
         })
-        .collect())
+        .collect();
+
+    let principal_names = PrincipalNames::load(
+        identities
+            .iter()
+            .filter_map(|i| {
+                i.credential_principal
+                    .as_ref()
+            }),
+    )
+    .await;
+    for identity in &mut identities {
+        identity.credential_principal = identity
+            .credential_principal
+            .take()
+            .map(|p| principal_names.named(p));
+    }
+    Ok(identities)
 }
 
 /// Helper function to build channel list
@@ -2360,6 +2492,311 @@ fn strip_ansi_codes(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_plain_text_log_entry;
+
+    mod identity_naming {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use chrono::Utc;
+        use serde_json::{Value, json};
+
+        use super::super::{IdentityInfo, build_identity_list_with, identities_changed_since};
+        use crate::config::agent_surface::AgentSurface;
+        use crate::identity::IdentityStore;
+        use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin};
+        use crate::identity::target_card_names::{NoTargetCards, TargetCardNameService};
+        use crate::identity::test_helpers::{MockIdentityStore, test_surface_identity_record};
+        use crate::metrics::MetricsStore;
+        use crate::observability::caller_names::{CallerNameService, CallerNameSources};
+
+        const CALLER_DID: &str = "did:web:acme.com:billing";
+
+        struct FakeSources;
+
+        #[async_trait]
+        impl CallerNameSources for FakeSources {
+            async fn resolve_did_document(
+                &self,
+                did: &str,
+            ) -> Result<Value, String> {
+                Ok(json!({ "id": did, "alsoKnownAs": ["acme.com/@billing"] }))
+            }
+
+            async fn verify_agent_name(
+                &self,
+                _name: &str,
+            ) -> Result<String, String> {
+                Ok(CALLER_DID.to_string())
+            }
+
+            async fn fetch_agent_card(
+                &self,
+                _url: &str,
+            ) -> Result<Value, String> {
+                Err("no card".to_string())
+            }
+        }
+
+        fn surface(
+            id: &str,
+            name: &str,
+        ) -> AgentSurface {
+            AgentSurface {
+                surface_id: id.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            }
+        }
+
+        fn managed(
+            did: &str,
+            surface_id: &str,
+        ) -> AgentIdentityRecord {
+            let mut record = test_surface_identity_record(did, surface_id);
+            record.origin = Some(IdentityOrigin::Managed);
+            record
+        }
+
+        fn caller(did: &str) -> AgentIdentityRecord {
+            let mut record = test_surface_identity_record(did, "oxygen");
+            record.origin = Some(IdentityOrigin::ExternalCaller);
+            record.is_local = false;
+            record
+                .identity_fields
+                .insert("certificate_id".to_string(), json!("NITROGEN"));
+            record
+        }
+
+        async fn list(
+            records: Vec<AgentIdentityRecord>,
+            surfaces: &[AgentSurface],
+            caller_names: &Arc<CallerNameService>,
+        ) -> HashMap<String, IdentityInfo> {
+            let store = MockIdentityStore::new();
+            for record in records {
+                store
+                    .create(record)
+                    .await
+                    .unwrap();
+            }
+            let store: Arc<dyn IdentityStore> = Arc::new(store);
+            build_identity_list_with(
+                &store,
+                surfaces,
+                &Arc::new(MetricsStore::new(10)),
+                None,
+                caller_names,
+                &Arc::new(TargetCardNameService::new(Arc::new(NoTargetCards))),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.did.clone(), i))
+            .collect()
+        }
+
+        fn names() -> Arc<CallerNameService> {
+            Arc::new(CallerNameService::new(Arc::new(FakeSources)))
+        }
+
+        async fn wait_for_caller_name(caller_names: &Arc<CallerNameService>) {
+            for _ in 0..200 {
+                if caller_names
+                    .lookup_or_spawn(CALLER_DID)
+                    .into_name()
+                    .is_some()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("caller name never resolved");
+        }
+
+        #[tokio::test]
+        async fn test_managed_row_carries_surface_name_origin_and_principal() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .identity_fields
+                .insert("certificate_id".to_string(), json!("NITROGEN"));
+            let rows = list(vec![record], &[surface("oxygen", "OXYGEN")], &names()).await;
+            let row = serde_json::to_value(&rows["did:example:oxygen"]).unwrap();
+            assert_eq!(row["origin"], json!("managed"));
+            assert_eq!(row["display_name"], json!("OXYGEN"));
+            assert_eq!(row["display_name_source"], json!("surface_name"));
+            assert_eq!(row["surface_id"], json!("oxygen"));
+            assert_eq!(row["surface_name"], json!("OXYGEN"));
+            assert_eq!(row["credential_principal"], json!({ "kind": "certificate", "id": "NITROGEN" }));
+            assert!(
+                row.get("display_name_verified")
+                    .is_none()
+            );
+            assert!(
+                row.get("name_conflict")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_conflicting_did_has_conflict_marker_and_no_name() {
+            let mut record = managed("did:example:shared", "oxygen");
+            record
+                .channel_usage
+                .push(crate::identity::filesystem::ChannelUsage {
+                    channel_config_id: "helium".to_string(),
+                    usage_count: 1,
+                    last_used_at: Utc::now(),
+                });
+            let rows = list(vec![record], &[surface("oxygen", "OXYGEN"), surface("helium", "HELIUM")], &names()).await;
+            let row = &rows["did:example:shared"];
+            assert!(row.name_conflict);
+            assert_eq!(row.display_name, None);
+            let json = serde_json::to_value(row).unwrap();
+            assert_eq!(json["name_conflict"], json!(true));
+            assert!(
+                json.get("display_name")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_external_row_uses_caller_name_and_never_surface_fields() {
+            let caller_names = names();
+            let rows = list(vec![caller(CALLER_DID)], &[surface("oxygen", "OXYGEN")], &caller_names).await;
+            let first = serde_json::to_value(&rows[CALLER_DID]).unwrap();
+            assert_eq!(first["origin"], json!("external_caller"));
+            assert_eq!(first["display_name_pending"], json!(true));
+            for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "name_conflict"] {
+                assert!(first.get(absent).is_none(), "{absent} must be omitted for a caller row: {first}");
+            }
+
+            wait_for_caller_name(&caller_names).await;
+            let rows = list(vec![caller(CALLER_DID)], &[surface("oxygen", "OXYGEN")], &caller_names).await;
+            let named = serde_json::to_value(&rows[CALLER_DID]).unwrap();
+            assert_eq!(named["display_name"], json!("acme.com/@billing"));
+            assert_eq!(named["display_name_source"], json!("agent_name"));
+            assert_eq!(named["display_name_verified"], json!(true));
+            assert!(
+                named
+                    .get("surface_name")
+                    .is_none()
+            );
+            assert!(
+                named
+                    .get("display_name_pending")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_unstamped_local_row_linked_to_a_surface_stays_unclassified() {
+            let mut legacy = test_surface_identity_record("did:example:legacy", "oxygen");
+            legacy.origin = None;
+            let mut orphan = test_surface_identity_record("did:example:orphan", "deleted");
+            orphan.origin = None;
+            let rows = list(vec![legacy, orphan], &[surface("oxygen", "OXYGEN")], &names()).await;
+
+            for did in ["did:example:legacy", "did:example:orphan"] {
+                let row = &rows[did];
+                assert_eq!(row.origin, None, "{did}");
+                assert_eq!(row.display_name, None, "{did}");
+                assert_eq!(row.display_name_source, None, "{did}");
+                assert!(!row.display_name_pending, "{did}");
+                assert_eq!(row.surface_id, None, "{did}");
+            }
+        }
+
+        #[tokio::test]
+        async fn test_managed_row_ignores_resolved_caller_name_for_same_did() {
+            let caller_names = names();
+            caller_names.lookup_or_spawn(CALLER_DID);
+            wait_for_caller_name(&caller_names).await;
+            let rows = list(vec![managed(CALLER_DID, "oxygen")], &[surface("oxygen", "OXYGEN")], &caller_names).await;
+            assert_eq!(
+                rows[CALLER_DID]
+                    .display_name
+                    .as_deref(),
+                Some("OXYGEN")
+            );
+            assert!(!rows[CALLER_DID].display_name_verified);
+        }
+
+        #[tokio::test]
+        async fn test_legacy_row_json_omits_new_fields() {
+            let rows = list(vec![test_surface_identity_record("did:example:legacy", "gone")], &[], &names()).await;
+            let json = serde_json::to_value(&rows["did:example:legacy"]).unwrap();
+            let keys: HashSet<&str> = json
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let expected: HashSet<&str> = [
+                "did",
+                "created_at",
+                "identity_hash",
+                "agent_identity",
+                "usage_count",
+                "last_used_at",
+                "channel_config_id",
+                "is_local",
+                "verified",
+                "channel_usage",
+            ]
+            .into();
+            assert_eq!(keys, expected);
+        }
+
+        #[test]
+        fn test_identity_info_deserializes_payload_without_new_fields() {
+            let info: IdentityInfo = serde_json::from_value(json!({
+                "did": "did:example:a", "created_at": "2026-01-01T00:00:00Z", "identity_hash": "h",
+                "agent_identity": {}, "usage_count": 0, "last_used_at": null, "is_local": true, "verified": false
+            }))
+            .unwrap();
+            assert_eq!(info.origin, None);
+            assert!(!info.name_conflict);
+        }
+
+        #[tokio::test]
+        async fn test_delta_includes_did_whose_caller_name_changed() {
+            let caller_names = names();
+            let mut record = caller(CALLER_DID);
+            record.last_used_at = Some(Utc::now() - chrono::Duration::hours(2));
+            record.created_at = Utc::now() - chrono::Duration::hours(2);
+            let since = Utc::now() - chrono::Duration::minutes(1);
+
+            let rows: Vec<IdentityInfo> = list(vec![record.clone()], &[], &caller_names)
+                .await
+                .into_values()
+                .collect();
+            let renamed: HashSet<String> = caller_names
+                .changed_since(since)
+                .into_iter()
+                .collect();
+            assert!(identities_changed_since(rows, since, &renamed, &HashSet::new()).is_empty());
+
+            wait_for_caller_name(&caller_names).await;
+            let rows: Vec<IdentityInfo> = list(vec![record], &[], &caller_names)
+                .await
+                .into_values()
+                .collect();
+            let renamed: HashSet<String> = caller_names
+                .changed_since(since)
+                .into_iter()
+                .collect();
+            let delta = identities_changed_since(rows, since, &renamed, &HashSet::new());
+            assert_eq!(delta.len(), 1);
+            assert_eq!(
+                delta[0]
+                    .display_name
+                    .as_deref(),
+                Some("acme.com/@billing")
+            );
+        }
+    }
 
     #[test]
     fn parses_padded_info_log_level() {

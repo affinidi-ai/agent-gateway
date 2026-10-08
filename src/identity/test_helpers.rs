@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use super::filesystem::AgentIdentityRecord;
+use super::filesystem::{AgentIdentityRecord, IdentityOrigin};
 use super::store::IdentityStore;
 use super::vc_issuer::VCIssuer;
 use super::vp_challenge_store::{VpChallengeRecord, VpChallengeStore};
@@ -55,6 +55,7 @@ pub fn test_surface_identity_record(
         channel_config_id: Some(surface_id.to_string()),
         is_local: true,
         verified: true,
+        origin: None,
     }
 }
 
@@ -149,10 +150,24 @@ impl IdentityStore for MockIdentityStore {
             channel_config_id,
             is_local: false,
             verified,
+            origin: Some(IdentityOrigin::ExternalCaller),
         };
 
         let mut records = self.records.write().await;
         records.insert(identity_hash, record);
+        Ok(())
+    }
+
+    async fn set_origin(
+        &self,
+        identity_hash: &str,
+        origin: IdentityOrigin,
+    ) -> Result<()> {
+        let mut records = self.records.write().await;
+        let record = records
+            .get_mut(identity_hash)
+            .ok_or_else(|| anyhow::anyhow!("identity record not found: {identity_hash}"))?;
+        record.origin = Some(origin);
         Ok(())
     }
 }
@@ -245,6 +260,7 @@ pub async fn signed_agent_presentation() -> SignedAgentPresentation {
             did: Cow::Borrowed(&holder_did),
             identity_fields: Cow::Owned(HashMap::new()),
             workload_binding: None,
+            display_name: None,
         }))
         .await
         .unwrap();

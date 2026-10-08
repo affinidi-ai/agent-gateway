@@ -336,7 +336,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
+| [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification, display names (including dashboard-only managed-agent Agent Card names) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
 | [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`didauth/`](src/didauth/) | The DID Auth challenge and JWS ceremony | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#did-auth) |
 | [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies and JWKS fetching | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
@@ -345,7 +345,7 @@ from.
 | [`vault_identity/`](src/vault_identity/) | Identity material for API keys and certificates | Source only: [`src/vault_identity/mod.rs`](src/vault_identity/mod.rs) |
 | [`issuers/`](src/issuers/) | Issuer records with generated `did:web` / `did:webvh` DIDs | Source only: [`src/issuers/mod.rs`](src/issuers/mod.rs) |
 | [`authorities/`](src/authorities/) | Local record of external authority DIDs used as trust anchors | Source only: [`src/authorities/mod.rs`](src/authorities/mod.rs) |
-| [`trust_registries/`](src/trust_registries/) | Trust registry connection records | [`POLICY.md`](docs/POLICY.md#trust-check) for Trust Check. Records: [`src/trust_registries/mod.rs`](src/trust_registries/mod.rs) |
+| [`trust_registries/`](src/trust_registries/) | Trust registry connection records, display-name reference fields | [`POLICY.md`](docs/POLICY.md#trust-check) for Trust Check. Records: [`src/trust_registries/mod.rs`](src/trust_registries/mod.rs) |
 | [`trust_registry_verification/`](src/trust_registry_verification/) | TRQP queries, Trust Check, the Trust Recorder | [`POLICY.md`](docs/POLICY.md) |
 | [`sts/`](src/sts/) | RFC 8693 token exchange, and ID-JAG issuance and redemption | [`STS.md`](docs/STS.md) |
 
@@ -396,7 +396,7 @@ from.
 | [`encryption/`](src/encryption/) | Encryption at rest and key sources | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#configtoml) |
 | [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`export/`](src/export/) | Redacted `.atgx` storage export | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
-| [`observability/`](src/observability/) | Tracing, policy audit events, dashboard event stream | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
+| [`observability/`](src/observability/) | Tracing, policy audit events, dashboard event stream, identity view and caller names | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | [`metrics/`](src/metrics/) | Metric collection, retention, aggregation | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | [`component_tests/`](src/component_tests/) | Cross-module tests that need no Docker | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 

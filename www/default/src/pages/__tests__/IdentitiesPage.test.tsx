@@ -1,9 +1,9 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import IdentitiesPage from '../IdentitiesPage';
 import { AppContext } from '../../context/AppContext';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
 
@@ -714,5 +714,220 @@ describe('IdentitiesPage', () => {
     expect(screen.queryAllByTitle(/View trust score/i)).toHaveLength(1);
     expect(screen.queryAllByTitle(/View version history/i)).toHaveLength(1);
     expect(screen.getByText('v2')).toBeInTheDocument();
+  });
+
+  describe('naming metadata', () => {
+    const statsWith = (identities: any[], channels: any[] = []) => ({
+      ...mockAppContext.getCurrentStats(),
+      identities,
+      channels,
+      total_identities: identities.length,
+    });
+
+    const renderWithStats = (identities: any[], channels: any[] = [], path = '/identities') => {
+      const stats = statsWith(identities, channels);
+      const context = { ...mockAppContext, getCurrentStats: jest.fn(() => stats) };
+      return render(
+        <MemoryRouter initialEntries={[path]}>
+          <AppContext.Provider value={context}>
+            <Routes>
+              <Route path="/identities" element={<IdentitiesPage />} />
+              <Route path="/identities/:did" element={<IdentitiesPage />} />
+              <Route path="/surfaces/:id" element={<div data-testid="surface-builder" />} />
+            </Routes>
+          </AppContext.Provider>
+        </MemoryRouter>
+      );
+    };
+
+    const managedOld = {
+      did: 'did:key:managed-old',
+      identity_hash: 'hash-old',
+      created_at: '2026-01-01T00:00:00Z',
+      last_used_at: '2026-01-05T00:00:00Z',
+      is_local: true,
+      origin: 'managed',
+      display_name: 'OXYGEN',
+      display_name_source: 'surface_name',
+      surface_id: 'surface-1',
+      surface_name: 'OXYGEN',
+      credential_principal: { kind: 'certificate', id: 'cert-1', name: 'NITROGEN' },
+    };
+    const managedNew = {
+      ...managedOld,
+      did: 'did:key:managed-new',
+      identity_hash: 'hash-new',
+      created_at: '2026-02-01T00:00:00Z',
+      last_used_at: '2026-02-05T00:00:00Z',
+    };
+    const callerNamed = {
+      did: 'did:web:caller.example',
+      identity_hash: 'hash-caller',
+      created_at: '2026-01-01T00:00:00Z',
+      is_local: false,
+      origin: 'external_caller',
+      display_name: 'acme.com/@billing',
+      display_name_source: 'agent_name',
+      display_name_verified: true,
+    };
+    const callerUnnamed = {
+      did: 'did:web:anon.example',
+      identity_hash: 'hash-anon',
+      created_at: '2026-01-01T00:00:00Z',
+      is_local: false,
+      origin: 'external_caller',
+    };
+    const callerPending = {
+      did: 'did:web:pending.example',
+      identity_hash: 'hash-pending',
+      created_at: '2026-01-01T00:00:00Z',
+      is_local: false,
+      origin: 'external_caller',
+      display_name_pending: true,
+    };
+
+    const jwtClaimA = {
+      ...managedNew,
+      did: 'did:key:jwt-claim-a',
+      identity_hash: 'hash-jwt-a',
+      trust_score: 0.9,
+      credential_principal: { kind: 'jwt_claim', id: 'sub-a', name: 'alice' },
+    };
+    const jwtClaimB = {
+      ...managedNew,
+      did: 'did:key:jwt-claim-b',
+      identity_hash: 'hash-jwt-b',
+      trust_score: 0.4,
+      credential_principal: { kind: 'jwt_claim', id: 'sub-b', name: 'bob' },
+    };
+
+    it('renders one row per identity, including managed identities on one surface', async () => {
+      renderWithStats([managedOld, managedNew, callerNamed]);
+
+      const oldRow = await screen.findByTestId('identities-row-did:key:managed-old');
+      const newRow = screen.getByTestId('identities-row-did:key:managed-new');
+      expect(within(oldRow).getByTitle('did:key:managed-old')).toBeInTheDocument();
+      expect(within(newRow).getByTitle('did:key:managed-new')).toBeInTheDocument();
+      expect(within(newRow).getByTestId('identities-origin-managed')).toHaveTextContent(
+        'Managed Agent'
+      );
+      expect(within(newRow).getByTestId('identities-credential-principal')).toHaveTextContent(
+        'NITROGEN'
+      );
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(3);
+      expect(
+        within(screen.getByTestId('identities-row-did:web:caller.example')).getByTestId(
+          'identities-origin-external_caller'
+        )
+      ).toBeInTheDocument();
+    });
+
+    it('gives each parallel managed identity on a surface its own actions', async () => {
+      renderWithStats([jwtClaimA, jwtClaimB]);
+
+      const rowA = await screen.findByTestId('identities-row-did:key:jwt-claim-a');
+      const rowB = screen.getByTestId('identities-row-did:key:jwt-claim-b');
+      expect(within(rowA).getAllByTitle('View Trust Score')).toHaveLength(1);
+      expect(within(rowB).getAllByTitle('View Trust Score')).toHaveLength(1);
+      expect(within(rowA).getByText('90%')).toBeInTheDocument();
+      expect(within(rowB).getByText('40%')).toBeInTheDocument();
+      expect(within(rowA).getByTestId('identities-credential-principal')).toHaveTextContent(
+        'alice'
+      );
+      expect(within(rowB).getByTestId('identities-credential-principal')).toHaveTextContent('bob');
+      expect(within(rowA).getByTestId('identities-surface-link')).toHaveTextContent('OXYGEN');
+      expect(within(rowB).getByTestId('identities-surface-link')).toHaveTextContent('OXYGEN');
+    });
+
+    it('deep links to the exact identity, not another on the same surface', async () => {
+      renderWithStats(
+        [jwtClaimA, jwtClaimB],
+        [],
+        `/identities/${encodeURIComponent('did:key:jwt-claim-b')}`
+      );
+
+      const rowB = await screen.findByTestId('identities-row-did:key:jwt-claim-b');
+      await waitFor(() => expect(rowB).toHaveAttribute('aria-expanded', 'true'));
+      expect(screen.getByTestId('identities-row-did:key:jwt-claim-a')).toHaveAttribute(
+        'aria-expanded',
+        'false'
+      );
+      expect(screen.getAllByText('Identity Hash:')).toHaveLength(1);
+      expect(screen.getByText('hash-jwt-b')).toBeInTheDocument();
+      expect(screen.queryByText('hash-jwt-a')).not.toBeInTheDocument();
+    });
+
+    it('prefers the live surface name and deep links to the surface', async () => {
+      renderWithStats([managedNew], [{ config_id: 'surface-1', name: 'OXYGEN renamed' }]);
+
+      const link = await screen.findByTestId('identities-surface-link');
+      expect(link).toHaveTextContent('OXYGEN renamed');
+      expect(screen.getByTestId('identities-name')).toHaveTextContent('OXYGEN renamed');
+
+      fireEvent.click(link);
+      expect(await screen.findByTestId('surface-builder')).toBeInTheDocument();
+    });
+
+    it('filters to unnamed identities, excluding names still resolving', async () => {
+      renderWithStats([managedNew, callerNamed, callerUnnamed, callerPending]);
+
+      const filter = await screen.findByTestId('identities-unnamed-filter-button');
+      expect(filter).toHaveTextContent('Unnamed only (1)');
+      expect(filter).toHaveAttribute('aria-pressed', 'false');
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(4);
+      expect(
+        within(screen.getByTestId('identities-row-did:web:pending.example')).getByTestId(
+          'identities-name-pending'
+        )
+      ).toHaveTextContent('resolving…');
+
+      fireEvent.click(filter);
+
+      expect(filter).toHaveAttribute('aria-pressed', 'true');
+      const rows = screen.getAllByTestId(/^identities-row-/);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toHaveAttribute('data-testid', 'identities-row-did:web:anon.example');
+      expect(within(rows[0]).queryByTestId('identities-name')).not.toBeInTheDocument();
+      expect(within(rows[0]).getByTitle('did:web:anon.example')).toBeInTheDocument();
+      expect(within(rows[0]).queryByText('No name')).not.toBeInTheDocument();
+
+      fireEvent.click(filter);
+      expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(4);
+    });
+
+    it('looks as before when the backend sends no naming fields', async () => {
+      renderWithStats([
+        { did: 'did:key:legacy-a', identity_hash: 'a', created_at: '2026-01-01T00:00:00Z' },
+        { did: 'did:key:legacy-b', identity_hash: 'b', created_at: '2026-01-02T00:00:00Z' },
+      ]);
+
+      expect(await screen.findAllByTestId(/^identities-row-/)).toHaveLength(2);
+      expect(screen.getByRole('columnheader', { name: 'DID' })).toBeInTheDocument();
+      expect(screen.getByRole('columnheader', { name: 'Origin' })).toBeInTheDocument();
+      expect(screen.queryByRole('columnheader', { name: 'Status' })).not.toBeInTheDocument();
+      expect(screen.queryByTestId('identities-unnamed-filter-button')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('identities-name')).not.toBeInTheDocument();
+      expect(screen.queryByText('No name')).not.toBeInTheDocument();
+      expect(screen.queryByTestId(/^identities-origin-/)).not.toBeInTheDocument();
+    });
+
+    it('expands rows independently', async () => {
+      renderWithStats([managedNew, callerNamed]);
+
+      const rowA = await screen.findByTestId('identities-row-did:key:managed-new');
+      const rowB = screen.getByTestId('identities-row-did:web:caller.example');
+
+      fireEvent.click(rowA);
+      fireEvent.click(rowB);
+      expect(rowA).toHaveAttribute('aria-expanded', 'true');
+      expect(rowB).toHaveAttribute('aria-expanded', 'true');
+      expect(screen.getAllByText('Identity Hash:')).toHaveLength(2);
+
+      fireEvent.click(rowA);
+      expect(rowA).toHaveAttribute('aria-expanded', 'false');
+      expect(rowB).toHaveAttribute('aria-expanded', 'true');
+      expect(screen.getAllByText('Identity Hash:')).toHaveLength(1);
+      expect(screen.getByText('hash-caller')).toBeInTheDocument();
+    });
   });
 });

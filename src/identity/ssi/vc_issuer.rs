@@ -28,6 +28,8 @@ pub struct AgentIdentity<'a> {
     /// Pre-built workload binding JSON for the credential subject.
     /// When present, replaces the flat `identityFields` with structured `workloadBinding`.
     pub workload_binding: Option<serde_json::Value>,
+    /// Surface name of a managed agent, issued as `credentialSubject.name`.
+    pub display_name: Option<Cow<'a, str>>,
 }
 
 pub enum IssueVcPayload<'a> {
@@ -184,7 +186,7 @@ impl VcIssuer for LocalVcIssuer {
         drop(config);
 
         // Build credential subject — use workloadBinding if provided, else legacy identityFields
-        let credential_subject = if let Some(ref wb) = air.workload_binding {
+        let mut credential_subject = if let Some(ref wb) = air.workload_binding {
             json!({
                 "id": air.did.as_ref(),
                 "workloadBinding": wb,
@@ -197,6 +199,9 @@ impl VcIssuer for LocalVcIssuer {
                 "identityFields": identity_json,
             })
         };
+        if let Some(name) = air.display_name.as_deref() {
+            credential_subject["name"] = json!(name);
+        }
 
         // Create unsigned VC v2 payload
         let now = chrono::Utc::now();
@@ -260,6 +265,7 @@ mod tests {
             did: Cow::Borrowed("did:web:example.com:agent:123"),
             identity_fields: Cow::Owned(identity_fields),
             workload_binding: None,
+            display_name: None,
         }
     }
 
@@ -321,5 +327,30 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(context.contains(&json!("https://www.w3.org/ns/credentials/v2")));
+    }
+
+    #[tokio::test]
+    async fn test_issue_sets_name_only_when_display_name_present() {
+        let config = Arc::new(RwLock::new(create_test_config()));
+        let signer = Arc::new(LocalVcSigner::new(config.clone())) as Arc<dyn VcSigner>;
+        let vc_issuer = LocalVcIssuer::new(config, signer);
+        let mut named = create_test_agent_identity_record();
+        named.display_name = Some(Cow::Borrowed("OXYGEN"));
+
+        let named_vc = vc_issuer
+            .issue(IssueVcPayload::AgentIdentity(named))
+            .await
+            .unwrap();
+        let unnamed_vc = vc_issuer
+            .issue(IssueVcPayload::AgentIdentity(create_test_agent_identity_record()))
+            .await
+            .unwrap();
+
+        assert_eq!(named_vc["credentialSubject"]["name"], json!("OXYGEN"));
+        assert!(
+            unnamed_vc["credentialSubject"]
+                .get("name")
+                .is_none()
+        );
     }
 }

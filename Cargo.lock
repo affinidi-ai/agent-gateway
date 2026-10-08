@@ -362,6 +362,7 @@ dependencies = [
  "affinidi-did-common 0.4.3",
  "affinidi-did-resolver-traits",
  "affinidi-did-web",
+ "agent-names",
  "ahash 0.8.12",
  "did-scid",
  "didwebvh-rs",
@@ -773,6 +774,7 @@ dependencies = [
  "tracing-subscriber",
  "trust-tasks-rs",
  "ts-rs",
+ "unicode-general-category",
  "url",
  "urlencoding",
  "uuid",
@@ -785,6 +787,21 @@ dependencies = [
  "x509-parser 0.18.1",
  "zeroize",
  "zip",
+]
+
+[[package]]
+name = "agent-names"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b7e2b7857b1f2aadbf3216a02046bef6a66fed4b199108d46d29953b5b487b0"
+dependencies = [
+ "affinidi-did-common 0.4.3",
+ "reqwest 0.13.4",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

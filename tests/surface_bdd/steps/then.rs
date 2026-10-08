@@ -479,10 +479,14 @@ fn named_managed_agent_received_forwarded_request(
     agent_name: String,
 ) {
     let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
-    assert_target_called_exactly_once(target, &agent_name);
+    let forwarded_requests: Vec<_> = get_observed_target_requests(target, &agent_name)
+        .iter()
+        .filter(|request| !is_agent_card_discovery(request))
+        .cloned()
+        .collect();
+    let request = assert_called_exactly_once(&forwarded_requests, &format!("target actor '{}'", agent_name));
 
     let sent = get_sent_body(world);
-    let request = get_observed_target_request(target, &format!("target actor '{}'", agent_name));
     let forwarded = request.json_body();
     assert_eq!(
         sent, &forwarded,

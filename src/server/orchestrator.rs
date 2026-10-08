@@ -1605,7 +1605,9 @@ pub async fn run_axum_proxy(
             {
                 Ok(store) => {
                     info!("Authority store initialized");
-                    Some(Arc::new(store))
+                    let store = Arc::new(store);
+                    crate::gateways::connection_points::init_authority_store(store.clone());
+                    Some(store)
                 }
                 Err(e) => {
                     error!("Failed to initialize authority store: {}", e);

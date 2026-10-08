@@ -177,6 +177,7 @@ pub async fn generate_did_webvh_identity(
         channel_config_id: None,
         is_local: true,
         verified: true,
+        origin: None,
     };
 
     info!("[Identity Generation] Generated did:webvh identity: {}", final_did);

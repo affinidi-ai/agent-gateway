@@ -1258,7 +1258,7 @@ async fn step_resolve_agent_identity(
                 ));
             };
             let response = vc_issuer
-                .issue_or_get_credential(
+                .issue_or_get_managed_credential(
                     identity_fields.clone(),
                     Some(identity_hash.clone()),
                     ctx.surface
@@ -1483,7 +1483,7 @@ async fn step_resolve_agent_identity(
 
         let vc_issuer = selector.get_vc_issuer();
         let response = vc_issuer
-            .issue_or_get_credential(
+            .issue_or_get_managed_credential(
                 identity_fields.clone(),
                 Some(hash.clone()),
                 ctx.surface
@@ -1541,7 +1541,7 @@ async fn step_resolve_agent_identity(
     };
 
     let response = vc_issuer
-        .issue_or_get_credential(
+        .issue_or_get_managed_credential(
             identity_fields.clone(),
             Some(hash.clone()),
             ctx.surface
@@ -2280,7 +2280,7 @@ fn resolve_agent_card_url(tp: &TransitPoint) -> (String, Option<String>) {
 /// `/.well-known/agent.json`. Each URL is dialled through a client pinned to
 /// the address it resolved to, under the forward step's egress policy, and the
 /// card is read within the Transit Point's response bounds.
-async fn fetch_agent_card(
+pub(crate) async fn fetch_agent_card(
     target_url: &str,
     agent_card_path: Option<&str>,
     request_id: &str,

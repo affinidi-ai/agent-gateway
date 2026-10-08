@@ -83,6 +83,7 @@ static GLOBAL_APPLIANCE_POLICY_MANAGER: OnceCell<Arc<crate::policies::GlobalPoli
 
 /// Global issuer store for GW2 - for trust registry validation lookups
 static GLOBAL_ISSUER_STORE: OnceCell<Arc<dyn crate::issuers::IssuerStore>> = OnceCell::const_new();
+static GLOBAL_AUTHORITY_STORE: OnceCell<Arc<dyn crate::authorities::AuthorityStore>> = OnceCell::const_new();
 
 /// Global secrets store for GW2 - for target_auth and credential delegation secret resolution
 static GLOBAL_SECRETS_STORE: OnceCell<Arc<dyn crate::secrets::SecretsStore>> = OnceCell::const_new();
@@ -128,6 +129,13 @@ pub async fn init_vc_issuer(
 
     let _ = GLOBAL_VC_ISSUER.set(vc_issuer);
     info!("GW2: Global VC issuer initialized for agent identity tracking");
+}
+
+/// Get the global VC issuer, if initialized.
+pub fn get_vc_issuer() -> Option<Arc<crate::identity::VCIssuer>> {
+    GLOBAL_VC_ISSUER
+        .get()
+        .cloned()
 }
 
 /// Listener manager, used on the fabric-receive path to resolve the sending
@@ -202,6 +210,13 @@ pub async fn init_agent_surface_store(store: Arc<dyn AgentSurfaceStore>) {
     } else {
         info!("GW2: Global agent-surface store initialized for O(1) surface lookup");
     }
+}
+
+/// Get the global agent-surface store, if initialized.
+pub fn get_agent_surface_store() -> Option<Arc<dyn AgentSurfaceStore>> {
+    GLOBAL_AGENT_SURFACE_STORE
+        .get()
+        .cloned()
 }
 
 /// Initialize the global facilitator mode for GW2
@@ -301,6 +316,18 @@ pub async fn init_issuer_store(store: Arc<dyn crate::issuers::IssuerStore>) {
 #[allow(dead_code)]
 pub fn get_issuer_store() -> Option<Arc<dyn crate::issuers::IssuerStore>> {
     GLOBAL_ISSUER_STORE
+        .get()
+        .cloned()
+}
+
+/// Initialize the global authority store used to name Trust Recorder authorities.
+pub fn init_authority_store(store: Arc<dyn crate::authorities::AuthorityStore>) {
+    let _ = GLOBAL_AUTHORITY_STORE.set(store);
+}
+
+/// Get the global authority store.
+pub fn get_authority_store() -> Option<Arc<dyn crate::authorities::AuthorityStore>> {
+    GLOBAL_AUTHORITY_STORE
         .get()
         .cloned()
 }
@@ -2184,6 +2211,7 @@ async fn extract_caller_identity_inbound(
                                             .config_id()
                                             .map(str::to_string),
                                         surface.issuer_id.clone(),
+                                        crate::identity::filesystem::IdentityOrigin::ExternalCaller,
                                     )
                                     .await
                                 {
@@ -6216,6 +6244,7 @@ async fn process_forward_request_with_mcp_runtime(
                                                         channel_id,
                                                         surface.config_id().map(str::to_string),
                                                         surface.issuer_id.clone(),
+                                                        crate::identity::filesystem::IdentityOrigin::Managed,
                                                     )
                                                     .await
                                                 {

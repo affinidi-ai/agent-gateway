@@ -4526,7 +4526,7 @@ async fn proxy_handler_with_mcp_runtime(
                     ));
                 };
                 match issuer
-                    .issue_or_get_credential(
+                    .issue_or_get_caller_credential(
                         identity_fields.clone(),
                         Some(identity_hash.clone()),
                         state
@@ -9520,7 +9520,8 @@ async fn fetch_agent_card(
 /// credential (cert / API key) or a configured static DID rather than the
 /// request body: `static`, `from_mtls` and `from_api_key`.
 /// `derive_credential_identity` returns `Bound` for `Static` and pre-bound
-/// certs, and `Derived` for `FromMtls` / `FromApiKey`.
+/// certs, and `Derived` for `FromMtls` / `FromApiKey`. A DID derived from the
+/// managed slot fallback is the surface's managed agent, so it is issued as managed.
 ///
 /// Returns `Ok(None)` for other modes and on public/discovery paths, where
 /// source auth, Trust Check and surface OPA are bypassed (mirroring the
@@ -9539,17 +9540,18 @@ async fn resolve_configured_caller_identity(
     if crate::proxy::paths::is_public_request(method, path) {
         return Ok(None);
     }
-    let Some(mi) = state
+    let (mi, from_managed_slot) = match state
         .surface
         .inbound_identity()
-        .cloned()
-        .or_else(|| {
-            state
-                .surface
-                .managed_identity()
-        })
-    else {
-        return Ok(None);
+    {
+        Some(inbound) => (inbound.clone(), false),
+        None => match state
+            .surface
+            .managed_identity()
+        {
+            Some(managed) => (managed, true),
+            None => return Ok(None),
+        },
     };
     if !matches!(
         mi,
@@ -9593,20 +9595,33 @@ async fn resolve_configured_caller_identity(
                 );
                 return Ok(None);
             };
-            let issued = issuer
-                .issue_or_get_credential(
-                    identity_fields.clone(),
-                    Some(identity_hash.clone()),
-                    state
-                        .surface
-                        .config_id()
-                        .map(String::from),
-                    state
-                        .surface
-                        .issuer_id
-                        .clone(),
-                )
-                .await;
+            let surface_id = state
+                .surface
+                .config_id()
+                .map(String::from);
+            let issuer_id = state
+                .surface
+                .issuer_id
+                .clone();
+            let issued = if from_managed_slot {
+                issuer
+                    .issue_or_get_managed_credential(
+                        identity_fields.clone(),
+                        Some(identity_hash.clone()),
+                        surface_id,
+                        issuer_id,
+                    )
+                    .await
+            } else {
+                issuer
+                    .issue_or_get_caller_credential(
+                        identity_fields.clone(),
+                        Some(identity_hash.clone()),
+                        surface_id,
+                        issuer_id,
+                    )
+                    .await
+            };
             let response = match issued {
                 Ok(response) => response,
                 Err(e) => {
@@ -9952,7 +9967,7 @@ async fn handle_fabric_request(
                     ));
                 };
                 match issuer
-                    .issue_or_get_credential(
+                    .issue_or_get_caller_credential(
                         identity_fields.clone(),
                         Some(identity_hash.clone()),
                         state

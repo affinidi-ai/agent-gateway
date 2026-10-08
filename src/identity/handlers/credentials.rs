@@ -1197,6 +1197,7 @@ mod tests {
                 channel_config_id: None,
                 is_local: true,
                 verified: true,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1265,6 +1266,7 @@ mod tests {
                 channel_config_id: None,
                 is_local: true,
                 verified: true,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1308,6 +1310,7 @@ mod tests {
                 channel_config_id: None,
                 is_local: true,
                 verified: true,
+                origin: None,
             })
             .await
             .unwrap();

@@ -41,12 +41,12 @@ Every new interactive element ships with a `data-testid`. Tests under `ui-tests/
 are the consumer; the convention is documented in
 [`ui-tests/README.md`](../../ui-tests/README.md).
 
-| Element | Pattern |
-| --- | --- |
-| Page root | `page-<area>` |
-| Action button | `<area>-<verb>-button` |
-| List item | `<area>-card-<id>` or `<area>-row-<id>` |
-| Wizard | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
+| Element       | Pattern                                                                              |
+| ------------- | ------------------------------------------------------------------------------------ |
+| Page root     | `page-<area>`                                                                        |
+| Action button | `<area>-<verb>-button`                                                               |
+| List item     | `<area>-card-<id>` or `<area>-row-<id>`                                              |
+| Wizard        | `wizard-<name>`, `wizard-step-<name>`, `wizard-next`, `wizard-back`, `wizard-submit` |
 
 ## Surface Builder
 
@@ -140,6 +140,44 @@ modern catalog could be registered. Render them with the shared `WriteWarnings` 
   Warnings**, and does not claim the proxy is ready to use.
 - The edit page shows the warnings from the latest save above the editor card, and clears
   them when the next save starts or another proxy opens.
+
+## Identities page
+
+`pages/IdentitiesPage.tsx` orchestrates. Its page-only parts live in
+`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: search,
+unnamed filter, and surface links in the `useIdentityRows` hook, and the row parts
+`IdentityNameCell` and `IdentityOriginBadge`.
+
+- Each DID gets its own row, keyed by the DID, with its own actions (Trust Score, Version History, Configure Policy, Copy link).
+  Managed identities that share a surface, such as parallel `from_jwt_claim` DIDs, are
+  separate rows linked to the same surface. `/identities/<did>` expands that exact
+  identity.
+- Expansion state is a `Set` of DIDs. Rows expand and collapse independently, and a deep link
+  adds to the set rather than replacing it.
+- The name cell shows the display name prominently, with the shortened DID in monospace
+  beside it and a copy button for the full DID. Without a name, the shortened DID and
+  copy button are the primary line, with no placeholder chip. While a caller name
+  lookup is pending (`display_name_pending`), a muted "resolving…" line sits above the
+  DID. A name conflict shows the DID as primary with a "name conflict" marker beside it.
+  A verified agent name renders as `local · host` with a verified marker, and a
+  caller's Agent Card name (`agent_card`) and a managed agent's target Agent Card name
+  (`target_agent_card`) are both marked unverified. A surface name shows no badge.
+- The unnamed filter and its count include only rows with no name and no pending lookup.
+- The **Origin** column holds the origin badge (Managed Agent or External Caller), or
+  LOCAL/REMOTE for records without an origin, plus a VERIFIED badge where it applies.
+- Managed rows show an origin badge, the live surface name linking to
+  `/surfaces/<surface_id>`, and the credential principal as a separate field.
+- When the backend sends none of the naming fields, the page renders as it did without
+  them: no name line, filter, or origin badge.
+
+| Element                                       | Test id                                                                                                                            |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Identity row                                  | `identities-row-<did>`                                                                                                             |
+| Name, pending, conflict, verified, unverified | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`, `identities-name-unverified` |
+| Copy DID                                      | `identities-copy-did-button`                                                                                                       |
+| Origin badge                                  | `identities-origin-<origin>`                                                                                                       |
+| Surface link, credential principal            | `identities-surface-link`, `identities-credential-principal`                                                                       |
+| Unnamed filter                                | `identities-unnamed-filter-button`                                                                                                 |
 
 ## Remote gateway Issuer DIDs
 

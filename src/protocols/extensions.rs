@@ -427,7 +427,13 @@ pub async fn inspect_message_extensions(
                         .map(|s| s.to_string());
                     let issuer_id = ctx.surface.issuer_id.clone();
                     match selector
-                        .compute_identity(&wrapped_identity, ctx.channel_name, config_id, issuer_id)
+                        .compute_identity(
+                            &wrapped_identity,
+                            ctx.channel_name,
+                            config_id,
+                            issuer_id,
+                            crate::identity::filesystem::IdentityOrigin::ExternalCaller,
+                        )
                         .await
                     {
                         Ok(result) => {
@@ -919,7 +925,13 @@ pub async fn inspect_message_extensions(
                         .map(|s| s.to_string());
                     let issuer_id = ctx.surface.issuer_id.clone();
                     match selector
-                        .compute_identity(extension_payload, ctx.channel_name, config_id, issuer_id)
+                        .compute_identity(
+                            extension_payload,
+                            ctx.channel_name,
+                            config_id,
+                            issuer_id,
+                            crate::identity::filesystem::IdentityOrigin::ExternalCaller,
+                        )
                         .await
                     {
                         Ok(result) => {
