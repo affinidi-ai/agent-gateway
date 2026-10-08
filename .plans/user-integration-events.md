@@ -13,7 +13,7 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 | 1 | Allow-listed user event state (no passkeys, SAML id or profile PII) | Done |
 | 2 | Server-side validation of user and identity trigger mappings; `/v1/integrations` fails closed without an RBAC guard | Done |
 | 3 | Dashboard: attach on select, no swallowed errors, event types required | Done |
-| 4 | Minimal Agent Watch `user` template | Not started |
+| 4 | Minimal Agent Watch `user` template | Done (gateway side; Agent Watch docs pending, see follow-ups) |
 | 5 | SAML: `user.created` and role-change `user.updated` | Not started |
 | 6 | SAML: keep the primary administrator's role (security fix) | Not started |
 | 7 | Fix `component_tests::mcp_record_compat` failing in the full suite | Not started |
@@ -125,6 +125,9 @@ First reproduce it reliably, then find what the parallel run shares with it (por
 state, environment), and fix the cause rather than retrying.
 
 ## Follow-ups (not on this branch)
+
+- Agent Watch (`docs/INTEGRATION_PAYLOADS.md`, `user` section): describe `state.old`/`state.new`
+  with the allow-listed fields, and offer the minimal template the gateway now suggests.
 
 - Agent Stream: same user triggers, selector and (if present) SAML provisioning.
 - Allow-list review of other triggers that serialise whole entities: identity first, then

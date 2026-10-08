@@ -296,7 +296,9 @@ The Audit Log header shows `audit-forward-button` beside Refresh for users with
   runtime-variable catalogue (`GET /integrations/runtime-variables`: the general
   variables plus the category's own), so a sample only uses variables that category can
   substitute. `audit` keeps its curated full-record JSON payload, and Email and Slack
-  leave out `AUDIT_RECORD` and `AUDIT_VP_JWT`.
+  leave out `AUDIT_RECORD` and `AUDIT_VP_JWT`. `user` has a curated minimal JSON payload
+  (`event_type`, `timestamp`, and the user's id, role and status) so names, emails and the
+  state blocks leave the appliance only when an operator adds them.
 - The Add wizard and Edit page apply it through `hooks/useIntegrationSamples.ts`. When the
   category changes, each type's content that is empty or still the previous category's
   sample (compared ignoring key order, since the gateway stores payloads with keys sorted)

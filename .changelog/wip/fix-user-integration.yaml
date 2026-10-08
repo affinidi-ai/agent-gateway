@@ -1,7 +1,10 @@
 branch: fix-user-integration
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-10-08T16:50:00.000Z'
+      title: Start new user Stream and Webhook integrations with a minimal payload
+      description: The suggested payload for a user integration now holds only the event type, timestamp and the user's id, role and status. Usernames, emails and the before and after state are left out unless an operator adds them.
   fixed:
     - timestamp: '2026-10-08T16:20:00.000Z'
       title: ⭐ Attach an integration to events as soon as it is selected

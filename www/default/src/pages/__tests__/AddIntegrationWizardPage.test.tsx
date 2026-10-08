@@ -90,8 +90,9 @@ const RUNTIME_VARIABLES = {
 
 const GENERAL_PAYLOAD = { event_type: '${EVENT_TYPE}', timestamp: '${TIMESTAMP}' };
 const USER_PAYLOAD = {
-  ...GENERAL_PAYLOAD,
-  user: { user_id: '${USER_ID}', username: '${USERNAME}' },
+  event_type: '${EVENT_TYPE}',
+  timestamp: '${TIMESTAMP}',
+  user: { user_id: '${USER_ID}', user_role: '${USER_ROLE}', user_status: '${USER_STATUS}' },
 };
 
 const AUDIT_TEMPLATE = {
