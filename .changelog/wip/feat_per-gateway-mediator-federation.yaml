@@ -1,0 +1,15 @@
+branch: feat/per-gateway-mediator-federation
+changes:
+  added:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Show when each secret was last updated
+      description: >-
+        The Secrets list now has an Updated column next to Created, showing the
+        secret's updated_at timestamp. That timestamp advances on both value and
+        metadata changes.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
+  internal: []
