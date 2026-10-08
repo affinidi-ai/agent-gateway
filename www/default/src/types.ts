@@ -92,6 +92,9 @@ export interface AccessTokenMeta {
   last_used_at?: string;
   expires_at?: string;
   revoked_at?: string;
+  rotation_generation?: number;
+  rotated_at?: string;
+  rotated_by?: string;
   active: boolean;
 }
 

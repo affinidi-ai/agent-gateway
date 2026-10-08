@@ -13,11 +13,51 @@ management-token contract: `agpat_` plus 32 random base64url bytes, `agat_`
 record IDs, SHA-256 hash-only persistence, O(1) active-hash lookup, optional
 immutable expiry, 60-second `last_used_at` write coalescing, immutable
 user/expiry, and idempotent DELETE revocation. Per-token mutation locks serialize
-update/revoke/usage writes so a stale usage write cannot undo revocation; revoked
+update/revoke/rotate/usage writes so a stale usage write cannot undo revocation; revoked
 hashes are removed from the authentication index. Create accepts only exact
 RFC 3339 `expires_at`, bounded to the future and at most 3650 days; omission means
 never, and the removed `expires_in_days` field is rejected so affected clients
 must calculate an exact timestamp and reissue their tokens.
+
+`POST /api/v1/access-tokens/{id}/rotate` (gated by `access_tokens.edit`) replaces the
+secret of an active token in place and returns the new `token` once, in the create
+response shape with status `200`. The record keeps its id, name, scopes, resource
+scope, expiry, `parent_token_id`, and `delegation_depth`, so descendants keep working;
+the old hash leaves the authentication index immediately and only the new hash is
+persisted. The record tracks `rotation_generation`, `rotated_at`, and `rotated_by`,
+and `last_used_at` resets. Rotation returns `409` for a revoked or expired token, a
+token whose lineage is no longer valid, or a concurrent rotation that lost the race.
+Rotating returns a working secret that authenticates as the token's owner. Any caller with
+`access_tokens.edit` (administrator by default) may rotate a token they own. Rotating a token
+owned by another user also requires the `Administrator` role, even when `rbac.json` grants
+`access_tokens.edit` to a lower role, and the new secret acts as that owner; otherwise the
+request is refused with `403`. A PAT caller can rotate only itself and its descendants, never
+with a resource-scoped PAT. Rotation is appliance-wide and is not limited by tenant.
+Responses that carry a secret are sent with `Cache-Control: no-store`.
+
+Each rotation is emitted as a structured log event on the `audit` tracing target
+(`access_token.rotated`, with the token id, owner, caller, auth method, and
+`rotated_for_other_user`, logged at `warn` when the caller is not the owner). A rotation
+refused by the handler is emitted as `access_token.rotate_denied` with the token id, caller,
+auth method, status, and reason, but not the owner: a request with no authenticated caller
+(`401`), a non-administrator rotating another user's token, a PAT caller rotating outside
+its lineage or with a resource-scoped PAT (`403`), an unknown token id (`404`), and a
+revoked, expired, inactive-lineage, or concurrently rotated token (`409`). A rotation that
+fails because the caller cannot be loaded or the token cannot be saved is also emitted as
+`access_token.rotate_denied` with status `500`; the error detail is logged only on the default
+target. Requests refused
+by the authentication or `access_tokens.edit` route checks before the handler runs emit no
+rotation event. These events are not stored in the delegation audit store or forwarded to
+Governance Audit integrations, so operators should ship the `audit` target off the appliance
+(see [`OBSERVABILITY.md`](OBSERVABILITY.md#access-token-rotation-events)). `rotated_by`,
+`rotated_at`, and `rotation_generation` are returned to anyone with `access_tokens.view`.
+
+Operator advice:
+
+- Keep `access_tokens.edit` administrator-only. A lower role granted it can rotate its own
+  tokens but not another user's.
+- On a suspected leak, revoke the parent token instead of rotating it. Revoke cascades to
+  descendants, while rotation does not touch them.
 
 ## Resource patterns and required headers
 
@@ -48,7 +88,7 @@ cascades to every transitive descendant under the same lock, so child creation
 cannot race an ancestor revoke. A PAT carrying a resource pattern or required
 headers cannot create or edit PATs; only appliance-wide/coarse feature-scoped
 PATs can delegate non-empty feature-scope subsets. PAT-authenticated
-list/get/update/revoke operations are confined to the caller token and its
+list/get/update/revoke/rotate operations are confined to the caller token and its
 descendants, while interactive administrators retain appliance-wide token
 administration. Records predating lineage remain backward-compatible roots.
 

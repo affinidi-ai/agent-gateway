@@ -44,6 +44,12 @@ pub struct AccessToken {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation_generation: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_by: Option<String>,
 }
 
 impl AccessToken {
@@ -81,6 +87,11 @@ pub struct AccessTokenMeta {
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub rotation_generation: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotated_by: Option<String>,
     pub active: bool,
 }
 
@@ -104,6 +115,9 @@ impl AccessTokenMeta {
             last_used_at: token.last_used_at,
             expires_at: token.expires_at,
             revoked_at: token.revoked_at,
+            rotation_generation: token.rotation_generation,
+            rotated_at: token.rotated_at,
+            rotated_by: token.rotated_by.clone(),
             active: token.is_active(now),
         }
     }
