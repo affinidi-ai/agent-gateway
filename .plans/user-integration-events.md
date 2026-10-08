@@ -16,6 +16,7 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 | 4 | Minimal Agent Watch `user` template | Not started |
 | 5 | SAML: `user.created` and role-change `user.updated` | Not started |
 | 6 | SAML: keep the primary administrator's role (security fix) | Not started |
+| 7 | Fix `component_tests::mcp_record_compat` failing in the full suite | Not started |
 
 Every phase is test-first: write the failing test, run it and see it fail for the expected
 reason, write the smallest code that passes, run it green, then refactor.
@@ -113,6 +114,16 @@ who must never be demoted.
 Tests first: a primary user whose IdP role maps to `user` stays Administrator and a warning
 is logged; a non-primary user's role still follows the IdP.
 
+## Phase 7: `mcp_record_compat` in the full suite
+
+Finding: `every_stored_surface_admits_modern_and_legacy_mcp` fails in the full
+`cargo test --bin agent-gateway` run (an `unwrap` on the second request at
+`src/component_tests/mcp_record_compat.rs:223`) and passes alone. It fails the same way on
+`1d30f35` and on latest `main`, so it predates this branch.
+
+First reproduce it reliably, then find what the parallel run shares with it (ports, global
+state, environment), and fix the cause rather than retrying.
+
 ## Follow-ups (not on this branch)
 
 - Agent Stream: same user triggers, selector and (if present) SAML provisioning.
@@ -120,5 +131,3 @@ is logged; a non-primary user's role still follows the IdP.
   gateway, connection point, mediator.
 - SAML sign-in writes the session token into `sessionStorage` from an inline script.
 - Identity events are never sent: `trigger_identity_integrations` is a stub.
-- `component_tests::mcp_record_compat` failed once on a connection error in the full parallel
-  run and passed alone; unrelated to this branch.
