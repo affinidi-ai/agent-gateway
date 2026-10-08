@@ -3,6 +3,7 @@ import { BrowserRouter as Router } from 'react-router-dom';
 
 import { AppButton } from './components/shared/AppButton';
 import LoginPage from './pages/LoginPage';
+import { ROUTES } from './routes';
 import {
   apiClient,
   sessionManager,
@@ -12,6 +13,7 @@ import {
 
 const AuthenticatedApp = lazy(() => import('./pages/AuthenticatedApp'));
 const TermsConsentPage = lazy(() => import('./pages/TermsConsentPage'));
+const CliConsentPage = lazy(() => import('./pages/CliConsentPage'));
 
 type AppAuthState =
   | 'loading'
@@ -153,7 +155,12 @@ const App: React.FC = () => {
   return (
     <Router>
       <Suspense fallback={<PageLoader />}>
-        {authState === 'authenticated' && <AuthenticatedApp onLogout={handleLogout} />}
+        {authState === 'authenticated' &&
+          (window.location.pathname === ROUTES.CLI_CONSENT ? (
+            <CliConsentPage />
+          ) : (
+            <AuthenticatedApp onLogout={handleLogout} />
+          ))}
         {authState === 'consent_pending' && (
           <TermsConsentPage onAccepted={checkAuth} onLogout={handleLogout} />
         )}

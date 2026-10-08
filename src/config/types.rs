@@ -1408,6 +1408,47 @@ pub struct StsRuntimeConfig {
     pub mcp_replay: crate::sts::replay::McpReplayConfig,
 }
 
+/// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login). Off unless enabled. The
+/// IP is resolved by [`crate::source_auth::client_ip`] from the proxies in [`ClientIpConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginThrottleConfig {
+    /// Master switch for the throttle. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Per-client-IP limit. A client over it waits until its window rolls off.
+    #[serde(default = "default_login_throttle_per_ip")]
+    pub per_ip: RateLimitConfig,
+}
+
+impl Default for LoginThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            per_ip: default_login_throttle_per_ip(),
+        }
+    }
+}
+
+/// Which proxies may report the caller's address for per-client-IP limits (the SAML and CLI
+/// login throttles). Separate from `tls.client_auth.trusted_proxies`, which only gates forwarded
+/// client certificates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientIpConfig {
+    /// Proxy CIDRs whose `X-Forwarded-For` is read, or RFC 7239 `Forwarded` when a request has no
+    /// `X-Forwarded-For`. Each listed proxy must append the address it saw to `X-Forwarded-For`
+    /// or overwrite it. Empty means the TCP peer is always the client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+}
+
+fn default_login_throttle_per_ip() -> RateLimitConfig {
+    RateLimitConfig {
+        requests: 20,
+        window_secs: 60,
+        burst: None,
+    }
+}
+
 /// Selects the replay-protection backend by name. The built-in backend is
 /// `in_process`; additional backends may be registered at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]

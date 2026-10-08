@@ -376,7 +376,74 @@ After onboarding, payload capture lets you watch the traffic at every stage. See
 ## Managing the gateway
 
 Everything is managed from a web dashboard, signed into with a passkey or, for enterprise
-deployments, SAML single sign-on.
+deployments, SAML single sign-on. A SAML sign-in must return from the identity provider within
+five minutes and is accepted once. The gateway holds at most 100,000 unfinished SAML sign-ins;
+past that, `/api/saml/login` answers 503 until older ones expire. An optional per-client-IP
+limit on `/api/saml/login` is off by default: set `login_throttle.enabled` to `true` in
+`saml.json` for 20 sign-ins per client IP per minute (the default `per_ip`), with 429 and
+`Retry-After` past that.
+
+The SAML login and CLI login limits count by client IP, taken from the TCP connection.
+`X-Forwarded-For` is only read when the connection comes from an address in
+`client_ip.trusted_proxies` (`gateway.json`), and then from the right, skipping trusted hops.
+Every listed proxy must append the address it saw to `X-Forwarded-For`, or overwrite the
+header. A proxy that passes the client's own `X-Forwarded-For` through unchanged (default
+nginx, or an ALB in `preserve` mode) lets each client choose the address it is counted under.
+RFC 7239 `Forwarded` is read only when a request has no `X-Forwarded-For`, so listed proxies
+must write `X-Forwarded-For`. A gateway behind a load balancer or reverse proxy must list it
+there before enabling a login limit; otherwise every user is counted as the balancer's address
+and shares one limit, and the gateway logs a warning at startup. This list is separate from
+`tls.client_auth.trusted_proxies`, which only gates forwarded client certificates.
+
+An IPv4 address counts on its own, and an IPv6 address counts by its /64 prefix, so one host
+cannot get a fresh limit by changing addresses inside its prefix.
+Each of these limits tracks up to 10,000 client IPs active within a window. While that many are
+active, a new client IP gets 429 with `Retry-After` until a slot frees up, IPs already tracked
+keep their normal limit, and the gateway logs one warning per window. Refusing new IPs is
+deliberate, because letting them through would switch the limit off for exactly the clients an
+attacker controls. The cost is that an attacker holding about 10,000 addresses (or one IPv6
+/48) can make new users wait up to one window for as long as it keeps the table full. A full
+table is rescanned for expired IPs at most once a second. The STS token endpoint throttle keeps
+its own address rule, see [`STS.md`](STS.md#token-endpoint-throttle).
+
+The `fabric` CLI signs in through the browser. It opens `/api/auth/cli/authorize` with a
+loopback port and a PKCE challenge. After the dashboard sign-in (passkey or SAML) the browser
+shows a confirmation page that names the signed-in user and the loopback port. Only when the
+user chooses Allow does the dashboard request a short-lived, single-use code and return it to
+`127.0.0.1`. Cancel issues no code and sends the browser to the CLI's callback with
+`error=access_denied`, so the CLI stops waiting. A user whose account is not approved yet gets
+the same, and the page asks them to have an administrator approve it. The CLI redeems the code
+with its PKCE verifier at `/api/auth/cli/exchange`, so the session token never appears in a
+URL. The loopback port must be 1024 or higher. RFC 8252 section 7.3 asks servers to allow any
+loopback port, but CLIs listen on ephemeral ports far above 1024, so the floor only blocks
+privileged ports. The challenge is a 43 character S256 value, and the verifier is 43 to 128
+characters as defined in RFC 7636. The consent page and its API must be served from the same
+origin: the consent request is accepted only when `Sec-Fetch-Site` is `same-origin`, or when
+`Origin` equals `Host` for clients that do not send it. The user must also be approved. After
+sign-in, the browser returns only to the dashboard root or the CLI authorize path. For SAML the
+gateway keeps that return target for five minutes and sends only a one-time 32 character key as
+`RelayState`, within the 80 byte limit of the HTTP-Redirect binding. The assertion consumer
+service uses the key once and checks the target again; an unknown, expired or reused key lands
+on the dashboard root. A session holds at most three pending codes, and a new request replaces
+the oldest. An optional per-client-IP limit is off by default: with `cli_login_throttle.enabled`
+set to `true` in `gateway.json`, the authorize, consent and exchange endpoints each allow 20
+requests per client IP per minute and answer 429 with `Retry-After` past that, before any code
+is issued or redeemed. Every exchange failure answers uncached
+JSON `{"error", "error_description"}`: `invalid_request` for a malformed request,
+`invalid_grant` for an unknown, expired, used or mismatched code without saying which, and
+`too_many_requests` when throttled. A code whose browser session has ended by the time of the
+exchange also gets `invalid_grant`. Each code is also random, single use, expires in two
+minutes and needs the PKCE verifier. The gateway logs each issued code, each redemption and
+each failed redemption with the user id and client IP where known, never with the code or
+verifier. The wire contract a CLI must follow is in
+[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#cli-browser-login).
+
+Known limitations: the login hands the CLI the browser's own session, so signing out in either
+place ends both: the browser signing out, or the CLI calling `/api/auth/logout`. The code store
+and the SAML return targets are in memory, so the login works with one gateway instance. With
+more than one replica, an exchange that reaches a different instance than the consent gets
+`invalid_grant`, and session stickiness does not help, because the CLI's exchange request
+carries no browser cookie.
 
 Surfaces are built on a canvas by dragging in elements. Adding a caller context element
 extracts the JWT claims a user presents to their agent from an identity provider such as

@@ -1,20 +1,23 @@
 use axum::{
     Extension, Form, Json,
-    extract::State,
-    http::StatusCode,
+    extract::{Query, State},
+    http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use super::service::SamlService;
+use super::service::{SamlService, TooManyPendingAuthnRequests};
 use super::user_provisioning::provision_user_from_saml;
+use crate::auth::cli_login::CLI_AUTHORIZE_PATH;
 use crate::auth::session::SessionManager;
 use crate::auth::session_finalizer::{
     AuthenticatedPrincipal, SessionFinalizationError, SessionFinalizer, SessionManagerFinalizer,
 };
 use crate::auth::storage::PasskeyStorage;
+use crate::source_auth::client_ip::ClientIp;
+use crate::sts::throttle::TokenEndpointThrottle;
 
 use crate::metrics::MetricsStore;
 
@@ -38,6 +41,9 @@ pub struct SamlState {
 
     /// Terms enforcement for human authentication.
     pub terms_manager: Arc<crate::terms::TermsManager>,
+
+    /// Per-client-IP limit on starting a sign-in, built from `saml.json` `login_throttle`.
+    pub login_throttle: Arc<TokenEndpointThrottle>,
 }
 
 /// SAML login request (POST form from Azure AD)
@@ -47,7 +53,6 @@ pub struct SamlLoginForm {
     pub saml_response: String,
 
     #[serde(rename = "RelayState")]
-    #[allow(dead_code)]
     pub relay_state: Option<String>,
 }
 
@@ -68,22 +73,95 @@ pub struct SamlUserInfo {
     pub role: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SamlLoginQuery {
+    pub next: Option<String>,
+}
+
+/// Only the dashboard root and the CLI authorize path (with its query) may be a return target.
+/// Anything else, including off-origin and protocol-relative targets, an encoded slash or
+/// backslash in the path, and characters that could break out of the ACS markup, is rejected.
+/// The query may carry an encoded slash or backslash, since the CLI `state` is opaque.
+pub(crate) fn is_allowed_return_target(target: &str) -> bool {
+    let path = target
+        .split_once('?')
+        .map_or(target, |(path, _)| path)
+        .to_ascii_lowercase();
+    if path.contains("%2f") || path.contains("%5c") {
+        return false;
+    }
+    let charset_ok = target.len() <= 1024
+        && target.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'-' | b'_' | b'.' | b'/' | b'?' | b'&' | b'=' | b'%' | b'~' | b':' | b'+')
+        });
+    if !charset_ok {
+        return false;
+    }
+    match target.split_once('?') {
+        None => target == "/",
+        Some((path, query)) => path == CLI_AUTHORIZE_PATH && !query.is_empty(),
+    }
+}
+
 /// Initiate SAML login (SP-initiated flow)
 /// GET /saml/login
-pub async fn saml_login(State(saml_state): State<Arc<SamlState>>) -> Result<Redirect, StatusCode> {
+///
+/// A client IP over its login limit gets 429 before any AuthnRequest is recorded. The IP is
+/// resolved from the connection by [`crate::source_auth::client_ip`], which trusts forwarded
+/// headers only from `client_auth.trusted_proxies`. When the cap on outstanding sign-ins is
+/// reached the answer is 503, since a request the gateway cannot record would be rejected at the
+/// ACS anyway. Both answers are readable pages.
+pub async fn saml_login(
+    State(saml_state): State<Arc<SamlState>>,
+    client_ip: Option<Extension<ClientIp>>,
+    Query(query): Query<SamlLoginQuery>,
+) -> Response {
     info!("Initiating SAML login");
 
-    // Create authentication request
-    let authn_request = saml_state
-        .saml_service
-        .create_authn_request()
-        .map_err(|e| {
-            error!("Failed to create SAML authn request: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    if let Some(retry_after) = saml_state
+        .login_throttle
+        .record_client_attempt(client_ip.map(|Extension(ClientIp(ip))| ip))
+    {
+        warn!("Throttling SAML login from a source over its limit");
+        return throttled_login_page(retry_after);
+    }
 
-    // Redirect to IdP
-    Ok(Redirect::to(&authn_request))
+    let return_target = query
+        .next
+        .as_deref()
+        .filter(|next| is_allowed_return_target(next));
+
+    match saml_state
+        .saml_service
+        .create_authn_request(return_target)
+    {
+        Ok(authn_request) => Redirect::to(&authn_request).into_response(),
+        Err(e) if e.is::<TooManyPendingAuthnRequests>() => {
+            warn!("Refusing SAML login: {}", e);
+            saml_error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Sign-in busy",
+                "Too many sign-ins are in progress. Please try again in a few minutes.",
+            )
+        }
+        Err(e) => {
+            error!("Failed to create SAML authn request: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn throttled_login_page(retry_after: u64) -> Response {
+    let mut response = saml_error_page(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many sign-in attempts",
+        &format!("Please try again in {retry_after} seconds."),
+    );
+    let headers = response.headers_mut();
+    headers.insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Render a self-contained HTML error page for a failed SAML sign-in, so the
@@ -113,6 +191,47 @@ fn saml_error_page(
         message = escape(message),
     );
     (status, Html(html)).into_response()
+}
+
+/// Where the ACS sends the signed-in browser: the target stored for the `RelayState` key, used
+/// once and checked against the return-target allowlist again, or the dashboard root.
+fn acs_return_target(
+    saml_service: &SamlService,
+    relay_state: Option<&str>,
+) -> String {
+    relay_state
+        .and_then(|key| saml_service.take_return_target(key))
+        .filter(|target| is_allowed_return_target(target))
+        .unwrap_or_else(|| "/".to_string())
+}
+
+fn acs_success_html(
+    redirect_target: &str,
+    session_token: &str,
+) -> String {
+    let redirect_target_js = serde_json::to_string(redirect_target).unwrap_or_else(|_| "\"/\"".to_string());
+    let redirect_target_attr = redirect_target
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+
+    format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Login Successful</title>
+    <meta http-equiv="refresh" content="0;url={redirect_target_attr}">
+    <script>
+        sessionStorage.setItem('session_token', '{session_token}');
+        window.location.href = {redirect_target_js};
+    </script>
+</head>
+<body>
+    <p>Login successful. Redirecting...</p>
+</body>
+</html>"#
+    )
 }
 
 /// Assertion Consumer Service - receives SAML response from Azure AD
@@ -207,24 +326,9 @@ pub async fn saml_acs(
 
     tracing::info!("Setting SAML session cookie");
 
-    // Return HTML with cookie and redirect
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Login Successful</title>
-    <meta http-equiv="refresh" content="0;url=/">
-    <script>
-        sessionStorage.setItem('session_token', '{}');
-        window.location.href = '/';
-    </script>
-</head>
-<body>
-    <p>Login successful. Redirecting...</p>
-</body>
-</html>"#,
-        finalized_session.session_token
-    );
+    let redirect_target = acs_return_target(&saml_state.saml_service, form.relay_state.as_deref());
+
+    let html = acs_success_html(&redirect_target, &finalized_session.session_token);
 
     Ok((finalized_session.headers, Html(html)).into_response())
 }
@@ -362,4 +466,510 @@ pub async fn saml_logout_generic(
     response_headers.insert(axum::http::header::SET_COOKIE, session_cookie);
 
     (response_headers, StatusCode::OK).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::auth_config::{SamlAttributeMapping, SamlConfig};
+    use crate::config::types::LoginThrottleConfig;
+    use axum::http::header::LOCATION;
+    use std::collections::HashMap;
+
+    const CLI_TARGET: &str = "/api/auth/cli/authorize?port=52111&state=st&challenge=ch";
+
+    #[test]
+    fn return_target_accepts_the_dashboard_root_and_cli_authorize() {
+        assert!(is_allowed_return_target("/"));
+        assert!(is_allowed_return_target(CLI_TARGET));
+        assert!(is_allowed_return_target("/api/auth/cli/authorize?port=52111&state=a%20b&challenge=ch"));
+    }
+
+    #[test]
+    fn return_target_rejects_paths_outside_the_allow_list() {
+        assert!(!is_allowed_return_target("/settings"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize/extra?port=1"));
+        assert!(!is_allowed_return_target("/?port=52111"));
+        assert!(!is_allowed_return_target("/api/v1/secrets?x=1"));
+    }
+
+    #[test]
+    fn return_target_rejects_off_origin_targets() {
+        assert!(!is_allowed_return_target("//evil.example"));
+        assert!(!is_allowed_return_target("https://evil.example"));
+        assert!(!is_allowed_return_target("/\\evil.example"));
+        assert!(!is_allowed_return_target("/%2fevil.example"));
+        assert!(!is_allowed_return_target("/%5Cevil.example"));
+        assert!(!is_allowed_return_target("evil.example"));
+    }
+
+    #[test]
+    fn return_target_accepts_an_encoded_slash_or_backslash_in_the_cli_state() {
+        let target = format!("/api/auth/cli/authorize?port=52111&state={}&challenge=ch", urlencoding::encode("a/b\\c"));
+        assert_eq!(target, "/api/auth/cli/authorize?port=52111&state=a%2Fb%5Cc&challenge=ch");
+
+        assert!(is_allowed_return_target(&target));
+    }
+
+    #[test]
+    fn return_target_rejects_traversal_in_the_path_even_with_a_query() {
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize%2f?port=1"));
+        assert!(!is_allowed_return_target("/api/auth/cli%2Fauthorize?port=1"));
+        assert!(!is_allowed_return_target("/api/auth/cli%5cauthorize?port=1"));
+        assert!(!is_allowed_return_target("/api/auth/cli\\authorize?port=1"));
+        assert!(!is_allowed_return_target("/api/auth/../auth/cli/authorize?port=1"));
+        assert!(!is_allowed_return_target("/api/auth/%2e%2e/cli/authorize?port=1"));
+        assert!(!is_allowed_return_target("//api/auth/cli/authorize?port=1"));
+        assert!(!is_allowed_return_target("/%2f/api/auth/cli/authorize?port=1"));
+    }
+
+    #[test]
+    fn return_target_rejects_markup_and_control_characters() {
+        assert!(!is_allowed_return_target("/a\"</script><script>alert(1)"));
+        assert!(!is_allowed_return_target("/a'b"));
+        assert!(!is_allowed_return_target("/a b"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1<"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1>"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1\n"));
+        assert!(!is_allowed_return_target("/api/auth/cli/authorize?port=1\u{7f}"));
+    }
+
+    #[test]
+    fn acs_html_redirects_to_the_target_in_markup_and_script() {
+        let html = acs_success_html(CLI_TARGET, "tok-1");
+
+        assert!(html.contains("content=\"0;url=/api/auth/cli/authorize?port=52111&amp;state=st&amp;challenge=ch\""));
+        assert!(html.contains("window.location.href = \"/api/auth/cli/authorize?port=52111&state=st&challenge=ch\";"));
+        assert!(html.contains("sessionStorage.setItem('session_token', 'tok-1');"));
+    }
+
+    #[test]
+    fn acs_html_escapes_a_hostile_target_in_the_meta_refresh() {
+        let html = acs_success_html("/a\"><script>x</script>", "tok-1");
+
+        assert!(html.contains("content=\"0;url=/a&quot;&gt;&lt;script&gt;x&lt;/script&gt;\""));
+    }
+
+    async fn saml_state(dir: &std::path::Path) -> Arc<SamlState> {
+        saml_state_with_throttle(dir, LoginThrottleConfig::default()).await
+    }
+
+    async fn saml_state_with_throttle(
+        dir: &std::path::Path,
+        login_throttle: LoginThrottleConfig,
+    ) -> Arc<SamlState> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::default()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.join("idp.crt");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        let config = SamlConfig {
+            idp_entity_id: "test-idp".to_string(),
+            idp_sso_url: "https://idp.example.test/sso".to_string(),
+            idp_slo_url: None,
+            sp_entity_id: "test-sp".to_string(),
+            sp_acs_url: "https://sp.example.test/saml/acs".to_string(),
+            idp_cert_path: cert_path
+                .to_string_lossy()
+                .to_string(),
+            attribute_mapping: SamlAttributeMapping::default(),
+            role_mapping: HashMap::new(),
+            require_encrypted_assertions: false,
+            sign_requests: false,
+            sp_key_path: None,
+            sp_cert_path: None,
+            graph_api: None,
+            login_throttle: Default::default(),
+        };
+        let avatars = dir
+            .join("avatars")
+            .to_string_lossy()
+            .to_string();
+        Arc::new(SamlState {
+            saml_service: Arc::new(SamlService::new(config).unwrap()),
+            storage: Arc::new(
+                PasskeyStorage::new(
+                    dir.join("passkeys")
+                        .to_string_lossy()
+                        .to_string(),
+                    avatars.clone(),
+                )
+                .await
+                .unwrap(),
+            ),
+            session_manager: Arc::new(SessionManager::new()),
+            avatars_storage_path: avatars,
+            notification_store: Arc::new(tokio::sync::RwLock::new(None)),
+            terms_manager: Arc::new(crate::terms::TermsManager::disabled()),
+            login_throttle: Arc::new(TokenEndpointThrottle::per_client_ip(&login_throttle)),
+        })
+    }
+
+    const TRUSTED_PROXY_CIDR: &str = "10.0.0.0/8";
+
+    /// Sends a login through the client IP layer, from a TCP connection at `peer` when given.
+    async fn login_request(
+        state: &Arc<SamlState>,
+        peer: Option<&str>,
+        forwarded_for: Option<&str>,
+    ) -> Response {
+        use tower::ServiceExt;
+
+        let router = axum::Router::new()
+            .route("/saml/login", axum::routing::get(saml_login))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(crate::config::types::ClientIpConfig {
+                    trusted_proxies: vec![
+                        TRUSTED_PROXY_CIDR
+                            .parse()
+                            .unwrap(),
+                    ],
+                }),
+                crate::source_auth::client_ip::resolve_client_ip_layer,
+            ));
+        let mut request = axum::http::Request::builder().uri("/saml/login");
+        if let Some(value) = forwarded_for {
+            request = request.header("x-forwarded-for", value);
+        }
+        let mut request = request
+            .body(axum::body::Body::empty())
+            .unwrap();
+        if let Some(peer) = peer {
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                    format!("{peer}:40000")
+                        .parse()
+                        .unwrap(),
+                ));
+        }
+        router
+            .oneshot(request)
+            .await
+            .unwrap()
+    }
+
+    async fn login_from(
+        state: &Arc<SamlState>,
+        peer: Option<&str>,
+    ) -> Response {
+        login_request(state, peer, None).await
+    }
+
+    async fn login_location(
+        state: Arc<SamlState>,
+        next: Option<&str>,
+    ) -> String {
+        saml_login(State(state), None, Query(SamlLoginQuery { next: next.map(str::to_string) }))
+            .await
+            .headers()
+            .get(LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn relay_state_key(location: &str) -> &str {
+        location
+            .split_once("&RelayState=")
+            .map(|(_, key)| key)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn saml_login_sends_a_short_relay_state_key_that_returns_the_target_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+
+        let location = login_location(state.clone(), Some(CLI_TARGET)).await;
+
+        assert!(location.starts_with("https://idp.example.test/sso?SAMLRequest="));
+        let key = relay_state_key(&location);
+        assert!(key.len() <= super::super::relay_state::MAX_RELAY_STATE_BYTES, "{key}");
+        assert!(!location.contains(&*urlencoding::encode(CLI_TARGET)));
+        let service = &state.saml_service;
+        assert_eq!(
+            service
+                .take_return_target(key)
+                .as_deref(),
+            Some(CLI_TARGET)
+        );
+        assert!(
+            service
+                .take_return_target(key)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn saml_login_keeps_a_cli_target_whose_state_has_an_encoded_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+        let target = "/api/auth/cli/authorize?port=52111&state=a%2Fb%5Cc&challenge=ch";
+
+        let location = login_location(state.clone(), Some(target)).await;
+
+        assert_eq!(
+            state
+                .saml_service
+                .take_return_target(relay_state_key(&location))
+                .as_deref(),
+            Some(target)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_relay_state_returns_no_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+
+        for relay_state in ["0123456789abcdef0123456789abcdef", CLI_TARGET, ""] {
+            assert!(
+                state
+                    .saml_service
+                    .take_return_target(relay_state)
+                    .is_none(),
+                "{relay_state}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saml_login_answers_503_when_too_many_sign_ins_are_outstanding() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+        let pending = state
+            .saml_service
+            .pending_requests();
+        for index in 0..super::super::pending_requests::MAX_PENDING_AUTHN_REQUESTS {
+            assert!(pending.register(format!("req-{index}"), chrono::Utc::now()));
+        }
+
+        let response = login_from(&state, None).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(LOCATION)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn saml_login_drops_a_target_outside_the_allow_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+
+        for next in ["//evil.example", "/settings", "https://evil.example"] {
+            let location = login_location(state.clone(), Some(next)).await;
+            assert!(!location.contains("RelayState"), "{next}");
+        }
+        let location = login_location(state, None).await;
+        assert!(!location.contains("RelayState"));
+    }
+    fn throttle_of(
+        enabled: bool,
+        requests: u32,
+    ) -> LoginThrottleConfig {
+        LoginThrottleConfig {
+            enabled,
+            per_ip: crate::config::types::RateLimitConfig {
+                requests,
+                window_secs: 60,
+                burst: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn saml_login_lets_a_source_under_its_limit_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(true, 2)).await;
+
+        for _ in 0..2 {
+            assert!(
+                login_from(&state, Some("203.0.113.7"))
+                    .await
+                    .status()
+                    .is_redirection()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saml_login_answers_429_with_retry_after_for_a_source_over_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(true, 1)).await;
+        login_from(&state, Some("203.0.113.7")).await;
+
+        let response = login_from(&state, Some("203.0.113.7")).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after), "{retry_after}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        assert!(
+            response
+                .headers()
+                .get(LOCATION)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn saml_login_counts_each_source_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(true, 1)).await;
+        login_from(&state, Some("203.0.113.7")).await;
+        login_from(&state, Some("203.0.113.7")).await;
+
+        let response = login_from(&state, Some("198.51.100.4")).await;
+
+        assert!(
+            response
+                .status()
+                .is_redirection()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throttled_saml_login_records_no_authn_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(true, 1)).await;
+        login_from(&state, Some("203.0.113.7")).await;
+        for _ in 0..5 {
+            assert_eq!(
+                login_from(&state, Some("203.0.113.7"))
+                    .await
+                    .status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+
+        assert_eq!(
+            state
+                .saml_service
+                .pending_requests()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn saml_login_skips_the_source_limit_when_the_throttle_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(false, 1)).await;
+
+        for _ in 0..5 {
+            assert!(
+                login_from(&state, Some("203.0.113.7"))
+                    .await
+                    .status()
+                    .is_redirection()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn a_spoofed_x_forwarded_for_cannot_lock_a_victim_out_of_saml_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(true, 1)).await;
+        login_request(&state, Some("203.0.113.7"), Some("192.0.2.10")).await;
+
+        let attacker = login_request(&state, Some("203.0.113.7"), Some("192.0.2.10")).await;
+        let victim = login_from(&state, Some("192.0.2.10")).await;
+
+        assert_eq!(attacker.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            victim
+                .status()
+                .is_redirection()
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_fake_x_forwarded_for_values_cannot_fill_the_saml_sign_in_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let enabled = LoginThrottleConfig {
+            enabled: true,
+            ..LoginThrottleConfig::default()
+        };
+        let limit = enabled.per_ip.requests;
+        let state = saml_state_with_throttle(dir.path(), enabled).await;
+        for index in 0..limit {
+            login_request(&state, Some("203.0.113.7"), Some(&format!("192.0.2.{index}"))).await;
+        }
+
+        let response = login_request(&state, Some("203.0.113.7"), Some("192.0.2.250")).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn saml_login_limits_the_client_behind_a_trusted_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state_with_throttle(dir.path(), throttle_of(true, 1)).await;
+        login_request(&state, Some("10.0.0.5"), Some("203.0.113.7")).await;
+
+        let same_client = login_request(&state, Some("10.0.0.5"), Some("192.0.2.10, 203.0.113.7")).await;
+        let other_client = login_request(&state, Some("10.0.0.5"), Some("198.51.100.4")).await;
+
+        assert_eq!(same_client.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            other_client
+                .status()
+                .is_redirection()
+        );
+    }
+    #[tokio::test]
+    async fn the_acs_returns_to_the_target_stored_for_a_known_key_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+        let location = login_location(state.clone(), Some(CLI_TARGET)).await;
+        let key = relay_state_key(&location);
+
+        assert_eq!(acs_return_target(&state.saml_service, Some(key)), CLI_TARGET);
+        assert_eq!(acs_return_target(&state.saml_service, Some(key)), "/");
+    }
+
+    #[tokio::test]
+    async fn the_acs_returns_to_the_root_for_an_unknown_or_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+
+        assert_eq!(acs_return_target(&state.saml_service, Some("0123456789abcdef0123456789abcdef")), "/");
+        assert_eq!(acs_return_target(&state.saml_service, Some(CLI_TARGET)), "/");
+        assert_eq!(acs_return_target(&state.saml_service, None), "/");
+    }
+
+    #[tokio::test]
+    async fn the_acs_rechecks_a_stored_target_against_the_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+        let key = state
+            .saml_service
+            .return_targets()
+            .insert("//evil.example/steal", chrono::Utc::now())
+            .unwrap();
+
+        assert_eq!(acs_return_target(&state.saml_service, Some(&key)), "/");
+    }
 }

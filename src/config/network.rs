@@ -64,6 +64,14 @@ pub struct NetworkConfig {
     /// STS (`/oauth2/token`) runtime controls (replay-protection backend, throttle).
     #[serde(default)]
     pub sts: crate::config::types::StsRuntimeConfig,
+
+    /// Per-client-IP limit on each `fabric` CLI login endpoint.
+    #[serde(default)]
+    pub cli_login_throttle: crate::config::types::LoginThrottleConfig,
+
+    /// Proxies trusted to report the caller's address for per-client-IP limits.
+    #[serde(default)]
+    pub client_ip: crate::config::types::ClientIpConfig,
 }
 
 /// DID configuration
@@ -505,6 +513,48 @@ mod url_mapping_tests {
             "routes": {},
         });
         serde_json::from_value(cfg).expect("test network config should deserialize")
+    }
+
+    #[test]
+    fn the_cli_login_throttle_is_off_and_no_client_ip_proxy_is_trusted_by_default() {
+        let cfg = cfg_with_listeners(serde_json::json!([]));
+
+        assert!(!cfg.cli_login_throttle.enabled);
+        assert_eq!(
+            cfg.cli_login_throttle
+                .per_ip
+                .requests,
+            20
+        );
+        assert!(
+            cfg.client_ip
+                .trusted_proxies
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn client_ip_trusted_proxies_deserialize_from_gateway_json() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+            "client_ip": { "trusted_proxies": ["10.0.0.0/8"] },
+            "cli_login_throttle": { "enabled": true },
+        }))
+        .expect("network config with client_ip should deserialize");
+
+        assert_eq!(
+            cfg.client_ip.trusted_proxies,
+            vec![
+                "10.0.0.0/8"
+                    .parse::<ipnet::IpNet>()
+                    .unwrap()
+            ]
+        );
+        assert!(cfg.cli_login_throttle.enabled);
     }
 
     #[test]

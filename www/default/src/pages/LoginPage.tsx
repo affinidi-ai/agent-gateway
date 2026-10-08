@@ -9,6 +9,7 @@ import {
 import styles from './LoginPage.module.css';
 import { apiClient, sessionManager } from '../api';
 import { ROUTES } from '../routes';
+import { loginNextTarget } from '../utils/loginNextTarget';
 import { RegistrationTerms } from './RegistrationTerms';
 import { useRegistrationTerms } from './useRegistrationTerms';
 
@@ -187,12 +188,20 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
 
     if (authMode === 'saml') {
       await new Promise(resolve => setTimeout(resolve, 100));
-      window.location.href = '/api/saml/login';
+      const next = loginNextTarget(window.location);
+      window.location.href = next
+        ? `/api/saml/login?next=${encodeURIComponent(next)}`
+        : '/api/saml/login';
       return;
     }
 
     try {
       await authenticateWithPasskey(username);
+      const next = loginNextTarget(window.location);
+      if (next) {
+        window.location.href = next;
+        return;
+      }
       onLogin();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');

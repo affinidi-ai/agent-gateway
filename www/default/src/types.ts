@@ -912,3 +912,9 @@ export interface Authority {
   created_at: string;
   updated_at: string;
 }
+
+export interface CliLoginRequest {
+  port: number;
+  state: string;
+  challenge: string;
+}

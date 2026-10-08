@@ -476,7 +476,7 @@ pub async fn extract_user_id(
 /// Returns true when the user record exists and has `UserStatus::Approved`.
 /// Any other state (New, Disabled, missing, or storage error) is treated
 /// as not approved — the safer choice for an auth gate.
-async fn user_is_approved(
+pub(crate) async fn user_is_approved(
     storage: &PasskeyStorage,
     user_id: &str,
 ) -> bool {
@@ -766,6 +766,9 @@ mod tests {
             .route("/auth/login/start", get(ok_handler))
             .route("/auth/check", get(ok_handler))
             .route("/auth/logout", get(ok_handler))
+            .route("/auth/cli/authorize", get(ok_handler))
+            .route("/auth/cli/consent", get(ok_handler))
+            .route("/auth/cli/exchange", get(ok_handler))
             .route("/saml/login", get(ok_handler))
             .route("/saml/acs", get(ok_handler))
             .route("/saml/metadata", get(ok_handler))
@@ -1092,6 +1095,9 @@ mod tests {
             "/auth/login/start",
             "/auth/check",
             "/auth/logout",
+            "/auth/cli/authorize",
+            "/auth/cli/consent",
+            "/auth/cli/exchange",
             "/saml/login",
             "/saml/acs",
             "/saml/metadata",

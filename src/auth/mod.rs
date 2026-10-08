@@ -4,6 +4,7 @@
 // for the management dashboard login.
 
 pub mod auth_config;
+pub mod cli_login;
 pub mod handlers;
 pub mod mode_handler;
 pub mod saml;

@@ -307,6 +307,7 @@ mod tests {
             sp_key_path: None,
             sp_cert_path: None,
             graph_api: None,
+            login_throttle: Default::default(),
         }
     }
 

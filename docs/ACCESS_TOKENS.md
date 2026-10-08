@@ -214,3 +214,25 @@ interface:
 - The resource-pattern editor enforces the same canonical grammar described under
   [Resource patterns and required headers](#resource-patterns-and-required-headers). A
   pattern the editor refuses is one the API would also refuse.
+
+### CLI browser login
+
+The `fabric` CLI does not use a management token. It signs in through the dashboard:
+`/api/auth/cli/authorize` sends the browser through the normal passkey or SAML sign-in to a
+consent page, `/api/auth/cli/consent` issues a single-use code once the signed-in, approved
+user allows it, and the CLI redeems that code with its PKCE verifier at
+`/api/auth/cli/exchange`. What the CLI receives is the browser's own dashboard session. It
+carries the user's full role and cannot be revoked on its own, and signing out on either side
+ends both: the browser signing out, or the CLI calling `/api/auth/logout`. Pending codes live
+in memory for two minutes, so CLI login works with one gateway instance. With more than one
+replica, an exchange that reaches a different instance than the consent gets `invalid_grant`;
+session stickiness does not help, because the exchange request carries no browser cookie.
+Limits and the full flow are in [`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway).
+
+The `fabric` CLI lives in its own repository, so this is the contract it must follow:
+
+| Step | Request | Response |
+| --- | --- | --- |
+| Authorize (browser opened by the CLI) | `GET /api/auth/cli/authorize?port=&state=&challenge=`. `port` is 1024 to 65535, `state` is 1 to 256 bytes and returned unchanged, `challenge` is the 43 character base64url S256 hash of the verifier. Only S256 is supported, so there is no method parameter, and the names are not OAuth's `code_challenge`. | A redirect to sign-in, then to the consent page. |
+| Callback (browser to the CLI) | `GET http://127.0.0.1:<port>/callback?code=&state=` after Allow, with a 36 character `code`. `GET http://127.0.0.1:<port>/callback?error=access_denied&error_description=&state=` after Cancel or for an account that is not approved. | Whatever page the CLI serves. |
+| Exchange (CLI) | `POST /api/auth/cli/exchange` with `Content-Type: application/json` and `{"code", "verifier"}`, the verifier being 43 to 128 RFC 7636 characters. | `200` `{"session_token"}`, with no expiry field. On failure `{"error", "error_description"}`: `invalid_request` (`400`, or `415` for a body that is not JSON), `invalid_grant` (`400`), or `too_many_requests` (`429` with `Retry-After`). Every answer carries `Cache-Control: no-store`. |
