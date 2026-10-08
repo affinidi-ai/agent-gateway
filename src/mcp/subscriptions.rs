@@ -10,27 +10,83 @@ const MAX_RESOURCE_URI_BYTES: usize = 4096;
 const ACCESS_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const ACCESS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-fn access_changes() -> &'static tokio::sync::watch::Sender<()> {
-    static CHANGES: std::sync::OnceLock<tokio::sync::watch::Sender<()>> = std::sync::OnceLock::new();
-    CHANGES.get_or_init(|| tokio::sync::watch::channel(()).0)
+/// Access changes a subscription can fall behind on before it ends anyway.
+const ACCESS_CHANGE_BACKLOG: usize = 1024;
+
+/// The subscriptions an access change can affect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessScope {
+    /// Subscriptions on one surface, by surface ID.
+    Surface(String),
+    /// Subscriptions on every surface and proxy one tenant owns.
+    Tenant(String),
+    /// Every subscription.
+    Appliance,
 }
 
-pub fn invalidate_access() {
-    access_changes().send_replace(());
+impl AccessScope {
+    /// The scope of a change to a resource owned by `tenant_id`. An
+    /// appliance-global resource can be referenced from every tenant.
+    pub fn owned_by(tenant_id: Option<&str>) -> Self {
+        tenant_id.map_or(Self::Appliance, |tenant| Self::Tenant(tenant.to_string()))
+    }
+
+    /// The scope of a change that moves a resource from `previous` to
+    /// `current` ownership.
+    pub fn reowned(
+        previous: Option<&str>,
+        current: Option<&str>,
+    ) -> Self {
+        if previous == current {
+            Self::owned_by(current)
+        } else {
+            Self::Appliance
+        }
+    }
+
+    /// Whether a subscription owned by `owner` ends on this change. A
+    /// subscription that has not recorded its owner ends on every change.
+    fn covers(
+        &self,
+        owner: Option<&SubscriptionOwner>,
+    ) -> bool {
+        match (self, owner) {
+            (Self::Appliance, _) | (_, None) => true,
+            (Self::Surface(surface), Some(owner)) => owner.surface == *surface,
+            (Self::Tenant(tenant), Some(owner)) => owner.tenant.as_deref() == Some(tenant.as_str()),
+        }
+    }
 }
 
-pub struct AccessChange;
+/// The surface (or gateway-owned proxy) and tenant a subscription runs on.
+struct SubscriptionOwner {
+    surface: String,
+    tenant: Option<String>,
+}
+
+fn access_changes() -> &'static tokio::sync::broadcast::Sender<AccessScope> {
+    static CHANGES: std::sync::OnceLock<tokio::sync::broadcast::Sender<AccessScope>> = std::sync::OnceLock::new();
+    CHANGES.get_or_init(|| tokio::sync::broadcast::channel(ACCESS_CHANGE_BACKLOG).0)
+}
+
+/// Ends the open subscriptions `scope` covers.
+pub fn invalidate_access(scope: AccessScope) {
+    let _ = access_changes().send(scope);
+}
+
+/// Signals an access change when it starts and again when it finishes.
+pub struct AccessChange(AccessScope);
 
 impl AccessChange {
-    pub fn begin() -> Self {
-        invalidate_access();
-        Self
+    pub fn begin(scope: AccessScope) -> Self {
+        invalidate_access(scope.clone());
+        Self(scope)
     }
 }
 
 impl Drop for AccessChange {
     fn drop(&mut self) {
-        invalidate_access();
+        invalidate_access(std::mem::replace(&mut self.0, AccessScope::Appliance));
     }
 }
 
@@ -151,7 +207,8 @@ pub fn listen_limit_error(request: &ValidatedModernMessage) -> McpRequestValidat
 }
 
 pub struct SubscriptionLifetime {
-    changes: tokio::sync::watch::Receiver<()>,
+    changes: tokio::sync::broadcast::Receiver<AccessScope>,
+    owner: Option<SubscriptionOwner>,
     deadline: tokio::time::Instant,
     vault_access: Option<VaultAccess>,
     /// Released when the subscription's response ends or is dropped.
@@ -190,12 +247,50 @@ impl SubscriptionLifetime {
     ) -> Self {
         let mut guard = Self {
             changes: access_changes().subscribe(),
+            owner: None,
             deadline: tokio::time::Instant::now() + lifetime,
             vault_access: None,
             slot: None,
         };
         guard.restrict_to_identity(identity);
         guard
+    }
+
+    /// Records the surface and tenant the subscription runs on, so it ends
+    /// only on changes in their scope, including changes made since it was
+    /// created.
+    pub fn record_owner(
+        &mut self,
+        surface: impl Into<String>,
+        tenant: Option<&str>,
+    ) {
+        self.owner = Some(SubscriptionOwner {
+            surface: surface.into(),
+            tenant: tenant.map(str::to_string),
+        });
+    }
+
+    /// Records the gateway-owned MCP proxy the subscription runs on. Proxy
+    /// subscriptions end on changes to the proxy's tenant, never on a
+    /// surface change.
+    pub fn record_proxy_owner(
+        &mut self,
+        proxy: &crate::mcp_proxies::types::McpProxy,
+    ) {
+        self.record_owner(format!("mcp_proxy:{}", proxy.id), proxy.tenant_id.as_deref());
+    }
+
+    /// Whether an access change in scope arrived since the last check. A
+    /// subscription that fell more than [`ACCESS_CHANGE_BACKLOG`] changes
+    /// behind ends.
+    fn pending_change(&mut self) -> bool {
+        loop {
+            match self.changes.try_recv() {
+                Ok(scope) if !scope.covers(self.owner.as_ref()) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return false,
+                Ok(_) | Err(_) => return true,
+            }
+        }
     }
 
     /// Holds `slot` for as long as the subscription's response lives.
@@ -269,12 +364,7 @@ impl SubscriptionLifetime {
             (body.into_data_stream(), self),
             |(mut source, mut lifetime)| async move {
                 loop {
-                    if lifetime
-                        .changes
-                        .has_changed()
-                        .unwrap_or(true)
-                        || tokio::time::Instant::now() >= lifetime.deadline
-                    {
+                    if lifetime.pending_change() || tokio::time::Instant::now() >= lifetime.deadline {
                         return Err(std::io::Error::other("MCP subscription access must be revalidated"));
                     }
                     let next_check = lifetime
@@ -283,13 +373,13 @@ impl SubscriptionLifetime {
                         .map_or(lifetime.deadline, |access| access.next_check);
                     let next = tokio::select! {
                         biased;
-                        _ = lifetime.changes.changed() => return Err(std::io::Error::other("MCP subscription access changed")),
+                        _ = change_in_scope(&mut lifetime.changes, lifetime.owner.as_ref()) => return Err(std::io::Error::other("MCP subscription access changed")),
                         _ = tokio::time::sleep_until(lifetime.deadline) => return Err(std::io::Error::other("MCP subscription authorization expired")),
                         _ = tokio::time::sleep_until(next_check), if lifetime.vault_access.is_some() => {
                             if let Some(access) = lifetime.vault_access.as_mut() {
                                 tokio::select! {
                                     biased;
-                                    _ = lifetime.changes.changed() => return Err(std::io::Error::other("MCP subscription access changed")),
+                                    _ = change_in_scope(&mut lifetime.changes, lifetime.owner.as_ref()) => return Err(std::io::Error::other("MCP subscription access changed")),
                                     _ = tokio::time::sleep_until(lifetime.deadline) => return Err(std::io::Error::other("MCP subscription authorization expired")),
                                     result = access.revalidate() => result?,
                                 }
@@ -307,6 +397,19 @@ impl SubscriptionLifetime {
             },
         );
         axum::response::Response::from_parts(parts, axum::body::Body::from_stream(body))
+    }
+}
+
+/// Waits for an access change that `owner`'s subscription must end on.
+async fn change_in_scope(
+    changes: &mut tokio::sync::broadcast::Receiver<AccessScope>,
+    owner: Option<&SubscriptionOwner>,
+) {
+    loop {
+        match changes.recv().await {
+            Ok(scope) if !scope.covers(owner) => {}
+            _ => return,
+        }
     }
 }
 
@@ -982,7 +1085,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let (changes, receiver) = tokio::sync::watch::channel(());
+        let (changes, receiver) = tokio::sync::broadcast::channel::<AccessScope>(16);
         let mut lifetime = SubscriptionLifetime::new(Duration::from_secs(60), None);
         lifetime.changes = receiver;
         lifetime
@@ -1058,7 +1161,7 @@ mod tests {
         assert!(sender.is_closed());
         assert_eq!(changes.receiver_count(), 0);
 
-        let (changes, receiver) = tokio::sync::watch::channel(());
+        let (changes, receiver) = tokio::sync::broadcast::channel::<AccessScope>(16);
         let mut lifetime = SubscriptionLifetime::new(Duration::from_secs(60), None);
         lifetime.changes = receiver;
         lifetime
@@ -1191,9 +1294,10 @@ mod tests {
     async fn subscription_lifetime_drops_quiet_upstream_on_access_change_or_expiry() {
         use http_body_util::BodyExt;
         for expire in [false, true] {
-            let (changes, receiver) = tokio::sync::watch::channel(());
+            let (changes, receiver) = tokio::sync::broadcast::channel::<AccessScope>(16);
             let lifetime = SubscriptionLifetime {
                 changes: receiver,
+                owner: None,
                 vault_access: None,
                 slot: None,
                 deadline: tokio::time::Instant::now()
@@ -1219,11 +1323,101 @@ mod tests {
             };
             let invalidate = async {
                 tokio::task::yield_now().await;
-                changes.send_replace(());
+                let _ = changes.send(AccessScope::Appliance);
             };
             tokio::join!(read, invalidate);
             assert!(sender.is_closed());
         }
+    }
+
+    #[test]
+    fn access_scopes_cover_only_their_surface_or_tenant() {
+        let owner = SubscriptionOwner {
+            surface: "alpha-surface".into(),
+            tenant: Some("alpha".into()),
+        };
+        let global = SubscriptionOwner {
+            surface: "global-surface".into(),
+            tenant: None,
+        };
+        assert!(AccessScope::Surface("alpha-surface".into()).covers(Some(&owner)));
+        assert!(!AccessScope::Surface("bravo-surface".into()).covers(Some(&owner)));
+        assert!(AccessScope::Tenant("alpha".into()).covers(Some(&owner)));
+        assert!(!AccessScope::Tenant("bravo".into()).covers(Some(&owner)));
+        assert!(!AccessScope::Tenant("alpha".into()).covers(Some(&global)));
+        assert!(AccessScope::Appliance.covers(Some(&owner)));
+        assert!(AccessScope::Appliance.covers(Some(&global)));
+        for scope in
+            [AccessScope::Surface("alpha-surface".into()), AccessScope::Tenant("alpha".into()), AccessScope::Appliance]
+        {
+            assert!(scope.covers(None), "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn resource_ownership_selects_the_narrowest_safe_scope() {
+        assert_eq!(AccessScope::owned_by(Some("alpha")), AccessScope::Tenant("alpha".into()));
+        assert_eq!(AccessScope::owned_by(None), AccessScope::Appliance);
+        assert_eq!(AccessScope::reowned(Some("alpha"), Some("alpha")), AccessScope::Tenant("alpha".into()));
+        assert_eq!(AccessScope::reowned(None, None), AccessScope::Appliance);
+        assert_eq!(AccessScope::reowned(Some("alpha"), Some("bravo")), AccessScope::Appliance);
+        assert_eq!(AccessScope::reowned(Some("alpha"), None), AccessScope::Appliance);
+        assert_eq!(AccessScope::reowned(None, Some("alpha")), AccessScope::Appliance);
+    }
+
+    #[tokio::test]
+    async fn quiet_subscription_ends_only_on_changes_in_its_scope() {
+        use http_body_util::BodyExt;
+        let open = |receiver| {
+            let mut lifetime = SubscriptionLifetime::new(std::time::Duration::from_secs(60), None);
+            lifetime.changes = receiver;
+            lifetime.record_owner("alpha-surface", Some("alpha"));
+            let (sender, upstream) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+            let body = lifetime
+                .wrap(axum::response::Response::new(axum::body::Body::from_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(upstream),
+                )))
+                .into_body();
+            (body, sender)
+        };
+        for ending in
+            [AccessScope::Surface("alpha-surface".into()), AccessScope::Tenant("alpha".into()), AccessScope::Appliance]
+        {
+            let (changes, receiver) = tokio::sync::broadcast::channel::<AccessScope>(16);
+            let (mut body, sender) = open(receiver);
+            changes
+                .send(AccessScope::Surface("bravo-surface".into()))
+                .unwrap();
+            assert!(futures::poll!(body.frame()).is_pending(), "{ending:?}");
+            changes
+                .send(AccessScope::Tenant("bravo".into()))
+                .unwrap();
+            assert!(futures::poll!(body.frame()).is_pending(), "{ending:?}");
+            assert!(!sender.is_closed());
+            changes
+                .send(ending.clone())
+                .unwrap();
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(frame.is_err(), "{ending:?}");
+            assert!(sender.is_closed());
+        }
+
+        let (changes, receiver) = tokio::sync::broadcast::channel::<AccessScope>(2);
+        let (mut body, sender) = open(receiver);
+        for _ in 0..3 {
+            changes
+                .send(AccessScope::Tenant("bravo".into()))
+                .unwrap();
+        }
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame.is_err(), "a subscription that missed changes must end");
+        assert!(sender.is_closed());
     }
 
     #[test]
@@ -1237,16 +1431,13 @@ mod tests {
         let anonymous = SubscriptionLifetime::new(std::time::Duration::from_secs(60), None);
         assert!(anonymous.deadline > tokio::time::Instant::now());
         let mut captured = SubscriptionLifetime::new(std::time::Duration::from_secs(60), None);
-        let (changes, receiver) = tokio::sync::watch::channel(());
+        let (changes, receiver) = tokio::sync::broadcast::channel::<AccessScope>(16);
         captured.changes = receiver;
-        changes.send_replace(());
+        changes
+            .send(AccessScope::Appliance)
+            .unwrap();
         captured.restrict_to_identity(Some(&claims));
-        assert!(
-            captured
-                .changes
-                .has_changed()
-                .unwrap()
-        );
+        assert!(captured.pending_change());
         assert!(captured.deadline <= tokio::time::Instant::now());
         let mut transit = SubscriptionLifetime::new(std::time::Duration::from_secs(60), None);
         let initial = transit.deadline;

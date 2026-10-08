@@ -2450,6 +2450,7 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
         .find("/mcp/messages")
         .map_or(normalized_path.as_str(), |index| &normalized_path[..index]);
     let (proxy, _suffix) = find_proxy_for_path(store.as_ref(), base_path).await?;
+    subscription_access.record_proxy_owner(&proxy);
     if let Some(authorization) = proxy
         .mcp_http
         .as_ref()

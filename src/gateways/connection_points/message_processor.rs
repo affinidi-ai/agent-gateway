@@ -4336,6 +4336,7 @@ async fn process_forward_request_with_mcp_runtime(
             return axum_response_to_forward_result(crate::mcp::subscriptions::listen_limit_error(request).into_response()).await;
         };
         subscription_access.hold(slot);
+        subscription_access.record_owner(surface.surface_id.clone(), surface.tenant_id.as_deref());
         if let Some(vault) = get_delegation_vault_store()
             && subscription_access.watch_vault(vault).await.is_err()
         {

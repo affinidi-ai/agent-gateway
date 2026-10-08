@@ -289,7 +289,8 @@ impl GlobalPolicyManager {
         &self,
         assignments: &GlobalPolicyAssignments,
     ) {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change =
+            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::Appliance);
         let store = self
             .policy_definition_store
             .read()
