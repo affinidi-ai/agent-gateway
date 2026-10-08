@@ -98,6 +98,26 @@ and lists, for each attached integration:
 So one Slack integration can be attached to three gateways, fire on `status_changed` for
 two of them, and on every event for the third.
 
+### User and identity events
+
+User and identity events describe the whole appliance, so their trigger configurations
+(`PUT /v1/users/integrations`, `PUT /v1/identities/integrations`, validated in
+[`trigger_mappings.rs`](../src/integrations/trigger_mappings.rs)) accept only:
+
+- An appliance-wide caller. A tenant or resource-scoped PAT gets `403`.
+- Integrations that exist, have no tenant owner, are not `audit`, and are in the
+  resource's category (`user` or `identity`) or `general`.
+- Event types the resource raises, at least one per integration. An integration already
+  stored with no event types keeps firing on every event and may be saved again unchanged.
+- Each integration once, at most 50 integrations, and only custom (`_`-prefixed) variables:
+  at most 32, names up to 64 characters, values up to 2048.
+- No unknown fields.
+
+Any refusal leaves the stored configuration unchanged. Each accepted change is logged as
+`integrations.mappings.updated` with the caller, the integration ids, and their event types;
+variable values are not logged. Without an RBAC guard the routes refuse every request.
+When an event is sent, tenant-owned integrations are skipped as well.
+
 ## Template variables
 
 Every event provides four variables, plus the resource's own.
@@ -119,6 +139,9 @@ A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is
 the SAML subject, and profile details (names, department, job title, avatar) never leave the
 appliance through an integration. `USERNAME` and `USER_EMAIL` remain available as separate
 variables for a template that needs them.
+
+Placeholders are filled in one pass: a substituted value is never scanned for placeholders
+again, so a value such as a username of `${_TOKEN}` stays literal.
 
 ## Outbound requests
 

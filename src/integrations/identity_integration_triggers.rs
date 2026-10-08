@@ -1,7 +1,20 @@
 use super::filesystem::FileSystemNotificationStore;
+use crate::integrations::trigger_mappings::MappingRules;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::info;
+
+/// What an identity integration mapping may name: the events this module raises.
+pub const IDENTITY_MAPPING_RULES: MappingRules = MappingRules {
+    category: "identity",
+    event_types: &[
+        "identity.created",
+        "identity.updated",
+        "identity.deleted",
+        "identity.appeared",
+        "identity.accessed",
+    ],
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {

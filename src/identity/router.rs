@@ -1843,68 +1843,6 @@ pub fn create_identity_api_router(
         None => Router::new(),
     };
 
-    // Create user integrations routes
-    let user_integrations_router = {
-        use crate::auth_manager::middleware::require_feature;
-        use crate::rbac::Feature;
-        let storage_opt = passkey_storage_for_manager.clone();
-        let rbac = rbac_config.clone();
-        let gate = |route: axum::routing::MethodRouter, feature: Feature| -> axum::routing::MethodRouter {
-            if let Some(auth_storage) = storage_opt.as_ref() {
-                route.layer(require_feature(auth_storage.clone(), rbac.clone(), feature))
-            } else {
-                route
-            }
-        };
-        Router::new()
-            .route(
-                "/v1/users/integrations",
-                gate(
-                    get(crate::integrations::user_integrations_handlers::get_user_integrations),
-                    Feature::IntegrationsView,
-                ),
-            )
-            .route(
-                "/v1/users/integrations",
-                gate(
-                    put(crate::integrations::user_integrations_handlers::update_user_integrations),
-                    Feature::IntegrationsEdit,
-                ),
-            )
-            .layer(Extension(state.bootstrap_config.clone()))
-    };
-
-    // Create identity integrations routes
-    let identity_integrations_router = {
-        use crate::auth_manager::middleware::require_feature;
-        use crate::rbac::Feature;
-        let storage_opt = passkey_storage_for_manager.clone();
-        let rbac = rbac_config.clone();
-        let gate = |mr: axum::routing::MethodRouter, feat: Feature| -> axum::routing::MethodRouter {
-            if let Some(s) = storage_opt.as_ref() {
-                mr.layer(require_feature(s.clone(), rbac.clone(), feat))
-            } else {
-                mr.layer(axum::middleware::from_fn(crate::auth_manager::middleware::deny_unguarded_request))
-            }
-        };
-        Router::new()
-            .route(
-                "/v1/identities/integrations",
-                gate(
-                    get(crate::integrations::identity_integrations_handlers::get_identity_integrations),
-                    Feature::IntegrationsView,
-                ),
-            )
-            .route(
-                "/v1/identities/integrations",
-                gate(
-                    put(crate::integrations::identity_integrations_handlers::update_identity_integrations),
-                    Feature::IntegrationsEdit,
-                ),
-            )
-            .layer(Extension(state.bootstrap_config.clone()))
-    };
-
     // Create trust registry routes if store is provided
     let trust_registry_router = if let Some(store) = trust_registry_store {
         use crate::auth_manager::middleware::require_feature;
@@ -2201,8 +2139,6 @@ pub fn create_identity_api_router(
         .merge(mcp_proxy_router)
         .merge(a2a_proxy_router)
         .merge(integration_router)
-        .merge(user_integrations_router)
-        .merge(identity_integrations_router)
         .merge(trust_registry_router)
         .merge(notification_router)
         .merge(auth_manager_router)

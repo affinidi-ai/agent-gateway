@@ -11,7 +11,7 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Allow-listed user event state (no passkeys, SAML id or profile PII) | Done |
-| 2 | Server-side validation of user and identity trigger mappings | Not started |
+| 2 | Server-side validation of user and identity trigger mappings | Done |
 | 3 | Dashboard: attach on select, no swallowed errors, event types required | Not started |
 | 4 | Minimal Agent Watch `user` template | Not started |
 | 5 | SAML: `user.created` and role-change `user.updated` | Not started |
@@ -119,3 +119,8 @@ is logged; a non-primary user's role still follows the IdP.
 - Allow-list review of other triggers that serialise whole entities: identity first, then
   gateway, connection point, mediator.
 - SAML sign-in writes the session token into `sessionStorage` from an inline script.
+- `/v1/integrations/*` stays reachable when mounted without an RBAC guard; a test pins this
+  as intended ("other categories keep the unguarded behaviour"). Confirm the intent.
+- Identity events are never sent: `trigger_identity_integrations` is a stub.
+- `component_tests::mcp_record_compat` failed once on a connection error in the full parallel
+  run and passed alone; unrelated to this branch.

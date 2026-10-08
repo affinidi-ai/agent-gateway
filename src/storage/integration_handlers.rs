@@ -71,6 +71,11 @@ pub fn integration_router(
     config: Arc<GatewayConfig>,
     bootstrap: Arc<crate::config::BootstrapConfig>,
 ) -> axum::Router {
+    use crate::auth_manager::middleware::maybe_gate;
+    use crate::integrations::identity_integrations_handlers::{
+        get_identity_integrations, update_identity_integrations,
+    };
+    use crate::integrations::user_integrations_handlers::{get_user_integrations, update_user_integrations};
     use crate::rbac::Feature;
     use crate::storage::integration_trigger_handlers::{
         test_notifier_handler, trigger_integration_handler, trigger_multiple_notifiers_handler,
@@ -98,7 +103,23 @@ pub fn integration_router(
         .route("/v1/integrations/{id}", gate(get(get_notifier), Feature::IntegrationsView))
         .route("/v1/integrations/{id}", gate(put(update_notifier), Feature::IntegrationsEdit))
         .route("/v1/integrations/{id}", gate(delete(delete_notifier), Feature::IntegrationsDelete))
-        .route("/v1/integrations/{id}/trigger", gate(post(trigger_integration_handler), Feature::IntegrationsEdit));
+        .route("/v1/integrations/{id}/trigger", gate(post(trigger_integration_handler), Feature::IntegrationsEdit))
+        .route(
+            "/v1/users/integrations",
+            maybe_gate(guard.as_ref(), get(get_user_integrations), Feature::IntegrationsView),
+        )
+        .route(
+            "/v1/users/integrations",
+            maybe_gate(guard.as_ref(), put(update_user_integrations), Feature::IntegrationsEdit),
+        )
+        .route(
+            "/v1/identities/integrations",
+            maybe_gate(guard.as_ref(), get(get_identity_integrations), Feature::IntegrationsView),
+        )
+        .route(
+            "/v1/identities/integrations",
+            maybe_gate(guard.as_ref(), put(update_identity_integrations), Feature::IntegrationsEdit),
+        );
     let router = match guard {
         Some(guard) => router.layer(Extension(guard)),
         None => router,
@@ -1274,5 +1295,75 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         let (status, _) = call(f.router(None), ADMIN, "POST", "/v1/integrations", Some(general)).await;
         assert_eq!(status, StatusCode::CREATED, "other categories keep the unguarded behaviour");
+    }
+
+    fn mapping_body(
+        integration_id: &str,
+        event_type: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "integration_integrations": [
+                { "integration_id": integration_id, "variables": {}, "event_types": [event_type] }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn integration_router_stores_validated_user_and_identity_mappings() {
+        let f = fixture().await;
+        let router = || f.router(Some(f.guard.clone()));
+        let user = f.seed("user").await;
+        let general = f.seed("general").await;
+
+        let (status, _) =
+            call(router(), OPERATOR, "PUT", "/v1/users/integrations", Some(mapping_body(&user.id, "user.created")))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, stored) = call(router(), OPERATOR, "GET", "/v1/users/integrations", None).await;
+        assert_eq!(stored["integration_integrations"][0]["integration_id"], user.id.as_str());
+        assert_eq!(stored["integration_integrations"][0]["event_types"][0], "user.created");
+
+        let (status, _) = call(
+            router(),
+            OPERATOR,
+            "PUT",
+            "/v1/identities/integrations",
+            Some(mapping_body(&general.id, "identity.created")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn integration_router_refuses_an_invalid_user_mapping() {
+        let f = fixture().await;
+        let audit = f.seed("audit").await;
+
+        let (status, _) = call(
+            f.router(Some(f.guard.clone())),
+            ADMIN,
+            "PUT",
+            "/v1/users/integrations",
+            Some(mapping_body(&audit.id, "user.created")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mapping_routes_mounted_without_an_rbac_guard_refuse_every_request() {
+        let f = fixture().await;
+        let user = f.seed("user").await;
+
+        for (method, uri, body) in [
+            ("GET", "/v1/users/integrations", None),
+            ("PUT", "/v1/users/integrations", Some(mapping_body(&user.id, "user.created"))),
+            ("GET", "/v1/identities/integrations", None),
+            ("PUT", "/v1/identities/integrations", Some(mapping_body(&user.id, "identity.created"))),
+        ] {
+            let (status, _) = call(f.router(None), ADMIN, method, uri, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
     }
 }

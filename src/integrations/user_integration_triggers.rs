@@ -6,6 +6,13 @@ use tracing::{error, info};
 use super::filesystem::FileSystemNotificationStore;
 use crate::auth::storage::UserData;
 use crate::auth::types::{UserRole, UserStatus};
+use crate::integrations::trigger_mappings::MappingRules;
+
+/// What a user integration mapping may name: the events this module raises.
+pub const USER_MAPPING_RULES: MappingRules = MappingRules {
+    category: "user",
+    event_types: &["user.created", "user.approved", "user.updated", "user.deleted", "user.login", "user.accessed"],
+};
 
 /// Trigger user integrations for user.created event
 pub async fn trigger_user_created(
@@ -93,6 +100,22 @@ impl<'a> From<&'a UserData> for UserEventState<'a> {
     }
 }
 
+/// Active `user` and `general` integrations without a tenant owner receive user events, which
+/// describe users across the whole appliance.
+fn receives_user_events(integration: &crate::storage::Integration) -> bool {
+    let matches_category = matches!(
+        integration
+            .category
+            .as_deref(),
+        Some("user" | "general")
+    );
+    matches_category
+        && integration.status == "active"
+        && integration
+            .tenant_id
+            .is_none()
+}
+
 /// Runtime variables for one user event: `old` is the user before it and `new` after it.
 /// The `USER_*` variables describe `new`, or `old` when the user was deleted.
 fn user_runtime_values(
@@ -151,14 +174,9 @@ async fn trigger_user_integrations(
         }
     };
 
-    // Filter to user and general category integrations that are active
     let user_integrations: Vec<_> = integrations
         .into_iter()
-        .filter(|n| {
-            let matches_category = n.category.as_deref() == Some("user") || n.category.as_deref() == Some("general");
-            let is_active = n.status == "active";
-            matches_category && is_active
-        })
+        .filter(receives_user_events)
         .collect();
 
     if user_integrations.is_empty() {
@@ -267,7 +285,45 @@ async fn trigger_user_integrations(
 
 #[cfg(test)]
 mod tests {
-    use super::user_runtime_values;
+    use super::{receives_user_events, user_runtime_values};
+    use crate::storage::Integration;
+
+    fn integration(
+        category: &str,
+        status: &str,
+        tenant_id: Option<&str>,
+    ) -> Integration {
+        let mut integration = Integration::new(
+            "Sink".to_string(),
+            String::new(),
+            "webhook".to_string(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            status.to_string(),
+            Some(category.to_string()),
+        );
+        integration.tenant_id = tenant_id.map(str::to_string);
+        integration
+    }
+
+    #[test]
+    fn active_user_and_general_integrations_receive_user_events() {
+        assert!(receives_user_events(&integration("user", "active", None)));
+        assert!(receives_user_events(&integration("general", "active", None)));
+    }
+
+    #[test]
+    fn inactive_or_other_category_integrations_receive_no_user_events() {
+        assert!(!receives_user_events(&integration("user", "inactive", None)));
+        assert!(!receives_user_events(&integration("gateway", "active", None)));
+        assert!(!receives_user_events(&integration("audit", "active", None)));
+    }
+
+    #[test]
+    fn a_tenant_owned_integration_receives_no_appliance_wide_user_events() {
+        assert!(!receives_user_events(&integration("general", "active", Some("tenant-a"))));
+        assert!(!receives_user_events(&integration("user", "active", Some("tenant-a"))));
+    }
     use crate::auth::storage::UserData;
     use crate::auth::types::{UserRole, UserStatus};
     use std::collections::BTreeSet;

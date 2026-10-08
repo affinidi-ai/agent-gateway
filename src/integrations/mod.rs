@@ -22,6 +22,7 @@ pub mod runtime_variables;
 pub mod secrets_integration_triggers;
 pub mod store;
 pub mod stream_publishers;
+pub mod trigger_mappings;
 pub mod trust_registry_integration_triggers;
 pub mod types;
 pub mod user_integration_triggers;
