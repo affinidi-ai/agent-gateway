@@ -1488,6 +1488,7 @@ mod tests {
             StreamErrorCode::LimitExceeded,
             StreamErrorCode::UpstreamFailed,
             StreamErrorCode::Cancelled,
+            StreamErrorCode::Unknown,
         ] {
             assert!(
                 matches!(stream_failure(code, "gw"), (FabricForwardError::StreamingUnavailable, false)),

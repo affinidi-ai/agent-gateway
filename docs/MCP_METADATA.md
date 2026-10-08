@@ -1356,8 +1356,9 @@ response deadline. The frame says why:
 | --- | --- | --- |
 | `stale_offer` | The Open names no live capability offer, for example after the receiver restarted or the offer expired | Drops its agreement, so the next request negotiates again |
 | `legacy_only` | Sent by an older peer whose surface does not admit modern MCP | Answers the caller as a legacy-only endpoint would: `400` / `-32022` listing `2024-11-05` |
-| `capacity_reached` | A framed-stream cap is full, or the Open replay table is | Keeps its agreement and answers `429` with `Retry-After: 5`. A sender built before this code does not recognise it and waits for its response deadline |
-| `unavailable` | Anything else: route, exposure, tenant, size limits, envelope times, admission timeout | Keeps its agreement and answers `502` |
+| `capacity_reached` | Not sent: a full framed-stream cap or Open replay table is refused with `unavailable`, because a 1.0.0 sender cannot parse this code and would wait for its response deadline | Keeps its agreement and answers `429` with `Retry-After: 5` |
+| `unavailable` | A full framed-stream cap or Open replay table, and anything else: route, exposure, tenant, size limits, envelope times, admission timeout | Keeps its agreement and answers `502` |
+| Any other code | Sent by a newer peer | Treated as `unavailable` |
 
 Only a stale offer makes the sender negotiate again, so a route the peer
 refuses does not make every request query its capabilities and fill the
@@ -1528,7 +1529,7 @@ process.
 
 | Limit | Value | Past it |
 |---|---|---|
-| Framed request streams per peer | 8, counted apart for streams a peer opened here and streams this gateway opened to it, across all surfaces | The stream is refused. The sending caller gets `429` with `Retry-After: 5` and a JSON-RPC error body (`-32603`), on an Access Point and on a Transit Point, whether the cap is full on the sending or the receiving gateway |
+| Framed request streams per peer | 8, counted apart for streams a peer opened here and streams this gateway opened to it, across all surfaces | The stream is refused. On an Access Point and on a Transit Point, a full cap on the sending gateway gets the caller `429` with `Retry-After: 5` and a JSON-RPC error body (`-32603`); a full cap on the receiving gateway gets it `502`, as the receiver refuses with `unavailable` |
 | Framed listens per peer | 8 forwarded `subscriptions/listen` streams, counted apart from request streams | As above |
 | Framed streams per surface | 16 request streams and 16 listens inbound per local surface (shared by every peer); outbound counted per peer channel | As above |
 | Framed streams in total | 128 receiving and 128 sending registrations, inbound and outbound, request streams and listens together | As above |
@@ -1546,7 +1547,7 @@ and the progress timeout does not end a quiet subscription. Listens therefore
 count against their own per-peer and per-surface caps, so a partner holding
 all eight of its listens still sends other modern requests. Two partners at
 eight listens each still fill a receiving surface's 16 listen slots, and
-further listens to that surface get `429` until one ends. Because the per-peer
+further listens to that surface are refused with `502` until one ends. Because the per-peer
 cap applies first over Fabric, the 16-per-caller listen limit cannot be
 reached there. The receiver picks the budget from the Open's `Mcp-Method`
 header before the body arrives, so a paired peer that labels other requests

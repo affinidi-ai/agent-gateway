@@ -546,12 +546,13 @@ impl From<String> for OpenRefusal {
     }
 }
 
+/// A full cap is sent as `unavailable`, not `capacity_reached`: a 1.0.0
+/// sender cannot parse `capacity_reached`, drops the frame, and holds its
+/// stream until the response deadline.
 impl From<registry::RegisterError> for OpenRefusal {
     fn from(error: registry::RegisterError) -> Self {
         match error {
-            registry::RegisterError::CapacityReached(reason) => {
-                Self::new(wire::StreamErrorCode::CapacityReached, reason)
-            }
+            registry::RegisterError::CapacityReached(reason) => reason.into(),
             registry::RegisterError::Refused(reason) => reason.into(),
         }
     }
@@ -1126,8 +1127,7 @@ mod tests {
             wire::StreamErrorCode::LegacyOnly
         );
         // Listens have their own budget: a peer holding all of its listens
-        // still opens request streams, and an Open past a full cap is refused
-        // with a reason the sender answers with 429.
+        // still opens request streams, and an Open past a full cap is refused.
         let listen_message = || {
             let mut next = fresh_message();
             next.message_body["payload"]["request"]["headers"]["mcp-method"] = json!(["subscriptions/listen"]);
@@ -1142,15 +1142,13 @@ mod tests {
                     .expect("a listen within the peer's listen budget"),
             );
         }
-        assert_eq!(
-            runtime
-                .prepare_incoming_with_versions(&listen_message(), &connection, &peer, versions)
-                .await
-                .err()
-                .expect("a listen past the peer's listen budget")
-                .code,
-            wire::StreamErrorCode::CapacityReached
-        );
+        let listen_refusal = runtime
+            .prepare_incoming_with_versions(&listen_message(), &connection, &peer, versions)
+            .await
+            .err()
+            .expect("a listen past the peer's listen budget");
+        assert_eq!(listen_refusal.code, wire::StreamErrorCode::Unavailable);
+        assert_eq!(listen_refusal.to_string(), "Fabric stream concurrency limit reached");
         held.push(
             runtime
                 .prepare_incoming_with_versions(&fresh_message(), &connection, &peer, versions)
@@ -1166,7 +1164,8 @@ mod tests {
                 Err(refusal) => break refusal,
             }
         };
-        assert_eq!(refusal.code, wire::StreamErrorCode::CapacityReached, "{refusal}");
+        assert_eq!(refusal.code, wire::StreamErrorCode::Unavailable, "{refusal}");
+        assert_eq!(refusal.to_string(), "Fabric stream concurrency limit reached");
         drop(held);
         for change in ["disabled", "other-protocol", "empty-variant-catalog"] {
             let mut changed = surface.clone();
@@ -1821,9 +1820,9 @@ mod tests {
     }
 
     #[test]
-    fn a_full_stream_cap_is_refused_with_its_own_wire_reason() {
+    fn a_full_stream_cap_is_refused_as_unavailable_but_capacity_reached_still_parses() {
         let refusal = OpenRefusal::from(registry::RegisterError::CapacityReached("full"));
-        assert_eq!(refusal.code, wire::StreamErrorCode::CapacityReached);
+        assert_eq!(refusal.code, wire::StreamErrorCode::Unavailable);
         assert_eq!(refusal.to_string(), "full");
         assert_eq!(
             OpenRefusal::from(registry::RegisterError::Refused("refused".into())).code,

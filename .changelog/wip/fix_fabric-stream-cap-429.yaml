@@ -5,12 +5,13 @@ changes:
     - timestamp: '2026-10-08T08:53:14.000Z'
       title: Answer Fabric stream-cap refusals with 429 and Retry-After
       description: >-
-        A modern MCP request refused because a framed Fabric stream cap is full, on the sending or
-        the receiving gateway, now gets `429` with `Retry-After: 5` and a JSON-RPC error body on
-        both Access Points and Transit Points, instead of `502` or `UpstreamConnectionFailed`. The
-        receiving gateway names the refusal with a new `capacity_reached` stream error code, so the
-        sender can tell a full cap from a transport failure, which keeps its current status. A
-        sender built before this code does not recognise it and waits for its response deadline.
+        A modern MCP request refused because a framed Fabric stream cap is full on the sending
+        gateway now gets `429` with `Retry-After: 5` and a JSON-RPC error body on both Access Points
+        and Transit Points, instead of `502` or `UpstreamConnectionFailed`. Senders also recognise a
+        new `capacity_reached` stream error code and answer it with `429`, and treat any stream
+        error code they do not recognise as `unavailable` instead of dropping the frame. Receivers
+        still refuse a full cap with `unavailable` (`502`), because a 1.0.0 sender cannot parse
+        `capacity_reached` and would hold its stream until the response deadline.
     - timestamp: '2026-10-08T08:53:14.000Z'
       title: Give forwarded Fabric listens their own per-peer and per-surface budget
       description: >-
