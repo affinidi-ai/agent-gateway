@@ -5,6 +5,9 @@ changes:
   fixed: []
   removed: []
   security:
+    - timestamp: '2026-10-08T15:10:00.000Z'
+      title: Refuse integration API requests when no RBAC guard is mounted
+      description: The /v1/integrations routes were served without any permission check when the router was built without an RBAC guard, while neighbouring admin routes refused such requests. They now fail closed with 403. Deployments always mount the guard, so this is hardening against a future wiring change.
     - timestamp: '2026-10-08T14:30:00.000Z'
       title: ⭐ Validate user and identity integration mappings before saving them
       description: PUT /v1/users/integrations and /v1/identities/integrations saved any payload. They now refuse tenant and resource-scoped tokens (403), unknown, tenant-owned, audit or wrong-category integrations, unknown or missing event types, duplicate or excess entries, non-custom or oversized variables and unknown fields (400), and log each accepted change. The routes refuse every request when mounted without an RBAC guard.

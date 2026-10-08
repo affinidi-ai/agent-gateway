@@ -82,12 +82,7 @@ pub fn integration_router(
     };
     use axum::routing::{MethodRouter, delete, get, post, put};
 
-    let gate = |route: MethodRouter, feature: Feature| -> MethodRouter {
-        match guard.as_ref() {
-            Some(guard) => guard.gate(route, feature),
-            None => route,
-        }
-    };
+    let gate = |route: MethodRouter, feature: Feature| -> MethodRouter { maybe_gate(guard.as_ref(), route, feature) };
     let router = axum::Router::new()
         .route("/v1/integrations", gate(get(list_notifiers), Feature::IntegrationsView))
         .route("/v1/integrations", gate(post(create_notifier), Feature::IntegrationsEdit))
@@ -104,22 +99,10 @@ pub fn integration_router(
         .route("/v1/integrations/{id}", gate(put(update_notifier), Feature::IntegrationsEdit))
         .route("/v1/integrations/{id}", gate(delete(delete_notifier), Feature::IntegrationsDelete))
         .route("/v1/integrations/{id}/trigger", gate(post(trigger_integration_handler), Feature::IntegrationsEdit))
-        .route(
-            "/v1/users/integrations",
-            maybe_gate(guard.as_ref(), get(get_user_integrations), Feature::IntegrationsView),
-        )
-        .route(
-            "/v1/users/integrations",
-            maybe_gate(guard.as_ref(), put(update_user_integrations), Feature::IntegrationsEdit),
-        )
-        .route(
-            "/v1/identities/integrations",
-            maybe_gate(guard.as_ref(), get(get_identity_integrations), Feature::IntegrationsView),
-        )
-        .route(
-            "/v1/identities/integrations",
-            maybe_gate(guard.as_ref(), put(update_identity_integrations), Feature::IntegrationsEdit),
-        );
+        .route("/v1/users/integrations", gate(get(get_user_integrations), Feature::IntegrationsView))
+        .route("/v1/users/integrations", gate(put(update_user_integrations), Feature::IntegrationsEdit))
+        .route("/v1/identities/integrations", gate(get(get_identity_integrations), Feature::IntegrationsView))
+        .route("/v1/identities/integrations", gate(put(update_identity_integrations), Feature::IntegrationsEdit));
     let router = match guard {
         Some(guard) => router.layer(Extension(guard)),
         None => router,
@@ -1286,15 +1269,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_router_without_an_rbac_guard_refuses_audit_integrations() {
+    async fn integration_router_without_an_rbac_guard_refuses_every_request() {
         let f = fixture().await;
+        let existing = f.seed("general").await;
         let mut general = request_json("general");
         general["content"] = serde_json::json!({"type": "${EVENT_TYPE}"});
+        let item = format!("/v1/integrations/{}", existing.id);
+        let trigger = format!("{item}/trigger");
 
-        let (status, _) = call(f.router(None), ADMIN, "POST", "/v1/integrations", Some(request_json("audit"))).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        let (status, _) = call(f.router(None), ADMIN, "POST", "/v1/integrations", Some(general)).await;
-        assert_eq!(status, StatusCode::CREATED, "other categories keep the unguarded behaviour");
+        for (method, uri, body) in [
+            ("GET", "/v1/integrations", None),
+            ("POST", "/v1/integrations", Some(general.clone())),
+            ("POST", "/v1/integrations", Some(request_json("audit"))),
+            ("GET", "/v1/integrations/config", None),
+            ("GET", "/v1/integrations/runtime-variables", None),
+            ("POST", "/v1/integrations/test", Some(general.clone())),
+            ("POST", "/v1/integrations/trigger-multiple", Some(serde_json::json!({}))),
+            ("GET", item.as_str(), None),
+            ("PUT", item.as_str(), Some(general.clone())),
+            ("DELETE", item.as_str(), None),
+            ("POST", trigger.as_str(), Some(serde_json::json!({}))),
+        ] {
+            let (status, _) = call(f.router(None), ADMIN, method, uri, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        assert_eq!(f.stored().await.len(), 1, "nothing was created or deleted");
     }
 
     fn mapping_body(

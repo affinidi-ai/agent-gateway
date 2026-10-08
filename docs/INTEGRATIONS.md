@@ -115,7 +115,7 @@ User and identity events describe the whole appliance, so their trigger configur
 
 Any refusal leaves the stored configuration unchanged. Each accepted change is logged as
 `integrations.mappings.updated` with the caller, the integration ids, and their event types;
-variable values are not logged. Without an RBAC guard the routes refuse every request.
+variable values are not logged.
 When an event is sent, tenant-owned integrations are skipped as well.
 
 ## Template variables
@@ -173,8 +173,11 @@ address and the connected address are not bound together. See
 | `/v1/gateways/{id}/integrations` | A gateway's trigger configuration |
 | `/v1/users/integrations`, `/v1/identities/integrations` | User and identity trigger configuration |
 
-Governance Audit integrations also require `audit.view`. Without it they are left out of
-lists, a read returns 404, and a write or manual trigger returns 403. See
+Each route needs `integrations.view`, `integrations.edit`, or `integrations.delete`, checked
+by the RBAC guard ([`integration_handlers.rs`](../src/storage/integration_handlers.rs)). Mounted
+without a guard, every route above refuses the request with `403`. Governance Audit
+integrations also require `audit.view`. Without it they are left out of lists, a read returns
+404, and a write or manual trigger returns 403. See
 [`RBAC.md`](RBAC.md#governance-audit-integrations).
 
 ## In-dashboard notifications
