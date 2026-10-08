@@ -1414,7 +1414,7 @@ record ends. The sending gateway gives a query a 300 s envelope lifetime.
 
 Current local bounds are 48 KiB per serialized frame, 16 KiB per decoded chunk,
 16 KiB of headers, a 1 MiB credit window and 64 outstanding frames. The registry
-allows 128 streams per direction, with 8 request streams and 8 listens per peer and 16 of each per surface; replay records
+allows 128 receiving and 128 sending stream registrations, with 8 request streams and 8 listens per peer and 16 of each per surface; replay records
 are additionally bounded, at 512 per allowed stream. See [Framed Fabric limits](#framed-fabric-limits). Capability negotiation intersects supported features
 and byte limits. Both send and receive registrations retain that immutable
 agreement and check every frame against it; senders split at the smaller peer
@@ -1531,7 +1531,7 @@ process.
 | Framed request streams per peer | 8, counted apart for streams a peer opened here and streams this gateway opened to it, across all surfaces | The stream is refused. The sending caller gets `429` with `Retry-After: 5` and a JSON-RPC error body (`-32603`), on an Access Point and on a Transit Point, whether the cap is full on the sending or the receiving gateway |
 | Framed listens per peer | 8 forwarded `subscriptions/listen` streams, counted apart from request streams | As above |
 | Framed streams per surface | 16 request streams and 16 listens inbound per local surface (shared by every peer); outbound counted per peer channel | As above |
-| Framed streams in total | 128 per direction, request streams and listens together | As above |
+| Framed streams in total | 128 receiving and 128 sending registrations, inbound and outbound, request streams and listens together | As above |
 | Stream progress | `stream_idle_timeout_secs` (default 60 s) bounds an upload and the Credit and EndAck waits while frames are outstanding; a quiet subscription has nothing outstanding and is not affected | The stream ends |
 | Opens per peer | 50/s, burst 100, per listener | The Open is refused before any lookup |
 | Capability queries per sender | 10/s, burst 20, per listener | The query is dropped |
@@ -1548,7 +1548,10 @@ all eight of its listens still sends other modern requests. Two partners at
 eight listens each still fill a receiving surface's 16 listen slots, and
 further listens to that surface get `429` until one ends. Because the per-peer
 cap applies first over Fabric, the 16-per-caller listen limit cannot be
-reached there.
+reached there. The receiver picks the budget from the Open's `Mcp-Method`
+header before the body arrives, so a paired peer that labels other requests
+as listens can hold up to 16 streams; the per-surface and total caps still
+bound it.
 
 **Modern MCP is active on every MCP endpoint, so weigh shared state before
 exposing a multi-tenant or internet-facing gateway.** Gateway-wide tables and

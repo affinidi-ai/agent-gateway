@@ -23,8 +23,9 @@ changes:
   security: []
   breaking: []
   internal:
-    - timestamp: '2026-10-08T08:53:14.000Z'
-      title: Fix the access token component test for token rotation fields
+    - timestamp: '2026-10-08T11:30:00.000Z'
+      title: Test the Access Point answer to a full Fabric stream cap
       description: >-
-        The scoped-token helper in the access token component tests now sets the rotation fields
-        added with token rotation, so the test target compiles again.
+        The Access Point's mapping of modern Fabric transport failures to responses is now its own
+        function, with a unit test that a full stream cap answers 429 with Retry-After while a
+        transport failure keeps 502 and a timeout keeps 504.
