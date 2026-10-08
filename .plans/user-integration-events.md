@@ -14,7 +14,7 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 | 2 | Server-side validation of user and identity trigger mappings; `/v1/integrations` fails closed without an RBAC guard | Done |
 | 3 | Dashboard: attach on select, no swallowed errors, event types required | Done |
 | 4 | Minimal Agent Watch `user` template | Done (gateway side; Agent Watch docs pending, see follow-ups) |
-| 5 | SAML: `user.created` and role-change `user.updated` | Not started |
+| 5 | SAML: `user.created` and role-change `user.updated` | Done |
 | 6 | SAML: keep the primary administrator's role (security fix) | Not started |
 | 7 | Fix `component_tests::mcp_record_compat` failing in the full suite | Not started |
 

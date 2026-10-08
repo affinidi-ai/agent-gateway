@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::service::{SamlService, TooManyPendingAuthnRequests};
-use super::user_provisioning::provision_user_from_saml;
+use super::user_provisioning::{SignInChange, SignInEvent, provision_user_from_saml, sign_in_events};
 use crate::auth::cli_login::CLI_AUTHORIZE_PATH;
 use crate::auth::session::SessionManager;
 use crate::auth::session_finalizer::{
@@ -262,7 +262,7 @@ pub async fn saml_acs(
         })?;
 
     // Provision or update user
-    let user = match provision_user_from_saml(
+    let provisioned = match provision_user_from_saml(
         &saml_state.storage,
         &attributes,
         saml_state
@@ -272,7 +272,7 @@ pub async fn saml_acs(
     )
     .await
     {
-        Ok(user) => user,
+        Ok(provisioned) => provisioned,
         Err(e) => {
             // A reached appliance user limit is reported to the SSO user as a
             // readable page rather than a blank 500.
@@ -288,6 +288,7 @@ pub async fn saml_acs(
             ));
         }
     };
+    let user = &provisioned.user;
     let finalized_session = SessionManagerFinalizer::new(
         saml_state
             .session_manager
@@ -300,29 +301,42 @@ pub async fn saml_acs(
     .await?;
 
     if let Some(metrics) = metric_store {
-        let user_role = user.role.clone();
+        let user_role = user.role.to_string();
+        let created = matches!(provisioned.change, SignInChange::Created);
         tokio::spawn(async move {
+            if created {
+                metrics
+                    .record_user_event("created", &user_role)
+                    .await;
+            }
             metrics
-                .record_user_login(user_role.to_string().as_str())
+                .record_user_login(&user_role)
                 .await;
         });
     }
 
-    // Trigger user.login integration (async, non-blocking)
+    info!(user_id = %user.user_id, role = %user.role, "SAML login successful");
+
+    // Raise the sign-in's user events in order (async, non-blocking)
     let notif_store_guard = saml_state
         .notification_store
         .read()
         .await;
     if let Some(notif_store) = notif_store_guard.as_ref() {
         let notif = notif_store.clone();
-        let user_clone = user.clone();
-        crate::observability::spawn_traced_task("integration.user_login", async move {
-            crate::integrations::trigger_user_login(notif.as_ref(), &user_clone).await;
+        crate::observability::spawn_traced_task("integration.user_sign_in", async move {
+            for event in sign_in_events(&provisioned) {
+                match event {
+                    SignInEvent::Created(user) => crate::integrations::trigger_user_created(notif.as_ref(), user).await,
+                    SignInEvent::Updated { old, new } => {
+                        crate::integrations::trigger_user_updated(notif.as_ref(), old, new).await
+                    }
+                    SignInEvent::Login(user) => crate::integrations::trigger_user_login(notif.as_ref(), user).await,
+                }
+            }
         });
     }
     drop(notif_store_guard);
-
-    info!("SAML login successful for user: {} (role: {:?})", user.username, user.role);
 
     tracing::info!("Setting SAML session cookie");
 

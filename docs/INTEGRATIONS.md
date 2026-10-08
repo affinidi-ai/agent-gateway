@@ -82,6 +82,12 @@ Each resource type raises its own events. The event type is always
 | x402 | transaction verification failed, settlement failed, completed; cleanup completed |
 | MPP | verification failed, payment verified, challenge issued |
 
+A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
+SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
+so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
+primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
+([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
 Surface events and the `surface` category were named `channel` in earlier builds. A stored
 integration with the `channel` category, or a `gateway.json` that still uses it, is moved
 to `surface` at load, and `${CHANNEL_*}` template variables become `${SURFACE_*}`.

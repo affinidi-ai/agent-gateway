@@ -1,6 +1,9 @@
 branch: fix-user-integration
 changes:
-  added: []
+  added:
+    - timestamp: '2026-10-08T17:20:00.000Z'
+      title: ⭐ Raise user.created and user.updated for SAML sign-ins
+      description: A SAML sign-in that creates a user now raises user.created, and one that changes the user's role, status or primary flag raises user.updated, before user.login. Previously only user.login was raised, so SAML users and IdP role changes never reached integrations. SAML sign-in logs now name users by id instead of username or email.
   changed:
     - timestamp: '2026-10-08T16:50:00.000Z'
       title: Start new user Stream and Webhook integrations with a minimal payload
