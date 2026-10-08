@@ -10,7 +10,7 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Allow-listed user event state (no passkeys, SAML id or profile PII) | Not started |
+| 1 | Allow-listed user event state (no passkeys, SAML id or profile PII) | Done |
 | 2 | Server-side validation of user and identity trigger mappings | Not started |
 | 3 | Dashboard: attach on select, no swallowed errors, event types required | Not started |
 | 4 | Minimal Agent Watch `user` template | Not started |

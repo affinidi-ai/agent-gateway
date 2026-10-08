@@ -17,12 +17,12 @@
     "global_runtime_variables": [
       {
         "name": "OLD_STATE",
-        "description": "JSON representation of the entity's state before the event. Empty for CREATE events. Contains complete entity object (Gateway, User, etc.) for UPDATE and DELETE events.",
+        "description": "JSON representation of the entity's state before the event. Empty for CREATE events. Contains the entity object (Gateway, User, etc.) for UPDATE and DELETE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.",
         "example": "{\"id\":\"gateway-123\",\"name\":\"My Gateway\",\"status\":\"Enabled\",...}"
       },
       {
         "name": "NEW_STATE",
-        "description": "JSON representation of the entity's state after the event. Empty for DELETE events. Contains complete entity object (Gateway, User, etc.) for CREATE and UPDATE events.",
+        "description": "JSON representation of the entity's state after the event. Empty for DELETE events. Contains the entity object (Gateway, User, etc.) for CREATE and UPDATE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.",
         "example": "{\"id\":\"gateway-123\",\"name\":\"Updated Gateway\",\"status\":\"Disabled\",...}"
       },
       {

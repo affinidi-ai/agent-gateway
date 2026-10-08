@@ -4,7 +4,10 @@ changes:
   changed: []
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-08T12:40:00.000Z'
+      title: ⭐ Stop sending passkeys and profile details in user integration events
+      description: User events (created, approved, updated, deleted, login, accessed) put the whole user record into OLD_STATE and NEW_STATE, including passkey credentials, the SAML subject, email, names, department, job title and avatar path. They now carry only user_id, role, status, is_primary, created_at and updated_at, and trigger logs name the user by id instead of username.
   breaking: []
   internal:
     - timestamp: '2026-10-08T12:20:00.000Z'

@@ -88,14 +88,14 @@ fn get_general_variables() -> RuntimeVariableCategory {
             RuntimeVariable {
                 name: "OLD_STATE".to_string(),
                 label: "Old State".to_string(),
-                description: "JSON representation of the entity's state before the event. Empty for CREATE events. Contains complete entity object (Gateway, User, etc.) for UPDATE and DELETE events.".to_string(),
+                description: "JSON representation of the entity's state before the event. Empty for CREATE events. Contains the entity object (Gateway, User, etc.) for UPDATE and DELETE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.".to_string(),
                 example: r#"${OLD_STATE}"#.to_string(),
                 category: "general".to_string(),
             },
             RuntimeVariable {
                 name: "NEW_STATE".to_string(),
                 label: "New State".to_string(),
-                description: "JSON representation of the entity's state after the event. Empty for DELETE events. Contains complete entity object (Gateway, User, etc.) for CREATE and UPDATE events.".to_string(),
+                description: "JSON representation of the entity's state after the event. Empty for DELETE events. Contains the entity object (Gateway, User, etc.) for CREATE and UPDATE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.".to_string(),
                 example: r#"${NEW_STATE}"#.to_string(),
                 category: "general".to_string(),
             },

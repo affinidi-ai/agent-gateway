@@ -113,6 +113,13 @@ Resource variables follow a prefix, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEW
 and `GATEWAY_STATUS` for a gateway. `GET /v1/integrations/runtime-variables` lists every
 variable available to each category.
 
+A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is_primary`,
+`created_at`, and `updated_at`
+([`user_integration_triggers.rs`](../src/integrations/user_integration_triggers.rs)). Passkeys,
+the SAML subject, and profile details (names, department, job title, avatar) never leave the
+appliance through an integration. `USERNAME` and `USER_EMAIL` remain available as separate
+variables for a template that needs them.
+
 ## Outbound requests
 
 Webhook and Slack URLs are checked with `validate_resolved_webhook_url`
