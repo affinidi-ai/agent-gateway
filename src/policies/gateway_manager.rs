@@ -103,7 +103,8 @@ impl GatewayPolicyManager {
         &self,
         gateway: &Gateway,
     ) -> Result<(), String> {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change =
+            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::Appliance);
         let gateway_id = &gateway.id;
 
         // Keep the tracked self-gateway id in step with policy updates. The self
@@ -436,7 +437,8 @@ impl GatewayPolicyManager {
         &self,
         gateway_id: &str,
     ) {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change =
+            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::Appliance);
         self.enforced
             .write()
             .expect("enforced lock poisoned")

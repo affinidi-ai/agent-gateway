@@ -1408,6 +1408,47 @@ pub struct StsRuntimeConfig {
     pub mcp_replay: crate::sts::replay::McpReplayConfig,
 }
 
+/// Per-client-IP throttle for a sign-in endpoint (SAML login, CLI login). Off unless enabled. The
+/// IP is resolved by [`crate::source_auth::client_ip`] from the proxies in [`ClientIpConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginThrottleConfig {
+    /// Master switch for the throttle. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Per-client-IP limit. A client over it waits until its window rolls off.
+    #[serde(default = "default_login_throttle_per_ip")]
+    pub per_ip: RateLimitConfig,
+}
+
+impl Default for LoginThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            per_ip: default_login_throttle_per_ip(),
+        }
+    }
+}
+
+/// Which proxies may report the caller's address for per-client-IP limits (the SAML and CLI
+/// login throttles). Separate from `tls.client_auth.trusted_proxies`, which only gates forwarded
+/// client certificates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientIpConfig {
+    /// Proxy CIDRs whose `X-Forwarded-For` is read, or RFC 7239 `Forwarded` when a request has no
+    /// `X-Forwarded-For`. Each listed proxy must append the address it saw to `X-Forwarded-For`
+    /// or overwrite it. Empty means the TCP peer is always the client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+}
+
+fn default_login_throttle_per_ip() -> RateLimitConfig {
+    RateLimitConfig {
+        requests: 20,
+        window_secs: 60,
+        burst: None,
+    }
+}
+
 /// Selects the replay-protection backend by name. The built-in backend is
 /// `in_process`; additional backends may be registered at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1756,6 +1797,32 @@ pub struct X402PaymentRequirement {
     /// Optional scheme-specific extra data (e.g., EIP-712 domain)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<serde_json::Value>,
+}
+
+impl X402PaymentRequirement {
+    /// Token contract address, or `None` when the requirement is for the network's native currency
+    pub fn token_address(&self) -> Option<&str> {
+        if self.asset.is_empty() || self.asset == "native" {
+            None
+        } else {
+            Some(&self.asset)
+        }
+    }
+
+    /// Asset transfer method from `extra` (`assetTransferMethod`, or legacy `asset_transfer_method`),
+    /// defaulting to `transaction`
+    pub fn asset_transfer_method(&self) -> String {
+        self.extra
+            .as_ref()
+            .and_then(|extra| {
+                extra
+                    .get("assetTransferMethod")
+                    .or_else(|| extra.get("asset_transfer_method"))
+            })
+            .and_then(|v| v.as_str())
+            .unwrap_or("transaction")
+            .to_string()
+    }
 }
 
 /// x402 payment provider — who enforces the paywall.
@@ -3422,6 +3489,14 @@ pub struct EvmTestEndpointConfig {
 
     /// Payment method (e.g., "eip3009", "permit2")
     pub payment_method: String,
+
+    /// Token EIP-712 domain name (e.g., "USDC"), issued as `extra.name`; required for EIP-3009
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_name: Option<String>,
+
+    /// Token EIP-712 domain version (e.g., "2"), issued as `extra.version`; required for EIP-3009
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_version: Option<String>,
 }
 
 /// Solana test endpoint configuration

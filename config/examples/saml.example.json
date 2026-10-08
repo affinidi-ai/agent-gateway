@@ -9,6 +9,13 @@
   "sp_cert_path": "certs/saml-sp-cert.pem",
   "sign_requests": true,
   "require_encrypted_assertions": false,
+  "login_throttle": {
+    "enabled": false,
+    "per_ip": {
+      "requests": 20,
+      "window_secs": 60
+    }
+  },
   "attribute_mapping": {
     "user_id": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier",
     "username": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",

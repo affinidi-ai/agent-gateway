@@ -61,6 +61,38 @@ pub async fn settle_payment(
     }
 }
 
+/// The payload a stored transaction settles with.
+///
+/// A record written before requirement binding carries the caller's own `accepted`. It settles
+/// only if that still resolves to one of the payment requirements `surface_config` issues, and
+/// then against that requirement.
+pub(crate) async fn settleable_payload(
+    transaction: &super::transaction_store::X402Transaction,
+    surface_config: Option<&X402Config>,
+) -> Result<PaymentPayload, String> {
+    if transaction.payment_requirement_bound {
+        return Ok(transaction
+            .payment_payload
+            .clone());
+    }
+    let config = surface_config.ok_or_else(|| {
+        "Transaction recorded before payment requirement binding, and its surface has no payment policy".to_string()
+    })?;
+    let requirement = super::verification::resolve_payment_requirement(
+        &transaction
+            .payment_payload
+            .accepted,
+        &super::issued_payment_requirements(config).await,
+    )
+    .map_err(|e| format!("Transaction recorded before payment requirement binding: {}", e))?;
+    Ok(PaymentPayload {
+        accepted: requirement,
+        ..transaction
+            .payment_payload
+            .clone()
+    })
+}
+
 /// Record payment for deferred settlement (batch processing)
 /// Storage location depends on verification_mode:
 /// - Local: Store locally on this gateway
@@ -635,7 +667,7 @@ async fn settle_via_external_facilitator(
 ///
 /// # Arguments
 /// * `transaction_store` - Transaction store to query
-/// * `settlement_backend` - Settlement backend for legacy compatibility
+/// * `bootstrap_config` - Locates surface payment policies for records written before requirement binding
 /// * `is_fabric_facilitator` - True if this gateway acts as facilitator (GW2), false if originating (GW1)
 ///
 /// # Recovery Logic
@@ -644,7 +676,7 @@ async fn settle_via_external_facilitator(
 /// - External facilitator settlements are not retried (delegated to external service)
 pub async fn recover_unsettled_on_startup(
     transaction_store: Arc<TransactionStore>,
-    _settlement_backend: Option<()>, // No longer used - kept for API compatibility
+    bootstrap_config: Arc<crate::config::BootstrapConfig>,
     is_fabric_facilitator: bool,
 ) {
     info!("[x402-recovery] Checking for unsettled verified payments on startup...");
@@ -707,10 +739,25 @@ pub async fn recover_unsettled_on_startup(
             Some(settlement.tx_hash.clone())
         };
 
-        // Reconstruct payment payload
-        let payload = transaction
-            .payment_payload
-            .clone();
+        let surface_config = if transaction.payment_requirement_bound {
+            None
+        } else {
+            super::settlement_worker::load_channel_payment_policy(&channel_id, &bootstrap_config).await
+        };
+        let payload = match settleable_payload(&transaction, surface_config.as_ref()).await {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("[x402-recovery] ❌ Not settling {}: {}", correlation_id, e);
+                if let Err(update_err) = transaction_store
+                    .fail_settlement(&correlation_id, e)
+                    .await
+                {
+                    warn!("[x402-recovery] Failed to mark {} as failed: {}", correlation_id, update_err);
+                }
+                failed += 1;
+                continue;
+            }
+        };
 
         // Build temporary config with settlement mode from transaction
         // Clone the inner X402Config from the Arc so we can modify it
@@ -775,4 +822,115 @@ pub async fn recover_unsettled_on_startup(
     }
 
     info!("[x402-recovery] Startup recovery complete: {} recovered, {} failed", recovered, failed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::X402PaymentRequirement;
+    use crate::x402::transaction_store::X402Transaction;
+
+    fn requirement(pay_to: &str) -> X402PaymentRequirement {
+        X402PaymentRequirement {
+            scheme: "exact".to_string(),
+            network: "eip155:1".to_string(),
+            amount: "1000000".to_string(),
+            asset: "0xtoken".to_string(),
+            recipient_id: String::new(),
+            pay_to: pay_to.to_string(),
+            max_timeout_seconds: 300,
+            extra: Some(serde_json::json!({"name": "USDC", "version": "2", "assetTransferMethod": "eip3009"})),
+        }
+    }
+
+    fn surface_config() -> X402Config {
+        X402Config {
+            payment_requirements: vec![requirement("0xmerchant")],
+            ..Default::default()
+        }
+    }
+
+    fn legacy_transaction(accepted: X402PaymentRequirement) -> X402Transaction {
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted,
+            payload: serde_json::json!({"signature": "0xsig"}),
+            extensions: None,
+        };
+        let mut record = serde_json::to_value(X402Transaction::new(
+            "correlation-1".to_string(),
+            "surface-1".to_string(),
+            "Surface".to_string(),
+            "/".to_string(),
+            payload,
+            "Local".to_string(),
+            None,
+        ))
+        .unwrap();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("payment_requirement_bound");
+        serde_json::from_value(record).unwrap()
+    }
+
+    #[test]
+    fn records_written_before_requirement_binding_read_as_unbound() {
+        assert!(!legacy_transaction(requirement("0xmerchant")).payment_requirement_bound);
+    }
+
+    #[tokio::test]
+    async fn bound_records_settle_as_stored() {
+        let mut transaction = legacy_transaction(requirement("0xcaller"));
+        transaction.payment_requirement_bound = true;
+
+        let payload = settleable_payload(&transaction, None)
+            .await
+            .unwrap();
+
+        assert_eq!(payload.accepted.pay_to, "0xcaller");
+    }
+
+    #[tokio::test]
+    async fn unbound_record_naming_an_issued_requirement_settles_against_it() {
+        let mut accepted = requirement("0xmerchant");
+        accepted.max_timeout_seconds = 1;
+
+        let payload = settleable_payload(&legacy_transaction(accepted), Some(&surface_config()))
+            .await
+            .unwrap();
+
+        assert_eq!(payload.accepted.pay_to, "0xmerchant");
+        assert_eq!(
+            payload
+                .accepted
+                .max_timeout_seconds,
+            300
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_self_payment_does_not_settle() {
+        let error = settleable_payload(&legacy_transaction(requirement("0xcaller")), Some(&surface_config()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Transaction recorded before payment requirement binding: Payment does not match any payment requirement issued for this resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_record_without_a_surface_payment_policy_does_not_settle() {
+        let error = settleable_payload(&legacy_transaction(requirement("0xmerchant")), None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Transaction recorded before payment requirement binding, and its surface has no payment policy"
+        );
+    }
 }

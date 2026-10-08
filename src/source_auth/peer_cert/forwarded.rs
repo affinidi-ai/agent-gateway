@@ -111,7 +111,7 @@ pub async fn forwarded_peer_cert(
     next.run(req).await
 }
 
-fn ip_in_any(
+pub(crate) fn ip_in_any(
     ip: &IpAddr,
     cidrs: &[IpNet],
 ) -> bool {

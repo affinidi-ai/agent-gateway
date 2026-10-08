@@ -606,11 +606,19 @@ empty filters receive an empty acknowledgement followed by graceful completion.
 The owned producer also completes at its configured lifetime and frees its
 registration on body drop.
 
-Direct, Transit, standalone and Fabric subscription responses retain an access
-revision captured before request setup. Persisted surface changes, policy
-refresh/removal, API-key revoke/rotate/delete, JWT strategy mutations/reload,
-credential-provider mutations and explicit vault revocation conservatively
-invalidate existing subscriptions appliance-wide. Policy, strategy and provider
+Direct, Transit, standalone and Fabric subscription responses record the
+surface (or gateway-owned proxy) and tenant they run on, and observe every
+access change made after request setup. Each access change carries a scope, and
+ends only the subscriptions in it:
+
+| Change | Scope |
+|--------|-------|
+| Persisted surface save or delete, surface policy update or removal | That surface; appliance-wide for a policy update on a surface with a response policy, whose engine every surface using that definition shares |
+| Gateway-owned MCP proxy create, delete or closing update; JWT strategy and credential-provider create, update or delete | The resource's tenant; appliance-wide when the resource is appliance-global or moves between tenants |
+| Gateway policy, global policies, JWT strategy reload, API-key revoke/rotate/delete, explicit vault revocation | Appliance-wide |
+
+A subscription that has not recorded its surface, or falls more than 1024
+changes behind, ends on the next change. Policy, strategy and provider
 mutations signal at both start and finish; vault revocation signals inside its
 cancellation-safe mutation task. Reads do not invalidate access. Streams close
 without waiting for upstream activity and must reconnect through current checks.
@@ -1541,8 +1549,8 @@ first over Fabric, the 16-per-caller listen limit cannot be reached there.
 
 **Modern MCP is active on every MCP endpoint, so weigh shared state before
 exposing a multi-tenant or internet-facing gateway.** Gateway-wide tables and
-signals are shared across tenants and peers: subscription invalidation is
-process-wide, the capability offer and Open replay tables have no per-peer or
+signals are shared across tenants and peers: appliance-wide access changes
+still end every subscription, the capability offer and Open replay tables have no per-peer or
 per-tenant caps, and there are no per-tenant limits. Prefer single-tenant or
 trusted deployments, or restrict who can reach MCP endpoints and which peers
 are paired, until these are scoped. See [Fabric: modern MCP activation](FABRIC.md#modern-mcp-activation).
@@ -1745,7 +1753,7 @@ Modern admission validates optional request log levels and string/number progres
 
 ### Discovery, subscriptions and variants
 
-Modern MCP discovery and subscriptions run for admitted modern requests on Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Surface/policy/API-key lifecycle changes invalidate subscriptions conservatively appliance-wide; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
+Modern MCP discovery and subscriptions run for admitted modern requests on Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Access changes end only the subscriptions on the changed surface or tenant, and appliance-wide changes (gateway and global policy, API keys, vault revocation, appliance-global resources) end all; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
 
 JWT strategy mutations/reload, provider mutations and explicit vault revocation also invalidate local subscription lifetimes; vault invalidation remains inside the owned mutation task so cancellation cannot release it early. Reads do not invalidate access. Access Points, Transit Points and independent Fabric receivers capture the configured vault's durable revocation epoch before credential evaluation and recheck it every second, with a one-second read timeout even on quiet streams. Changed, corrupt or unavailable state closes the stream; initial read failure returns correlated `503`. Separate-process local-filesystem tests cover revocation without a local signal. Remote-filesystem visibility, other credential kinds, cross-process configuration changes and full resource-policy conformance remain required.
 

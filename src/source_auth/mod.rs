@@ -9,7 +9,9 @@
 //! - [`errors`]      — `SourceAuthError` / `SourceAuthResult`
 //! - [`middleware`]   — `SourceAuthMiddleware` — the unified authentication gate
 //! - [`mtls`]         — mTLS verification helpers (pure logic; no I/O)
+//! - [`client_ip`]    — the caller's IP for per-client limits, trusting forwarded headers only from trusted proxies
 
+pub mod client_ip;
 pub mod errors;
 pub mod middleware;
 pub mod mtls;

@@ -2,6 +2,7 @@ import {
   AccessTokenCreated,
   AccessTokenMeta,
   Authority,
+  CliLoginRequest,
   CreateAccessTokenRequest,
   DashboardStats,
   Issuer,
@@ -810,6 +811,14 @@ class APIClient {
   async deleteApiKey(agentId: string, keyId: string): Promise<void> {
     await this.request(`/api-keys/${encodeURIComponent(agentId)}/${encodeURIComponent(keyId)}`, {
       method: 'DELETE',
+    });
+  }
+
+  async cliConsent(request: CliLoginRequest): Promise<Response> {
+    return this.fetch('/api/auth/cli/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
     });
   }
 

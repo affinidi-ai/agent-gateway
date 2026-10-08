@@ -538,6 +538,45 @@ that changes may be overwritten by, or break, the managing product. The surface
 builder's "via MCP Proxy" target notes whether the chosen proxy can also be
 reached around the surface.
 
+## x402 Payment Verification
+
+A local x402 paywall verifies a caller's payment against the surface's own `payment_requirements`,
+never against the requirement the credential carries. The credential's `accepted` object must name
+one of the requirements the `402` challenge issued, exactly, in everything verification and
+settlement act on: `scheme`, `network`, `asset`, `payTo`, `amount`, the asset transfer method in
+`extra`, and the EIP-712 `name` and `version` in `extra`. The amount must equal the configured one
+for `upto` as well as `exact`, because an `upto` payer authorises the configured amount as the
+maximum. EVM addresses compare case-insensitively, because the challenge issues them lowercased;
+Solana addresses compare exactly. A credential that names no issued requirement is rejected with
+`400 invalid_payment` before any signature check, chain lookup, facilitator call, or settlement,
+in every `verification_mode` including `mock`, and its transaction record is marked failed. A
+surface with x402 enabled and no `payment_requirements` accepts no payment. Beyond that match,
+`mock` skips every signature, chain, and facilitator check, so it grants access for an unpaid
+credential; it is for tests only and must not be used in production.
+
+Every check takes its expected values from the resolved requirement: the recipient, amount, token,
+asset transfer method, and EIP-712 domain. A requirement checked by signature therefore needs
+`extra.assetTransferMethod` (`eip3009` or `permit2`), and an EIP-3009 one also needs `extra.name`
+and `extra.version`; clients no longer supply them. Signature checks require the authorised value
+to equal the configured amount. Solana transaction-hash verification checks native SOL lamports
+only and refuses a requirement for an SPL token, which must use `spl_transfer`. An embedded or
+external facilitator receives the resolved requirement as `paymentRequirements` next to the
+caller's `paymentPayload.accepted`, so the facilitator's own requirement match also applies.
+
+The transaction record and every settlement path (immediate, deferred, startup recovery, and
+fabric) use the payload with `accepted` replaced by the resolved requirement. A record written by
+an earlier build carries the caller's own `accepted`: the deferred worker and startup recovery
+settle it only if that still resolves to one of the surface's current requirements, and otherwise
+mark its settlement failed.
+
+In `fabric_gateway` verification mode, the requesting gateway resolves the requirement and sends it
+as `payment_requirement` in the `x402/verify-request` body. The facilitator gateway verifies against
+that requirement and rejects a verify-request that does not carry one. A facilitator gateway trusts
+its fabric peers: it verifies against the requirement a peer sends, and settles the payload a peer
+sends in `x402/settle-request` as it is. Upgrade requesting gateways first. An upgraded requester
+binds the payment, including its EIP-712 domain, before a facilitator on an earlier build sees it;
+an upgraded facilitator rejects every verify-request from a requester on an earlier build.
+
 ## AP2 Limitation
 
 AP2 is controlled by `feature_flags.ap2_experimental`, which defaults to off. When disabled, an AP2

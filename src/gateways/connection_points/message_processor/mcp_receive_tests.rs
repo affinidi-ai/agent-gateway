@@ -1517,6 +1517,8 @@ async fn fabric_consent_flow() {
         surface.target.payment_policy = Some(
             serde_json::from_value(json!({
                 "type": "x402", "enabled": true, "verification_mode": "mock", "settlement_mode": "none",
+                "payment_requirements": [{"scheme": "exact", "network": "eip155:1", "amount": "1000",
+                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300}],
                 "mcp_payment_triggers": {"mode": "all"}
             }))
             .unwrap(),

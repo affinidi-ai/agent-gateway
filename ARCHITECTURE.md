@@ -300,6 +300,7 @@ Breaking one of these is a correctness bug, not a style question.
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
+| x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 
 ## Module map
 
@@ -374,7 +375,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`auth/`](src/auth/), [`auth_manager/`](src/auth_manager/) | Dashboard login: passkey and SAML, sessions | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#samljson), [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md#gating-the-session) |
+| [`auth/`](src/auth/), [`auth_manager/`](src/auth_manager/) | Dashboard login: passkey and SAML, sessions, and `fabric` CLI browser login (in-memory single-use codes, so one gateway instance) | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#samljson), [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md#cli-browser-login), [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md#gating-the-session) |
 | [`rbac/`](src/rbac/) | Management API role enforcement | [`RBAC.md`](docs/RBAC.md) |
 | [`access_tokens/`](src/access_tokens/) | Management PATs, delegation, resource patterns | [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md) |
 | [`tenancy/`](src/tenancy/) | Tenant context and record ownership | [`ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md) |

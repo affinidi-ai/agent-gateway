@@ -12,6 +12,7 @@ jest.mock('./api', () => ({
 jest.mock('./pages/LoginPage', () => () => <div data-testid="mock-login" />);
 jest.mock('./pages/AuthenticatedApp', () => () => <div data-testid="mock-authenticated" />);
 jest.mock('./pages/TermsConsentPage', () => () => <div data-testid="mock-terms-consent" />);
+jest.mock('./pages/CliConsentPage', () => () => <div data-testid="mock-cli-consent" />);
 
 test('moves an authenticated app into consent state after a protected API rejection', async () => {
   (apiClient.fetch as jest.Mock).mockResolvedValue(
@@ -45,4 +46,20 @@ test('blocks an authenticated app after a runtime Terms operational failure', as
 
   expect(await screen.findByTestId('page-terms-operational-error')).toBeInTheDocument();
   expect(screen.queryByTestId('mock-authenticated')).not.toBeInTheDocument();
+});
+
+test('shows the CLI consent page instead of the dashboard on the consent route', async () => {
+  (apiClient.fetch as jest.Mock).mockResolvedValue(
+    new Response(JSON.stringify({ authenticated: true, consent_required: false }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  );
+  window.history.pushState({}, '', '/cli-consent');
+
+  render(<App />);
+
+  expect(await screen.findByTestId('mock-cli-consent')).toBeInTheDocument();
+  expect(screen.queryByTestId('mock-authenticated')).not.toBeInTheDocument();
+  window.history.pushState({}, '', '/');
 });

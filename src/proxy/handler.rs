@@ -2085,6 +2085,16 @@ async fn proxy_handler_with_mcp_runtime(
             return Ok(crate::mcp::subscriptions::listen_limit_error(request).into_response());
         };
         subscription_access.hold(slot);
+        subscription_access.record_owner(
+            state
+                .surface
+                .surface_id
+                .clone(),
+            state
+                .surface
+                .tenant_id
+                .as_deref(),
+        );
         if let Some(vault) = &state.delegation_vault_store
             && subscription_access
                 .watch_vault(vault.clone())
@@ -17427,6 +17437,8 @@ mod tests {
         surface.target.payment_policy = Some(
             serde_json::from_value(json!({
                 "type": "x402", "enabled": true, "verification_mode": "mock", "settlement_mode": "none",
+                "payment_requirements": [{"scheme": "exact", "network": "eip155:1", "amount": "1000",
+                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300}],
                 "mcp_payment_triggers": {"mode": "all"}
             }))
             .unwrap(),

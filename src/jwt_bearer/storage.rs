@@ -105,7 +105,8 @@ impl FileSystemJwtVerificationStrategyStore {
     /// Safe to call from a hot-reload watcher.
     #[allow(dead_code)]
     pub async fn reload(&self) -> Result<()> {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change =
+            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::Appliance);
         info!("Reloading JWT verification strategy store from disk");
         self.storage
             .refresh_from_disk()
@@ -124,7 +125,9 @@ impl JwtVerificationStrategyStorage for FileSystemJwtVerificationStrategyStore {
         strategy.created_at = now;
         strategy.updated_at = now;
 
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change = crate::mcp::subscriptions::AccessChange::begin(
+            crate::mcp::subscriptions::AccessScope::owned_by(strategy.tenant_id.as_deref()),
+        );
         self.storage
             .save(&strategy)
             .await?;
@@ -166,7 +169,11 @@ impl JwtVerificationStrategyStorage for FileSystemJwtVerificationStrategyStore {
         strategy.created_at = existing.created_at;
         strategy.updated_at = Utc::now();
 
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change =
+            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::reowned(
+                existing.tenant_id.as_deref(),
+                strategy.tenant_id.as_deref(),
+            ));
         self.storage
             .save(&strategy)
             .await?;
@@ -178,7 +185,13 @@ impl JwtVerificationStrategyStorage for FileSystemJwtVerificationStrategyStore {
         &self,
         id: &str,
     ) -> Result<()> {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let existing = self.storage.get(id).await?;
+        let _access_change =
+            crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::owned_by(
+                existing
+                    .as_ref()
+                    .and_then(|strategy| strategy.tenant_id.as_deref()),
+            ));
         self.storage
             .delete(id)
             .await?;

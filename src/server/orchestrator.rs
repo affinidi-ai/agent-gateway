@@ -938,6 +938,7 @@ pub async fn run_axum_proxy(
                 // Worker checks facilitator_gateway_id to determine what to settle
                 info!("Starting crash recovery for unsettled payments...");
                 let txn_store_rec = Arc::clone(&store_arc);
+                let recovery_bootstrap_config = Arc::clone(&bootstrap_config);
                 let facilitator_enabled = config
                     .facilitator_mode
                     .facilitator_via_fabric
@@ -947,7 +948,7 @@ pub async fn run_axum_proxy(
                 tokio::spawn(async move {
                     crate::x402::recover_unsettled_on_startup(
                         txn_store_rec,
-                        None, // No settlement_backend needed
+                        recovery_bootstrap_config,
                         facilitator_enabled,
                     )
                     .await;
@@ -1517,6 +1518,11 @@ pub async fn run_axum_proxy(
                     )
                 })?;
 
+                crate::source_auth::client_ip::warn_if_login_throttle_shares_one_limit(
+                    "login_throttle",
+                    &saml_config.login_throttle,
+                    &network_config.client_ip,
+                );
                 match initialize_saml_state(&bootstrap_config, &saml_config, terms_manager.clone()).await {
                     Ok(state) => {
                         info!("SAML authentication enabled with IdP: {}", saml_config.idp_entity_id);
@@ -4409,6 +4415,9 @@ async fn initialize_saml_state(
         avatars_storage_path: avatars_path,
         notification_store,
         terms_manager,
+        login_throttle: Arc::new(crate::sts::throttle::TokenEndpointThrottle::per_client_ip(
+            &saml_config.login_throttle,
+        )),
     })
 }
 

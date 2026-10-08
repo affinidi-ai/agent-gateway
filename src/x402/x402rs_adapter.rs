@@ -5,8 +5,8 @@
 //!
 //! ## Type Conversions
 //!
-//! - `to_verify_request()` - Convert PaymentPayload → x402-rs VerifyRequest
-//! - `to_settle_request()` - Convert PaymentPayload → x402-rs SettleRequest
+//! - `to_verify_request()` - Convert PaymentPayload + resolved requirement → x402-rs VerifyRequest
+//! - `to_settle_request()` - Convert a bound PaymentPayload → x402-rs SettleRequest
 //!
 //! ## Response Parsing
 //!
@@ -19,11 +19,18 @@
 //! - `extract_settle_error()` - Get settlement error reason
 
 use super::PaymentPayload;
+use crate::config::types::X402PaymentRequirement;
 use tracing::info;
 use x402_types::proto;
 
-/// Convert our internal PaymentPayload to x402-rs VerifyRequest
-pub fn to_verify_request(payload: &PaymentPayload) -> Result<proto::VerifyRequest, String> {
+/// Convert our internal PaymentPayload to x402-rs VerifyRequest.
+///
+/// `payment_requirements` is the surface requirement verification resolved for this payment,
+/// so the facilitator checks the caller's `accepted` against it.
+pub fn to_verify_request(
+    payload: &PaymentPayload,
+    payment_requirements: &X402PaymentRequirement,
+) -> Result<proto::VerifyRequest, String> {
     info!(
         "[x402-adapter] Converting PaymentPayload to VerifyRequest: network={}, scheme={}",
         payload.accepted.network, payload.accepted.scheme
@@ -48,16 +55,14 @@ pub fn to_verify_request(payload: &PaymentPayload) -> Result<proto::VerifyReques
     // WORKAROUND: Use wallets that don't automatically add compute budget instructions, or wait for
     // x402-chain-solana SDK update to whitelist these standard Solana instructions.
 
-    // Ensure asset field is in payload for SDK (copy from accepted if missing)
+    // Ensure asset field is in payload for SDK (copy from the payment requirement if missing)
     #[allow(clippy::nonminimal_bool)]
     if normalized_payload
         .payload
         .get("asset")
         .is_none()
     {
-        let asset = &normalized_payload
-            .accepted
-            .asset;
+        let asset = &payment_requirements.asset;
         normalized_payload
             .payload
             .as_object_mut()
@@ -78,11 +83,6 @@ pub fn to_verify_request(payload: &PaymentPayload) -> Result<proto::VerifyReques
             .accepted
             .network
     );
-
-    // Clone the accepted requirements before moving normalized_payload
-    let payment_requirements = normalized_payload
-        .accepted
-        .clone();
 
     // Build the correct structure based on protocol version
     let wrapped = if x402_version == 1 {
@@ -131,11 +131,13 @@ pub fn to_verify_request(payload: &PaymentPayload) -> Result<proto::VerifyReques
     Ok(proto::VerifyRequest::from(raw))
 }
 
-/// Convert our internal PaymentPayload to x402-rs SettleRequest
+/// Convert our internal PaymentPayload to x402-rs SettleRequest.
+///
+/// `payload` is the one verification returned, whose `accepted` is the surface requirement it
+/// was bound to.
 pub fn to_settle_request(payload: &PaymentPayload) -> Result<proto::SettleRequest, String> {
-    // SettleRequest is the same as VerifyRequest in x402-rs
     info!("[x402-adapter] Converting PaymentPayload to SettleRequest: network={}", payload.accepted.network);
-    to_verify_request(payload)
+    to_verify_request(payload, &payload.accepted)
 }
 
 /// Extract payer address from VerifyResponse
@@ -217,30 +219,54 @@ pub fn extract_settle_error(response: &proto::SettleResponse) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::X402PaymentRequirement;
 
-    #[test]
-    fn test_payment_payload_conversion() {
-        // Test basic conversion functionality
-        let payload = PaymentPayload {
+    fn requirement(
+        pay_to: &str,
+        amount: &str,
+    ) -> X402PaymentRequirement {
+        X402PaymentRequirement {
+            scheme: "exact".to_string(),
+            network: "eip155:8453".to_string(),
+            amount: amount.to_string(),
+            asset: "0xtoken".to_string(),
+            recipient_id: String::new(),
+            pay_to: pay_to.to_string(),
+            max_timeout_seconds: 300,
+            extra: None,
+        }
+    }
+
+    fn payload(accepted: X402PaymentRequirement) -> PaymentPayload {
+        PaymentPayload {
             x402_version: 2,
             resource: None,
-            accepted: X402PaymentRequirement {
-                scheme: "exact".to_string(),
-                network: "eip155:8453".to_string(),
-                amount: "1000000".to_string(),
-                asset: "0x...".to_string(),
-                recipient_id: String::new(),
-                pay_to: "0x...".to_string(),
-                max_timeout_seconds: 300,
-                extra: None,
-            },
-            payload: serde_json::json!({}),
+            accepted,
+            payload: serde_json::json!({"signature": "0xsig"}),
             extensions: None,
-        };
+        }
+    }
 
-        // This should succeed or fail gracefully
-        let result = to_verify_request(&payload);
-        assert!(result.is_ok() || result.is_err());
+    #[test]
+    fn verify_request_carries_resolved_requirement_not_caller_accepted() {
+        let caller = payload(requirement("0xcaller", "1"));
+        let configured = requirement("0xmerchant", "1000000");
+
+        let request = serde_json::to_value(to_verify_request(&caller, &configured).unwrap()).unwrap();
+
+        assert_eq!(request["paymentRequirements"]["payTo"], "0xmerchant");
+        assert_eq!(request["paymentRequirements"]["amount"], "1000000");
+        assert_eq!(request["paymentPayload"]["accepted"]["payTo"], "0xcaller");
+        assert_eq!(request["paymentPayload"]["accepted"]["amount"], "1");
+        assert_eq!(request["paymentPayload"]["payload"]["asset"], "0xtoken");
+    }
+
+    #[test]
+    fn settle_request_uses_bound_accepted_as_requirement() {
+        let bound = payload(requirement("0xmerchant", "1000000"));
+
+        let request = serde_json::to_value(to_settle_request(&bound).unwrap()).unwrap();
+
+        assert_eq!(request["paymentRequirements"], request["paymentPayload"]["accepted"]);
+        assert_eq!(request["paymentRequirements"]["payTo"], "0xmerchant");
     }
 }

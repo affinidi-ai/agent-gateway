@@ -398,7 +398,8 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     ) -> Result<bool> {
         let id = id.to_string();
         self.mutate(move |store| async move {
-            let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+            let _access_change =
+                crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::Appliance);
             store
                 .revoke_pending_consents()
                 .await?;
@@ -433,7 +434,8 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     ) -> Result<usize> {
         let user_identity_hash = user_identity_hash.to_string();
         self.mutate(move |store| async move {
-            let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+            let _access_change =
+                crate::mcp::subscriptions::AccessChange::begin(crate::mcp::subscriptions::AccessScope::Appliance);
             store
                 .revoke_pending_consents()
                 .await?;

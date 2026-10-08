@@ -25,6 +25,7 @@ The bootstrap TOML is the entry point. Everything else is named from it.
 | `saml.json` | SAML identity provider, when `auth_mode = "saml"` | Startup |
 | `x402.json` | x402 payment networks, assets, and facilitator settings | Startup |
 | `x402-proxy.json` | Networks and wallets for the x402 proxy | Startup |
+| `test-endpoints.json` | Payment requirements for the x402 test endpoints, when `facilitator_mode.enable_test_endpoints` is on | Startup |
 | `agent_surface_templates/` | Surface templates seeded into the template store | Startup |
 
 **No configuration file is re-read after startup.** `POST /v1/config/reload` rebuilds the
@@ -171,6 +172,8 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `webauthn` | Relying-party ID and external origin for passkey registration |
 | `integration` | Notification and webhook integration settings |
 | `sts` | Security Token Service runtime settings. See [`STS.md`](STS.md). |
+| `cli_login_throttle` | Optional per-client-IP limit on each `fabric` CLI login endpoint: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds). Behind a load balancer, set `client_ip.trusted_proxies` first. |
+| `client_ip` | `trusted_proxies`: proxy CIDRs whose `X-Forwarded-For` gives the client IP for the SAML and CLI login limits (default empty, so the TCP peer is the client). Each listed proxy must append the address it saw to `X-Forwarded-For` or overwrite it; `Forwarded` is read only when `X-Forwarded-For` is absent. Separate from `tls.client_auth.trusted_proxies`. |
 | `facilitator_mode` | x402 facilitator behaviour |
 | `cors` | Permitted dashboard origins |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
@@ -270,6 +273,7 @@ Read when `auth_mode = "saml"`. Ignored otherwise.
 | Identity provider | `idp_entity_id`, `idp_sso_url`, `idp_slo_url`, `idp_cert_path` |
 | Service provider | `sp_entity_id`, `sp_acs_url`, `sp_key_path`, `sp_cert_path` |
 | Security | `sign_requests`, `require_encrypted_assertions` |
+| Sign-in throttle | `login_throttle`: `enabled` (default `false`) and `per_ip` `{requests, window_secs}` (default 20 per 60 seconds) per client IP for `/saml/login`. Behind a load balancer, set `client_ip.trusted_proxies` in `gateway.json` first. |
 | Claims | `attribute_mapping` from SAML claim URI to user field |
 | Roles | `role_mapping` from identity-provider role to gateway role |
 | Directory | `graph_api` for Microsoft Entra ID group and profile lookup |
@@ -294,6 +298,14 @@ logs a warning and starts neither.
 
 Transaction records are always kept on the filesystem; other keys in these sections are
 ignored.
+
+`test-endpoints.json` (`[config_files].test_endpoints`) feeds the unauthenticated x402 test
+endpoints, which are mounted only when `facilitator_mode.enable_test_endpoints` is on. Its `evm`,
+`solana_devnet`, and `solana_mainnet` entries each give a `network`, `rpc_endpoint`,
+`token_address`, `recipient`, and `amount`; each endpoint issues and verifies against one `exact`
+requirement built from them. The `evm` entry also takes `payment_method`, and optional `token_name`
+and `token_version`, issued as the EIP-712 `extra.name` and `extra.version` that `/protected`
+(EIP-3009) needs.
 
 Both reach live payment infrastructure. A network entry pointing at mainnet moves real
 value. The demo scripts and a worked walkthrough are in

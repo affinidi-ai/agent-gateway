@@ -4336,6 +4336,7 @@ async fn process_forward_request_with_mcp_runtime(
             return axum_response_to_forward_result(crate::mcp::subscriptions::listen_limit_error(request).into_response()).await;
         };
         subscription_access.hold(slot);
+        subscription_access.record_owner(surface.surface_id.clone(), surface.tenant_id.as_deref());
         if let Some(vault) = get_delegation_vault_store()
             && subscription_access.watch_vault(vault).await.is_err()
         {
@@ -8071,12 +8072,62 @@ async fn handle_mcp_proxy_forward(
     }
 }
 
+/// The x402 config a fabric verify-request is verified with: the requesting gateway resolved the
+/// payment to one of its surface's payment requirements and sent it as `payment_requirement`, so
+/// that requirement, not this gateway's x402.json, is the only one the payment can match.
+fn x402_verify_request_config(
+    config: crate::config::types::X402Config,
+    body: &serde_json::Value,
+) -> Option<crate::config::types::X402Config> {
+    let payment_requirement = serde_json::from_value(
+        body.get("payment_requirement")?
+            .clone(),
+    )
+    .ok()?;
+    Some(crate::config::types::X402Config {
+        payment_requirements: vec![payment_requirement],
+        ..config
+    })
+}
+
 /// Process x402 verify-request message
 /// When acting as a facilitator, verify payment for another gateway
 #[instrument(skip(message), fields(message_id = %message.id))]
 async fn process_x402_verify_request(message: &ReceivedMessage) -> ProcessingResult {
     info!("📥 Processing x402 verify-request from {:?}", message.from_did);
 
+    // Check if fabric facilitator is enabled at gateway level
+    if let Some(facilitator_mode) = GLOBAL_FACILITATOR_MODE.get() {
+        if !facilitator_mode.facilitator_via_fabric {
+            warn!("Fabric facilitator not enabled on this gateway, rejecting verification request");
+            return ProcessingResult::RequiresResponse {
+                response_type: MessageType::X402VerifyResponse.to_string(),
+                response_body: serde_json::json!({
+                    "valid": false,
+                    "error": "Fabric facilitator not enabled on this gateway"
+                }),
+            };
+        }
+    } else {
+        warn!("Facilitator mode not initialized, rejecting verification request");
+        return ProcessingResult::RequiresResponse {
+            response_type: MessageType::X402VerifyResponse.to_string(),
+            response_body: serde_json::json!({
+                "valid": false,
+                "error": "Facilitator mode not configured on this gateway"
+            }),
+        };
+    }
+
+    verify_x402_request(message, get_transaction_store()).await
+}
+
+/// Verify a fabric peer's x402 verify-request against the payment requirement it sent, recording
+/// the transaction in `transaction_store`
+async fn verify_x402_request(
+    message: &ReceivedMessage,
+    transaction_store: Option<Arc<crate::x402::TransactionStore>>,
+) -> ProcessingResult {
     // Get x402 configuration from context
     let config = match message
         .context
@@ -8107,29 +8158,6 @@ async fn process_x402_verify_request(message: &ReceivedMessage) -> ProcessingRes
         }
     };
 
-    // Check if fabric facilitator is enabled at gateway level
-    if let Some(facilitator_mode) = GLOBAL_FACILITATOR_MODE.get() {
-        if !facilitator_mode.facilitator_via_fabric {
-            warn!("Fabric facilitator not enabled on this gateway, rejecting verification request");
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402VerifyResponse.to_string(),
-                response_body: serde_json::json!({
-                    "valid": false,
-                    "error": "Fabric facilitator not enabled on this gateway"
-                }),
-            };
-        }
-    } else {
-        warn!("Facilitator mode not initialized, rejecting verification request");
-        return ProcessingResult::RequiresResponse {
-            response_type: MessageType::X402VerifyResponse.to_string(),
-            response_body: serde_json::json!({
-                "valid": false,
-                "error": "Facilitator mode not configured on this gateway"
-            }),
-        };
-    }
-
     // Extract request fields from message body
     let body = &message.message_body;
 
@@ -8151,6 +8179,20 @@ async fn process_x402_verify_request(message: &ReceivedMessage) -> ProcessingRes
                 response_body: serde_json::json!({
                     "valid": false,
                     "error": "Missing payment_signature field"
+                }),
+            };
+        }
+    };
+
+    let config = match x402_verify_request_config(config, body) {
+        Some(config) => config,
+        None => {
+            error!("Missing or invalid payment_requirement in verify-request");
+            return ProcessingResult::RequiresResponse {
+                response_type: MessageType::X402VerifyResponse.to_string(),
+                response_body: serde_json::json!({
+                    "valid": false,
+                    "error": "Missing or invalid payment_requirement field"
                 }),
             };
         }
@@ -8196,9 +8238,9 @@ async fn process_x402_verify_request(message: &ReceivedMessage) -> ProcessingRes
         &channel_id,
         &channel_id,
         &resource,
-        None,                    // No listener manager - verify locally
-        get_transaction_store(), // Creates transaction with correlation_id=tx_hash
-        None,                    // No existing correlation_id - will use tx_hash from payment
+        None,                      // No listener manager - verify locally
+        transaction_store.clone(), // Creates transaction with correlation_id=tx_hash
+        None,                      // No existing correlation_id - will use tx_hash from payment
     )
     .await
     {
@@ -8207,7 +8249,7 @@ async fn process_x402_verify_request(message: &ReceivedMessage) -> ProcessingRes
 
             // Update transaction to set facilitator_gateway_id to the requesting gateway (message sender)
             // This allows GW2 to send settlement-complete notification back to GW1 after settling
-            if let Some(store) = get_transaction_store() {
+            if let Some(store) = &transaction_store {
                 // Set facilitator_gateway_id to the requesting gateway's ID
                 let requesting_gateway_id = message.gateway_id.clone();
                 info!("Setting requesting_gateway_id={} for transaction {}", requesting_gateway_id, correlation_id);
@@ -8223,7 +8265,7 @@ async fn process_x402_verify_request(message: &ReceivedMessage) -> ProcessingRes
 
             // GW2 should create settlement stage after successful verification
             // Settlement mode determines whether to settle immediately or defer
-            if let Some(store) = get_transaction_store() {
+            if let Some(store) = transaction_store {
                 let settlement_mode_str = format!("{:?}", config.settlement_mode).to_lowercase();
 
                 match config.settlement_mode {
@@ -10843,5 +10885,97 @@ mod tests {
             }
             other => panic!("expected OOBConnectionSetup, got {other:?}"),
         }
+    }
+
+    fn x402_requirement(pay_to: &str) -> crate::config::types::X402PaymentRequirement {
+        crate::config::types::X402PaymentRequirement {
+            scheme: "exact".to_string(),
+            network: "eip155:1".to_string(),
+            amount: "1000".to_string(),
+            asset: "0x123".to_string(),
+            recipient_id: String::new(),
+            pay_to: pay_to.to_string(),
+            max_timeout_seconds: 300,
+            extra: None,
+        }
+    }
+
+    async fn x402_verify_request(body: serde_json::Value) -> serde_json::Value {
+        let mut message = make_handshake_msg(MessageType::X402VerifyRequest.as_str(), None, body);
+        message.context.insert(
+            "x402_config".to_string(),
+            serde_json::to_value(crate::config::types::X402Config {
+                verification_mode: crate::config::types::X402VerificationMode::Mock,
+                settlement_mode: crate::config::types::X402SettlementMode::None,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        match verify_x402_request(&message, None).await {
+            ProcessingResult::RequiresResponse { response_body, .. } => response_body,
+            other => panic!("expected RequiresResponse, got {other:?}"),
+        }
+    }
+
+    fn x402_payment_signature(
+        accepted: &crate::config::types::X402PaymentRequirement,
+        nonce: &str,
+    ) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "x402Version": 2,
+                "accepted": accepted,
+                "payload": {"signature": "0xsig", "nonce": nonce}
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn x402_requester_body(
+        accepted: &crate::config::types::X402PaymentRequirement,
+        nonce: &str,
+    ) -> serde_json::Value {
+        crate::x402::gateway_facilitator_service::verify_request_body(
+            "verification-1",
+            &x402_payment_signature(accepted, nonce),
+            &x402_requirement("0x456"),
+            "surface-1",
+            "/resource/surface-1",
+        )
+    }
+
+    #[test]
+    fn x402_requester_body_carries_the_resolved_requirement() {
+        let body = x402_requester_body(&x402_requirement("0x456"), "body");
+
+        assert_eq!(body["payment_requirement"], serde_json::to_value(x402_requirement("0x456")).unwrap());
+        assert_eq!(body["network"], "eip155:1");
+        assert_eq!(body["channel_id"], "surface-1");
+    }
+
+    #[tokio::test]
+    async fn x402_verify_request_refuses_missing_or_invalid_payment_requirement() {
+        let signature = x402_payment_signature(&x402_requirement("0x456"), "no-requirement");
+        for body in [
+            serde_json::json!({"payment_signature": signature}),
+            serde_json::json!({"payment_signature": signature, "payment_requirement": {"payTo": "0x456"}}),
+        ] {
+            let response = x402_verify_request(body.clone()).await;
+
+            assert_eq!(response["valid"], false, "{body}");
+            assert_eq!(response["error"], "Missing or invalid payment_requirement field", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn x402_verify_request_binds_to_the_requesters_requirement() {
+        let rejected = x402_verify_request(x402_requester_body(&x402_requirement("0xbad"), "self-payment")).await;
+        let accepted = x402_verify_request(x402_requester_body(&x402_requirement("0x456"), "honest")).await;
+
+        assert_eq!(rejected["valid"], false);
+        assert_eq!(rejected["error"], "Payment does not match any payment requirement issued for this resource");
+        assert_eq!(accepted["valid"], true);
+        assert_eq!(accepted["payment"]["accepted"]["payTo"], "0x456");
     }
 }

@@ -52,7 +52,9 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         self.storage
             .save(surface)
             .await?;
-        crate::mcp::subscriptions::invalidate_access();
+        crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
+            surface.surface_id.clone(),
+        ));
         Ok(())
     }
 
@@ -76,7 +78,9 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         self.storage
             .delete(surface_id)
             .await?;
-        crate::mcp::subscriptions::invalidate_access();
+        crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
+            surface_id.to_string(),
+        ));
         Ok(())
     }
 }

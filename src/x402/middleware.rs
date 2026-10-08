@@ -4,7 +4,9 @@ use axum::response::Response;
 use std::sync::Arc;
 
 use super::{PaymentPayload, PaymentRequired, create_payment_response, settle_payment, verify_payment};
-use crate::config::types::{ChannelProtocol, McpPaymentTriggers, X402Config, X402SettlementMode};
+use crate::config::types::{
+    ChannelProtocol, McpPaymentTriggers, X402Config, X402PaymentRequirement, X402SettlementMode,
+};
 use crate::{channel_info, channel_warn};
 
 /// Fallback bound applied to Immediate-mode settlement when
@@ -386,129 +388,6 @@ pub async fn process_payment(
             }
         }
         None => {
-            // No payment provided - return 402 with requirements
-            // Normalize addresses to lowercase for EVM chains (case-insensitive hex)
-            // Keep original case for Solana (case-sensitive base58)
-            // Add feePayer to extra field for Solana networks
-            // Add decimals and symbol to extra field from x402.json token configuration
-
-            // Get global config to access facilitator addresses
-            let global_config = super::config_cache::get_or_load_x402_config()
-                .await
-                .ok();
-
-            // Get cached x402 metadata for token decimals and symbols
-            // This is loaded at startup from x402.json
-            let x402_json_config = super::config_cache::get_x402_metadata().await;
-
-            let normalized_requirements: Vec<_> = config
-                .payment_requirements
-                .iter()
-                .map(|req| {
-                    let mut normalized = req.clone();
-                    // Only lowercase addresses for EVM chains (eip155:*)
-                    // Solana addresses are case-sensitive base58, so preserve them
-                    if normalized
-                        .network
-                        .starts_with("eip155:")
-                    {
-                        // Lowercase asset address (ERC20 token)
-                        normalized.asset = normalized
-                            .asset
-                            .to_lowercase();
-                        // Lowercase recipient address
-                        normalized.pay_to = normalized
-                            .pay_to
-                            .to_lowercase();
-                    }
-
-                    // For Solana networks, add feePayer to extra field
-                    if normalized
-                        .network
-                        .starts_with("solana:")
-                        && let Some(ref global) = global_config
-                        && let Some(ref keys) = global.facilitator_private_keys
-                        && let Some(key_info) = keys.get(&normalized.network)
-                    {
-                        // Add feePayer to extra field
-                        let mut extra = normalized
-                            .extra
-                            .clone()
-                            .unwrap_or_else(|| serde_json::json!({}));
-                        if let Some(extra_obj) = extra.as_object_mut() {
-                            extra_obj.insert("feePayer".to_string(), serde_json::json!(key_info.address));
-                            normalized.extra = Some(extra);
-                        }
-                    }
-
-                    // Add decimals and symbol from x402.json token configuration
-                    if let Some(ref x402_config) = x402_json_config {
-                        // Find matching network
-                        for x402_network in &x402_config.networks {
-                            if x402_network.id == normalized.network {
-                                tracing::debug!(
-                                    "[x402] Found matching network: {} with {} tokens",
-                                    x402_network.id,
-                                    x402_network.x402_tokens.len()
-                                );
-                                // Find matching token
-                                for token in &x402_network.x402_tokens {
-                                    // Case-insensitive comparison for EVM addresses, case-sensitive for Solana
-                                    let addresses_match = if normalized
-                                        .network
-                                        .starts_with("eip155:")
-                                    {
-                                        token
-                                            .contract_address
-                                            .to_lowercase()
-                                            == normalized
-                                                .asset
-                                                .to_lowercase()
-                                    } else {
-                                        token.contract_address == normalized.asset
-                                    };
-
-                                    if addresses_match {
-                                        tracing::info!(
-                                            "[x402] Matched token {} ({}) for asset {} on network {}",
-                                            token.symbol,
-                                            token.contract_address,
-                                            normalized.asset,
-                                            normalized.network
-                                        );
-                                        let mut extra = normalized
-                                            .extra
-                                            .clone()
-                                            .unwrap_or_else(|| serde_json::json!({}));
-                                        if let Some(extra_obj) = extra.as_object_mut() {
-                                            extra_obj.insert("decimals".to_string(), serde_json::json!(token.decimals));
-                                            extra_obj.insert("symbol".to_string(), serde_json::json!(token.symbol));
-                                            normalized.extra = Some(extra);
-                                            tracing::info!(
-                                                "[x402] Enriched payment requirement with symbol={}, decimals={}",
-                                                token.symbol,
-                                                token.decimals
-                                            );
-                                        }
-                                        break;
-                                    } else {
-                                        tracing::debug!(
-                                            "[x402] Token {} ({}) did not match asset {}",
-                                            token.symbol,
-                                            token.contract_address,
-                                            normalized.asset
-                                        );
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-
-                    normalized
-                })
-                .collect();
-
             let payment_required = PaymentRequired {
                 x402_version: 2,
                 error: Some("Payment required".to_string()),
@@ -517,7 +396,7 @@ pub async fn process_payment(
                     description: "Access to this resource requires payment".to_string(),
                     mime_type: "application/json".to_string(),
                 },
-                accepts: normalized_requirements,
+                accepts: issued_payment_requirements(config).await,
                 extensions: None,
             };
 
@@ -526,6 +405,130 @@ pub async fn process_payment(
             Err(super::create_402_response(payment_required, &x402_headers.payment_required))
         }
     }
+}
+
+/// Lowercase the asset and recipient of an EVM (`eip155:*`) requirement; EVM hex addresses are
+/// case-insensitive, while Solana base58 addresses are case-sensitive and kept as configured.
+pub(crate) fn normalize_requirement_addresses(requirement: &mut X402PaymentRequirement) {
+    if requirement
+        .network
+        .starts_with("eip155:")
+    {
+        requirement.asset = requirement
+            .asset
+            .to_lowercase();
+        requirement.pay_to = requirement
+            .pay_to
+            .to_lowercase();
+    }
+}
+
+/// The surface's payment requirements as the 402 challenge issues them: EVM addresses
+/// lowercased, Solana requirements given the facilitator `feePayer`, and token `decimals` and
+/// `symbol` added from the x402.json token metadata.
+pub(crate) async fn issued_payment_requirements(config: &X402Config) -> Vec<X402PaymentRequirement> {
+    // Get global config to access facilitator addresses
+    let global_config = super::config_cache::get_or_load_x402_config()
+        .await
+        .ok();
+
+    // Get cached x402 metadata for token decimals and symbols
+    // This is loaded at startup from x402.json
+    let x402_json_config = super::config_cache::get_x402_metadata().await;
+
+    config
+        .payment_requirements
+        .iter()
+        .map(|req| {
+            let mut normalized = req.clone();
+            normalize_requirement_addresses(&mut normalized);
+
+            // For Solana networks, add feePayer to extra field
+            if normalized
+                .network
+                .starts_with("solana:")
+                && let Some(ref global) = global_config
+                && let Some(ref keys) = global.facilitator_private_keys
+                && let Some(key_info) = keys.get(&normalized.network)
+            {
+                // Add feePayer to extra field
+                let mut extra = normalized
+                    .extra
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if let Some(extra_obj) = extra.as_object_mut() {
+                    extra_obj.insert("feePayer".to_string(), serde_json::json!(key_info.address));
+                    normalized.extra = Some(extra);
+                }
+            }
+
+            // Add decimals and symbol from x402.json token configuration
+            if let Some(ref x402_config) = x402_json_config {
+                // Find matching network
+                for x402_network in &x402_config.networks {
+                    if x402_network.id == normalized.network {
+                        tracing::debug!(
+                            "[x402] Found matching network: {} with {} tokens",
+                            x402_network.id,
+                            x402_network.x402_tokens.len()
+                        );
+                        // Find matching token
+                        for token in &x402_network.x402_tokens {
+                            // Case-insensitive comparison for EVM addresses, case-sensitive for Solana
+                            let addresses_match = if normalized
+                                .network
+                                .starts_with("eip155:")
+                            {
+                                token
+                                    .contract_address
+                                    .to_lowercase()
+                                    == normalized
+                                        .asset
+                                        .to_lowercase()
+                            } else {
+                                token.contract_address == normalized.asset
+                            };
+
+                            if addresses_match {
+                                tracing::info!(
+                                    "[x402] Matched token {} ({}) for asset {} on network {}",
+                                    token.symbol,
+                                    token.contract_address,
+                                    normalized.asset,
+                                    normalized.network
+                                );
+                                let mut extra = normalized
+                                    .extra
+                                    .clone()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                if let Some(extra_obj) = extra.as_object_mut() {
+                                    extra_obj.insert("decimals".to_string(), serde_json::json!(token.decimals));
+                                    extra_obj.insert("symbol".to_string(), serde_json::json!(token.symbol));
+                                    normalized.extra = Some(extra);
+                                    tracing::info!(
+                                        "[x402] Enriched payment requirement with symbol={}, decimals={}",
+                                        token.symbol,
+                                        token.decimals
+                                    );
+                                }
+                                break;
+                            } else {
+                                tracing::debug!(
+                                    "[x402] Token {} ({}) did not match asset {}",
+                                    token.symbol,
+                                    token.contract_address,
+                                    normalized.asset
+                                );
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            normalized
+        })
+        .collect()
 }
 
 /// Run the post-verification settlement step according to
@@ -690,7 +693,27 @@ mod settlement_gating_tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    fn configured_requirement() -> X402PaymentRequirement {
+        X402PaymentRequirement {
+            scheme: "exact".to_string(),
+            network: "eip155:1".to_string(),
+            amount: "1000".to_string(),
+            asset: "0x123".to_string(),
+            recipient_id: String::new(),
+            pay_to: "0x456".to_string(),
+            max_timeout_seconds: 300,
+            extra: None,
+        }
+    }
+
     fn payment_header(nonce_suffix: &str) -> String {
+        payment_header_paying("0x456", nonce_suffix)
+    }
+
+    fn payment_header_paying(
+        pay_to: &str,
+        nonce_suffix: &str,
+    ) -> String {
         let payload_json = format!(
             r#"{{
                 "x402Version": 2,
@@ -700,13 +723,13 @@ mod settlement_gating_tests {
                     "network": "eip155:1",
                     "amount": "1000",
                     "asset": "0x123",
-                    "payTo": "0x456",
+                    "payTo": "{pay_to}",
                     "maxTimeoutSeconds": 300
                 }},
                 "payload": {{
                     "authorization": {{
                         "from": "0xabc",
-                        "to": "0x456",
+                        "to": "{pay_to}",
                         "value": "1000",
                         "validAfter": "0",
                         "validBefore": "999999999",
@@ -752,6 +775,7 @@ mod settlement_gating_tests {
             verification_mode: X402VerificationMode::Mock,
             settlement_mode: X402SettlementMode::Immediate,
             facilitator_private_keys: None,
+            payment_requirements: vec![configured_requirement()],
             ..Default::default()
         };
         let headers = X402Headers::default();
@@ -786,6 +810,7 @@ mod settlement_gating_tests {
         let config = X402Config {
             verification_mode: X402VerificationMode::Mock,
             settlement_mode: X402SettlementMode::Deferred,
+            payment_requirements: vec![configured_requirement()],
             ..Default::default()
         };
         let headers = X402Headers::default();
@@ -819,6 +844,7 @@ mod settlement_gating_tests {
         let config = X402Config {
             verification_mode: X402VerificationMode::Mock,
             settlement_mode: X402SettlementMode::None,
+            payment_requirements: vec![configured_requirement()],
             ..Default::default()
         };
         let headers = X402Headers::default();
@@ -839,6 +865,55 @@ mod settlement_gating_tests {
             .expect("none mode must grant after verification")
             .expect("expected PAYMENT-RESPONSE header in none mode");
         assert_payment_response(&header, true, false);
+    }
+
+    #[tokio::test]
+    async fn rejects_payment_to_a_recipient_the_surface_did_not_issue() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(
+            TransactionStore::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let config = X402Config {
+            verification_mode: X402VerificationMode::Mock,
+            settlement_mode: X402SettlementMode::Deferred,
+            payment_requirements: vec![configured_requirement()],
+            ..Default::default()
+        };
+
+        let result = process_payment(
+            Some(payment_header_paying("0xbad", "dd")),
+            &config,
+            "Test Channel",
+            "channel-self-payment",
+            &X402Headers::default(),
+            "/test",
+            None,
+            Some(Arc::clone(&store)),
+        )
+        .await;
+
+        let response = result.expect_err("self-payment must not be granted");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "error": "invalid_payment",
+                "message": "Payment does not match any payment requirement issued for this resource"
+            })
+        );
+        let transactions = store.list_all().await;
+        assert_eq!(transactions.len(), 1);
+        assert!(
+            transactions[0]
+                .settlement
+                .is_none(),
+            "settlement must not start"
+        );
     }
 }
 

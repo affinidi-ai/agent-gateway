@@ -136,7 +136,17 @@ impl SurfacePolicyManager {
         &self,
         surface: &crate::config::agent_surface::AgentSurface,
     ) -> Result<(), String> {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change = crate::mcp::subscriptions::AccessChange::begin(
+            if surface
+                .response_policy_definition_id()
+                .is_some()
+            {
+                // Response engines are keyed by definition and shared by every surface that uses it.
+                crate::mcp::subscriptions::AccessScope::Appliance
+            } else {
+                crate::mcp::subscriptions::AccessScope::Surface(surface.surface_id.clone())
+            },
+        );
         let config_id = surface
             .config_id()
             .map(|s| s.to_string())
@@ -1254,7 +1264,9 @@ impl SurfacePolicyManager {
         &self,
         channel_id: &str,
     ) {
-        let _access_change = crate::mcp::subscriptions::AccessChange::begin();
+        let _access_change = crate::mcp::subscriptions::AccessChange::begin(
+            crate::mcp::subscriptions::AccessScope::Surface(channel_id.to_string()),
+        );
         {
             let mut engines = self
                 .opa_engines

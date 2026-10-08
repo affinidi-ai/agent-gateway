@@ -31,7 +31,9 @@ impl McpProxyStore for FileSystemMcpProxyStore {
         self.storage
             .save(proxy)
             .await?;
-        crate::mcp::subscriptions::invalidate_access();
+        crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::owned_by(
+            proxy.tenant_id.as_deref(),
+        ));
         crate::mcp::subscriptions::catalog_subscriptions()
             .publish(&proxy.id, crate::mcp::subscriptions::CatalogChange::Closed);
         Ok(())
@@ -52,10 +54,15 @@ impl McpProxyStore for FileSystemMcpProxyStore {
         &self,
         id: &str,
     ) -> Result<()> {
+        let previous = self.storage.get(id).await?;
         self.storage
             .delete(id)
             .await?;
-        crate::mcp::subscriptions::invalidate_access();
+        crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::owned_by(
+            previous
+                .as_ref()
+                .and_then(|proxy| proxy.tenant_id.as_deref()),
+        ));
         crate::mcp::subscriptions::catalog_subscriptions()
             .publish(id, crate::mcp::subscriptions::CatalogChange::Closed);
         Ok(())
@@ -72,6 +79,12 @@ impl McpProxyStore for FileSystemMcpProxyStore {
         self.storage
             .save(proxy)
             .await?;
+        let scope = crate::mcp::subscriptions::AccessScope::reowned(
+            previous
+                .as_ref()
+                .map_or(proxy.tenant_id.as_deref(), |previous| previous.tenant_id.as_deref()),
+            proxy.tenant_id.as_deref(),
+        );
         let close = previous.is_none_or(|previous| {
             proxy.status != super::types::McpProxyStatus::Active
                 || previous.status != proxy.status
@@ -82,7 +95,7 @@ impl McpProxyStore for FileSystemMcpProxyStore {
                 || previous.mcp_http != proxy.mcp_http
         });
         if close {
-            crate::mcp::subscriptions::invalidate_access();
+            crate::mcp::subscriptions::invalidate_access(scope);
         }
         crate::mcp::subscriptions::catalog_subscriptions().publish(
             &proxy.id,
