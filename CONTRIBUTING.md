@@ -25,7 +25,7 @@ management endpoint, see
 (CI generates it on release). Create or append to `.changelog/wip/<branch>.yaml`, where the filename
 is the current branch with every `/` replaced by `_` (read `.git/HEAD` for the branch name). Each
 entry needs a `title` (imperative, 80 characters or less) and a `description`. User-visible work goes
- under `added` / `changed` / `fixed` / `removed` / `security` / `breaking`; tests, docs, CI, and
+under `added` / `changed` / `fixed` / `removed` / `security` / `breaking`; tests, docs, CI, and
 refactors go under the public category that best describes their user-visible effect.
 
 ## Code Quality Expectations
