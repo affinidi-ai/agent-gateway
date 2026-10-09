@@ -530,10 +530,10 @@ async fn inbound_a2a_tampered_jwt_signature_forwarded_without_policy() {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_invalid_json_rejected() {
     //
-    // Given — a plain A2A channel (validate_messages defaults to true)
+    // Given — a plain A2A channel; the envelope is checked whatever validate_messages says
     //
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
     })
     .await;
 
@@ -587,7 +587,7 @@ async fn inbound_a2a_missing_jsonrpc_field_rejected() {
     // Given
     //
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
     })
     .await;
 
@@ -648,7 +648,7 @@ async fn inbound_a2a_missing_method_field_rejected() {
     // Given
     //
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
     })
     .await;
 
@@ -1468,54 +1468,74 @@ async fn inbound_a2a_well_formed_message_still_forwarded() {
 
 // ── Validation bypass ────────────────────────────────────────────────────────
 
-/// When `validate_messages` is set to `false`, malformed JSON-RPC requests are
-/// forwarded unmodified to the upstream agent instead of being rejected.
+/// The JSON-RPC envelope is checked whatever `validate_messages` says: a body
+/// with neither `jsonrpc` nor `method` is refused and never forwarded.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_validation_disabled_passes_malformed_through() {
-    //
-    // Given — channel with validate_messages disabled
-    //
-    let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
-
-    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+async fn inbound_a2a_envelope_is_checked_when_message_validation_is_off() {
+    let h = GatewayHarness::start(|_, gw_config, _| {
         gw_config.surfaces = vec![surface_without_message_validation()];
     })
     .await;
 
-    let client = reqwest::Client::new();
-
-    //
-    // When — send body that is NOT valid JSON-RPC (missing jsonrpc and method)
-    //
-    let resp = client
+    let resp = reqwest::Client::new()
         .post(&h.gateway_url)
         .header("content-type", "application/json")
         .body(r#"{"hello": "world"}"#)
         .send()
         .await
-        .expect("request with validation disabled failed");
+        .expect("request failed");
 
-    //
-    // Then — 200 OK, request forwarded despite invalid envelope
-    //
-    assert_eq!(
-        resp.status(),
-        200,
-        "with validate_messages=false, malformed request should be forwarded, got {}",
-        resp.status()
+    assert_eq!(resp.status(), 400, "a malformed envelope is refused even with validation off");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("response is not JSON");
+    assert_eq!(body["error"]["code"], -32600, "got {body}");
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "the malformed request must not be forwarded"
     );
-
-    let received = h
-        .mock
-        .last_request_rx
-        .borrow()
-        .clone()
-        .expect("mock should have received the malformed request");
-    assert_eq!(received.body, r#"{"hello": "world"}"#);
 }
 
-/// Message validation is off unless the surface turns it on, so a surface that
-/// stores no `access_point.a2a` forwards a malformed message unchecked.
+/// A JSON-RPC batch carries no single `method`, so policy could not match it on
+/// one. It is refused as an invalid request whatever `validate_messages` says.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_batch_is_refused_when_message_validation_is_off() {
+    let h = GatewayHarness::start(|_, gw_config, _| {
+        gw_config.surfaces = vec![surface_without_message_validation()];
+    })
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("A2A-Version", "1.0")
+        .body(r#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t1"}}]"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 400, "a batch is refused");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("response is not JSON");
+    assert_eq!(body["error"]["code"], -32600, "got {body}");
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "the batch must not be forwarded"
+    );
+}
+
+/// Message-shape validation is off unless the surface turns it on, so a surface
+/// that stores no `access_point.a2a` forwards a malformed message whose envelope
+/// is valid.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_messages_are_not_validated_by_default() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
@@ -1543,8 +1563,9 @@ async fn inbound_a2a_messages_are_not_validated_by_default() {
     assert_mock_received_request(&h.mock, request_str);
 }
 
-/// With `validate_messages = false` the A2A message-shape check is skipped too, so
-/// a v1.0 `SendMessage` missing every required message field reaches the upstream.
+/// With `validate_messages = false` the A2A message-shape check is skipped, so a
+/// v1.0 `SendMessage` with a valid envelope but missing every required message
+/// field reaches the upstream.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_validation_disabled_forwards_v1_message_missing_required_fields() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
@@ -1920,7 +1941,7 @@ async fn inbound_a2a_malformed_message_refused_before_delegated_payment() {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_invalid_envelope_refused_before_delegated_payment() {
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![with_message_validation(agent_pay_surface("prepay-envelope", None))];
+        gw_config.surfaces = vec![agent_pay_surface("prepay-envelope", None)];
     })
     .await;
 

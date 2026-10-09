@@ -853,7 +853,43 @@ async fn a2a_proxy_refuses_a_caller_that_does_not_negotiate_1_0() {
     );
 }
 
-/// An A2A-proxy surface never validates messages, whatever its stored settings.
+/// The JSON-RPC envelope is checked on an A2A-proxy surface too: a batch or a
+/// non-string `method` is refused with `-32600` before the proxy runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_proxy_refuses_an_invalid_json_rpc_envelope() {
+    let fake_direct_line = FakeDirectLine::start("should not be called").await;
+    let h = start_a2a_proxy_harness(&fake_direct_line).await;
+
+    let batch = json!([a2a_text_request(vec![json!({ "kind": "text", "text": "hello" })])]);
+    let mut numeric_method = a2a_text_request(vec![json!({ "kind": "text", "text": "hello" })]);
+    numeric_method["method"] = json!(7);
+    for (label, body) in [("batch", batch), ("numeric method", numeric_method)] {
+        let response = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .header("A2A-Version", "1.0")
+            .json(&body)
+            .send()
+            .await
+            .expect("send request through gateway");
+
+        assert_eq!(response.status(), 400, "{label}");
+        let body: Value = response
+            .json()
+            .await
+            .expect("JSON error");
+        assert_eq!(body["error"]["code"], -32600, "{label}: {body}");
+    }
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0,
+        "a refused request must not reach Direct Line"
+    );
+}
+
+/// An A2A-proxy surface never validates the message shape, whatever its stored settings.
 ///
 /// A managed agent validates its own payloads, so checking at the gateway fails
 /// a bad request sooner and names the field. An A2A proxy is different: it is

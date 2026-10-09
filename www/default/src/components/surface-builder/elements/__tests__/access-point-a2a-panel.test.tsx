@@ -130,7 +130,17 @@ describe('AccessPointPanel A2A protocol settings', () => {
     expect(await screen.findByText(/counts as version 0\.3/)).toBeInTheDocument();
 
     fireEvent.focus(screen.getByTestId('field-help-access-point-a2a-validate-messages'));
-    expect(await screen.findByText(/requests are forwarded as they are/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/including batch requests, are always\s+refused/)
+    ).toBeInTheDocument();
+  });
+
+  it('is shown on an AP2 surface, whose Access Point carries the same settings', () => {
+    render(<AccessPointPanel {...baseProps({ protocol: 'ap2' })} />);
+
+    expect(screen.getByTestId('access-point-a2a-protocol')).toBeInTheDocument();
+    expect(version('0.3')).toBeChecked();
+    expect(validate()).not.toBeChecked();
   });
 
   it('is not shown on an MCP surface', () => {

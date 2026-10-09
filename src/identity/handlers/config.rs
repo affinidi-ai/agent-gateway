@@ -222,6 +222,12 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
                     .await?;
                 crate::surfaces::strip_unsupported_header_metadata_mappings(&agent_surface_store, &mut channels)
                     .await?;
+                crate::surfaces::carry_over_a2a_settings(
+                    &agent_surface_store,
+                    &mut channels,
+                    crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config).await,
+                )
+                .await?;
                 info!("Reloaded {} surface(s) from local storage", channels.len());
 
                 let config = GatewayConfig {

@@ -96,13 +96,13 @@ describe('Access Point A2A settings payload', () => {
   });
 
   it('blocks saving an A2A surface with no version selected, except for an A2A proxy target', () => {
-    const errorsFor = (endpoint: string, versions: string[]) => {
+    const errorsFor = (endpoint: string, versions: string[], protocol: 'a2a' | 'ap2' = 'a2a') => {
       const surfaceNodes = nodes({ a2a_accepted_versions: versions }, endpoint);
       return registry
         .getDependencyWarnings(
           'access-point',
           surfaceNodes[0].config,
-          buildSurfaceContext('a2a', surfaceNodes as any)
+          buildSurfaceContext(protocol, surfaceNodes as any)
         )
         .filter(w => w.severity === 'error');
     };
@@ -112,5 +112,8 @@ describe('Access Point A2A settings payload', () => {
     ]);
     expect(errorsFor('https://agent.example', ['1.0'])).toEqual([]);
     expect(errorsFor('a2a-proxy://worker', [])).toEqual([]);
+    expect(errorsFor('https://agent.example', [], 'ap2')).toEqual([
+      { severity: 'error', message: 'Select at least one supported A2A version' },
+    ]);
   });
 });

@@ -2671,8 +2671,9 @@ async fn proxy_handler_with_mcp_runtime(
             .target
             .endpoint
             .starts_with("fabric://");
-    // The accepted versions and whether messages are validated are set per A2A
-    // Access Point; an A2A-proxy target is always 1.0 only without validation.
+    // The accepted versions and whether the request shape is validated are set
+    // per A2A Access Point; an A2A-proxy target is always 1.0 only without
+    // request-shape validation. The JSON-RPC envelope is checked either way.
     let a2a_settings = state.surface.a2a_settings();
 
     // ── A2A protocol version negotiation (A2A / AP2 only) ────────────────
@@ -2743,20 +2744,16 @@ async fn proxy_handler_with_mcp_runtime(
     }
 
     // ── JSON-RPC envelope validation (A2A / AP2 only) ────────────────────
-    // When the surface validates messages, reject requests that are not valid
-    // JSON or that lack the required JSON-RPC 2.0 envelope fields (`jsonrpc`
-    // and `method`).  This catches malformed requests early, before they reach
-    // the upstream agent.
-    if a2a_settings.validate_messages
-        && checks_a2a_request
+    // Always on, A2A-proxy targets included: reject requests that are not valid
+    // JSON or that lack the JSON-RPC 2.0 envelope fields (`jsonrpc` and a string
+    // `method`). Besides catching malformed requests early, this keeps a batch
+    // or a non-string `method` from reaching policy without a method that rules
+    // could match on.
+    if checks_a2a_request
         && !body_bytes.is_empty()
         && let Err((code, message)) = validate_jsonrpc_envelope(&body_bytes)
     {
-        channel_warn!(
-            config_id,
-            "A2A request refused: JSON-RPC validation failed: {} (message validation is on for this surface)",
-            message
-        );
+        channel_warn!(config_id, "A2A request refused: JSON-RPC validation failed: {}", message);
         connection_guard
             .decrement()
             .await;
@@ -2765,7 +2762,7 @@ async fn proxy_handler_with_mcp_runtime(
 
     // ── A2A request-shape validation ─────────────────────────────────────
     // Beyond the JSON-RPC envelope, check the fields A2A itself requires on a
-    // request, under the same per-surface setting. A request that fails here
+    // request, when the surface's `validate_messages` asks for it. A request that fails here
     // was already going to fail: a conformant agent refuses a message with no
     // `messageId` too, one hop later and with a vaguer error. Only fields both
     // protocol eras spell the same way are checked, so it favours neither.

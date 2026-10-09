@@ -2,22 +2,31 @@ branch: feat/a2a-support-followup-changes
 changes:
   added:
     - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Choose accepted A2A versions and message validation per A2A surface
+      title: ⭐ Choose accepted A2A versions and message validation per A2A surface
       description: >-
         The Access Point of an A2A surface has an A2A Protocol section with a checkbox for
         each A2A version (0.3 and 1.0, both on by default) and a Validate messages checkbox
         (off by default), stored as access_point.a2a. Version negotiation and the -32009
-        supported list follow the surface's accepted versions, and envelope and request-shape
-        validation run only on surfaces that enable it. When the Target is an A2A proxy,
+        supported list follow the surface's accepted versions, and A2A request-shape
+        validation runs only on surfaces that enable it. When the Target is an A2A proxy,
         the section is locked to 1.0 without validation, and the Managed Agent panel
         says the proxy serves A2A 1.0 only without message validation.
   changed:
     - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Ignore the [a2a] validate_messages setting and warn at startup
+      title: Serve A2A proxy surfaces in A2A 1.0 only
       description: >-
-        Message validation is now set per A2A surface. A configuration that still sets
-        [a2a] validate_messages starts, logs a deprecation warning, and the value has no
-        effect. The setting is removed from the example configuration.
+        An A2A proxy's generated agent card lists only the 1.0 interface, and its replies
+        use the A2A 1.0 SendMessageResponse shape (result.message, ROLE_AGENT, parts without
+        kind). Callers send A2A-Version 1.0; a request with no header or with 0.3 is refused
+        with -32009. Message validation stays off so lenient callers keep working.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Always check the JSON-RPC envelope and deprecate [a2a] validate_messages
+      description: >-
+        The JSON-RPC envelope check (valid JSON, jsonrpc 2.0, a string method) now runs on
+        every A2A and AP2 surface, A2A proxy targets included, so a batch or a non-string
+        method never reaches policy without a method. A2A request-shape validation is set
+        per surface instead. [a2a] validate_messages, which gated both, is ignored with a
+        startup warning and removed from the example configuration.
     - timestamp: '2026-10-08T00:00:00.000Z'
       title: Explain A2A version and validation refusals in the gateway log
       description: >-
@@ -30,29 +39,23 @@ changes:
         these lines (the A2A-Version header and the JSON-RPC method) are cut to 64
         characters, and no message content is logged.
   fixed: []
-  removed: []
+  removed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Remove the global A2A legacy compatibility flag in favour of surface settings
+      description: >-
+        The a2a_legacy_compatibility Settings flag is replaced by each A2A surface's
+        accepted versions. When surfaces are loaded, an A2A surface stored without its own
+        settings is given them from the previous gateway-wide switches and they are written
+        to storage: A2A 1.0 only if the flag was off, both versions otherwise.
   security: []
-  breaking:
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: ⭐ Replace the A2A legacy compatibility flag with per-surface settings
-      description: >-
-        The a2a_legacy_compatibility feature flag is removed from Settings and is no longer
-        read. Every A2A surface, including existing ones, accepts A2A 0.3 and 1.0 and does
-        not validate messages unless an operator changes its settings. Surfaces that relied
-        on the previous global defaults (validation on) must enable validation per surface.
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: ⭐ Serve A2A proxy surfaces in A2A 1.0 only
-      description: >-
-        An A2A proxy's generated agent card lists only the 1.0 interface and drops the v0.3
-        fields, and its replies use the A2A 1.0 SendMessageResponse shape (result.message,
-        ROLE_AGENT, parts without kind). A caller must send A2A-Version 1.0; a request with
-        no header or with 0.3 is refused with -32009. Message validation stays off so lenient
-        callers keep working.
+  breaking: []
   internal:
     - timestamp: '2026-10-08T00:00:00.000Z'
       title: Cover per-surface A2A settings with unit, component, BDD and UI tests
       description: >-
         Adds unit and component tests for settings defaults, validation and storage,
+        carrying the previous gateway-wide switches over to stored surfaces, protocol and
+        Target changes on save,
         per-surface negotiation, validation off by default, the deprecated TOML key, and
         the 1.0-only A2A proxy card and reply; an A2A surface settings BDD feature; and
         dashboard tests for the A2A Protocol section, its payload mapping and variant

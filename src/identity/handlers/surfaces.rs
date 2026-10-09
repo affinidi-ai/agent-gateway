@@ -925,10 +925,7 @@ pub async fn create_surface(
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
-    fill_a2a_settings(&mut surface);
-    surface
-        .validate_a2a_settings()
-        .map_err(SurfaceApiError::BadRequest)?;
+    normalize_a2a_settings(&mut surface).map_err(SurfaceApiError::BadRequest)?;
     validate_mcp_resource_declarations(&state, &surface).await?;
     if let Ok(Some(_)) = store
         .get(&surface.surface_id)
@@ -1004,8 +1001,9 @@ pub async fn update_surface(
 }
 
 /// PUT carries the whole record, so an omitted `access_point.a2a` means
-/// "unchanged". A Target that is now an A2A proxy takes the fixed proxy
-/// settings instead, which [`fill_a2a_settings`] supplies.
+/// "unchanged" while the surface stays an A2A or AP2 surface with a non-proxy
+/// Target. A surface that was an A2A proxy has no stored block, so one moving
+/// off the proxy starts from the defaults.
 fn retain_a2a_settings(
     surface: &mut AgentSurface,
     existing: &AgentSurface,
@@ -1014,7 +1012,9 @@ fn retain_a2a_settings(
         .access_point
         .a2a
         .is_none()
+        && surface.uses_a2a_settings()
         && !surface.is_a2a_proxy_target()
+        && !existing.is_a2a_proxy_target()
     {
         surface.access_point.a2a = existing
             .access_point
@@ -1023,26 +1023,28 @@ fn retain_a2a_settings(
     }
 }
 
-/// Store `access_point.a2a` explicitly on every saved A2A or AP2 surface: the
-/// fixed proxy settings for an A2A-proxy Target, otherwise the defaults when it
-/// is absent, so the stored record shows what the surface is served with.
-fn fill_a2a_settings(surface: &mut AgentSurface) {
-    use crate::config::agent_surface::{A2aAccessPointSettings, SurfaceProtocol};
-
-    if !matches!(surface.access_point.protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2) {
-        return;
+/// Settle `access_point.a2a` before a save. A surface that is not A2A or AP2
+/// drops the block, so a protocol change never fails on a block left over from
+/// before. An A2A-proxy Target stores none, because the runtime fixes its
+/// settings and a later Target change should start from the defaults. Every
+/// other A2A or AP2 surface stores the block explicitly, the defaults when it
+/// was not sent.
+fn normalize_a2a_settings(surface: &mut AgentSurface) -> Result<(), String> {
+    if !surface.uses_a2a_settings() {
+        surface.access_point.a2a = None;
+        return Ok(());
     }
-    if surface
+    surface.validate_a2a_settings()?;
+    if surface.is_a2a_proxy_target() {
+        surface.access_point.a2a = None;
+    } else if surface
         .access_point
         .a2a
         .is_none()
     {
-        surface.access_point.a2a = Some(if surface.is_a2a_proxy_target() {
-            A2aAccessPointSettings::a2a_proxy()
-        } else {
-            A2aAccessPointSettings::default()
-        });
+        surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings::default());
     }
+    Ok(())
 }
 
 fn retain_mcp_settings(
@@ -1203,10 +1205,7 @@ async fn validate_and_save_surface(
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
-    fill_a2a_settings(&mut surface);
-    surface
-        .validate_a2a_settings()
-        .map_err(SurfaceApiError::BadRequest)?;
+    normalize_a2a_settings(&mut surface).map_err(SurfaceApiError::BadRequest)?;
     validate_mcp_resource_declarations(state, &surface).await?;
 
     store
@@ -2170,29 +2169,64 @@ mod validation_tests {
     #[test]
     fn a_saved_a2a_surface_always_stores_its_a2a_block() {
         let mut surface = base_surface();
-        fill_a2a_settings(&mut surface);
+        assert_eq!(normalize_a2a_settings(&mut surface), Ok(()));
         assert_eq!(surface.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], false)));
 
-        // An explicit block is kept as sent.
         let mut explicit = base_surface();
-        explicit.access_point.a2a = Some(a2a_block(&["1.0"], false));
-        fill_a2a_settings(&mut explicit);
-        assert_eq!(explicit.access_point.a2a, Some(a2a_block(&["1.0"], false)));
+        explicit.access_point.a2a = Some(a2a_block(&["1.0"], true));
+        assert_eq!(normalize_a2a_settings(&mut explicit), Ok(()));
+        assert_eq!(explicit.access_point.a2a, Some(a2a_block(&["1.0"], true)), "an explicit block is kept as sent");
     }
 
     #[test]
-    fn an_a2a_proxy_surface_stores_the_fixed_proxy_block() {
+    fn a_saved_surface_with_no_accepted_version_is_refused() {
+        let mut surface = base_surface();
+        surface.access_point.a2a = Some(a2a_block(&[], false));
+        assert!(
+            normalize_a2a_settings(&mut surface)
+                .unwrap_err()
+                .contains("at least one version")
+        );
+    }
+
+    #[test]
+    fn an_a2a_proxy_surface_stores_no_a2a_block() {
+        let mut omitted = base_surface();
+        omitted.target.endpoint = "a2a-proxy://worker".to_string();
+        assert_eq!(normalize_a2a_settings(&mut omitted), Ok(()));
+        assert_eq!(omitted.access_point.a2a, None);
+
+        let mut fixed = base_surface();
+        fixed.target.endpoint = "a2a-proxy://worker".to_string();
+        fixed.access_point.a2a = Some(a2a_block(&["1.0"], false));
+        assert_eq!(normalize_a2a_settings(&mut fixed), Ok(()));
+        assert_eq!(fixed.access_point.a2a, None, "the fixed block the dashboard sends is not stored");
+        assert_eq!(
+            fixed
+                .a2a_settings()
+                .accepted_versions,
+            crate::a2a::version::VERSIONS_1_0_ONLY
+        );
+    }
+
+    #[test]
+    fn an_a2a_proxy_surface_refuses_a_conflicting_block() {
         let mut surface = base_surface();
         surface.target.endpoint = "a2a-proxy://worker".to_string();
-        fill_a2a_settings(&mut surface);
-        assert_eq!(surface.access_point.a2a, Some(a2a_block(&["1.0"], false)));
+        surface.access_point.a2a = Some(a2a_block(&["0.3"], true));
+        assert!(
+            normalize_a2a_settings(&mut surface)
+                .unwrap_err()
+                .contains("A2A proxy target")
+        );
     }
 
     #[test]
-    fn a_non_a2a_surface_gets_no_a2a_block() {
+    fn a_non_a2a_surface_stores_no_a2a_block() {
         let mut surface = base_surface();
         surface.access_point.protocol = SurfaceProtocol::Mcp;
-        fill_a2a_settings(&mut surface);
+        surface.access_point.a2a = Some(a2a_block(&["1.0"], false));
+        assert_eq!(normalize_a2a_settings(&mut surface), Ok(()));
         assert_eq!(surface.access_point.a2a, None);
     }
 
@@ -2211,19 +2245,60 @@ mod validation_tests {
         assert_eq!(changed.access_point.a2a, Some(a2a_block(&["0.3"], true)), "a sent block replaces the stored one");
     }
 
-    /// A PUT that switches the Target to an A2A proxy must not keep a block the
-    /// proxy would refuse: it gets the fixed proxy block instead.
     #[test]
-    fn a_put_that_switches_to_an_a2a_proxy_gets_the_fixed_block() {
+    fn a_put_that_changes_the_protocol_away_from_a2a_drops_the_stored_block() {
+        let mut existing = base_surface();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], true));
+
+        let mut mcp = base_surface();
+        mcp.access_point.protocol = SurfaceProtocol::Mcp;
+        retain_a2a_settings(&mut mcp, &existing);
+        assert_eq!(normalize_a2a_settings(&mut mcp), Ok(()));
+        assert_eq!(mcp.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_merge_patch_that_changes_the_protocol_away_from_a2a_drops_the_stored_block() {
+        let mut existing = base_surface();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], true));
+
+        let mut merged = serde_json::to_value(&existing).unwrap();
+        json_patch::merge(&mut merged, &serde_json::json!({ "access_point": { "protocol": "mcp" } }));
+        let mut patched: AgentSurface = serde_json::from_value(merged).unwrap();
+        assert!(
+            patched
+                .access_point
+                .a2a
+                .is_some(),
+            "the merge carries the stored block"
+        );
+
+        assert_eq!(normalize_a2a_settings(&mut patched), Ok(()));
+        assert_eq!(patched.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_put_that_switches_to_an_a2a_proxy_stores_no_block() {
         let mut existing = base_surface();
         existing.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], true));
 
         let mut switched = base_surface();
         switched.target.endpoint = "a2a-proxy://worker".to_string();
         retain_a2a_settings(&mut switched, &existing);
-        fill_a2a_settings(&mut switched);
-        assert_eq!(switched.access_point.a2a, Some(a2a_block(&["1.0"], false)));
-        assert_eq!(switched.validate_a2a_settings(), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut switched), Ok(()));
+        assert_eq!(switched.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_put_that_moves_off_an_a2a_proxy_starts_from_the_defaults() {
+        let mut existing = base_surface();
+        existing.target.endpoint = "a2a-proxy://worker".to_string();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], false));
+
+        let mut moved = base_surface();
+        retain_a2a_settings(&mut moved, &existing);
+        assert_eq!(normalize_a2a_settings(&mut moved), Ok(()));
+        assert_eq!(moved.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], false)));
     }
 
     #[test]
@@ -2236,7 +2311,7 @@ mod validation_tests {
         let mut patched: AgentSurface = serde_json::from_value(merged).unwrap();
         assert_eq!(patched.access_point.a2a, None);
 
-        fill_a2a_settings(&mut patched);
+        assert_eq!(normalize_a2a_settings(&mut patched), Ok(()));
         assert_eq!(patched.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], false)));
     }
 

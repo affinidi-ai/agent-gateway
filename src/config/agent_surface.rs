@@ -277,8 +277,8 @@ pub struct A2aAccessPointSettings {
     /// non-empty subset of [`crate::a2a::version::SUPPORTED_VERSIONS`].
     pub accepted_versions: Vec<String>,
 
-    /// Whether the JSON-RPC envelope and the A2A request shape are validated
-    /// before the request is forwarded. Off by default.
+    /// Whether the A2A request shape is validated before the request is
+    /// forwarded. Off by default. The JSON-RPC envelope is always checked.
     pub validate_messages: bool,
 }
 
@@ -296,8 +296,8 @@ impl Default for A2aAccessPointSettings {
 
 impl A2aAccessPointSettings {
     /// The fixed settings of an `a2a-proxy://` target: A2A 1.0 only, without
-    /// message validation, so the proxy keeps serving the lenient requests its
-    /// Copilot callers send.
+    /// request-shape validation, so the proxy keeps serving the lenient requests
+    /// its callers send.
     pub fn a2a_proxy() -> Self {
         Self {
             accepted_versions: vec![crate::a2a::version::VERSION_1_0.to_string()],
@@ -337,7 +337,7 @@ impl A2aAccessPointSettings {
 pub struct EffectiveA2aSettings {
     /// The versions negotiation accepts, in `SUPPORTED_VERSIONS` order.
     pub accepted_versions: &'static [&'static str],
-    /// Whether the JSON-RPC envelope and the A2A request shape are validated.
+    /// Whether the A2A request shape is validated.
     pub validate_messages: bool,
 }
 
@@ -1878,6 +1878,11 @@ impl AgentSurface {
         Ok(())
     }
 
+    /// True for the Access Point protocols that carry `access_point.a2a`: A2A and AP2.
+    pub fn uses_a2a_settings(&self) -> bool {
+        matches!(self.access_point.protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2)
+    }
+
     /// True when the Target is an A2A proxy (`a2a-proxy://`).
     pub fn is_a2a_proxy_target(&self) -> bool {
         self.target
@@ -1921,7 +1926,7 @@ impl AgentSurface {
         let Some(settings) = &self.access_point.a2a else {
             return Ok(());
         };
-        if !matches!(self.access_point.protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2) {
+        if !self.uses_a2a_settings() {
             return Err("access_point.a2a requires an A2A or AP2 Access Point".to_string());
         }
         settings.validate()?;

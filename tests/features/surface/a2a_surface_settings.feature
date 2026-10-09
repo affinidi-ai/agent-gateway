@@ -1,8 +1,9 @@
 Feature: A2A settings of an A2A surface
   Each A2A surface chooses the A2A versions it accepts and whether the gateway
-  validates its messages. By default a surface accepts A2A 0.3 and 1.0 and forwards
-  messages without validating them, leaving the managed agent to decide. A caller
-  that sends no A2A-Version header counts as A2A 0.3.
+  validates the shape of its A2A messages. By default a surface accepts A2A 0.3 and
+  1.0 and forwards messages without checking their shape, leaving the managed agent
+  to decide. The JSON-RPC envelope is always checked. A caller that sends no
+  A2A-Version header counts as A2A 0.3.
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
@@ -22,6 +23,15 @@ Feature: A2A settings of an A2A surface
       """
     Then the response status is 200
     And managed agent "bravo" received the forwarded request
+
+  Scenario: A JSON-RPC batch is refused even though message validation is off
+    When the caller sends a request to the surface with header "A2A-Version" set to "1.0" and body
+      """
+      [{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t1"}}]
+      """
+    Then the response status is 400
+    And the response is a JSON-RPC error with code -32600
+    And managed agent "bravo" was not called
 
   Scenario: By default an unsupported version lists both accepted versions
     When the caller sends a request to the surface with header "A2A-Version" set to "2.0" and body

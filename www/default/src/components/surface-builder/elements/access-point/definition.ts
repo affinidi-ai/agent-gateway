@@ -54,7 +54,8 @@ export const accessPointDefinition: NodeDefinition = {
       // An A2A proxy Target serves A2A 1.0 whatever is selected, so the
       // disabled checkboxes there never block a save.
       condition: (_config, ctx) =>
-        ctx.protocol === 'a2a' && !isA2aProxyEndpoint(ctx.target?.endpoint),
+        (ctx.protocol === 'a2a' || ctx.protocol === 'ap2') &&
+        !isA2aProxyEndpoint(ctx.target?.endpoint),
       check: config => selectedA2aVersions(config).length > 0,
       severity: 'error',
       message: 'Select at least one supported A2A version',

@@ -137,21 +137,33 @@ Access Point of an A2A surface (**A2A Protocol**):
 | Field | Default | Effect |
 | --- | --- | --- |
 | `accepted_versions` | `["0.3", "1.0"]` | The versions [negotiation](#version-negotiation) accepts. At least one; each must be `0.3` or `1.0`. |
-| `validate_messages` | `false` | Whether the JSON-RPC envelope and the A2A request shape are [validated](#error-mapping) before forwarding. |
+| `validate_messages` | `false` | Whether the A2A request shape is [validated](#request-shape-validation) before forwarding. The JSON-RPC envelope is always checked, whatever this says. |
 
 ```json
 "access_point": { "protocol": "a2a", "a2a": { "accepted_versions": ["1.0"], "validate_messages": true } }
 ```
 
-- A surface without the block uses the defaults. The surface API stores the block explicitly on
-  every save; a `PUT` that omits it keeps the stored one, and a `PATCH` with `null` resets it to the
-  defaults.
-- An `a2a-proxy://` Target always serves `1.0` only without validation, whatever is stored, and the
-  API refuses a block on such a surface that says otherwise. The dashboard locks both fields to
-  those values when the Target is an A2A proxy. This applies to a variant that points the Target at
-  an A2A proxy too.
+- The surface API stores the block explicitly on every save of an A2A or AP2 surface, the defaults
+  when none is sent. A `PUT` that omits it keeps the stored one, and a JSON merge `PATCH` with
+  `null` resets it to the defaults. A save that changes the protocol to anything other than A2A or
+  AP2 drops the block.
+- An `a2a-proxy://` Target always serves `1.0` only without request-shape validation, whatever is
+  stored (its JSON-RPC envelope is still checked). The API refuses a block on such a surface that
+  says otherwise and stores none, so moving the Target off the proxy later starts from the
+  defaults. The dashboard locks both fields to those values when the
+  Target is an A2A proxy. This applies to a variant that points the Target at an A2A proxy too.
 - The block is surface-level: variants cannot override it. It is valid on A2A and AP2 Access Points
   only.
+- A surface stored before per-surface settings existed has no block. When surfaces are loaded, at
+  startup or on a configuration reload, each such A2A or AP2 surface (other than an A2A proxy Target)
+  is given one, and the block is written to storage: `accepted_versions` is `["1.0"]` if the retired
+  `a2a_legacy_compatibility` flag was off, and both versions otherwise; `validate_messages` is
+  `false`. The retired `[a2a] validate_messages` is not carried over: it gated the envelope check,
+  which is now always on. A log line reports how many surfaces were given settings, with a warning
+  when the retired flag was off.
+- A stored block that is invalid, which only editing storage by hand can produce, is not refused: a
+  startup warning names the surface, and an empty or unrecognised `accepted_versions` serves both
+  versions until the surface is saved with valid settings.
 - Changes take effect when the surface is saved, without a restart.
 
 ### Error mapping
@@ -168,9 +180,10 @@ is contacted:
 
 `data.requested` on `-32009` is the trimmed header when it names no known version (`2.0`), and the
 resolved `Major.Minor` otherwise, so an absent header, `0.3` or `0.3.x` refused under v1.0-only
-answers `"requested": "0.3"`, and `data.supported` lists the surface's accepted versions. The last
-three rows need the surface's `access_point.a2a.validate_messages` (off by default) and a non-empty
-body.
+answers `"requested": "0.3"`, and `data.supported` lists the surface's accepted versions. The
+envelope rows (`-32700`, `-32600`) apply to every non-empty body on an A2A or AP2 surface, A2A proxy
+Targets included. The request-shape row needs the surface's `access_point.a2a.validate_messages`
+(off by default) and never applies to an A2A proxy Target.
 
 ### Method names
 
@@ -249,18 +262,17 @@ allow if input.a2a.message.parts[_].text
 `metadata`, `extensions`, and `messageId` are the same in both versions, so rules that read them,
 including the agent identity extension, need no change.
 
-Two gaps remain. On a surface that does not validate messages, the default, a JSON-RPC batch or a
-non-string `method` reaches policy with neither `input.a2a.method` nor `input.a2a.method_canonical`,
-so no rule keyed on the method sees it; turn validation on for the surface, which refuses both with
-`-32600`. On a `fabric://` surface the request is never validated, so the same applies whatever the
-setting.
+A JSON-RPC batch or a non-string `method` would reach policy with neither `input.a2a.method` nor
+`input.a2a.method_canonical`, so no rule keyed on the method would see it. The envelope check, which
+is always on, refuses both with `-32600` first. One gap remains: on a `fabric://` surface the request
+is never checked, so a batch or a non-string `method` reaches policy on both gateways that way.
 
 The allow-list and message-shape patterns are pinned against the policy engine by the tests in
 [`src/surface_context/mod.rs`](../src/surface_context/mod.rs).
 
 ### Request-shape validation
 
-On a surface that validates messages, requests are checked against what A2A itself requires, and the problems found are reported together in one `-32602` response, up to 20
+On a surface that validates messages (`access_point.a2a.validate_messages`), requests are checked against what A2A itself requires, and the problems found are reported together in one `-32602` response, up to 20
 of them: validation stops walking `parts` at the cap and sets `data.truncated: true` (the key is
 absent otherwise), and a caller-supplied `kind` echoed in a message is quoted and cut to 64
 characters, so a large body cannot inflate the error:
@@ -346,8 +358,9 @@ Before removing `0.3` from a surface, check `agent_gateway_a2a_protocol_version_
 traffic, bearing in mind it does not count [fabric traffic](#fabric-coverage-gap). Refused callers
 are counted with `negotiated_version="rejected"`.
 
-The retired `a2a_legacy_compatibility` dashboard flag is no longer read: a surface stored before
-per-surface settings existed accepts both versions without message validation, the defaults.
+The retired `a2a_legacy_compatibility` dashboard flag is read only when surfaces are loaded, to give
+a surface stored before per-surface settings existed its accepted versions: `1.0` only if the flag
+was off (see [A2A surface settings](#a2a-surface-settings)).
 
 ### Guidance for callers
 

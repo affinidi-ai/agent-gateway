@@ -520,7 +520,8 @@ pub struct A2aConfig {
     #[serde(default = "default_a2a_version")]
     pub default_version: String,
 
-    /// Deprecated and ignored: message validation is set per A2A Access Point
+    /// Deprecated and ignored. The JSON-RPC envelope check it used to gate is
+    /// always on, and A2A message-shape validation is set per A2A Access Point
     /// (`access_point.a2a.validate_messages`, off by default).
     ///
     /// Still accepted so an existing config file starts; a startup warning

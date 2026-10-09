@@ -45,7 +45,7 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
         hasAttemptedSave={hasAttemptedSave}
       />
 
-      {protocol === 'a2a' && (
+      {isA2aLike && (
         <div className="config-section" data-testid="access-point-a2a-protocol">
           <label>A2A Protocol</label>
           {isA2aProxyTarget && (
@@ -112,11 +112,12 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
                   testId="field-help-access-point-a2a-validate-messages"
                   ariaLabel="About Validate messages"
                 >
-                  Check each request before it reaches your agent: that it is a well-formed JSON-RPC
-                  request carrying the fields A2A requires, such as a message ID, a role and at
-                  least one message part. A malformed request is refused with an error that names
-                  the field. When this is off, requests are forwarded as they are and your agent
-                  decides.
+                  Check that each request carries the fields A2A requires, such as a message ID, a
+                  role and at least one message part, before it reaches your agent. A request
+                  missing one is refused with an error that names the field. When this is off, such
+                  requests are forwarded as they are and your agent decides. Requests that are not a
+                  single, well-formed JSON-RPC request, including batch requests, are always
+                  refused.
                 </FieldHelp>
               </span>
             }

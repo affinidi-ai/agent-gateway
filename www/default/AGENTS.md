@@ -243,9 +243,10 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
   `params.message` envelope is A2A; any other JSON-RPC method is MCP.
 - The A2A method table mirrors `src/a2a/methods.rs`. Keep them in step.
 - A2A versions and message validation are per surface, not feature flags. The Access Point
-  panel of an A2A surface has an **A2A Protocol** section (`access-point-a2a-protocol`): a
+  panel of an A2A or AP2 surface has an **A2A Protocol** section (`access-point-a2a-protocol`): a
   checkbox per version (`access-point-a2a-version-0.3`, `-1.0`, both checked by default) and
-  **Validate messages** (`access-point-a2a-validate-messages`, unchecked by default), each
+  **Validate messages** (`access-point-a2a-validate-messages`, unchecked by default; it turns
+  on A2A message-shape validation only, the JSON-RPC envelope is always checked), each
   with field help. The node keeps them flat as `a2a_accepted_versions` and
   `a2a_validate_messages`; `access-point/a2aSettings.ts` maps them to and from the payload's
   `access_point.a2a`, which every A2A and AP2 save sends.
@@ -253,7 +254,7 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
   blocking dependency error stops the save.
 - When the Target is an `a2a-proxy://` endpoint, the section is disabled, shows 1.0 only and
   validation off, and explains why (`access-point-a2a-proxy-locked`); the payload sends those
-  fixed values whatever the node holds.
+  fixed values whatever the node holds, and the API stores no block for a proxy Target.
 - When the Managed Agent element targets an A2A proxy, its panel shows
   `managed-agent-a2a-proxy-protocol-hint`: the proxy serves A2A 1.0 only, without message
   validation, callers must send `A2A-Version: 1.0`, and the Access Point's A2A Protocol

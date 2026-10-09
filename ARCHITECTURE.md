@@ -132,7 +132,7 @@ logic.
 | Appliance-wide gateway policy | The global gateway-plane set, deny-overrides, ahead of the gateway's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Gateway OPA | The appliance-level policy gate | [`src/policies/gateway_manager.rs`](src/policies/gateway_manager.rs) |
 | AP2 gate | Refusing AP2 while `ap2_experimental` is off | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/ap2/`](src/ap2/) |
-| A2A version and request validation | Resolving `A2A-Version` and checking the request shape, A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
+| A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, checking the JSON-RPC envelope, and checking the request shape when the surface asks for it; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
 | Delegated payment | `agent_pay` settlement through another gateway | [`src/x402/delegate.rs`](src/x402/delegate.rs) |
 | Egress check | Vetting the forward target before anything is charged locally | [`src/egress.rs`](src/egress.rs) |
 | Body-size limit | Refusing a body over `[a2a] max_body_size` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
