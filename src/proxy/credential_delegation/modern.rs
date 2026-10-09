@@ -1904,4 +1904,147 @@ mod tests {
             body
         );
     }
+
+    #[tokio::test]
+    async fn fabric_send_preparation_carries_the_access_token_and_never_the_refresh_token() {
+        for inject_as in [
+            json!({"type": "bearer_header"}),
+            json!({"type": "meta", "field": "io.affinidi.fabric/delegated-credential"}),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let providers = FileSystemCredentialProviderStore::new(
+                directory
+                    .path()
+                    .join("providers"),
+            )
+            .await
+            .unwrap();
+            let strategies = FileSystemJwtVerificationStrategyStore::new(
+                directory
+                    .path()
+                    .join("strategies"),
+            )
+            .await
+            .unwrap();
+            let vault = FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap();
+            let strategy = strategies
+                .create(
+                    crate::sts::handlers::gateway_self_trust_strategy(
+                        "https://identity.example/",
+                        &json!({"keys": []}),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let provider = providers.create(serde_json::from_value(json!({
+                "id": "provider", "name": "Provider", "provider_id": "provider", "resource": "https://provider.example/api",
+                "consent_identity_strategy_id": strategy.id, "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+            })).unwrap()).await.unwrap();
+            let surface: AgentSurface = serde_json::from_value(json!({
+                "surface_id": "surface", "name": "Surface", "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "fabric://peer-gateway/peer-surface", "fabric_delegated_credentials": true},
+                "outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"], "inject_as": inject_as}]
+            })).unwrap();
+            let authorization = McpResourceServerConfig {
+                resource: "https://gateway.example/mcp".into(),
+                scopes: vec!["read".into()],
+            };
+            let profile = McpIssuerProfile {
+                issuer: "https://gateway.example/oauth2/mcp".into(),
+            };
+            let caller = AuthenticatedIdentity::JwtBearer {
+                subject: "user".into(),
+                claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            };
+            let now = now_secs().unwrap();
+            let service = ContinuationService::new(
+                ContinuationCipher::new(
+                    "deployment".into(),
+                    "key".into(),
+                    vec![ContinuationKey::new("key".into(), [7; 32], now - 1, now + 3600, now + 4500).unwrap()],
+                )
+                .unwrap(),
+                Arc::new(EmbeddedContinuations::new(32).unwrap()),
+            );
+            let context = ModernDelegationContext {
+                service: &service,
+                deployment: "deployment",
+                ttl_secs: 300,
+                surface: &surface,
+                variant_id: None,
+                route: ContinuationRoute::FabricSend {
+                    peer_did: "did:web:peer.example".into(),
+                },
+                authorization: &authorization,
+                identity: &caller,
+                agent_did: "did:web:agent.example",
+                profile: &profile,
+                vault: &vault,
+                providers: &providers,
+                strategies: &strategies,
+                secrets: None,
+                provider_http: None,
+            };
+            let request = ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: None,
+                client_info: None,
+                method: "tools/call".into(),
+                id: Some(json!(1)),
+                kind: McpMessageKind::Request,
+                params: Some(json!({"name": "read", "arguments": {"value": 1}})),
+            };
+            let selected = context
+                .select(&request)
+                .await
+                .unwrap();
+            vault.store(serde_json::from_value(json!({
+                "id": "live-token", "agent_did": context.agent_did, "user_identity_hash": selected[0].binding.user_identity_hash,
+                "credential_provider_id": "provider", "provider_id": "provider", "access_token": "live-access", "refresh_token": "never-shared-refresh",
+                "scopes": ["read"], "expires_at": chrono::DateTime::from_timestamp(now as i64 + 3600, 0),
+                "consent_granted_at": "2026-09-01T00:00:00Z", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
+                "consent_identity": {"principal": selected[0].binding.principal,
+                    "provider_digest": provider_digest(&provider).unwrap(), "strategy_digest": identity_strategy_digest(&strategy).unwrap()}
+            })).unwrap()).await.unwrap();
+            let ModernDelegationResult::Prepared(prepared) = context
+                .prepare(&request, now)
+                .await
+                .ok()
+                .unwrap()
+            else {
+                panic!("a live credential must prepare the Fabric request");
+            };
+            let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "read", "arguments": {"value": 1}}}))
+            .unwrap();
+            let body = prepared
+                .inject_body_credentials(
+                    &prepared
+                        .rewrite_body(&body)
+                        .unwrap(),
+                )
+                .unwrap();
+            let headers = prepared
+                .credential_headers()
+                .unwrap();
+            let sent = headers
+                .values()
+                .map(|value| value.to_str().unwrap())
+                .chain([std::str::from_utf8(&body).unwrap()])
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(sent.contains("live-access"), "{sent}");
+            assert!(!sent.contains("never-shared-refresh"), "{sent}");
+            if inject_as["type"] == "bearer_header" {
+                assert_eq!(headers["authorization"], "Bearer live-access");
+            } else {
+                assert!(headers.is_empty());
+                let sent: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(sent["params"]["_meta"]["io.affinidi.fabric/delegated-credential"], "live-access");
+            }
+        }
+    }
 }

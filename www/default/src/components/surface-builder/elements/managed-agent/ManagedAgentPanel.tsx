@@ -8,6 +8,10 @@ import { filterSelectableGateways } from '../../../../utils/gateways';
 import type { ConfigPanelProps } from '../types';
 import { RouteListenerBanner } from '../_shared/RouteListenerSection';
 import FieldHelp from '../../../shared/FieldHelp';
+import FabricDelegatedCredentialsSection, {
+  fabricPeerGatewayId,
+  hasOutboundCredentialBindings,
+} from '../_shared/FabricDelegatedCredentialsSection';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
 
 interface Gateway {
@@ -549,6 +553,18 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
           onChange={e => updateField('inject_vp', e.target.checked)}
         />
       </div>
+
+      {config.endpoint?.startsWith('fabric://') && hasOutboundCredentialBindings(allNodes) && (
+        <FabricDelegatedCredentialsSection
+          testIdPrefix="managed-agent"
+          checked={config.fabric_delegated_credentials === true}
+          peerName={
+            gateways.find(g => g.id === fabricPeerGatewayId(config.endpoint, selectedGatewayId))
+              ?.name
+          }
+          onChange={next => updateField('fabric_delegated_credentials', next)}
+        />
+      )}
 
       {ENABLE_MPP_PAYWALL && config.endpoint?.startsWith('fabric://') && (
         <div className="config-section">

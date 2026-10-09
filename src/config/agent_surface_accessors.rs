@@ -152,9 +152,6 @@ impl AgentSurface {
     /// is populated. Mirrors the conversion in
     /// `agent_surface_compat::to_channel_mapping`.
     pub fn outbound_credentials(&self) -> Vec<crate::config::types::OutboundCredentialBinding> {
-        use crate::config::types::{
-            ConsentMode, CredentialInjection, CredentialRequirement, OutboundCredentialBinding,
-        };
         if !self
             .outbound_credentials
             .is_empty()
@@ -172,48 +169,34 @@ impl AgentSurface {
                         point
                             .transit_credentials
                             .as_ref()
-                            .map(|cred| OutboundCredentialBinding {
-                                credential_provider_id: cred
-                                    .credential_provider_id
-                                    .clone(),
-                                scopes: cred.scopes.clone(),
-                                required_for: CredentialRequirement::All,
-                                consent_mode: match cred.consent_mode {
-                                    crate::config::agent_surface::ConsentMode::OnDemand => ConsentMode::OnDemand,
-                                    crate::config::agent_surface::ConsentMode::PreAuthorize => {
-                                        ConsentMode::PreAuthorize
-                                    }
-                                    crate::config::agent_surface::ConsentMode::Elicit => ConsentMode::Elicit,
-                                },
-                                inject_as: match &cred.inject_as {
-                                    crate::config::agent_surface::CredentialInjection::BearerHeader => {
-                                        CredentialInjection::BearerHeader
-                                    }
-                                    crate::config::agent_surface::CredentialInjection::CustomHeader {
-                                        name,
-                                        format,
-                                    } => CredentialInjection::CustomHeader {
-                                        name: name.clone(),
-                                        format: format.clone(),
-                                    },
-                                    crate::config::agent_surface::CredentialInjection::Meta { field } => {
-                                        CredentialInjection::Meta { field: field.clone() }
-                                    }
-                                },
-                                elicit_timeout_secs: cred.elicit_timeout_secs,
-                                elicit_fallback: match cred.elicit_fallback {
-                                    crate::config::agent_surface::ElicitFallback::OnDemand => {
-                                        crate::config::types::ElicitFallback::OnDemand
-                                    }
-                                    crate::config::agent_surface::ElicitFallback::Fail => {
-                                        crate::config::types::ElicitFallback::Fail
-                                    }
-                                },
-                            })
+                            .map(transit_credential_binding)
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Outbound credential bindings for a request through one Transit Point.
+    /// Prefers the surface-level `outbound_credentials` field; otherwise
+    /// only that point's own `transit_credentials`, never another point's.
+    pub fn transit_point_outbound_credentials(
+        &self,
+        point: &super::agent_surface::TransitPoint,
+    ) -> Vec<crate::config::types::OutboundCredentialBinding> {
+        if !self
+            .outbound_credentials
+            .is_empty()
+        {
+            return self
+                .outbound_credentials
+                .clone();
+        }
+        point
+            .transit_credentials
+            .as_ref()
+            .map(transit_credential_binding)
+            .into_iter()
+            .collect()
     }
 
     /// Target service-level credentials.
@@ -642,6 +625,38 @@ impl AgentSurface {
     }
 }
 
+fn transit_credential_binding(
+    cred: &super::agent_surface::TransitCredentials
+) -> crate::config::types::OutboundCredentialBinding {
+    use crate::config::agent_surface as surface;
+    use crate::config::types::{ConsentMode, CredentialInjection, CredentialRequirement, ElicitFallback};
+    crate::config::types::OutboundCredentialBinding {
+        credential_provider_id: cred
+            .credential_provider_id
+            .clone(),
+        scopes: cred.scopes.clone(),
+        required_for: CredentialRequirement::All,
+        consent_mode: match cred.consent_mode {
+            surface::ConsentMode::OnDemand => ConsentMode::OnDemand,
+            surface::ConsentMode::PreAuthorize => ConsentMode::PreAuthorize,
+            surface::ConsentMode::Elicit => ConsentMode::Elicit,
+        },
+        inject_as: match &cred.inject_as {
+            surface::CredentialInjection::BearerHeader => CredentialInjection::BearerHeader,
+            surface::CredentialInjection::CustomHeader { name, format } => CredentialInjection::CustomHeader {
+                name: name.clone(),
+                format: format.clone(),
+            },
+            surface::CredentialInjection::Meta { field } => CredentialInjection::Meta { field: field.clone() },
+        },
+        elicit_timeout_secs: cred.elicit_timeout_secs,
+        elicit_fallback: match cred.elicit_fallback {
+            surface::ElicitFallback::OnDemand => ElicitFallback::OnDemand,
+            surface::ElicitFallback::Fail => ElicitFallback::Fail,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +716,7 @@ mod tests {
                 fabric_target_name: None,
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
+                fabric_delegated_credentials: false,
             },
             transit: None,
             canvas: None,
@@ -832,5 +848,40 @@ mod tests {
             ..Default::default()
         }));
         assert!(s.inject_identity_vp(), "dropping Identity element on inbound edge should imply VP injection");
+    }
+
+    #[test]
+    fn transit_point_outbound_credentials_use_only_that_points_own_credentials() {
+        let point = |value: serde_json::Value| -> crate::config::agent_surface::TransitPoint {
+            serde_json::from_value(value).unwrap()
+        };
+        let providers = |bindings: Vec<crate::config::types::OutboundCredentialBinding>| {
+            bindings
+                .into_iter()
+                .map(|binding| binding.credential_provider_id)
+                .collect::<Vec<_>>()
+        };
+        let partner = point(serde_json::json!({"alias": "partner", "target_endpoint": "https://partner.example/mcp",
+            "transit_credentials": {"credential_provider_id": "provider-a"}}));
+        let peer = point(serde_json::json!({"alias": "peer", "target_endpoint": "fabric://peer/surface",
+            "fabric_delegated_credentials": true}));
+        let mut s = surface(SurfaceProtocol::Mcp);
+        s.transit =
+            Some(serde_json::from_value(serde_json::json!({"points": [partner.clone(), peer.clone()]})).unwrap());
+
+        assert!(
+            s.transit_point_outbound_credentials(&peer)
+                .is_empty()
+        );
+        assert_eq!(providers(s.transit_point_outbound_credentials(&partner)), vec!["provider-a"]);
+        assert_eq!(providers(s.outbound_credentials()), vec!["provider-a"]);
+
+        let peer_with_own = point(serde_json::json!({"alias": "peer", "target_endpoint": "fabric://peer/surface",
+            "fabric_delegated_credentials": true, "transit_credentials": {"credential_provider_id": "provider-b"}}));
+        assert_eq!(providers(s.transit_point_outbound_credentials(&peer_with_own)), vec!["provider-b"]);
+
+        s.outbound_credentials =
+            vec![serde_json::from_value(serde_json::json!({"credential_provider_id": "surface-provider"})).unwrap()];
+        assert_eq!(providers(s.transit_point_outbound_credentials(&peer_with_own)), vec!["surface-provider"]);
     }
 }

@@ -1790,6 +1790,7 @@ mod tests {
                     listen_path: tp_listen_path.map(str::to_string),
                     require_transit_token: true,
                     extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
+                    fabric_delegated_credentials: false,
                 }],
                 outbound_listen_address: None,
                 shared: SharedTransitConfig::default(),
