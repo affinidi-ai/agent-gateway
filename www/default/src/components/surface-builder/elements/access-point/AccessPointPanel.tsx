@@ -3,12 +3,12 @@ import { Form } from 'react-bootstrap';
 import type { ConfigPanelProps } from '../types';
 import RouteListenerSection from '../_shared/RouteListenerSection';
 import { AgentCardLocationHelp, AGENT_CARD_EXPLAINER } from '../_shared/AgentCardLocationHelp';
+import { isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 import FieldHelp from '../../../shared/FieldHelp';
 import {
   A2A_PROXY_SETTINGS,
   A2A_VALIDATION_OPTIONS,
   A2A_VERSIONS,
-  isA2aProxyEndpoint,
   isA2aValidation,
   selectedA2aValidation,
   selectedA2aVersions,

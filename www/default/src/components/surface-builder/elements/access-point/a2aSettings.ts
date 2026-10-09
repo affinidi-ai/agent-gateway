@@ -6,6 +6,8 @@
  * `a2a_validation`; the payload carries them as one `a2a` object.
  */
 
+import { isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
+
 export const A2A_VERSIONS = ['0.3', '1.0'] as const;
 export type A2aVersion = (typeof A2A_VERSIONS)[number];
 
@@ -39,9 +41,6 @@ export const A2A_PROXY_SETTINGS: A2aAccessPointSettings = {
   accepted_versions: ['1.0'],
   validation: 'envelope',
 };
-
-export const isA2aProxyEndpoint = (endpoint: unknown): boolean =>
-  typeof endpoint === 'string' && endpoint.startsWith('a2a-proxy://');
 
 export const isA2aValidation = (value: unknown): value is A2aValidation =>
   A2A_VALIDATION_OPTIONS.some(option => option.value === value);

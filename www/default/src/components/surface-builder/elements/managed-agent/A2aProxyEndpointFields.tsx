@@ -1,6 +1,7 @@
 import React from 'react';
 import { Form } from 'react-bootstrap';
 import { useNavigate } from 'react-router-dom';
+import { a2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 
 export interface A2aProxyOption {
   id: string;
@@ -34,7 +35,7 @@ const A2aProxyEndpointFields: React.FC<A2aProxyEndpointFieldsProps> = ({
             const id = e.target.value;
             updateFields({
               a2a_proxy_id: id,
-              endpoint: id ? `a2a-proxy://${id}` : '',
+              endpoint: id ? a2aProxyEndpoint(id) : '',
             });
           }}
         >

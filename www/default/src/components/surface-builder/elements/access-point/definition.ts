@@ -3,10 +3,10 @@ import type { NodeDefinition } from '../types';
 import { normalizeRoute } from '../validators';
 import AccessPointPanel from './AccessPointPanel';
 import { DOCS_URL } from '../../../../config/docs';
+import { isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 import {
   DEFAULT_A2A_SETTINGS,
   a2aSettingsForPayload,
-  isA2aProxyEndpoint,
   isA2aValidation,
   selectedA2aVersions,
 } from './a2aSettings';

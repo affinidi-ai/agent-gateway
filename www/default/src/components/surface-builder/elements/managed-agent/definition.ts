@@ -4,6 +4,7 @@ import { urlError } from '../validators';
 import ManagedAgentPanel from './ManagedAgentPanel';
 import ManagedAgentAuthFullscreen from './ManagedAgentAuthFullscreen';
 import { DOCS_URL } from '../../../../config/docs';
+import { a2aProxyIdFromEndpoint, isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 
 export const managedAgentDefinition: NodeDefinition = {
   type: 'target',
@@ -102,7 +103,7 @@ export const managedAgentDefinition: NodeDefinition = {
     let kind = 'Direct URL';
     if (ep.startsWith('fabric://')) kind = 'Gateway';
     else if (ep.startsWith('proxy://')) kind = 'MCP Proxy';
-    else if (ep.startsWith('a2a-proxy://')) kind = 'A2A Proxy';
+    else if (isA2aProxyEndpoint(ep)) kind = 'A2A Proxy';
     return {
       extras: [ep || '—', kind, c?.target_auth_enabled ? c.target_auth_type || 'enabled' : 'none'],
     };
@@ -151,12 +152,10 @@ export const managedAgentDefinition: NodeDefinition = {
         };
         delete c.mcp_tool_policies_enabled;
       }
-    } else if (ep.startsWith('a2a-proxy://')) {
+    } else if (isA2aProxyEndpoint(ep)) {
       c.endpoint_type = 'a2a-proxy';
       c.a2a_proxy_id =
-        typeof slice?.a2a_proxy_id === 'string'
-          ? slice.a2a_proxy_id
-          : ep.slice('a2a-proxy://'.length);
+        typeof slice?.a2a_proxy_id === 'string' ? slice.a2a_proxy_id : a2aProxyIdFromEndpoint(ep);
     } else {
       c.endpoint_type = 'url';
     }
@@ -198,8 +197,8 @@ export const managedAgentDefinition: NodeDefinition = {
     const node = ctx.firstNodeOfType('target');
     const c = node?.config ?? {};
     const tgt: any = { endpoint: c.endpoint || '' };
-    if (typeof c.endpoint === 'string' && c.endpoint.startsWith('a2a-proxy://')) {
-      tgt.a2a_proxy_id = c.a2a_proxy_id || c.endpoint.slice('a2a-proxy://'.length);
+    if (isA2aProxyEndpoint(c.endpoint)) {
+      tgt.a2a_proxy_id = c.a2a_proxy_id || a2aProxyIdFromEndpoint(c.endpoint);
     }
     if (c.target_auth_enabled && c.target_auth_secret_id) {
       tgt.auth = {

@@ -112,3 +112,8 @@ changes:
         Updates PROTOCOLS, CONFIGURATION_RELOAD, FABRIC, OBSERVABILITY, ARCHITECTURE, README,
         CONTEXT and both AGENTS files for per-surface accepted versions and validation levels,
         fabric:// surfaces, A2A proxy surfaces with URL variants, and rolling back.
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Share one a2a-proxy:// endpoint helper across dashboard elements
+      description: >-
+        The Access Point and Managed Agent elements now build, detect and parse a2a-proxy://
+        Target endpoints through one shared helper instead of repeating the prefix.
