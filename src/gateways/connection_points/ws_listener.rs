@@ -2066,6 +2066,79 @@ fn mediator_reported(
     from_did.is_some_and(|from_did| base_did(from_did) == base_did(mediator_did))
 }
 
+/// The record of a message the mediator delivered. `from_did` is the
+/// envelope's `from`, not a key ID from the unpack metadata.
+fn received_message(
+    connection_point: &GatewayConnectionPoint,
+    connection_point_did: &str,
+    message: &affinidi_messaging_didcomm::Message,
+    metadata: &affinidi_messaging_sdk::messages::compat::UnpackMetadata,
+) -> ReceivedMessage {
+    let to_dids = message
+        .to
+        .clone()
+        .unwrap_or_else(|| vec![connection_point_did.to_string()]);
+    let message_metadata = MessageMetadata {
+        encrypted: metadata.encrypted,
+        authenticated: metadata.authenticated,
+        from_key: metadata
+            .encrypted_from_kid
+            .clone(),
+        extra: serde_json::to_value(metadata).unwrap_or(serde_json::json!({})),
+    };
+    ReceivedMessage::new(
+        connection_point.id.clone(),
+        connection_point
+            .gateway_id
+            .clone(),
+        message.typ.clone(),
+        message.id.clone(),
+        message.thid.clone(),
+        message.from.clone(),
+        to_dids,
+        message.created_time,
+        message.expires_time,
+        message.body.clone(),
+        message_metadata,
+    )
+}
+
+/// The mediator reports `account.not_found` when it no longer has this
+/// connection point's account (e.g. its store was flushed). Unlike
+/// `recipient.unknown` or `access_list.denied`, which are about the remote
+/// peer, this is about us, and the stale socket cannot recover the account.
+/// Returns the report's code when the reader must end so the supervision loop
+/// re-authenticates, which recreates the account and re-applies its ACL. The
+/// same report from any other sender is ignored.
+fn mediator_account_loss<'a>(
+    received_msg: &'a ReceivedMessage,
+    mediator_did: &str,
+) -> Option<&'a str> {
+    if !matches!(MessageType::from_str(&received_msg.message_type), MessageType::ProblemReport) {
+        return None;
+    }
+    let code = received_msg
+        .message_body
+        .get("code")
+        .and_then(|code| code.as_str())?;
+    if !code.contains("account.not_found") {
+        return None;
+    }
+    if !mediator_reported(
+        received_msg
+            .from_did
+            .as_deref(),
+        mediator_did,
+    ) {
+        warn!(
+            from = ?received_msg.from_did,
+            "Ignoring an account.not_found problem report that did not come from the mediator"
+        );
+        return None;
+    }
+    Some(code)
+}
+
 /// Whether the sender is a registered, active gateway. A capability query
 /// creates an offer in a table every peer shares, so only such a gateway may
 /// send one, and only such a gateway is answered when its `Open` is refused.
@@ -2372,43 +2445,7 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                 debug!("Message metadata: from={:?}, encrypted={}", metadata.encrypted_from_kid, metadata.encrypted);
                 debug!("Message.from: {:?}, Message.to: {:?}", message.from, message.to);
                 let message_sha256_hash = metadata.sha256_hash.clone();
-
-                // Extract sender DID from message.from field (not from metadata)
-                let from_did = message.from.clone();
-
-                // Extract recipient DIDs from message.to field
-                let to_dids = if let Some(to_vec) = &message.to {
-                    to_vec.clone()
-                } else {
-                    vec![connection_point_did.to_string()]
-                };
-
-                // Create message metadata
-                let msg_metadata = MessageMetadata {
-                    encrypted: metadata.encrypted,
-                    authenticated: metadata.authenticated,
-                    from_key: metadata
-                        .encrypted_from_kid
-                        .clone(),
-                    extra: serde_json::to_value(&metadata).unwrap_or(serde_json::json!({})),
-                };
-
-                // Create received message
-                let mut received_msg = ReceivedMessage::new(
-                    connection_point.id.clone(),
-                    connection_point
-                        .gateway_id
-                        .clone(),
-                    message.typ.clone(),
-                    message.id.clone(),
-                    message.thid.clone(), // Pass thread ID for correlation
-                    from_did,             // Use message.from instead of metadata.from_prior_issuer_kid
-                    to_dids,
-                    message.created_time,
-                    message.expires_time,
-                    message.body.clone(),
-                    msg_metadata,
-                );
+                let mut received_msg = received_message(connection_point, connection_point_did, &message, &metadata);
                 stream_listener.stamp(&mut received_msg);
 
                 // Attach pre-computed per-listener context. These values
@@ -2566,42 +2603,15 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                             m.last_activity = Some(Utc::now());
                         }
 
-                        // The mediator emits `e.p.account.not_found` when it no
-                        // longer has THIS connection point's account (e.g. its
-                        // store was flushed). Unlike recipient.unknown /
-                        // access_list.denied (which are about the remote peer),
-                        // this is unambiguously about us: our account is gone
-                        // and the stale socket can't recover it. Reconnect so
-                        // the supervision loop re-authenticates — which
-                        // recreates the account and re-applies its ACL.
-                        if matches!(MessageType::from_str(&received_msg.message_type), MessageType::ProblemReport) {
-                            let code = received_msg
-                                .message_body
-                                .get("code")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            if code.contains("account.not_found")
-                                && !mediator_reported(
-                                    received_msg
-                                        .from_did
-                                        .as_deref(),
-                                    mediator_did,
-                                )
-                            {
-                                warn!(
-                                    from = ?received_msg.from_did,
-                                    "Ignoring an account.not_found problem report that did not come from the mediator"
-                                );
-                            } else if code.contains("account.not_found") {
-                                warn!(
-                                    "Connection point '{}' account is missing on the mediator ('{}'); reconnecting to re-authenticate and re-register.",
-                                    connection_point.name, code
-                                );
-                                return Err(format!(
-                                    "mediator account not found ('{}') — reconnecting to re-register",
-                                    code
-                                ));
-                            }
+                        if let Some(code) = mediator_account_loss(&received_msg, mediator_did) {
+                            warn!(
+                                "Connection point '{}' account is missing on the mediator ('{}'); reconnecting to re-authenticate and re-register.",
+                                connection_point.name, code
+                            );
+                            return Err(format!(
+                                "mediator account not found ('{}') — reconnecting to re-register",
+                                code
+                            ));
                         }
 
                         // Sender authentication is enforced natively by the SDK's
@@ -4153,6 +4163,95 @@ mod tests {
         {
             assert!(!super::mediator_reported(sender, "did:peer:mediator"), "{sender:?}");
         }
+    }
+
+    const MEDIATOR_DID: &str = "did:web:mediator.example.com";
+    const CONNECTION_POINT_DID: &str = "did:web:gateway.example.com:cp";
+
+    /// A problem report as the mediator's WebSocket handler packages it: its
+    /// own DID as `from`, the session DID as `to`, the failed message as
+    /// `pthid`, and a `ProblemReport` body.
+    fn mediator_problem_report(
+        sender: &str,
+        descriptor: &str,
+    ) -> super::ReceivedMessage {
+        use affinidi_messaging_sdk::messages::problem_report::{
+            ProblemReport, ProblemReportScope, ProblemReportSorter,
+        };
+
+        let report = ProblemReport::new(
+            ProblemReportSorter::Error,
+            ProblemReportScope::Protocol,
+            descriptor.to_string(),
+            "account {1} not found".to_string(),
+            vec![CONNECTION_POINT_DID.to_string()],
+            None,
+        );
+        let envelope = affinidi_messaging_didcomm::Message::build(
+            uuid::Uuid::new_v4().to_string(),
+            "https://didcomm.org/report-problem/2.0/problem-report".to_string(),
+            serde_json::json!(report),
+        )
+        .from(sender.to_string())
+        .to(CONNECTION_POINT_DID.to_string())
+        .created_time(1_760_000_000)
+        .pthid(uuid::Uuid::new_v4().to_string())
+        .finalize();
+        let connection_point = super::GatewayConnectionPoint::new(
+            "gw-1".to_string(),
+            MEDIATOR_DID.to_string(),
+            CONNECTION_POINT_DID.to_string(),
+            "cp".to_string(),
+            String::new(),
+            "oob-1".to_string(),
+            "https://oob.example.com".to_string(),
+            serde_json::json!({}),
+            None,
+            ConnectionPointType::OobAcceptor,
+            String::new(),
+        );
+
+        super::received_message(
+            &connection_point,
+            CONNECTION_POINT_DID,
+            &envelope,
+            &affinidi_messaging_sdk::messages::compat::UnpackMetadata::default(),
+        )
+    }
+
+    #[test]
+    fn a_mediator_account_not_found_report_ends_the_reader() {
+        let received = mediator_problem_report(MEDIATOR_DID, "account.not_found");
+
+        assert_eq!(received.from_did.as_deref(), Some(MEDIATOR_DID));
+        assert_eq!(received.to_dids, vec![CONNECTION_POINT_DID.to_string()]);
+        assert_eq!(super::mediator_account_loss(&received, MEDIATOR_DID), Some("e.p.account.not_found"));
+        assert_eq!(
+            super::mediator_account_loss(&received, &format!("{MEDIATOR_DID}#key-1")),
+            Some("e.p.account.not_found")
+        );
+    }
+
+    #[test]
+    fn an_account_not_found_report_from_another_sender_keeps_the_socket() {
+        for sender in ["did:web:peer.example.com", "did:web:mediator.example.com.attacker"] {
+            let received = mediator_problem_report(sender, "account.not_found");
+
+            assert_eq!(received.from_did.as_deref(), Some(sender));
+            assert_eq!(super::mediator_account_loss(&received, MEDIATOR_DID), None, "{sender}");
+        }
+    }
+
+    #[test]
+    fn other_mediator_reports_keep_the_socket() {
+        let denied = mediator_problem_report(MEDIATOR_DID, "authorization.account.denied");
+        assert_eq!(super::mediator_account_loss(&denied, MEDIATOR_DID), None);
+
+        let mut not_a_report = mediator_problem_report(MEDIATOR_DID, "account.not_found");
+        not_a_report.message_type = MessageType::MessagePickupStatus
+            .as_str()
+            .to_string();
+        assert_eq!(super::mediator_account_loss(&not_a_report, MEDIATOR_DID), None);
     }
 
     #[tokio::test]

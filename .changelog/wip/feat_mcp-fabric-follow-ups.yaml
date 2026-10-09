@@ -1,0 +1,12 @@
+branch: feat/mcp-fabric-follow-ups
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Test mediator account problem reports with the envelope the mediator sends
+      description: The Connection Point reader's account.not_found decision and its envelope-to-record conversion are now functions of their own, and unit tests drive them with a problem report built the way the mediator's WebSocket handler packages it. A report from the mediator ends the reader so the listener reconnects and re-registers, also when the configured mediator DID carries a fragment; the same report from another DID, another mediator problem code and a non-report message keep the socket. Matching stays on the base DID.
