@@ -223,6 +223,23 @@ The **Remote** tab of a remote gateway starts with the **Issuer DIDs** card
 - The Gateways list shows a muted **ISSUER NOT ESTABLISHED** badge on active remote rows
   that have neither an established nor a trusted issuer DID.
 
+## Remote gateway exposure
+
+The **Publishing** tab of a remote gateway (`EditGatewayPage/PublishingTab.tsx`) edits the
+peer's Fabric exposure through `PUT /gateways/{id}/exposed-surfaces`.
+
+- A radio group picks the mode: **No surfaces** (`none`), **Selected surfaces** (`list`), or
+  **All surfaces** (`all`). The surface checklist shows only in **Selected surfaces** mode.
+- The page reads the mode with `exposureModeOf` (`utils/gateways.ts`), which keeps the earlier
+  meaning for a record without `exposure_mode`. A form without a mode shows **No surfaces**.
+- Save sends `exposure_mode` with the list, and an empty list outside `list` mode.
+
+| Element                        | Test id                                                              |
+| ------------------------------ | -------------------------------------------------------------------- |
+| Mode radio                     | `gateway-exposure-mode-<mode>`                                       |
+| Surface checklist, one surface | `gateway-exposure-surfaces`, `gateway-exposure-surface-<surface_id>` |
+| Save button, summary           | `gateway-exposure-save-button`, `gateway-exposure-summary`           |
+
 ## Feature flags
 
 Settings → **System** → **Feature Flags** is a table of the shared `FeatureFlagRow`

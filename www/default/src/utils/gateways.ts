@@ -32,3 +32,21 @@ export function filterSelectableGateways<T extends { gateway_type?: string; stat
 ): T[] {
   return Array.isArray(gateways) ? gateways.filter(isSelectableRemoteGateway) : [];
 }
+
+/** Which local surfaces a remote gateway may reach over Fabric. */
+export type ExposureMode = 'all' | 'none' | 'list';
+
+/**
+ * The effective exposure mode of a remote gateway record. A record without a
+ * stored mode keeps its earlier meaning: an empty list is `all`, a non-empty
+ * list is `list`.
+ */
+export function exposureModeOf(gw: {
+  exposure_mode?: string | null;
+  exposed_channels?: string[] | null;
+}): ExposureMode {
+  if (gw.exposure_mode === 'all' || gw.exposure_mode === 'none' || gw.exposure_mode === 'list') {
+    return gw.exposure_mode;
+  }
+  return (gw.exposed_channels?.length ?? 0) === 0 ? 'all' : 'list';
+}

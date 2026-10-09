@@ -4,6 +4,7 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { apiClient } from '../api';
 import { ConnectionRuntimeStatus } from '../utils/connectionHealth';
 import { showToast } from '../utils/toaster';
+import { ExposureMode, exposureModeOf } from '../utils/gateways';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
 import { integrationIntegration } from '../components/connection-points/IntegrationsStep';
 import OverviewTab from './EditGatewayPage/OverviewTab';
@@ -23,6 +24,7 @@ interface GatewayForm {
   gateway_type: 'self' | 'remote';
   status: 'active' | 'disabled';
   exposed_channels?: string[];
+  exposure_mode?: ExposureMode;
   integrations?: integrationIntegration[];
 }
 
@@ -163,6 +165,7 @@ const EditGatewayPage: React.FC = () => {
         integrations: [] as any[],
         status: response.data.status,
         exposed_channels: response.data.exposed_channels || [],
+        exposure_mode: exposureModeOf(response.data),
       });
 
       // Load integrations from separate endpoint
@@ -210,13 +213,15 @@ const EditGatewayPage: React.FC = () => {
 
     try {
       setSavingExposedChannels(true);
+      const exposureMode = form.exposure_mode ?? 'none';
       await apiClient.put(`/gateways/${id}/exposed-surfaces`, {
-        exposed_channels: form.exposed_channels || [],
+        exposure_mode: exposureMode,
+        exposed_channels: exposureMode === 'list' ? form.exposed_channels || [] : [],
       });
-      setSuccess('Exposed channels updated successfully!');
+      setSuccess('Exposure updated successfully!');
       setTimeout(() => setSuccess(null), 3000);
     } catch (error: any) {
-      setError(error.message || 'Failed to update exposed channels');
+      setError(error.message || 'Failed to update exposure');
     } finally {
       setSavingExposedChannels(false);
     }
