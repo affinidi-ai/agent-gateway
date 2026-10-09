@@ -182,12 +182,15 @@ pub async fn connect_legacy_sse(
 /// upstream SSE stream, and returns an axum-compatible streaming response.
 ///
 /// An event that grows past `max_event_bytes` before it is complete ends the
-/// stream.
+/// stream, as does an upstream that sends nothing for `idle_timeout` or that
+/// is still streaming after `max_lifetime`.
 pub fn create_sse_passthrough_response(
     upstream_response: reqwest::Response,
     upstream_headers: reqwest::header::HeaderMap,
     channel_name: String,
     max_event_bytes: usize,
+    idle_timeout: std::time::Duration,
+    max_lifetime: std::time::Duration,
 ) -> axum::response::Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(32);
 
@@ -196,8 +199,24 @@ pub fn create_sse_passthrough_response(
     tokio::spawn(async move {
         let mut byte_stream = upstream_response.bytes_stream();
         let mut events = SseEventBuffer::new(max_event_bytes);
+        let lifetime_deadline = tokio::time::Instant::now() + max_lifetime;
 
-        while let Some(chunk_result) = byte_stream.next().await {
+        loop {
+            let idle_deadline = tokio::time::Instant::now() + idle_timeout;
+            let chunk_result =
+                match tokio::time::timeout_at(idle_deadline.min(lifetime_deadline), byte_stream.next()).await {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let limit = if lifetime_deadline <= idle_deadline {
+                            "maximum lifetime"
+                        } else {
+                            "idle timeout"
+                        };
+                        warn!(channel = channel_name_clone, limit, "Ending upstream SSE stream");
+                        break;
+                    }
+                };
             match chunk_result {
                 Ok(chunk) => {
                     let raw_events = match events.push(&chunk) {

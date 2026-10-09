@@ -2384,9 +2384,12 @@ pub async fn handle_mcp_get<S: McpProxyStore>(
         }
 
         info!("🔌 SSE connect for MCP proxy at {}", base_path);
-        let (session_id, rx_stream) = session_mgr
+        let Some((session_id, rx_stream)) = session_mgr
             .create_session()
-            .await;
+            .await
+        else {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "Too many active SSE sessions".to_string()));
+        };
         let response = crate::mcp::sse_server::build_legacy_sse_response(session_id, rx_stream, base_path);
         return Ok(response);
     }
@@ -4658,7 +4661,8 @@ mod tests {
         let (router, sessions, _directory) = standalone_mcp_router().await;
         let (session_id, _stream) = sessions
             .create_session()
-            .await;
+            .await
+            .unwrap();
         let body = serde_json::json!({"jsonrpc": "2.0", "id": "standalone", "method": "server/discover", "params": {"_meta": {
             "io.modelcontextprotocol/protocolVersion": "2025-11-25", "io.modelcontextprotocol/clientCapabilities": {}
         }}}).to_string();
@@ -4750,7 +4754,8 @@ mod tests {
         let (router, sessions, _directory) = standalone_mcp_router().await;
         let (session_id, _stream) = sessions
             .create_session()
-            .await;
+            .await
+            .unwrap();
         for (path, method, expected_status) in [
             ("/mcp/owned".to_string(), "initialize", StatusCode::OK),
             ("/mcp/owned".to_string(), "notifications/initialized", StatusCode::NO_CONTENT),

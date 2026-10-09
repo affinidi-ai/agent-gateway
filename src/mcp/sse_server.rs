@@ -44,6 +44,10 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 /// Cleanup interval for the background reaper task.
 const CLEANUP_INTERVAL_SECS: u64 = 60;
 
+/// Hard cap on concurrent Legacy SSE sessions to bound memory. Beyond this
+/// limit, `create_session` returns `None` and the caller responds 429.
+const MAX_SESSIONS: usize = 10_000;
+
 /// An active SSE session with a sender channel for pushing events.
 struct SseSession {
     /// Sender end — used by POST handlers to push responses to the SSE stream.
@@ -62,6 +66,7 @@ struct SseSession {
 pub struct SseSessionManager {
     sessions: Arc<RwLock<HashMap<String, SseSession>>>,
     idle_timeout: Duration,
+    max_sessions: usize,
 }
 
 impl SseSessionManager {
@@ -71,6 +76,7 @@ impl SseSessionManager {
         let manager = Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             idle_timeout,
+            max_sessions: MAX_SESSIONS,
         };
 
         // Spawn background reaper
@@ -103,27 +109,33 @@ impl SseSessionManager {
     ///
     /// Returns `(session_id, receiver_stream)` — the receiver is used to build
     /// the axum SSE response; the session_id is communicated to the client via
-    /// the `endpoint` event.
-    pub async fn create_session(&self) -> (String, ReceiverStream<Result<SseEvent, Infallible>>) {
+    /// the `endpoint` event. Returns `None` when the session cap is reached
+    /// even after dropping sessions whose client has disconnected.
+    pub async fn create_session(&self) -> Option<(String, ReceiverStream<Result<SseEvent, Infallible>>)> {
+        let mut sessions = self.sessions.write().await;
+        if sessions.len() >= self.max_sessions {
+            sessions.retain(|_, session| !session.tx.is_closed());
+            if sessions.len() >= self.max_sessions {
+                return None;
+            }
+        }
         let session_id = Uuid::new_v4()
             .to_string()
             .replace('-', "");
         let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
         let now = Instant::now();
 
-        let session = SseSession {
-            tx,
-            created_at: now,
-            last_active: now,
-        };
-
-        self.sessions
-            .write()
-            .await
-            .insert(session_id.clone(), session);
+        sessions.insert(
+            session_id.clone(),
+            SseSession {
+                tx,
+                created_at: now,
+                last_active: now,
+            },
+        );
         debug!(session_id = %session_id, "Created new SSE session");
 
-        (session_id, ReceiverStream::new(rx))
+        Some((session_id, ReceiverStream::new(rx)))
     }
 
     /// Send a JSON-RPC response to a session's SSE stream as a `message` event.
@@ -329,14 +341,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_refuses_beyond_the_cap_until_a_client_disconnects() {
+        let manager = SseSessionManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            idle_timeout: Duration::from_secs(300),
+            max_sessions: 2,
+        };
+
+        let (_, first) = manager
+            .create_session()
+            .await
+            .unwrap();
+        let (_, _second) = manager
+            .create_session()
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .create_session()
+                .await
+                .is_none()
+        );
+        assert_eq!(manager.session_count().await, 2);
+
+        drop(first);
+        let (third, _third_rx) = manager
+            .create_session()
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .session_exists(&third)
+                .await
+        );
+        assert_eq!(manager.session_count().await, 2);
+        assert!(
+            manager
+                .create_session()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_session_lifecycle() {
         let manager = SseSessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             idle_timeout: Duration::from_secs(300),
+            max_sessions: MAX_SESSIONS,
         };
 
         // Create session
-        let (session_id, _rx) = manager.create_session().await;
+        let (session_id, _rx) = manager
+            .create_session()
+            .await
+            .unwrap();
         assert!(
             manager
                 .session_exists(&session_id)
@@ -367,6 +426,7 @@ mod tests {
         let manager = SseSessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             idle_timeout: Duration::from_secs(300),
+            max_sessions: MAX_SESSIONS,
         };
 
         let sent = manager
