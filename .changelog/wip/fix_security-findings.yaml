@@ -19,6 +19,9 @@ changes:
       title: Stop sending target credentials for failed callers over MCP proxy and Fabric
       description: Backends behind `proxy://` MCP, `a2a-proxy://` or Fabric surfaces with source authentication now receive requests from failed callers without the target credential, and will usually reject them. Two Fabric gateways that both require source authentication on the same header no longer reach the backend, because the sending gateway strips that header; require caller authentication on one side of the hop or use a different header on each side (see docs/POLICY.md).
   internal:
+    - timestamp: '2026-10-09T00:00:06.000Z'
+      title: Test access-token scopes on JWT strategy create, update and JWKS probe
+      description: Component tests through the router and access-token middleware show that a token without the edit scope cannot create or update a JWT verification strategy and one without the view scope cannot probe a JWKS URI, with positive controls for tokens that hold the scope.
     - timestamp: '2026-10-09T00:00:04.000Z'
       title: Test tenant token write refusals on every management store
       description: Adds handler-level 403 and own-record tests per store, router and access-token middleware tests for JWT strategies and secrets, and lists the read-only stores in ACCESS_TOKENS.md.

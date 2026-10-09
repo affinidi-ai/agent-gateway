@@ -1487,7 +1487,8 @@ async fn jwt_strategies_app() -> JwtStrategiesApp {
         .layer(middleware::from_fn_with_state(auth, require_session_auth))
         .layer(Extension(sessions.clone()))
         .layer(Extension(users))
-        .layer(Extension(Arc::new(crate::rbac::RbacConfig::default())));
+        .layer(Extension(Arc::new(crate::rbac::RbacConfig::default())))
+        .layer(Extension(Arc::new(crate::jwt_bearer::JwksClient::new())));
     JwtStrategiesApp {
         app,
         store,
@@ -1554,6 +1555,156 @@ async fn jwt_strategy_list_accepts_a_session_login_on_role_alone() {
     assert_eq!(
         request(&fixture.app, "GET", "/v1/jwt-verification-strategies", Some(&session), None).await,
         StatusCode::OK
+    );
+}
+
+const SCOPES_WITHOUT_STRATEGY_EDIT: [&[&str]; 2] = [&["jwt_verification_strategies.view"], &["surfaces.view"]];
+
+async fn json_request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    secret: &str,
+    body: serde_json::Value,
+) -> StatusCode {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("Authorization", format!("Bearer {secret}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let (status, _, _) = send(app, request).await;
+    status
+}
+
+#[tokio::test]
+async fn jwt_strategy_create_refuses_a_pat_without_the_edit_scope() {
+    use crate::jwt_bearer::JwtVerificationStrategyStorage;
+    let fixture = jwt_strategies_app().await;
+
+    for scopes in SCOPES_WITHOUT_STRATEGY_EDIT {
+        let secret = create_owned_token(&fixture.store, &fixture.user_id, scopes).await;
+        assert_eq!(
+            json_request(&fixture.app, "POST", "/v1/jwt-verification-strategies", &secret, strategy_replacement())
+                .await,
+            StatusCode::FORBIDDEN,
+            "scopes {scopes:?}"
+        );
+    }
+    assert!(
+        fixture
+            .strategies
+            .list()
+            .await
+            .expect("list")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn jwt_strategy_create_lets_a_pat_with_the_edit_scope_store_a_strategy() {
+    use crate::jwt_bearer::JwtVerificationStrategyStorage;
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.edit"]).await;
+
+    assert_eq!(
+        json_request(&fixture.app, "POST", "/v1/jwt-verification-strategies", &secret, strategy_replacement()).await,
+        StatusCode::CREATED
+    );
+    let stored = fixture
+        .strategies
+        .list()
+        .await
+        .expect("list");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].expected_issuer, "https://tenant.example.com");
+}
+
+#[tokio::test]
+async fn jwt_strategy_update_refuses_a_pat_without_the_edit_scope() {
+    use crate::jwt_bearer::JwtVerificationStrategyStorage;
+    let fixture = jwt_strategies_app().await;
+    let id = seed_strategy(&fixture.strategies, None).await;
+    let path = format!("/v1/jwt-verification-strategies/{id}");
+
+    for scopes in SCOPES_WITHOUT_STRATEGY_EDIT {
+        let secret = create_owned_token(&fixture.store, &fixture.user_id, scopes).await;
+        assert_eq!(
+            json_request(&fixture.app, "PUT", &path, &secret, strategy_replacement()).await,
+            StatusCode::FORBIDDEN,
+            "scopes {scopes:?}"
+        );
+    }
+    let stored = fixture
+        .strategies
+        .get(&id)
+        .await
+        .expect("load")
+        .expect("strategy");
+    assert_eq!(stored.expected_issuer, "https://operator.example.com");
+}
+
+#[tokio::test]
+async fn jwt_strategy_update_lets_a_pat_with_the_edit_scope_change_a_strategy() {
+    use crate::jwt_bearer::JwtVerificationStrategyStorage;
+    let fixture = jwt_strategies_app().await;
+    let id = seed_strategy(&fixture.strategies, None).await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.edit"]).await;
+
+    assert_eq!(
+        json_request(
+            &fixture.app,
+            "PUT",
+            &format!("/v1/jwt-verification-strategies/{id}"),
+            &secret,
+            strategy_replacement()
+        )
+        .await,
+        StatusCode::OK
+    );
+    let stored = fixture
+        .strategies
+        .get(&id)
+        .await
+        .expect("load")
+        .expect("strategy");
+    assert_eq!(stored.expected_issuer, "https://tenant.example.com");
+}
+
+#[tokio::test]
+async fn jwks_uri_validation_refuses_a_pat_without_the_view_scope() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["surfaces.view"]).await;
+
+    assert_eq!(
+        json_request(
+            &fixture.app,
+            "POST",
+            "/v1/jwt-verification-strategies/validate-jwks-uri",
+            &secret,
+            serde_json::json!({ "uri": "not-a-url" })
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn jwks_uri_validation_lets_a_pat_with_the_view_scope_reach_the_probe() {
+    let fixture = jwt_strategies_app().await;
+    let secret = create_owned_token(&fixture.store, &fixture.user_id, &["jwt_verification_strategies.view"]).await;
+
+    assert_eq!(
+        json_request(
+            &fixture.app,
+            "POST",
+            "/v1/jwt-verification-strategies/validate-jwks-uri",
+            &secret,
+            serde_json::json!({ "uri": "not-a-url" })
+        )
+        .await,
+        StatusCode::BAD_REQUEST
     );
 }
 
