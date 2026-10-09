@@ -290,16 +290,28 @@ the paired sending gateway's check, as it trusts that peer for every other forwa
 
 ### Delegated credentials over Fabric
 
-A sending surface with `outbound_credentials` keeps its delegated tokens to itself for legacy
-traffic. For a modern (`2026-07-28`) MCP request, the sending gateway applies the
-caller's delegated credential after stripping the caller's own token, the same way it would for a
-local Target, and sends it to the peer inside the authcrypt framed stream: the access token only,
-injected as the binding's `inject_as` says (a header or a `_meta` field), never the refresh token.
-The receiving gateway, and its Target, can therefore use that access token until it expires.
-Any modern MCP caller on a `fabric://` route with `outbound_credentials` triggers this, with no
-per-route opt-in or opt-out, so routes that predate this behaviour start sharing tokens on upgrade.
-Pair only with peers you would trust with those tokens, and remove `outbound_credentials` from a
-`fabric://` route whose peer must not receive them. See [Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
+A sending surface's `outbound_credentials` reach a `fabric://` peer only when the route to that
+peer opts in with `fabric_delegated_credentials: true`: on the Target for Access Point traffic, or
+on the Transit Point for agent-initiated traffic. The setting is off by default, including on
+surfaces saved before it existed, and no migration turns it on. With it off, the sending gateway
+still strips the caller's own token and sends the peer no delegated credential, whatever the
+request's MCP revision.
+
+With it on, the access token crosses as it would to a local destination, injected as the
+binding's `inject_as` says (a header or a `_meta` field); the refresh token never crosses. On the
+Target, only modern (`2026-07-28`) MCP requests carry it: the sending gateway strips the caller's
+own token, applies the delegated credential, and sends it inside the authcrypt framed stream.
+Legacy Access Point requests never carry it. On a Transit Point, both modern requests and legacy
+`_meta` injection carry it. The receiving gateway, and its Target, can use that access token until
+it expires.
+
+The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
+gateway sends no delegated credential unless it opts in too. A Target variant can override the
+setting, and a variant with `complete: true` that omits the override turns it off. Turn it on only
+for peers you would trust with those tokens. In the dashboard it is the **Send delegated
+credentials over Fabric** switch on the Managed Agent or Transit Point panel, shown for a
+`fabric://` route on a surface with credential bindings. See
+[Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
 
 A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 `agent_gateway_a2a_protocol_version_total` metric do not run on either G2G leg. The sending gateway
