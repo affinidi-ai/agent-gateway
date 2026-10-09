@@ -5,7 +5,8 @@ Feature: A2A proxy endpoint targets a non-A2A managed agent
   Target service and returns A2A responses.
 
   An A2A-proxy surface serves A2A 1.0 only: its card is a 1.0 card, its replies
-  are A2A 1.0 messages, and it validates no messages. Unless a scenario says
+  are A2A 1.0 messages, and it checks only the JSON-RPC envelope, not the A2A
+  message shape. Unless a scenario says
   otherwise, its requests send A2A-Version 1.0.
 
   Background:

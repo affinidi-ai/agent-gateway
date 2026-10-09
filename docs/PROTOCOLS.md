@@ -143,9 +143,13 @@ Access Point of an A2A surface (**A2A Protocol**):
 ```
 
 The dashboard shows `validation` as **Message validation**: **Off**, **JSON-RPC envelope** (the
-default) or **Envelope + A2A fields**. A block stored with the earlier boolean `validate_messages`
-is still read: `true` as `"full"`, `false` as `"envelope"`; it is written back as `validation`.
+default) or **Envelope + A2A fields**.
 
+- `"off"` lets a JSON-RPC batch, a non-string `method` and a body that is not JSON reach surface
+  policy and the agent with no method that rules keyed on `input.a2a.method` could match. Only an
+  appliance-wide caller can set it: a tenant-scoped token that sets `"off"` on a surface that was not
+  already `"off"` is refused with `403`. On such a request, an x402 or MPP payment with A2A method
+  filters is required rather than skipped, since the filters cannot be matched.
 - The surface API stores the block explicitly on every save of an A2A or AP2 surface, the defaults
   when none is sent. A `PUT` that omits it keeps the stored one, and a JSON merge `PATCH` with
   `null` resets it to the defaults. A save that changes the protocol to anything other than A2A or
@@ -155,9 +159,10 @@ is still read: `true` as `"full"`, `false` as `"envelope"`; it is written back a
   fields to those values while the Target in view is an A2A proxy, and leaves the block out of the
   payload so the stored settings are kept.
 - On a surface whose Target is an A2A proxy, the block configures only the variants that point the
-  Target at a URL. With no such variant it applies to no request: the API then refuses a block that
-  differs from `1.0` with `"envelope"` and stores none, so moving the Target off the proxy later
-  starts from the defaults.
+  Target at a URL. With no such variant it applies to no request, and none is stored, so moving the
+  Target off the proxy later starts from the defaults. A save that only carries the stored block
+  along (a Target moved to a proxy, a `PUT` echoing `GET`, the last URL variant changed or removed)
+  drops it; a save that changes the block to anything but `1.0` with `"envelope"` is refused.
 - The block is surface-level: variants cannot override it. It is valid on A2A and AP2 Access Points
   only: a create, a `PUT` or a merge `PATCH` that sends it on another protocol is refused with `400`
   ("access_point.a2a requires an A2A or AP2 Access Point"). A block left over from the stored
@@ -167,13 +172,20 @@ is still read: `true` as `"full"`, `false` as `"envelope"`; it is written back a
   is given one, and the block is written to storage: `accepted_versions` is `["1.0"]` if the retired
   `a2a_legacy_compatibility` flag was off, and both versions otherwise; `validation` is `"off"` if
   the retired `[a2a] validate_messages` is `false`, and `"envelope"` otherwise. It is never carried
-  over as `"full"`: before the request-shape check existed, `validate_messages` gated the envelope
-  check alone, so `"full"` could refuse callers the gateway served before. A log line reports how
-  many surfaces were given settings, with a warning when the retired flag was off.
+  over as `"full"`, although `validate_messages = true` (the old default) also checked the request
+  shape: the shape check is the one that can refuse lenient callers, so it is now opt-in per surface,
+  and a surface that relied on it must select `"full"`. A log line reports how many surfaces were
+  given settings, with a warning when the retired flag was off.
+- The settings file is read for the retired flag only while some surface still needs a block, and
+  never written. If it exists but cannot be read or parsed, no block is stored, a warning is logged,
+  and the next load retries; those surfaces are served with the defaults meanwhile. A block that
+  cannot be saved applies in memory and is stored on a later load or save.
 - Rolling back to a version from before per-surface settings needs `access_point.a2a` removed from
   every stored surface first. Those versions reject unknown Access Point fields, so they skip any
-  surface that has the block, and every A2A or AP2 surface other than an A2A proxy Target has it
-  after the first start.
+  surface that has the block, and almost every A2A or AP2 surface has it after the first start. For
+  the same reason, nodes that share surface storage (Active and Standby) must run the same version:
+  upgrade them together, and set `cache_refresh_interval_secs` to `0` on the older node until it is
+  upgraded, or its refresh drops the surfaces the newer node has written.
 - A stored block that is invalid, which only editing storage by hand can produce, is not refused: a
   startup warning names the surface, and an empty or unrecognised `accepted_versions` serves both
   versions until the surface is saved with valid settings.
@@ -275,11 +287,12 @@ allow if input.a2a.message.parts[_].text
 `metadata`, `extensions`, and `messageId` are the same in both versions, so rules that read them,
 including the agent identity extension, need no change.
 
-A JSON-RPC batch or a non-string `method` would reach policy with neither `input.a2a.method` nor
-`input.a2a.method_canonical`, so no rule keyed on the method would see it. The envelope check refuses
-both with `-32600` first, so they reach policy only on a surface whose `validation` is `"off"`. A
-request a sending gateway forwards over the fabric is checked there, and is not checked again by the
-receiving gateway.
+A JSON-RPC batch or a non-string `method` reaches policy with neither `input.a2a.method` nor
+`input.a2a.method_canonical`, so no rule keyed on the method sees it. Global and gateway policy run
+before the envelope check, so they see such a request at every validation level; the envelope check
+then refuses it with `-32600` before payment, surface policy and forwarding. Only on a surface whose
+`validation` is `"off"` does it reach surface policy and the agent. A request a sending gateway
+forwards over the fabric is checked there, and is not checked again by the receiving gateway.
 
 The allow-list and message-shape patterns are pinned against the policy engine by the tests in
 [`src/surface_context/mod.rs`](../src/surface_context/mod.rs).

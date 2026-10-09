@@ -173,22 +173,25 @@ pub fn should_require_payment(
                 return false;
             };
 
-            // Parse JSON-RPC request
-            let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
-                // If we can't parse the request and filters are configured,
-                // fail open (no payment) since we can't match against any filter
-                // This allows non-JSON-RPC requests (like GET requests) to pass through
-                info!("[x402] A2A/AP2 payment NOT required: failed to parse body as JSON (cannot match filters)");
+            // A request without a body (a GET) carries no method and is not charged.
+            // A body the filters cannot be matched against (not JSON, a JSON-RPC
+            // batch, a non-string `method`) is charged rather than let through
+            // free: it only gets here when the surface's A2A validation is `off`.
+            if body_bytes.is_empty() {
+                info!("[x402] A2A/AP2 payment NOT required: empty body (no method to match filters)");
                 return false;
+            }
+            let Some(json) = serde_json::from_slice::<serde_json::Value>(body_bytes).ok() else {
+                info!("[x402] A2A/AP2 payment required: body is not JSON, so method filters cannot be matched");
+                return true;
             };
 
             let Some(method) = json
                 .get("method")
                 .and_then(|m| m.as_str())
             else {
-                // No method field - this is not a JSON-RPC request
-                info!("[x402] A2A/AP2 payment NOT required: no method field in request (cannot match filters)");
-                return false;
+                info!("[x402] A2A/AP2 payment required: no string method, so method filters cannot be matched");
+                return true;
             };
 
             info!("[x402] A2A/AP2 JSON-RPC method: {}", method);
@@ -1020,5 +1023,27 @@ mod a2a_method_gating_tests {
         assert!(should_require_payment(&config, &ChannelProtocol::A2a, &body(&text), None));
         let free = format!("a{}", "é".repeat(150));
         assert!(!should_require_payment(&config, &ChannelProtocol::A2a, &body(&free), None));
+    }
+
+    /// With A2A method filters configured, a body the filters cannot be matched
+    /// against is charged instead of let through free; a request without a body
+    /// is still not charged.
+    #[test]
+    fn a2a_method_filters_charge_a_body_without_a_string_method() {
+        let config = X402Config {
+            a2a_method_filters: Some(vec![A2AMethodFilter {
+                method: "CancelTask".to_string(),
+                message_patterns: vec![],
+            }]),
+            ..Default::default()
+        };
+        let requires = |body: &[u8]| should_require_payment(&config, &ChannelProtocol::A2a, body, None);
+
+        assert!(requires(br#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t"}}]"#), "a batch");
+        assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":7}"#), "a non-string method");
+        assert!(requires(b"not json"), "a body that is not JSON");
+        assert!(!requires(b""), "no body");
+        assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","params":{"id":"t"}}"#));
+        assert!(!requires(br#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t"}}"#));
     }
 }

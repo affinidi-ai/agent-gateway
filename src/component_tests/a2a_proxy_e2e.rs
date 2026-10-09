@@ -930,3 +930,188 @@ async fn a2a_proxy_accepts_a_message_a_managed_agent_would_refuse() {
         .expect("JSON response");
     assert!(body.get("error").is_none(), "expected the proxy to serve the request, got {body}");
 }
+
+// ── Surface API: A2A settings that apply to nothing ─────────────────────────
+
+/// A block the gateway stored must not turn an edit that leaves only A2A-proxy
+/// Targets into a 400. Each of these carries the stored block unchanged, and the
+/// API drops it instead of refusing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn surface_api_drops_a_stored_a2a_block_once_only_a2a_proxy_targets_remain() {
+    let mut client = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_a2a_proxy_fixtures(temp_dir, "http://127.0.0.1:9", "active", true, 5, 100, 3);
+        client = Some(helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let proxy = format!("a2a-proxy://{PROXY_ID}");
+    let client = client.unwrap();
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let create = |route: &str, target: &str, variant_target: Option<&str>| {
+        let mut body = json!({
+            "name": route.trim_start_matches('/'), "status": "disabled",
+            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a"},
+            "target": {"endpoint": target}
+        });
+        if target.starts_with("a2a-proxy://") {
+            body["target"]["a2a_proxy_id"] = json!(PROXY_ID);
+        }
+        if let Some(variant_target) = variant_target {
+            body["access_point"]["a2a"] = json!({"accepted_versions": ["1.0"], "validation": "full"});
+            body["variants"] = json!([{"id": "url-variant", "alias": "url", "name": "url", "enabled": true,
+                "overrides": {"complete": true, "target": {"endpoint": variant_target}}},
+                {"id": "proxy-variant", "alias": "proxy", "name": "proxy", "enabled": true,
+                "overrides": {}}]);
+        }
+        body
+    };
+    let send = |request: reqwest::RequestBuilder| async move {
+        let response = request
+            .send()
+            .await
+            .expect("admin API request");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or(json!(null));
+        (status, body)
+    };
+
+    // A merge PATCH that moves the Target to an A2A proxy carries the stored default block along.
+    let (status, created) = send(
+        client
+            .post(&collection)
+            .json(&create("/stale-patch", &h.mock.url(), None)),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["access_point"]["a2a"]["validation"], "envelope");
+    let endpoint = format!(
+        "{collection}/{}",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let (status, patched) = send(
+        client
+            .patch(&endpoint)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({"target": {"endpoint": &proxy, "a2a_proxy_id": PROXY_ID}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{patched}");
+    assert!(
+        patched["access_point"]
+            .get("a2a")
+            .is_none(),
+        "{patched}"
+    );
+
+    // A PUT that echoes the block from GET, after the Target moved to a proxy.
+    let (_, created) = send(
+        client
+            .post(&collection)
+            .json(&create("/stale-put", &h.mock.url(), None)),
+    )
+    .await;
+    let endpoint = format!(
+        "{collection}/{}",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let mut echoed = created.clone();
+    echoed["target"]["endpoint"] = json!(&proxy);
+    echoed["target"]["a2a_proxy_id"] = json!(PROXY_ID);
+    let (status, put) = send(
+        client
+            .put(&endpoint)
+            .json(&echoed),
+    )
+    .await;
+    assert_eq!(status, 200, "{put}");
+    assert!(
+        put["access_point"]
+            .get("a2a")
+            .is_none(),
+        "{put}"
+    );
+
+    // patch_variant pointing the last URL variant at a proxy.
+    let (status, created) = send(
+        client
+            .post(&collection)
+            .json(&create("/stale-variant", &proxy, Some(&h.mock.url()))),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["access_point"]["a2a"]["validation"], "full", "the block configures the URL variant");
+    let endpoint = format!(
+        "{collection}/{}",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let (status, patched) = send(
+        client
+            .patch(format!("{endpoint}/variants/url-variant"))
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({"overrides": {"target": {"endpoint": &proxy, "a2a_proxy_id": PROXY_ID}}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{patched}");
+    let (_, stored) = send(client.get(&endpoint)).await;
+    assert!(
+        stored["access_point"]
+            .get("a2a")
+            .is_none(),
+        "{stored}"
+    );
+
+    // delete_variant removing the last URL variant.
+    let (_, created) = send(
+        client
+            .post(&collection)
+            .json(&create("/stale-delete", &proxy, Some(&h.mock.url()))),
+    )
+    .await;
+    let endpoint = format!(
+        "{collection}/{}",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let (status, deleted) = send(client.delete(format!("{endpoint}/variants/url-variant"))).await;
+    assert!((200..300).contains(&status), "{status} {deleted}");
+    let (_, stored) = send(client.get(&endpoint)).await;
+    assert!(
+        stored["access_point"]
+            .get("a2a")
+            .is_none(),
+        "{stored}"
+    );
+
+    // A changed block that would apply to nothing is still refused.
+    let (_, created) = send(
+        client
+            .post(&collection)
+            .json(&create("/stale-refused", &h.mock.url(), None)),
+    )
+    .await;
+    let endpoint = format!(
+        "{collection}/{}",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let (status, refused) = send(
+        client
+            .patch(&endpoint)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({"target": {"endpoint": &proxy, "a2a_proxy_id": PROXY_ID},
+                          "access_point": {"a2a": {"accepted_versions": ["0.3"]}}})),
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+}

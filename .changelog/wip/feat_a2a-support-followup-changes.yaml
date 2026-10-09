@@ -12,8 +12,16 @@ changes:
         surface's accepted versions. When the Target is an A2A proxy, the section is locked
         to 1.0 with envelope validation, and the Managed Agent panel explains why; on such a
         surface the settings configure the variants that point the Target at a URL. The
-        surface API refuses the block on a surface that is not A2A or AP2.
+        surface API refuses the block on a surface that is not A2A or AP2, and only an
+        appliance-wide administrator can set validation to off; a tenant-scoped token is
+        refused with 403.
   changed:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: List both A2A versions on the onboarding agent card
+      description: >-
+        The onboarding agent card belongs to no surface, so it now always lists A2A 0.3 and
+        1.0 and carries the v0.3 fields. It no longer follows the retired
+        a2a_legacy_compatibility flag. What the onboarding agent serves is unchanged.
     - timestamp: '2026-10-09T00:00:00.000Z'
       title: Apply A2A version negotiation and validation to fabric:// surfaces
       description: >-
@@ -55,7 +63,14 @@ changes:
         to storage: A2A 1.0 only if the flag was off, both versions otherwise. Versions
         before this change cannot read a surface with access_point.a2a, so rolling back
         needs the block removed from each stored surface first.
-  security: []
+  security:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Charge A2A requests that payment method filters cannot match
+      description: >-
+        An x402 or MPP payment with A2A method filters used to be skipped for a request body
+        that is not JSON, is a JSON-RPC batch, or has no string method, because the filters
+        could not be matched. Such a request is now charged; a request without a body is
+        still not. It only reaches payment when the surface's A2A validation is off.
   breaking:
     - timestamp: '2026-10-08T00:00:00.000Z'
       title: ⭐ Serve A2A proxy surfaces in A2A 1.0 only
@@ -80,7 +95,10 @@ changes:
       title: Cover per-surface A2A settings with unit, component, BDD and UI tests
       description: >-
         Adds unit and component tests for settings defaults, the three validation levels
-        (including batches and the A2A proxy), reading the earlier boolean, storage,
+        (including batches and the A2A proxy), restricting off to appliance-wide callers,
+        payment method filters on unmatchable bodies, storage, reading the settings file
+        without writing it, dropping a stored block that no longer applies (through the
+        surface and variant API),
         carrying the previous gateway-wide switches over to stored surfaces, protocol and
         Target changes on save, per-surface negotiation, the deprecated TOML key, and the
         1.0-only A2A proxy card and reply, fabric:// surfaces, URL variants of A2A proxy

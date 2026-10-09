@@ -21,8 +21,9 @@ const JSONRPC_TARGET_TIMEOUT: i32 = -32021;
 ///
 /// This proxy fronts a non-A2A backend and supports only non-streaming send, so it
 /// accepts `SendMessage` and nothing else, also in its v0.3 spelling `message/send`:
-/// the surface serves A2A 1.0 only but validates no messages, so a caller using
-/// the older spelling under `A2A-Version: 1.0` keeps working. Hence the canonical
+/// the surface serves A2A 1.0 only and checks only the JSON-RPC envelope, not the
+/// A2A message shape, so a caller using the older spelling under
+/// `A2A-Version: 1.0` keeps working. Hence the canonical
 /// comparison rather than a raw string match.
 ///
 /// Everything else is correctly refused, including the extended-card method: the

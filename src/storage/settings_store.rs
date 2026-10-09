@@ -6,6 +6,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use tokio::fs;
 use tracing::{info, warn};
 
+/// File name of the dashboard settings inside the settings storage directory.
+pub const SETTINGS_FILE_NAME: &str = "settings.json";
+
 /// Process-global settings store, registered once at boot by the orchestrator.
 static GLOBAL_SETTINGS: OnceLock<Arc<SettingsStore>> = OnceLock::new();
 
@@ -201,7 +204,7 @@ impl SettingsStore {
     pub fn new<P: AsRef<Path>>(storage_dir: P) -> Self {
         let storage_path = storage_dir
             .as_ref()
-            .join("settings.json");
+            .join(SETTINGS_FILE_NAME);
 
         Self {
             settings: Arc::new(RwLock::new(DashboardSettings::default())),

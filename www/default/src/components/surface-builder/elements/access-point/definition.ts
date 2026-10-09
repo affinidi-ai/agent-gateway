@@ -120,7 +120,6 @@ export const accessPointDefinition: NodeDefinition = {
       c.a2a_validation = isA2aValidation(a2a.validation)
         ? a2a.validation
         : DEFAULT_A2A_SETTINGS.validation;
-      delete c.a2a_validate_messages;
     }
     return c;
   },

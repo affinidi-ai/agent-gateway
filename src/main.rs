@@ -386,6 +386,18 @@ async fn async_main() -> Result<()> {
     // before this point consider using println
     let _guard: Option<WorkerGuard> = init_logging(&config, &bootstrap_config, otlp_auth_header)?;
 
+    if bootstrap_config
+        .a2a
+        .validate_messages
+        .is_some()
+    {
+        warn!(
+            "[a2a] validate_messages is deprecated: validation is set per A2A surface (access_point.a2a.validation). \
+             It is only applied to A2A surfaces loaded without their own settings, as \"off\" when false and \
+             \"envelope\" otherwise. Remove it from the config file once every surface has its own settings."
+        );
+    }
+
     // Load resource-limit configuration into the process-global. Placed after
     // logging init so a missing/misconfigured path is visible. A missing or
     // malformed file leaves every dimension unconstrained (limit 1_000_000).
@@ -896,8 +908,7 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
         .context("Failed to load network config for duplicate-route detection")?;
     disable_duplicate_route_surfaces(&store, &mut channels, &network_config).await?;
     surfaces::strip_unsupported_header_metadata_mappings(&store, &mut channels).await?;
-    surfaces::carry_over_a2a_settings(&store, &mut channels, surfaces::RetiredA2aSwitches::read(bootstrap).await)
-        .await?;
+    surfaces::carry_over_a2a_settings(&store, &mut channels, || surfaces::RetiredA2aSwitches::read(bootstrap)).await;
 
     info!("✅ Loaded {} surface(s) from local storage", channels.len());
 

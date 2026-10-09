@@ -949,8 +949,8 @@ fn response_is_jsonrpc_error_with_code(
     assert_eq!(actual, Some(expected_code), "expected JSON-RPC error code {expected_code}; body was {body}");
 }
 
-/// Assert the response's JSON-RPC error lists a supported protocol version, so a
-/// rejected caller can renegotiate without guessing.
+/// Assert the response's JSON-RPC error lists exactly the given comma-separated
+/// supported versions, in order: the surface's accepted set.
 #[then(expr = "the response error lists only the supported versions {string}")]
 fn response_error_lists_only_supported_versions(
     world: &mut SurfaceWorld,
@@ -968,6 +968,8 @@ fn response_error_lists_only_supported_versions(
     );
 }
 
+/// Assert the surface the admin API created stores the given comma-separated
+/// accepted versions with the default `envelope` validation.
 #[then(expr = "the created surface accepts A2A versions {string} with envelope validation")]
 fn created_surface_accepts_a2a_versions(
     world: &mut SurfaceWorld,
@@ -985,6 +987,8 @@ fn created_surface_accepts_a2a_versions(
     );
 }
 
+/// Assert the response's JSON-RPC error lists a supported protocol version, so a
+/// rejected caller can renegotiate without guessing.
 #[then(expr = "the response error lists supported version {string}")]
 fn response_error_lists_supported_version(
     world: &mut SurfaceWorld,

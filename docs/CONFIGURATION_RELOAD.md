@@ -147,6 +147,13 @@ loop and reconcile with disk only at startup; an explicit reload uses their in-m
 store's periodic scans are serialized by a shared per-store lock, so two overlapping refreshes can
 never apply out of order and revert a record to an older on-disk snapshot.
 
+Nodes sharing storage must run the same version. A newer node can write a field an older one
+rejects; the older node's refresh then drops that record from its cache while it is still serving.
+Per-surface A2A settings are such a field: a newer node writes `access_point.a2a` into stored A2A
+surfaces on its first start. Upgrade nodes that share storage together, or set
+`cache_refresh_interval_secs` to `0` on the older node until it is upgraded (see
+[A2A surface settings](PROTOCOLS.md#a2a-surface-settings)).
+
 ## Fabric envelope lifetime
 
 A `forward-request` sent over the fabric carries a DIDComm `expires_time`. The sending gateway

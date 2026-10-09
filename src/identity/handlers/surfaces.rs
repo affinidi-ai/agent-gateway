@@ -926,7 +926,8 @@ pub async fn create_surface(
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
-    normalize_a2a_settings(&mut surface).map_err(SurfaceApiError::BadRequest)?;
+    normalize_a2a_settings(&mut surface, None).map_err(SurfaceApiError::BadRequest)?;
+    refuse_tenant_validation_off(&surface, None, tenant_context(&context))?;
     validate_mcp_resource_declarations(&state, &surface).await?;
     if let Ok(Some(_)) = store
         .get(&surface.surface_id)
@@ -1047,28 +1048,78 @@ fn patch_sets_a2a_settings(patch: &serde_json::Value) -> bool {
         .is_some_and(|a2a| !a2a.is_null())
 }
 
-/// Settle `access_point.a2a` before a save. A surface that is not A2A or AP2
-/// drops a block left over from the stored surface, so a protocol change never
-/// fails on it; a block the request itself sent was already refused by
-/// [`refuse_a2a_settings_sent_on_other_protocols`]. A surface whose block applies
-/// to no request (an A2A-proxy Target with no URL variant) stores none, because
-/// the runtime fixes its settings and a later change should start from the
-/// defaults. Every other A2A or AP2 surface stores the block explicitly, the
-/// defaults when it was not sent.
-fn normalize_a2a_settings(surface: &mut AgentSurface) -> Result<(), String> {
+/// Settle `access_point.a2a` before a save, given the block the surface had
+/// stored (`None` on create). A surface that is not A2A or AP2 drops a block left
+/// over from the stored surface, so a protocol change never fails on it; a block
+/// the request itself sent was already refused by
+/// [`refuse_a2a_settings_sent_on_other_protocols`].
+///
+/// A surface whose block applies to no request (an A2A-proxy Target with no URL
+/// variant) stores none, because the runtime fixes its settings and a later
+/// change should start from the defaults. An unchanged stored block is dropped
+/// quietly there, so an edit that leaves only proxy Targets (a Target moved to a
+/// proxy, the last URL variant removed) never fails on a block the gateway
+/// stored; a changed block that is not the fixed proxy settings is refused.
+///
+/// Every other A2A or AP2 surface stores the block explicitly, the defaults when
+/// it was not sent.
+fn normalize_a2a_settings(
+    surface: &mut AgentSurface,
+    stored: Option<&crate::config::agent_surface::A2aAccessPointSettings>,
+) -> Result<(), String> {
     if !surface.uses_a2a_settings() {
         surface.access_point.a2a = None;
         return Ok(());
     }
-    surface.validate_a2a_settings()?;
     if !surface.a2a_settings_apply() {
+        if surface
+            .access_point
+            .a2a
+            .as_ref()
+            != stored
+        {
+            surface.validate_a2a_settings()?;
+        }
         surface.access_point.a2a = None;
-    } else if surface
+        return Ok(());
+    }
+    surface.validate_a2a_settings()?;
+    if surface
         .access_point
         .a2a
         .is_none()
     {
         surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings::default());
+    }
+    Ok(())
+}
+
+/// Only an appliance-wide caller may turn a surface's A2A validation `off`. With
+/// it off, a JSON-RPC batch or a non-string `method` reaches policy and the
+/// payment filters without a method to match, so a tenant-scoped token could
+/// otherwise step around operator-wide method rules. A surface that is already
+/// `off` stays editable.
+fn refuse_tenant_validation_off(
+    surface: &AgentSurface,
+    stored: Option<&crate::config::agent_surface::A2aAccessPointSettings>,
+    context: Option<&PatTenantContext>,
+) -> Result<(), SurfaceApiError> {
+    use crate::config::agent_surface::A2aValidation;
+    let is_off = |settings: Option<&crate::config::agent_surface::A2aAccessPointSettings>| {
+        settings.is_some_and(|settings| settings.validation == A2aValidation::Off)
+    };
+    if context.is_some()
+        && is_off(
+            surface
+                .access_point
+                .a2a
+                .as_ref(),
+        )
+        && !is_off(stored)
+    {
+        return Err(SurfaceApiError::Forbidden(
+            "only an appliance-wide administrator can set access_point.a2a.validation to \"off\"".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1231,7 +1282,14 @@ async fn validate_and_save_surface(
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
-    normalize_a2a_settings(&mut surface).map_err(SurfaceApiError::BadRequest)?;
+    let stored_a2a = existing.and_then(|existing| {
+        existing
+            .access_point
+            .a2a
+            .as_ref()
+    });
+    normalize_a2a_settings(&mut surface, stored_a2a).map_err(SurfaceApiError::BadRequest)?;
+    refuse_tenant_validation_off(&surface, stored_a2a, context)?;
     validate_mcp_resource_declarations(state, &surface).await?;
 
     store
@@ -2199,12 +2257,12 @@ mod validation_tests {
     #[test]
     fn a_saved_a2a_surface_always_stores_its_a2a_block() {
         let mut surface = base_surface();
-        assert_eq!(normalize_a2a_settings(&mut surface), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut surface, None), Ok(()));
         assert_eq!(surface.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)));
 
         let mut explicit = base_surface();
         explicit.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
-        assert_eq!(normalize_a2a_settings(&mut explicit), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut explicit, None), Ok(()));
         assert_eq!(
             explicit.access_point.a2a,
             Some(a2a_block(&["1.0"], A2aValidation::Full)),
@@ -2217,7 +2275,7 @@ mod validation_tests {
         let mut surface = base_surface();
         surface.access_point.a2a = Some(a2a_block(&[], A2aValidation::Envelope));
         assert!(
-            normalize_a2a_settings(&mut surface)
+            normalize_a2a_settings(&mut surface, None)
                 .unwrap_err()
                 .contains("at least one version")
         );
@@ -2227,13 +2285,13 @@ mod validation_tests {
     fn an_a2a_proxy_surface_stores_no_a2a_block() {
         let mut omitted = base_surface();
         omitted.target.endpoint = "a2a-proxy://worker".to_string();
-        assert_eq!(normalize_a2a_settings(&mut omitted), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut omitted, None), Ok(()));
         assert_eq!(omitted.access_point.a2a, None);
 
         let mut fixed = base_surface();
         fixed.target.endpoint = "a2a-proxy://worker".to_string();
         fixed.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Envelope));
-        assert_eq!(normalize_a2a_settings(&mut fixed), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut fixed, None), Ok(()));
         assert_eq!(fixed.access_point.a2a, None, "the fixed block the dashboard sends is not stored");
         assert_eq!(
             fixed
@@ -2258,13 +2316,13 @@ mod validation_tests {
         sent.target.endpoint = "a2a-proxy://worker".to_string();
         sent.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
         let mut sent = with_url_variant(sent);
-        assert_eq!(normalize_a2a_settings(&mut sent), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut sent, None), Ok(()));
         assert_eq!(sent.access_point.a2a, Some(a2a_block(&["1.0"], A2aValidation::Full)));
 
         let mut omitted = base_surface();
         omitted.target.endpoint = "a2a-proxy://worker".to_string();
         let mut omitted = with_url_variant(omitted);
-        assert_eq!(normalize_a2a_settings(&mut omitted), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut omitted, None), Ok(()));
         assert_eq!(
             omitted.access_point.a2a,
             Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)),
@@ -2283,7 +2341,7 @@ mod validation_tests {
         omitted.target.endpoint = "a2a-proxy://worker".to_string();
         let mut omitted = with_url_variant(omitted);
         retain_a2a_settings(&mut omitted, &existing);
-        assert_eq!(normalize_a2a_settings(&mut omitted), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut omitted, None), Ok(()));
         assert_eq!(omitted.access_point.a2a, Some(a2a_block(&["1.0"], A2aValidation::Full)));
     }
 
@@ -2293,7 +2351,7 @@ mod validation_tests {
         surface.target.endpoint = "a2a-proxy://worker".to_string();
         surface.access_point.a2a = Some(a2a_block(&["0.3"], A2aValidation::Full));
         assert!(
-            normalize_a2a_settings(&mut surface)
+            normalize_a2a_settings(&mut surface, None)
                 .unwrap_err()
                 .contains("A2A proxy target")
         );
@@ -2304,7 +2362,7 @@ mod validation_tests {
         let mut surface = base_surface();
         surface.access_point.protocol = SurfaceProtocol::Mcp;
         surface.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Envelope));
-        assert_eq!(normalize_a2a_settings(&mut surface), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut surface, None), Ok(()));
         assert_eq!(surface.access_point.a2a, None);
     }
 
@@ -2336,6 +2394,77 @@ mod validation_tests {
         assert!(!patch_sets_a2a_settings(&serde_json::json!({ "name": "renamed" })));
     }
 
+    /// A block the gateway stored itself must not turn an edit that leaves only
+    /// A2A-proxy Targets into a 400: a merge `PATCH` moving the Target to a proxy,
+    /// a `PUT` echoing the block from `GET`, or a variant change that removes the
+    /// last URL Target all carry the stored block unchanged, and it is dropped.
+    #[test]
+    fn an_unchanged_stored_block_is_dropped_once_it_applies_to_nothing() {
+        let stored = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
+        let mut moved = base_surface();
+        moved.target.endpoint = "a2a-proxy://worker".to_string();
+        moved.access_point.a2a = Some(stored.clone());
+
+        assert_eq!(normalize_a2a_settings(&mut moved, Some(&stored)), Ok(()));
+        assert_eq!(moved.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_changed_block_that_applies_to_nothing_is_still_refused() {
+        let stored = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
+        let mut changed = base_surface();
+        changed.target.endpoint = "a2a-proxy://worker".to_string();
+        changed.access_point.a2a = Some(a2a_block(&["0.3"], A2aValidation::Full));
+
+        assert!(
+            normalize_a2a_settings(&mut changed, Some(&stored))
+                .unwrap_err()
+                .starts_with("an A2A proxy target serves A2A 1.0 only")
+        );
+    }
+
+    fn tenant() -> PatTenantContext {
+        PatTenantContext {
+            token_id: "token".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_tenant_token_cannot_turn_validation_off() {
+        let mut surface = base_surface();
+        surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
+        let envelope = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
+
+        match refuse_tenant_validation_off(&surface, Some(&envelope), Some(&tenant())) {
+            Err(SurfaceApiError::Forbidden(message)) => assert!(message.contains("appliance-wide administrator")),
+            other => panic!("expected a 403, got {other:?}"),
+        }
+        assert!(
+            matches!(refuse_tenant_validation_off(&surface, None, Some(&tenant())), Err(SurfaceApiError::Forbidden(_))),
+            "on create too"
+        );
+    }
+
+    #[test]
+    fn validation_off_is_allowed_for_an_appliance_wide_caller_or_when_already_off() {
+        let mut surface = base_surface();
+        surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
+        let off = a2a_block(&["1.0"], A2aValidation::Off);
+
+        assert!(refuse_tenant_validation_off(&surface, None, None).is_ok(), "appliance-wide caller");
+        assert!(
+            refuse_tenant_validation_off(&surface, Some(&off), Some(&tenant())).is_ok(),
+            "a tenant may edit a surface that is already off"
+        );
+
+        surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Full));
+        assert!(
+            refuse_tenant_validation_off(&surface, None, Some(&tenant())).is_ok(),
+            "a tenant may choose any other level"
+        );
+    }
+
     #[test]
     fn a_put_that_omits_the_a2a_block_keeps_the_stored_one() {
         let mut existing = base_surface();
@@ -2363,7 +2492,7 @@ mod validation_tests {
         let mut mcp = base_surface();
         mcp.access_point.protocol = SurfaceProtocol::Mcp;
         retain_a2a_settings(&mut mcp, &existing);
-        assert_eq!(normalize_a2a_settings(&mut mcp), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut mcp, None), Ok(()));
         assert_eq!(mcp.access_point.a2a, None);
     }
 
@@ -2383,7 +2512,7 @@ mod validation_tests {
             "the merge carries the stored block"
         );
 
-        assert_eq!(normalize_a2a_settings(&mut patched), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut patched, None), Ok(()));
         assert_eq!(patched.access_point.a2a, None);
     }
 
@@ -2395,7 +2524,7 @@ mod validation_tests {
         let mut switched = base_surface();
         switched.target.endpoint = "a2a-proxy://worker".to_string();
         retain_a2a_settings(&mut switched, &existing);
-        assert_eq!(normalize_a2a_settings(&mut switched), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut switched, None), Ok(()));
         assert_eq!(switched.access_point.a2a, None);
     }
 
@@ -2407,7 +2536,7 @@ mod validation_tests {
 
         let mut moved = base_surface();
         retain_a2a_settings(&mut moved, &existing);
-        assert_eq!(normalize_a2a_settings(&mut moved), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut moved, None), Ok(()));
         assert_eq!(moved.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)));
     }
 
@@ -2421,7 +2550,7 @@ mod validation_tests {
         let mut patched: AgentSurface = serde_json::from_value(merged).unwrap();
         assert_eq!(patched.access_point.a2a, None);
 
-        assert_eq!(normalize_a2a_settings(&mut patched), Ok(()));
+        assert_eq!(normalize_a2a_settings(&mut patched, None), Ok(()));
         assert_eq!(patched.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)));
     }
 

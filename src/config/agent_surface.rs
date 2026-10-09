@@ -260,11 +260,11 @@ pub struct AccessPoint {
     #[serde(default)]
     pub terminate_trace_id: bool,
 
-    /// A2A protocol settings: the versions this surface accepts and whether
-    /// inbound messages are validated. A2A and AP2 Access Points only. Absent
-    /// means [`A2aAccessPointSettings::default`]: both versions, no message
-    /// validation. Surface-level, not overridable per variant; read it through
-    /// [`AgentSurface::a2a_settings`].
+    /// A2A protocol settings: the versions this surface accepts and how much of
+    /// an inbound request is validated. A2A and AP2 Access Points only. Absent
+    /// means [`A2aAccessPointSettings::default`]: both versions, with the
+    /// JSON-RPC envelope checked. Surface-level, not overridable per variant;
+    /// read it through [`AgentSurface::a2a_settings`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2a: Option<A2aAccessPointSettings>,
 }
@@ -308,7 +308,7 @@ impl A2aValidation {
 
 /// A2A protocol settings of an A2A Access Point.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(from = "A2aAccessPointSettingsWire")]
+#[serde(default, deny_unknown_fields)]
 pub struct A2aAccessPointSettings {
     /// A2A versions the surface accepts through `A2A-Version` negotiation: a
     /// non-empty subset of [`crate::a2a::version::SUPPORTED_VERSIONS`].
@@ -316,40 +316,6 @@ pub struct A2aAccessPointSettings {
 
     /// How much of a request is validated before it is forwarded.
     pub validation: A2aValidation,
-}
-
-/// The stored form of [`A2aAccessPointSettings`]. It also reads the boolean
-/// `validate_messages` that `validation` replaced: `true` is
-/// [`A2aValidation::Full`], `false` is [`A2aValidation::Envelope`].
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct A2aAccessPointSettingsWire {
-    accepted_versions: Option<Vec<String>>,
-    validation: Option<A2aValidation>,
-    validate_messages: Option<bool>,
-}
-
-impl From<A2aAccessPointSettingsWire> for A2aAccessPointSettings {
-    fn from(wire: A2aAccessPointSettingsWire) -> Self {
-        let defaults = Self::default();
-        Self {
-            accepted_versions: wire
-                .accepted_versions
-                .unwrap_or(defaults.accepted_versions),
-            validation: wire
-                .validation
-                .or(wire
-                    .validate_messages
-                    .map(|validate| {
-                        if validate {
-                            A2aValidation::Full
-                        } else {
-                            A2aValidation::Envelope
-                        }
-                    }))
-                .unwrap_or(defaults.validation),
-        }
-    }
 }
 
 impl Default for A2aAccessPointSettings {
@@ -4447,22 +4413,6 @@ mod a2a_settings_tests {
         assert_eq!(validation_only.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Full));
         let versions_only = surface("a2a", "http://agent", Some(json!({ "accepted_versions": ["1.0"] })));
         assert_eq!(versions_only.a2a_settings(), effective(VERSIONS_1_0_ONLY, A2aValidation::Envelope));
-    }
-
-    /// Blocks written before `validation` replaced the boolean still load:
-    /// `true` meant the request shape was checked, `false` that it was not.
-    #[test]
-    fn the_retired_validate_messages_boolean_is_still_read() {
-        let full =
-            surface("a2a", "http://agent", Some(json!({ "accepted_versions": ["1.0"], "validate_messages": true })));
-        assert_eq!(full.a2a_settings(), effective(VERSIONS_1_0_ONLY, A2aValidation::Full));
-        let envelope = surface("a2a", "http://agent", Some(json!({ "validate_messages": false })));
-        assert_eq!(envelope.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Envelope));
-        let both = surface("a2a", "http://agent", Some(json!({ "validation": "off", "validate_messages": true })));
-        assert_eq!(both.a2a_settings().validation, A2aValidation::Off, "validation wins over the boolean");
-
-        let saved = serde_json::to_value(&full).unwrap();
-        assert_eq!(saved["access_point"]["a2a"], settings(&["1.0"], "full"), "saved in the new form");
     }
 
     /// An A2A-proxy Target serves A2A 1.0 only with envelope validation, whatever

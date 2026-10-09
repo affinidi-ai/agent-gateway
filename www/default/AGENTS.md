@@ -247,7 +247,8 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
   checkbox per version (`access-point-a2a-version-0.3`, `-1.0`, both checked by default) and a
   **Message validation** dropdown (`access-point-a2a-validation`) with **Off**, **JSON-RPC
   envelope** (the default) and **Envelope + A2A fields**, each with field help. Keep the option
-  labels short: the sidebar is narrow, and the field help explains each level. The node keeps
+  labels short: the sidebar is narrow, and the field help explains each level, including that only
+  an appliance-wide administrator can choose Off (the API refuses it from tenant-scoped tokens). The node keeps
   them flat as `a2a_accepted_versions` and `a2a_validation`; `access-point/a2aSettings.ts` maps
   them to and from the payload's `access_point.a2a`, which every A2A and AP2 save sends.
 - With no version checked, the section shows `access-point-a2a-versions-error` and a

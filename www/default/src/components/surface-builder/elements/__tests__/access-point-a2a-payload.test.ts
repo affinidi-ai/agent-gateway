@@ -47,7 +47,6 @@ describe('Access Point A2A settings payload', () => {
 
   it('sends the default level for an unknown or missing node value', () => {
     expect(accessPointPayload({ a2a_validation: 'strict' }).a2a.validation).toBe('envelope');
-    expect(accessPointPayload({ a2a_validate_messages: true }).a2a.validation).toBe('envelope');
   });
 
   it('sends no block for an A2A proxy target, so the stored settings are kept', () => {
@@ -77,19 +76,13 @@ describe('Access Point A2A settings payload', () => {
     expect(config.a2a).toBeUndefined();
   });
 
-  it('loads the defaults when the stored surface has no block, and drops a stale flat field', () => {
+  it('loads the defaults when the stored surface has no block', () => {
     const config = definition.configFromPayload!(
-      {
-        listen_address: '0.0.0.0:8443',
-        route: '/agent',
-        protocol: 'a2a',
-        a2a_validate_messages: true,
-      } as any,
+      { listen_address: '0.0.0.0:8443', route: '/agent', protocol: 'a2a' },
       {}
     );
     expect(config.a2a_accepted_versions).toEqual(['0.3', '1.0']);
     expect(config.a2a_validation).toBe('envelope');
-    expect(config.a2a_validate_messages).toBeUndefined();
 
     const mcp = definition.configFromPayload!(
       { listen_address: '0.0.0.0:8443', route: '/agent', protocol: 'mcp' },

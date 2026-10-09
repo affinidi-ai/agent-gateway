@@ -2648,24 +2648,17 @@ async fn proxy_handler_with_mcp_runtime(
         | Ap2InboundDecision::RejectTransformationFailed => {}
     }
 
-    let is_a2a_surface = matches!(
-        state
-            .surface
-            .access_point
-            .protocol,
-        crate::config::agent_surface::SurfaceProtocol::A2a | crate::config::agent_surface::SurfaceProtocol::Ap2
-    );
-    let is_a2a_proxy_target = is_a2a_surface
-        && state
-            .surface
-            .target
-            .endpoint
-            .starts_with("a2a-proxy://");
     // Version negotiation, JSON-RPC envelope validation and A2A request-shape
     // validation are decided from the headers and the body shape alone, so they
     // run here, before any payment is taken and before a `fabric://` target is
     // dispatched, and a request they refuse is never charged or forwarded.
-    let checks_a2a_request = is_a2a_surface;
+    let is_a2a_surface = state
+        .surface
+        .uses_a2a_settings();
+    let is_a2a_proxy_target = is_a2a_surface
+        && state
+            .surface
+            .is_a2a_proxy_target();
     // The accepted versions and the validation level are set per A2A Access
     // Point; an A2A-proxy target is always 1.0 only with envelope validation.
     let a2a_settings = state.surface.a2a_settings();
@@ -2683,7 +2676,7 @@ async fn proxy_handler_with_mcp_runtime(
     // named by -32602 and resending would only surface the -32009 on the second
     // attempt, and the version is the more fundamental rejection since the
     // gateway cannot serve that caller whatever the body contains.
-    if checks_a2a_request {
+    if is_a2a_surface {
         // The gateway accepts either method era regardless of the negotiated
         // version, so record both: the skew between them is the signal that
         // tells us when v0.3 traffic has faded enough to drop it. Refused
@@ -2723,9 +2716,7 @@ async fn proxy_handler_with_mcp_runtime(
                         &headers,
                         &requested,
                         a2a_settings.accepted_versions,
-                        state
-                            .surface
-                            .is_a2a_proxy_target(),
+                        is_a2a_proxy_target,
                     )
                 );
                 connection_guard
@@ -2743,12 +2734,13 @@ async fn proxy_handler_with_mcp_runtime(
     // Unless the surface's validation is `off`: reject requests that are not
     // valid JSON or that lack the JSON-RPC 2.0 envelope fields (`jsonrpc` and a
     // string `method`). Besides catching malformed requests early, this keeps a
-    // batch or a non-string `method` from reaching policy without a method that
-    // rules could match on.
+    // batch or a non-string `method` from reaching payment, surface policy and
+    // the agent without a method that rules and payment filters could match on.
+    // Global and gateway policy have already run and seen it without one.
     if a2a_settings
         .validation
         .checks_envelope()
-        && checks_a2a_request
+        && is_a2a_surface
         && !body_bytes.is_empty()
         && let Err((code, message)) = validate_jsonrpc_envelope(&body_bytes)
     {
@@ -2771,7 +2763,7 @@ async fn proxy_handler_with_mcp_runtime(
     if a2a_settings
         .validation
         .checks_request_shape()
-        && checks_a2a_request
+        && is_a2a_surface
         && !body_bytes.is_empty()
         && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         && let Err(field_errors) = crate::a2a::validation::validate_request_shape(&parsed)

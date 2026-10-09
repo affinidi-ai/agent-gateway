@@ -115,11 +115,12 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
               >
                 How much of each request is checked before it reaches your agent. Off: requests are
                 forwarded as they are, so a batch request or a request without a valid method name
-                reaches your policies with no method to match. JSON-RPC envelope (recommended):
-                refuses anything that is not a single, well-formed JSON-RPC request, including batch
-                requests. Envelope + A2A fields: also requires the fields A2A defines, such as a
-                message ID, a role and at least one message part, and refuses a request that misses
-                one with an error that names the field.
+                reaches your surface policies with no method to match; only an appliance-wide
+                administrator can choose it. JSON-RPC envelope (recommended): refuses anything that
+                is not a single, well-formed JSON-RPC request, including batch requests. Envelope +
+                A2A fields: also requires the fields A2A defines, such as a message ID, a role and
+                at least one message part, and refuses a request that misses one with an error that
+                names the field.
               </FieldHelp>
             </div>
             <Form.Select

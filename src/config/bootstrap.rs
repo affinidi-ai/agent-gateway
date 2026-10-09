@@ -316,18 +316,6 @@ impl BootstrapConfig {
         // to be supported, so the cards the gateway generates reflect it.
         crate::a2a::version::init_advertised_version(&self.a2a.default_version);
 
-        if self
-            .a2a
-            .validate_messages
-            .is_some()
-        {
-            tracing::warn!(
-                "[a2a] validate_messages is deprecated: validation is set per A2A surface \
-                 (access_point.a2a.validation). It is only applied to A2A surfaces loaded without their own \
-                 settings, as \"off\" when false and \"envelope\" otherwise. Remove it from the config file."
-            );
-        }
-
         if let Some(continuations) = &self.mcp.continuations {
             continuations
                 .validate()
