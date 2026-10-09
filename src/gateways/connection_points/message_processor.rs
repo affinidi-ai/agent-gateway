@@ -1323,31 +1323,14 @@ async fn process_get_surfaces(message: &ReceivedMessage) -> ProcessingResult {
         Ok(channel_list) => {
             info!("Found {} total channels", channel_list.len());
 
-            // Get exposed channel filter from connection point
-            let exposed_channel_ids = get_exposed_channels_from_context(message).await;
-
-            // Convert active channels to SurfaceInfo format
             let filtered_channels: Vec<serde_json::Value> = channel_list
                 .iter()
                 .filter(|ch| {
-                    // First check if channel is active
-                    if ch.status != crate::config::agent_surface::SurfaceStatus::Active
-                        || !fabric_peer_may_reach_surface(peer.tenant_id.as_deref(), ch.tenant_id.as_deref())
-                    {
-                        return false;
-                    }
-
-                    // If no exposed channels configured, return all active channels
-                    if exposed_channel_ids.is_empty() {
-                        return true;
-                    }
-
-                    // Otherwise, only return channels in the exposed list
-                    if let Some(config_id) = ch.config_id() {
-                        exposed_channel_ids.contains(&config_id.to_string())
-                    } else {
-                        false
-                    }
+                    ch.status == crate::config::agent_surface::SurfaceStatus::Active
+                        && fabric_peer_may_reach_surface(peer.tenant_id.as_deref(), ch.tenant_id.as_deref())
+                        && ch
+                            .config_id()
+                            .is_some_and(|config_id| peer.exposes_surface(config_id))
                 })
                 .map(|ch| {
                     serde_json::json!({
@@ -1360,7 +1343,7 @@ async fn process_get_surfaces(message: &ReceivedMessage) -> ProcessingResult {
                 })
                 .collect();
 
-            info!("Filtered to {} channels based on connection point configuration", filtered_channels.len());
+            info!("Filtered to {} channels exposed to the sender", filtered_channels.len());
             filtered_channels
         }
         Err(e) => {
@@ -1397,96 +1380,6 @@ fn storage_root_from_context(message: &ReceivedMessage) -> Option<std::path::Pat
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| path.to_path_buf()),
     )
-}
-
-/// Get the list of exposed channel IDs from the gateway configuration
-async fn get_exposed_channels_from_context(message: &ReceivedMessage) -> Vec<String> {
-    info!("🔍 Getting exposed channels for remote gateway...");
-    info!("   Message ID: {}", message.id);
-    info!("   Connection Point ID: {}", message.connection_point_id);
-    info!("   From DID: {:?}", message.from_did);
-
-    let storage_path = match storage_root_from_context(message) {
-        Some(base_path) => {
-            info!("   Base storage path: {}", base_path.display());
-            base_path
-        }
-        None => {
-            warn!("Agent surface storage path not found in message context");
-            return Vec::new();
-        }
-    };
-
-    // First, load the connection point to get the gateway_id
-    let cp_store = match crate::gateways::connection_points::FileSystemConnectionPointStore::new(
-        storage_path.join("connection_points"),
-    )
-    .await
-    {
-        Ok(store) => store,
-        Err(e) => {
-            warn!("Failed to create connection point store: {}", e);
-            return Vec::new();
-        }
-    };
-
-    let cp_id = &message.connection_point_id;
-    let gateway_id = match cp_store.get(cp_id).await {
-        Ok(Some(cp)) => {
-            info!("   ✓ Found connection point '{}' for gateway {}", cp.name, cp.gateway_id);
-            cp.gateway_id
-        }
-        Ok(None) => {
-            warn!("   ✗ Connection point {} not found", cp_id);
-            return Vec::new();
-        }
-        Err(e) => {
-            warn!("   ✗ Failed to load connection point: {}", e);
-            return Vec::new();
-        }
-    };
-
-    // Now load the gateway to get exposed_channels configuration
-    let gateway_store = match crate::gateways::FileSystemGatewayStore::new(
-        storage_path.join("gateways"),
-        None, // proxy_did not needed for reading
-    )
-    .await
-    {
-        Ok(store) => store,
-        Err(e) => {
-            warn!("Failed to create gateway store: {}", e);
-            return Vec::new();
-        }
-    };
-
-    info!("   Looking up gateway: {}", gateway_id);
-    match gateway_store
-        .get(&gateway_id)
-        .await
-    {
-        Ok(Some(gateway)) => {
-            info!("   ✓ Found gateway '{}' ({})", gateway.name, gateway.id);
-            info!("   Exposed channels config: {:?}", gateway.exposed_channels);
-            if gateway
-                .exposed_channels
-                .is_empty()
-            {
-                info!("   → No exposed_channels filter - will return all channels");
-            } else {
-                info!("   → Will filter to {} specific channels", gateway.exposed_channels.len());
-            }
-            gateway.exposed_channels
-        }
-        Ok(None) => {
-            warn!("   ✗ Gateway {} not found", gateway_id);
-            Vec::new()
-        }
-        Err(e) => {
-            warn!("   ✗ Failed to load gateway: {}", e);
-            Vec::new()
-        }
-    }
 }
 
 /// Load channels from the configured storage location
@@ -3476,9 +3369,9 @@ async fn active_sender_peer(message: &ReceivedMessage) -> Option<crate::gateways
 }
 
 /// Whether a Fabric peer may reach a surface. A tenant-owned peer reaches only
-/// its own tenant's and appliance-wide surfaces, whatever its exposure lists
-/// say, so an empty list ("every surface") never widens it to another
-/// tenant's. An appliance-wide peer is unaffected.
+/// its own tenant's and appliance-wide surfaces, whatever its exposure mode
+/// says, so `all` never widens it to another tenant's. An appliance-wide peer
+/// is unaffected.
 pub(crate) fn fabric_peer_may_reach_surface(
     peer_tenant_id: Option<&str>,
     surface_tenant_id: Option<&str>,
@@ -3527,14 +3420,7 @@ async fn authorize_fabric_sender(
     };
     match lookup {
         Ok(Some(gateway)) if gateway.status == crate::gateways::types::GatewayStatus::Active => {
-            if !gateway
-                .exposed_channels
-                .is_empty()
-                && !gateway
-                    .exposed_channels
-                    .iter()
-                    .any(|exposed| exposed == channel_id)
-            {
+            if !gateway.exposes_surface(channel_id) {
                 warn!(
                     "Refusing forward-request from gateway {} ({}): channel {} is not exposed to it",
                     gateway.id, from_did, channel_id
@@ -3542,7 +3428,7 @@ async fn authorize_fabric_sender(
                 return Err(refuse("Channel is not exposed to sender"));
             }
             // A tenant-owned peer must not reach another tenant's surface, even
-            // through an empty ("every surface") exposure list. A surface that
+            // in `all` mode. A surface that
             // does not exist is reported later, by channel resolution.
             if gateway.tenant_id.is_some() {
                 let reachable = match lookup_channel(message, channel_id).await {
@@ -10336,6 +10222,7 @@ mod tests {
             temp.path(),
             "did:web:peer.example",
             crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::All,
             Vec::new(),
         )
         .await;
@@ -10384,6 +10271,7 @@ mod tests {
             temp.path(),
             "did:web:peer.example",
             crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::All,
             Vec::new(),
         )
         .await;
@@ -10410,6 +10298,7 @@ mod tests {
         storage_root: &std::path::Path,
         did: &str,
         status: crate::gateways::types::GatewayStatus,
+        exposure_mode: crate::gateways::types::ExposureMode,
         exposed_channels: Vec<String>,
     ) {
         let store = crate::gateways::FileSystemGatewayStore::new(storage_root.join("gateways"), None)
@@ -10422,6 +10311,7 @@ mod tests {
             crate::gateways::types::GatewayType::Remote,
         );
         gateway.status = status;
+        gateway.exposure_mode = Some(exposure_mode);
         gateway.exposed_channels = exposed_channels;
         store
             .create(&gateway)
@@ -10442,11 +10332,10 @@ mod tests {
         }
     }
 
-    /// An empty exposure list ("every surface") never lets a tenant-owned peer
-    /// reach or list another tenant's surface; an appliance-wide peer is
-    /// unaffected.
+    /// `all` mode never lets a tenant-owned peer reach or list another
+    /// tenant's surface; an appliance-wide peer is unaffected.
     #[tokio::test]
-    async fn a_tenant_peer_with_empty_exposure_reaches_only_its_own_tenants_surfaces() {
+    async fn a_tenant_peer_with_all_exposure_reaches_only_its_own_tenants_surfaces() {
         use crate::surfaces::AgentSurfaceStore;
         // Surface lookup prefers the process-global surface store, which other
         // tests in this binary can initialise; run in a child process where it
@@ -10503,6 +10392,7 @@ mod tests {
                 crate::gateways::types::GatewayType::Remote,
             );
             gateway.status = crate::gateways::types::GatewayStatus::Active;
+            gateway.exposure_mode = Some(crate::gateways::types::ExposureMode::All);
             gateway.tenant_id = tenant.map(str::to_string);
             gateways
                 .create(&gateway)
@@ -10528,19 +10418,55 @@ mod tests {
             }
         }
 
-        let mut listing = make_forward_request_msg(temp.path(), Some("did:web:tenant-peer.example"), "");
-        listing.message_type = MessageType::GetSurfaces.to_string();
-        let ProcessingResult::RequiresResponse { response_body, .. } = process_get_surfaces(&listing).await else {
-            panic!("expected a get-channels response");
+        for (did, mode, exposed) in [
+            (
+                "did:web:listed-peer.example",
+                crate::gateways::types::ExposureMode::List,
+                vec!["shared-surface".to_string()],
+            ),
+            (
+                "did:web:closed-peer.example",
+                crate::gateways::types::ExposureMode::None,
+                vec!["shared-surface".to_string()],
+            ),
+        ] {
+            let mut gateway = crate::gateways::types::Gateway::new(
+                "Peer".to_string(),
+                String::new(),
+                did.to_string(),
+                crate::gateways::types::GatewayType::Remote,
+            );
+            gateway.exposure_mode = Some(mode);
+            gateway.exposed_channels = exposed;
+            gateways
+                .create(&gateway)
+                .await
+                .unwrap();
+        }
+
+        let listed = async |did: &str| {
+            let mut listing = make_forward_request_msg(temp.path(), Some(did), "");
+            listing.message_type = MessageType::GetSurfaces.to_string();
+            let ProcessingResult::RequiresResponse { response_body, .. } = process_get_surfaces(&listing).await else {
+                panic!("expected a get-channels response");
+            };
+            let mut listed: Vec<String> = response_body["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|channel| channel["config_id"].as_str())
+                .map(str::to_string)
+                .collect();
+            listed.sort_unstable();
+            listed
         };
-        let mut listed: Vec<&str> = response_body["channels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|channel| channel["config_id"].as_str())
-            .collect();
-        listed.sort_unstable();
-        assert_eq!(listed, ["own-surface", "shared-surface"]);
+        assert_eq!(listed("did:web:tenant-peer.example").await, ["own-surface", "shared-surface"]);
+        assert_eq!(listed("did:web:listed-peer.example").await, ["shared-surface"]);
+        assert!(
+            listed("did:web:closed-peer.example")
+                .await
+                .is_empty()
+        );
     }
 
     async fn forward_response(message: &ReceivedMessage) -> serde_json::Value {
@@ -10582,6 +10508,7 @@ mod tests {
             temp.path(),
             "did:web:peer.example",
             crate::gateways::types::GatewayStatus::AwaitingApproval,
+            crate::gateways::types::ExposureMode::All,
             vec![],
         )
         .await;
@@ -10600,6 +10527,7 @@ mod tests {
             temp.path(),
             "did:web:peer.example",
             crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::List,
             vec!["surface-2".to_string()],
         )
         .await;
@@ -10611,13 +10539,56 @@ mod tests {
         assert_eq!(response["error"], "Channel is not exposed to sender");
     }
 
+    #[tokio::test]
+    async fn forward_request_from_peer_exposed_nothing_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        register_gateway(
+            temp.path(),
+            "did:web:peer.example",
+            crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::None,
+            vec!["surface-1".to_string()],
+        )
+        .await;
+        let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
+
+        let response = forward_response(&msg).await;
+
+        assert_eq!(response["status"], 403);
+        assert_eq!(response["error"], "Channel is not exposed to sender");
+    }
+
+    #[tokio::test]
+    async fn forward_request_to_listed_channel_passes_sender_check() {
+        let temp = tempfile::tempdir().unwrap();
+        register_gateway(
+            temp.path(),
+            "did:web:peer.example",
+            crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::List,
+            vec!["surface-1".to_string()],
+        )
+        .await;
+        let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
+
+        let response = forward_response(&msg).await;
+
+        assert_ne!(response["status"], 403, "a listed surface must pass the sender check");
+    }
+
     // The sender check passes and processing reaches channel resolution, which
     // is where an unknown channel is reported.
     #[tokio::test]
     async fn forward_request_from_active_gateway_passes_sender_check() {
         let temp = tempfile::tempdir().unwrap();
-        register_gateway(temp.path(), "did:web:peer.example", crate::gateways::types::GatewayStatus::Active, vec![])
-            .await;
+        register_gateway(
+            temp.path(),
+            "did:web:peer.example",
+            crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::All,
+            vec![],
+        )
+        .await;
         let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
 
         let response = forward_response(&msg).await;
