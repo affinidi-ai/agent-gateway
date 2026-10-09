@@ -63,6 +63,10 @@ belong to a tenant, and never receives resource events. See
 All four stream platforms are compiled into the binary; which one is used is a matter of
 configuration.
 
+Slack messages are sent as mrkdwn. Variable values have `&`, `<`, and `>` escaped before
+substitution, so caller-supplied text such as a JWT `name` claim cannot produce mentions
+(`<!channel>`) or links. The admin-written template is not escaped.
+
 ## Events
 
 Each resource type raises its own events. The event type is always

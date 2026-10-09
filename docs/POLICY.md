@@ -349,6 +349,5 @@ Every OPA evaluation emits a structured `tracing` event via
 `policy_content_hash`. See `src/observability/policy_audit.rs`.
 
 When the `policies` audit category is enabled, the decision is also written to the VP Audit
-Log, and from there forwarded to any Governance Audit integrations, which are Stream (Kafka, Kinesis,
-Pulsar, or Redis Streams) or Webhook. See
+Log, and from there forwarded to any Governance Audit integrations (any type). See
 [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
