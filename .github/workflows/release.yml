@@ -74,7 +74,16 @@ jobs:
           RELEASE_TYPE: ${{ inputs.release_type }}
         run: |
           current="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
-          read -r bump version <<< "$(python3 .github/scripts/changelog.py next-version "${current}" --bump "${RELEASE_TYPE}")"
+          # If the version already in Cargo.toml has never been tagged (e.g. the first
+          # release, or a previous prepare run that bumped it but was never merged),
+          # release it as-is instead of always bumping past it: the reviewed flow
+          # would otherwise never be able to produce that exact version.
+          if git rev-parse --verify "refs/tags/v${current}" >/dev/null 2>&1; then
+            read -r bump version <<< "$(python3 .github/scripts/changelog.py next-version "${current}" --bump "${RELEASE_TYPE}")"
+          else
+            bump="none (v${current} is not yet tagged)"
+            version="${current}"
+          fi
           tag="v${version}"
           if git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
             echo "::error::Tag ${tag} already exists."

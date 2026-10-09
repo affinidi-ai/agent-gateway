@@ -18,6 +18,16 @@ changes:
       description: >-
         Local and end-to-end mediator configurations now allow up to 150 queued messages per
         peer, preventing higher-concurrency Fabric traffic from timing out.
+    - timestamp: '2026-10-06T12:00:00.000Z'
+      title: Use the messaging SDK's hash for DID resolver cache keys
+      description: >-
+        Resolver cache keys are now derived via the SDK's `hash_did` instead of a separate local
+        implementation, so the two cannot drift apart. The direct `highway` dependency is dropped.
+    - timestamp: '2026-10-06T12:00:00.000Z'
+      title: Document DID resolution host policy and cache behavior
+      description: >-
+        The documentation now explains public-host restrictions, the opt-in private-host setting,
+        per-method host rules, and mediator document caching.
   fixed:
     - timestamp: '2026-10-05T13:57:17.000Z'
       title: Restart the Connection Point when the mediator reports its account missing
@@ -34,11 +44,6 @@ changes:
       description: >-
         EC2 mediator redeploys now refresh the bundled Redis functions before starting the
         mediator, so upgrades do not retain stale functions or report a degraded readiness state.
-    - timestamp: '2026-10-06T12:00:00.000Z'
-      title: Align DID resolver cache keys with the messaging SDK
-      description: >-
-        Resolver cache entries now use the SDK's canonical DID hash, preventing cache misses
-        caused by different local key derivation.
   removed: []
   security:
     - timestamp: '2026-10-06T12:00:00.000Z'
@@ -62,8 +67,3 @@ changes:
         `[did_cache] allow_private_hosts = true`, which logs a warning at startup and also
         reopens cloud metadata. `scripts/_prepare.sh` turns it on for local and Docker dev
         stacks, and the BDD configs turn it on too.
-    - timestamp: '2026-10-06T12:00:00.000Z'
-      title: Document DID resolution host policy and cache behavior
-      description: >-
-        The documentation now explains public-host restrictions, the opt-in private-host setting,
-        per-method host rules, and mediator document caching.
