@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../api';
+import { getErrorMessage } from '../utils/apiError';
 import { integrationIntegration } from '../components/connection-points/IntegrationsStep';
 import UserIntegrationsTab from './UserIntegrationsPage/UserIntegrationsTab';
 
@@ -12,6 +13,7 @@ const UserIntegrationsPage: React.FC = () => {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [isModified, setIsModified] = useState(false);
@@ -48,17 +50,13 @@ const UserIntegrationsPage: React.FC = () => {
   const fetchUserIntegrations = async () => {
     try {
       setLoading(true);
-      setError(null);
-      // TODO: Replace with actual API endpoint when backend is ready
-      // For now, we'll start with empty integrations
-      const response = await apiClient
-        .get('/users/integrations')
-        .catch(() => ({ data: { integration_integrations: [] } }));
+      setLoadError(null);
+      const response = await apiClient.get('/users/integrations');
       setFormData({
         integration_integrations: response.data.integration_integrations || [],
       });
-    } catch (error: any) {
-      setError(error.message || 'Failed to load user integrations');
+    } catch (error: unknown) {
+      setLoadError(getErrorMessage(error, 'Failed to load user integrations'));
     } finally {
       setLoading(false);
     }
@@ -77,49 +75,14 @@ const UserIntegrationsPage: React.FC = () => {
 
   const handleSave = async () => {
     try {
-      // Filter out any "ghost" integrations that have all empty variable values
-      const cleanedIntegrations = formData.integration_integrations.filter(integration => {
-        const variableCount = Object.keys(integration.variables).length;
-        if (variableCount === 0) return true; // Keep integrations with no variables
-
-        // Check if ALL variables are empty (this indicates a ghost integration)
-        const allEmpty = Object.values(integration.variables).every(
-          value => !value || value.trim() === ''
-        );
-        return !allEmpty; // Remove ghost integrations
-      });
-
-      // Validate integrations - check if any variables have empty values
-      const hasEmptyVariables = cleanedIntegrations.some(integration => {
-        const variableCount = Object.keys(integration.variables).length;
-        if (variableCount === 0) return false; // No variables to validate
-        return Object.values(integration.variables).some(value => !value || value.trim() === '');
-      });
-
-      if (hasEmptyVariables) {
-        setError('Please fill in all integration variable values before saving');
-        return;
-      }
-
-      // Update formData with cleaned integrations
-      const updatedFormData = {
-        integration_integrations: cleanedIntegrations,
-      };
-
       setSaving(true);
       setError(null);
-      // TODO: Replace with actual API endpoint when backend is ready
-      await apiClient.put('/users/integrations', updatedFormData).catch(() => {
-        // For now, just simulate success
-        return { data: updatedFormData };
-      });
-
-      setFormData(updatedFormData);
+      await apiClient.put('/users/integrations', formData);
       setSuccess('User integrations updated successfully!');
       setIsModified(false);
       setTimeout(() => setSuccess(null), 3000);
-    } catch (error: any) {
-      setError(error.message || 'Failed to update user integrations');
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, 'Failed to update user integrations'));
     } finally {
       setSaving(false);
     }
@@ -148,13 +111,29 @@ const UserIntegrationsPage: React.FC = () => {
     );
   }
 
+  const backButton = (
+    <div className="mb-3">
+      <button className="btn btn-sm btn-secondary" onClick={handleCancel}>
+        <i className="fas fa-arrow-left"></i>
+      </button>
+    </div>
+  );
+
+  if (loadError) {
+    return (
+      <div className="container-fluid">
+        {backButton}
+        <div className="alert alert-danger" role="alert">
+          <i className="fas fa-exclamation-triangle me-2"></i>
+          {loadError}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="container-fluid">
-      <div className="mb-3">
-        <button className="btn btn-sm btn-secondary" onClick={handleCancel}>
-          <i className="fas fa-arrow-left"></i>
-        </button>
-      </div>
+      {backButton}
       <div className="card shadow mb-4 channel-editor-card">
         <div className="card-header py-3 d-flex justify-content-between align-items-center">
           <h6 className="m-0 font-weight-bold text-primary">
@@ -165,6 +144,7 @@ const UserIntegrationsPage: React.FC = () => {
               className={`btn btn-sm btn-primary me-2 ${saving ? 'disabled' : ''}`}
               onClick={handleSave}
               disabled={!isModified || saving || integrationValidationErrors}
+              data-testid="user-integrations-save-button"
               title={
                 integrationValidationErrors ? 'Please fill in all integration variable values' : ''
               }

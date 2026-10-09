@@ -133,6 +133,7 @@ appliance-wide.
 | `/v1/policy-assignments` | Yes | No |
 | API keys of a global Agent Surface | List and read | No, `403` on create, revoke, rotate, and delete |
 | Appliance-wide Gateway records (peer gateways) | Yes | No, `403` on update, exposure, policy, delete, issuer, `POST /v1/gateways/{id}/approve` and `PUT /v1/gateways/{id}/integrations` |
+| User and identity event integrations (`/v1/users/integrations`, `/v1/identities/integrations`) | Yes | No, `403` on `PUT` for a tenant or resource-scoped PAT; these events describe the whole appliance |
 
 Peers that arrive through the inbound Fabric handshake are always appliance-wide, so a tenant
 PAT cannot approve, rename or reconfigure them. Approving one needs an appliance-wide

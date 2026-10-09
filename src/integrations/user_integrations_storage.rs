@@ -1,8 +1,9 @@
+use crate::integrations::trigger_mappings::{MappingRequest, MappingStore};
 use crate::storage::StorageBackend;
 use crate::storage::filesystem::{StorableEntity, cached_storage};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -32,6 +33,58 @@ pub struct UserIntegrationsConfig {
 impl StorableEntity for UserIntegrationsConfig {
     fn id(&self) -> &str {
         CONFIG_ID
+    }
+}
+
+impl From<MappingRequest> for IntegrationIntegration {
+    fn from(mapping: MappingRequest) -> Self {
+        Self {
+            integration_id: mapping.integration_id,
+            variables: mapping.variables,
+            event_types: mapping.event_types,
+        }
+    }
+}
+
+impl MappingStore for UserIntegrationsStorage {
+    async fn unfiltered_integration_ids(&self) -> Result<HashSet<String>> {
+        Ok(self
+            .load()
+            .await?
+            .integration_integrations
+            .into_iter()
+            .filter(|mapping| mapping.event_types.is_empty())
+            .map(|mapping| mapping.integration_id)
+            .collect())
+    }
+
+    async fn replace(
+        &self,
+        mappings: Vec<MappingRequest>,
+    ) -> Result<Vec<MappingRequest>> {
+        let config = UserIntegrationsConfig {
+            integration_integrations: mappings
+                .into_iter()
+                .map(IntegrationIntegration::from)
+                .collect(),
+            ..Default::default()
+        };
+        self.save(&config).await?;
+        Ok(config
+            .integration_integrations
+            .into_iter()
+            .map(MappingRequest::from)
+            .collect())
+    }
+}
+
+impl From<IntegrationIntegration> for MappingRequest {
+    fn from(mapping: IntegrationIntegration) -> Self {
+        Self {
+            integration_id: mapping.integration_id,
+            variables: mapping.variables,
+            event_types: mapping.event_types,
+        }
     }
 }
 

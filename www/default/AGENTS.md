@@ -296,13 +296,33 @@ The Audit Log header shows `audit-forward-button` beside Refresh for users with
   runtime-variable catalogue (`GET /integrations/runtime-variables`: the general
   variables plus the category's own), so a sample only uses variables that category can
   substitute. `audit` keeps its curated full-record JSON payload, and Email and Slack
-  leave out `AUDIT_RECORD` and `AUDIT_VP_JWT`.
+  leave out `AUDIT_RECORD` and `AUDIT_VP_JWT`. `user` has a curated minimal JSON payload
+  (`event_type`, `timestamp`, and the user's id, role and status) so names, emails and the
+  state blocks leave the appliance only when an operator adds them.
 - The Add wizard and Edit page apply it through `hooks/useIntegrationSamples.ts`. When the
   category changes, each type's content that is empty or still the previous category's
   sample (compared ignoring key order, since the gateway stores payloads with keys sorted)
   is replaced with the new sample, and edited content is kept.
 - The Edit page starts only after the integration has loaded, so stored content is never
   replaced on open.
+
+## Attaching integrations to events
+
+`components/connection-points/IntegrationsStep.tsx` attaches integrations to a resource's
+events on the gateway, connection point, user, and identity pages.
+
+- Choosing an integration in the selector (`data-testid="integrations-step-select"`)
+  attaches it at once with its template's custom (`_`-prefixed) variables set empty, opens
+  its card, and drops it from the selector. Event checkboxes carry
+  `data-testid="integration-<index>-event-<event type>"`.
+- Missing custom variables are judged against the integration's template, not only the
+  stored values.
+- `requireEventTypes` (user and identity pages) blocks saving until every attached
+  integration names an event, matching the API, which refuses a new mapping without one.
+- The user and identity pages show a failed load as an error with no editor, so an empty
+  list can never be saved over the stored mappings, and a failed save as an error, never as
+  success. Save buttons are `user-integrations-save-button` and
+  `identity-integrations-save-button`.
 
 ## Validation
 

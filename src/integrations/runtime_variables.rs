@@ -1,6 +1,7 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -29,6 +30,14 @@ pub fn set_variable_patterns(
     {
         *regex = new_regex;
     }
+}
+
+/// The prefix that marks a template variable as custom (operator-supplied) rather than runtime.
+pub fn custom_variable_prefix() -> String {
+    CUSTOM_VARIABLE_PREFIX
+        .read()
+        .map(|prefix| prefix.clone())
+        .unwrap_or_else(|_| "_".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,14 +97,14 @@ fn get_general_variables() -> RuntimeVariableCategory {
             RuntimeVariable {
                 name: "OLD_STATE".to_string(),
                 label: "Old State".to_string(),
-                description: "JSON representation of the entity's state before the event. Empty for CREATE events. Contains complete entity object (Gateway, User, etc.) for UPDATE and DELETE events.".to_string(),
+                description: "JSON representation of the entity's state before the event. Empty for CREATE events. Contains the entity object (Gateway, User, etc.) for UPDATE and DELETE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.".to_string(),
                 example: r#"${OLD_STATE}"#.to_string(),
                 category: "general".to_string(),
             },
             RuntimeVariable {
                 name: "NEW_STATE".to_string(),
                 label: "New State".to_string(),
-                description: "JSON representation of the entity's state after the event. Empty for DELETE events. Contains complete entity object (Gateway, User, etc.) for CREATE and UPDATE events.".to_string(),
+                description: "JSON representation of the entity's state after the event. Empty for DELETE events. Contains the entity object (Gateway, User, etc.) for CREATE and UPDATE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.".to_string(),
                 example: r#"${NEW_STATE}"#.to_string(),
                 category: "general".to_string(),
             },
@@ -793,44 +802,23 @@ pub fn substitute_variables(
     category: Option<&str>,
     values: &HashMap<String, String>,
 ) -> String {
-    let mut result = template.to_string();
-
-    // Get variable names for the category if specified
     let allowed_variables: Option<Vec<String>> = category.map(get_variable_names_for_category);
+    let custom_prefix = custom_variable_prefix();
+    let Ok(re) = VAR_REGEX.read() else {
+        return template.to_string();
+    };
 
-    // Get custom prefix from global config
-    let custom_prefix = CUSTOM_VARIABLE_PREFIX
-        .read()
-        .unwrap()
-        .clone();
-
-    // Use cached regex
-    let re = VAR_REGEX.read().unwrap();
-
-    // Collect all matches first to avoid issues with multiple replacements
-    let mut replacements = Vec::new();
-    for cap in re.captures_iter(template) {
-        // Variable name is in capture group 1
-        let var_name = cap
-            .get(1)
-            .unwrap()
-            .as_str()
-            .trim();
-        let placeholder = &cap[0];
-
-        if is_variable_allowed(var_name, allowed_variables.as_deref(), &custom_prefix)
-            && let Some(value) = values.get(var_name)
-        {
-            replacements.push((placeholder.to_string(), value.clone()));
+    // One pass over the template: a substituted value is never scanned for placeholders again.
+    re.replace_all(template, |cap: &regex::Captures| {
+        let var_name = cap[1].trim();
+        match values.get(var_name) {
+            Some(value) if is_variable_allowed(var_name, allowed_variables.as_deref(), &custom_prefix) => {
+                Cow::Borrowed(value.as_str())
+            }
+            _ => Cow::Owned(cap[0].to_string()),
         }
-    }
-
-    // Apply all replacements
-    for (placeholder, value) in replacements {
-        result = result.replace(&placeholder, &value);
-    }
-
-    result
+    })
+    .into_owned()
 }
 
 /// Custom variables are always allowed; runtime variables must belong to the
@@ -1111,5 +1099,26 @@ mod tests {
         let template = serde_json::json!({"record": "${AUDIT_RECORD}"});
         let result = substitute_variables_in_json(&template, Some("audit"), &values);
         assert_eq!(result["record"], "not json");
+    }
+
+    #[test]
+    fn test_a_substituted_value_is_never_expanded_again() {
+        let values = HashMap::from([
+            ("USERNAME".to_string(), "${_TOKEN}".to_string()),
+            ("_TOKEN".to_string(), "operator-secret".to_string()),
+        ]);
+
+        let result = substitute_variables("user=${USERNAME} token=${_TOKEN}", Some("user"), &values);
+
+        assert_eq!(result, "user=${_TOKEN} token=operator-secret");
+    }
+
+    #[test]
+    fn test_a_repeated_placeholder_is_filled_everywhere() {
+        let values = HashMap::from([("USER_ID".to_string(), "u-1".to_string())]);
+
+        let result = substitute_variables("${USER_ID}/${USER_ID}", Some("user"), &values);
+
+        assert_eq!(result, "u-1/u-1");
     }
 }

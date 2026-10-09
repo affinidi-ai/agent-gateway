@@ -1,0 +1,51 @@
+branch: fix-user-integration
+changes:
+  added:
+    - timestamp: '2026-10-08T17:20:00.000Z'
+      title: ⭐ Raise user.created and user.updated for SAML sign-ins
+      description: A SAML sign-in that creates a user now raises user.created, and one that changes the user's role, status or primary flag raises user.updated, before user.login. Previously only user.login was raised, so SAML users and IdP role changes never reached integrations. SAML sign-in logs now name users by id instead of username or email.
+  changed:
+    - timestamp: '2026-10-08T16:50:00.000Z'
+      title: Start new user Stream and Webhook integrations with a minimal payload
+      description: The suggested payload for a user integration now holds only the event type, timestamp and the user's id, role and status. Usernames, emails and the before and after state are left out unless an operator adds them.
+  fixed:
+    - timestamp: '2026-10-08T16:20:00.000Z'
+      title: ⭐ Attach an integration to events as soon as it is selected
+      description: Choosing an integration on the gateway, connection point, user and identity integration pages did nothing, so Save stayed disabled and no events could be wired up. Selecting one now attaches it with its template's custom variables, opens it to choose events, and removes it from the selector.
+    - timestamp: '2026-10-08T16:21:00.000Z'
+      title: Show load and save failures on user and identity integration pages
+      description: Both pages reported a failed save as success and showed a failed load as an empty list that could then be saved over the stored mappings. Failures now show the server's message, and a failed load offers no editor.
+    - timestamp: '2026-10-08T16:22:00.000Z'
+      title: Require an event for each integration on user and identity pages
+      description: Save stays disabled until every attached integration names at least one event, matching the API, and missing custom variables are checked against the integration's template.
+  removed: []
+  security:
+    - timestamp: '2026-10-08T17:40:00.000Z'
+      title: ⭐ Keep the primary administrator's role across SAML sign-ins
+      description: Every SAML sign-in overwrote the stored role with the identity provider's, so the primary administrator, made Administrator on first sign-in, was demoted to User on the next sign-in whenever the identity provider sent no administrator role. The primary administrator now keeps the role, and a sign-in that would have changed it logs a warning.
+    - timestamp: '2026-10-08T15:10:00.000Z'
+      title: Refuse integration API requests when no RBAC guard is mounted
+      description: The /v1/integrations routes were served without any permission check when the router was built without an RBAC guard, while neighbouring admin routes refused such requests. They now fail closed with 403. Deployments always mount the guard, so this is hardening against a future wiring change.
+    - timestamp: '2026-10-08T14:30:00.000Z'
+      title: ⭐ Validate user and identity integration mappings before saving them
+      description: PUT /v1/users/integrations and /v1/identities/integrations saved any payload. They now refuse tenant and resource-scoped tokens (403), unknown, tenant-owned, audit or wrong-category integrations, unknown or missing event types, duplicate or excess entries, non-custom or oversized variables and unknown fields (400), and log each accepted change. The routes refuse every request when mounted without an RBAC guard.
+    - timestamp: '2026-10-08T14:31:00.000Z'
+      title: Skip tenant-owned integrations when sending appliance-wide user events
+      description: User events describe every user on the appliance, so an integration owned by a tenant no longer receives them, even if a stored trigger configuration names it.
+    - timestamp: '2026-10-08T14:32:00.000Z'
+      title: Fill integration template placeholders in a single pass
+      description: A substituted value was scanned again for placeholders, so a self-chosen username such as ${_TOKEN} could pull an operator's custom variable into the message. Values are now inserted literally.
+    - timestamp: '2026-10-08T12:40:00.000Z'
+      title: ⭐ Stop sending passkeys and profile details in user integration events
+      description: User events (created, approved, updated, deleted, login, accessed) put the whole user record into OLD_STATE and NEW_STATE, including passkey credentials, the SAML subject, email, names, department, job title and avatar path. They now carry only user_id, role, status, is_primary, created_at and updated_at, and trigger logs name the user by id instead of username.
+  breaking: []
+  internal:
+    - timestamp: '2026-10-09T09:00:00.000Z'
+      title: Ignore the MCP record compatibility test that fails in the full run
+      description: every_stored_surface_admits_modern_and_legacy_mcp passes alone but fails in the full test run, on main as well, because its gateway refuses connections after other tests change the process-wide server mode. It is ignored until the isolation is fixed.
+    - timestamp: '2026-10-08T16:00:00.000Z'
+      title: Describe the allow-listed user state in the example gateway config
+      description: The example config's per-event user state descriptions still listed the whole user record.
+    - timestamp: '2026-10-08T12:20:00.000Z'
+      title: Set rotation fields on the scoped PAT component test token
+      description: The scoped-token helper in the access-token component tests built an AccessToken without the rotation fields added with token rotation, so the test binary did not compile.

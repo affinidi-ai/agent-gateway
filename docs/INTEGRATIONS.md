@@ -82,6 +82,12 @@ Each resource type raises its own events. The event type is always
 | x402 | transaction verification failed, settlement failed, completed; cleanup completed |
 | MPP | verification failed, payment verified, challenge issued |
 
+A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
+SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
+so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
+primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
+([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
 Surface events and the `surface` category were named `channel` in earlier builds. A stored
 integration with the `channel` category, or a `gateway.json` that still uses it, is moved
 to `surface` at load, and `${CHANNEL_*}` template variables become `${SURFACE_*}`.
@@ -98,6 +104,26 @@ and lists, for each attached integration:
 So one Slack integration can be attached to three gateways, fire on `status_changed` for
 two of them, and on every event for the third.
 
+### User and identity events
+
+User and identity events describe the whole appliance, so their trigger configurations
+(`PUT /v1/users/integrations`, `PUT /v1/identities/integrations`, validated in
+[`trigger_mappings.rs`](../src/integrations/trigger_mappings.rs)) accept only:
+
+- An appliance-wide caller. A tenant or resource-scoped PAT gets `403`.
+- Integrations that exist, have no tenant owner, are not `audit`, and are in the
+  resource's category (`user` or `identity`) or `general`.
+- Event types the resource raises, at least one per integration. An integration already
+  stored with no event types keeps firing on every event and may be saved again unchanged.
+- Each integration once, at most 50 integrations, and only custom (`_`-prefixed) variables:
+  at most 32, names up to 64 characters, values up to 2048.
+- No unknown fields.
+
+Any refusal leaves the stored configuration unchanged. Each accepted change is logged as
+`integrations.mappings.updated` with the caller, the integration ids, and their event types;
+variable values are not logged.
+When an event is sent, tenant-owned integrations are skipped as well.
+
 ## Template variables
 
 Every event provides four variables, plus the resource's own.
@@ -112,6 +138,16 @@ Every event provides four variables, plus the resource's own.
 Resource variables follow a prefix, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`,
 and `GATEWAY_STATUS` for a gateway. `GET /v1/integrations/runtime-variables` lists every
 variable available to each category.
+
+A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is_primary`,
+`created_at`, and `updated_at`
+([`user_integration_triggers.rs`](../src/integrations/user_integration_triggers.rs)). Passkeys,
+the SAML subject, and profile details (names, department, job title, avatar) never leave the
+appliance through an integration. `USERNAME` and `USER_EMAIL` remain available as separate
+variables for a template that needs them.
+
+Placeholders are filled in one pass: a substituted value is never scanned for placeholders
+again, so a value such as a username of `${_TOKEN}` stays literal.
 
 ## Outbound requests
 
@@ -143,8 +179,11 @@ address and the connected address are not bound together. See
 | `/v1/gateways/{id}/integrations` | A gateway's trigger configuration |
 | `/v1/users/integrations`, `/v1/identities/integrations` | User and identity trigger configuration |
 
-Governance Audit integrations also require `audit.view`. Without it they are left out of
-lists, a read returns 404, and a write or manual trigger returns 403. See
+Each route needs `integrations.view`, `integrations.edit`, or `integrations.delete`, checked
+by the RBAC guard ([`integration_handlers.rs`](../src/storage/integration_handlers.rs)). Mounted
+without a guard, every route above refuses the request with `403`. Governance Audit
+integrations also require `audit.view`. Without it they are left out of lists, a read returns
+404, and a write or manual trigger returns 403. See
 [`RBAC.md`](RBAC.md#governance-audit-integrations).
 
 ## In-dashboard notifications

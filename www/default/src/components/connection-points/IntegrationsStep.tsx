@@ -27,6 +27,8 @@ interface IntegrationsStepProps {
   availableEventTypes?: Array<{ value: string; label: string; description: string }>;
   /** Render the integration selector flush (no wrapping card) when the parent already provides one */
   bareSelector?: boolean;
+  /** Every attached integration must name at least one of `availableEventTypes` */
+  requireEventTypes?: boolean;
 }
 
 /**
@@ -42,35 +44,18 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
   category,
   availableEventTypes = [],
   bareSelector = false,
+  requireEventTypes = false,
 }) => {
-  const [selectedNotifierId, setSelectedNotifierId] = useState<string>('');
   const [expandedIntegrations, setExpandedIntegrations] = useState<Set<number>>(new Set());
 
-  // Filter integrations to only show those matching the category or 'general'
+  // Offer integrations of this category or 'general' (or uncategorised, for backward
+  // compatibility) that are not attached yet
   const filteredIntegrations = availableIntegrations.filter(integration => {
-    // If no category is set on the integration, allow it (backward compatibility)
+    if (integrations.some(attached => attached.integration_id === integration.id)) return false;
     if (!integration.category) return true;
-    // Allow 'general' category integrations for all contexts
     if (integration.category === 'general') return true;
-    // Allow integrations that match the current category
     return integration.category === category;
   });
-
-  // Validate integrations - check if any CUSTOM variables have empty values
-  // Runtime variables are auto-populated and don't need validation
-  const hasValidationErrors = integrations.some(integration => {
-    const customVariables = Object.entries(integration.variables).filter(([key]) =>
-      key.startsWith('_')
-    );
-    if (customVariables.length === 0) return false; // No custom variables to validate
-    return customVariables.some(([_, value]) => !value || value.trim() === '');
-  });
-
-  // Notify parent when validation state changes
-  useEffect(() => {
-    onValidationChange?.(hasValidationErrors);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasValidationErrors]);
 
   // Get all variables from a integration's template
   const getIntegrationTemplateVariables = (integration: any): TemplateVariable[] => {
@@ -93,6 +78,12 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
     const variables = extractAllTemplateVariables(templateText);
     return variables;
   };
+
+  // Custom variables (starting with _) need an operator-supplied value; runtime ones are filled in
+  const getCustomVariableNames = (integration: any): string[] =>
+    getIntegrationTemplateVariables(integration)
+      .map(variable => variable.name)
+      .filter(name => name.startsWith('_'));
 
   const toggleIntegration = (index: number) => {
     const newExpanded = new Set(expandedIntegrations);
@@ -121,6 +112,34 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
   const getIntegrationById = (id: string) => {
     return availableIntegrations.find(n => n.id === id);
   };
+
+  const handleAttachIntegration = (integrationId: string) => {
+    const integration = getIntegrationById(integrationId);
+    if (!integration) return;
+    const variables = Object.fromEntries(
+      getCustomVariableNames(integration).map(name => [name, ''])
+    );
+    setExpandedIntegrations(new Set(expandedIntegrations).add(integrations.length));
+    onChange([...integrations, { integration_id: integrationId, variables, event_types: [] }]);
+  };
+
+  const hasMissingVariables = integrations.some(integration => {
+    const config = getIntegrationById(integration.integration_id);
+    const names = config
+      ? getCustomVariableNames(config)
+      : Object.keys(integration.variables).filter(name => name.startsWith('_'));
+    return names.some(name => !integration.variables[name]?.trim());
+  });
+  const hasMissingEventTypes =
+    requireEventTypes &&
+    availableEventTypes.length > 0 &&
+    integrations.some(integration => (integration.event_types ?? []).length === 0);
+  const hasValidationErrors = hasMissingVariables || hasMissingEventTypes;
+
+  useEffect(() => {
+    onValidationChange?.(hasValidationErrors);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasValidationErrors]);
 
   const getPreviewTemplate = (integration: any): string => {
     if (!integration?.content) return 'No template configured';
@@ -153,11 +172,16 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
 
   return (
     <>
-      {/* Validation Warning */}
-      {hasValidationErrors && (
+      {hasMissingVariables && (
         <div className="alert alert-warning mb-4">
           <i className="fas fa-exclamation-triangle me-1"></i>
           Some variables have empty values. Please fill in all variable values before saving.
+        </div>
+      )}
+      {hasMissingEventTypes && (
+        <div className="alert alert-warning mb-4">
+          <i className="fas fa-exclamation-triangle me-1"></i>
+          Select at least one event for each integration.
         </div>
       )}
 
@@ -169,10 +193,11 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
               <label>Select Integration (optional)</label>
               <select
                 className="form-control dropdown-styling"
-                value={selectedNotifierId}
-                onChange={e => setSelectedNotifierId(e.target.value)}
+                value=""
+                onChange={e => handleAttachIntegration(e.target.value)}
                 disabled={filteredIntegrations.length === 0}
                 title="Select an integration to add"
+                data-testid="integrations-step-select"
               >
                 <option value="">Select an integration</option>
                 {filteredIntegrations.map(integration => (
@@ -287,6 +312,7 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
                                   type="checkbox"
                                   className="custom-control-input"
                                   id={`event-${index}-${eventType.value}`}
+                                  data-testid={`integration-${index}-event-${eventType.value}`}
                                   checked={
                                     integration.event_types?.includes(eventType.value) || false
                                   }
