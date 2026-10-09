@@ -29,6 +29,9 @@ changes:
     - timestamp: '2026-10-10T00:00:05.000Z'
       title: Answer 404 for records a tenant token cannot see on every write
       description: Updating, deleting or otherwise changing another tenant's record, or one outside the token's resource pattern, now returns the same 404 as a missing record across all management stores, Gateways, Connection Points, Agent Surfaces, policies and API keys, so a tenant token cannot tell that an id exists in another tenant. A record the token can see but not change, such as an appliance-wide one, still returns 403. Previously these writes returned 403 for another tenant's record.
+    - timestamp: '2026-10-10T00:00:06.000Z'
+      title: Publish the Docker Compose ports on loopback only
+      description: docker-compose.yml now publishes the HTTPS (8443) and HTTP (8080) listeners on 127.0.0.1 instead of every host interface, so a local gateway is not reachable from the network before its first administrator registers. Remove the 127.0.0.1 prefix to expose it deliberately.
   breaking:
     - timestamp: '2026-10-09T00:00:01.000Z'
       title: Stop sending target credentials for failed callers over MCP proxy and Fabric

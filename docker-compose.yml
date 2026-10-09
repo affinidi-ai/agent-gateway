@@ -48,9 +48,10 @@ services:
     # not crash-loop and bury the first error.
     security_opt:
       - no-new-privileges:true
+    # Published on loopback only. Drop the 127.0.0.1 prefix to reach the gateway from other hosts.
     ports:
-      - "8443:8443"   # HTTPS listener — dashboard + passkey origin
-      - "8080:8080"   # HTTP listener
+      - "127.0.0.1:8443:8443"   # HTTPS listener — dashboard + passkey origin
+      - "127.0.0.1:8080:8080"   # HTTP listener
     environment:
       RUST_LOG: info
       # Required. Encrypts backups; must be a 64-character hex string. The :? guard

@@ -138,7 +138,12 @@ exist` instead of a cryptic in-container error. Keep the key exported for every
 ### Accessing the gateway
 
 The container publishes `8443` (HTTPS, self-signed) and `8080` (HTTP). Both serve
-the same dashboard and `/api/v1/*` endpoints.
+the same dashboard and `/api/v1/*` endpoints. `docker compose` publishes them on
+`127.0.0.1` only, so the gateway is reachable from this machine and not from the
+network; `make docker-run` publishes them on every interface. To reach a compose
+gateway from another host, remove the `127.0.0.1` prefix in
+[`docker-compose.yml`](../../docker-compose.yml) and set the public host as
+described below.
 
 | Goal | URL |
 | --- | --- |
