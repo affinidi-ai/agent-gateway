@@ -232,6 +232,25 @@ mode. A body without `exposure_mode` selects `list` for a non-empty list and `no
 one, so an empty list never means every surface. The dashboard sets it on the **Publishing** tab of
 a remote gateway.
 
+### Revoking access ends running streams
+
+A change that narrows a peer's access also ends, at once, the framed streams it no longer allows on
+this node. They end the way a replaced listener ends its streams: each side is told `unavailable`,
+and the caller's response ends with an error. The gateway and Connection Point stores apply it on
+every write of a record ([`Revocation`](../src/proxy/fabric_stream/mod.rs)):
+
+| Change | Streams that end |
+| --- | --- |
+| The peer's status leaves `active`, or its record is removed | Every stream with the peer, opened by either side |
+| The peer's exposure no longer admits a surface (`none`, or a list without it) | The streams the peer opened here to that surface |
+| A Connection Point is disabled or removed | Every stream it carries |
+| A Connection Point's exposure list no longer admits a surface | The streams opened here through it to that surface |
+
+Streams of other peers, surfaces and Connection Points keep running. An Open admitted while a
+revocation runs is refused, so it cannot outlive the change. Admission reads the Connection Point's
+current record rather than the one its listener started with, so a disabled Connection Point admits
+no new stream.
+
 ## Fabric receive pipeline
 
 [`process_forward_request`](../src/gateways/connection_points/message_processor.rs) handles a G2G

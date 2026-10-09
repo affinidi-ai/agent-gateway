@@ -263,6 +263,8 @@ pub(crate) struct ReceiveRegistry {
     senders: Mutex<HashMap<Uuid, Arc<SendEntry>>>,
     opened: Mutex<SharedTable<Uuid, tokio::time::Instant>>,
     held: Mutex<HashMap<Uuid, HeldOpen>>,
+    /// Counts revocations, so a stream admitted while one ran can be refused.
+    revocations: std::sync::atomic::AtomicU64,
     limits: RegistryLimits,
 }
 
@@ -278,6 +280,7 @@ impl ReceiveRegistry {
                     .saturating_mul(OPEN_REPLAY_RECORDS_PER_STREAM),
             )),
             held: Mutex::new(HashMap::new()),
+            revocations: std::sync::atomic::AtomicU64::new(0),
             limits,
         }))
     }
@@ -827,17 +830,38 @@ impl ReceiveRegistry {
         connection_point_id: &str,
         instance_id: &str,
     ) {
+        self.cancel_where(|binding, _| {
+            binding.connection_point_id == connection_point_id && binding.listener_instance_id == instance_id
+        });
+    }
+
+    /// Ends the running streams `revoked` matches, given each stream's binding
+    /// and whether a peer opened it here. The revocation is counted first, so
+    /// an `Open` admitted while it runs can tell (see [`Self::revocations`]).
+    pub fn revoke(
+        &self,
+        revoked: impl Fn(&StreamBinding, bool) -> bool,
+    ) {
+        self.revocations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.cancel_where(revoked);
+    }
+
+    /// How many revocations have run.
+    pub fn revocations(&self) -> u64 {
+        self.revocations
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Ends every registered stream `ends` matches, given its binding and
+    /// whether a peer opened it here, as `unavailable`.
+    fn cancel_where(
+        &self,
+        ends: impl Fn(&StreamBinding, bool) -> bool,
+    ) {
         if let Ok(mut senders) = self.senders.lock() {
             senders.retain(|_, entry| {
-                if entry
-                    .binding
-                    .connection_point_id
-                    != connection_point_id
-                    || entry
-                        .binding
-                        .listener_instance_id
-                        != instance_id
-                {
+                if !ends(&entry.binding, entry.direction == StreamDirection::Response) {
                     return true;
                 }
                 entry
@@ -848,15 +872,7 @@ impl ReceiveRegistry {
         }
         let Ok(mut entries) = self.entries.lock() else { return };
         entries.retain(|_, entry| {
-            if entry
-                .binding
-                .connection_point_id
-                != connection_point_id
-                || entry
-                    .binding
-                    .listener_instance_id
-                    != instance_id
-            {
+            if !ends(&entry.binding, entry.direction == StreamDirection::Request) {
                 return true;
             }
             if let Ok(mut state) = entry.state.lock() {
@@ -1518,6 +1534,51 @@ mod tests {
                 .release(&flooded, true)
                 .is_err(),
             "a sender past the held frames is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revocation_ends_only_the_streams_it_matches_and_is_counted() {
+        let registry = registry();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut revoked_peer = binding();
+        revoked_peer.peer_did = "did:example:revoked".into();
+        let (revoked_receiver, revoked_sender) = registry
+            .open(Uuid::new_v4(), revoked_peer, MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
+            .unwrap();
+        let (kept_receiver, kept_sender) = registry
+            .open(Uuid::new_v4(), binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
+            .unwrap();
+        let before = registry.revocations();
+
+        registry.revoke(|binding, inbound| inbound && binding.peer_did == "did:example:revoked");
+
+        assert_eq!(registry.revocations(), before + 1);
+        assert_eq!(
+            *revoked_receiver
+                .closed()
+                .borrow(),
+            Some(StreamErrorCode::Unavailable)
+        );
+        assert_eq!(
+            *revoked_sender
+                .credit()
+                .cancellation()
+                .borrow(),
+            Some(StreamErrorCode::Unavailable)
+        );
+        assert_eq!(
+            *kept_receiver
+                .closed()
+                .borrow(),
+            None
+        );
+        assert_eq!(
+            *kept_sender
+                .credit()
+                .cancellation()
+                .borrow(),
+            None
         );
     }
 

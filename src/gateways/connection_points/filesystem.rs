@@ -108,6 +108,37 @@ impl FileSystemConnectionPointStore {
 
         Ok(cleaned)
     }
+
+    /// Saves `connection_point` and ends the running Fabric streams the change
+    /// revokes. When the previous record cannot be read, every stream it
+    /// carries ends.
+    async fn save_and_revoke(
+        &self,
+        connection_point: &GatewayConnectionPoint,
+    ) -> Result<()> {
+        let previous = self
+            .storage
+            .get(&connection_point.id)
+            .await;
+        self.storage
+            .save(connection_point)
+            .await?;
+        match &previous {
+            Ok(Some(previous)) => {
+                if let Some(revocation) = crate::proxy::fabric_stream::Revocation::of_connection_point_change(
+                    previous,
+                    Some(connection_point),
+                ) {
+                    crate::proxy::fabric_stream::revoke(revocation);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => crate::proxy::fabric_stream::revoke(crate::proxy::fabric_stream::Revocation::ConnectionPoint(
+                &connection_point.id,
+            )),
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -116,8 +147,7 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         &self,
         connection_point: &GatewayConnectionPoint,
     ) -> Result<()> {
-        self.storage
-            .save(connection_point)
+        self.save_and_revoke(connection_point)
             .await
     }
 
@@ -166,9 +196,7 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         &self,
         connection_point: &GatewayConnectionPoint,
     ) -> Result<()> {
-        // Update is the same as store
-        self.storage
-            .save(connection_point)
+        self.save_and_revoke(connection_point)
             .await
     }
 
@@ -176,7 +204,22 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         &self,
         id: &str,
     ) -> Result<()> {
-        self.storage.delete(id).await
+        let previous = self.storage.get(id).await;
+        self.storage
+            .delete(id)
+            .await?;
+        match &previous {
+            Ok(Some(previous)) => {
+                if let Some(revocation) =
+                    crate::proxy::fabric_stream::Revocation::of_connection_point_change(previous, None)
+                {
+                    crate::proxy::fabric_stream::revoke(revocation);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => crate::proxy::fabric_stream::revoke(crate::proxy::fabric_stream::Revocation::ConnectionPoint(id)),
+        }
+        Ok(())
     }
 }
 

@@ -14,6 +14,9 @@ changes:
     - timestamp: '2026-10-09T12:30:00.000Z'
       title: ⭐ Give each Fabric peer and tenant its own share of the shared stream tables
       description: One peer could fill the capability offer, capability probe or Open replay table and get every other peer refused. Each peer may now hold an eighth of a table and the peers of one tenant half of it, so a second peer is still served after one peer sends hundreds of refused requests. The listener also admits Opens off its reader loop, at most 16 at a time, holding up to 8 early frames per stream until its Open is admitted, so a slow admission no longer stalls every other message. The share values are interim constants.
+    - timestamp: '2026-10-09T17:00:00.000Z'
+      title: End running Fabric streams when a peer's access is revoked
+      description: Running framed streams kept going after a peer left active or was removed, a surface was un-exposed, or a Connection Point was disabled, and a disabled Connection Point still admitted new streams until its listener restarted. Every write of a gateway or Connection Point record now ends, at once, only the streams the change no longer allows, an Open admitted while a revocation runs is refused, and admission reads the Connection Point's current record.
   breaking:
     - timestamp: '2026-10-09T12:30:00.000Z'
       title: Answer full Fabric stream caps on the receiving gateway with capacity_reached

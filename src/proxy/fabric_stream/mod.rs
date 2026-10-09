@@ -767,6 +767,95 @@ fn bdd_legacy_only_receive(
     test_mode == Some("true") && legacy_only == Some("true")
 }
 
+/// The running streams an access change ends.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Revocation<'change> {
+    /// Every stream with the peer, opened by either side: it left active, or
+    /// its record was removed.
+    Peer(&'change str),
+    /// Streams the peer opened here to a surface its record no longer exposes.
+    PeerExposure(&'change crate::gateways::types::Gateway),
+    /// Every stream the Connection Point carries: it was disabled or removed.
+    ConnectionPoint(&'change str),
+    /// Streams a peer opened here through the Connection Point to a surface it
+    /// no longer exposes.
+    ConnectionPointExposure(&'change crate::gateways::connection_points::types::GatewayConnectionPoint),
+}
+
+impl<'change> Revocation<'change> {
+    /// Whether this ends the stream with `binding`; `inbound` when the peer
+    /// opened it here.
+    pub fn covers(
+        &self,
+        binding: &registry::StreamBinding,
+        inbound: bool,
+    ) -> bool {
+        match self {
+            Self::Peer(peer_did) => binding.peer_did == *peer_did,
+            Self::PeerExposure(peer) => {
+                inbound && binding.peer_did == peer.did && !peer.exposes_surface(&binding.surface_id)
+            }
+            Self::ConnectionPoint(connection_point_id) => binding.connection_point_id == *connection_point_id,
+            Self::ConnectionPointExposure(connection_point) => {
+                inbound
+                    && binding.connection_point_id == connection_point.id
+                    && !connection_point
+                        .exposed_channels
+                        .is_empty()
+                    && !connection_point
+                        .exposed_channels
+                        .contains(&binding.surface_id)
+            }
+        }
+    }
+
+    /// What a write of a gateway record revokes, from `previous` to `current`
+    /// (`None` when it was removed). Only an active Remote gateway has streams,
+    /// and only a change that narrows its access revokes them.
+    pub fn of_gateway_change(
+        previous: &'change crate::gateways::types::Gateway,
+        current: Option<&'change crate::gateways::types::Gateway>,
+    ) -> Option<Self> {
+        use crate::gateways::types::{GatewayStatus, GatewayType};
+        if previous.gateway_type != GatewayType::Remote || previous.status != GatewayStatus::Active {
+            return None;
+        }
+        match current {
+            Some(current) if current.status == GatewayStatus::Active && current.did == previous.did => {
+                (current.exposure() != previous.exposure() || current.exposed_channels != previous.exposed_channels)
+                    .then_some(Self::PeerExposure(current))
+            }
+            _ => Some(Self::Peer(&previous.did)),
+        }
+    }
+
+    /// What a write of a Connection Point revokes, from `previous` to
+    /// `current` (`None` when it was removed).
+    pub fn of_connection_point_change(
+        previous: &'change crate::gateways::connection_points::types::GatewayConnectionPoint,
+        current: Option<&'change crate::gateways::connection_points::types::GatewayConnectionPoint>,
+    ) -> Option<Self> {
+        if !previous.enabled {
+            return None;
+        }
+        match current {
+            Some(current) if current.enabled => (current.exposed_channels != previous.exposed_channels)
+                .then_some(Self::ConnectionPointExposure(current)),
+            _ => Some(Self::ConnectionPoint(&previous.id)),
+        }
+    }
+}
+
+/// Ends the running streams `revocation` covers on this node, the way a
+/// replaced listener ends its streams: each side is told `unavailable`.
+pub(crate) fn revoke(revocation: Revocation<'_>) {
+    if let Ok(runtime) = global() {
+        runtime
+            .registry
+            .revoke(|binding, inbound| revocation.covers(binding, inbound));
+    }
+}
+
 pub(crate) fn global() -> Result<&'static Arc<StreamRuntime>, String> {
     static RUNTIME: OnceLock<Result<Arc<StreamRuntime>, String>> = OnceLock::new();
     RUNTIME
@@ -1859,6 +1948,144 @@ mod tests {
                 .is_none(),
             "only an Open is answered"
         );
+    }
+
+    fn revocation_binding(
+        peer_did: &str,
+        connection_point_id: &str,
+        surface_id: &str,
+    ) -> registry::StreamBinding {
+        registry::StreamBinding {
+            peer_did: peer_did.into(),
+            recipient_did: "did:example:local".into(),
+            connection_point_id: connection_point_id.into(),
+            listener_instance_id: "instance".into(),
+            surface_id: surface_id.into(),
+        }
+    }
+
+    fn active_peer(
+        mode: crate::gateways::types::ExposureMode,
+        surfaces: &[&str],
+    ) -> crate::gateways::types::Gateway {
+        use crate::gateways::types::{Gateway, GatewayStatus, GatewayType};
+        let mut peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
+        peer.status = GatewayStatus::Active;
+        peer.exposure_mode = Some(mode);
+        peer.exposed_channels = surfaces
+            .iter()
+            .map(|surface| surface.to_string())
+            .collect();
+        peer
+    }
+
+    #[test]
+    fn each_revocation_covers_only_the_streams_it_names() {
+        use crate::gateways::types::ExposureMode;
+
+        let peer = active_peer(ExposureMode::List, &["kept"]);
+        let peer_stream = |surface: &str| revocation_binding("did:example:peer", "cp", surface);
+        let other_peer = revocation_binding("did:example:other", "cp", "lost");
+
+        assert!(Revocation::Peer("did:example:peer").covers(&peer_stream("kept"), true));
+        assert!(Revocation::Peer("did:example:peer").covers(&peer_stream("peer-channel"), false));
+        assert!(!Revocation::Peer("did:example:peer").covers(&other_peer, true));
+
+        let exposure = Revocation::PeerExposure(&peer);
+        assert!(exposure.covers(&peer_stream("lost"), true));
+        assert!(!exposure.covers(&peer_stream("kept"), true));
+        assert!(!exposure.covers(&peer_stream("lost"), false), "streams this gateway opened are not exposure");
+        assert!(!exposure.covers(&other_peer, true));
+
+        let mut connection_point = crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+            "gateway".into(),
+            "mediator".into(),
+            "did:example:cp".into(),
+            "cp".into(),
+            String::new(),
+            "oob".into(),
+            String::new(),
+            serde_json::json!({}),
+            None,
+            crate::gateways::connection_points::types::ConnectionPointType::User,
+            String::new(),
+        );
+        connection_point.id = "cp".into();
+        assert!(Revocation::ConnectionPoint("cp").covers(&peer_stream("kept"), false));
+        assert!(!Revocation::ConnectionPoint("other-cp").covers(&peer_stream("kept"), true));
+        assert!(
+            !Revocation::ConnectionPointExposure(&connection_point).covers(&peer_stream("any"), true),
+            "an empty list exposes every surface"
+        );
+        connection_point.exposed_channels = vec!["kept".into()];
+        let narrowed = Revocation::ConnectionPointExposure(&connection_point);
+        assert!(narrowed.covers(&peer_stream("lost"), true));
+        assert!(!narrowed.covers(&peer_stream("kept"), true));
+        assert!(!narrowed.covers(&peer_stream("lost"), false));
+    }
+
+    #[test]
+    fn only_a_change_that_narrows_access_revokes_streams() {
+        use crate::gateways::types::{ExposureMode, GatewayStatus, GatewayType};
+
+        let previous = active_peer(ExposureMode::List, &["x", "y"]);
+        let mut renamed = previous.clone();
+        renamed.name = "Renamed".into();
+        assert!(Revocation::of_gateway_change(&previous, Some(&renamed)).is_none());
+
+        let mut narrowed = previous.clone();
+        narrowed.exposed_channels = vec!["y".into()];
+        assert!(matches!(Revocation::of_gateway_change(&previous, Some(&narrowed)), Some(Revocation::PeerExposure(_))));
+        let mut closed = previous.clone();
+        closed.exposure_mode = Some(ExposureMode::None);
+        assert!(matches!(Revocation::of_gateway_change(&previous, Some(&closed)), Some(Revocation::PeerExposure(_))));
+
+        for status in [GatewayStatus::Disabled, GatewayStatus::Pending, GatewayStatus::Failed] {
+            let mut left = previous.clone();
+            left.status = status;
+            assert!(matches!(
+                Revocation::of_gateway_change(&previous, Some(&left)),
+                Some(Revocation::Peer("did:example:peer"))
+            ));
+        }
+        assert!(matches!(Revocation::of_gateway_change(&previous, None), Some(Revocation::Peer(_))));
+
+        let mut inactive = previous.clone();
+        inactive.status = GatewayStatus::Disabled;
+        assert!(Revocation::of_gateway_change(&inactive, None).is_none(), "an inactive peer has no streams");
+        let mut own = previous.clone();
+        own.gateway_type = GatewayType::SelfGateway;
+        assert!(Revocation::of_gateway_change(&own, None).is_none());
+
+        let connection_point = crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+            "gateway".into(),
+            "mediator".into(),
+            "did:example:cp".into(),
+            "cp".into(),
+            String::new(),
+            "oob".into(),
+            String::new(),
+            serde_json::json!({}),
+            None,
+            crate::gateways::connection_points::types::ConnectionPointType::User,
+            String::new(),
+        );
+        let mut renamed = connection_point.clone();
+        renamed.name = "Renamed".into();
+        assert!(Revocation::of_connection_point_change(&connection_point, Some(&renamed)).is_none());
+        let mut disabled = connection_point.clone();
+        disabled.enabled = false;
+        assert!(matches!(
+            Revocation::of_connection_point_change(&connection_point, Some(&disabled)),
+            Some(Revocation::ConnectionPoint(_))
+        ));
+        assert!(Revocation::of_connection_point_change(&disabled, None).is_none());
+        let mut narrowed = connection_point.clone();
+        narrowed.exposed_channels = vec!["only".into()];
+        assert!(matches!(
+            Revocation::of_connection_point_change(&connection_point, Some(&narrowed)),
+            Some(Revocation::ConnectionPointExposure(_))
+        ));
     }
 
     #[test]

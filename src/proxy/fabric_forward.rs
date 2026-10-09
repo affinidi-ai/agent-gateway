@@ -175,6 +175,7 @@ async fn forward_stream_with_runtime(
         .get_listener(gateway_id)
         .await
         .ok_or_else(|| FabricForwardError::GatewayNotConnected(gateway_id.to_string()))?;
+    let revocations = runtime.registry.revocations();
     let (peer_did, peer_tenant_id) = manager
         .get_active_stream_peer(gateway_id)
         .await
@@ -324,6 +325,11 @@ async fn forward_stream_with_runtime(
             &agreement.capabilities,
         )
         .map_err(registration_failure)?;
+    // A revocation that ran after the peer was read could not end these
+    // registrations, which did not exist yet.
+    if runtime.registry.revocations() != revocations {
+        return Err(FabricForwardError::StreamingUnavailable);
+    }
     // Waits for the peer's Credit on the upload; the response itself may be
     // quiet for as long as the target takes.
     sender

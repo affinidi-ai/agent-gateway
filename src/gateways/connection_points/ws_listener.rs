@@ -2322,17 +2322,18 @@ where
 }
 
 /// What admitting one `Open` off the reader loop needs.
-struct OpenAdmission {
+struct OpenAdmission<CS> {
     runtime: Arc<crate::proxy::fabric_stream::StreamRuntime>,
     message: ReceivedMessage,
     connection_point: Arc<GatewayConnectionPoint>,
+    cp_store: Option<Arc<CS>>,
     gateway_store: Option<Arc<crate::gateways::FileSystemGatewayStore>>,
     client: DIDCommClient,
     bootstrap_config: Option<Arc<crate::config::BootstrapConfig>>,
     refusals: Arc<tokio::sync::Semaphore>,
 }
 
-impl OpenAdmission {
+impl<CS: super::ConnectionPointStore + 'static> OpenAdmission<CS> {
     /// Admits the `Open`, releases the frames held for its stream and runs the
     /// stream. A refused `Open` is answered, so its sender fails at once.
     async fn admit_and_run(
@@ -2398,6 +2399,10 @@ impl OpenAdmission {
     async fn admit(
         &self
     ) -> Result<crate::proxy::fabric_stream::IncomingStream, crate::proxy::fabric_stream::OpenRefusal> {
+        let revocations = self
+            .runtime
+            .registry
+            .revocations();
         let store = self
             .gateway_store
             .as_ref()
@@ -2412,9 +2417,40 @@ impl OpenAdmission {
             .await
             .map_err(|error| error.to_string())?
             .ok_or("Fabric sender is not a configured peer")?;
-        self.runtime
-            .prepare_incoming(&self.message, &self.connection_point, &peer)
-            .await
+        let connection_point = self
+            .current_connection_point()
+            .await?;
+        let incoming = self
+            .runtime
+            .prepare_incoming(&self.message, &connection_point, &peer)
+            .await?;
+        // A revocation that ran after the records were read could not end
+        // this stream, which was not registered yet.
+        if self
+            .runtime
+            .registry
+            .revocations()
+            != revocations
+        {
+            return Err("Fabric access changed while the Open was admitted".into());
+        }
+        Ok(incoming)
+    }
+
+    /// The Connection Point as stored now, so a disabled one or a narrowed
+    /// exposure applies to this `Open`, not the record the listener started
+    /// with.
+    async fn current_connection_point(
+        &self
+    ) -> Result<GatewayConnectionPoint, crate::proxy::fabric_stream::OpenRefusal> {
+        match &self.cp_store {
+            Some(store) => store
+                .get(&self.connection_point.id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Fabric Connection Point no longer exists".into()),
+            None => Ok((*self.connection_point).clone()),
+        }
     }
 }
 
@@ -2660,6 +2696,7 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                     runtime: Arc::clone(runtime),
                                     message: received_msg.clone(),
                                     connection_point: Arc::clone(&connection_point_arc),
+                                    cp_store: cp_store.clone(),
                                     gateway_store: gateway_store.clone(),
                                     client: client.clone(),
                                     bootstrap_config: bootstrap_config.clone(),
