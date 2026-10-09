@@ -21,13 +21,4 @@ changes:
     - timestamp: '2026-10-09T00:00:07.000Z'
       title: Refuse tenant token edits to records that belong to no tenant
       description: Tenant automations that updated, deleted or triggered appliance-wide records, including records created before tenant stamping, now get 403, and tenant tokens can no longer create Connection Points. Use an appliance-wide token, or have an operator assign the record with `PUT /v1/tenant-ownership/...`.
-  internal:
-    - timestamp: '2026-10-09T00:00:06.000Z'
-      title: Test access-token scopes on JWT strategy create, update and JWKS probe
-      description: Component tests through the router and access-token middleware show that a token without the edit scope cannot create or update a JWT verification strategy and one without the view scope cannot probe a JWKS URI, with positive controls for tokens that hold the scope.
-    - timestamp: '2026-10-09T00:00:04.000Z'
-      title: Test tenant token write refusals on every management store
-      description: Adds handler-level 403 and own-record tests per store, router and access-token middleware tests for JWT strategies and secrets, and lists the read-only stores in ACCESS_TOKENS.md.
-    - timestamp: '2026-10-09T00:00:02.000Z'
-      title: Test target-credential withholding on MCP proxy, Fabric and A2A proxy paths
-      description: Adds surface and g2g BDD scenarios for failed and authenticated callers on each forwarding sink, an agent-card-over-Fabric scenario, Direct Line component and unit tests, and documents the rule in POLICY.md, SOURCE_AUTH.md and ARCHITECTURE.md.
+  internal: []
