@@ -3760,6 +3760,9 @@ async fn step_prepare_modern_credentials(
         .surface
         .outbound_credentials
         .is_empty()
+        || ctx
+            .virtual_channel
+            .withholds_delegated_credentials()
     {
         return Ok(None);
     }
@@ -3809,6 +3812,12 @@ async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
+    if ctx
+        .virtual_channel
+        .withholds_delegated_credentials()
+    {
+        return Ok(());
+    }
     let mut outbound_creds = ctx
         .surface
         .outbound_credentials();
@@ -10626,5 +10635,149 @@ mod tests {
                 "client_capabilities": body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
             })
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fabric_transit_points_withhold_delegated_credentials_unless_opted_in() {
+        use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+        use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+        use std::collections::HashMap;
+
+        let directory = tempfile::tempdir().unwrap();
+        let providers = Arc::new(
+            FileSystemCredentialProviderStore::new(
+                directory
+                    .path()
+                    .join("providers"),
+            )
+            .await
+            .unwrap(),
+        );
+        let vault = Arc::new(
+            FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap(),
+        );
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        providers
+            .create(
+                serde_json::from_value(json!({
+                    "id": "provider", "name": "Provider", "provider_id": "provider",
+                    "resource": "https://provider.example/api",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        vault
+            .store(
+                serde_json::from_value(json!({
+                    "id": "transit-token", "agent_did": "did:web:agent.example", "user_identity_hash": "sha256:user",
+                    "credential_provider_id": "provider", "provider_id": "provider", "access_token": "transit-access",
+                    "refresh_token": "transit-refresh", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.credential_provider_store = Some(providers);
+        state.delegation_vault_store = Some(vault);
+        state.secrets_store = Some(secrets);
+        state.gateway_base_url = Some("https://gateway.example".into());
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "transit-fabric", "name": "Transit Fabric",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://managed.example/agent"},
+            "outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"],
+                "inject_as": {"type": "meta", "field": "io.affinidi.fabric/delegated-credential"}}]
+        }))
+        .unwrap();
+        let surface = Arc::new(surface);
+
+        for (endpoint, opted_in, delegates) in [
+            ("fabric://peer-gateway/peer-surface", false, false),
+            ("fabric://peer-gateway/peer-surface", true, true),
+            ("https://partner.example/mcp", false, true),
+        ] {
+            let transit_point = |mut ctx: OutboundPipelineContext| {
+                ctx.surface = surface.clone();
+                ctx.virtual_channel
+                    .target_endpoint = endpoint.into();
+                ctx.virtual_channel
+                    .fabric_delegated_credentials = opted_in;
+                ctx
+            };
+            assert_eq!(
+                transit_point(test_pipeline_context())
+                    .virtual_channel
+                    .withholds_delegated_credentials(),
+                !delegates,
+                "{endpoint} opted_in={opted_in}"
+            );
+
+            let mut legacy = transit_point(test_pipeline_context());
+            legacy.body_bytes = Some(bytes::Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}"#,
+            ));
+            legacy.transit_token_claims = Some(
+                serde_json::from_value(json!({"iss": "https://gateway.example", "surface_id": "transit-fabric",
+                    "iat": 0, "exp": u64::MAX, "jti": "jti", "user_identity_hash": "sha256:user"}))
+                .unwrap(),
+            );
+            legacy.resolved_identity = ProtectedAgentIdentity::Managed {
+                did: "did:web:agent.example".into(),
+                identity_fields: HashMap::new(),
+            };
+            step_inject_credentials(&state, &mut legacy)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(
+                legacy
+                    .body_bytes
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            let injected = &body["params"]["_meta"]["io.affinidi.fabric/delegated-credential"];
+            if delegates {
+                assert_eq!(injected, "transit-access", "{endpoint} opted_in={opted_in}");
+            } else {
+                assert!(injected.is_null(), "{endpoint} opted_in={opted_in}");
+            }
+            assert!(
+                !String::from_utf8_lossy(
+                    legacy
+                        .body_bytes
+                        .as_ref()
+                        .unwrap()
+                )
+                .contains("transit-refresh")
+            );
+
+            let mut modern = transit_point(modern_pipeline_context("tools/call"));
+            let response = step_prepare_modern_credentials(&state, &mut modern)
+                .await
+                .unwrap();
+            assert_eq!(response.is_some(), delegates, "{endpoint} opted_in={opted_in}");
+            assert!(
+                modern
+                    .modern_delegation
+                    .is_none()
+            );
+        }
     }
 }

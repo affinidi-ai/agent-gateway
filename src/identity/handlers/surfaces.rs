@@ -2156,6 +2156,7 @@ mod validation_tests {
                 fabric_target_name: None,
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
+                fabric_delegated_credentials: false,
             },
             transit: None,
             canvas: None,
