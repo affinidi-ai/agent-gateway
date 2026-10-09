@@ -30,3 +30,9 @@ changes:
         adds each surface to the receiver's record for the sending peer in list mode. Adds the
         scenario where a newly paired peer is refused with 403, plus unit, store, handler and
         dashboard tests for the mode, its evaluation and the boot migration.
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Tag the g2g issuer request scenario as a known bug
+      description: >-
+        The scenario fails most runs because the accepting gateway can send from its temporary
+        pairing Connection Point just after the peer turns Active, and the reply to that DID is
+        lost. It is skipped by default until the gateway fix lands; BDD_INCLUDE_KNOWN_BUGS=1 runs it.
