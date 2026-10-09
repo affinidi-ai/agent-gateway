@@ -2478,6 +2478,7 @@ pub async fn run_axum_proxy(
 
             // Start DID cache maintenance task
             manager.start_cache_maintenance_task();
+            manager.start_account_watch_task();
 
             // Load cached DIDs from disk
             let did_cache = manager.get_did_cache();

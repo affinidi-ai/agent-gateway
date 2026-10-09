@@ -265,6 +265,8 @@ pub struct G2gWorld {
     pub response_status: Option<u16>,
     pub response_body: Option<Value>,
     pub response_content_type: Option<String>,
+    /// How long the caller waited for the last surface response.
+    pub response_elapsed: Option<std::time::Duration>,
     pub concurrent_requests: Vec<Value>,
     pub concurrent_responses: Vec<ConcurrentResponse>,
     pub fabric_forward_baseline: HashMap<usize, usize>,
@@ -308,6 +310,7 @@ impl G2gWorld {
             response_status: None,
             response_body: None,
             response_content_type: None,
+            response_elapsed: None,
             concurrent_requests: Vec::new(),
             concurrent_responses: Vec::new(),
             fabric_forward_baseline: HashMap::new(),

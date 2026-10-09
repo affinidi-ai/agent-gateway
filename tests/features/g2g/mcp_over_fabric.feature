@@ -130,6 +130,19 @@ Feature: MCP requests travel across gateways over fabric
     And MCP server "bravo" was not called
     And gateway 2 did not receive a fabric forward request
 
+  Scenario: A modern sender talking to a legacy-only receiver fails fast
+    Given a fabric with 2 gateways
+    And gateway 2 admits only MCP protocol version "2024-11-05" over Fabric
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller asks gateway 1 surface "charlie" for available MCP tools using protocol version "2026-07-28"
+    Then the response status is 400
+    And the MCP response is a JSON-RPC error with code -32022
+    And the MCP response id matches the request id
+    And the MCP unsupported-version error requests "2026-07-28" and supports only "2024-11-05"
+    And the response arrives in under 5 seconds
+    And MCP server "bravo" was not called
+
   Scenario: Source MCP tool policy does not gate a request without a method before fabric forwarding
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"

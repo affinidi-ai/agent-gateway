@@ -1357,18 +1357,25 @@ capabilities do not establish caller authorization.
 The listener answers a capability query only from a registered, active peer
 gateway, read from its in-memory gateway store; any other sender's query is
 dropped before it creates an offer, because the offer table is shared by every
-peer. An Open that preparation refuses, or that times out in admission, is
-answered with an `Error` frame when it comes from an active peer on this
-listener, so the sending gateway fails at once instead of waiting for its
-response deadline. Past 16 refusals awaiting an answer, further refusals go
-unanswered (see [Framed Fabric limits](#framed-fabric-limits)). The frame says why:
+peer. Each peer holds at most its share of the offer table, and the peers of
+one tenant theirs together, so one peer's queries cannot fill it.
+
+The listener admits an Open (the peer lookup and route resolution) off its
+reader loop, at most 16 at a time. Frames that arrive for the stream before its
+Open is admitted, at most 8, are held and delivered in order once it is
+admitted, or dropped when it is refused. An Open that admission refuses, or
+that times out in admission, is answered with an `Error` frame when it comes
+from an active peer on this listener, so the sending gateway fails at once
+instead of waiting for its response deadline. Past 16 refusals awaiting an
+answer, further refusals go unanswered (see
+[Framed Fabric limits](#framed-fabric-limits)). The frame says why:
 
 | Code | Refusal | Sender |
 | --- | --- | --- |
 | `stale_offer` | The Open names no live capability offer, for example after the receiver restarted or the offer expired | Drops its agreement, so the next request negotiates again |
 | `legacy_only` | Sent by an older peer whose surface does not admit modern MCP | Answers the caller as a legacy-only endpoint would: `400` / `-32022` listing `2024-11-05` |
-| `capacity_reached` | Not sent: a full framed-stream cap or Open replay table is refused with `unavailable`, because a 1.0.0 sender cannot parse this code and would wait for its response deadline | Keeps its agreement and answers `429` with `Retry-After: 5` |
-| `unavailable` | A full framed-stream cap or Open replay table, and anything else: route, exposure, tenant, size limits, envelope times, admission timeout | Keeps its agreement and answers `502` |
+| `capacity_reached` | A full framed-stream cap, a full Open replay table or the peer's or its tenant's share of it, the peer's Open rate, or a listener already admitting 16 Opens | Keeps its agreement and answers `429` with `Retry-After: 5`. A 1.0.0 sender cannot parse this code and waits for its response deadline instead |
+| `unavailable` | Anything else: route, exposure, tenant, size limits, envelope times, admission timeout | Keeps its agreement and answers `502` |
 | Any other code | Sent by a newer peer | Treated as `unavailable` |
 
 Only a stale offer makes the sender negotiate again, so a route the peer
@@ -1427,7 +1434,7 @@ record ends. The sending gateway gives a query a 300 s envelope lifetime.
 Current local bounds are 48 KiB per serialized frame, 16 KiB per decoded chunk,
 16 KiB of headers, a 1 MiB credit window and 64 outstanding frames. The registry
 allows 128 receiving and 128 sending stream registrations, with 8 request streams and 8 listens per peer and 16 of each per surface; replay records
-are additionally bounded, at 512 per allowed stream. See [Framed Fabric limits](#framed-fabric-limits). Capability negotiation intersects supported features
+are additionally bounded, at 512 per allowed stream, with a share per peer and per tenant. See [Framed Fabric limits](#framed-fabric-limits). Capability negotiation intersects supported features
 and byte limits. Both send and receive registrations retain that immutable
 agreement and check every frame against it; senders split at the smaller peer
 chunk limit. The DIDComm sender checks the actual encrypted payload against
@@ -1540,13 +1547,18 @@ process.
 
 | Limit | Value | Past it |
 |---|---|---|
-| Framed request streams per peer | 8, counted apart for streams a peer opened here and streams this gateway opened to it, across all surfaces | The stream is refused. On an Access Point and on a Transit Point, a full cap on the sending gateway gets the caller `429` with `Retry-After: 5` and a JSON-RPC error body (`-32603`); a full cap on the receiving gateway gets it `502`, as the receiver refuses with `unavailable` |
+| Framed request streams per peer | 8, counted apart for streams a peer opened here and streams this gateway opened to it, across all surfaces | The stream is refused. On an Access Point and on a Transit Point the caller gets `429` with `Retry-After: 5` and a JSON-RPC error body (`-32603`), whether the cap is full on the sending gateway or on the receiving one, which refuses with `capacity_reached` |
 | Framed listens per peer | 8 forwarded `subscriptions/listen` streams, counted apart from request streams | As above |
 | Framed streams per surface | 16 request streams and 16 listens inbound per local surface (shared by every peer); outbound counted per peer channel | As above |
 | Framed streams in total | 128 receiving and 128 sending registrations, inbound and outbound, request streams and listens together | As above |
 | Stream progress | `stream_idle_timeout_secs` (default 60 s) bounds an upload and the Credit and EndAck waits while frames are outstanding; a quiet subscription has nothing outstanding and is not affected | The stream ends |
-| Opens per peer | 50/s, burst 100, per listener | The Open is refused before any lookup |
+| Opens per peer | 50/s, burst 100, per listener | The Open is refused with `capacity_reached` before any lookup; the caller gets `429` |
+| Opens being admitted | 16 at a time per listener, off the listener's reader loop, each for up to 2 s | The Open is refused with `capacity_reached`; the caller gets `429` |
+| Frames held per Open being admitted | 8, from the Open's sender only | The admitted stream is dropped, and its caller waits for the response deadline |
+| Open replay records | 512 per allowed stream (65,536); one peer holds at most an eighth of them and the peers of one tenant half | The Open is refused with `capacity_reached`; the caller gets `429` |
 | Capability queries per sender | 10/s, burst 20, per listener | The query is dropped |
+| Capability offers held | 256; one peer holds at most 32 live offers and the peers of one tenant 128 | The query is not answered; the sender's caller gets `502` |
+| Capability probes in flight | 256 on the sending gateway; to one peer at most 32 and to the peers of one tenant 128 | The caller gets `429` with `Retry-After: 5` |
 | Refused Opens being answered | 16 at a time per listener, across all peers, off the listener's reader loop | Further refusals are not answered and are logged at `warn`; the sender waits for its response deadline and its caller gets `504` |
 | `subscriptions/listen` per caller | 16 (the authenticated principal, or the client IP or peer DID when unauthenticated) | `429` |
 | `subscriptions/listen` per surface | 256 across callers | `429` |
@@ -1558,7 +1570,7 @@ and the progress timeout does not end a quiet subscription. Listens therefore
 count against their own per-peer and per-surface caps, so a partner holding
 all eight of its listens still sends other modern requests. Two partners at
 eight listens each still fill a receiving surface's 16 listen slots, and
-further listens to that surface are refused with `502` until one ends. Because the per-peer
+further listens to that surface are refused with `429` until one ends. Because the per-peer
 cap applies first over Fabric, the 16-per-caller listen limit cannot be
 reached there. The receiver picks the budget from the Open's `Mcp-Method`
 header before the body arrives, so a paired peer that labels other requests
@@ -1576,14 +1588,19 @@ the peer.
 **Cap refusals are logged.** Each registration refused by a full cap is logged
 at `warn` as `Fabric stream cap reached`, with `peer_did`, `surface_id`,
 `kind` (`Request` or `Listen`), `direction`, and `cap`: `total`, `per_peer`,
-`per_surface`, or `open_replay` for a full Open replay table. The receiver's
-`Rejecting Fabric Open` warning also carries the sending peer's DID.
+`per_surface`, or `open_replay`, `open_replay_per_peer` and
+`open_replay_per_tenant` for the Open replay table and its shares. A full offer
+or probe table or share is logged at `warn` as `Fabric capability offer cap
+reached` or `Fabric capability probe cap reached`, with `cap`: `total`,
+`per_peer` or `per_tenant`. The receiver's `Rejecting Fabric Open` warning also
+carries the sending peer's DID.
 
 **Modern MCP is active on every MCP endpoint, so weigh shared state before
 exposing a multi-tenant or internet-facing gateway.** Gateway-wide tables and
 signals are shared across tenants and peers: appliance-wide access changes
-still end every subscription, the capability offer and Open replay tables have no per-peer or
-per-tenant caps, and there are no per-tenant limits. Prefer single-tenant or
+still end every subscription, and apart from the per-peer and per-tenant shares
+of the capability offer and probe tables and of the Open replay table, the
+limits are per caller, per peer or per surface. Prefer single-tenant or
 trusted deployments, or restrict who can reach MCP endpoints and which peers
 are paired, until these are scoped. See [Fabric: modern MCP activation](FABRIC.md#modern-mcp-activation).
 

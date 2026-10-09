@@ -103,6 +103,9 @@ pub struct GatewayPlan {
     pub surfaces: Vec<SurfaceSpec>,
     pub mock_responses: HashMap<String, serde_json::Value>,
     pub mock_response_delays: HashMap<String, (u64, u64)>,
+    /// Admits only legacy MCP on Fabric streams it receives, as a gateway
+    /// whose surfaces do not serve modern MCP does.
+    pub legacy_only_fabric_receive: bool,
 }
 
 impl GatewayPlan {
@@ -133,8 +136,7 @@ pub struct FabricRouteReadyProbe {
 pub struct MultiGatewayHarness {
     nodes: Vec<GatewayNode>,
     remote_views: HashMap<(usize, usize), GatewayRecord>,
-    #[allow(dead_code)]
-    pub mediator: Box<dyn Mediator>,
+    pub mediator: ScenarioDockerMediator,
 }
 
 impl MultiGatewayHarness {
@@ -146,12 +148,12 @@ impl MultiGatewayHarness {
             bail!("MultiGatewayHarness::spawn requires at least one gateway plan");
         }
 
-        let mediator: Box<dyn Mediator> = Box::new(ScenarioDockerMediator::start().await?);
+        let mediator = ScenarioDockerMediator::start().await?;
 
         let mut nodes = Vec::with_capacity(plans.len());
         for (offset, plan) in plans.into_iter().enumerate() {
             let index = offset + 1;
-            let node = spawn_node(&format!("g2g-gw{index}"), plan, &*mediator, index)
+            let node = spawn_node(&format!("g2g-gw{index}"), plan, &mediator, index)
                 .await
                 .with_context(|| format!("spawn gateway {index}"))?;
             nodes.push(node);
@@ -816,6 +818,9 @@ async fn spawn_node(
     let mut extra_env: HashMap<String, String> = HashMap::new();
     if let Some(allowlist) = mediator_egress_allowlist(mediator) {
         extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), allowlist);
+    }
+    if plan.legacy_only_fabric_receive {
+        extra_env.insert("AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY".to_string(), "true".to_string());
     }
     let mut gateway = GatewayProcess::start_g2g_with_env(&config_path, temp_dir.path(), &extra_env);
     gateway = gateway

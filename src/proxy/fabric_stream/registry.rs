@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::flow::{Credit, ReceiveWindow, SendCredit};
 use super::peer::StreamCapabilities;
+use super::share::{ShareLimit, ShareOwner, SharedTable};
 use super::wire::{FramePayload, StreamDirection, StreamErrorCode, StreamFrame, WireHeaders, decode_chunk};
 use crate::gateways::connection_points::messages::ReceivedMessage;
 
@@ -238,10 +239,32 @@ struct SendEntry {
 /// ordinary traffic.
 const OPEN_REPLAY_RECORDS_PER_STREAM: usize = 512;
 
+fn open_replay_cap(limit: ShareLimit) -> &'static str {
+    match limit {
+        ShareLimit::Total => "open_replay",
+        ShareLimit::Peer => "open_replay_per_peer",
+        ShareLimit::Tenant => "open_replay_per_tenant",
+    }
+}
+
+/// Frames a sender may send for a stream before its `Open` is admitted: the
+/// request chunk its initial window allows, and control frames.
+const MAX_HELD_FRAMES_PER_OPEN: usize = 8;
+
+/// Frames that arrived for a stream whose `Open` is still being admitted.
+struct HeldOpen {
+    peer_did: String,
+    frames: Vec<(ReceivedMessage, String, StreamFrame)>,
+    overflowed: bool,
+}
+
 pub(crate) struct ReceiveRegistry {
     entries: Mutex<HashMap<Uuid, Arc<ReceiveEntry>>>,
     senders: Mutex<HashMap<Uuid, Arc<SendEntry>>>,
-    opened: Mutex<HashMap<Uuid, tokio::time::Instant>>,
+    opened: Mutex<SharedTable<Uuid, tokio::time::Instant>>,
+    held: Mutex<HashMap<Uuid, HeldOpen>>,
+    /// Counts revocations, so a stream admitted while one ran can be refused.
+    revocations: std::sync::atomic::AtomicU64,
     limits: RegistryLimits,
 }
 
@@ -251,7 +274,13 @@ impl ReceiveRegistry {
         Ok(Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             senders: Mutex::new(HashMap::new()),
-            opened: Mutex::new(HashMap::new()),
+            opened: Mutex::new(SharedTable::new(
+                limits
+                    .max_streams
+                    .saturating_mul(OPEN_REPLAY_RECORDS_PER_STREAM),
+            )),
+            held: Mutex::new(HashMap::new()),
+            revocations: std::sync::atomic::AtomicU64::new(0),
             limits,
         }))
     }
@@ -274,12 +303,24 @@ impl ReceiveRegistry {
             deadline,
             deadline,
             &StreamCapabilities::local(true, true),
+            None,
         )
     }
 
-    /// Whether an `Open` for this stream was accepted and the stream is still
-    /// registered or the same `Open` could still be admitted.
+    /// Whether an `Open` for this stream is being admitted, or was accepted and
+    /// the stream is still registered or the same `Open` could still be
+    /// admitted.
     pub fn was_opened(
+        &self,
+        stream_id: &Uuid,
+    ) -> bool {
+        self.held
+            .lock()
+            .is_ok_and(|held| held.contains_key(stream_id))
+            || self.was_accepted(stream_id)
+    }
+
+    fn was_accepted(
         &self,
         stream_id: &Uuid,
     ) -> bool {
@@ -305,7 +346,8 @@ impl ReceiveRegistry {
     /// `Open` could still be admitted, the earlier of its envelope's and its
     /// capability offer's expiry, and the replay record lasts until then. A
     /// repeated `Open` of a stream still registered is refused by that
-    /// registration, however long the stream runs.
+    /// registration, however long the stream runs. The replay record counts
+    /// against the peer's and its tenant's (`tenant_id`) share of the records.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_capabilities(
         self: &Arc<Self>,
@@ -317,6 +359,7 @@ impl ReceiveRegistry {
         deadline: tokio::time::Instant,
         replayable_until: tokio::time::Instant,
         capabilities: &StreamCapabilities,
+        tenant_id: Option<String>,
     ) -> Result<(ReceiveLease, SendLease), RegisterError> {
         binding.validate(stream_id)?;
         let now = tokio::time::Instant::now();
@@ -336,19 +379,19 @@ impl ReceiveRegistry {
         {
             return Err("Fabric stream Open was already accepted".into());
         }
-        let capacity = self
-            .limits
-            .max_streams
-            .saturating_mul(OPEN_REPLAY_RECORDS_PER_STREAM);
-        if opened.len() >= capacity {
+        let owner = ShareOwner {
+            peer_did: binding.peer_did.clone(),
+            tenant_id,
+        };
+        if opened.admits(&owner).is_err() {
             opened.retain(|_, until| *until > now);
         }
-        if opened.len() >= capacity {
+        if let Err(limit) = opened.admits(&owner) {
             tracing::warn!(
                 peer_did = %binding.peer_did,
                 surface_id = %binding.surface_id,
                 ?kind,
-                cap = "open_replay",
+                cap = open_replay_cap(limit),
                 "Fabric stream cap reached"
             );
             return Err(RegisterError::CapacityReached("Fabric open replay-protection capacity reached"));
@@ -369,8 +412,64 @@ impl ReceiveRegistry {
             response_window,
             capabilities,
         )?;
-        opened.insert(stream_id, replayable_until);
+        opened
+            .insert(stream_id, owner, replayable_until)
+            .map_err(|_| RegisterError::CapacityReached("Fabric open replay-protection capacity reached"))?;
         Ok((receiver, sender))
+    }
+
+    /// Holds the frames that arrive for `stream_id` while its `Open` is
+    /// admitted off the reader loop, so they reach the stream in order once it
+    /// is registered. Only frames from `peer_did` are held.
+    pub fn hold(
+        &self,
+        stream_id: Uuid,
+        peer_did: &str,
+    ) -> Result<(), RegisterError> {
+        let mut held = self
+            .held
+            .lock()
+            .map_err(|_| "Fabric open registry is unavailable")?;
+        if held.contains_key(&stream_id) || self.was_accepted(&stream_id) {
+            return Err("Fabric stream Open was already accepted or is being admitted".into());
+        }
+        held.insert(
+            stream_id,
+            HeldOpen {
+                peer_did: peer_did.to_string(),
+                frames: Vec::new(),
+                overflowed: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Stops holding `stream_id`'s frames. When its `Open` was admitted, the
+    /// held frames are delivered in arrival order, ahead of any frame read
+    /// later; otherwise they are dropped. Fails when the sender sent more
+    /// frames than it may before admission, or a held frame is refused.
+    pub fn release(
+        &self,
+        stream_id: &Uuid,
+        admitted: bool,
+    ) -> Result<(), String> {
+        let mut held = self
+            .held
+            .lock()
+            .map_err(|_| "Fabric open registry is unavailable")?;
+        let Some(open) = held.remove(stream_id) else {
+            return Ok(());
+        };
+        if !admitted {
+            return Ok(());
+        }
+        if open.overflowed {
+            return Err("Fabric stream sent too many frames before its Open was admitted".to_string());
+        }
+        for (message, listener_instance_id, frame) in open.frames {
+            self.deliver_registered(&message, &listener_instance_id, frame)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -532,7 +631,36 @@ impl ReceiveRegistry {
         })
     }
 
+    /// Delivers a frame to its stream, or holds it while the stream's `Open`
+    /// is being admitted (see [`Self::hold`]).
     pub fn deliver(
+        &self,
+        message: &ReceivedMessage,
+        listener_instance_id: &str,
+        frame: StreamFrame,
+    ) -> Result<bool, String> {
+        {
+            let mut held = self
+                .held
+                .lock()
+                .map_err(|_| "Fabric open registry is unavailable")?;
+            if let Some(open) = held.get_mut(&frame.stream_id) {
+                if message.from_did.as_deref() != Some(open.peer_did.as_str()) {
+                    return Err("Fabric stream frame for an Open being admitted has another sender".to_string());
+                }
+                if open.frames.len() >= MAX_HELD_FRAMES_PER_OPEN {
+                    open.overflowed = true;
+                    return Err("Fabric stream sent too many frames before its Open was admitted".to_string());
+                }
+                open.frames
+                    .push((message.clone(), listener_instance_id.to_string(), frame));
+                return Ok(false);
+            }
+        }
+        self.deliver_registered(message, listener_instance_id, frame)
+    }
+
+    fn deliver_registered(
         &self,
         message: &ReceivedMessage,
         listener_instance_id: &str,
@@ -702,17 +830,38 @@ impl ReceiveRegistry {
         connection_point_id: &str,
         instance_id: &str,
     ) {
+        self.cancel_where(|binding, _| {
+            binding.connection_point_id == connection_point_id && binding.listener_instance_id == instance_id
+        });
+    }
+
+    /// Ends the running streams `revoked` matches, given each stream's binding
+    /// and whether a peer opened it here. The revocation is counted first, so
+    /// an `Open` admitted while it runs can tell (see [`Self::revocations`]).
+    pub fn revoke(
+        &self,
+        revoked: impl Fn(&StreamBinding, bool) -> bool,
+    ) {
+        self.revocations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.cancel_where(revoked);
+    }
+
+    /// How many revocations have run.
+    pub fn revocations(&self) -> u64 {
+        self.revocations
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Ends every registered stream `ends` matches, given its binding and
+    /// whether a peer opened it here, as `unavailable`.
+    fn cancel_where(
+        &self,
+        ends: impl Fn(&StreamBinding, bool) -> bool,
+    ) {
         if let Ok(mut senders) = self.senders.lock() {
             senders.retain(|_, entry| {
-                if entry
-                    .binding
-                    .connection_point_id
-                    != connection_point_id
-                    || entry
-                        .binding
-                        .listener_instance_id
-                        != instance_id
-                {
+                if !ends(&entry.binding, entry.direction == StreamDirection::Response) {
                     return true;
                 }
                 entry
@@ -723,15 +872,7 @@ impl ReceiveRegistry {
         }
         let Ok(mut entries) = self.entries.lock() else { return };
         entries.retain(|_, entry| {
-            if entry
-                .binding
-                .connection_point_id
-                != connection_point_id
-                || entry
-                    .binding
-                    .listener_instance_id
-                    != instance_id
-            {
+            if !ends(&entry.binding, entry.direction == StreamDirection::Request) {
                 return true;
             }
             if let Ok(mut state) = entry.state.lock() {
@@ -1129,6 +1270,7 @@ mod tests {
                     run,
                     offer_expires,
                     &capabilities,
+                    None,
                 )
                 .unwrap(),
         );
@@ -1144,7 +1286,8 @@ mod tests {
                     MAX_CHUNK_BYTES,
                     later,
                     later,
-                    &capabilities
+                    &capabilities,
+                    None
                 )
                 .is_err(),
             "a replayed Open is refused after its run ends while its offer is live"
@@ -1164,6 +1307,7 @@ mod tests {
                     short,
                     short,
                     &capabilities,
+                    None,
                 )
                 .unwrap(),
         );
@@ -1198,6 +1342,7 @@ mod tests {
                         now + std::time::Duration::from_secs(3600),
                         now + std::time::Duration::from_secs(300),
                         &capabilities,
+                        None,
                     )
                     .unwrap_or_else(|error| panic!("stream {stream}: {error}")),
             );
@@ -1220,6 +1365,7 @@ mod tests {
                 now + std::time::Duration::from_secs(3600),
                 now + std::time::Duration::from_millis(50),
                 &capabilities,
+                None,
             )
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1235,13 +1381,205 @@ mod tests {
                     MAX_CHUNK_BYTES,
                     later,
                     later,
-                    &capabilities
+                    &capabilities,
+                    None
                 )
                 .is_err(),
             "a repeated Open never replaces a live stream"
         );
         drop(leases);
         assert!(!registry.was_opened(&id), "the record ended with its admission window");
+    }
+
+    #[tokio::test]
+    async fn one_peer_or_tenant_cannot_fill_the_open_replay_table() {
+        let registry = ReceiveRegistry::new(RegistryLimits {
+            max_streams: 1,
+            max_peer_streams: 1,
+            max_surface_streams: 1,
+            max_peer_listens: 1,
+            max_surface_listens: 1,
+        })
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let open = |peer: &str, tenant: Option<&str>| {
+            let mut binding = binding();
+            binding.peer_did = format!("did:example:{peer}");
+            registry
+                .open_with_capabilities(
+                    Uuid::new_v4(),
+                    binding,
+                    StreamKind::Request,
+                    MAX_CHUNK_BYTES,
+                    MAX_CHUNK_BYTES,
+                    deadline,
+                    deadline,
+                    &StreamCapabilities::local(true, true),
+                    tenant.map(str::to_string),
+                )
+                .map(drop)
+        };
+        let full = Err(RegisterError::CapacityReached("Fabric open replay-protection capacity reached"));
+        let peer_share = OPEN_REPLAY_RECORDS_PER_STREAM / 8;
+
+        for _ in 0..peer_share {
+            assert_eq!(open("alpha", None), Ok(()));
+        }
+        assert_eq!(open("alpha", None), full, "a peer past its share is told to retry");
+        assert_eq!(open("bravo", None), Ok(()), "another peer is still admitted");
+
+        for peer in ["tenant-1", "tenant-2", "tenant-3", "tenant-4"] {
+            for _ in 0..peer_share {
+                assert_eq!(open(peer, Some("tenant")), Ok(()));
+            }
+        }
+        assert_eq!(open("tenant-5", Some("tenant")), full, "the tenant's peers hold at most half");
+        assert_eq!(open("other-1", Some("other")), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn frames_sent_before_admission_reach_the_stream_in_order_once_it_is_admitted() {
+        let registry = registry();
+        let id = Uuid::new_v4();
+        let data = |sequence: u64, offset: u64, chunk: &[u8]| StreamFrame {
+            stream_id: id,
+            payload: FramePayload::RequestData {
+                sequence,
+                offset,
+                data: encode_chunk(chunk).unwrap(),
+            },
+        };
+        registry
+            .hold(id, "did:example:peer")
+            .unwrap();
+        assert!(registry.was_opened(&id), "an Open being admitted is not answered as refused");
+        assert!(
+            registry
+                .hold(id, "did:example:peer")
+                .is_err(),
+            "a repeated Open of a stream being admitted"
+        );
+        assert_eq!(registry.deliver(&message(id), "instance", data(0, 0, b"one")), Ok(false));
+        let mut forged = message(id);
+        forged.from_did = Some("did:example:other".into());
+        assert!(
+            registry
+                .deliver(&forged, "instance", data(1, 3, b"forged"))
+                .is_err(),
+            "only frames from the Open's sender are held"
+        );
+        assert_eq!(registry.deliver(&message(id), "instance", data(1, 3, b"two")), Ok(false));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let (mut receiver, _sender) = registry
+            .open(id, binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
+            .unwrap();
+        registry
+            .release(&id, true)
+            .unwrap();
+        for expected in [b"one".as_slice(), b"two".as_slice()] {
+            match receiver.next().await {
+                Ok(ReceiveEvent::Data { bytes, .. }) => assert_eq!(bytes.as_ref(), expected),
+                other => panic!("expected held data, got {other:?}"),
+            }
+        }
+        assert!(registry.was_opened(&id));
+    }
+
+    #[tokio::test]
+    async fn held_frames_are_bounded_and_dropped_when_the_open_is_refused() {
+        let registry = registry();
+        let frame = |id: Uuid| StreamFrame {
+            stream_id: id,
+            payload: FramePayload::RequestData {
+                sequence: 0,
+                offset: 0,
+                data: encode_chunk(b"held").unwrap(),
+            },
+        };
+
+        let refused = Uuid::new_v4();
+        registry
+            .hold(refused, "did:example:peer")
+            .unwrap();
+        assert_eq!(registry.deliver(&message(refused), "instance", frame(refused)), Ok(false));
+        registry
+            .release(&refused, false)
+            .unwrap();
+        assert!(!registry.was_opened(&refused), "a refused Open can be answered");
+        assert_eq!(
+            registry.deliver(&message(refused), "instance", frame(refused)),
+            Ok(false),
+            "later frames find no stream"
+        );
+
+        let flooded = Uuid::new_v4();
+        registry
+            .hold(flooded, "did:example:peer")
+            .unwrap();
+        for _ in 0..MAX_HELD_FRAMES_PER_OPEN {
+            assert_eq!(registry.deliver(&message(flooded), "instance", frame(flooded)), Ok(false));
+        }
+        assert!(
+            registry
+                .deliver(&message(flooded), "instance", frame(flooded))
+                .is_err()
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let _leases = registry
+            .open(flooded, binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
+            .unwrap();
+        assert!(
+            registry
+                .release(&flooded, true)
+                .is_err(),
+            "a sender past the held frames is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revocation_ends_only_the_streams_it_matches_and_is_counted() {
+        let registry = registry();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut revoked_peer = binding();
+        revoked_peer.peer_did = "did:example:revoked".into();
+        let (revoked_receiver, revoked_sender) = registry
+            .open(Uuid::new_v4(), revoked_peer, MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
+            .unwrap();
+        let (kept_receiver, kept_sender) = registry
+            .open(Uuid::new_v4(), binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
+            .unwrap();
+        let before = registry.revocations();
+
+        registry.revoke(|binding, inbound| inbound && binding.peer_did == "did:example:revoked");
+
+        assert_eq!(registry.revocations(), before + 1);
+        assert_eq!(
+            *revoked_receiver
+                .closed()
+                .borrow(),
+            Some(StreamErrorCode::Unavailable)
+        );
+        assert_eq!(
+            *revoked_sender
+                .credit()
+                .cancellation()
+                .borrow(),
+            Some(StreamErrorCode::Unavailable)
+        );
+        assert_eq!(
+            *kept_receiver
+                .closed()
+                .borrow(),
+            None
+        );
+        assert_eq!(
+            *kept_sender
+                .credit()
+                .cancellation()
+                .borrow(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1261,10 +1599,12 @@ mod tests {
                 .open(id, binding(), MAX_CHUNK_BYTES, 0, deadline)
                 .is_err()
         );
-        for _ in 0..OPEN_REPLAY_RECORDS_PER_STREAM {
+        for record in 0..OPEN_REPLAY_RECORDS_PER_STREAM {
+            let mut peer = binding();
+            peer.peer_did = format!("did:example:peer-{}", record % 16);
             drop(
                 registry
-                    .open(Uuid::new_v4(), binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
+                    .open(Uuid::new_v4(), peer, MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
                     .unwrap(),
             );
         }
@@ -1960,6 +2300,7 @@ mod tests {
                 deadline,
                 deadline,
                 &StreamCapabilities::local(true, true),
+                None,
             )
             .unwrap();
         assert!(matches!(

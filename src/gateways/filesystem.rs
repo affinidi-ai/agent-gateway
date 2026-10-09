@@ -77,14 +77,43 @@ impl FileSystemGatewayStore {
     }
 }
 
+impl FileSystemGatewayStore {
+    /// Saves `gateway` and ends the running Fabric streams the change revokes.
+    /// When the previous record cannot be read, every stream with the peer
+    /// ends.
+    async fn save_and_revoke(
+        &self,
+        gateway: &Gateway,
+    ) -> Result<()> {
+        let previous = self
+            .storage
+            .get(&gateway.id)
+            .await;
+        self.storage
+            .save(gateway)
+            .await?;
+        match &previous {
+            Ok(Some(previous)) => {
+                if let Some(revocation) =
+                    crate::proxy::fabric_stream::Revocation::of_gateway_change(previous, Some(gateway))
+                {
+                    crate::proxy::fabric_stream::revoke(revocation);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => crate::proxy::fabric_stream::revoke(crate::proxy::fabric_stream::Revocation::Peer(&gateway.did)),
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl GatewayStore for FileSystemGatewayStore {
     async fn create(
         &self,
         gateway: &Gateway,
     ) -> Result<()> {
-        self.storage
-            .save(gateway)
+        self.save_and_revoke(gateway)
             .await
     }
 
@@ -116,16 +145,23 @@ impl GatewayStore for FileSystemGatewayStore {
         &self,
         id: &str,
     ) -> Result<()> {
-        self.storage.delete(id).await
+        let previous = self.storage.get(id).await;
+        self.storage
+            .delete(id)
+            .await?;
+        if let Ok(Some(previous)) = &previous
+            && let Some(revocation) = crate::proxy::fabric_stream::Revocation::of_gateway_change(previous, None)
+        {
+            crate::proxy::fabric_stream::revoke(revocation);
+        }
+        Ok(())
     }
 
     async fn update(
         &self,
         gateway: &Gateway,
     ) -> Result<()> {
-        // Update is the same as create for filesystem implementation
-        self.storage
-            .save(gateway)
+        self.save_and_revoke(gateway)
             .await
     }
 }
