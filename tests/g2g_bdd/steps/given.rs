@@ -111,6 +111,11 @@ fn build_mcp_tools_call_response() -> Value {
     })
 }
 
+#[given(expr = "gateway 1 and gateway 2 have just been paired")]
+pub async fn gateways_have_just_been_paired(world: &mut G2gWorld) {
+    a_fabric_with_n_gateways(world, 2).await;
+}
+
 #[given(regex = r"^a fabric with (\d+) gateways?$")]
 pub async fn a_fabric_with_n_gateways(
     world: &mut G2gWorld,
@@ -428,7 +433,7 @@ pub async fn transit_point_derives_outbound_managed_agent_identity_from_mapped_m
 }
 
 #[given(
-    regex = r#"^gateway (\d+) has an (A2A|MCP) surface "([^"]+)" forwarding over fabric to gateway (\d+) surface "([^"]+)"$"#
+    regex = r#"^gateway (\d+) has an (A2A|MCP) surface "([^"]+)" forwarding over fabric to gateway (\d+) surface "([^"]+)"( that is not exposed to it)?$"#
 )]
 pub async fn gateway_has_fabric_surface(
     world: &mut G2gWorld,
@@ -437,6 +442,7 @@ pub async fn gateway_has_fabric_surface(
     surface_name: String,
     peer_gw: usize,
     peer_surface_name: String,
+    not_exposed: String,
 ) {
     let protocol = protocol_label.to_lowercase();
     let surface_id = surface_name.clone();
@@ -462,6 +468,7 @@ pub async fn gateway_has_fabric_surface(
             from_surface: surface_id.clone(),
             to_gw: peer_gw,
             to_surface: peer_surface_id,
+            exposed: not_exposed.is_empty(),
         });
     world
         .topology

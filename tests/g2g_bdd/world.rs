@@ -32,6 +32,8 @@ pub struct FabricLink {
     pub from_surface: String,
     pub to_gw: usize,
     pub to_surface: String,
+    /// Whether `to_gw` exposes `to_surface` to `from_gw`.
+    pub exposed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +117,9 @@ pub(crate) fn fabric_route_probe(
     link: &FabricLink,
     stage: FabricRouteProbeStage,
 ) -> Option<FabricRouteReadyProbe> {
+    if !link.exposed {
+        return None;
+    }
     let expected_stage = fabric_route_probe_stage(topology, link)?;
     if expected_stage != stage {
         return None;
@@ -362,7 +367,7 @@ impl G2gWorld {
 
         for link in &self.topology.fabric_links {
             harness
-                .point_surface_at_peer(link.from_gw, &link.from_surface, link.to_gw, &link.to_surface)
+                .point_surface_at_peer(link.from_gw, &link.from_surface, link.to_gw, &link.to_surface, link.exposed)
                 .await
                 .expect("wire fabric link");
         }

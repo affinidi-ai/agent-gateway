@@ -339,7 +339,22 @@ seeded survives.
 Full loading rules are in
 [`config/examples/agent_surface_templates/README.md`](../config/examples/agent_surface_templates/README.md).
 
-## Related
+## Remote gateway records
+
+Gateway records live in `_storage/gateways/`, not in a configuration file, and are managed
+through `/v1/gateways`. Two fields of a Remote record decide which local surfaces that peer
+reaches over Fabric:
+
+| Field | Values | Behaviour |
+| --- | --- | --- |
+| `exposure_mode` | `all`, `none`, `list` | `none` for every newly paired peer. A record without the field is migrated on boot: an empty list becomes `all`, a non-empty list `list`. |
+| `exposed_channels` | Surface ids | Used only in `list` mode. An empty list in `list` mode reaches nothing. |
+
+A manual edit is picked up as described in
+[`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). See
+[`FABRIC.md`](FABRIC.md#peer-exposure).
+
+
 
 - [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md): what a reload does and does not re-read.
 - [`config/examples/README.md`](../config/examples/README.md): the example files and their roles.

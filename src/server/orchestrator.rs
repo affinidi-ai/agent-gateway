@@ -1556,6 +1556,14 @@ pub async fn run_axum_proxy(
             .await
             {
                 Ok(store) => {
+                    match store
+                        .migrate_exposure_modes()
+                        .await
+                    {
+                        Ok(0) => {}
+                        Ok(n) => info!("Migrated the exposure mode of {n} remote gateway(s)"),
+                        Err(e) => warn!("Failed to migrate remote gateway exposure modes: {}", e),
+                    }
                     info!("Gateway store initialized");
                     Some(Arc::new(store))
                 }

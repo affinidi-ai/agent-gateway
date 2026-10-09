@@ -180,12 +180,7 @@ impl StreamRuntime {
                 && !connection_point
                     .exposed_channels
                     .contains(&request.channel_id))
-            || (!peer
-                .exposed_channels
-                .is_empty()
-                && !peer
-                    .exposed_channels
-                    .contains(&request.channel_id))
+            || !peer.exposes_surface(&request.channel_id)
         {
             return Err("Fabric stream peer or route is unavailable".into());
         }
@@ -853,7 +848,8 @@ mod tests {
             String::new(),
         );
         connection.id = "cp".into();
-        let peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
+        let mut peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
+        peer.exposure_mode = Some(crate::gateways::types::ExposureMode::All);
         let mut paired = peer.clone();
         paired.issuer_did = Some("did:example:peer-gateway".into());
         let _paired_dir =
@@ -1054,6 +1050,7 @@ mod tests {
             "peer-disabled",
             "peer-local",
             "peer-exposure",
+            "peer-exposure-none",
             "peer-did",
             "missing-offer",
             "past-deadline",
@@ -1073,7 +1070,11 @@ mod tests {
                 "connection-exposure" => invalid_connection.exposed_channels = vec!["other".into()],
                 "peer-disabled" => invalid_peer.status = crate::gateways::types::GatewayStatus::Disabled,
                 "peer-local" => invalid_peer.gateway_type = GatewayType::SelfGateway,
-                "peer-exposure" => invalid_peer.exposed_channels = vec!["other".into()],
+                "peer-exposure" => {
+                    invalid_peer.exposure_mode = Some(crate::gateways::types::ExposureMode::List);
+                    invalid_peer.exposed_channels = vec!["other".into()];
+                }
+                "peer-exposure-none" => invalid_peer.exposure_mode = Some(crate::gateways::types::ExposureMode::None),
                 "peer-did" => invalid_peer.did = "did:example:other".into(),
                 "missing-offer" => request["capability_nonce"] = json!(Uuid::new_v4()),
                 "past-deadline" => request["deadline_ms"] = json!(1),
@@ -1242,7 +1243,7 @@ mod tests {
             );
         }
         // A tenant-owned peer reaches its own tenant's and appliance-wide
-        // surfaces, never another tenant's, even with empty exposure lists.
+        // surfaces, never another tenant's, even in `all` mode.
         let mut tenant_surface = surface.clone();
         tenant_surface.tenant_id = Some("tenant-a".into());
         store
@@ -2034,7 +2035,8 @@ mod tests {
                 String::new(),
             );
             connection.id = "cp".into();
-            let peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
+            let mut peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
+            peer.exposure_mode = Some(crate::gateways::types::ExposureMode::All);
             let mut paired = peer.clone();
             paired.issuer_did = Some("did:example:peer-gateway".into());
             let paired_dir =

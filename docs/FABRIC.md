@@ -206,6 +206,32 @@ receives would stay unreachable.
 When the appliance is Standby, fabric and trust listeners are inactive and the node reports not
 ready. Periodic cache refresh keeps supported cached stores current on a Standby node.
 
+## Peer exposure
+
+Each Remote gateway record carries an exposure mode that decides which local surfaces that peer
+reaches over Fabric ([`Gateway::exposes_surface`](../src/gateways/types.rs)):
+
+| `exposure_mode` | The peer reaches |
+| --- | --- |
+| `none` | No surface. Every newly paired peer starts here, on every pairing path, including the inbound handshake. |
+| `list` | Only the surface ids in `exposed_channels`. An empty list reaches nothing. |
+| `all` | Every active surface. |
+
+The same check applies to buffered `forward-request` traffic, framed-stream Opens, and the
+`get-channels` capability query, which lists only the surfaces the sender may reach. The tenant rule
+applies on top of every mode.
+
+Records written before the mode existed have no `exposure_mode`. On boot,
+[`migrate_exposure_modes`](../src/gateways/filesystem.rs) persists `all` for a record with an empty
+list (its earlier meaning) and `list` for a record with a non-empty one, so existing peers keep their
+access. Until a record is migrated, it is read with that same earlier meaning, never with more access.
+
+Set the mode with `PUT /v1/gateways/{id}/exposed-surfaces` (`gateways.edit`), body
+`{"exposure_mode": "list", "exposed_channels": ["surface-id"]}`. The list is stored only in `list`
+mode. A body without `exposure_mode` selects `list` for a non-empty list and `none` for an empty
+one, so an empty list never means every surface. The dashboard sets it on the **Publishing** tab of
+a remote gateway.
+
 ## Fabric receive pipeline
 
 [`process_forward_request`](../src/gateways/connection_points/message_processor.rs) handles a G2G
@@ -213,15 +239,16 @@ request received by the destination gateway:
 
 1. Decrypt and authenticate the DIDComm envelope.
 2. Authorize the sender and admit the envelope once. The sender's Connection Point DID must belong
-   to an active paired Remote gateway record that exposes the requested surface (403 otherwise). An
-   empty exposure list exposes every active surface the peer may reach, and a newly paired peer
-   starts with an empty list, so set an explicit list to restrict what a peer can reach. Tenancy
-   narrows that further: an appliance-wide peer, which includes every peer that arrived through the
-   inbound handshake, may reach every surface, while a tenant-owned peer reaches only surfaces of
-   its own tenant and appliance-wide surfaces, whatever its exposure list says
+   to an active paired Remote gateway record that exposes the requested surface (403 otherwise).
+   See [Peer exposure](#peer-exposure). Tenancy narrows that further: an appliance-wide peer, which
+   includes every peer that arrived through the inbound handshake, may reach every surface its mode
+   allows, while a tenant-owned peer reaches only surfaces of its own tenant and appliance-wide
+   surfaces, whatever its exposure mode says
    ([`fabric_peer_may_reach_surface`](../src/gateways/connection_points/message_processor.rs)). A
-   framed stream also checks the receiving Connection Point's exposure list and the tenant rule the
-   same way. The envelope is then checked by
+   framed stream Open checks the same peer exposure and tenant rule, and also the receiving
+   Connection Point's exposure list. A refused Open is answered with the `unavailable` stream error
+   code, which 1.0.0 senders can parse, so a modern MCP caller sees `502` rather than `403`. The
+   envelope is then checked by
    [`envelope_replay.rs`](../src/gateways/connection_points/envelope_replay.rs): its DIDComm
    `expires_time` must be present, in the future and at most one hour ahead, its `created_time`
    (when present) at most 120 s in the future, and its `(sender DID, message id)` pair not processed
