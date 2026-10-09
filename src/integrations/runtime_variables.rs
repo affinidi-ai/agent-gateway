@@ -12,6 +12,37 @@ static CUSTOM_VARIABLE_PREFIX: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("
 /// Cached compiled regex for variable substitution
 static VAR_REGEX: Lazy<RwLock<Regex>> = Lazy::new(|| RwLock::new(Regex::new(r"\$\{([^:}]+)(?::[^}]+)?\}").unwrap()));
 
+/// Variable filled only from the Appliance ID set in System Settings.
+pub const APPLIANCE_ID_VARIABLE: &str = "APPLIANCE_ID";
+
+/// The Appliance ID set in System Settings, if any.
+fn configured_appliance_id() -> Option<String> {
+    crate::storage::settings_store::global_appliance_id_override()
+}
+
+/// The value that fills `name` in a template. `${APPLIANCE_ID}` comes only
+/// from the appliance's settings, never from event or caller values, so no
+/// trigger can make an event look like it came from another appliance; while
+/// no Appliance ID is set it stays unfilled.
+pub fn variable_value(
+    name: &str,
+    values: &HashMap<String, String>,
+) -> Option<String> {
+    variable_value_with(name, values, configured_appliance_id)
+}
+
+fn variable_value_with(
+    name: &str,
+    values: &HashMap<String, String>,
+    appliance_id: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if name == APPLIANCE_ID_VARIABLE {
+        appliance_id()
+    } else {
+        values.get(name).cloned()
+    }
+}
+
 /// Update the variable patterns from config (called during startup)
 pub fn set_variable_patterns(
     variable_pattern: String,
@@ -76,7 +107,16 @@ static RUNTIME_VARIABLES: Lazy<RuntimeVariablesResponse> = Lazy::new(|| RuntimeV
 
 /// Get all runtime variable definitions
 pub fn get_runtime_variables() -> RuntimeVariablesResponse {
-    RUNTIME_VARIABLES.clone()
+    let mut response = RUNTIME_VARIABLES.clone();
+    if let Some(appliance_id) = response
+        .categories
+        .iter_mut()
+        .flat_map(|c| c.variables.iter_mut())
+        .find(|v| v.name == APPLIANCE_ID_VARIABLE)
+    {
+        appliance_id.example = configured_appliance_id().unwrap_or_else(|| "${APPLIANCE_ID}".to_string());
+    }
+    response
 }
 
 fn get_general_variables() -> RuntimeVariableCategory {
@@ -85,6 +125,13 @@ fn get_general_variables() -> RuntimeVariableCategory {
         label: "General".to_string(),
         description: "Variables available to all integrations regardless of context".to_string(),
         variables: vec![
+            RuntimeVariable {
+                name: APPLIANCE_ID_VARIABLE.to_string(),
+                label: "Appliance ID".to_string(),
+                description: "Appliance ID set in System Settings (e.g. this appliance's id in Agent Watch), filled on every delivery; left unfilled while none is set".to_string(),
+                example: "${APPLIANCE_ID}".to_string(),
+                category: "general".to_string(),
+            },
             RuntimeVariable {
                 name: "OLD_STATE".to_string(),
                 label: "Old State".to_string(),
@@ -819,9 +866,9 @@ pub fn substitute_variables(
         let placeholder = &cap[0];
 
         if is_variable_allowed(var_name, allowed_variables.as_deref(), &custom_prefix)
-            && let Some(value) = values.get(var_name)
+            && let Some(value) = variable_value(var_name, values)
         {
-            replacements.push((placeholder.to_string(), value.clone()));
+            replacements.push((placeholder.to_string(), value));
         }
     }
 
@@ -955,6 +1002,44 @@ mod tests {
         let result = substitute_variables(template, Some("user"), &values);
 
         assert_eq!(result, "User user_123 (john.doe) has email john@example.com");
+    }
+
+    #[test]
+    fn appliance_id_is_a_general_variable_for_every_category() {
+        assert!(get_variable_names_for_category("general").contains(&APPLIANCE_ID_VARIABLE.to_string()));
+        assert!(get_variable_names_for_category("audit").contains(&APPLIANCE_ID_VARIABLE.to_string()));
+        assert!(validate_template_variables("${APPLIANCE_ID}", "user").is_empty());
+    }
+
+    #[test]
+    fn appliance_id_comes_only_from_the_configured_id() {
+        let mut values = HashMap::new();
+        values.insert(APPLIANCE_ID_VARIABLE.to_string(), "forged-appliance".to_string());
+        values.insert("EVENT_TYPE".to_string(), "user.created".to_string());
+
+        assert_eq!(
+            variable_value_with(APPLIANCE_ID_VARIABLE, &values, || Some("aw-appliance-42".to_string())),
+            Some("aw-appliance-42".to_string())
+        );
+        assert_eq!(variable_value_with(APPLIANCE_ID_VARIABLE, &values, || None), None);
+        assert_eq!(
+            variable_value_with("EVENT_TYPE", &values, || Some("aw-appliance-42".to_string())),
+            Some("user.created".to_string())
+        );
+    }
+
+    #[test]
+    fn unset_appliance_id_stays_unfilled_even_when_a_value_is_supplied() {
+        let mut values = HashMap::new();
+        values.insert(APPLIANCE_ID_VARIABLE.to_string(), "forged-appliance".to_string());
+        values.insert("EVENT_TYPE".to_string(), "user.created".to_string());
+
+        let text = substitute_variables("${APPLIANCE_ID} sent ${EVENT_TYPE}", Some("user"), &values);
+        assert_eq!(text, "${APPLIANCE_ID} sent user.created");
+
+        let json =
+            substitute_variables_in_json(&serde_json::json!({ "appliance_id": "${APPLIANCE_ID}" }), None, &values);
+        assert_eq!(json, serde_json::json!({ "appliance_id": "${APPLIANCE_ID}" }));
     }
 
     #[test]

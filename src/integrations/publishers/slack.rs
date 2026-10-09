@@ -10,6 +10,22 @@ use crate::storage::Integration;
 
 pub struct SlackPublisher;
 
+/// Escapes Slack's mrkdwn control characters in variable values so caller-supplied text
+/// cannot form mentions such as `<!channel>` or disguised links. The admin-written
+/// template is left as is.
+fn escape_mrkdwn_values(variables: &HashMap<String, String>) -> HashMap<String, String> {
+    variables
+        .iter()
+        .map(|(name, value)| {
+            let escaped = value
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            (name.clone(), escaped)
+        })
+        .collect()
+}
+
 #[async_trait]
 impl IntegrationPublisher for SlackPublisher {
     fn name(&self) -> &str {
@@ -69,7 +85,7 @@ impl IntegrationPublisher for SlackPublisher {
             integration
                 .category
                 .as_deref(),
-            variables,
+            &escape_mrkdwn_values(variables),
         );
 
         let bot_name = integration
@@ -157,7 +173,7 @@ impl IntegrationPublisher for SlackPublisher {
             .and_then(|v| v.as_str())
             .unwrap_or("This is a test message from the integration system.");
 
-        let text = substitute_variables(text_template, None, variables);
+        let text = substitute_variables(text_template, None, &escape_mrkdwn_values(variables));
 
         let bot_name = content
             .get("bot_name")
@@ -294,6 +310,34 @@ mod tests {
     fn validate_config_rejects_missing_url() {
         let result = publisher().validate_config(&serde_json::json!({}));
         assert!(result.is_err(), "should reject missing webhook_url");
+    }
+
+    #[test]
+    fn escape_mrkdwn_values_escapes_mentions_and_links_in_values_only() {
+        let variables = HashMap::from([(
+            "AUDIT_PRINCIPAL_NAME".to_string(),
+            "<!channel> <https://evil.example|Re-verify admin> & co".to_string(),
+        )]);
+
+        let text = substitute_variables(
+            "<https://gateway.example|Audit>: ${AUDIT_PRINCIPAL_NAME}",
+            None,
+            &escape_mrkdwn_values(&variables),
+        );
+
+        assert_eq!(
+            text,
+            "<https://gateway.example|Audit>: &lt;!channel&gt; &lt;https://evil.example|Re-verify admin&gt; &amp; co"
+        );
+    }
+
+    #[test]
+    fn escape_mrkdwn_values_leaves_plain_values_unchanged() {
+        let variables = HashMap::from([("AUDIT_PRINCIPAL_EMAIL".to_string(), "alice@example.com".to_string())]);
+
+        let escaped = escape_mrkdwn_values(&variables);
+
+        assert_eq!(escaped["AUDIT_PRINCIPAL_EMAIL"], "alice@example.com");
     }
 
     #[test]

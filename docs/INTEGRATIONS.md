@@ -47,8 +47,8 @@ configured destination.
 
 An integration with the category `general` serves every resource type. An integration with
 the category `audit` is a Governance Audit integration: it receives every record the audit
-log writes, must be a `stream` or `webhook` integration, cannot belong to a tenant, and
-never receives resource events. See
+log writes, may be of any type (Email and Slack send one message per record), cannot
+belong to a tenant, and never receives resource events. See
 [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
 ## Publishers
@@ -62,6 +62,10 @@ never receives resource events. See
 
 All four stream platforms are compiled into the binary; which one is used is a matter of
 configuration.
+
+Slack messages are sent as mrkdwn. Variable values have `&`, `<`, and `>` escaped before
+substitution, so caller-supplied text such as a JWT `name` claim cannot produce mentions
+(`<!channel>`) or links. The admin-written template is not escaped.
 
 ## Events
 
@@ -100,10 +104,12 @@ two of them, and on every event for the third.
 
 ## Template variables
 
-Every event provides four variables, plus the resource's own.
+Every event provides four variables, plus the resource's own. `APPLIANCE_ID` is available
+to every category too.
 
 | Variable | Value |
 | --- | --- |
+| `APPLIANCE_ID` | The **Appliance ID** set in Settings › System Settings (`appliance_id` in `settings.json`), such as the appliance's id in Agent Watch. It never comes from event or trigger values, is never the appliance DID, and is unrelated to any Kafka topic name. While unset, `${APPLIANCE_ID}` is left unfilled. |
 | `EVENT_TYPE` | For example `gateway.created` |
 | `TIMESTAMP` | RFC 3339 |
 | `NEW_STATE` | The resource after the change, as JSON. Empty for a delete. |

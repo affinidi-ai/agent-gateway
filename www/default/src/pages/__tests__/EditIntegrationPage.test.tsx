@@ -59,7 +59,7 @@ const RUNTIME_VARIABLES = {
       category: 'general',
       label: 'General',
       description: 'General',
-      variables: ['EVENT_TYPE', 'TIMESTAMP'].map(name => variable(name, 'general')),
+      variables: ['APPLIANCE_ID', 'EVENT_TYPE', 'TIMESTAMP'].map(name => variable(name, 'general')),
     },
     {
       category: 'audit',
@@ -149,7 +149,13 @@ describe('EditIntegrationPage governance audit', () => {
   });
 
   it('moves a webhook stored with the untouched sample into the audit template', async () => {
-    const storedSample = { timestamp: '${TIMESTAMP}', event_type: '${EVENT_TYPE}' }; // eslint-disable-line no-template-curly-in-string
+    /* eslint-disable no-template-curly-in-string */
+    const storedSample = {
+      appliance_id: '${APPLIANCE_ID}',
+      timestamp: '${TIMESTAMP}',
+      event_type: '${EVENT_TYPE}',
+    };
+    /* eslint-enable no-template-curly-in-string */
     renderEditor({
       ...STREAM_INTEGRATION,
       type: 'webhook',

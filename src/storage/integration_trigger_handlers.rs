@@ -39,8 +39,8 @@ fn substitute_variables(
         let var_name = cap[1].trim();
         let placeholder = &cap[0];
 
-        if let Some(value) = variables.get(var_name) {
-            result = result.replace(placeholder, value);
+        if let Some(value) = crate::integrations::runtime_variables::variable_value(var_name, variables) {
+            result = result.replace(placeholder, &value);
         }
     }
 

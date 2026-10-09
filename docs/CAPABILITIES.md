@@ -353,7 +353,7 @@ enabled in the dashboard, where you choose to record policy decisions, trust che
 identity events.
 
 Each record can also be forwarded as it is written to a Kafka, Kinesis, Pulsar, or Redis
-stream, or a webhook, so a copy is kept outside the appliance. Forwarding is best-effort. See
+stream, a webhook, email, or Slack, so a copy is kept outside the appliance. Forwarding is best-effort. See
 [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
 ![The Audit page listing two denied requests, each showing the policy version and content hash that decided it, with the event details panel open](assets/diagrams/screenshot-audit-policy-decision.jpg)

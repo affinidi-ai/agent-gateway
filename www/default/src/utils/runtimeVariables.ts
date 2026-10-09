@@ -143,6 +143,14 @@ function getFallbackRuntimeVariables(): RuntimeVariablesResponse {
         description: 'Variables available to all integrations regardless of category',
         variables: [
           {
+            name: 'APPLIANCE_ID',
+            label: 'Appliance ID',
+            description:
+              'Appliance ID set in System Settings, filled on every delivery; unfilled while none is set',
+            example: '$APPLIANCE_ID',
+            category: 'general',
+          },
+          {
             name: 'TIMESTAMP',
             label: 'Timestamp',
             description: 'Current timestamp in ISO 8601 format',
