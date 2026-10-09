@@ -295,15 +295,16 @@ peer opts in with `fabric_delegated_credentials: true`: on the Target for Access
 on the Transit Point for agent-initiated traffic. The setting is off by default, including on
 surfaces saved before it existed, and no migration turns it on. With it off, the sending gateway
 still strips the caller's own token and sends the peer no delegated credential, whatever the
-request's MCP revision.
+request's protocol or MCP revision.
 
 With it on, the access token crosses as it would to a local destination, injected as the
 binding's `inject_as` says (a header or a `_meta` field); the refresh token never crosses. On the
 Target, only modern (`2026-07-28`) MCP requests carry it: the sending gateway strips the caller's
 own token, applies the delegated credential, and sends it inside the authcrypt framed stream.
-Legacy Access Point requests never carry it. On a Transit Point, both modern requests and legacy
-`_meta` injection carry it. The receiving gateway, and its Target, can use that access token until
-it expires.
+Legacy MCP and A2A Access Point requests never carry it. On a Transit Point the setting applies to
+every protocol: modern MCP requests, legacy MCP `_meta` injection, and header injection on any
+request, including A2A. The receiving gateway, and its Target, can use that access token until it
+expires.
 
 The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without
