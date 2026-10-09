@@ -13,7 +13,9 @@ use super::filesystem::SurfaceTemplateStore;
 use super::types::{CreateSurfaceTemplate, SurfaceTemplate};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::identity::state::IdentityApiState;
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+};
 
 /// Application error type for surface template handlers.
 #[derive(Debug)]
@@ -95,6 +97,22 @@ fn template_allowed(
         )
 }
 
+/// May this caller change or delete the template? Requires [`can_mutate`]
+/// ownership and a resource scope that matches the template id.
+fn template_writable(
+    template: &SurfaceTemplate,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> bool {
+    can_mutate(template.tenant_id.as_deref(), tenant_context(context))
+        && scope_allows_resource(
+            resource_scope(scope),
+            tenant_context(context),
+            ResourceKind::SurfaceTemplates,
+            &template.id,
+        )
+}
+
 /// `GET /v1/surface-templates`
 pub async fn list_templates(
     State(state): State<IdentityApiState>,
@@ -161,7 +179,7 @@ pub async fn create_template(
     let id = format!("user-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
     let tpl = req.into_template(id, now);
-    if !template_allowed(&tpl, &context, &scope) {
+    if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
 
@@ -177,15 +195,26 @@ pub async fn update_template(
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
-    Json(mut tpl): Json<SurfaceTemplate>,
+    Json(tpl): Json<SurfaceTemplate>,
 ) -> Result<Json<SurfaceTemplate>, TemplateApiError> {
-    let s = store(&state)?;
+    update_stored_template(store(&state)?, id, &context, &scope, tpl)
+        .await
+        .map(Json)
+}
+
+async fn update_stored_template(
+    s: &super::FileSystemSurfaceTemplateStore,
+    id: String,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+    mut tpl: SurfaceTemplate,
+) -> Result<SurfaceTemplate, TemplateApiError> {
     let existing = s
         .get(&id)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("get: {}", e)))?
         .ok_or_else(|| TemplateApiError::NotFound(format!("template '{}' not found", id)))?;
-    if !template_allowed(&existing, &context, &scope) {
+    if !template_writable(&existing, context, scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
     if existing.builtin {
@@ -202,7 +231,7 @@ pub async fn update_template(
     s.save(&tpl)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("save: {}", e)))?;
-    Ok(Json(tpl))
+    Ok(tpl)
 }
 
 /// `GET /v1/surface-templates/{id}/export`
@@ -285,7 +314,7 @@ pub async fn import_template(
     let now = chrono::Utc::now().to_rfc3339();
     tpl.created_at = Some(now.clone());
     tpl.updated_at = Some(now);
-    if !template_allowed(&tpl, &context, &scope) {
+    if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
     s.save(&tpl)
@@ -302,20 +331,132 @@ pub async fn delete_template(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<StatusCode, TemplateApiError> {
-    let s = store(&state)?;
+    delete_stored_template(store(&state)?, &id, &context, &scope).await
+}
+
+async fn delete_stored_template(
+    s: &super::FileSystemSurfaceTemplateStore,
+    id: &str,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<StatusCode, TemplateApiError> {
     let existing = s
-        .get(&id)
+        .get(id)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("get: {}", e)))?
         .ok_or_else(|| TemplateApiError::NotFound(format!("template '{}' not found", id)))?;
-    if !template_allowed(&existing, &context, &scope) {
+    if !template_writable(&existing, context, scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
     if existing.builtin {
         return Err(TemplateApiError::Forbidden(format!("builtin template '{}' cannot be deleted", id)));
     }
-    s.delete(&id)
+    s.delete(id)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("delete: {}", e)))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tenant_may_read_an_appliance_wide_template_but_not_change_it() {
+        let tenant = Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+        let mut record = serde_json::from_value::<crate::surface_templates::types::CreateSurfaceTemplate>(
+            serde_json::json!({ "name": "Template" }),
+        )
+        .unwrap()
+        .into_template("template-a".into(), "2026-01-01T00:00:00Z".into());
+        record.tenant_id = None;
+        assert!(template_allowed(&record, &tenant, &None));
+        assert!(!template_writable(&record, &tenant, &None));
+        assert!(template_writable(&record, &None, &None));
+
+        record.tenant_id = Some("tenant-a".into());
+        assert!(template_writable(&record, &tenant, &None));
+
+        record.tenant_id = Some("tenant-b".into());
+        assert!(!template_writable(&record, &tenant, &None));
+    }
+
+    async fn stored_template(
+        tenant_id: Option<&str>
+    ) -> (super::super::FileSystemSurfaceTemplateStore, SurfaceTemplate, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::super::FileSystemSurfaceTemplateStore::new(dir.path().join("templates"), None)
+            .await
+            .unwrap();
+        let mut template = serde_json::from_value::<crate::surface_templates::types::CreateSurfaceTemplate>(
+            serde_json::json!({ "name": "Operator template" }),
+        )
+        .unwrap()
+        .into_template("template-a".into(), "2026-01-01T00:00:00Z".into());
+        template.tenant_id = tenant_id.map(str::to_string);
+        store
+            .save(&template)
+            .await
+            .unwrap();
+        (store, template, dir)
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn renamed(template: &SurfaceTemplate) -> SurfaceTemplate {
+        let mut renamed = template.clone();
+        renamed.name = "Tenant template".into();
+        renamed
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_update_or_delete_an_appliance_wide_template() {
+        let (store, template, _dir) = stored_template(None).await;
+        assert!(template_allowed(&template, &tenant_a(), &None));
+
+        let update = update_stored_template(&store, template.id.clone(), &tenant_a(), &None, renamed(&template)).await;
+        assert!(matches!(update, Err(TemplateApiError::Forbidden(_))), "update: {update:?}");
+
+        let delete = delete_stored_template(&store, &template.id, &tenant_a(), &None).await;
+        assert!(matches!(delete, Err(TemplateApiError::Forbidden(_))), "delete: {delete:?}");
+
+        let after = store
+            .get(&template.id)
+            .await
+            .unwrap()
+            .expect("appliance-wide template must survive");
+        assert_eq!(after.name, "Operator template");
+        assert_eq!(after.updated_at, template.updated_at);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_and_delete_its_own_template() {
+        let (store, template, _dir) = stored_template(Some("tenant-a")).await;
+
+        let updated = update_stored_template(&store, template.id.clone(), &tenant_a(), &None, renamed(&template))
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "Tenant template");
+        assert_eq!(updated.tenant_id.as_deref(), Some("tenant-a"));
+
+        let status = delete_stored_template(&store, &template.id, &tenant_a(), &None)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            store
+                .get(&template.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

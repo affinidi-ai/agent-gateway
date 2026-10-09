@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::secrets::SecretsStore;
 use crate::tenancy::{
-    PatTenantContext, ResourceKind, can_access, can_reference, scope_allows_resource, tenant_for_create,
+    PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
 };
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
@@ -443,7 +443,7 @@ pub async fn update_provider(
                 .into_response();
         }
     };
-    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -586,7 +586,7 @@ pub async fn delete_provider(
                 .into_response();
         }
     };
-    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -828,6 +828,120 @@ mod consent_strategy_tests {
             validate_consent_strategy(&state, &provider, &None, &None)
                 .await
                 .is_ok()
+        );
+    }
+
+    async fn state_with_provider(
+        directory: &tempfile::TempDir,
+        tenant_id: Option<&str>,
+    ) -> CredentialProviderState {
+        let state = CredentialProviderState {
+            store: Arc::new(
+                super::super::storage::FileSystemCredentialProviderStore::new(
+                    directory
+                        .path()
+                        .join("providers"),
+                )
+                .await
+                .unwrap(),
+            ),
+            secrets_store: Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+            identity_strategies: None,
+            oauth_callback_route: "/oauth/callback".into(),
+        };
+        let provider: CredentialProvider = serde_json::from_value(json!({
+            "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(provider)
+            .await
+            .unwrap();
+        state
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn rename() -> Json<UpdateCredentialProviderRequest> {
+        Json(serde_json::from_value(json!({ "name": "Tenant provider" })).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_token_cannot_update_or_delete_an_appliance_wide_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, None).await;
+
+        let read = get_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+
+        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
+            .await
+            .into_response();
+        assert_eq!(update.status(), StatusCode::FORBIDDEN);
+
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(delete.status(), StatusCode::FORBIDDEN);
+
+        let after = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("appliance-wide provider must survive");
+        assert_eq!(after.name, "Operator provider");
+        assert_eq!(after.tenant_id, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_token_can_update_and_delete_its_own_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, Some("tenant-a")).await;
+
+        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
+            .await
+            .into_response();
+        assert_eq!(update.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .map(|provider| provider.name),
+            Some("Tenant provider".to_string())
+        );
+
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

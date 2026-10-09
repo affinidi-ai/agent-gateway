@@ -2,17 +2,26 @@ branch: fix/security-findings
 changes:
   added: []
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-09T00:00:05.000Z'
+      title: Refuse secret updates and deletes when the secret cannot be loaded
+      description: Updating or deleting a secret now returns 404 when it does not exist and 500 when it cannot be read, before any write. Previously the ownership check was skipped when the lookup failed, and a missing secret returned 400.
   removed: []
   security:
     - timestamp: '2026-10-09T00:00:00.000Z'
       title: ⭐ Withhold target credentials from callers whose source auth failed
       description: A caller whose source authentication failed is now forwarded without the stored target credential on `proxy://` MCP Targets, Fabric send, Fabric receive (direct and MCP proxy Targets) and the `a2a-proxy://` Direct Line secret, as the direct inbound path already did. Previously these paths decided from the request path alone or assumed the caller was authenticated, so an anonymous caller on a surface without a denying policy reached the backend with the operator's credential. Agent-card fetches between gateways still carry the receiving gateway's credential.
+    - timestamp: '2026-10-09T00:00:03.000Z'
+      title: ⭐ Refuse tenant token writes to appliance-wide management records
+      description: A tenant access token can still read records that belong to no tenant, but now gets 403 when it updates, deletes or otherwise changes them in JWT verification strategies, secrets, STS clients, mediators, credential providers, certificates, trust authorities, issuers, trust registries, surface templates and integrations (including triggering an appliance-wide integration), and on the appliance Gateway's Connection Points, which tenant tokens can therefore no longer create. Previously these write paths used the read rule, so a tenant could, for example, replace a global JWT strategy's keys. Tenant automations that edited untenanted records need an appliance-wide token, or an operator can assign the record with `PUT /v1/tenant-ownership/...`.
   breaking:
     - timestamp: '2026-10-09T00:00:01.000Z'
       title: Stop sending target credentials for failed callers over MCP proxy and Fabric
       description: Backends behind `proxy://` MCP, `a2a-proxy://` or Fabric surfaces with source authentication now receive requests from failed callers without the target credential, and will usually reject them. Two Fabric gateways that both require source authentication on the same header no longer reach the backend, because the sending gateway strips that header; require caller authentication on one side of the hop or use a different header on each side (see docs/POLICY.md).
   internal:
+    - timestamp: '2026-10-09T00:00:04.000Z'
+      title: Test tenant token write refusals on every management store
+      description: Adds handler-level 403 and own-record tests per store, router and access-token middleware tests for JWT strategies and secrets, and lists the read-only stores in ACCESS_TOKENS.md.
     - timestamp: '2026-10-09T00:00:02.000Z'
       title: Test target-credential withholding on MCP proxy, Fabric and A2A proxy paths
       description: Adds surface and g2g BDD scenarios for failed and authenticated callers on each forwarding sink, an agent-card-over-Fabric scenario, Direct Line component and unit tests, and documents the rule in POLICY.md, SOURCE_AUTH.md and ARCHITECTURE.md.

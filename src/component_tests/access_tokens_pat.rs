@@ -1460,6 +1460,7 @@ async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
 struct JwtStrategiesApp {
     app: Router,
     store: Arc<FsAccessTokenStore>,
+    strategies: Arc<crate::jwt_bearer::FileSystemJwtVerificationStrategyStore>,
     sessions: Arc<SessionManager>,
     user_id: String,
     // Held so the temp directories are removed when the test ends.
@@ -1472,14 +1473,16 @@ async fn jwt_strategies_app() -> JwtStrategiesApp {
     let sessions = Arc::new(SessionManager::new());
     let store = new_store().await;
     let directory = tempfile::tempdir().expect("tempdir");
-    let strategies = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(directory.path().to_path_buf())
-        .await
-        .expect("strategy store");
+    let strategies = Arc::new(
+        crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(directory.path().to_path_buf())
+            .await
+            .expect("strategy store"),
+    );
 
     let auth =
         AuthGuardState::new(sessions.clone(), Some(users.clone()), Arc::new(crate::terms::TermsManager::disabled()))
             .with_pat_authenticator(Some(store.clone()));
-    let app = crate::jwt_bearer::router::create_jwt_verification_strategies_router(Arc::new(strategies))
+    let app = crate::jwt_bearer::router::create_jwt_verification_strategies_router(strategies.clone())
         .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
         .layer(middleware::from_fn_with_state(auth, require_session_auth))
         .layer(Extension(sessions.clone()))
@@ -1488,6 +1491,7 @@ async fn jwt_strategies_app() -> JwtStrategiesApp {
     JwtStrategiesApp {
         app,
         store,
+        strategies,
         sessions,
         user_id,
         _users_dir: users_dir,
@@ -1551,4 +1555,198 @@ async fn jwt_strategy_list_accepts_a_session_login_on_role_alone() {
         request(&fixture.app, "GET", "/v1/jwt-verification-strategies", Some(&session), None).await,
         StatusCode::OK
     );
+}
+
+async fn tenant_request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    secret: &str,
+    body: Option<serde_json::Value>,
+) -> StatusCode {
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("Authorization", format!("Bearer {secret}"))
+        .header("x-external-account", "tenant-a");
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())),
+        None => builder.body(Body::empty()),
+    }
+    .expect("request");
+    let (status, _, _) = send(app, request).await;
+    status
+}
+
+async fn seed_strategy(
+    strategies: &crate::jwt_bearer::FileSystemJwtVerificationStrategyStore,
+    tenant_id: Option<&str>,
+) -> String {
+    use crate::jwt_bearer::JwtVerificationStrategyStorage;
+    strategies
+        .create(crate::jwt_bearer::models::JwtVerificationStrategy {
+            id: String::new(),
+            tenant_id: tenant_id.map(str::to_string),
+            name: "Seeded strategy".to_string(),
+            expected_issuer: "https://operator.example.com".to_string(),
+            jwks_source: crate::jwt_bearer::models::JwksSource::Remote {
+                jwks_uri: "https://operator.example.com/.well-known/jwks.json".to_string(),
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("seed strategy")
+        .id
+}
+
+fn strategy_replacement() -> serde_json::Value {
+    serde_json::json!({
+        "name": "Tenant strategy",
+        "expected_issuer": "https://tenant.example.com",
+        "jwks_source": { "type": "remote", "jwks_uri": "https://tenant.example.com/.well-known/jwks.json" }
+    })
+}
+
+#[tokio::test]
+async fn a_tenant_pat_reads_but_cannot_change_an_appliance_wide_jwt_strategy() {
+    use crate::jwt_bearer::JwtVerificationStrategyStorage;
+    let fixture = jwt_strategies_app().await;
+    let (_, secret) = create_token_with(
+        &fixture.store,
+        &fixture.user_id,
+        Some("TENANT:${x-external-account}:jwt-verification-strategies:.*"),
+        tenant_selector_header(),
+        vec![
+            "jwt_verification_strategies.view".to_string(),
+            "jwt_verification_strategies.edit".to_string(),
+            "jwt_verification_strategies.delete".to_string(),
+        ],
+    )
+    .await;
+    let global = seed_strategy(&fixture.strategies, None).await;
+    let own = seed_strategy(&fixture.strategies, Some("tenant-a")).await;
+    let global_path = format!("/v1/jwt-verification-strategies/{global}");
+    let own_path = format!("/v1/jwt-verification-strategies/{own}");
+
+    assert_eq!(tenant_request(&fixture.app, "GET", &global_path, &secret, None).await, StatusCode::OK);
+    assert_eq!(
+        tenant_request(&fixture.app, "PUT", &global_path, &secret, Some(strategy_replacement())).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(tenant_request(&fixture.app, "DELETE", &global_path, &secret, None).await, StatusCode::FORBIDDEN);
+    let stored = fixture
+        .strategies
+        .get(&global)
+        .await
+        .expect("load")
+        .expect("appliance-wide strategy survives");
+    assert_eq!(stored.expected_issuer, "https://operator.example.com");
+    assert_eq!(stored.tenant_id, None);
+
+    assert_eq!(
+        tenant_request(&fixture.app, "PUT", &own_path, &secret, Some(strategy_replacement())).await,
+        StatusCode::OK
+    );
+    let own_stored = fixture
+        .strategies
+        .get(&own)
+        .await
+        .expect("load")
+        .expect("own strategy");
+    assert_eq!(own_stored.expected_issuer, "https://tenant.example.com");
+    assert_eq!(
+        own_stored
+            .tenant_id
+            .as_deref(),
+        Some("tenant-a")
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_pat_reads_but_cannot_change_an_appliance_wide_secret() {
+    use crate::secrets::SecretsStore;
+    let (users, user_id, _users_dir) = new_user_storage(crate::auth::types::UserRole::Administrator).await;
+    let store = new_store().await;
+    let secrets_dir = tempfile::tempdir().expect("tempdir");
+    let secrets: Arc<dyn SecretsStore> = Arc::new(
+        crate::secrets::FilesystemSecretsStore::new_async(
+            secrets_dir
+                .path()
+                .to_str()
+                .expect("utf-8 path"),
+        )
+        .await
+        .expect("secrets store"),
+    );
+    let seed = |tenant_id: Option<&str>, secret_id: &str| crate::secrets::CreateSecretRequest {
+        tenant_id: tenant_id.map(str::to_string),
+        name: "Billing API key".to_string(),
+        secret_id: secret_id.to_string(),
+        description: None,
+        value: "operator-value".to_string(),
+        secret_type: "ApiKey".to_string(),
+        tags: Vec::new(),
+    };
+    let global = secrets
+        .create(seed(None, "billing_api_key"))
+        .await
+        .expect("seed global")
+        .id;
+    let own = secrets
+        .create(seed(Some("tenant-a"), "tenant_api_key"))
+        .await
+        .expect("seed own")
+        .id;
+    let rbac = Arc::new(crate::rbac::RbacConfig::default());
+    let auth = AuthGuardState::new(
+        Arc::new(SessionManager::new()),
+        Some(users.clone()),
+        Arc::new(crate::terms::TermsManager::disabled()),
+    )
+    .with_pat_authenticator(Some(store.clone()));
+    let app =
+        crate::secrets::router::create_secrets_router(secrets.clone(), None, None, Some(RbacGuard::new(users, rbac)))
+            .layer(middleware::from_fn_with_state(auth, require_session_auth));
+    let (_, token) = create_token_with(
+        &store,
+        &user_id,
+        Some("TENANT:${x-external-account}:secrets:.*"),
+        tenant_selector_header(),
+        vec!["secrets.view".to_string(), "secrets.edit".to_string(), "secrets.delete".to_string()],
+    )
+    .await;
+    let rename = serde_json::json!({ "name": "Tenant key", "value": "tenant-value", "update_value": true });
+
+    assert_eq!(tenant_request(&app, "GET", &format!("/api/v1/secrets/{global}"), &token, None).await, StatusCode::OK);
+    assert_eq!(
+        tenant_request(&app, "PUT", &format!("/api/v1/secrets/{global}"), &token, Some(rename.clone())).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        tenant_request(&app, "DELETE", &format!("/api/v1/secrets/{global}"), &token, None).await,
+        StatusCode::FORBIDDEN
+    );
+    let stored = secrets
+        .get(&global)
+        .await
+        .expect("load")
+        .expect("appliance-wide secret survives");
+    assert_eq!(stored.name, "Billing API key");
+    assert_eq!(stored.value, "operator-value");
+    assert_eq!(stored.tenant_id, None);
+
+    assert_eq!(
+        tenant_request(&app, "PUT", &format!("/api/v1/secrets/{own}"), &token, Some(rename)).await,
+        StatusCode::OK
+    );
+    let own_stored = secrets
+        .get(&own)
+        .await
+        .expect("load")
+        .expect("own secret");
+    assert_eq!(own_stored.name, "Tenant key");
+    assert_eq!(own_stored.value, "tenant-value");
 }

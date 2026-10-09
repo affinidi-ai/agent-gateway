@@ -8,8 +8,8 @@ use crate::integrations::audit_integration_triggers::is_audit_integration;
 use crate::integrations::integration_service::trigger_authorized_integration;
 use crate::integrations::stream_publishers::PUBLISHER_REGISTRY;
 use crate::integrations::trigger_integrations;
-use crate::storage::integration_handlers::AuditCaller;
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource};
+use crate::storage::integration_handlers::{AuditCaller, integration_writable};
+use crate::tenancy::PatTenantContext;
 
 /// Substitute template variables in a string
 fn substitute_variables(
@@ -68,18 +68,6 @@ pub struct IntegrationResult {
     pub error: Option<String>,
 }
 
-fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
-    context
-        .as_ref()
-        .map(|Extension(context)| context)
-}
-
-fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatResourceScope> {
-    scope
-        .as_ref()
-        .map(|Extension(scope)| scope)
-}
-
 async fn require_integration_access(
     storage: &crate::storage::IntegrationStorage,
     integration_id: &str,
@@ -91,17 +79,7 @@ async fn require_integration_access(
         .load(integration_id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "Integration not found".to_string()))?;
-    if !can_access(
-        integration
-            .tenant_id
-            .as_deref(),
-        tenant_context(context),
-    ) || !scope_allows_resource(
-        resource_scope(scope),
-        tenant_context(context),
-        ResourceKind::Integrations,
-        &integration.id,
-    ) {
+    if !integration_writable(&integration, context, scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".to_string()));
     }
     if is_audit_integration(&integration) {

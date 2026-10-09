@@ -18,7 +18,9 @@ use crate::jwt_bearer::{
     models::{JwksSource, JwtVerificationStrategy},
 };
 use crate::rbac::{Feature, RbacConfig};
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+};
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
@@ -296,7 +298,7 @@ pub async fn update_strategy(
             return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to load strategy")).into_response();
         }
     };
-    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -370,7 +372,7 @@ pub async fn delete_strategy(
             return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to load strategy")).into_response();
         }
     };
-    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -1086,5 +1088,132 @@ mod tests {
                 .status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    fn tenant_context_a() -> PatTenantContext {
+        PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }
+    }
+
+    fn seeded_strategy(tenant_id: Option<&str>) -> JwtVerificationStrategy {
+        JwtVerificationStrategy {
+            id: "strategy-a".to_string(),
+            tenant_id: tenant_id.map(str::to_string),
+            name: "Operator strategy".to_string(),
+            expected_issuer: "https://operator.example.com".to_string(),
+            jwks_source: JwksSource::Remote {
+                jwks_uri: "https://operator.example.com/.well-known/jwks.json".to_string(),
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    async fn tenant_router(store: Arc<MemStore>) -> (Router, TempDir) {
+        let (ps, dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let router = build_test_router(
+            store,
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        )
+        .layer(Extension(tenant_context_a()));
+        (router, dir)
+    }
+
+    fn replacement_body() -> String {
+        serde_json::json!({
+            "name": "Tenant strategy",
+            "expected_issuer": "https://tenant.example.com",
+            "jwks_source": { "type": "remote", "jwks_uri": "https://tenant.example.com/.well-known/jwks.json" }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_rewrite_or_delete_an_appliance_wide_strategy() {
+        let store = Arc::new(MemStore::default());
+        store
+            .inner
+            .insert("strategy-a".to_string(), seeded_strategy(None));
+        let (router, _dir) = tenant_router(store.clone()).await;
+
+        let read = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jwt-verification-strategies/strategy-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+
+        let update = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/jwt-verification-strategies/strategy-a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(replacement_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::FORBIDDEN);
+
+        let delete = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/jwt-verification-strategies/strategy-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::FORBIDDEN);
+
+        let stored = store
+            .get("strategy-a")
+            .await
+            .unwrap()
+            .expect("strategy must survive");
+        assert_eq!(stored.expected_issuer, "https://operator.example.com");
+        assert_eq!(stored.tenant_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_its_own_strategy() {
+        let store = Arc::new(MemStore::default());
+        store
+            .inner
+            .insert("strategy-a".to_string(), seeded_strategy(Some("tenant-a")));
+        let (router, _dir) = tenant_router(store.clone()).await;
+
+        let update = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/jwt-verification-strategies/strategy-a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(replacement_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let stored = store
+            .get("strategy-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.expected_issuer, "https://tenant.example.com");
+        assert_eq!(stored.tenant_id.as_deref(), Some("tenant-a"));
     }
 }
