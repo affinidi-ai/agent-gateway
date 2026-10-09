@@ -31,7 +31,8 @@
 #   mkdir -p envs/docker/_storage && chmod 777 envs/docker/_storage
 #
 # For a real deployment, override webauthn.rp_id, webauthn.external_origin, and
-# the did.domain in envs/docker/config/gateway.json with your public host.
+# the did.domain in envs/docker/config/gateway.json with your public host, and
+# remove the 127.0.0.1 prefix from `ports` below so other hosts can reach it.
 # Browser passkey login requires that WebAuthn origin to match the URL you open.
 # Also set `[did_cache] allow_private_hosts = false` in
 # envs/docker/config/config.toml: the generated dev config turns it on so DID
@@ -48,7 +49,7 @@ services:
     # not crash-loop and bury the first error.
     security_opt:
       - no-new-privileges:true
-    # Published on loopback only. Drop the 127.0.0.1 prefix to reach the gateway from other hosts.
+    # Published on loopback only; see the deployment note at the top of this file.
     ports:
       - "127.0.0.1:8443:8443"   # HTTPS listener — dashboard + passkey origin
       - "127.0.0.1:8080:8080"   # HTTP listener
