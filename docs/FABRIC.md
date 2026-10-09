@@ -306,8 +306,17 @@ Legacy Access Point requests never carry it. On a Transit Point, both modern req
 it expires.
 
 The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
-gateway sends no delegated credential unless it opts in too. A Target variant can override the
-setting, and a variant with `complete: true` that omits the override turns it off. Turn it on only
+gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without
+`outbound_credentials` uses only its own `transit_credentials`, never another Transit Point's. A
+Target variant can override the setting, a variant's `transit.points` override sets it for that
+variant's Transit Points, and a variant with `complete: true` that omits the Target override turns
+it off. A legacy request whose Transit Point variant fails to resolve carries no delegated
+credential.
+
+When the setting keeps bindings from a peer, the sending gateway logs `Delegated credentials
+withheld from Fabric peer` at debug level under the `credential_delegation` target, with
+`surface_id`, `route` (the Target endpoint or Transit Point alias) and
+`reason = "fabric_delegated_credentials=false"`. It never logs credential values. Turn it on only
 for peers you would trust with those tokens. In the dashboard it is the **Send delegated
 credentials over Fabric** switch on the Managed Agent or Transit Point panel, shown for a
 `fabric://` route on a surface with credential bindings. See

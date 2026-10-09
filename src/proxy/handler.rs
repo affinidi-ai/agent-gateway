@@ -10641,6 +10641,20 @@ async fn handle_fabric_request(
                 .await;
             return Err(ModernDelegationError::from(ContinuationError::Denied).response(request));
         }
+        if !state
+            .surface
+            .outbound_credentials
+            .is_empty()
+            && !delegates_credentials_over_fabric(&state.surface)
+        {
+            debug!(
+                target: "credential_delegation",
+                surface_id = %state.surface.surface_id,
+                route = %state.surface.target.endpoint,
+                reason = "fabric_delegated_credentials=false",
+                "Delegated credentials withheld from Fabric peer"
+            );
+        }
         if delegates_credentials_over_fabric(&state.surface) {
             let Some(runtime) = mcp_continuations.as_deref() else {
                 connection_guard
@@ -17240,6 +17254,72 @@ mod tests {
         .unwrap();
         assert_eq!(status, axum::http::StatusCode::OK, "{response}");
         assert_eq!(response["result"]["resultType"], "input_required");
+        // With the switch off a `fabric://` Target skips consent even with a runtime and goes on
+        // to payment; with it on and no runtime, the request stops at the delegation gate.
+        let fabric_root = tempfile::tempdir().unwrap();
+        let peer = crate::gateways::types::Gateway::new(
+            "Peer".into(),
+            String::new(),
+            "did:example:peer".into(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                fabric_root
+                    .path()
+                    .join("gateways"),
+                Some("did:web:gateway.example".into()),
+            )
+            .await
+            .unwrap(),
+        );
+        crate::gateways::GatewayStore::create(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+        let (manager, _issuer_dir) = crate::gateways::test_helpers::test_listener_manager(fabric_root.path()).await;
+        let manager = manager.with_gateway_store(gateways);
+        let mut listener = crate::gateways::test_helpers::test_listener("fabric-send").await;
+        listener.gateway_id = peer.id.clone();
+        manager
+            .register_test_listener(listener)
+            .await;
+        let listener_manager = Arc::new(tokio::sync::RwLock::new(Some(Arc::new(manager))));
+        for opted_in in [false, true] {
+            let mut fabric = state.clone();
+            fabric.listener_manager = listener_manager.clone();
+            let mut surface = (*state.surface).clone();
+            surface.target.endpoint = format!("fabric://{}/peer-surface", peer.id);
+            surface
+                .target
+                .fabric_delegated_credentials = opted_in;
+            fabric.surface = Arc::new(surface);
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Box::pin(super::proxy_handler_with_mcp_runtime(
+                    address,
+                    fabric,
+                    build_request(&message),
+                    versions,
+                    (!opted_in).then(|| runtime.clone()),
+                )),
+            )
+            .await
+            .expect("the Fabric send leg answers")
+            .unwrap_or_else(|response| response);
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(!body.contains("input_required"), "opted_in={opted_in}: {status} {body}");
+            assert!(!body.contains("requestState"), "opted_in={opted_in}: {body}");
+            assert_eq!(
+                body.contains("MCP credential service unavailable"),
+                opted_in,
+                "opted_in={opted_in}: {status} {body}"
+            );
+            assert_eq!(body.contains("payment delegation"), !opted_in, "opted_in={opted_in}: {status} {body}");
+        }
         // Tampered, expired, cross-user and incapable MRTR retries, on a continuation of their
         // own so the flow below keeps its state.
         {
