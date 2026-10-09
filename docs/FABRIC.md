@@ -362,7 +362,9 @@ own token, applies the delegated credential, and sends it inside the authcrypt f
 Legacy MCP and A2A Access Point requests never carry it. On a Transit Point the setting applies to
 every protocol: modern MCP requests, legacy MCP `_meta` injection, and header injection on any
 request, including A2A. The receiving gateway, and its Target, can use that access token until it
-expires.
+expires. When the receiving gateway forwards the request to its Target it logs the name of each
+forwarded header, never its value, so a delegated credential stays out of the logs whatever header
+carries it.
 
 The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without

@@ -4908,8 +4908,8 @@ async fn process_forward_request_with_mcp_runtime(
                 Some(request) => request.headers.get_all(key).iter().filter_map(|value| value.to_str().ok()).collect::<Vec<_>>(),
                 None => value.as_str().into_iter().collect(),
             };
+            channel_info!(config_id, "    Header: {}", key);
             for value_str in values {
-                channel_info!(config_id, "    Header: {}: {}", key, value_str);
                 req = req.header(key.as_str(), value_str);
             }
         }

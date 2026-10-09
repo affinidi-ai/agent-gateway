@@ -2380,3 +2380,142 @@ allow if {
     );
     assert_ne!(last_body(), Some(denied), "a request the policy rejects never reaches the Target");
 }
+
+#[derive(Clone, Default)]
+struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(
+        &mut self,
+        buf: &[u8],
+    ) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap()
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn fabric_receive_logs_forwarded_header_names_without_values() {
+    use tracing::instrument::WithSubscriber;
+
+    if std::env::var_os("AG_MCP_RECEIVE_REGRESSION_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .expect("test thread name")
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("AG_MCP_RECEIVE_REGRESSION_CHILD", "1")
+            .output()
+            .expect("run receiver regression with isolated globals");
+        assert!(
+            output.status.success(),
+            "isolated receiver regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let target_response = json!({"jsonrpc": "2.0", "id": "header-logs", "result": {"tools": []}});
+    let target = MockServer::start_with_response(target_response.to_string()).await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-header-logs",
+        "name": "Fabric header logs",
+        "access_point": {
+            "listen_address": "127.0.0.1:8080",
+            "route": "/mcp",
+            "protocol": "mcp"
+        },
+        "target": { "endpoint": format!("http://{}", target.addr) }
+    }))
+    .unwrap();
+    store
+        .save(&surface)
+        .await
+        .unwrap();
+
+    let credentials = [
+        ("authorization", "Bearer delegated-access-token"),
+        ("proxy-authorization", "Basic proxy-credential"),
+        ("cookie", "session=cookie-credential"),
+        ("x-api-key", "api-key-credential"),
+        ("x-transit-token", "transit-credential"),
+        ("x-upstream-auth", "custom-header-credential"),
+    ];
+    let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+    for (name, value) in credentials {
+        headers[name] = json!(value);
+    }
+    let message = ReceivedMessage::new(
+        "receiver-connection".to_string(),
+        "receiver-gateway".to_string(),
+        MessageType::ForwardRequest.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        None,
+        Some(SENDER_CONNECTION_POINT_DID.to_string()),
+        vec!["did:web:receiver.example".to_string()],
+        None,
+        Some(super::super::envelope_replay::now_secs() + 60),
+        json!({
+            "channel_id": surface.surface_id,
+            "method": "POST",
+            "path": "/mcp",
+            "headers": headers,
+            "body": {"jsonrpc": "2.0", "id": "header-logs", "method": "tools/list"}
+        }),
+        MessageMetadata {
+            encrypted: true,
+            authenticated: true,
+            from_key: None,
+            extra: Value::Null,
+        },
+    )
+    .with_context("agent_surface_storage_path", json!(storage_path));
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+    let (forward_response, envelope) = receive(&message)
+        .with_subscriber(subscriber)
+        .await;
+    assert_eq!(forward_response["status"], 200);
+    assert_eq!(envelope, target_response);
+
+    let forwarded = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("request reached the Target");
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    for (name, value) in credentials {
+        assert_eq!(forwarded.headers[name], value, "{name} was not forwarded");
+        assert!(logs.contains(&format!("Header: {name}\n")), "header name {name} was not logged:\n{logs}");
+        assert!(!logs.contains(value), "credential value for {name} was logged:\n{logs}");
+    }
+}
