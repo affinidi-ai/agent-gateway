@@ -18,6 +18,9 @@ changes:
     - timestamp: '2026-10-09T00:00:01.000Z'
       title: Stop sending target credentials for failed callers over MCP proxy and Fabric
       description: Backends behind `proxy://` MCP, `a2a-proxy://` or Fabric surfaces with source authentication now receive requests from failed callers without the target credential, and will usually reject them. Two Fabric gateways that both require source authentication on the same header no longer reach the backend, because the sending gateway strips that header; require caller authentication on one side of the hop or use a different header on each side (see docs/POLICY.md).
+    - timestamp: '2026-10-09T00:00:07.000Z'
+      title: Refuse tenant token edits to records that belong to no tenant
+      description: Tenant automations that updated, deleted or triggered appliance-wide records, including records created before tenant stamping, now get 403, and tenant tokens can no longer create Connection Points. Use an appliance-wide token, or have an operator assign the record with `PUT /v1/tenant-ownership/...`.
   internal:
     - timestamp: '2026-10-09T00:00:06.000Z'
       title: Test access-token scopes on JWT strategy create, update and JWKS probe
