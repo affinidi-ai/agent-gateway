@@ -239,17 +239,6 @@ pub async fn gateway_restarts(
         .unwrap_or_else(|error| panic!("{error:#}"));
 }
 
-#[when(expr = "the mediator loses every account it holds")]
-pub async fn mediator_loses_every_account(world: &mut G2gWorld) {
-    world.start().await;
-    world
-        .harness()
-        .mediator
-        .flush_store()
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
-}
-
 #[when(regex = r"^gateway (\d+) pings gateway (\d+)$")]
 pub async fn gateway_pings_gateway(
     world: &mut G2gWorld,

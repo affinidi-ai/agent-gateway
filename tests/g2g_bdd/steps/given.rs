@@ -801,3 +801,14 @@ pub async fn managed_agent_has_obtained_identity_presentation(
     world.response_status = None;
     world.response_body = None;
 }
+
+#[given(expr = "the mediator has lost every account it held")]
+pub async fn mediator_lost_every_account(world: &mut G2gWorld) {
+    world.start().await;
+    world
+        .harness()
+        .mediator
+        .flush_store()
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+}
