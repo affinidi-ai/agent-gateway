@@ -231,6 +231,9 @@ pub async fn update_trust_registry<S: TrustRegistryStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get trust registry: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Trust registry not found".to_string()))?;
+    if !registry_allowed(&trust_registry, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Trust registry not found".to_string()));
+    }
     if !registry_writable(&trust_registry, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Trust registry is outside this token's permitted scope".into()));
     }
@@ -290,6 +293,9 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get trust registry: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Trust registry not found".to_string()))?;
+    if !registry_allowed(&trust_registry, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Trust registry not found".to_string()));
+    }
     if !registry_writable(&trust_registry, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Trust registry is outside this token's permitted scope".into()));
     }
@@ -511,6 +517,9 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get trust registry: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Trust registry not found".to_string()))?;
+    if !registry_allowed(&tr, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Trust registry not found".to_string()));
+    }
     if !registry_writable(&tr, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Trust registry is outside this token's permitted scope".to_string()));
     }
@@ -870,6 +879,53 @@ mod tests {
             .await
             .unwrap()
             .expect("appliance-wide registry must survive");
+        assert_eq!(after.name, "Operator registry");
+        assert_eq!(after.updated_at, registry.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_registry_is_not_found_on_update_reconnect_or_delete() {
+        let (store, registry, dir) = stored_registry(Some("tenant-b")).await;
+
+        let update = update_trust_registry(
+            Extension(store.clone()),
+            Extension(None),
+            Path(registry.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let reconnect = reconnect_trust_registry(
+            Extension(store.clone()),
+            None,
+            None,
+            Extension(None),
+            Path(registry.id.clone()),
+            tenant_a(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reconnect
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(delete_as_tenant_a(&store, &dir, &registry.id).await, StatusCode::NOT_FOUND);
+
+        let after = store
+            .get(&registry.id)
+            .await
+            .unwrap()
+            .expect("another tenant's registry must survive");
         assert_eq!(after.name, "Operator registry");
         assert_eq!(after.updated_at, registry.updated_at);
     }

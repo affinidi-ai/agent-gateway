@@ -531,18 +531,11 @@ async fn load_accessible_connection_point<S: ConnectionPointStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get parent gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Connection point not found".to_string()))?;
-    let permitted = if mutation {
-        connection_point_writable(&connection_point, &gateway, context, scope)
-    } else {
-        connection_point_allowed(&connection_point, &gateway, context, scope)
-    };
-    if !permitted {
-        let status = if mutation {
-            StatusCode::FORBIDDEN
-        } else {
-            StatusCode::NOT_FOUND
-        };
-        return Err((status, "Connection point not accessible".to_string()));
+    if !connection_point_allowed(&connection_point, &gateway, context, scope) {
+        return Err((StatusCode::NOT_FOUND, "Connection point not accessible".to_string()));
+    }
+    if mutation && !connection_point_writable(&connection_point, &gateway, context, scope) {
+        return Err((StatusCode::FORBIDDEN, "Connection point not accessible".to_string()));
     }
     Ok((connection_point, gateway))
 }
@@ -2452,6 +2445,20 @@ mod tests {
                 .await
                 .is_ok()
         );
+        let other_tenant = Some(Extension(PatTenantContext {
+            token_id: "token-b".into(),
+            tenant_id: "tenant-b".into(),
+        }));
+        for mutation in [false, true] {
+            assert_eq!(
+                load(tenant_point.id.clone(), other_tenant.clone(), mutation)
+                    .await
+                    .err()
+                    .map(|(status, _)| status),
+                Some(StatusCode::NOT_FOUND),
+                "another tenant's connection point is hidden (mutation: {mutation})"
+            );
+        }
     }
 
     async fn create_on_appliance_gateway(tenant: Option<crate::tenancy::PatTenantContext>) -> (StatusCode, usize) {

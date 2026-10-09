@@ -443,7 +443,7 @@ pub async fn update_provider(
                 .into_response();
         }
     };
-    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -451,6 +451,10 @@ pub async fn update_provider(
             &existing.id,
         )
     {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
+            .into_response();
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "credential provider is outside this token's permitted scope" })),
@@ -586,7 +590,7 @@ pub async fn delete_provider(
                 .into_response();
         }
     };
-    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -594,6 +598,10 @@ pub async fn delete_provider(
             &existing.id,
         )
     {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
+            .into_response();
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "credential provider is outside this token's permitted scope" })),
@@ -910,6 +918,30 @@ mod consent_strategy_tests {
             .expect("appliance-wide provider must survive");
         assert_eq!(after.name, "Operator provider");
         assert_eq!(after.tenant_id, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_tenants_provider_is_not_found_on_update_or_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, Some("tenant-b")).await;
+
+        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
+            .await
+            .into_response();
+        assert_eq!(update.status(), StatusCode::NOT_FOUND);
+
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(delete.status(), StatusCode::NOT_FOUND);
+
+        let after = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("another tenant's provider must survive");
+        assert_eq!(after.name, "Operator provider");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

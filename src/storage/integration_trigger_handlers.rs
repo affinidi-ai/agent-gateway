@@ -8,7 +8,7 @@ use crate::integrations::audit_integration_triggers::is_audit_integration;
 use crate::integrations::integration_service::trigger_authorized_integration;
 use crate::integrations::stream_publishers::PUBLISHER_REGISTRY;
 use crate::integrations::trigger_integrations;
-use crate::storage::integration_handlers::{AuditCaller, integration_writable};
+use crate::storage::integration_handlers::{AuditCaller, integration_allowed, integration_writable};
 use crate::tenancy::PatTenantContext;
 
 /// Substitute template variables in a string
@@ -79,6 +79,9 @@ async fn require_integration_access(
         .load(integration_id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "Integration not found".to_string()))?;
+    if !integration_allowed(&integration, context, scope) {
+        return Err((StatusCode::NOT_FOUND, "Integration not found".to_string()));
+    }
     if !integration_writable(&integration, context, scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".to_string()));
     }

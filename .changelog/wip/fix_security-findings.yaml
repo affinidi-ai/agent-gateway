@@ -26,6 +26,9 @@ changes:
     - timestamp: '2026-10-10T00:00:03.000Z'
       title: Accept one connection setup per gateway invitation, and only that one
       description: A gateway invitation now accepts a connection setup only on a User Connection Point with a secret, only when the setup's parent thread id names the invitation message the mediator served, and only once. Previously the parent thread id was ignored, a leaked invitation URL and secret could be redeemed repeatedly until it expired, and system Connection Points with an empty secret accepted setups, each one creating an approval request, an admin notification and integration calls. The secret is now compared in constant time.
+    - timestamp: '2026-10-10T00:00:05.000Z'
+      title: Answer 404 for records a tenant token cannot see on every write
+      description: Updating, deleting or otherwise changing another tenant's record, or one outside the token's resource pattern, now returns the same 404 as a missing record across all management stores, Gateways, Connection Points, Agent Surfaces, policies and API keys, so a tenant token cannot tell that an id exists in another tenant. A record the token can see but not change, such as an appliance-wide one, still returns 403. Previously these writes returned 403 for another tenant's record.
   breaking:
     - timestamp: '2026-10-09T00:00:01.000Z'
       title: Stop sending target credentials for failed callers over MCP proxy and Fabric

@@ -214,6 +214,9 @@ async fn update_stored_template(
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("get: {}", e)))?
         .ok_or_else(|| TemplateApiError::NotFound(format!("template '{}' not found", id)))?;
+    if !template_allowed(&existing, context, scope) {
+        return Err(TemplateApiError::NotFound(format!("template '{}' not found", id)));
+    }
     if !template_writable(&existing, context, scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -345,6 +348,9 @@ async fn delete_stored_template(
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("get: {}", e)))?
         .ok_or_else(|| TemplateApiError::NotFound(format!("template '{}' not found", id)))?;
+    if !template_allowed(&existing, context, scope) {
+        return Err(TemplateApiError::NotFound(format!("template '{}' not found", id)));
+    }
     if !template_writable(&existing, context, scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -435,6 +441,24 @@ mod tests {
             .expect("appliance-wide template must survive");
         assert_eq!(after.name, "Operator template");
         assert_eq!(after.updated_at, template.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_template_is_not_found_on_update_or_delete() {
+        let (store, template, _dir) = stored_template(Some("tenant-b")).await;
+
+        let update = update_stored_template(&store, template.id.clone(), &tenant_a(), &None, renamed(&template)).await;
+        assert!(matches!(update, Err(TemplateApiError::NotFound(_))), "update: {update:?}");
+
+        let delete = delete_stored_template(&store, &template.id, &tenant_a(), &None).await;
+        assert!(matches!(delete, Err(TemplateApiError::NotFound(_))), "delete: {delete:?}");
+
+        let after = store
+            .get(&template.id)
+            .await
+            .unwrap()
+            .expect("another tenant's template must survive");
+        assert_eq!(after.name, "Operator template");
     }
 
     #[tokio::test]

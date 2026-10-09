@@ -321,6 +321,9 @@ pub async fn update_issuer<S: IssuerStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Issuer not found".to_string()))?;
+    if !issuer_allowed(&issuer, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Issuer not found".to_string()));
+    }
     if !issuer_writable(&issuer, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Issuer is outside this token's permitted scope".into()));
     }
@@ -358,6 +361,9 @@ pub async fn delete_issuer<S: IssuerStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Issuer not found".to_string()))?;
+    if !issuer_allowed(&issuer, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Issuer not found".to_string()));
+    }
     if !issuer_writable(&issuer, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Issuer is outside this token's permitted scope".into()));
     }
@@ -460,6 +466,9 @@ pub async fn retry_issuer_tr_registration<S: IssuerStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Issuer not found".to_string()))?;
+    if !issuer_allowed(&issuer, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Issuer not found".to_string()));
+    }
     if !issuer_writable(&issuer, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Issuer is outside this token's permitted scope".to_string()));
     }
@@ -1277,6 +1286,61 @@ mod tests {
             .await
             .unwrap()
             .expect("appliance-wide issuer must survive");
+        assert_eq!(after.name, "Operator issuer");
+        assert_eq!(after.updated_at, issuer.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_issuer_is_not_found_on_update_delete_or_retry() {
+        let (store, issuer, _dir) = stored_issuer(Some("tenant-b")).await;
+
+        let update = update_issuer(
+            Extension(store.clone()),
+            Extension(None),
+            Extension(None),
+            Path(issuer.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let delete =
+            delete_issuer(Extension(store.clone()), Extension(None), Path(issuer.id.clone()), tenant_a(), None).await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let retry = retry_issuer_tr_registration(
+            Extension(store.clone()),
+            Extension(None),
+            Extension(None),
+            Path(issuer.id.clone()),
+            tenant_a(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            retry
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let after = store
+            .get(&issuer.id)
+            .await
+            .unwrap()
+            .expect("another tenant's issuer must survive");
         assert_eq!(after.name, "Operator issuer");
         assert_eq!(after.updated_at, issuer.updated_at);
     }

@@ -123,10 +123,11 @@ Tenant-owned top-level management records carry an optional `tenant_id`. Its abs
 means appliance-global, for backward compatibility.
 
 A tenant PAT sees same-tenant records plus global ones. Dashboard sessions remain
-appliance-wide. A Secret that belongs to another tenant, or whose ID falls outside the PAT's
-resource pattern, answers `404 Secret not found` on read, update and delete, the same as a
-missing Secret, so its ID cannot be probed. An appliance-wide Secret the PAT can read answers
-`403` on update and delete.
+appliance-wide. A record that belongs to another tenant, or whose ID falls outside the PAT's
+resource pattern, answers `404` on read and on every write (update, delete, trigger, reconnect,
+retry and the other record actions), the same as a missing record, so its ID cannot be probed.
+An appliance-wide record the PAT can read answers `403` on those writes. For API keys and
+Connection Points, the parent Agent Surface or Gateway decides which applies.
 
 ### What a tenant PAT may do with global records
 

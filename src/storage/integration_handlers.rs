@@ -158,7 +158,7 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
-fn integration_allowed(
+pub(crate) fn integration_allowed(
     integration: &Integration,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
@@ -448,6 +448,9 @@ pub async fn update_notifier(
         .load(&id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "Integration not found".to_string()))?;
+    if !integration_allowed(&existing, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Integration not found".to_string()));
+    }
     if !integration_writable(&existing, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".into()));
     }
@@ -499,6 +502,9 @@ pub async fn delete_notifier(
         .load(&id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "Integration not found".to_string()))?;
+    if !integration_allowed(&integration, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Integration not found".to_string()));
+    }
     if !integration_writable(&integration, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".into()));
     }
@@ -1605,6 +1611,22 @@ mod tests {
         assert_eq!(delete_as_tenant_a(&f, &integration.id).await, StatusCode::FORBIDDEN);
         assert_eq!(trigger_as_tenant_a(&f, &integration.id).await, StatusCode::FORBIDDEN);
         assert_eq!(trigger_several_as_tenant_a(&f, &integration.id).await, StatusCode::FORBIDDEN);
+
+        let stored = f.stored().await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "Operator stream");
+        assert_eq!(stored[0].updated_at, integration.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_integration_is_not_found_on_update_delete_or_trigger() {
+        let f = fixture().await;
+        let integration = seed_general(&f, Some("tenant-b")).await;
+
+        assert_eq!(update_as_tenant_a(&f, &integration).await, StatusCode::NOT_FOUND);
+        assert_eq!(delete_as_tenant_a(&f, &integration.id).await, StatusCode::NOT_FOUND);
+        assert_eq!(trigger_as_tenant_a(&f, &integration.id).await, StatusCode::NOT_FOUND);
+        assert_eq!(trigger_several_as_tenant_a(&f, &integration.id).await, StatusCode::NOT_FOUND);
 
         let stored = f.stored().await;
         assert_eq!(stored.len(), 1);

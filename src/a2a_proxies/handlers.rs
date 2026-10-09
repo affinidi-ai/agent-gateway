@@ -135,9 +135,12 @@ pub async fn update_a2a_proxy<S: A2aProxyStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "A2A Proxy not found".to_string()))?;
-    if !can_mutate(proxy.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(proxy.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(resource_scope(&scope), tenant_context(&context), ResourceKind::A2aProxies, &proxy.id)
     {
+        return Err((StatusCode::NOT_FOUND, "A2A Proxy not found".to_string()));
+    }
+    if !can_mutate(proxy.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "A2A Proxy is outside this token's permitted scope".into()));
     }
 
@@ -188,9 +191,12 @@ pub async fn delete_a2a_proxy<S: A2aProxyStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "A2A Proxy not found".to_string()))?;
-    if !can_mutate(proxy.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(proxy.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(resource_scope(&scope), tenant_context(&context), ResourceKind::A2aProxies, &proxy.id)
     {
+        return Err((StatusCode::NOT_FOUND, "A2A Proxy not found".to_string()));
+    }
+    if !can_mutate(proxy.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "A2A Proxy is outside this token's permitted scope".into()));
     }
 
@@ -287,6 +293,53 @@ mod tests {
                 .expect("an appliance-wide caller is unaffected"),
             StatusCode::NO_CONTENT
         );
+    }
+
+    #[tokio::test]
+    async fn another_tenants_proxy_is_not_found_on_update_or_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            FileSystemA2aProxyStore::new(dir.path().to_path_buf())
+                .await
+                .expect("store"),
+        );
+        let mut proxy = A2aProxy::new("theirs".to_string(), "before".to_string(), backend(), None);
+        proxy.tenant_id = Some("tenant-b".to_string());
+        let id = proxy.id.clone();
+        store
+            .create(&proxy)
+            .await
+            .expect("create");
+        let tenant = || {
+            Some(Extension(PatTenantContext {
+                token_id: "agat_test".into(),
+                tenant_id: "tenant-a".into(),
+            }))
+        };
+
+        let request: UpdateA2aProxyRequest =
+            serde_json::from_value(serde_json::json!({ "description": "hijacked" })).expect("request");
+        let err = update_a2a_proxy(
+            Extension(store.clone()),
+            Extension(None),
+            Path(id.clone()),
+            tenant(),
+            None,
+            Json(request),
+        )
+        .await
+        .expect_err("update refused");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let err = delete_a2a_proxy(Extension(store.clone()), Path(id.clone()), tenant(), None)
+            .await
+            .expect_err("delete refused");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let kept = store
+            .get(&id)
+            .await
+            .expect("get")
+            .expect("still there");
+        assert_eq!(kept.description, "before");
     }
 
     #[tokio::test]

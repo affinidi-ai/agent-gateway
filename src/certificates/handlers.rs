@@ -123,9 +123,12 @@ pub async fn update_certificate(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Certificate not found: {id}")))?;
-    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(resource_scope(&scope), tenant_context(&context), ResourceKind::Certificates, &id)
     {
+        return Err((StatusCode::NOT_FOUND, format!("Certificate not found: {id}")));
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "certificate is outside this token's permitted scope".into()));
     }
     info!("[Certificates] UPDATE request received for: {}", id);
@@ -149,9 +152,12 @@ pub async fn delete_certificate(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Certificate not found: {id}")))?;
-    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(resource_scope(&scope), tenant_context(&context), ResourceKind::Certificates, &id)
     {
+        return Err((StatusCode::NOT_FOUND, format!("Certificate not found: {id}")));
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "certificate is outside this token's permitted scope".into()));
     }
     info!("[Certificates] DELETE request received for: {}", id);
@@ -326,6 +332,36 @@ mod tests {
             .await
             .unwrap()
             .expect("appliance-wide certificate must survive");
+        assert_eq!(after.name, "Operator certificate");
+        assert_eq!(after.updated_at, certificate.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_certificate_is_not_found_on_update_or_delete() {
+        let (store, certificate, _dir) = stored_certificate(Some("tenant-b")).await;
+
+        let update =
+            update_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None, rename()).await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let delete = delete_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None).await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let after = store
+            .get(&certificate.id)
+            .await
+            .unwrap()
+            .expect("another tenant's certificate must survive");
         assert_eq!(after.name, "Operator certificate");
         assert_eq!(after.updated_at, certificate.updated_at);
     }

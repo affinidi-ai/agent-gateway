@@ -425,6 +425,9 @@ pub async fn update_mediator<S: MediatorStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Mediator not found".to_string()))?;
+    if !mediator_allowed(&mediator, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()));
+    }
     if !mediator_writable(&mediator, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
     }
@@ -545,6 +548,9 @@ pub async fn delete_mediator<S: MediatorStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Mediator not found".to_string()))?;
+    if !mediator_allowed(&mediator, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()));
+    }
     if !mediator_writable(&mediator, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
     }
@@ -922,7 +928,7 @@ pub async fn trust_ping_mediator<S: MediatorStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Mediator not found".to_string()))?;
     if !mediator_allowed(&mediator, &context, &scope) {
-        return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".to_string()));
+        return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()));
     }
 
     tracing::warn!("🆕 [{request_id}] Mediator: {} ({})", mediator.name, mediator.did);
@@ -1184,6 +1190,55 @@ mod tests {
             .await
             .unwrap()
             .expect("appliance-wide mediator must survive");
+        assert_eq!(after.name, "Operator mediator");
+        assert_eq!(after.updated_at, mediator.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_mediator_is_not_found_on_update_or_delete() {
+        use crate::mediators::MediatorStore;
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        let (store, mediator, _dir) = stored_mediator(Some("tenant-b")).await;
+
+        let update = super::update_mediator(
+            Extension(store.clone()),
+            Extension(None),
+            Path(mediator.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let delete = super::delete_mediator(
+            Extension(store.clone()),
+            Extension(None),
+            Extension(None),
+            Extension(None),
+            Path(mediator.id.clone()),
+            tenant_a(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let after = store
+            .get(&mediator.id)
+            .await
+            .unwrap()
+            .expect("another tenant's mediator must survive");
         assert_eq!(after.name, "Operator mediator");
         assert_eq!(after.updated_at, mediator.updated_at);
     }

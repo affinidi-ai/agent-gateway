@@ -298,7 +298,7 @@ pub async fn update_strategy(
             return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to load strategy")).into_response();
         }
     };
-    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -306,6 +306,9 @@ pub async fn update_strategy(
             &existing.id,
         )
     {
+        return (StatusCode::NOT_FOUND, ErrorBody::json(format!("Strategy '{}' not found", id))).into_response();
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return (StatusCode::FORBIDDEN, ErrorBody::json("strategy is outside this token's permitted scope"))
             .into_response();
     }
@@ -372,7 +375,7 @@ pub async fn delete_strategy(
             return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to load strategy")).into_response();
         }
     };
-    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -380,6 +383,9 @@ pub async fn delete_strategy(
             &existing.id,
         )
     {
+        return (StatusCode::NOT_FOUND, ErrorBody::json(format!("Strategy '{}' not found", id))).into_response();
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return (StatusCode::FORBIDDEN, ErrorBody::json("strategy is outside this token's permitted scope"))
             .into_response();
     }
@@ -1186,6 +1192,48 @@ mod tests {
             .expect("strategy must survive");
         assert_eq!(stored.expected_issuer, "https://operator.example.com");
         assert_eq!(stored.tenant_id, None);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_strategy_is_not_found_on_rewrite_or_delete() {
+        let store = Arc::new(MemStore::default());
+        store
+            .inner
+            .insert("strategy-a".to_string(), seeded_strategy(Some("tenant-b")));
+        let (router, _dir) = tenant_router(store.clone()).await;
+
+        let update = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/jwt-verification-strategies/strategy-a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(replacement_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::NOT_FOUND);
+
+        let delete = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/jwt-verification-strategies/strategy-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::NOT_FOUND);
+
+        let stored = store
+            .get("strategy-a")
+            .await
+            .unwrap()
+            .expect("strategy must survive");
+        assert_eq!(stored.expected_issuer, "https://operator.example.com");
     }
 
     #[tokio::test]

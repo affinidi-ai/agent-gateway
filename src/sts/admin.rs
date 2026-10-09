@@ -437,6 +437,9 @@ pub async fn update_client(
             return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error")).into_response();
         }
     };
+    if !client_allowed(&existing, &context, &scope) {
+        return (StatusCode::NOT_FOUND, ErrorBody::json("client not found")).into_response();
+    }
     if !client_writable(&existing, &context, &scope) {
         return (StatusCode::FORBIDDEN, ErrorBody::json("STS client is outside this token's permitted scope"))
             .into_response();
@@ -515,11 +518,11 @@ pub async fn delete_client(
     }
     match store.get(&id).await {
         Ok(Some(client)) if client_writable(&client, &context, &scope) => {}
-        Ok(Some(_)) => {
+        Ok(Some(client)) if client_allowed(&client, &context, &scope) => {
             return (StatusCode::FORBIDDEN, ErrorBody::json("STS client is outside this token's permitted scope"))
                 .into_response();
         }
-        Ok(None) => return (StatusCode::NOT_FOUND, ErrorBody::json("client not found")).into_response(),
+        Ok(Some(_)) | Ok(None) => return (StatusCode::NOT_FOUND, ErrorBody::json("client not found")).into_response(),
         Err(e) => {
             error!(id = %id, error = %e, "Failed to load STS client before delete");
             return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error")).into_response();
@@ -959,6 +962,23 @@ mod tests {
             .await
             .unwrap()
             .expect("appliance-wide client must survive");
+        assert_eq!(after.name, "Agent");
+        assert_eq!(after.updated_at, fixture.client.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_sts_client_is_not_found_on_update_or_delete() {
+        let fixture = sts_fixture(Some("tenant-b")).await;
+
+        assert_eq!(update_as_tenant_a(&fixture).await, StatusCode::NOT_FOUND);
+        assert_eq!(delete_as_tenant_a(&fixture).await, StatusCode::NOT_FOUND);
+
+        let after = fixture
+            .store
+            .get(&fixture.client.id)
+            .await
+            .unwrap()
+            .expect("another tenant's client must survive");
         assert_eq!(after.name, "Agent");
         assert_eq!(after.updated_at, fixture.client.updated_at);
     }

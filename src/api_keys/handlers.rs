@@ -137,8 +137,8 @@ async fn authorize_agent(
         .await
     {
         Ok(Some(surface)) if surface_allows_api_keys(&surface, context, mutation) => Ok(ParentAuthorization::Existing),
-        Ok(Some(_)) => {
-            let status = if mutation {
+        Ok(Some(surface)) => {
+            let status = if surface_allows_api_keys(&surface, context, false) {
                 StatusCode::FORBIDDEN
             } else {
                 StatusCode::NOT_FOUND
@@ -689,6 +689,109 @@ mod tests {
         assert_eq!(rotated.status(), StatusCode::FORBIDDEN);
         assert_eq!(deleted.status(), StatusCode::FORBIDDEN);
         assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(
+            key_store
+                .creates
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            key_store
+                .deletes
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_key_writes_on_another_tenants_surface_are_not_found_before_store_write() {
+        let key_store = Arc::new(CountingKeyStore {
+            creates: AtomicUsize::new(0),
+            deletes: AtomicUsize::new(0),
+            delete_actors: std::sync::Mutex::new(Vec::new()),
+        });
+        let surface_store: ApiKeySurfaceState = Arc::new(OneSurfaceStore {
+            surface: crate::config::agent_surface::AgentSurface {
+                surface_id: "surface-global".into(),
+                tenant_id: Some("tenant-b".into()),
+                ..Default::default()
+            },
+        });
+        let tenant = || {
+            Some(Extension(PatTenantContext {
+                token_id: "atgat-test".into(),
+                tenant_id: "tenant-a".into(),
+            }))
+        };
+        let key_path = || KeyPath {
+            agent_id: "surface-global".into(),
+            key_id: "atgk_operator".into(),
+        };
+        let actor = || Json(ActorRequest { actor: "tenant-user".into() });
+
+        let created = create_key(
+            State(key_store.clone()),
+            Extension(surface_store.clone()),
+            Path(AgentPath {
+                agent_id: "surface-global".into(),
+            }),
+            tenant(),
+            None,
+            Json(CreateApiKeyRequest {
+                client_id: "client-a".into(),
+                labels: None,
+            }),
+        )
+        .await
+        .into_response();
+        let revoked = revoke_key(
+            State(key_store.clone()),
+            Extension(surface_store.clone()),
+            Path(key_path()),
+            tenant(),
+            None,
+            actor(),
+        )
+        .await
+        .into_response();
+        let rotated = rotate_key(
+            State(key_store.clone()),
+            Extension(surface_store.clone()),
+            Path(key_path()),
+            tenant(),
+            None,
+            actor(),
+        )
+        .await
+        .into_response();
+        let deleted = delete_key(
+            State(key_store.clone()),
+            Extension(surface_store.clone()),
+            Path(key_path()),
+            tenant(),
+            None,
+            None,
+            Some(Extension(AuthGuardOk("tenant-user".into()))),
+        )
+        .await
+        .into_response();
+        let listed = list_keys(
+            State(key_store.clone()),
+            Extension(surface_store),
+            Path(AgentPath {
+                agent_id: "surface-global".into(),
+            }),
+            tenant(),
+            None,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(created.status(), StatusCode::NOT_FOUND);
+        assert_eq!(revoked.status(), StatusCode::NOT_FOUND);
+        assert_eq!(rotated.status(), StatusCode::NOT_FOUND);
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+        assert_eq!(listed.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             key_store
                 .creates

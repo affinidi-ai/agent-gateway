@@ -178,7 +178,7 @@ pub async fn update_authority<S: AuthorityStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Authority not found".to_string()))?;
-    if !can_mutate(authority.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(authority.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -186,6 +186,9 @@ pub async fn update_authority<S: AuthorityStore>(
             &authority.id,
         )
     {
+        return Err((StatusCode::NOT_FOUND, "Authority not found".to_string()));
+    }
+    if !can_mutate(authority.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "Authority is outside this token's permitted scope".into()));
     }
 
@@ -222,7 +225,7 @@ pub async fn delete_authority<S: AuthorityStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Authority not found".to_string()))?;
-    if !can_mutate(authority.tenant_id.as_deref(), tenant_context(&context))
+    if !can_access(authority.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(
             resource_scope(&scope),
             tenant_context(&context),
@@ -230,6 +233,9 @@ pub async fn delete_authority<S: AuthorityStore>(
             &authority.id,
         )
     {
+        return Err((StatusCode::NOT_FOUND, "Authority not found".to_string()));
+    }
+    if !can_mutate(authority.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "Authority is outside this token's permitted scope".into()));
     }
 
@@ -679,6 +685,42 @@ mod tests {
                 .err()
                 .map(|(status, _)| status),
             Some(StatusCode::FORBIDDEN)
+        );
+
+        let Json(after) = get_authority(Extension(store), Path(created.id), None, None)
+            .await
+            .unwrap();
+        assert_eq!(after.name, "Operator anchor");
+        assert_eq!(after.updated_at, created.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_authority_is_not_found_on_update_or_delete() {
+        let (store, _dir) = test_store().await;
+        let created = create_for_tenant(&store, Some("tenant-b"), "did:web:operator.example.com").await;
+
+        let update = update_authority(
+            Extension(store.clone()),
+            Extension(None),
+            Path(created.id.clone()),
+            tenant_a(),
+            None,
+            rename(&created.did),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let delete = delete_authority(Extension(store.clone()), Path(created.id.clone()), tenant_a(), None).await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
         );
 
         let Json(after) = get_authority(Extension(store), Path(created.id), None, None)
