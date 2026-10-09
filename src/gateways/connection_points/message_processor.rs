@@ -1001,20 +1001,58 @@ async fn load_invited_connection_point(
     }
 }
 
-/// Record that an invitation has paired a gateway, so a later connection-setup on it is refused.
+/// Why an invitation was not redeemed for a connection-setup.
+#[derive(Debug, PartialEq)]
+pub(crate) enum InvitationRefusal {
+    InvalidSecret,
+    Unavailable(String),
+}
+
+/// Redeem the invitation whose DID a connection-setup was addressed to, returning the redeemed record.
+///
+/// The record is read again here, so edits made since the setup arrived are kept, and only
+/// `use_count` and `last_used_at` change. Single use relies on connection-setup being dispatched
+/// inline (`dispatches_inline` in ws_listener.rs), so two setups on one listener cannot both pass
+/// the `use_count` check before either writes.
 pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
     store: &CS,
-    invitation: &crate::gateways::connection_points::types::GatewayConnectionPoint,
-) -> Result<(), String> {
-    let mut redeemed = invitation.clone();
-    redeemed.use_count = redeemed
-        .use_count
-        .saturating_add(1);
-    redeemed.last_used_at = Some(chrono::Utc::now());
-    store
-        .update(&redeemed)
+    connection_point_did: &str,
+    provided_secret: &str,
+) -> Result<crate::gateways::connection_points::types::GatewayConnectionPoint, InvitationRefusal> {
+    use subtle::ConstantTimeEq;
+
+    let unavailable = |reason: &str| InvitationRefusal::Unavailable(reason.to_string());
+    let mut invitation = store
+        .list_all()
         .await
-        .map_err(|e| format!("Failed to mark invitation {} as used: {}", invitation.id, e))
+        .map_err(|e| InvitationRefusal::Unavailable(format!("failed to list connection points: {}", e)))?
+        .into_iter()
+        .find(|cp| cp.connection_point_did == connection_point_did)
+        .ok_or_else(|| unavailable("connection point not found"))?;
+    if invitation.cp_type != crate::gateways::connection_points::types::ConnectionPointType::User {
+        return Err(unavailable("connection point is not an invitation"));
+    }
+    if !invitation.enabled {
+        return Err(unavailable("connection point is disabled"));
+    }
+    if invitation.use_count > 0 {
+        return Err(unavailable("invitation has already been used"));
+    }
+    let secret_matches: bool = invitation
+        .secret
+        .as_bytes()
+        .ct_eq(provided_secret.as_bytes())
+        .into();
+    if invitation.secret.is_empty() || !secret_matches {
+        return Err(InvitationRefusal::InvalidSecret);
+    }
+    invitation.use_count += 1;
+    invitation.last_used_at = Some(chrono::Utc::now());
+    store
+        .update(&invitation)
+        .await
+        .map_err(|e| InvitationRefusal::Unavailable(format!("failed to mark invitation as used: {}", e)))?;
+    Ok(invitation)
 }
 
 async fn process_connection_accepted(message: &ReceivedMessage) -> ProcessingResult {
@@ -10965,33 +11003,161 @@ mod tests {
         make_connection_setup_msg(storage_root, connection_point_id, setup_body(&did, Some(&proof)))
     }
 
+    async fn invitation_store(
+        storage_root: &std::path::Path
+    ) -> crate::gateways::connection_points::FileSystemConnectionPointStore {
+        crate::gateways::connection_points::FileSystemConnectionPointStore::new(storage_root.join("connection_points"))
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn redeemed_invitation_refuses_a_second_setup() {
+    async fn redeeming_an_invitation_refuses_a_later_setup() {
         init_resolver().await;
         let temp = tempfile::tempdir().unwrap();
         let connection_point = store_invitation(temp.path(), None).await;
-        let first = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
-        assert!(matches!(first, ProcessingResult::OOBConnectionSetup(_)), "{first:?}");
-        let store = crate::gateways::connection_points::FileSystemConnectionPointStore::new(
-            temp.path()
-                .join("connection_points"),
-        )
-        .await
-        .unwrap();
+        let store = invitation_store(temp.path()).await;
 
-        redeem_invitation(&store, &connection_point)
+        let redeemed = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
             .await
             .unwrap();
 
-        let stored = store
-            .get(&connection_point.id)
+        assert_eq!(redeemed.id, connection_point.id);
+        assert_eq!(redeemed.use_count, 1);
+        assert!(
+            redeemed
+                .last_used_at
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .use_count,
+            1
+        );
+        let later = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
+        assert_eq!(failure_reason(&later), "invitation has already been used");
+        assert_eq!(
+            redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+                .await
+                .unwrap_err(),
+            InvitationRefusal::Unavailable("invitation has already been used".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn redeeming_keeps_edits_made_after_the_setup_arrived() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+        connection_point.name = "Renamed".to_string();
+        store
+            .update(&connection_point)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(stored.use_count, 1);
-        assert!(stored.last_used_at.is_some());
-        let second = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
-        assert_eq!(failure_reason(&second), "invitation has already been used");
+
+        let redeemed = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+
+        assert_eq!(redeemed.name, "Renamed");
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "Renamed"
+        );
+    }
+
+    #[tokio::test]
+    async fn redeeming_with_a_wrong_secret_leaves_the_invitation_unused() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+
+        let refused = redeem_invitation(&store, INVITER_TMP_DID, "wrong")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused, InvitationRefusal::InvalidSecret);
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .use_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn redeeming_an_invitation_without_a_secret_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.secret = String::new();
+        save_connection_point(temp.path(), &connection_point).await;
+        let store = invitation_store(temp.path()).await;
+
+        let refused = redeem_invitation(&store, INVITER_TMP_DID, "")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused, InvitationRefusal::InvalidSecret);
+    }
+
+    #[tokio::test]
+    async fn redeeming_an_invitation_disabled_or_deleted_after_the_setup_arrived_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+        connection_point.enabled = false;
+        store
+            .update(&connection_point)
+            .await
+            .unwrap();
+
+        let disabled = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+        store
+            .delete(&connection_point.id)
+            .await
+            .unwrap();
+        let deleted = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+
+        assert_eq!(disabled, InvitationRefusal::Unavailable("connection point is disabled".to_string()));
+        assert_eq!(deleted, InvitationRefusal::Unavailable("connection point not found".to_string()));
+        assert!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn redeeming_a_system_connection_point_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.cp_type = crate::gateways::connection_points::ConnectionPointType::OobResponder;
+        save_connection_point(temp.path(), &connection_point).await;
+        let store = invitation_store(temp.path()).await;
+
+        let refused = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused, InvitationRefusal::Unavailable("connection point is not an invitation".to_string()));
     }
 
     const NOT_THIS_INVITATION: &str = "connection-setup does not reference this invitation";

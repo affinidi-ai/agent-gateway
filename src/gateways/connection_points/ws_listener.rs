@@ -2487,7 +2487,8 @@ impl<CS: super::ConnectionPointStore + 'static> OpenAdmission<CS> {
 }
 
 /// Connection-protocol OOB messages run inline because their handlers stop or
-/// replace this listener. Messages that only complete a waiter held by an
+/// replace this listener, and because single use of an invitation relies on two
+/// connection-setups on one listener never being redeemed concurrently. Messages that only complete a waiter held by an
 /// in-flight dispatch run inline, because waiting for a slot could wait on the
 /// very dispatch the reply would free.
 fn dispatches_inline(message_type: &str) -> bool {
@@ -3661,59 +3662,44 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
     // Step 0: Validate the secret
     info!("🔐 Step 0: Validating connection secret...");
 
-    // Find the connection point that corresponds to our temporary DID
-    let all_connection_points = cp_store
-        .list_all()
-        .await
-        .map_err(|e| format!("Failed to list connection points: {}", e))?;
-
-    let connection_point = all_connection_points
-        .iter()
-        .find(|cp| cp.connection_point_did == our_temporary_did)
-        .ok_or_else(|| {
-            error!("❌ Connection point not found for our DID: {}", our_temporary_did);
-            "Connection point not found".to_string()
-        })?;
-
-    info!("  Found connection point: {} (ID: {})", connection_point.name, connection_point.id);
-    info!("  Validating secret...");
-
-    // Validate the secret
-    let secret_matches: bool = subtle::ConstantTimeEq::ct_eq(
-        connection_point
-            .secret
-            .as_bytes(),
-        provided_secret.as_bytes(),
+    let connection_point = match super::message_processor::redeem_invitation(
+        cp_store.as_ref(),
+        our_temporary_did,
+        provided_secret,
     )
-    .into();
-    if connection_point
-        .secret
-        .is_empty()
-        || !secret_matches
+    .await
     {
-        error!("❌ Secret validation failed for connection point {}", connection_point.id);
-
-        // Send connection-rejected message back to acceptor
-        info!("📤 Sending connection-rejected message to acceptor...");
-
-        match crate::comm::didcomm::gateway::send_connection_rejected(
-            client,
-            our_temporary_did,
-            acceptor_temporary_did,
-            "Invalid connection secret",
-        )
-        .await
-        {
-            Ok(_) => {
-                info!("✓ Connection-rejected message sent successfully");
-            }
-            Err(e) => {
-                error!("❌ Failed to send connection-rejected message: {}", e);
-            }
+        Ok(connection_point) => connection_point,
+        Err(super::message_processor::InvitationRefusal::Unavailable(reason)) => {
+            error!("❌ Invitation for {} not redeemed: {}", our_temporary_did, reason);
+            return Err(reason);
         }
+        Err(super::message_processor::InvitationRefusal::InvalidSecret) => {
+            error!("❌ Secret validation failed for invitation {}", our_temporary_did);
 
-        return Err("Invalid connection secret".to_string());
-    }
+            // Send connection-rejected message back to acceptor
+            info!("📤 Sending connection-rejected message to acceptor...");
+
+            match crate::comm::didcomm::gateway::send_connection_rejected(
+                client,
+                our_temporary_did,
+                acceptor_temporary_did,
+                "Invalid connection secret",
+            )
+            .await
+            {
+                Ok(_) => {
+                    info!("✓ Connection-rejected message sent successfully");
+                }
+                Err(e) => {
+                    error!("❌ Failed to send connection-rejected message: {}", e);
+                }
+            }
+
+            return Err("Invalid connection secret".to_string());
+        }
+    };
+    info!("  Redeemed invitation: {} (ID: {})", connection_point.name, connection_point.id);
 
     info!("✓ Secret validated successfully");
 
@@ -3780,8 +3766,6 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
     crate::config::enforce_add("connections.gateways")
         .await
         .map_err(|e| format!("Inbound gateway connection refused (appliance limit): {}", e.message()))?;
-
-    super::message_processor::redeem_invitation(cp_store.as_ref(), connection_point).await?;
 
     // Step 2: Create our secure DID for the permanent connection
     info!("🔑 Creating our secure DID for permanent connection...");
