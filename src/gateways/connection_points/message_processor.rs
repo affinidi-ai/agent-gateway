@@ -4084,6 +4084,8 @@ async fn process_forward_request_with_mcp_runtime(
             None
         };
 
+    let source_auth_failed = source_auth_failure.is_some();
+
     // Merged source-auth context for policy inputs: the verified identity on
     // success, or a `Failed` marker on a non-blocking caller-attributable
     // failure. `None` when no source auth is configured.
@@ -4763,6 +4765,7 @@ async fn process_forward_request_with_mcp_runtime(
             proxy_id,
             body_bytes,
             caller_identity,
+            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
         )
         .await;
     }
@@ -4783,6 +4786,7 @@ async fn process_forward_request_with_mcp_runtime(
             headers,
             body_bytes,
             caller_identity,
+            source_auth_failed,
         )
         .await;
     }
@@ -4946,12 +4950,12 @@ async fn process_forward_request_with_mcp_runtime(
             }
         };
 
-        match crate::proxy::handler::inject_target_auth_header(
-            target_auth,
-            &secrets_store,
-            &surface.name,
-            crate::proxy::handler::CallerAssertion::Authenticated,
-        )
+        let caller = if is_agent_card_request {
+            crate::proxy::handler::CallerAssertion::GatewayOriginated
+        } else {
+            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed)
+        };
+        match crate::proxy::handler::inject_target_auth_header(target_auth, &secrets_store, &surface.name, caller)
         .await
         {
             Ok(Some((header_name, header_value))) => {
@@ -7197,6 +7201,7 @@ async fn handle_a2a_proxy_forward(
     proxy_id: &str,
     body_bytes: bytes::Bytes,
     caller_identity: Option<String>,
+    caller: crate::proxy::handler::CallerAssertion,
 ) -> ProcessingResult {
     let config_id = surface
         .config_id()
@@ -7257,7 +7262,7 @@ async fn handle_a2a_proxy_forward(
 
     let secrets_store = get_secrets_store();
     let response = adapter
-        .dispatch_message_send(proxy_id, &body_bytes, secrets_store.as_ref(), &surface.name)
+        .dispatch_message_send(proxy_id, &body_bytes, secrets_store.as_ref(), &surface.name, caller)
         .await;
 
     let request_body_bytes = body_bytes;
@@ -7469,11 +7474,12 @@ async fn handle_mcp_proxy_forward(
     surface: &crate::config::agent_surface::AgentSurface,
     channel_id: &str,
     proxy_id: &str,
-    _method: &str,
-    _path: &str,
+    method: &str,
+    path: &str,
     _headers: Option<serde_json::Map<String, serde_json::Value>>,
     body_bytes: bytes::Bytes,
     caller_identity: Option<String>,
+    source_auth_failed: bool,
 ) -> ProcessingResult {
     // Record fields in the span
     tracing::Span::current().record("channel_id", channel_id);
@@ -7651,7 +7657,7 @@ async fn handle_mcp_proxy_forward(
             target_auth,
             &secrets_store,
             &surface.name,
-            crate::proxy::handler::CallerAssertion::Authenticated,
+            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
         )
         .await
         {
