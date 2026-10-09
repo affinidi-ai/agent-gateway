@@ -526,6 +526,7 @@ pub(crate) async fn send_rpc(
     world.sent_body = Some(body.clone());
 
     let client = Client::new();
+    let sent_at = tokio::time::Instant::now();
     let response = if retry_transient_timeout {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -543,6 +544,7 @@ pub(crate) async fn send_rpc(
             .expect("caller request must succeed at the transport layer")
     };
 
+    world.response_elapsed = Some(sent_at.elapsed());
     world.response_status = Some(response.status);
     world.response_content_type = response.content_type;
     world.response_body = Some(response.body);

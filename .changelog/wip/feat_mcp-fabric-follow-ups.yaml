@@ -25,3 +25,12 @@ changes:
     - timestamp: '2026-10-09T10:40:00.000Z'
       title: Let g2g scenarios flush the scenario mediator's store
       description: The g2g harness can empty the scenario mediator's store while the mediator and the gateways' connections keep running. A scenario uses it to show that a gateway that only receives is reachable again after the mediator loses every account.
+    - timestamp: '2026-10-09T15:00:00.000Z'
+      title: Test a modern Fabric sender against a legacy-only receiver
+      description: A g2g scenario runs the receiving gateway on the legacy-only Fabric receive policy, switched on for the g2g suite by AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY and read only in test mode, and shows that a modern MCP request fails within 5 seconds with 400 and -32022 listing only 2024-11-05, without reaching the MCP server.
+    - timestamp: '2026-10-09T15:00:00.000Z'
+      title: Replace the Open replay proof test with one built on the current admission
+      description: One replay proof test, admitting Opens through the receiver's own entry point with both envelope times set, shows that a captured Open is refused after its stream ends and after its clamped lifetime, and that a captured capability query cannot recreate the expired offer the Open was bound to. It fails when the capability-query replay check is removed, and replaces two tests that duplicated their setup and admitted Opens under a hand-built version policy.
+    - timestamp: '2026-10-09T15:00:00.000Z'
+      title: Document the shared pepper and per-node OAuth state checks for multiple nodes
+      description: The deployment docs say to set the same AG_IDENTITY_HASH_PEPPER on every node of a multi-node gateway, and that used OAuth state nonces are checked per node, not across nodes.

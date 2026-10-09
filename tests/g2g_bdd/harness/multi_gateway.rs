@@ -103,6 +103,9 @@ pub struct GatewayPlan {
     pub surfaces: Vec<SurfaceSpec>,
     pub mock_responses: HashMap<String, serde_json::Value>,
     pub mock_response_delays: HashMap<String, (u64, u64)>,
+    /// Admits only legacy MCP on Fabric streams it receives, as a gateway
+    /// whose surfaces do not serve modern MCP does.
+    pub legacy_only_fabric_receive: bool,
 }
 
 impl GatewayPlan {
@@ -796,6 +799,9 @@ async fn spawn_node(
     let mut extra_env: HashMap<String, String> = HashMap::new();
     if let Some(allowlist) = mediator_egress_allowlist(mediator) {
         extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), allowlist);
+    }
+    if plan.legacy_only_fabric_receive {
+        extra_env.insert("AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY".to_string(), "true".to_string());
     }
     let mut gateway = GatewayProcess::start_g2g_with_env(&config_path, temp_dir.path(), &extra_env);
     gateway = gateway

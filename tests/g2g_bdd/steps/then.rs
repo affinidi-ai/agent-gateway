@@ -837,6 +837,17 @@ pub async fn mcp_unsupported_version_error_has_exact_versions(
     assert_mcp_unsupported_version_error(response_body(world), &requested, &supported);
 }
 
+#[then(expr = "the response arrives in under {int} seconds")]
+pub async fn response_arrives_within(
+    world: &mut G2gWorld,
+    seconds: u64,
+) {
+    let elapsed = world
+        .response_elapsed
+        .expect("the caller sent no request through a surface");
+    assert!(elapsed < std::time::Duration::from_secs(seconds), "the response took {elapsed:?}");
+}
+
 #[then(expr = "the A2A response result matches managed agent {string} response result")]
 #[then(expr = "the MCP response result matches MCP server {string} response result")]
 pub async fn response_result_matches_target(

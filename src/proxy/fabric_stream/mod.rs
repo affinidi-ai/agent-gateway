@@ -150,15 +150,8 @@ impl StreamRuntime {
         connection_point: &crate::gateways::connection_points::types::GatewayConnectionPoint,
         peer: &crate::gateways::types::Gateway,
     ) -> Result<IncomingStream, OpenRefusal> {
-        self.prepare_incoming_with_versions(
-            message,
-            connection_point,
-            peer,
-            crate::mcp::request_validation::runtime_policy_for(
-                crate::mcp::request_validation::McpPathKind::FabricReceive,
-            ),
-        )
-        .await
+        self.prepare_incoming_with_versions(message, connection_point, peer, fabric_receive_policy())
+            .await
     }
 
     pub(crate) async fn prepare_incoming_with_versions(
@@ -747,6 +740,36 @@ impl Drop for ListenerGeneration {
             listeners.remove(&self.connection_point_id);
         }
     }
+}
+
+/// The MCP versions a received Fabric `Open` is admitted under. The g2g suite
+/// runs a receiver on the legacy-only policy, as a gateway whose surfaces do
+/// not serve modern MCP, with `AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY=true`, which
+/// is read only when `AG_TEST_MODE=true`.
+fn fabric_receive_policy() -> crate::mcp::request_validation::McpVersionPolicy<'static> {
+    static LEGACY_ONLY: OnceLock<bool> = OnceLock::new();
+    let legacy_only = *LEGACY_ONLY.get_or_init(|| {
+        bdd_legacy_only_receive(
+            std::env::var("AG_TEST_MODE")
+                .ok()
+                .as_deref(),
+            std::env::var("AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY")
+                .ok()
+                .as_deref(),
+        )
+    });
+    if legacy_only {
+        crate::mcp::request_validation::LEGACY_ONLY_POLICY
+    } else {
+        crate::mcp::request_validation::runtime_policy_for(crate::mcp::request_validation::McpPathKind::FabricReceive)
+    }
+}
+
+fn bdd_legacy_only_receive(
+    test_mode: Option<&str>,
+    legacy_only: Option<&str>,
+) -> bool {
+    test_mode == Some("true") && legacy_only == Some("true")
 }
 
 pub(crate) fn global() -> Result<&'static Arc<StreamRuntime>, String> {
@@ -1838,6 +1861,27 @@ mod tests {
     }
 
     #[test]
+    fn only_test_mode_lets_the_g2g_suite_receive_fabric_streams_as_legacy_only() {
+        assert!(super::bdd_legacy_only_receive(Some("true"), Some("true")));
+        for (test_mode, legacy_only) in [
+            (None, Some("true")),
+            (Some("false"), Some("true")),
+            (Some("true"), None),
+            (Some("true"), Some("1")),
+            (None, None),
+        ] {
+            assert!(
+                !super::bdd_legacy_only_receive(test_mode, legacy_only),
+                "AG_TEST_MODE={test_mode:?} AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY={legacy_only:?}"
+            );
+        }
+        assert!(
+            super::fabric_receive_policy().supports_modern(crate::mcp::MCP_MODERN_VERSION),
+            "a gateway without the BDD switch admits modern MCP over Fabric"
+        );
+    }
+
+    #[test]
     fn a_full_stream_cap_is_refused_as_capacity_reached_and_other_refusals_as_unavailable() {
         let refusal = OpenRefusal::from(registry::RegisterError::CapacityReached("full"));
         assert_eq!(refusal.code, wire::StreamErrorCode::CapacityReached);
@@ -1935,382 +1979,297 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn open_replay_is_refused_after_the_clamped_lifetime_while_the_offer_is_live() {
-        use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
-        use crate::gateways::types::{Gateway, GatewayType};
-        use crate::mcp::request_validation::McpVersionPolicy;
-        use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
-        use serde_json::json;
-
-        if std::env::var_os("ATG_FABRIC_STREAM_ADMISSION_CHILD").is_none() {
-            let test_name = std::thread::current()
-                .name()
-                .unwrap()
-                .to_string();
-            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &test_name, "--nocapture"])
-                .env("ATG_FABRIC_STREAM_ADMISSION_CHILD", "1")
-                .env("RUST_MIN_STACK", "8388608")
-                .kill_on_drop(true)
-                .output()
-                .await
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "isolated Open replay failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let surfaces_path = directory
-            .path()
-            .join("surfaces");
-        let store = FileSystemAgentSurfaceStore::new(surfaces_path.clone())
-            .await
-            .unwrap();
-        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface", "name": "Surface",
-            "mcp_http": {"stream_idle_timeout_secs": 1, "stream_max_lifetime_secs": 1},
-            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
-            "target": {"endpoint": "https://target.example/mcp"}
-        }))
-        .unwrap();
-        store
-            .save(&surface)
-            .await
-            .unwrap();
-        let mut connection = GatewayConnectionPoint::new(
-            "gateway".into(),
-            "mediator".into(),
-            "did:example:local".into(),
-            "Connection".into(),
-            String::new(),
-            "oob".into(),
-            String::new(),
-            json!({}),
-            None,
-            ConnectionPointType::User,
-            String::new(),
-        );
-        connection.id = "cp".into();
-        let peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
-        let mut paired = peer.clone();
-        paired.issuer_did = Some("did:example:peer-gateway".into());
-        let _paired_dir =
-            crate::gateways::test_helpers::install_listener_manager_with_peers(directory.path(), &[paired]).await;
-        let capabilities = StreamCapabilities::local(true, true);
-        let runtime = Arc::new(StreamRuntime {
-            registry: ReceiveRegistry::new(RegistryLimits {
-                max_streams: 4,
-                max_peer_streams: 4,
-                max_surface_streams: 4,
-                max_peer_listens: 4,
-                max_surface_listens: 4,
-            })
-            .unwrap(),
-            peers: PeerCapabilities::new(capabilities.clone()),
-            local_capabilities: capabilities.clone(),
-            listeners: Mutex::new(HashMap::new()),
-        });
-        let listener = runtime
-            .listener(
-                connection.id.clone(),
-                connection
-                    .connection_point_did
-                    .clone(),
-            )
-            .unwrap();
-        let metadata = || MessageMetadata {
-            authenticated: true,
-            encrypted: true,
-            from_key: None,
-            extra: json!(null),
-        };
-        let nonce = Uuid::new_v4();
-        let mut offer = ReceivedMessage::new(
-            connection.id.clone(),
-            peer.id.clone(),
-            MessageType::ForwardStreamQuery.to_string(),
-            nonce.to_string(),
-            Some(nonce.to_string()),
-            Some(peer.did.clone()),
-            vec![
-                connection
-                    .connection_point_did
-                    .clone(),
-            ],
-            None,
-            Some(crate::gateways::connection_points::envelope_replay::now_secs() + 60),
-            serde_json::to_value(CapabilityMessage { nonce, capabilities }).unwrap(),
-            metadata(),
-        );
-        listener.stamp(&mut offer);
-        assert!(matches!(
-            runtime.process(&offer, &MessageType::ForwardStreamQuery),
-            ProcessingResult::RequiresResponse { .. }
-        ));
-        let stream_id = Uuid::new_v4();
-        let request = wire::OpenRequest {
-            capability_nonce: nonce,
-            channel_id: surface.surface_id.clone(),
-            variant_alias: None,
-            path: "/mcp".into(),
-            headers: std::collections::BTreeMap::from([
-                ("mcp-protocol-version".into(), vec![crate::mcp::MCP_MODERN_VERSION.into()]),
-                ("mcp-method".into(), vec!["tools/list".into()]),
-            ]),
-            body_bytes: 0,
-            response_window_bytes: wire::MAX_CHUNK_BYTES as u32,
-            deadline_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000,
-            trace_id: Uuid::new_v4(),
-        };
-        let mut message = ReceivedMessage::new(
-            connection.id.clone(),
-            peer.id.clone(),
-            MessageType::ForwardStreamFrame.to_string(),
-            Uuid::new_v4().to_string(),
-            Some(stream_id.to_string()),
-            Some(peer.did.clone()),
-            vec![
-                connection
-                    .connection_point_did
-                    .clone(),
-            ],
-            None,
-            Some(crate::gateways::connection_points::envelope_replay::now_secs() + 60),
-            serde_json::to_value(wire::StreamFrame {
-                stream_id,
-                payload: wire::FramePayload::Open { request },
-            })
-            .unwrap(),
-            metadata(),
-        )
-        .with_context("agent_surface_storage_path", json!(surfaces_path));
-        listener.stamp(&mut message);
-        let versions = McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
-        let accepted = runtime
-            .prepare_incoming_with_versions(&message, &connection, &peer, versions)
-            .await
-            .expect("first Open is accepted");
-        drop(accepted);
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        let replay = runtime
-            .prepare_incoming_with_versions(&message, &connection, &peer, versions)
-            .await;
-        assert!(
-            replay.is_err(),
-            "the same Open envelope was accepted again after the 1 s clamped lifetime, \
-             while its 60 s sender deadline, envelope expiry and capability offer are all still live"
-        );
+    /// A receiving gateway with one surface and one paired peer, fed the
+    /// capability queries and Opens the peer's current sender builds: both
+    /// envelope times set, and an Open naming its capability offer.
+    struct ReplayFixture {
+        runtime: Arc<StreamRuntime>,
+        listener: ListenerGeneration,
+        connection: crate::gateways::connection_points::types::GatewayConnectionPoint,
+        peer: crate::gateways::types::Gateway,
+        surfaces_path: std::path::PathBuf,
+        _directory: tempfile::TempDir,
+        _paired_dir: tempfile::TempDir,
     }
 
-    #[tokio::test]
-    async fn a_replayed_capability_query_cannot_revive_an_expired_offer_for_a_captured_open() {
-        use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
-        use crate::gateways::types::{Gateway, GatewayType};
-        use crate::mcp::request_validation::McpVersionPolicy;
-        use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
-        use serde_json::json;
+    impl ReplayFixture {
+        const SURFACE_ID: &'static str = "surface";
 
-        if std::env::var_os("ATG_FABRIC_STREAM_ADMISSION_CHILD").is_none() {
-            let test_name = std::thread::current()
-                .name()
-                .unwrap()
-                .to_string();
-            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &test_name, "--nocapture"])
-                .env("ATG_FABRIC_STREAM_ADMISSION_CHILD", "1")
-                .env("RUST_MIN_STACK", "8388608")
-                .kill_on_drop(true)
-                .output()
+        async fn new() -> Self {
+            use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
+            use crate::gateways::types::{Gateway, GatewayType};
+            use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
+
+            let directory = tempfile::tempdir().unwrap();
+            let surfaces_path = directory
+                .path()
+                .join("surfaces");
+            let store = FileSystemAgentSurfaceStore::new(surfaces_path.clone())
                 .await
                 .unwrap();
-            assert!(
-                output.status.success(),
-                "isolated capability query replay failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+            // The stream lifetime is clamped to 1 s, far below the Open's
+            // deadline, envelope expiry and offer lifetime.
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+                "surface_id": Self::SURFACE_ID, "name": "Surface",
+                "mcp_http": {"stream_idle_timeout_secs": 1, "stream_max_lifetime_secs": 1},
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "https://target.example/mcp"}
+            }))
+            .unwrap();
+            store
+                .save(&surface)
+                .await
+                .unwrap();
+            let mut connection = GatewayConnectionPoint::new(
+                "gateway".into(),
+                "mediator".into(),
+                "did:example:local".into(),
+                "Connection".into(),
+                String::new(),
+                "oob".into(),
+                String::new(),
+                serde_json::json!({}),
+                None,
+                ConnectionPointType::User,
+                String::new(),
             );
-            return;
+            connection.id = "cp".into();
+            let peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
+            let mut paired = peer.clone();
+            paired.issuer_did = Some("did:example:peer-gateway".into());
+            let paired_dir =
+                crate::gateways::test_helpers::install_listener_manager_with_peers(directory.path(), &[paired]).await;
+            let capabilities = StreamCapabilities::local(true, true);
+            let runtime = Arc::new(StreamRuntime {
+                registry: ReceiveRegistry::new(RegistryLimits {
+                    max_streams: 4,
+                    max_peer_streams: 4,
+                    max_surface_streams: 4,
+                    max_peer_listens: 4,
+                    max_surface_listens: 4,
+                })
+                .unwrap(),
+                peers: PeerCapabilities::new(capabilities.clone()),
+                local_capabilities: capabilities,
+                listeners: Mutex::new(HashMap::new()),
+            });
+            let listener = runtime
+                .listener(
+                    connection.id.clone(),
+                    connection
+                        .connection_point_did
+                        .clone(),
+                )
+                .unwrap();
+            Self {
+                runtime,
+                listener,
+                connection,
+                peer,
+                surfaces_path,
+                _directory: directory,
+                _paired_dir: paired_dir,
+            }
         }
-        let directory = tempfile::tempdir().unwrap();
-        let surfaces_path = directory
-            .path()
-            .join("surfaces");
-        let store = FileSystemAgentSurfaceStore::new(surfaces_path.clone())
-            .await
-            .unwrap();
-        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
-            "surface_id": "surface", "name": "Surface",
-            "mcp_http": {"stream_idle_timeout_secs": 1, "stream_max_lifetime_secs": 1},
-            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
-            "target": {"endpoint": "https://target.example/mcp"}
-        }))
-        .unwrap();
-        store
-            .save(&surface)
-            .await
-            .unwrap();
-        let mut connection = GatewayConnectionPoint::new(
-            "gateway".into(),
-            "mediator".into(),
-            "did:example:local".into(),
-            "Connection".into(),
-            String::new(),
-            "oob".into(),
-            String::new(),
-            json!({}),
-            None,
-            ConnectionPointType::User,
-            String::new(),
-        );
-        connection.id = "cp".into();
-        let peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
-        let mut paired = peer.clone();
-        paired.issuer_did = Some("did:example:peer-gateway".into());
-        let _paired_dir =
-            crate::gateways::test_helpers::install_listener_manager_with_peers(directory.path(), &[paired]).await;
-        let capabilities = StreamCapabilities::local(true, true);
-        let runtime = Arc::new(StreamRuntime {
-            registry: ReceiveRegistry::new(RegistryLimits {
-                max_streams: 4,
-                max_peer_streams: 4,
-                max_surface_streams: 4,
-                max_peer_listens: 4,
-                max_surface_listens: 4,
-            })
-            .unwrap(),
-            peers: PeerCapabilities::new(capabilities.clone()),
-            local_capabilities: capabilities.clone(),
-            listeners: Mutex::new(HashMap::new()),
-        });
-        let listener = runtime
-            .listener(
-                connection.id.clone(),
-                connection
-                    .connection_point_did
-                    .clone(),
+
+        fn envelope(
+            &self,
+            message_type: MessageType,
+            id: Uuid,
+            thid: Uuid,
+            body: serde_json::Value,
+        ) -> ReceivedMessage {
+            let now = crate::gateways::connection_points::envelope_replay::now_secs();
+            let mut message = ReceivedMessage::new(
+                self.connection.id.clone(),
+                self.peer.id.clone(),
+                message_type.to_string(),
+                id.to_string(),
+                Some(thid.to_string()),
+                Some(self.peer.did.clone()),
+                vec![
+                    self.connection
+                        .connection_point_did
+                        .clone(),
+                ],
+                Some(now),
+                Some(now + 60),
+                body,
+                MessageMetadata {
+                    authenticated: true,
+                    encrypted: true,
+                    from_key: None,
+                    extra: serde_json::Value::Null,
+                },
             )
-            .unwrap();
-        let metadata = || MessageMetadata {
-            authenticated: true,
-            encrypted: true,
-            from_key: None,
-            extra: json!(null),
-        };
-        let nonce = Uuid::new_v4();
-        let mut offer = ReceivedMessage::new(
-            connection.id.clone(),
-            peer.id.clone(),
-            MessageType::ForwardStreamQuery.to_string(),
-            nonce.to_string(),
-            Some(nonce.to_string()),
-            Some(peer.did.clone()),
-            vec![
-                connection
-                    .connection_point_did
-                    .clone(),
-            ],
-            None,
-            Some(crate::gateways::connection_points::envelope_replay::now_secs() + 60),
-            serde_json::to_value(CapabilityMessage { nonce, capabilities }).unwrap(),
-            metadata(),
-        );
-        listener.stamp(&mut offer);
-        assert!(matches!(
-            runtime.process(&offer, &MessageType::ForwardStreamQuery),
-            ProcessingResult::RequiresResponse { .. }
-        ));
-        let stream_id = Uuid::new_v4();
-        let request = wire::OpenRequest {
-            capability_nonce: nonce,
-            channel_id: surface.surface_id.clone(),
-            variant_alias: None,
-            path: "/mcp".into(),
-            headers: std::collections::BTreeMap::from([
-                ("mcp-protocol-version".into(), vec![crate::mcp::MCP_MODERN_VERSION.into()]),
-                ("mcp-method".into(), vec!["tools/list".into()]),
-            ]),
-            body_bytes: 0,
-            response_window_bytes: wire::MAX_CHUNK_BYTES as u32,
-            deadline_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000,
-            trace_id: Uuid::new_v4(),
-        };
-        let mut message = ReceivedMessage::new(
-            connection.id.clone(),
-            peer.id.clone(),
-            MessageType::ForwardStreamFrame.to_string(),
-            Uuid::new_v4().to_string(),
-            Some(stream_id.to_string()),
-            Some(peer.did.clone()),
-            vec![
-                connection
-                    .connection_point_did
-                    .clone(),
-            ],
-            None,
-            Some(crate::gateways::connection_points::envelope_replay::now_secs() + 60),
-            serde_json::to_value(wire::StreamFrame {
+            .with_context("agent_surface_storage_path", serde_json::json!(self.surfaces_path));
+            self.listener
+                .stamp(&mut message);
+            message
+        }
+
+        fn capability_query(
+            &self,
+            nonce: Uuid,
+        ) -> ReceivedMessage {
+            let query = CapabilityMessage {
+                nonce,
+                capabilities: StreamCapabilities::local(true, true),
+            };
+            self.envelope(MessageType::ForwardStreamQuery, nonce, nonce, serde_json::to_value(query).unwrap())
+        }
+
+        fn open(
+            &self,
+            capability_nonce: Uuid,
+        ) -> ReceivedMessage {
+            let stream_id = Uuid::new_v4();
+            let request = wire::OpenRequest {
+                capability_nonce,
+                channel_id: Self::SURFACE_ID.into(),
+                variant_alias: None,
+                path: "/mcp".into(),
+                headers: std::collections::BTreeMap::from([
+                    ("mcp-protocol-version".into(), vec![crate::mcp::MCP_MODERN_VERSION.into()]),
+                    ("mcp-method".into(), vec!["tools/list".into()]),
+                ]),
+                body_bytes: 0,
+                response_window_bytes: wire::MAX_CHUNK_BYTES as u32,
+                deadline_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000,
+                trace_id: Uuid::new_v4(),
+            };
+            let frame = wire::StreamFrame {
                 stream_id,
                 payload: wire::FramePayload::Open { request },
-            })
-            .unwrap(),
-            metadata(),
-        )
-        .with_context("agent_surface_storage_path", json!(surfaces_path));
-        listener.stamp(&mut message);
-        let versions = McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
-        let accepted = runtime
-            .prepare_incoming_with_versions(&message, &connection, &peer, versions)
-            .await
-            .expect("first Open is accepted");
-        drop(accepted);
-        // Past the offer's lifetime the offer is gone, and so is the Open's
-        // replay record, which lasts no longer than the offer. Only the offer
-        // is expired here: with no live offer the Open cannot be admitted,
-        // whatever its replay record says.
-        let binding = registry::StreamBinding {
-            peer_did: peer.did.clone(),
-            recipient_did: connection
-                .connection_point_did
-                .clone(),
-            connection_point_id: connection.id.clone(),
-            listener_instance_id: offer.context[INSTANCE_CONTEXT]
-                .as_str()
-                .unwrap()
-                .to_string(),
-            surface_id: "capabilities".into(),
-        };
-        let past_offer = Instant::now() + std::time::Duration::from_secs(301);
-        assert!(
-            runtime
+            };
+            self.envelope(
+                MessageType::ForwardStreamFrame,
+                Uuid::new_v4(),
+                stream_id,
+                serde_json::to_value(frame).unwrap(),
+            )
+        }
+
+        /// Whether the offer for `nonce` is live at `at`. Asking about a later
+        /// instant drops the offers that have expired by then.
+        fn offered(
+            &self,
+            query: &ReceivedMessage,
+            nonce: Uuid,
+            at: Instant,
+        ) -> bool {
+            let binding = registry::StreamBinding {
+                peer_did: self.peer.did.clone(),
+                recipient_did: self
+                    .connection
+                    .connection_point_did
+                    .clone(),
+                connection_point_id: self.connection.id.clone(),
+                listener_instance_id: query.context[INSTANCE_CONTEXT]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                surface_id: "capabilities".into(),
+            };
+            self.runtime
                 .peers
-                .offered(&binding, nonce, past_offer)
-                .is_none()
-        );
+                .offered(&binding, nonce, at)
+                .is_some()
+        }
+    }
+
+    /// Runs the calling test alone in a child process: the fixture installs the
+    /// process-wide listener manager. Returns false in the parent, which has
+    /// checked the child's outcome.
+    async fn in_isolated_child(what: &str) -> bool {
+        if std::env::var_os("ATG_FABRIC_STREAM_ADMISSION_CHILD").is_some() {
+            return true;
+        }
+        let test_name = std::thread::current()
+            .name()
+            .unwrap()
+            .to_string();
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("ATG_FABRIC_STREAM_ADMISSION_CHILD", "1")
+            .env("RUST_MIN_STACK", "8388608")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
         assert!(
-            matches!(runtime.process(&offer, &MessageType::ForwardStreamQuery), ProcessingResult::Failed { .. }),
+            output.status.success(),
+            "isolated {what} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    /// The replay proof: a captured Open is never admitted twice, and a
+    /// captured capability query cannot recreate the expired offer the Open
+    /// was bound to. Removing the capability-query replay check fails it.
+    #[tokio::test]
+    async fn replay_proof_refuses_a_replayed_open_and_a_replayed_capability_query() {
+        if !in_isolated_child("replay proof").await {
+            return;
+        }
+        let fixture = ReplayFixture::new().await;
+        let nonce = Uuid::new_v4();
+        let query = fixture.capability_query(nonce);
+        assert!(matches!(
+            fixture
+                .runtime
+                .process(&query, &MessageType::ForwardStreamQuery),
+            ProcessingResult::RequiresResponse { .. }
+        ));
+        assert!(fixture.offered(&query, nonce, Instant::now()));
+
+        let open = fixture.open(nonce);
+        let accepted = fixture
+            .runtime
+            .prepare_incoming(&open, &fixture.connection, &fixture.peer)
+            .await
+            .expect("the first Open is admitted");
+        drop(accepted);
+        assert!(
+            fixture
+                .runtime
+                .prepare_incoming(&open, &fixture.connection, &fixture.peer)
+                .await
+                .is_err(),
+            "the same Open envelope is refused once its stream has ended"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            fixture
+                .runtime
+                .prepare_incoming(&open, &fixture.connection, &fixture.peer)
+                .await
+                .is_err(),
+            "the same Open envelope is refused after the 1 s clamped stream lifetime, \
+             while its 60 s deadline, envelope expiry and capability offer are all still live"
+        );
+
+        let past_offer = Instant::now() + std::time::Duration::from_secs(301);
+        assert!(!fixture.offered(&query, nonce, past_offer), "the offer has expired");
+        assert!(
+            matches!(
+                fixture
+                    .runtime
+                    .process(&query, &MessageType::ForwardStreamQuery),
+                ProcessingResult::Failed { .. }
+            ),
             "a replayed capability query is refused while its envelope is live"
         );
+        assert!(!fixture.offered(&query, nonce, Instant::now()), "the replayed query did not recreate the offer");
         assert!(
-            runtime
-                .peers
-                .offered(&binding, nonce, Instant::now())
-                .is_none(),
-            "the replayed query did not recreate the offer"
+            fixture
+                .runtime
+                .prepare_incoming(&open, &fixture.connection, &fixture.peer)
+                .await
+                .is_err(),
+            "the captured Open has no offer to be admitted under"
         );
-        let replay = runtime
-            .prepare_incoming_with_versions(&message, &connection, &peer, versions)
-            .await;
-        assert!(replay.is_err(), "the captured Open has no offer to be admitted under");
     }
 }

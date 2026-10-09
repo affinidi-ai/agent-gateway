@@ -122,6 +122,19 @@ pub async fn a_fabric_with_n_gateways(
         .max(count);
 }
 
+/// The receiving gateway admits Fabric streams as one whose surfaces serve
+/// only legacy MCP does; no product setting does this.
+#[given(regex = r#"^gateway (\d+) admits only MCP protocol version "2024-11-05" over Fabric$"#)]
+pub async fn gateway_admits_only_legacy_mcp_over_fabric(
+    world: &mut G2gWorld,
+    gw_index: usize,
+) {
+    world
+        .topology
+        .plan_mut(gw_index)
+        .legacy_only_fabric_receive = true;
+}
+
 #[given(expr = "gateway {int} surface {string} uses {string} MCP metadata output")]
 async fn gateway_surface_uses_mcp_metadata_output(
     world: &mut G2gWorld,
