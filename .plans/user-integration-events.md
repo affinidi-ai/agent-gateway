@@ -20,9 +20,14 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 
 ## Before the merge request
 
-- [ ] `cargo test --no-fail-fast --all-targets --all-features` (includes the Gherkin suites) and
-  `make lint`. Done so far: `cargo test --bin agent-gateway`, `cargo clippy` and `cargo fmt` on
-  the changed files, dashboard `npm run test`, `lint` and `format`.
+- [x] Pre-review checks (2026-10-09): `cargo fmt --check` clean; `cargo clippy --all-targets
+  --all-features` has no warnings in changed files (9 pre-existing `result_large_err` in
+  untouched files); `cargo test --no-fail-fast --all-targets --all-features` passes: 4287 unit and
+  component (16 ignored), 112 + 96 BDD support, `surface_bdd` 327 of 333 scenarios with 6
+  skipped for undefined steps in the untouched `a2a_proxy_endpoint.feature`; `g2g_bdd` skips
+  itself without `FABRIC_BDD_MANAGED_MEDIATOR=1` (run with `make gw-e2e`). Dashboard: 1018 tests
+  pass, `prettier` changes nothing, lint has no warnings in changed files.
+- [ ] `make gw-e2e` (two-gateway Gherkin suite; needs mediator containers).
 - [ ] End-to-end on a gateway with Agent Watch: attach an integration in the UI with only
   "New User Registered", register a passkey user, and confirm Agent Watch receives
   `user.created` without passkeys; confirm a login sends nothing.
