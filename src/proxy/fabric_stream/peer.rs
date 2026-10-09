@@ -5,13 +5,17 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::registry::StreamBinding;
+use super::registry::{RegisterError, StreamBinding};
+use super::share::{ShareOwner, SharedTable};
 use super::wire::{
     FramePayload, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES, MAX_WINDOW_BYTES, StreamFrame, decode_chunk,
 };
 use crate::gateways::connection_points::messages::ReceivedMessage;
 
+/// Capability probes this gateway may have in flight to its peers.
 const MAX_PROBES: usize = 256;
+/// Capability offers this gateway may hold for its peers.
+const MAX_OFFERS: usize = 256;
 const MAX_PEERS: usize = 256;
 const PROBE_TTL: Duration = Duration::from_secs(30);
 const PEER_TTL: Duration = Duration::from_secs(300);
@@ -168,6 +172,9 @@ impl From<&StreamBinding> for PeerKey {
 struct PendingProbe {
     binding: StreamBinding,
     deadline: Instant,
+    /// What the peer disclosed for this probe. Kept for the probe's own waiter,
+    /// as a concurrent probe to the same peer may replace the cached agreement.
+    agreement: Option<CapabilityMessage>,
 }
 
 struct InboundOffer {
@@ -177,9 +184,9 @@ struct InboundOffer {
 }
 
 struct PeerState {
-    probes: HashMap<Uuid, PendingProbe>,
+    probes: SharedTable<Uuid, PendingProbe>,
     peers: HashMap<PeerKey, (CapabilityMessage, Instant)>,
-    offers: HashMap<Uuid, InboundOffer>,
+    offers: SharedTable<Uuid, InboundOffer>,
 }
 
 pub(crate) struct PeerCapabilities {
@@ -193,19 +200,23 @@ impl PeerCapabilities {
         Self {
             local,
             state: Mutex::new(PeerState {
-                probes: HashMap::new(),
+                probes: SharedTable::new(MAX_PROBES),
                 peers: HashMap::new(),
-                offers: HashMap::new(),
+                offers: SharedTable::new(MAX_OFFERS),
             }),
             changed: tokio::sync::Notify::new(),
         }
     }
 
+    /// Answers a peer's capability query with an offer. A peer may hold several
+    /// live offers, so its concurrent first requests each negotiate, up to its
+    /// share of the offer table; `tenant_id` is the tenant owning its record.
     pub fn offer(
         &self,
         message: &ReceivedMessage,
         binding: StreamBinding,
         query: CapabilityMessage,
+        tenant_id: Option<String>,
         now: Instant,
     ) -> Result<CapabilityMessage, String> {
         binding.validate(query.nonce)?;
@@ -227,18 +238,32 @@ impl PeerCapabilities {
         if state
             .offers
             .contains_key(&query.nonce)
-            || state.offers.len() >= MAX_PROBES
         {
-            return Err("Fabric capability offer is duplicate or capacity is unavailable".to_string());
+            return Err("Fabric capability offer is a duplicate".to_string());
         }
-        state.offers.insert(
-            query.nonce,
-            InboundOffer {
-                binding,
-                capabilities: capabilities.clone(),
-                deadline: now + PEER_TTL,
-            },
-        );
+        let owner = ShareOwner {
+            peer_did: binding.peer_did.clone(),
+            tenant_id,
+        };
+        state
+            .offers
+            .insert(
+                query.nonce,
+                owner,
+                InboundOffer {
+                    binding,
+                    capabilities: capabilities.clone(),
+                    deadline: now + PEER_TTL,
+                },
+            )
+            .map_err(|limit| {
+                tracing::warn!(
+                    peer_did = %message.from_did.as_deref().unwrap_or_default(),
+                    cap = limit.as_str(),
+                    "Fabric capability offer cap reached"
+                );
+                "Fabric capability offer capacity is unavailable".to_string()
+            })?;
         Ok(CapabilityMessage {
             nonce: query.nonce,
             capabilities,
@@ -260,11 +285,15 @@ impl PeerCapabilities {
         (PeerKey::from(&offer.binding) == PeerKey::from(binding)).then(|| (offer.capabilities.clone(), offer.deadline))
     }
 
+    /// Starts negotiating with a peer, within the peer's share of the probe
+    /// table; `tenant_id` is the tenant owning the peer's record. A full share
+    /// is `CapacityReached`, so the caller is told to retry.
     pub fn begin(
         &self,
         binding: StreamBinding,
+        tenant_id: Option<String>,
         now: Instant,
-    ) -> Result<CapabilityMessage, String> {
+    ) -> Result<CapabilityMessage, RegisterError> {
         let nonce = Uuid::new_v4();
         binding.validate(nonce)?;
         let mut state = self
@@ -274,16 +303,25 @@ impl PeerCapabilities {
         state
             .probes
             .retain(|_, probe| probe.deadline > now);
-        if state.probes.len() >= MAX_PROBES {
-            return Err("Fabric capability probe limit reached".to_string());
-        }
-        state.probes.insert(
-            nonce,
-            PendingProbe {
-                binding,
-                deadline: now + PROBE_TTL,
-            },
-        );
+        let owner = ShareOwner {
+            peer_did: binding.peer_did.clone(),
+            tenant_id,
+        };
+        state
+            .probes
+            .insert(
+                nonce,
+                owner,
+                PendingProbe {
+                    binding,
+                    deadline: now + PROBE_TTL,
+                    agreement: None,
+                },
+            )
+            .map_err(|limit| {
+                tracing::warn!(cap = limit.as_str(), "Fabric capability probe cap reached");
+                RegisterError::CapacityReached("Fabric capability probe limit reached")
+            })?;
         Ok(CapabilityMessage {
             nonce,
             capabilities: self.local.clone(),
@@ -311,6 +349,9 @@ impl PeerCapabilities {
             .probes
             .get(&disclosure.nonce)
             .ok_or("Unsolicited or expired Fabric stream capability disclosure")?;
+        if probe.agreement.is_some() {
+            return Err("Fabric capability disclosure was already accepted".to_string());
+        }
         if !probe
             .binding
             .matches(message, listener_instance_id, disclosure.nonce)
@@ -324,19 +365,19 @@ impl PeerCapabilities {
         if !state.peers.contains_key(&key) && state.peers.len() >= MAX_PEERS {
             return Err("Fabric peer capability cache limit reached".to_string());
         }
-        state
+        let agreement = CapabilityMessage {
+            nonce: disclosure.nonce,
+            capabilities: negotiated.clone(),
+        };
+        if let Some(probe) = state
             .probes
-            .remove(&disclosure.nonce);
-        state.peers.insert(
-            key,
-            (
-                CapabilityMessage {
-                    nonce: disclosure.nonce,
-                    capabilities: negotiated.clone(),
-                },
-                now + PEER_TTL,
-            ),
-        );
+            .get_mut(&disclosure.nonce)
+        {
+            probe.agreement = Some(agreement.clone());
+        }
+        state
+            .peers
+            .insert(key, (agreement, now + PEER_TTL));
         drop(state);
         self.changed.notify_waiters();
         Ok(negotiated)
@@ -398,11 +439,6 @@ impl PeerCapabilities {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(agreement) = self.agreement(binding, Instant::now())
-                && agreement.nonce == nonce
-            {
-                return Ok(agreement);
-            }
             {
                 let state = self
                     .state
@@ -412,7 +448,13 @@ impl PeerCapabilities {
                     .probes
                     .get(&nonce)
                     .ok_or("Fabric capability probe was cancelled")?;
-                if probe.deadline <= Instant::now() || PeerKey::from(&probe.binding) != PeerKey::from(binding) {
+                if PeerKey::from(&probe.binding) != PeerKey::from(binding) {
+                    return Err("Fabric capability probe is expired or mismatched".to_string());
+                }
+                if let Some(agreement) = &probe.agreement {
+                    return Ok(agreement.clone());
+                }
+                if probe.deadline <= Instant::now() {
                     return Err("Fabric capability probe is expired or mismatched".to_string());
                 }
             }
@@ -590,7 +632,7 @@ mod tests {
         let peers = PeerCapabilities::new(StreamCapabilities::local(true, false));
         let now = Instant::now();
         let probe = peers
-            .begin(binding(), now)
+            .begin(binding(), None, now)
             .unwrap();
         let disclosure = CapabilityMessage {
             nonce: probe.nonce,
@@ -631,7 +673,7 @@ mod tests {
         let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
         let now = Instant::now();
         let probe = peers
-            .begin(binding(), now)
+            .begin(binding(), None, now)
             .unwrap();
         let disclosure = CapabilityMessage {
             nonce: probe.nonce,
@@ -661,7 +703,7 @@ mod tests {
         let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
         let now = Instant::now();
         let probe = peers
-            .begin(binding(), now)
+            .begin(binding(), None, now)
             .unwrap();
         let disclosure = CapabilityMessage {
             nonce: probe.nonce,
@@ -673,7 +715,7 @@ mod tests {
                 .is_err()
         );
         let probe = peers
-            .begin(binding(), now)
+            .begin(binding(), None, now)
             .unwrap();
         peers
             .accept(&message(probe.nonce), "instance", probe.clone(), now)
@@ -684,7 +726,7 @@ mod tests {
                 .is_none()
         );
         let probe = peers
-            .begin(binding(), now)
+            .begin(binding(), None, now)
             .unwrap();
         peers
             .accept(&message(probe.nonce), "instance", probe, now)
@@ -738,7 +780,7 @@ mod tests {
         let mut message = message(nonce);
         message.didcomm_message_id = nonce.to_string();
         let offered = peers
-            .offer(&message, binding(), query.clone(), now)
+            .offer(&message, binding(), query.clone(), None, now)
             .unwrap();
         assert!(
             offered
@@ -758,7 +800,7 @@ mod tests {
         );
         assert!(
             peers
-                .offer(&message, binding(), query, now)
+                .offer(&message, binding(), query, None, now)
                 .is_err()
         );
         let mut other = binding();
@@ -788,7 +830,7 @@ mod tests {
         let now = Instant::now();
         let peer_binding = binding();
         let probe = peers
-            .begin(binding(), now)
+            .begin(binding(), None, now)
             .unwrap();
         let wait = peers.wait(&peer_binding, probe.nonce, tokio::time::Instant::now() + Duration::from_secs(1));
         let disclose = async {
@@ -801,7 +843,7 @@ mod tests {
         assert_eq!(result.unwrap(), probe);
 
         let probe = peers
-            .begin(binding(), now)
+            .begin(binding(), None, now)
             .unwrap();
         assert!(
             peers
@@ -819,7 +861,7 @@ mod tests {
         );
 
         let probe = peers
-            .begin(binding(), now)
+            .begin(binding(), None, now)
             .unwrap();
         let wait = peers.wait(&peer_binding, probe.nonce, tokio::time::Instant::now() + Duration::from_secs(1));
         let replace = async {
@@ -831,6 +873,169 @@ mod tests {
             result
                 .unwrap_err()
                 .contains("cancelled")
+        );
+    }
+
+    fn query_from(
+        peer: &str,
+        nonce: Uuid,
+    ) -> (ReceivedMessage, StreamBinding, CapabilityMessage) {
+        let mut message = message(nonce);
+        message.from_did = Some(format!("did:example:{peer}"));
+        message.didcomm_message_id = nonce.to_string();
+        let mut binding = binding();
+        binding.peer_did = format!("did:example:{peer}");
+        let query = CapabilityMessage {
+            nonce,
+            capabilities: StreamCapabilities::local(true, true),
+        };
+        (message, binding, query)
+    }
+
+    /// Offers `attempts` queries from `peer` and returns the nonces offered.
+    fn offer_queries(
+        peers: &PeerCapabilities,
+        peer: &str,
+        tenant_id: Option<&str>,
+        attempts: usize,
+        now: Instant,
+    ) -> Vec<Uuid> {
+        (0..attempts)
+            .filter_map(|_| {
+                let (message, binding, query) = query_from(peer, Uuid::new_v4());
+                peers
+                    .offer(&message, binding, query.clone(), tenant_id.map(str::to_string), now)
+                    .ok()
+                    .map(|_| query.nonce)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_the_offer_table() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+
+        let alpha_offers = offer_queries(&peers, "alpha", None, MAX_OFFERS + 1, now);
+        assert_eq!(alpha_offers.len(), MAX_OFFERS / 8, "a peer holds at most its share");
+        let (_, alpha, _) = query_from("alpha", Uuid::new_v4());
+        assert!(
+            alpha_offers
+                .iter()
+                .all(|nonce| peers
+                    .offered(&alpha, *nonce, now)
+                    .is_some()),
+            "every offer within the share stays live, so concurrent first requests each negotiate"
+        );
+
+        let (message, bravo, query) = query_from("bravo", Uuid::new_v4());
+        let offered = peers
+            .offer(&message, bravo.clone(), query.clone(), None, now)
+            .expect("another peer is still offered capabilities");
+        assert_eq!(offered.nonce, query.nonce);
+        assert!(
+            peers
+                .offered(&bravo, query.nonce, now)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn one_tenants_peers_cannot_fill_the_offer_table() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        let held: usize = (0..8)
+            .map(|peer| offer_queries(&peers, &format!("tenant-a-{peer}"), Some("tenant-a"), MAX_OFFERS, now).len())
+            .sum();
+        assert_eq!(held, MAX_OFFERS / 2, "the peers of one tenant hold at most the tenant's share");
+        assert!(offer_queries(&peers, "tenant-a-late", Some("tenant-a"), 1, now).is_empty());
+        assert_eq!(offer_queries(&peers, "tenant-b-0", Some("tenant-b"), 1, now).len(), 1);
+        assert_eq!(offer_queries(&peers, "appliance", None, 1, now).len(), 1);
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_the_probe_table() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        let refusal = (0..=MAX_PROBES).find_map(|_| {
+            peers
+                .begin(binding(), None, now)
+                .err()
+        });
+        assert_eq!(
+            refusal,
+            Some(RegisterError::CapacityReached("Fabric capability probe limit reached")),
+            "a full share is a capacity refusal, so the caller is told to retry"
+        );
+        assert_eq!(
+            peers
+                .state
+                .lock()
+                .unwrap()
+                .probes
+                .len(),
+            MAX_PROBES / 8
+        );
+
+        let mut other = binding();
+        other.peer_did = "did:example:other".into();
+        assert!(
+            peers
+                .begin(other, None, now)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_requests_to_one_peer_each_keep_their_own_agreement() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        let first = peers
+            .begin(binding(), None, now)
+            .unwrap();
+        let second = peers
+            .begin(binding(), None, now)
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let (first_binding, second_binding) = (binding(), binding());
+        let disclose = async {
+            tokio::task::yield_now().await;
+            peers
+                .accept(&message(first.nonce), "instance", first.clone(), now)
+                .unwrap();
+            peers
+                .accept(&message(second.nonce), "instance", second.clone(), now)
+                .unwrap();
+        };
+        let (first_agreement, second_agreement, ()) = tokio::join!(
+            peers.wait(&first_binding, first.nonce, deadline),
+            peers.wait(&second_binding, second.nonce, deadline),
+            disclose
+        );
+        assert_eq!(
+            first_agreement
+                .expect("the first request is not cancelled by the second disclosure")
+                .nonce,
+            first.nonce
+        );
+        assert_eq!(
+            second_agreement
+                .unwrap()
+                .nonce,
+            second.nonce
+        );
+        assert_eq!(
+            peers
+                .agreement(&binding(), now)
+                .map(|agreement| agreement.nonce),
+            Some(second.nonce),
+            "the latest agreement serves the next request"
+        );
+        assert!(
+            peers
+                .accept(&message(first.nonce), "instance", first, now)
+                .is_err(),
+            "a disclosure is accepted once"
         );
     }
 }

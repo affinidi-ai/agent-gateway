@@ -6,9 +6,18 @@ changes:
     - timestamp: '2026-10-09T10:40:00.000Z'
       title: Reconnect a Connection Point whose account the mediator has lost
       description: A mediator can lose accounts while connections stay open, for example when its store is flushed or fails over. It recreates an account only when that account sends and refuses delivery to a missing one, so a gateway that only received stayed unreachable until it sent, restarted or was reconnected by hand. Every connected Connection Point now checks its own mediator account every 30 seconds, reauthenticates and reregisters when the account is gone, and re-opens the receive list when it was closed. The Gateway Ping timeout uses the same check.
+    - timestamp: '2026-10-09T12:30:00.000Z'
+      title: Keep concurrent first Fabric stream requests to one peer from failing
+      description: When several first requests to a peer negotiated stream capabilities at once, a later disclosure replaced the earlier agreement and the request still waiting for it failed. Each request now keeps the agreement negotiated for its own probe, and the receiver keeps several live offers per peer, so concurrent first requests all go through.
   removed: []
-  security: []
-  breaking: []
+  security:
+    - timestamp: '2026-10-09T12:30:00.000Z'
+      title: ⭐ Give each Fabric peer and tenant its own share of the shared stream tables
+      description: One peer could fill the capability offer, capability probe or Open replay table and get every other peer refused. Each peer may now hold an eighth of a table and the peers of one tenant half of it, so a second peer is still served after one peer sends hundreds of refused requests. The listener also admits Opens off its reader loop, at most 16 at a time, holding up to 8 early frames per stream until its Open is admitted, so a slow admission no longer stalls every other message. The share values are interim constants.
+  breaking:
+    - timestamp: '2026-10-09T12:30:00.000Z'
+      title: Answer full Fabric stream caps on the receiving gateway with capacity_reached
+      description: A full framed-stream cap, Open replay table or table share, or a peer past its Open rate, is now refused with capacity_reached instead of unavailable, so the sending gateway's caller gets 429 with Retry-After instead of 502. A 1.0.0 sender cannot parse capacity_reached and waits for its response deadline instead, so upgrade paired gateways.
   internal:
     - timestamp: '2026-10-09T00:00:00.000Z'
       title: Test mediator account problem reports with the envelope the mediator sends

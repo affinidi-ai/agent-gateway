@@ -175,7 +175,7 @@ async fn forward_stream_with_runtime(
         .get_listener(gateway_id)
         .await
         .ok_or_else(|| FabricForwardError::GatewayNotConnected(gateway_id.to_string()))?;
-    let peer_did = manager
+    let (peer_did, peer_tenant_id) = manager
         .get_active_stream_peer(gateway_id)
         .await
         .ok_or(FabricForwardError::StreamingUnavailable)?;
@@ -209,8 +209,8 @@ async fn forward_stream_with_runtime(
         None => {
             let probe = runtime
                 .peers
-                .begin(binding.clone(), std::time::Instant::now())
-                .map_err(|_| FabricForwardError::StreamingUnavailable)?;
+                .begin(binding.clone(), peer_tenant_id, std::time::Instant::now())
+                .map_err(registration_failure)?;
             let _probe = CapabilityProbe {
                 runtime: runtime.clone(),
                 nonce: probe.nonce,

@@ -1273,10 +1273,11 @@ impl ConnectionPointListenerManager {
         }
     }
 
+    /// The DID of an active Remote gateway, and the tenant owning its record.
     pub(crate) async fn get_active_stream_peer(
         &self,
         gateway_id: &str,
-    ) -> Option<String> {
+    ) -> Option<(String, Option<String>)> {
         let peer = self
             .gateway_store
             .as_ref()?
@@ -1285,7 +1286,7 @@ impl ConnectionPointListenerManager {
             .ok()??;
         (peer.status == crate::gateways::types::GatewayStatus::Active
             && peer.gateway_type == crate::gateways::types::GatewayType::Remote)
-            .then_some(peer.did)
+            .then_some((peer.did, peer.tenant_id))
     }
 
     pub(crate) fn fabric_stream_max_envelope_bytes(&self) -> usize {
@@ -2156,13 +2157,23 @@ async fn sender_is_active_peer_gateway(
     gateway_store: Option<&crate::gateways::FileSystemGatewayStore>,
     from_did: Option<&str>,
 ) -> bool {
-    let (Some(store), Some(from_did)) = (gateway_store, from_did) else {
-        return false;
-    };
-    matches!(
-        store.get_by_did(from_did).await,
-        Ok(Some(gateway)) if gateway.status == crate::gateways::types::GatewayStatus::Active
-    )
+    active_peer_gateway(gateway_store, from_did)
+        .await
+        .is_some()
+}
+
+/// The sender's gateway record, when it is an active peer.
+async fn active_peer_gateway(
+    gateway_store: Option<&crate::gateways::FileSystemGatewayStore>,
+    from_did: Option<&str>,
+) -> Option<crate::gateways::types::Gateway> {
+    let (store, from_did) = (gateway_store?, from_did?);
+    store
+        .get_by_did(from_did)
+        .await
+        .ok()
+        .flatten()
+        .filter(|gateway| gateway.status == crate::gateways::types::GatewayStatus::Active)
 }
 
 /// A refused `Open` from an active peer is answered with an `Error` frame, so
@@ -2189,10 +2200,17 @@ async fn answer_refused_open(
 /// Past this, a refusal goes unanswered and its sender waits out its deadline.
 const MAX_PENDING_OPEN_REFUSALS: usize = 16;
 
+/// `Open`s one listener may be admitting at once. Admission (the peer lookup
+/// and route resolution) runs off the reader loop; past this, an `Open` is
+/// refused with `capacity_reached` before any lookup.
+const MAX_PENDING_OPEN_ADMISSIONS: usize = 16;
+
+/// How long admitting one `Open` may take before it is refused.
+const OPEN_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `Open`s one peer may have admitted per second per listener, and the burst
-/// allowed on top. Admission runs on the reader loop (a stream must be
-/// registered before its next frame is read), so a peer past this rate is
-/// refused before any lookup.
+/// allowed on top. A peer past this rate is refused with `capacity_reached`
+/// before any lookup.
 const PEER_OPENS_PER_SECOND: u32 = 50;
 const PEER_OPEN_BURST: u32 = 100;
 
@@ -2265,6 +2283,139 @@ fn spawn_refused_open_answer(
         let _permit = permit;
         answer_refused_open(&client, &message, code, gateway_store.as_deref(), &bootstrap_config).await;
     });
+}
+
+/// Starts admitting an `Open` off the reader loop. The frames that arrive for
+/// its stream are held until `admission` releases them, and at most
+/// `admissions` `Open`s are admitted at once. Returns at once; a refusal here
+/// is the caller's to answer.
+fn start_open_admission<Admission, Task>(
+    stream_tasks: &mut tokio::task::JoinSet<()>,
+    admissions: &Arc<tokio::sync::Semaphore>,
+    registry: &crate::proxy::fabric_stream::registry::ReceiveRegistry,
+    message: &ReceivedMessage,
+    admission: Admission,
+) -> Result<(), crate::proxy::fabric_stream::OpenRefusal>
+where
+    Admission: FnOnce(uuid::Uuid, tokio::sync::OwnedSemaphorePermit) -> Task,
+    Task: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Ok(permit) = Arc::clone(admissions).try_acquire_owned() else {
+        return Err(crate::proxy::fabric_stream::OpenRefusal::new(
+            crate::proxy::fabric_stream::wire::StreamErrorCode::CapacityReached,
+            "Too many Fabric Opens are being admitted",
+        ));
+    };
+    let stream_id = message
+        .message_body
+        .get("stream_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .ok_or("Fabric Open frame has no stream id")?;
+    let peer_did = message
+        .from_did
+        .as_deref()
+        .ok_or("Fabric sender is missing")?;
+    registry.hold(stream_id, peer_did)?;
+    stream_tasks.spawn(admission(stream_id, permit));
+    Ok(())
+}
+
+/// What admitting one `Open` off the reader loop needs.
+struct OpenAdmission {
+    runtime: Arc<crate::proxy::fabric_stream::StreamRuntime>,
+    message: ReceivedMessage,
+    connection_point: Arc<GatewayConnectionPoint>,
+    gateway_store: Option<Arc<crate::gateways::FileSystemGatewayStore>>,
+    client: DIDCommClient,
+    bootstrap_config: Option<Arc<crate::config::BootstrapConfig>>,
+    refusals: Arc<tokio::sync::Semaphore>,
+}
+
+impl OpenAdmission {
+    /// Admits the `Open`, releases the frames held for its stream and runs the
+    /// stream. A refused `Open` is answered, so its sender fails at once.
+    async fn admit_and_run(
+        self,
+        stream_id: uuid::Uuid,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let admitted = tokio::time::timeout(OPEN_ADMISSION_TIMEOUT, self.admit())
+            .await
+            .unwrap_or_else(|_| Err("Fabric Open admission timed out".into()));
+        drop(permit);
+        match admitted {
+            Ok(incoming) => {
+                if let Err(error) = self
+                    .runtime
+                    .registry
+                    .release(&stream_id, true)
+                {
+                    warn!(from = ?self.message.from_did, %error, "Ending an admitted Fabric stream");
+                    return;
+                }
+                let sink = Arc::new(crate::proxy::fabric_stream::transport::DidCommFrameSink {
+                    client: self.client,
+                    binding: incoming.binding.clone(),
+                    capabilities: incoming.capabilities.clone(),
+                    max_envelope_bytes: stream_envelope_limit(self.bootstrap_config.as_ref()),
+                });
+                incoming.run(sink).await;
+            }
+            Err(refusal) => {
+                if let Err(error) = self
+                    .runtime
+                    .registry
+                    .release(&stream_id, false)
+                {
+                    warn!(%error, "Could not drop the frames held for a refused Fabric Open");
+                }
+                warn!(
+                    from = ?self.message.from_did,
+                    error = %refusal,
+                    code = ?refusal.code,
+                    "Rejecting Fabric Open"
+                );
+                let Ok(_answering) = self
+                    .refusals
+                    .try_acquire_owned()
+                else {
+                    warn!(from = ?self.message.from_did, "Too many refused Fabric Opens awaiting an answer; leaving this one unanswered");
+                    return;
+                };
+                answer_refused_open(
+                    &self.client,
+                    &self.message,
+                    refusal.code,
+                    self.gateway_store.as_deref(),
+                    &self.bootstrap_config,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn admit(
+        &self
+    ) -> Result<crate::proxy::fabric_stream::IncomingStream, crate::proxy::fabric_stream::OpenRefusal> {
+        let store = self
+            .gateway_store
+            .as_ref()
+            .ok_or("Fabric gateway store is unavailable")?;
+        let peer_did = self
+            .message
+            .from_did
+            .as_deref()
+            .ok_or("Fabric sender is missing")?;
+        let peer = store
+            .get_by_did(peer_did)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("Fabric sender is not a configured peer")?;
+        self.runtime
+            .prepare_incoming(&self.message, &self.connection_point, &peer)
+            .await
+    }
 }
 
 /// Connection-protocol OOB messages run inline because their handlers stop or
@@ -2423,6 +2574,7 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
     let mut dispatch_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let mut stream_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let pending_open_refusals = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_OPEN_REFUSALS));
+    let pending_open_admissions = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_OPEN_ADMISSIONS));
     let open_rate = open_rate_limiter();
     let query_rate = query_rate_limiter();
     let in_flight = Arc::new(AtomicU64::new(0));
@@ -2491,73 +2643,55 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                         .and_then(serde_json::Value::as_str)
                         == Some("open")
                 {
-                    let prepared = async {
-                        let store = gateway_store
-                            .as_ref()
-                            .ok_or("Fabric gateway store is unavailable")?;
-                        let peer_did = received_msg
-                            .from_did
-                            .as_deref()
-                            .ok_or("Fabric sender is missing")?;
-                        let peer = store
-                            .get_by_did(peer_did)
-                            .await
-                            .map_err(|error| error.to_string())?
-                            .ok_or("Fabric sender is not a configured peer")?;
-                        crate::proxy::fabric_stream::global()?
-                            .prepare_incoming(&received_msg, connection_point, &peer)
-                            .await
-                    };
-                    let admitted = if admits_from_peer(
+                    let started = if !admits_from_peer(
                         &open_rate,
                         received_msg
                             .from_did
                             .as_deref(),
                     ) {
-                        tokio::time::timeout(std::time::Duration::from_secs(2), prepared).await
+                        Err(crate::proxy::fabric_stream::OpenRefusal::new(
+                            crate::proxy::fabric_stream::wire::StreamErrorCode::CapacityReached,
+                            "Fabric Open rate exceeded for this peer",
+                        ))
                     } else {
-                        Ok(Err("Fabric Open rate exceeded for this peer".into()))
+                        match crate::proxy::fabric_stream::global() {
+                            Ok(runtime) => {
+                                let admission = OpenAdmission {
+                                    runtime: Arc::clone(runtime),
+                                    message: received_msg.clone(),
+                                    connection_point: Arc::clone(&connection_point_arc),
+                                    gateway_store: gateway_store.clone(),
+                                    client: client.clone(),
+                                    bootstrap_config: bootstrap_config.clone(),
+                                    refusals: Arc::clone(&pending_open_refusals),
+                                };
+                                start_open_admission(
+                                    &mut stream_tasks,
+                                    &pending_open_admissions,
+                                    &runtime.registry,
+                                    &received_msg,
+                                    move |stream_id, permit| admission.admit_and_run(stream_id, permit),
+                                )
+                            }
+                            Err(error) => Err(error.into()),
+                        }
                     };
-                    match admitted {
-                        Ok(Ok(incoming)) => {
-                            let max_envelope_bytes = stream_envelope_limit(bootstrap_config.as_ref());
-                            let sink = Arc::new(crate::proxy::fabric_stream::transport::DidCommFrameSink {
-                                client: client.clone(),
-                                binding: incoming.binding.clone(),
-                                capabilities: incoming.capabilities.clone(),
-                                max_envelope_bytes,
-                            });
-                            stream_tasks.spawn(incoming.run(sink));
-                        }
-                        Ok(Err(refusal)) => {
-                            warn!(
-                                from = ?received_msg.from_did,
-                                error = %refusal,
-                                code = ?refusal.code,
-                                "Rejecting Fabric Open"
-                            );
-                            spawn_refused_open_answer(
-                                &mut stream_tasks,
-                                &pending_open_refusals,
-                                client,
-                                &received_msg,
-                                refusal.code,
-                                gateway_store,
-                                bootstrap_config,
-                            );
-                        }
-                        Err(_) => {
-                            warn!("Fabric Open admission timed out");
-                            spawn_refused_open_answer(
-                                &mut stream_tasks,
-                                &pending_open_refusals,
-                                client,
-                                &received_msg,
-                                crate::proxy::fabric_stream::wire::StreamErrorCode::Unavailable,
-                                gateway_store,
-                                bootstrap_config,
-                            );
-                        }
+                    if let Err(refusal) = started {
+                        warn!(
+                            from = ?received_msg.from_did,
+                            error = %refusal,
+                            code = ?refusal.code,
+                            "Rejecting Fabric Open"
+                        );
+                        spawn_refused_open_answer(
+                            &mut stream_tasks,
+                            &pending_open_refusals,
+                            client,
+                            &received_msg,
+                            refusal.code,
+                            gateway_store,
+                            bootstrap_config,
+                        );
                     }
                     delete_message_after_processing(client, &message_sha256_hash, &connection_point.name).await;
                     while stream_tasks
@@ -2579,21 +2713,26 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                     delete_message_after_processing(client, &message_sha256_hash, &connection_point.name).await;
                     continue;
                 }
-                if matches!(MessageType::from_str(&received_msg.message_type), MessageType::ForwardStreamQuery)
-                    && !sender_is_active_peer_gateway(
+                if matches!(MessageType::from_str(&received_msg.message_type), MessageType::ForwardStreamQuery) {
+                    let Some(peer) = active_peer_gateway(
                         gateway_store.as_deref(),
                         received_msg
                             .from_did
                             .as_deref(),
                     )
                     .await
-                {
-                    debug!(
-                        from = ?received_msg.from_did,
-                        "Dropping a Fabric capability query from a sender that is not an active peer"
+                    else {
+                        debug!(
+                            from = ?received_msg.from_did,
+                            "Dropping a Fabric capability query from a sender that is not an active peer"
+                        );
+                        delete_message_after_processing(client, &message_sha256_hash, &connection_point.name).await;
+                        continue;
+                    };
+                    received_msg.context.insert(
+                        crate::proxy::fabric_stream::PEER_TENANT_CONTEXT.to_string(),
+                        serde_json::json!(peer.tenant_id),
                     );
-                    delete_message_after_processing(client, &message_sha256_hash, &connection_point.name).await;
-                    continue;
                 }
 
                 // Store the message
@@ -4018,6 +4157,119 @@ mod tests {
         );
         const { assert!(super::PEER_QUERY_BURST < super::PEER_OPEN_BURST) };
         assert!(super::admits_from_peer(&limiter, Some("did:example:peer")));
+    }
+
+    fn open_from(stream_id: Option<uuid::Uuid>) -> crate::gateways::connection_points::messages::ReceivedMessage {
+        crate::gateways::connection_points::messages::ReceivedMessage::new(
+            "cp".into(),
+            "gateway".into(),
+            MessageType::ForwardStreamFrame.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some("did:example:peer".into()),
+            vec!["did:example:local".into()],
+            None,
+            None,
+            serde_json::json!({ "stream_id": stream_id, "payload": { "kind": "open" } }),
+            crate::gateways::connection_points::messages::MessageMetadata {
+                authenticated: true,
+                encrypted: true,
+                from_key: None,
+                extra: serde_json::Value::Null,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn open_admission_runs_off_the_reader_loop_and_is_bounded() {
+        use crate::proxy::fabric_stream::wire::StreamErrorCode;
+
+        let runtime = StreamRuntime::test_runtime();
+        let admissions = Arc::new(Semaphore::new(1));
+        let mut tasks = JoinSet::new();
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        let waiting = Arc::clone(&finish);
+        super::start_open_admission(
+            &mut tasks,
+            &admissions,
+            &runtime.registry,
+            &open_from(Some(first)),
+            move |stream_id, permit| async move {
+                assert_eq!(stream_id, first);
+                waiting.notified().await;
+                drop(permit);
+            },
+        )
+        .expect("the reader loop goes on while the Open is admitted");
+        assert!(
+            runtime
+                .registry
+                .was_opened(&first),
+            "frames for the Open are held while it is admitted"
+        );
+
+        let refusal = super::start_open_admission(
+            &mut tasks,
+            &admissions,
+            &runtime.registry,
+            &open_from(Some(second)),
+            |_, _| async {},
+        )
+        .expect_err("no admission slot is free");
+        assert_eq!(refusal.code, StreamErrorCode::CapacityReached);
+        assert!(
+            !runtime
+                .registry
+                .was_opened(&second),
+            "a refused Open holds nothing"
+        );
+
+        finish.notify_one();
+        tasks
+            .join_next()
+            .await
+            .unwrap()
+            .unwrap();
+        super::start_open_admission(
+            &mut tasks,
+            &admissions,
+            &runtime.registry,
+            &open_from(Some(second)),
+            |_, _| async {},
+        )
+        .expect("the slot is free again once admission ends");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_or_malformed_open_is_refused_without_taking_a_slot() {
+        let runtime = StreamRuntime::test_runtime();
+        let admissions = Arc::new(Semaphore::new(2));
+        let mut tasks = JoinSet::new();
+        let stream_id = uuid::Uuid::new_v4();
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let waiting = Arc::clone(&finish);
+        super::start_open_admission(
+            &mut tasks,
+            &admissions,
+            &runtime.registry,
+            &open_from(Some(stream_id)),
+            move |_, permit| async move {
+                waiting.notified().await;
+                drop(permit);
+            },
+        )
+        .unwrap();
+
+        for message in [open_from(Some(stream_id)), open_from(None)] {
+            assert!(
+                super::start_open_admission(&mut tasks, &admissions, &runtime.registry, &message, |_, _| async {})
+                    .is_err()
+            );
+            assert_eq!(admissions.available_permits(), 1, "a refused Open gives its slot back");
+        }
+        finish.notify_one();
     }
 
     use futures::FutureExt;

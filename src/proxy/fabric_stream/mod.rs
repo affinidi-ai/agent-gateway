@@ -1,6 +1,7 @@
 pub(crate) mod flow;
 pub(crate) mod peer;
 pub(crate) mod registry;
+pub(crate) mod share;
 pub(crate) mod transport;
 pub(crate) mod wire;
 
@@ -18,6 +19,9 @@ use registry::{ReceiveRegistry, RegistryLimits};
 
 pub(crate) const INSTANCE_CONTEXT: &str = "fabric_stream_listener_instance";
 const RECIPIENT_CONTEXT: &str = "fabric_stream_recipient";
+/// The tenant owning the sender's Remote gateway record, set by the listener
+/// once it has looked the sender up.
+pub(crate) const PEER_TENANT_CONTEXT: &str = "fabric_stream_peer_tenant";
 
 /// Framed-stream caps. Per-peer caps sit below the surface caps, so one peer
 /// cannot fill a surface, and listens have a budget apart from request streams.
@@ -312,6 +316,7 @@ impl StreamRuntime {
                 deadline,
                 replayable_until,
                 &capabilities,
+                peer.tenant_id.clone(),
             )?;
         let mut message = message.clone();
         let header_values: serde_json::Map<String, serde_json::Value> = request
@@ -504,9 +509,14 @@ impl StreamRuntime {
                         // captured one cannot recreate an expired offer.
                         crate::gateways::connection_points::envelope_replay::check_capability_query(message)
                             .map_err(|rejection| rejection.to_string())?;
-                        let capabilities = self
-                            .peers
-                            .offer(message, binding, capabilities, Instant::now())?;
+                        let tenant_id = message
+                            .context
+                            .get(PEER_TENANT_CONTEXT)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        let capabilities =
+                            self.peers
+                                .offer(message, binding, capabilities, tenant_id, Instant::now())?;
                         crate::gateways::connection_points::envelope_replay::admit_capability_query(message)
                             .map_err(|rejection| rejection.to_string())?;
                         Ok(ProcessingResult::RequiresResponse {
@@ -546,13 +556,15 @@ impl From<String> for OpenRefusal {
     }
 }
 
-/// A full cap is sent as `unavailable`, not `capacity_reached`: a 1.0.0
-/// sender cannot parse `capacity_reached`, drops the frame, and holds its
-/// stream until the response deadline.
+/// A full cap is sent as `capacity_reached`, so the sender's caller is told to
+/// retry. A 1.0.0 sender cannot parse it and holds its stream until the
+/// response deadline instead.
 impl From<registry::RegisterError> for OpenRefusal {
     fn from(error: registry::RegisterError) -> Self {
         match error {
-            registry::RegisterError::CapacityReached(reason) => reason.into(),
+            registry::RegisterError::CapacityReached(reason) => {
+                Self::new(wire::StreamErrorCode::CapacityReached, reason)
+            }
             registry::RegisterError::Refused(reason) => reason.into(),
         }
     }
@@ -1147,7 +1159,7 @@ mod tests {
             .await
             .err()
             .expect("a listen past the peer's listen budget");
-        assert_eq!(listen_refusal.code, wire::StreamErrorCode::Unavailable);
+        assert_eq!(listen_refusal.code, wire::StreamErrorCode::CapacityReached);
         assert_eq!(listen_refusal.to_string(), "Fabric stream concurrency limit reached");
         held.push(
             runtime
@@ -1164,7 +1176,7 @@ mod tests {
                 Err(refusal) => break refusal,
             }
         };
-        assert_eq!(refusal.code, wire::StreamErrorCode::Unavailable, "{refusal}");
+        assert_eq!(refusal.code, wire::StreamErrorCode::CapacityReached, "{refusal}");
         assert_eq!(refusal.to_string(), "Fabric stream concurrency limit reached");
         drop(held);
         drop(
@@ -1826,9 +1838,9 @@ mod tests {
     }
 
     #[test]
-    fn a_full_stream_cap_is_refused_as_unavailable_but_capacity_reached_still_parses() {
+    fn a_full_stream_cap_is_refused_as_capacity_reached_and_other_refusals_as_unavailable() {
         let refusal = OpenRefusal::from(registry::RegisterError::CapacityReached("full"));
-        assert_eq!(refusal.code, wire::StreamErrorCode::Unavailable);
+        assert_eq!(refusal.code, wire::StreamErrorCode::CapacityReached);
         assert_eq!(refusal.to_string(), "full");
         assert_eq!(
             OpenRefusal::from(registry::RegisterError::Refused("refused".into())).code,
