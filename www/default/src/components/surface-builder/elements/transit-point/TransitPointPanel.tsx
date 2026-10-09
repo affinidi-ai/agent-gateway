@@ -443,7 +443,8 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
       />
 
       {isFabricEndpoint(config.target_endpoint) &&
-        (hasOutboundCredentialBindings(allNodes) || !!config.transit_credentials) && (
+        (hasOutboundCredentialBindings(allNodes) ||
+          !!config.transit_credentials?.credential_provider_id) && (
           <FabricDelegatedCredentialsSection
             testIdPrefix="transit-point"
             instanceKey={config.id}

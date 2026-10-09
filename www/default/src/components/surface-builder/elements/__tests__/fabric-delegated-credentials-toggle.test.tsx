@@ -177,6 +177,28 @@ describe('Transit Point fabric delegated-credentials toggle', () => {
     expect(props.updateField).toHaveBeenCalledWith('fabric_delegated_credentials', true);
   });
 
+  it('is hidden when its own transit credentials name no provider', () => {
+    render(
+      <TransitPointPanel
+        {...transitPointProps(
+          {
+            ...fabricTransitPoint,
+            transit_credentials: {
+              credential_provider_id: '',
+              scopes: '',
+              consent_mode: 'on_demand',
+              inject_as_type: 'bearer_header',
+            },
+          },
+          []
+        )}
+      />
+    );
+    expect(
+      screen.queryByTestId('transit-point-fabric-delegated-credentials-switch')
+    ).not.toBeInTheDocument();
+  });
+
   it('shows for a fabric destination with its own transit credentials and warns when on', async () => {
     render(
       <TransitPointPanel
