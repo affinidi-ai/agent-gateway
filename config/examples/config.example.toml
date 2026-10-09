@@ -184,29 +184,15 @@ max_backoff_seconds = 1800
 backoff_multiplier = 2.0
 
 [a2a]
-# Advertised A2A protocol version for cards the gateway generates.
-# "1.0" is the current spec line; set "0.3" to pin the legacy line.
-# It does not change which versions are accepted: 0.3 is accepted while the
-# a2a_legacy_compatibility dashboard flag is on (the default). A managed agent's
-# own card is always served at the version it declares.
+# Preferred A2A protocol version for cards the gateway generates.
+# "1.0" is the current spec line; set "0.3" to prefer the legacy line on the
+# onboarding card. The A2A proxy card is always 1.0 only.
+# It does not change which versions are accepted: each A2A surface chooses its
+# accepted versions (access_point.a2a.accepted_versions, 0.3 and 1.0 by
+# default). A managed agent's own card is always served at the version it declares.
 # An unsupported value is rejected at startup rather than published in a card.
 # Startup-only: a change needs a restart.
 default_version = "1.0"
-# Validate inbound A2A requests before forwarding them. Two layers:
-#   1. the JSON-RPC envelope (valid JSON, `jsonrpc` 2.0, a string `method`)
-#   2. the A2A request shape: `messageId`, `role`, non-empty `parts` and one
-#      content member per part on the message methods; `params.id` on the task
-#      methods; the `status` filter on ListTasks. Rejects with -32602 naming
-#      each bad field.
-# Layer 2 applies to managed-agent targets only: an `a2a-proxy://` target is the
-# implementation, not a pass-through, so no downstream agent would have refused
-# the message. Both layers accept either protocol era.
-# This one setting gates both layers; there is no separate flag. With it on, a
-# caller that omits `messageId`, `role` or `parts` on a managed-agent surface is
-# refused here with -32602 instead of being forwarded.
-# Off forwards everything and lets the agent decide, which A2A expects of it
-# anyway: the spec puts validation on servers, not on intermediaries.
-validate_messages = true
 max_body_size = 10485760  # 10MB in bytes; also caps buffered upstream responses
 timeout_seconds = 30
 

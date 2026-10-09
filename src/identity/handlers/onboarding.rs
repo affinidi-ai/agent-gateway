@@ -785,10 +785,11 @@ fn build_onboarding_agent_card(
     let provider = serde_json::json!({ "organization": "Affinidi", "url": "https://affinidi.com" });
     // The onboarding agent serves no extended card.
     let extended_agent_card = false;
+    // The onboarding agent belongs to no surface, so it advertises every
+    // version the gateway supports.
+    let accepted = crate::a2a::version::SUPPORTED_VERSIONS;
 
     let mut card = serde_json::json!({
-        // Single source of truth for the advertised A2A version — never a literal.
-        "protocolVersion": crate::a2a::effective_advertised_version(),
         "name": "Affinidi Fabric Onboarding Agent",
         "description": "Temporary onboarding agent for testing agent connectivity and identity exchange",
         // A2A 1.0 renamed `agentProvider` → `provider`.
@@ -819,13 +820,13 @@ fn build_onboarding_agent_card(
         }],
         // A2A 1.0: `url` + `preferredTransport` collapse into one ordered
         // `supportedInterfaces[]`; `transport` became `protocolBinding`.
-        "supportedInterfaces": crate::a2a::version::generated_supported_interfaces(&onboarding_url),
+        "supportedInterfaces": crate::a2a::version::generated_supported_interfaces(&onboarding_url, accepted),
 
     });
 
-    // Legacy v0.3 fields, emitted only while the gateway still accepts v0.3 —
-    // otherwise the card would advertise an entry point it refuses.
-    if let Some(legacy) = crate::a2a::version::legacy_v0_3_card_fields(&onboarding_url, &provider, extended_agent_card)
+    // Legacy v0.3 fields, including the top-level `protocolVersion`.
+    if let Some(legacy) =
+        crate::a2a::version::legacy_v0_3_card_fields(&onboarding_url, &provider, extended_agent_card, accepted)
         && let Some(object) = card.as_object_mut()
     {
         object.extend(legacy);
@@ -876,28 +877,24 @@ mod onboarding_card_tests {
         assert_eq!(card["supportedInterfaces"][1]["protocolVersion"], "1.0");
     }
 
+    /// The onboarding agent belongs to no surface and serves both versions, so
+    /// its card lists both and carries the v0.3 fields.
     #[test]
-    fn onboarding_card_never_names_a_refused_configured_version() {
-        if !crate::a2a::version::run_isolated_from_other_tests() {
-            return;
-        }
-        use crate::storage::settings_store::{DashboardSettings, SettingsStore, set_global_settings_store};
-
-        crate::a2a::version::init_advertised_version("0.3");
-        let store = SettingsStore::new("unused-settings-dir");
-        store
-            .update(DashboardSettings {
-                feature_flags: [(crate::a2a::version::FLAG_A2A_LEGACY_COMPATIBILITY.to_string(), false)].into(),
-                ..DashboardSettings::default()
-            })
-            .expect("default settings are valid");
-        set_global_settings_store(Arc::new(store));
-        assert!(!crate::a2a::version::legacy_v0_3_enabled());
-
+    fn onboarding_card_lists_every_supported_version() {
         let card = build_onboarding_agent_card("https://gw.example", "session-123");
 
-        assert_eq!(card["protocolVersion"], "1.0", "the configured 0.3 is refused, so it must not be advertised");
-        assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "1.0");
+        let listed: Vec<&str> = card["supportedInterfaces"]
+            .as_array()
+            .expect("supportedInterfaces")
+            .iter()
+            .map(|i| {
+                i["protocolVersion"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(listed, vec!["1.0", "0.3"]);
+        assert_eq!(card["protocolVersion"], "1.0");
     }
 
     #[test]
@@ -905,14 +902,15 @@ mod onboarding_card_tests {
         let card = build_onboarding_agent_card("https://gw.example", "session-123");
         let expected_url = "https://gw.example/onboard/session-123/";
 
-        assert_eq!(card["protocolVersion"], crate::a2a::effective_advertised_version());
+        let advertised = crate::a2a::version::effective_advertised_version(crate::a2a::version::SUPPORTED_VERSIONS);
+        assert_eq!(card["protocolVersion"], advertised);
 
         // 1.0 transport shape: one ordered `supportedInterfaces[]` in camelCase with
         // `protocolBinding` (JSONRPC, not HTTP+JSON) and a per-interface version.
         let iface = &card["supportedInterfaces"][0];
         assert_eq!(iface["url"], expected_url);
         assert_eq!(iface["protocolBinding"], crate::a2a::version::PROTOCOL_BINDING_JSONRPC);
-        assert_eq!(iface["protocolVersion"], crate::a2a::effective_advertised_version());
+        assert_eq!(iface["protocolVersion"], advertised);
         assert!(iface["transport"].is_null(), "`transport` became `protocolBinding` in 1.0");
 
         // Renamed / relocated / removed fields.
@@ -920,9 +918,10 @@ mod onboarding_card_tests {
         assert_eq!(card["provider"]["organization"], "Affinidi");
         assert_eq!(card["capabilities"]["extendedAgentCard"], false);
 
-        // While legacy compatibility is on, the v0.3 spellings are emitted too,
-        // so a v0.3 reader gets a card it can act on rather than one it can only
-        // partially parse. They track the 1.0 values rather than being hardcoded.
+        // The onboarding agent accepts v0.3 too, so the v0.3 spellings are emitted
+        // as well, and a v0.3 reader gets a card it can act on rather than one it
+        // can only partially parse. They track the 1.0 values rather than being
+        // hardcoded.
         assert_eq!(card["agentProvider"], card["provider"]);
         assert_eq!(card["supportsAuthenticatedExtendedCard"], card["capabilities"]["extendedAgentCard"]);
 

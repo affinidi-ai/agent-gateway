@@ -745,8 +745,6 @@ export interface FeatureFlags {
    *  surfaces already configured to delegate payment continue to work
    *  and remain editable regardless of this flag. */
   agent_pay_delegation?: boolean;
-  /** Accept A2A protocol version 0.3 alongside 1.0. Absent means enabled. */
-  a2a_legacy_compatibility?: boolean;
   /** Whether Terms enforcement and management are enabled by the appliance. */
   terms?: boolean;
 }

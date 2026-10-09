@@ -827,6 +827,7 @@ pub async fn create_surface(
         .agent_surface_store
         .as_ref()
         .ok_or_else(|| SurfaceApiError::InternalError("Agent surface store not initialized".to_string()))?;
+    refuse_a2a_settings_sent_on_other_protocols(&surface)?;
 
     // Assign a new ID if not provided
     if surface.surface_id.is_empty() {
@@ -925,6 +926,8 @@ pub async fn create_surface(
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
+    normalize_a2a_settings(&mut surface, None).map_err(SurfaceApiError::BadRequest)?;
+    refuse_tenant_validation_off(&surface, None, tenant_context(&context))?;
     validate_mcp_resource_declarations(&state, &surface).await?;
     if let Ok(Some(_)) = store
         .get(&surface.surface_id)
@@ -968,6 +971,7 @@ pub async fn update_surface(
         return Err(SurfaceApiError::BadRequest("surface_id in body does not match URL parameter".to_string()));
     }
     surface.surface_id = surface_id.clone();
+    refuse_a2a_settings_sent_on_other_protocols(&surface)?;
 
     let existing = store
         .get(&surface_id)
@@ -985,6 +989,7 @@ pub async fn update_surface(
         surface.mcp_legacy_metadata_output = existing.mcp_legacy_metadata_output;
     }
     retain_mcp_settings(&mut surface, &existing);
+    retain_a2a_settings(&mut surface, &existing);
 
     let saved = validate_and_save_surface(
         &state,
@@ -996,6 +1001,127 @@ pub async fn update_surface(
     )
     .await?;
     Ok(Json(saved))
+}
+
+/// PUT carries the whole record, so an omitted `access_point.a2a` means
+/// "unchanged" while the block applies to some request on the surface, before
+/// and after the save. A surface whose block applied to nothing (an A2A proxy
+/// Target with no URL variant) stores none, so one leaving that state starts
+/// from the defaults.
+fn retain_a2a_settings(
+    surface: &mut AgentSurface,
+    existing: &AgentSurface,
+) {
+    if surface
+        .access_point
+        .a2a
+        .is_none()
+        && surface.uses_a2a_settings()
+        && surface.a2a_settings_apply()
+        && existing.a2a_settings_apply()
+    {
+        surface.access_point.a2a = existing
+            .access_point
+            .a2a
+            .clone();
+    }
+}
+
+/// Refuse an `access_point.a2a` the request itself carries on a surface that is
+/// not A2A or AP2, as `mcp_http` is refused on a surface that is not MCP. A block
+/// that only came from the stored surface, as when a merge `PATCH` changes the
+/// protocol, is dropped by [`normalize_a2a_settings`] instead.
+fn refuse_a2a_settings_sent_on_other_protocols(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    if surface.uses_a2a_settings() {
+        return Ok(());
+    }
+    surface
+        .validate_a2a_settings()
+        .map_err(SurfaceApiError::BadRequest)
+}
+
+/// Whether a merge `PATCH` body itself sets `access_point.a2a` (to anything
+/// other than `null`, which removes it).
+fn patch_sets_a2a_settings(patch: &serde_json::Value) -> bool {
+    patch
+        .pointer("/access_point/a2a")
+        .is_some_and(|a2a| !a2a.is_null())
+}
+
+/// Settle `access_point.a2a` before a save, given the block the surface had
+/// stored (`None` on create). A surface that is not A2A or AP2 drops a block left
+/// over from the stored surface, so a protocol change never fails on it; a block
+/// the request itself sent was already refused by
+/// [`refuse_a2a_settings_sent_on_other_protocols`].
+///
+/// A surface whose block applies to no request (an A2A-proxy Target with no URL
+/// variant) stores none, because the runtime fixes its settings and a later
+/// change should start from the defaults. An unchanged stored block is dropped
+/// quietly there, so an edit that leaves only proxy Targets (a Target moved to a
+/// proxy, the last URL variant removed) never fails on a block the gateway
+/// stored; a changed block that is not the fixed proxy settings is refused.
+///
+/// Every other A2A or AP2 surface stores the block explicitly, the defaults when
+/// it was not sent.
+fn normalize_a2a_settings(
+    surface: &mut AgentSurface,
+    stored: Option<&crate::config::agent_surface::A2aAccessPointSettings>,
+) -> Result<(), String> {
+    if !surface.uses_a2a_settings() {
+        surface.access_point.a2a = None;
+        return Ok(());
+    }
+    if !surface.a2a_settings_apply() {
+        if surface
+            .access_point
+            .a2a
+            .as_ref()
+            != stored
+        {
+            surface.validate_a2a_settings()?;
+        }
+        surface.access_point.a2a = None;
+        return Ok(());
+    }
+    surface.validate_a2a_settings()?;
+    if surface
+        .access_point
+        .a2a
+        .is_none()
+    {
+        surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings::default());
+    }
+    Ok(())
+}
+
+/// Only an appliance-wide caller may turn a surface's A2A validation `off`. With
+/// it off, a JSON-RPC batch or a non-string `method` reaches policy and the
+/// payment filters without a method to match, so a tenant-scoped token could
+/// otherwise step around operator-wide method rules. A surface that is already
+/// `off` stays editable.
+fn refuse_tenant_validation_off(
+    surface: &AgentSurface,
+    stored: Option<&crate::config::agent_surface::A2aAccessPointSettings>,
+    context: Option<&PatTenantContext>,
+) -> Result<(), SurfaceApiError> {
+    use crate::config::agent_surface::A2aValidation;
+    let is_off = |settings: Option<&crate::config::agent_surface::A2aAccessPointSettings>| {
+        settings.is_some_and(|settings| settings.validation == A2aValidation::Off)
+    };
+    if context.is_some()
+        && is_off(
+            surface
+                .access_point
+                .a2a
+                .as_ref(),
+        )
+        && !is_off(stored)
+    {
+        return Err(SurfaceApiError::Forbidden(
+            "only an appliance-wide administrator can set access_point.a2a.validation to \"off\"".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn retain_mcp_settings(
@@ -1156,6 +1282,14 @@ async fn validate_and_save_surface(
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
+    let stored_a2a = existing.and_then(|existing| {
+        existing
+            .access_point
+            .a2a
+            .as_ref()
+    });
+    normalize_a2a_settings(&mut surface, stored_a2a).map_err(SurfaceApiError::BadRequest)?;
+    refuse_tenant_validation_off(&surface, stored_a2a, context)?;
     validate_mcp_resource_declarations(state, &surface).await?;
 
     store
@@ -1243,6 +1377,9 @@ pub async fn patch_surface(
     let mut surface: AgentSurface = serde_json::from_value(merged)
         .map_err(|e| SurfaceApiError::BadRequest(format!("Merged surface failed to deserialise: {}", e)))?;
     surface.surface_id = surface_id.clone();
+    if patch_sets_a2a_settings(&patch) {
+        refuse_a2a_settings_sent_on_other_protocols(&surface)?;
+    }
 
     let saved = validate_and_save_surface(
         &state,
@@ -2056,6 +2193,7 @@ pub async fn get_resolved_variant(
 #[cfg(test)]
 mod validation_tests {
     use super::*;
+    use crate::config::agent_surface::A2aValidation;
     use crate::config::agent_surface::{AccessPoint, IdentityInjectionConfig, SurfaceProtocol, SurfaceStatus, Target};
     use crate::config::agent_surface_variants::{SurfaceOverrides, SurfaceVariant, TargetOverrides};
 
@@ -2103,6 +2241,319 @@ mod validation_tests {
         );
     }
 
+    fn a2a_block(
+        versions: &[&str],
+        validation: crate::config::agent_surface::A2aValidation,
+    ) -> crate::config::agent_surface::A2aAccessPointSettings {
+        crate::config::agent_surface::A2aAccessPointSettings {
+            accepted_versions: versions
+                .iter()
+                .map(|v| v.to_string())
+                .collect(),
+            validation,
+        }
+    }
+
+    #[test]
+    fn a_saved_a2a_surface_always_stores_its_a2a_block() {
+        let mut surface = base_surface();
+        assert_eq!(normalize_a2a_settings(&mut surface, None), Ok(()));
+        assert_eq!(surface.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)));
+
+        let mut explicit = base_surface();
+        explicit.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
+        assert_eq!(normalize_a2a_settings(&mut explicit, None), Ok(()));
+        assert_eq!(
+            explicit.access_point.a2a,
+            Some(a2a_block(&["1.0"], A2aValidation::Full)),
+            "an explicit block is kept as sent"
+        );
+    }
+
+    #[test]
+    fn a_saved_surface_with_no_accepted_version_is_refused() {
+        let mut surface = base_surface();
+        surface.access_point.a2a = Some(a2a_block(&[], A2aValidation::Envelope));
+        assert!(
+            normalize_a2a_settings(&mut surface, None)
+                .unwrap_err()
+                .contains("at least one version")
+        );
+    }
+
+    #[test]
+    fn an_a2a_proxy_surface_stores_no_a2a_block() {
+        let mut omitted = base_surface();
+        omitted.target.endpoint = "a2a-proxy://worker".to_string();
+        assert_eq!(normalize_a2a_settings(&mut omitted, None), Ok(()));
+        assert_eq!(omitted.access_point.a2a, None);
+
+        let mut fixed = base_surface();
+        fixed.target.endpoint = "a2a-proxy://worker".to_string();
+        fixed.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Envelope));
+        assert_eq!(normalize_a2a_settings(&mut fixed, None), Ok(()));
+        assert_eq!(fixed.access_point.a2a, None, "the fixed block the dashboard sends is not stored");
+        assert_eq!(
+            fixed
+                .a2a_settings()
+                .accepted_versions,
+            crate::a2a::version::VERSIONS_1_0_ONLY
+        );
+    }
+
+    fn with_url_variant(surface: AgentSurface) -> AgentSurface {
+        let mut value = serde_json::to_value(surface).unwrap();
+        value["variants"] = serde_json::json!([{
+            "id": "v", "alias": "url", "name": "url", "enabled": true,
+            "overrides": {"target": {"endpoint": "https://agent.example"}}
+        }]);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn an_a2a_proxy_surface_with_a_url_variant_stores_its_block() {
+        let mut sent = base_surface();
+        sent.target.endpoint = "a2a-proxy://worker".to_string();
+        sent.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
+        let mut sent = with_url_variant(sent);
+        assert_eq!(normalize_a2a_settings(&mut sent, None), Ok(()));
+        assert_eq!(sent.access_point.a2a, Some(a2a_block(&["1.0"], A2aValidation::Full)));
+
+        let mut omitted = base_surface();
+        omitted.target.endpoint = "a2a-proxy://worker".to_string();
+        let mut omitted = with_url_variant(omitted);
+        assert_eq!(normalize_a2a_settings(&mut omitted, None), Ok(()));
+        assert_eq!(
+            omitted.access_point.a2a,
+            Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)),
+            "stored explicitly, as on any surface it applies to"
+        );
+    }
+
+    #[test]
+    fn a_put_that_omits_the_block_keeps_it_on_an_a2a_proxy_surface_with_a_url_variant() {
+        let mut existing = base_surface();
+        existing.target.endpoint = "a2a-proxy://worker".to_string();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
+        let existing = with_url_variant(existing);
+
+        let mut omitted = base_surface();
+        omitted.target.endpoint = "a2a-proxy://worker".to_string();
+        let mut omitted = with_url_variant(omitted);
+        retain_a2a_settings(&mut omitted, &existing);
+        assert_eq!(normalize_a2a_settings(&mut omitted, None), Ok(()));
+        assert_eq!(omitted.access_point.a2a, Some(a2a_block(&["1.0"], A2aValidation::Full)));
+    }
+
+    #[test]
+    fn an_a2a_proxy_surface_refuses_a_conflicting_block() {
+        let mut surface = base_surface();
+        surface.target.endpoint = "a2a-proxy://worker".to_string();
+        surface.access_point.a2a = Some(a2a_block(&["0.3"], A2aValidation::Full));
+        assert!(
+            normalize_a2a_settings(&mut surface, None)
+                .unwrap_err()
+                .contains("A2A proxy target")
+        );
+    }
+
+    #[test]
+    fn a_non_a2a_surface_stores_no_a2a_block() {
+        let mut surface = base_surface();
+        surface.access_point.protocol = SurfaceProtocol::Mcp;
+        surface.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Envelope));
+        assert_eq!(normalize_a2a_settings(&mut surface, None), Ok(()));
+        assert_eq!(surface.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_block_sent_on_a_non_a2a_surface_is_refused() {
+        let mut mcp = base_surface();
+        mcp.access_point.protocol = SurfaceProtocol::Mcp;
+        mcp.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Envelope));
+        match refuse_a2a_settings_sent_on_other_protocols(&mcp) {
+            Err(SurfaceApiError::BadRequest(message)) => {
+                assert_eq!(message, "access_point.a2a requires an A2A or AP2 Access Point")
+            }
+            other => panic!("expected a 400, got {other:?}"),
+        }
+
+        mcp.access_point.a2a = None;
+        assert!(refuse_a2a_settings_sent_on_other_protocols(&mcp).is_ok(), "no block, nothing to refuse");
+
+        let mut a2a = base_surface();
+        a2a.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
+        assert!(refuse_a2a_settings_sent_on_other_protocols(&a2a).is_ok(), "an A2A surface may carry it");
+    }
+
+    #[test]
+    fn only_a_patch_body_that_sets_the_block_counts_as_sending_it() {
+        assert!(patch_sets_a2a_settings(&serde_json::json!({ "access_point": { "a2a": { "validation": "off" } } })));
+        assert!(!patch_sets_a2a_settings(&serde_json::json!({ "access_point": { "a2a": null } })));
+        assert!(!patch_sets_a2a_settings(&serde_json::json!({ "access_point": { "protocol": "mcp" } })));
+        assert!(!patch_sets_a2a_settings(&serde_json::json!({ "name": "renamed" })));
+    }
+
+    /// A block the gateway stored itself must not turn an edit that leaves only
+    /// A2A-proxy Targets into a 400: a merge `PATCH` moving the Target to a proxy,
+    /// a `PUT` echoing the block from `GET`, or a variant change that removes the
+    /// last URL Target all carry the stored block unchanged, and it is dropped.
+    #[test]
+    fn an_unchanged_stored_block_is_dropped_once_it_applies_to_nothing() {
+        let stored = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
+        let mut moved = base_surface();
+        moved.target.endpoint = "a2a-proxy://worker".to_string();
+        moved.access_point.a2a = Some(stored.clone());
+
+        assert_eq!(normalize_a2a_settings(&mut moved, Some(&stored)), Ok(()));
+        assert_eq!(moved.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_changed_block_that_applies_to_nothing_is_still_refused() {
+        let stored = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
+        let mut changed = base_surface();
+        changed.target.endpoint = "a2a-proxy://worker".to_string();
+        changed.access_point.a2a = Some(a2a_block(&["0.3"], A2aValidation::Full));
+
+        assert!(
+            normalize_a2a_settings(&mut changed, Some(&stored))
+                .unwrap_err()
+                .starts_with("an A2A proxy target serves A2A 1.0 only")
+        );
+    }
+
+    fn tenant() -> PatTenantContext {
+        PatTenantContext {
+            token_id: "token".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_tenant_token_cannot_turn_validation_off() {
+        let mut surface = base_surface();
+        surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
+        let envelope = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
+
+        match refuse_tenant_validation_off(&surface, Some(&envelope), Some(&tenant())) {
+            Err(SurfaceApiError::Forbidden(message)) => assert!(message.contains("appliance-wide administrator")),
+            other => panic!("expected a 403, got {other:?}"),
+        }
+        assert!(
+            matches!(refuse_tenant_validation_off(&surface, None, Some(&tenant())), Err(SurfaceApiError::Forbidden(_))),
+            "on create too"
+        );
+    }
+
+    #[test]
+    fn validation_off_is_allowed_for_an_appliance_wide_caller_or_when_already_off() {
+        let mut surface = base_surface();
+        surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
+        let off = a2a_block(&["1.0"], A2aValidation::Off);
+
+        assert!(refuse_tenant_validation_off(&surface, None, None).is_ok(), "appliance-wide caller");
+        assert!(
+            refuse_tenant_validation_off(&surface, Some(&off), Some(&tenant())).is_ok(),
+            "a tenant may edit a surface that is already off"
+        );
+
+        surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Full));
+        assert!(
+            refuse_tenant_validation_off(&surface, None, Some(&tenant())).is_ok(),
+            "a tenant may choose any other level"
+        );
+    }
+
+    #[test]
+    fn a_put_that_omits_the_a2a_block_keeps_the_stored_one() {
+        let mut existing = base_surface();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Envelope));
+
+        let mut omitted = base_surface();
+        retain_a2a_settings(&mut omitted, &existing);
+        assert_eq!(omitted.access_point.a2a, existing.access_point.a2a);
+
+        let mut changed = base_surface();
+        changed.access_point.a2a = Some(a2a_block(&["0.3"], A2aValidation::Full));
+        retain_a2a_settings(&mut changed, &existing);
+        assert_eq!(
+            changed.access_point.a2a,
+            Some(a2a_block(&["0.3"], A2aValidation::Full)),
+            "a sent block replaces the stored one"
+        );
+    }
+
+    #[test]
+    fn a_put_that_changes_the_protocol_away_from_a2a_drops_the_stored_block() {
+        let mut existing = base_surface();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
+
+        let mut mcp = base_surface();
+        mcp.access_point.protocol = SurfaceProtocol::Mcp;
+        retain_a2a_settings(&mut mcp, &existing);
+        assert_eq!(normalize_a2a_settings(&mut mcp, None), Ok(()));
+        assert_eq!(mcp.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_merge_patch_that_changes_the_protocol_away_from_a2a_drops_the_stored_block() {
+        let mut existing = base_surface();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
+
+        let mut merged = serde_json::to_value(&existing).unwrap();
+        json_patch::merge(&mut merged, &serde_json::json!({ "access_point": { "protocol": "mcp" } }));
+        let mut patched: AgentSurface = serde_json::from_value(merged).unwrap();
+        assert!(
+            patched
+                .access_point
+                .a2a
+                .is_some(),
+            "the merge carries the stored block"
+        );
+
+        assert_eq!(normalize_a2a_settings(&mut patched, None), Ok(()));
+        assert_eq!(patched.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_put_that_switches_to_an_a2a_proxy_stores_no_block() {
+        let mut existing = base_surface();
+        existing.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Full));
+
+        let mut switched = base_surface();
+        switched.target.endpoint = "a2a-proxy://worker".to_string();
+        retain_a2a_settings(&mut switched, &existing);
+        assert_eq!(normalize_a2a_settings(&mut switched, None), Ok(()));
+        assert_eq!(switched.access_point.a2a, None);
+    }
+
+    #[test]
+    fn a_put_that_moves_off_an_a2a_proxy_starts_from_the_defaults() {
+        let mut existing = base_surface();
+        existing.target.endpoint = "a2a-proxy://worker".to_string();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Envelope));
+
+        let mut moved = base_surface();
+        retain_a2a_settings(&mut moved, &existing);
+        assert_eq!(normalize_a2a_settings(&mut moved, None), Ok(()));
+        assert_eq!(moved.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)));
+    }
+
+    #[test]
+    fn a_merge_patch_that_nulls_the_a2a_block_resets_it_to_the_defaults() {
+        let mut existing = base_surface();
+        existing.access_point.a2a = Some(a2a_block(&["1.0"], A2aValidation::Full));
+
+        let mut merged = serde_json::to_value(&existing).unwrap();
+        json_patch::merge(&mut merged, &serde_json::json!({ "access_point": { "a2a": null } }));
+        let mut patched: AgentSurface = serde_json::from_value(merged).unwrap();
+        assert_eq!(patched.access_point.a2a, None);
+
+        assert_eq!(normalize_a2a_settings(&mut patched, None), Ok(()));
+        assert_eq!(patched.access_point.a2a, Some(a2a_block(&["0.3", "1.0"], A2aValidation::Envelope)));
+    }
+
     fn base_surface() -> AgentSurface {
         AgentSurface {
             surface_id: "s1".to_string(),
@@ -2134,6 +2585,7 @@ mod validation_tests {
                 response_custom_metadata: None,
                 didwebvh_identity: None,
                 terminate_trace_id: false,
+                a2a: None,
             },
             target: Target {
                 endpoint: "https://prod.example.com".to_string(),

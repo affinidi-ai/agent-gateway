@@ -1127,19 +1127,28 @@ pub async fn handle_agent_card(
     // `application/a2a+json`, but it is only served to callers that signalled 1.0
     // (via `A2A-Version` or `Accept`) so 0.3 clients and tools that strict-check
     // `application/json` are unaffected.
-    Ok(agent_card_response(agent_card, &headers))
+    Ok(agent_card_response(
+        agent_card,
+        &headers,
+        state
+            .surface
+            .a2a_settings()
+            .accepted_versions,
+    ))
 }
 
 /// Serialize an agent card with the media type negotiated from the request's
-/// `A2A-Version` / `Accept` headers, and a `Vary` naming those headers so a
-/// shared cache keys each variant separately.
+/// `A2A-Version` / `Accept` headers against the surface's `accepted` versions,
+/// and a `Vary` naming those headers so a shared cache keys each variant
+/// separately.
 fn agent_card_response(
     agent_card: JsonValue,
     headers: &HeaderMap,
+    accepted: &[&str],
 ) -> Response {
     use axum::http::{HeaderValue, header};
 
-    let content_type = crate::a2a::version::agent_card_content_type(headers);
+    let content_type = crate::a2a::version::agent_card_content_type(headers, accepted);
     let mut response = Json(agent_card).into_response();
     let response_headers = response.headers_mut();
     response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -2655,33 +2664,24 @@ async fn proxy_handler_with_mcp_runtime(
         | Ap2InboundDecision::RejectTransformationFailed => {}
     }
 
-    let is_a2a_surface = matches!(
-        state
-            .surface
-            .access_point
-            .protocol,
-        crate::config::agent_surface::SurfaceProtocol::A2a | crate::config::agent_surface::SurfaceProtocol::Ap2
-    );
+    // Version negotiation, JSON-RPC envelope validation and A2A request-shape
+    // validation are decided from the headers and the body shape alone, so they
+    // run here, before any payment is taken and before a `fabric://` target is
+    // dispatched, and a request they refuse is never charged or forwarded.
+    let is_a2a_surface = state
+        .surface
+        .uses_a2a_settings();
     let is_a2a_proxy_target = is_a2a_surface
         && state
             .surface
-            .target
-            .endpoint
-            .starts_with("a2a-proxy://");
-    // Version negotiation, JSON-RPC envelope validation and A2A request-shape
-    // validation are decided from the headers and the body shape alone, so they
-    // run here, before any payment is taken, and a request they refuse is never
-    // charged. `fabric://` targets are neither negotiated nor validated.
-    let checks_a2a_request = is_a2a_surface
-        && !state
-            .surface
-            .target
-            .endpoint
-            .starts_with("fabric://");
+            .is_a2a_proxy_target();
+    // The accepted versions and the validation level are set per A2A Access
+    // Point; an A2A-proxy target is always 1.0 only with envelope validation.
+    let a2a_settings = state.surface.a2a_settings();
 
     // ── A2A protocol version negotiation (A2A / AP2 only) ────────────────
     // A2A 1.0 added the `A2A-Version` request header. Per spec an absent or
-    // empty value means `0.3`; a version outside the set the gateway accepts is
+    // empty value means `0.3`; a version outside the set the surface accepts is
     // rejected with `VersionNotSupportedError` (-32009) plus the supported list.
     // The gateway recognises both eras but never translates between them — a
     // caller and its managed agent must be version-compatible.
@@ -2692,14 +2692,14 @@ async fn proxy_handler_with_mcp_runtime(
     // named by -32602 and resending would only surface the -32009 on the second
     // attempt, and the version is the more fundamental rejection since the
     // gateway cannot serve that caller whatever the body contains.
-    if checks_a2a_request {
+    if is_a2a_surface {
         // The gateway accepts either method era regardless of the negotiated
         // version, so record both: the skew between them is the signal that
         // tells us when v0.3 traffic has faded enough to drop it. Refused
-        // requests are recorded too, so callers turned away after legacy
-        // compatibility is switched off stay visible.
+        // requests are recorded too, so callers turned away by a surface that
+        // no longer accepts 0.3 stay visible.
         // Reuses the already-parsed `a2a_context` — no extra body parse.
-        let negotiation = crate::a2a::negotiate_from_headers(&headers);
+        let negotiation = crate::a2a::negotiate_from_headers(&headers, a2a_settings.accepted_versions);
         let method_era = a2a_context
             .as_ref()
             .and_then(|ctx| ctx.method.as_deref())
@@ -2711,32 +2711,56 @@ async fn proxy_handler_with_mcp_runtime(
         );
         match negotiation {
             Ok(version) => {
-                channel_debug!(config_id, "A2A protocol version negotiated: {} (method era: {})", version, method_era);
+                channel_debug!(
+                    config_id,
+                    "A2A protocol version negotiated: {} (method era: {}; surface accepts {}, validation={})",
+                    version,
+                    method_era,
+                    a2a_settings
+                        .accepted_versions
+                        .join(", "),
+                    a2a_settings
+                        .validation
+                        .as_str()
+                );
             }
             Err(requested) => {
-                channel_warn!(config_id, "Unsupported A2A protocol version requested: {}", requested);
+                channel_warn!(
+                    config_id,
+                    "A2A request refused with -32009: {}",
+                    crate::a2a::version::version_refusal_reason(
+                        &headers,
+                        &requested,
+                        a2a_settings.accepted_versions,
+                        is_a2a_proxy_target,
+                    )
+                );
                 connection_guard
                     .decrement()
                     .await;
-                return Err(crate::a2a::create_version_not_supported_response(&requested));
+                return Err(crate::a2a::create_version_not_supported_response(
+                    &requested,
+                    a2a_settings.accepted_versions,
+                ));
             }
         }
     }
 
     // ── JSON-RPC envelope validation (A2A / AP2 only) ────────────────────
-    // When `validate_messages` is enabled, reject requests that are not valid
-    // JSON or that lack the required JSON-RPC 2.0 envelope fields (`jsonrpc`
-    // and `method`).  This catches malformed requests early, before they reach
-    // the upstream agent.
-    if state
-        .config
-        .a2a
-        .validate_messages
-        && checks_a2a_request
+    // Unless the surface's validation is `off`: reject requests that are not
+    // valid JSON or that lack the JSON-RPC 2.0 envelope fields (`jsonrpc` and a
+    // string `method`). Besides catching malformed requests early, this keeps a
+    // batch or a non-string `method` from reaching payment, surface policy and
+    // the agent without a method that rules and payment filters could match on.
+    // Global and gateway policy have already run and seen it without one.
+    if a2a_settings
+        .validation
+        .checks_envelope()
+        && is_a2a_surface
         && !body_bytes.is_empty()
         && let Err((code, message)) = validate_jsonrpc_envelope(&body_bytes)
     {
-        channel_warn!(config_id, "JSON-RPC validation failed: {}", message);
+        channel_warn!(config_id, "A2A request refused: JSON-RPC validation failed: {}", message);
         connection_guard
             .decrement()
             .await;
@@ -2745,28 +2769,25 @@ async fn proxy_handler_with_mcp_runtime(
 
     // ── A2A request-shape validation ─────────────────────────────────────
     // Beyond the JSON-RPC envelope, check the fields A2A itself requires on a
-    // request, under the same `validate_messages` setting. A request that fails
-    // here was already going to fail: a conformant agent refuses a message with
-    // no `messageId` too, one hop later and with a vaguer error. Only fields
-    // both protocol eras spell the same way are checked, so it favours neither.
-    if state
-        .config
-        .a2a
-        .validate_messages
-        && checks_a2a_request
-        // Managed agents only. An A2A-proxy target is not a pass-through to an
-        // A2A agent, it IS the implementation: it translates the message into a
-        // non-A2A backend and needs only `params.message` and text parts. There
-        // is no downstream agent to refuse a malformed request, so checking here
-        // would not fail a request sooner, it would fail one that works today.
-        && !is_a2a_proxy_target
+    // request, when the surface's validation is `full`. A request that fails here
+    // was already going to fail: a conformant agent refuses a message with no
+    // `messageId` too, one hop later and with a vaguer error. Only fields both
+    // protocol eras spell the same way are checked, so it favours neither.
+    // An A2A-proxy target never checks the shape: it is the implementation
+    // rather than a pass-through, and keeps serving the lenient requests its
+    // callers send.
+    if a2a_settings
+        .validation
+        .checks_request_shape()
+        && is_a2a_surface
         && !body_bytes.is_empty()
         && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         && let Err(field_errors) = crate::a2a::validation::validate_request_shape(&parsed)
     {
         channel_warn!(
             config_id,
-            "A2A request shape validation failed: {} error(s), truncated={}, first fields: {}",
+            "A2A request refused: request shape validation failed (validation is full for this surface): \
+             {} error(s), truncated={}, first fields: {}",
             field_errors.errors.len(),
             field_errors.truncated,
             field_errors
@@ -15476,7 +15497,8 @@ mod tests {
         for (name, value) in request_headers {
             headers.insert(*name, HeaderValue::from_static(value));
         }
-        let response = agent_card_response(serde_json::json!({"name": "card"}), &headers);
+        let response =
+            agent_card_response(serde_json::json!({"name": "card"}), &headers, crate::a2a::version::SUPPORTED_VERSIONS);
         let content_type = response.headers()[axum::http::header::CONTENT_TYPE]
             .to_str()
             .unwrap()

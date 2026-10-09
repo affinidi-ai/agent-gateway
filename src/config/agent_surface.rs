@@ -259,6 +259,122 @@ pub struct AccessPoint {
     /// the next gateway/agent.
     #[serde(default)]
     pub terminate_trace_id: bool,
+
+    /// A2A protocol settings: the versions this surface accepts and how much of
+    /// an inbound request is validated. A2A and AP2 Access Points only. Absent
+    /// means [`A2aAccessPointSettings::default`]: both versions, with the
+    /// JSON-RPC envelope checked. Surface-level, not overridable per variant;
+    /// read it through [`AgentSurface::a2a_settings`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a: Option<A2aAccessPointSettings>,
+}
+
+/// How much of an inbound A2A request the gateway validates before forwarding it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum A2aValidation {
+    /// Nothing: requests are forwarded as they are. A JSON-RPC batch or a
+    /// non-string `method` then reaches policy without a method to match.
+    Off,
+    /// The JSON-RPC envelope: valid JSON, `"jsonrpc": "2.0"` and a string
+    /// `method`, which refuses batches.
+    #[default]
+    Envelope,
+    /// The envelope and the A2A request shape (`messageId`, `role`, `parts`,
+    /// `params.id`, the ListTasks `status`).
+    Full,
+}
+
+impl A2aValidation {
+    /// Whether the JSON-RPC envelope is checked.
+    pub fn checks_envelope(self) -> bool {
+        matches!(self, Self::Envelope | Self::Full)
+    }
+
+    /// Whether the A2A request shape is checked.
+    pub fn checks_request_shape(self) -> bool {
+        self == Self::Full
+    }
+
+    /// The setting's value as stored and logged.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Envelope => "envelope",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// A2A protocol settings of an A2A Access Point.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct A2aAccessPointSettings {
+    /// A2A versions the surface accepts through `A2A-Version` negotiation: a
+    /// non-empty subset of [`crate::a2a::version::SUPPORTED_VERSIONS`].
+    pub accepted_versions: Vec<String>,
+
+    /// How much of a request is validated before it is forwarded.
+    pub validation: A2aValidation,
+}
+
+impl Default for A2aAccessPointSettings {
+    fn default() -> Self {
+        Self {
+            accepted_versions: crate::a2a::version::SUPPORTED_VERSIONS
+                .iter()
+                .map(|version| version.to_string())
+                .collect(),
+            validation: A2aValidation::default(),
+        }
+    }
+}
+
+impl A2aAccessPointSettings {
+    /// The fixed settings of an `a2a-proxy://` target: A2A 1.0 only, with the
+    /// JSON-RPC envelope checked but not the request shape, so the proxy keeps
+    /// serving the lenient requests its callers send.
+    pub fn a2a_proxy() -> Self {
+        Self {
+            accepted_versions: vec![crate::a2a::version::VERSION_1_0.to_string()],
+            validation: A2aValidation::Envelope,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self
+            .accepted_versions
+            .is_empty()
+        {
+            return Err("access_point.a2a.accepted_versions must name at least one version".to_string());
+        }
+        for (index, version) in self
+            .accepted_versions
+            .iter()
+            .enumerate()
+        {
+            if !crate::a2a::version::SUPPORTED_VERSIONS.contains(&version.as_str()) {
+                return Err(format!(
+                    "access_point.a2a.accepted_versions: unsupported version '{version}' (supported: {})",
+                    crate::a2a::version::SUPPORTED_VERSIONS.join(", ")
+                ));
+            }
+            if self.accepted_versions[..index].contains(version) {
+                return Err(format!("access_point.a2a.accepted_versions lists '{version}' more than once"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The A2A settings a request on a surface is served with; see
+/// [`AgentSurface::a2a_settings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveA2aSettings {
+    /// The versions negotiation accepts, in `SUPPORTED_VERSIONS` order.
+    pub accepted_versions: &'static [&'static str],
+    /// How much of a request is validated.
+    pub validation: A2aValidation,
 }
 
 /// Agent protocol — governs both inbound and Target communication.
@@ -1798,6 +1914,82 @@ impl AgentSurface {
         Ok(())
     }
 
+    /// True for the Access Point protocols that carry `access_point.a2a`: A2A and AP2.
+    pub fn uses_a2a_settings(&self) -> bool {
+        matches!(self.access_point.protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2)
+    }
+
+    /// True when the Target is an A2A proxy (`a2a-proxy://`).
+    pub fn is_a2a_proxy_target(&self) -> bool {
+        self.target
+            .endpoint
+            .starts_with(A2A_PROXY_ENDPOINT_PREFIX)
+    }
+
+    /// The A2A settings requests on this surface are served with: the stored
+    /// `access_point.a2a`, or its defaults when absent. An `a2a-proxy://` target
+    /// always gets [`A2aAccessPointSettings::a2a_proxy`], whatever is stored.
+    ///
+    /// Call it on the variant-resolved surface, so a variant that points at an
+    /// A2A proxy is served as one.
+    pub fn a2a_settings(&self) -> EffectiveA2aSettings {
+        let proxy;
+        let stored;
+        let settings = if self.is_a2a_proxy_target() {
+            proxy = A2aAccessPointSettings::a2a_proxy();
+            &proxy
+        } else if let Some(settings) = &self.access_point.a2a {
+            settings
+        } else {
+            stored = A2aAccessPointSettings::default();
+            &stored
+        };
+        EffectiveA2aSettings {
+            accepted_versions: crate::a2a::version::accepted_set(&settings.accepted_versions),
+            validation: settings.validation,
+        }
+    }
+
+    /// Whether `access_point.a2a` applies to any request on this surface: its own
+    /// Target is not an A2A proxy, or a variant points the Target at one that
+    /// is not. A2A-proxy Targets always use the fixed proxy settings.
+    pub fn a2a_settings_apply(&self) -> bool {
+        !self.is_a2a_proxy_target()
+            || self
+                .variants
+                .iter()
+                .any(|variant| {
+                    self.resolve_variant(Some(&variant.alias))
+                        .is_ok_and(|resolved| !resolved.is_a2a_proxy_target())
+                })
+    }
+
+    /// Validate `access_point.a2a`: it belongs to A2A and AP2 Access Points only,
+    /// and must name supported versions. On a surface where it applies to no
+    /// request (its Target is an A2A proxy and so is every variant's), it must
+    /// match the fixed proxy settings rather than look applied and not be.
+    ///
+    /// The block and the protocol are surface-level, so variants are not
+    /// checked separately. A variant that points the Target at an A2A proxy is
+    /// served with the fixed proxy settings whatever the block says, and one that
+    /// points it at a URL is served with the block.
+    pub fn validate_a2a_settings(&self) -> Result<(), String> {
+        let Some(settings) = &self.access_point.a2a else {
+            return Ok(());
+        };
+        if !self.uses_a2a_settings() {
+            return Err("access_point.a2a requires an A2A or AP2 Access Point".to_string());
+        }
+        settings.validate()?;
+        if !self.a2a_settings_apply() && *settings != A2aAccessPointSettings::a2a_proxy() {
+            return Err("an A2A proxy target serves A2A 1.0 only with envelope validation, and no variant \
+                        points the Target at a URL that other settings could apply to: set access_point.a2a to \
+                        accepted_versions [\"1.0\"] and validation \"envelope\", or omit it"
+                .to_string());
+        }
+        Ok(())
+    }
+
     pub fn validate_mcp_metadata(&self) -> Result<(), String> {
         self.validate_mcp_metadata_base()?;
         for variant in &self.variants {
@@ -2759,6 +2951,7 @@ mod tests {
                 response_custom_metadata: None,
                 didwebvh_identity: None,
                 terminate_trace_id: false,
+                a2a: None,
             },
             target: Target {
                 endpoint: "https://sales.internal:3000/a2a".to_string(),
@@ -2832,6 +3025,7 @@ mod tests {
                 response_custom_metadata: None,
                 didwebvh_identity: None,
                 terminate_trace_id: false,
+                a2a: None,
             },
             target: Target {
                 endpoint: "https://test.internal/mcp".to_string(),
@@ -4143,5 +4337,247 @@ mod tests {
             "serialised surface must NOT contain the legacy department_id field, got: {}",
             value
         );
+    }
+}
+
+#[cfg(test)]
+mod a2a_settings_tests {
+    use super::*;
+    use crate::a2a::version::{SUPPORTED_VERSIONS, VERSIONS_0_3_ONLY, VERSIONS_1_0_ONLY};
+    use serde_json::json;
+
+    fn surface(
+        protocol: &str,
+        endpoint: &str,
+        a2a: Option<serde_json::Value>,
+    ) -> AgentSurface {
+        let mut value = json!({
+            "surface_id": "s", "name": "s",
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/agent", "protocol": protocol},
+            "target": {"endpoint": endpoint}
+        });
+        if let Some(a2a) = a2a {
+            value["access_point"]["a2a"] = a2a;
+        }
+        serde_json::from_value(value).expect("surface fixture")
+    }
+
+    fn settings(
+        versions: &[&str],
+        validation: &str,
+    ) -> serde_json::Value {
+        json!({ "accepted_versions": versions, "validation": validation })
+    }
+
+    fn effective(
+        accepted_versions: &'static [&'static str],
+        validation: A2aValidation,
+    ) -> EffectiveA2aSettings {
+        EffectiveA2aSettings { accepted_versions, validation }
+    }
+
+    #[test]
+    fn an_absent_block_means_both_versions_with_envelope_validation() {
+        let surface = surface("a2a", "http://agent", None);
+        assert_eq!(surface.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Envelope));
+        assert_eq!(
+            A2aAccessPointSettings::default(),
+            A2aAccessPointSettings {
+                accepted_versions: vec!["0.3".to_string(), "1.0".to_string()],
+                validation: A2aValidation::Envelope
+            }
+        );
+    }
+
+    #[test]
+    fn validation_levels_check_what_they_name() {
+        assert!(!A2aValidation::Off.checks_envelope());
+        assert!(!A2aValidation::Off.checks_request_shape());
+        assert!(A2aValidation::Envelope.checks_envelope());
+        assert!(!A2aValidation::Envelope.checks_request_shape());
+        assert!(A2aValidation::Full.checks_envelope());
+        assert!(A2aValidation::Full.checks_request_shape());
+    }
+
+    #[test]
+    fn a_stored_block_is_what_requests_are_served_with() {
+        let only_1_0 = surface("a2a", "http://agent", Some(settings(&["1.0"], "off")));
+        assert_eq!(only_1_0.a2a_settings(), effective(VERSIONS_1_0_ONLY, A2aValidation::Off));
+        let only_0_3 = surface("a2a", "http://agent", Some(settings(&["0.3"], "full")));
+        assert_eq!(only_0_3.a2a_settings(), effective(VERSIONS_0_3_ONLY, A2aValidation::Full));
+    }
+
+    #[test]
+    fn a_partial_block_fills_the_missing_field_with_its_default() {
+        let validation_only = surface("a2a", "http://agent", Some(json!({ "validation": "full" })));
+        assert_eq!(validation_only.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Full));
+        let versions_only = surface("a2a", "http://agent", Some(json!({ "accepted_versions": ["1.0"] })));
+        assert_eq!(versions_only.a2a_settings(), effective(VERSIONS_1_0_ONLY, A2aValidation::Envelope));
+    }
+
+    /// An A2A-proxy Target serves A2A 1.0 only with envelope validation, whatever
+    /// is stored, so a hand-edited surface file cannot reopen it to 0.3.
+    #[test]
+    fn an_a2a_proxy_target_is_always_1_0_only_with_envelope_validation() {
+        for stored in [None, Some(settings(&["0.3", "1.0"], "full")), Some(settings(&["0.3"], "off"))] {
+            let surface = surface("a2a", "a2a-proxy://worker", stored.clone());
+            assert!(surface.is_a2a_proxy_target());
+            assert_eq!(surface.a2a_settings(), effective(VERSIONS_1_0_ONLY, A2aValidation::Envelope), "{stored:?}");
+        }
+    }
+
+    #[test]
+    fn the_block_round_trips_and_is_omitted_when_absent() {
+        for validation in ["off", "envelope", "full"] {
+            let stored = surface("a2a", "http://agent", Some(settings(&["1.0"], validation)));
+            let saved = serde_json::to_value(&stored).unwrap();
+            assert_eq!(saved["access_point"]["a2a"], settings(&["1.0"], validation));
+        }
+
+        let absent = serde_json::to_value(surface("a2a", "http://agent", None)).unwrap();
+        assert!(
+            absent["access_point"]
+                .get("a2a")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_or_validation_level_in_the_block_is_refused() {
+        for a2a in [json!({"accepted_versions": ["1.0"], "versions": ["1.0"]}), json!({"validation": "strict"})] {
+            let result: Result<AgentSurface, _> = serde_json::from_value(json!({
+                "surface_id": "s", "name": "s",
+                "access_point": {"listen_address": "127.0.0.1:8080", "route": "/agent", "protocol": "a2a", "a2a": a2a},
+                "target": {"endpoint": "http://agent"}
+            }));
+            assert!(result.is_err(), "{a2a}");
+        }
+    }
+
+    #[test]
+    fn valid_settings_pass_validation() {
+        for versions in [&["0.3", "1.0"][..], &["1.0"], &["0.3"], &["1.0", "0.3"]] {
+            for validation in ["off", "envelope", "full"] {
+                let surface = surface("a2a", "http://agent", Some(settings(versions, validation)));
+                assert_eq!(surface.validate_a2a_settings(), Ok(()), "{versions:?} {validation}");
+            }
+        }
+        assert_eq!(surface("ap2", "http://agent", Some(settings(&["1.0"], "full"))).validate_a2a_settings(), Ok(()));
+        assert_eq!(surface("a2a", "http://agent", None).validate_a2a_settings(), Ok(()));
+    }
+
+    #[test]
+    fn invalid_version_lists_are_refused() {
+        let error = |versions: &[&str]| {
+            surface("a2a", "http://agent", Some(settings(versions, "full")))
+                .validate_a2a_settings()
+                .unwrap_err()
+        };
+        assert_eq!(error(&[]), "access_point.a2a.accepted_versions must name at least one version");
+        assert_eq!(
+            error(&["1.0", "2.0"]),
+            "access_point.a2a.accepted_versions: unsupported version '2.0' (supported: 0.3, 1.0)"
+        );
+        assert_eq!(error(&["1.0", "1.0"]), "access_point.a2a.accepted_versions lists '1.0' more than once");
+    }
+
+    #[test]
+    fn the_block_is_refused_on_a_non_a2a_access_point() {
+        for protocol in ["mcp", "didcomm"] {
+            let surface = surface(protocol, "http://agent", Some(settings(&["1.0"], "full")));
+            assert_eq!(
+                surface.validate_a2a_settings(),
+                Err("access_point.a2a requires an A2A or AP2 Access Point".to_string()),
+                "{protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_a2a_proxy_target_accepts_only_its_fixed_settings() {
+        assert_eq!(surface("a2a", "a2a-proxy://worker", None).validate_a2a_settings(), Ok(()));
+        assert_eq!(
+            surface("a2a", "a2a-proxy://worker", Some(settings(&["1.0"], "envelope"))).validate_a2a_settings(),
+            Ok(())
+        );
+        for contradicting in [
+            settings(&["0.3", "1.0"], "envelope"),
+            settings(&["1.0"], "full"),
+            settings(&["1.0"], "off"),
+            settings(&["0.3"], "envelope"),
+        ] {
+            let error = surface("a2a", "a2a-proxy://worker", Some(contradicting.clone()))
+                .validate_a2a_settings()
+                .unwrap_err();
+            assert!(error.starts_with("an A2A proxy target serves A2A 1.0 only"), "{contradicting}: {error}");
+        }
+    }
+
+    fn with_variant_target(
+        surface: AgentSurface,
+        endpoint: &str,
+    ) -> AgentSurface {
+        let mut value = serde_json::to_value(surface).unwrap();
+        value["variants"] = json!([{
+            "id": "v", "alias": "other", "name": "other", "enabled": true,
+            "overrides": {"target": {"endpoint": endpoint}}
+        }]);
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// On an A2A-proxy surface with a variant that points the Target at a URL,
+    /// the block configures that variant, while the proxy Target itself keeps
+    /// its fixed settings.
+    #[test]
+    fn the_block_configures_a_url_variant_of_an_a2a_proxy_surface() {
+        let surface =
+            with_variant_target(surface("a2a", "a2a-proxy://worker", Some(settings(&["0.3"], "full"))), "http://agent");
+        assert!(surface.a2a_settings_apply());
+        assert_eq!(surface.validate_a2a_settings(), Ok(()), "the block applies to the URL variant");
+
+        assert_eq!(surface.a2a_settings(), effective(VERSIONS_1_0_ONLY, A2aValidation::Envelope));
+        let url_variant = surface
+            .resolve_variant(Some("other"))
+            .unwrap();
+        assert_eq!(url_variant.a2a_settings(), effective(VERSIONS_0_3_ONLY, A2aValidation::Full));
+    }
+
+    #[test]
+    fn the_block_applies_to_nothing_when_every_target_is_an_a2a_proxy() {
+        let proxies_only = with_variant_target(surface("a2a", "a2a-proxy://worker", None), "a2a-proxy://other");
+        assert!(!proxies_only.a2a_settings_apply());
+        assert!(!surface("a2a", "a2a-proxy://worker", None).a2a_settings_apply());
+        assert!(surface("a2a", "http://agent", None).a2a_settings_apply());
+
+        let with_block = with_variant_target(
+            surface("a2a", "a2a-proxy://worker", Some(settings(&["0.3"], "full"))),
+            "a2a-proxy://other",
+        );
+        assert!(
+            with_block
+                .validate_a2a_settings()
+                .unwrap_err()
+                .starts_with("an A2A proxy target serves A2A 1.0 only")
+        );
+    }
+
+    /// A variant that points the Target at an A2A proxy is served as one, and
+    /// the surface-level block of a URL base Target stays valid.
+    #[test]
+    fn a_variant_targeting_an_a2a_proxy_is_served_as_one() {
+        let mut value =
+            serde_json::to_value(surface("a2a", "http://agent", Some(settings(&["0.3", "1.0"], "full")))).unwrap();
+        value["variants"] = json!([{
+            "id": "v", "alias": "proxy", "name": "proxy", "enabled": true,
+            "overrides": {"target": {"endpoint": "a2a-proxy://worker", "a2a_proxy_id": "worker"}}
+        }]);
+        let surface: AgentSurface = serde_json::from_value(value).unwrap();
+
+        let resolved = surface
+            .resolve_variant(Some("proxy"))
+            .unwrap();
+        assert_eq!(resolved.a2a_settings(), effective(VERSIONS_1_0_ONLY, A2aValidation::Envelope));
+        assert_eq!(surface.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Full));
+        assert_eq!(surface.validate_a2a_settings(), Ok(()));
     }
 }

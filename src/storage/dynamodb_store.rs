@@ -18,7 +18,7 @@ use crate::storage::ConfigurationStore;
 /// Attributes depend on config_type:
 /// - For channels: name, description, listen_address, target_endpoint, managed_identity (with extension_rules for identity schema)
 /// - For tls: cert_path, key_path, verify_upstream
-/// - For a2a: default_version, validate_messages, max_body_size, timeout_seconds
+/// - For a2a: default_version, max_body_size, timeout_seconds
 /// - For logging: level, json
 pub struct DynamoDbConfigStore {
     client: DynamoDbClient,

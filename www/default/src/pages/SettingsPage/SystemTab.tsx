@@ -2,7 +2,6 @@ import React, { useRef, useState } from 'react';
 import { apiClient } from '../../api';
 import { showToast } from '../../utils/toaster';
 import { FeatureFlags, Settings } from '../../types';
-import { isA2aLegacyCompatibilityOn } from '../../utils/a2aLegacyCompatibility';
 
 interface SystemTabProps {
   isSubmitting: boolean;
@@ -116,20 +115,6 @@ const SystemTab: React.FC<SystemTabProps> = ({
   };
 
   const featureFlags = settings?.feature_flags || {};
-
-  const handleToggleFeatureFlag = async (flag: keyof FeatureFlags) => {
-    const updatedFlags: FeatureFlags = {
-      ...featureFlags,
-      [flag]: !featureFlags[flag],
-    };
-    try {
-      await updateSettings({ feature_flags: updatedFlags });
-      showToast('success', `Feature flag "${flag}" ${updatedFlags[flag] ? 'enabled' : 'disabled'}`);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to update feature flag';
-      showToast('error', errorMessage);
-    }
-  };
 
   const handleTruncateOldLogs = async () => {
     setIsTruncatingLogs(true);
@@ -403,31 +388,6 @@ const SystemTab: React.FC<SystemTabProps> = ({
                   onChangeMessages={{
                     on: 'Metrics shown in sidebar.',
                     off: 'Metrics hidden from sidebar.',
-                  }}
-                  featureFlags={featureFlags}
-                  updateSettings={updateSettings}
-                />
-                <FeatureFlagRow
-                  flag="a2a_legacy_compatibility"
-                  // Default on when unset — explicit `false` serves A2A 1.0 only.
-                  checked={isA2aLegacyCompatibilityOn(featureFlags)}
-                  disabled={isSubmitting}
-                  description={
-                    <>
-                      Legacy compatibility for A2A version 0.3. While this is on, agents can call
-                      your surfaces using either version 1.0 or the older version 0.3, and the agent
-                      cards the gateway generates list both so callers can see what is accepted.
-                      <br />
-                      Turning it off serves version 1.0 only. A version 0.3 call is then answered
-                      with an unsupported-version error instead of reaching your agent, and a caller
-                      that sends no version at all is treated as version 0.3, so those calls stop
-                      working too. Check the A2A protocol version metric to see whether anyone is
-                      still on 0.3 before you turn this off.
-                    </>
-                  }
-                  onChangeMessages={{
-                    on: 'Serving A2A 1.0 and 0.3.',
-                    off: 'Serving A2A 1.0 only. Version 0.3 calls will be rejected.',
                   }}
                   featureFlags={featureFlags}
                   updateSettings={updateSettings}

@@ -29,15 +29,15 @@
 //! invention of ours that could refuse a conformant agent's ids. `contextId` is
 //! not checked at all, being optional in both eras.
 //!
-//! These run under the same `[a2a] validate_messages` setting as the envelope
-//! check, which is **on by default**, and they apply to **managed-agent targets
-//! only**. A request that fails them was already going to fail: a conformant
-//! agent refuses a message with no `messageId` too, just one hop later and with
-//! a vaguer error. Refusing here names the offending field and spares the agent
-//! the round trip. A surface whose target is `a2a-proxy://` is exempt, because
-//! the proxy is the implementation rather than a pass-through, so there is no
-//! downstream agent that would have refused the message and checking would only
-//! refuse callers that work today. The call site is in
+//! These run when a surface's `access_point.a2a.validation` is `full`; the
+//! default, `envelope`, checks only the JSON-RPC envelope. A request
+//! that fails them was already going to fail: a conformant agent refuses a
+//! message with no `messageId` too, just one hop later and with a vaguer error.
+//! Refusing here names the offending field and spares the agent the round trip.
+//! A surface whose target is `a2a-proxy://` never checks the shape, because the proxy
+//! is the implementation rather than a pass-through, so there is no downstream
+//! agent that would have refused the message and checking would only refuse
+//! callers that work today. The call site is in
 //! `src/proxy/handler.rs::proxy_handler_with_mcp_runtime`.
 //!
 //! The gateway stays a transparent proxy: this validates shape and never

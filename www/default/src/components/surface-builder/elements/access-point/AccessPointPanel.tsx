@@ -3,7 +3,16 @@ import { Form } from 'react-bootstrap';
 import type { ConfigPanelProps } from '../types';
 import RouteListenerSection from '../_shared/RouteListenerSection';
 import { AgentCardLocationHelp, AGENT_CARD_EXPLAINER } from '../_shared/AgentCardLocationHelp';
+import { isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 import FieldHelp from '../../../shared/FieldHelp';
+import {
+  A2A_PROXY_SETTINGS,
+  A2A_VALIDATION_OPTIONS,
+  A2A_VERSIONS,
+  isA2aValidation,
+  selectedA2aValidation,
+  selectedA2aVersions,
+} from './a2aSettings';
 
 const AccessPointPanel: React.FC<ConfigPanelProps> = ({
   config,
@@ -15,6 +24,16 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
   hasAttemptedSave,
 }) => {
   const isA2aLike = protocol === 'a2a' || protocol === 'ap2';
+  const targetEndpoint = allNodes?.find(n => n.type === 'target')?.config?.endpoint;
+  // An A2A proxy Target serves A2A 1.0 with envelope validation, whatever was
+  // selected, so the controls show those values and are locked.
+  const isA2aProxyTarget = isA2aProxyEndpoint(targetEndpoint);
+  const a2aVersions = isA2aProxyTarget
+    ? A2A_PROXY_SETTINGS.accepted_versions
+    : selectedA2aVersions(config);
+  const a2aValidation = isA2aProxyTarget
+    ? A2A_PROXY_SETTINGS.validation
+    : selectedA2aValidation(config);
 
   return (
     <>
@@ -28,6 +47,103 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
         replaceCommit={replaceCommit}
         hasAttemptedSave={hasAttemptedSave}
       />
+
+      {isA2aLike && (
+        <div className="config-section" data-testid="access-point-a2a-protocol">
+          <label>A2A Protocol</label>
+          {isA2aProxyTarget && (
+            <Form.Text
+              className="text-muted d-block mb-1"
+              style={{ fontSize: '10px' }}
+              data-testid="access-point-a2a-proxy-locked"
+            >
+              An A2A proxy target serves A2A 1.0 with JSON-RPC envelope validation only.
+            </Form.Text>
+          )}
+          <Form.Group className="mb-2">
+            <div className="d-flex align-items-center gap-1 mb-1">
+              <Form.Label className="small text-muted mb-0">Supported versions</Form.Label>
+              <FieldHelp
+                testId="field-help-access-point-a2a-versions"
+                ariaLabel="About Supported versions"
+              >
+                The A2A (Agent2Agent) protocol versions callers may use with this surface. A caller
+                declares its version in the <code>A2A-Version</code> header, and a request without
+                that header counts as version 0.3. A request for a version that is not selected is
+                refused with an unsupported-version error that lists the selected versions.
+              </FieldHelp>
+            </div>
+            <div className="d-flex gap-3">
+              {A2A_VERSIONS.map(version => (
+                <Form.Check
+                  key={version}
+                  type="checkbox"
+                  id={`ap-a2a-version-${version}`}
+                  data-testid={`access-point-a2a-version-${version}`}
+                  label={`A2A ${version}`}
+                  checked={a2aVersions.includes(version)}
+                  disabled={isA2aProxyTarget}
+                  onChange={e => {
+                    const next = e.target.checked
+                      ? [...a2aVersions, version]
+                      : a2aVersions.filter(v => v !== version);
+                    updateFields({
+                      a2a_accepted_versions: A2A_VERSIONS.filter(v => next.includes(v)),
+                    });
+                  }}
+                />
+              ))}
+            </div>
+            {!isA2aProxyTarget && a2aVersions.length === 0 && (
+              <Form.Text
+                className="text-danger d-block"
+                style={{ fontSize: '10px' }}
+                data-testid="access-point-a2a-versions-error"
+              >
+                Select at least one supported A2A version.
+              </Form.Text>
+            )}
+          </Form.Group>
+          <Form.Group className="mb-0">
+            <div className="d-flex align-items-center gap-1 mb-1">
+              <Form.Label htmlFor="ap-a2a-validation" className="small text-muted mb-0">
+                Message validation
+              </Form.Label>
+              <FieldHelp
+                testId="field-help-access-point-a2a-validation"
+                ariaLabel="About Message validation"
+              >
+                How much of each request is checked before it reaches your agent. Off: requests are
+                forwarded as they are, so a batch request or a request without a valid method name
+                reaches your surface policies with no method to match; only an appliance-wide
+                administrator can choose it. JSON-RPC envelope (recommended): refuses anything that
+                is not a single, well-formed JSON-RPC request, including batch requests. Envelope +
+                A2A fields: also requires the fields A2A defines, such as a message ID, a role and
+                at least one message part, and refuses a request that misses one with an error that
+                names the field.
+              </FieldHelp>
+            </div>
+            <Form.Select
+              size="sm"
+              id="ap-a2a-validation"
+              data-testid="access-point-a2a-validation"
+              value={a2aValidation}
+              disabled={isA2aProxyTarget}
+              onChange={e => {
+                if (isA2aValidation(e.target.value)) {
+                  updateFields({ a2a_validation: e.target.value });
+                }
+              }}
+            >
+              {A2A_VALIDATION_OPTIONS.map(option => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </Form.Select>
+          </Form.Group>
+        </div>
+      )}
 
       {isA2aLike && (
         <div className="config-section">
@@ -125,9 +241,7 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
               />
               <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
                 <AgentCardLocationHelp
-                  endpoint={
-                    allNodes?.find(n => n.type === 'target')?.config?.endpoint as string | undefined
-                  }
+                  endpoint={targetEndpoint as string | undefined}
                   customPath={config.agent_card_path}
                 />
               </Form.Text>

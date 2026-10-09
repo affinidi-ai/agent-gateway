@@ -20,9 +20,10 @@ const JSONRPC_TARGET_TIMEOUT: i32 = -32021;
 /// True when the request method is the **send** operation, in either protocol era.
 ///
 /// This proxy fronts a non-A2A backend and supports only non-streaming send, so it
-/// accepts `message/send` (v0.3) and `SendMessage` (v1.0) and nothing else. Because
-/// the card synthesized for this proxy advertises `protocolVersion` 1.0, rejecting
-/// the v1.0 spelling would contradict the card we publish — hence the canonical
+/// accepts `SendMessage` and nothing else, also in its v0.3 spelling `message/send`:
+/// the surface serves A2A 1.0 only and checks only the JSON-RPC envelope, not the
+/// A2A message shape, so a caller using the older spelling under
+/// `A2A-Version: 1.0` keeps working. Hence the canonical
 /// comparison rather than a raw string match.
 ///
 /// Everything else is correctly refused, including the extended-card method: the
@@ -58,6 +59,7 @@ pub async fn handle_a2a_proxy_request(
         .and_then(Value::as_str)
         .unwrap_or_default();
     if !is_supported_proxy_method(method) {
+        warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), "A2A proxy refused an unsupported method");
         return jsonrpc_error(request_id, JSONRPC_METHOD_NOT_FOUND, "Unsupported A2A method");
     }
 
@@ -66,14 +68,20 @@ pub async fn handle_a2a_proxy_request(
         .and_then(|params| params.get("message"))
     {
         Some(message) => message,
-        None => return jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, "Missing params.message"),
+        None => {
+            warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), "A2A proxy refused a request without params.message");
+            return jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, "Missing params.message");
+        }
     };
     let context_id = message
         .get("contextId")
         .cloned();
     let text = match extract_text(message) {
         Ok(text) => text,
-        Err(message) => return jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, message),
+        Err(message) => {
+            warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), reason = message, "A2A proxy refused the message");
+            return jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, message);
+        }
     };
 
     match &proxy.backend {
@@ -444,6 +452,10 @@ fn collect_bot_texts(activities: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The A2A 1.0 `SendMessageResponse` for the backend's reply: the `message`
+/// member of its `oneof payload`, with role `ROLE_AGENT` and one text part per
+/// reply, without the 0.3 `kind` discriminators. An A2A-proxy surface serves
+/// A2A 1.0 only, so this is the only reply shape it returns.
 fn jsonrpc_success(
     id: Option<Value>,
     context_id: Option<Value>,
@@ -451,23 +463,22 @@ fn jsonrpc_success(
 ) -> Response {
     let parts: Vec<Value> = texts
         .into_iter()
-        .map(|text| serde_json::json!({ "kind": "text", "text": text }))
+        .map(|text| serde_json::json!({ "text": text }))
         .collect();
-    let mut result = serde_json::json!({
-        "kind": "message",
+    let mut message = serde_json::json!({
         "messageId": uuid::Uuid::new_v4().to_string(),
-        "role": "agent",
+        "role": "ROLE_AGENT",
         "parts": parts,
     });
     if let Some(context_id) = context_id
-        && let Some(object) = result.as_object_mut()
+        && let Some(object) = message.as_object_mut()
     {
         object.insert("contextId".to_string(), context_id);
     }
     json_response(serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(Value::Null),
-        "result": result,
+        "result": { "message": message },
     }))
 }
 
@@ -713,5 +724,55 @@ mod tests {
         });
 
         assert_eq!(collect_bot_texts(&activities), vec!["hi".to_string()]);
+    }
+
+    async fn reply_body(response: Response) -> Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The reply is the A2A 1.0 `SendMessageResponse`: the `message` member of
+    /// its payload, `ROLE_AGENT`, and text parts without the 0.3 `kind`.
+    #[tokio::test]
+    async fn the_reply_is_an_a2a_1_0_send_message_response() {
+        let body = reply_body(jsonrpc_success(
+            Some(serde_json::json!("req-1")),
+            Some(serde_json::json!("ctx-1")),
+            vec!["hello".to_string(), "world".to_string()],
+        ))
+        .await;
+
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], "req-1");
+        let message = &body["result"]["message"];
+        assert_eq!(message["role"], "ROLE_AGENT");
+        assert_eq!(message["contextId"], "ctx-1");
+        assert!(
+            message["messageId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(message["parts"], serde_json::json!([{ "text": "hello" }, { "text": "world" }]));
+        assert!(
+            body["result"]
+                .get("kind")
+                .is_none(),
+            "no 0.3 discriminator on the result"
+        );
+        assert!(message.get("kind").is_none(), "no 0.3 discriminator on the message");
+    }
+
+    #[tokio::test]
+    async fn the_reply_omits_a_context_id_the_caller_did_not_send() {
+        let body = reply_body(jsonrpc_success(None, None, vec!["hi".to_string()])).await;
+        assert_eq!(body["id"], Value::Null);
+        assert!(
+            body["result"]["message"]
+                .get("contextId")
+                .is_none()
+        );
     }
 }

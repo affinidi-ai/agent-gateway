@@ -1,6 +1,7 @@
 import React from 'react';
 import { Form } from 'react-bootstrap';
 import { useNavigate } from 'react-router-dom';
+import { a2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 
 export interface A2aProxyOption {
   id: string;
@@ -34,7 +35,7 @@ const A2aProxyEndpointFields: React.FC<A2aProxyEndpointFieldsProps> = ({
             const id = e.target.value;
             updateFields({
               a2a_proxy_id: id,
-              endpoint: id ? `a2a-proxy://${id}` : '',
+              endpoint: id ? a2aProxyEndpoint(id) : '',
             });
           }}
         >
@@ -53,6 +54,19 @@ const A2aProxyEndpointFields: React.FC<A2aProxyEndpointFieldsProps> = ({
           Managed A2A proxy that adapts this surface to a non-A2A backend.
         </Form.Text>
       </Form.Group>
+      <div
+        className="alert alert-info py-2 mb-2"
+        style={{ fontSize: '10px' }}
+        data-testid="managed-agent-a2a-proxy-protocol-hint"
+      >
+        <div className="fw-semibold mb-1">A2A 1.0 only, JSON-RPC envelope validation only.</div>
+        <div>
+          An A2A proxy serves A2A 1.0, so callers must send the <code>A2A-Version: 1.0</code>{' '}
+          header. Only the JSON-RPC envelope is checked, not the A2A message fields, so lenient
+          callers keep working. The Access Point&apos;s A2A Protocol settings are locked to these
+          values.
+        </div>
+      </div>
       <div
         className="alert alert-info py-2 mb-2"
         style={{ fontSize: '10px' }}

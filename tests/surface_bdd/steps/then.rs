@@ -283,9 +283,9 @@ fn agent_card_url_points_to_surface_access_point(world: &mut SurfaceWorld) {
     let response = get_caller_response(world);
     let url = response
         .body
-        .get("url")
+        .pointer("/supportedInterfaces/0/url")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| panic!("agent card url must be present, got {}", response.body));
+        .unwrap_or_else(|| panic!("agent card supportedInterfaces[0].url must be present, got {}", response.body));
     assert!(
         url.contains(&world.surface_config.route),
         "agent card url should include surface route '{}', got {url}",
@@ -300,16 +300,16 @@ fn a2a_response_result_contains_text_from_non_a2a_managed_agent(
     agent_name: String,
 ) {
     let response = get_caller_response(world);
+    // The A2A 1.0 `SendMessageResponse`: the reply is `result.message`, and a
+    // text part carries `text` with no 0.3 `kind`.
     let parts = response
         .body
-        .pointer("/result/parts")
+        .pointer("/result/message/parts")
         .and_then(serde_json::Value::as_array)
-        .unwrap_or_else(|| panic!("A2A response result.parts must be an array, got {}", response.body));
+        .unwrap_or_else(|| panic!("A2A response result.message.parts must be an array, got {}", response.body));
     assert!(
         parts.iter().any(|part| {
-            part.get("kind")
-                .and_then(serde_json::Value::as_str)
-                == Some("text")
+            part.get("kind").is_none()
                 && part
                     .get("text")
                     .and_then(serde_json::Value::as_str)
@@ -947,6 +947,44 @@ fn response_is_jsonrpc_error_with_code(
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_i64());
     assert_eq!(actual, Some(expected_code), "expected JSON-RPC error code {expected_code}; body was {body}");
+}
+
+/// Assert the response's JSON-RPC error lists exactly the given comma-separated
+/// supported versions, in order: the surface's accepted set.
+#[then(expr = "the response error lists only the supported versions {string}")]
+fn response_error_lists_only_supported_versions(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let body = get_response_body_value(world);
+    let expected: Vec<&str> = expected
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        body.pointer("/error/data/supported"),
+        Some(&serde_json::json!(expected)),
+        "unexpected supported versions in {body}"
+    );
+}
+
+/// Assert the surface the admin API created stores the given comma-separated
+/// accepted versions with the default `envelope` validation.
+#[then(expr = "the created surface accepts A2A versions {string} with envelope validation")]
+fn created_surface_accepts_a2a_versions(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let body = &get_admin_response(world).body;
+    let expected: Vec<&str> = expected
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        body.pointer("/access_point/a2a"),
+        Some(&serde_json::json!({ "accepted_versions": expected, "validation": "envelope" })),
+        "unexpected A2A settings in {body}"
+    );
 }
 
 /// Assert the response's JSON-RPC error lists a supported protocol version, so a

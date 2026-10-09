@@ -46,10 +46,12 @@ pub fn synthesize_agent_card(
     let provider = json!({ "organization": "Affinidi", "url": "https://affinidi.com" });
     // This proxy translates one operation and serves no extended card.
     let extended_agent_card = false;
+    // An A2A-proxy surface serves A2A 1.0 only, so the card is a 1.0 card.
+    let accepted = surface
+        .a2a_settings()
+        .accepted_versions;
 
     let mut card = json!({
-        // Single source of truth for the advertised A2A version — never a literal.
-        "protocolVersion": crate::a2a::effective_advertised_version(),
         "name": name,
         "description": description,
         // A2A 1.0 renamed `agentProvider` → `provider`.
@@ -67,8 +69,8 @@ pub fn synthesize_agent_card(
         "defaultOutputModes": ["text/plain"],
         "skills": [{
             "id": "message-send-text",
-            "name": "Text message/send",
-            "description": "Accepts non-streaming A2A message/send requests with text parts",
+            "name": "Text SendMessage",
+            "description": "Accepts non-streaming A2A SendMessage requests with text parts",
             "tags": ["a2a-proxy", "message-send", "text"],
             "examples": ["Send a text message"],
             "inputModes": ["text/plain"],
@@ -76,14 +78,13 @@ pub fn synthesize_agent_card(
         }],
         // A2A 1.0: `url` + `preferredTransport` + `additionalInterfaces` collapse into
         // one ordered `supportedInterfaces[]`; the first entry is the preferred one,
-        // and `transport` became `protocolBinding`. Every protocol version the
-        // gateway accepts is listed, so a v0.3 caller can discover it is served.
-        "supportedInterfaces": crate::a2a::version::generated_supported_interfaces(&url),
+        // and `transport` became `protocolBinding`.
+        "supportedInterfaces": crate::a2a::version::generated_supported_interfaces(&url, accepted),
     });
 
-    // Legacy v0.3 fields, emitted only while the gateway still accepts v0.3 —
-    // otherwise the card would advertise an entry point it refuses.
-    if let Some(legacy) = crate::a2a::version::legacy_v0_3_card_fields(&url, &provider, extended_agent_card)
+    // Legacy v0.3 fields, emitted only when the surface accepts v0.3, which an
+    // A2A-proxy surface never does.
+    if let Some(legacy) = crate::a2a::version::legacy_v0_3_card_fields(&url, &provider, extended_agent_card, accepted)
         && let Some(object) = card.as_object_mut()
     {
         object.extend(legacy);
@@ -179,7 +180,7 @@ mod tests {
 
         assert_eq!(card["name"], "Worker Card");
         assert_eq!(card["description"], "Worker card description");
-        assert_eq!(card["url"], "https://gateway.example/example/rpc");
+        assert_eq!(card["supportedInterfaces"][0]["url"], "https://gateway.example/example/rpc");
         assert_eq!(card["capabilities"]["streaming"], false);
         assert_eq!(card["skills"][0]["id"], "message-send-text");
     }
@@ -193,158 +194,89 @@ mod tests {
         assert_eq!(card["supportedInterfaces"][0]["url"], "https://gateway.example/example/rpc");
     }
 
+    /// An A2A-proxy surface serves A2A 1.0 only, so its card is a 1.0 card: one
+    /// JSONRPC interface at 1.0 and none of the v0.3 fields.
     #[test]
-    fn synthesized_card_advertises_1_0_when_no_version_is_configured() {
+    fn synthesized_card_is_an_a2a_1_0_only_card() {
         let card = synthesize_agent_card(&proxy(None), &surface());
-
-        assert_eq!(card["protocolVersion"], "1.0");
-        assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "1.0");
-    }
-
-    #[test]
-    fn synthesized_card_advertises_the_configured_version() {
-        if !crate::a2a::version::run_isolated_from_other_tests() {
-            return;
-        }
-        crate::a2a::version::init_advertised_version("0.3");
-
-        let card = synthesize_agent_card(&proxy(None), &surface());
-
-        assert_eq!(card["protocolVersion"], "0.3");
-        assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "0.3");
-        assert_eq!(card["supportedInterfaces"][1]["protocolVersion"], "1.0");
-    }
-
-    #[test]
-    fn synthesized_card_is_valid_a2a_1_0() {
-        let card = synthesize_agent_card(&proxy(None), &surface());
-
-        // Version comes from the single source of truth.
-        assert_eq!(card["protocolVersion"], crate::a2a::effective_advertised_version());
 
         // 1.0 collapses the transport fields into one ordered `supportedInterfaces[]`,
         // in camelCase, with `protocolBinding` (not `transport`) and a per-interface
         // version. The binding for the `/rpc` endpoint is JSONRPC, never HTTP+JSON
         // (which is the REST binding's label).
-        let iface = &card["supportedInterfaces"][0];
-        assert_eq!(iface["url"], "https://gateway.example/example/rpc");
-        assert_eq!(iface["protocolBinding"], crate::a2a::version::PROTOCOL_BINDING_JSONRPC);
-        assert_eq!(iface["protocolVersion"], crate::a2a::effective_advertised_version());
+        assert_eq!(
+            card["supportedInterfaces"],
+            json!([{
+                "url": "https://gateway.example/example/rpc",
+                "protocolBinding": crate::a2a::version::PROTOCOL_BINDING_JSONRPC,
+                "protocolVersion": "1.0"
+            }])
+        );
 
-        // Every version the gateway accepts is discoverable from the card, so a
-        // v0.3 caller is not misled into thinking only 1.0 is served.
-        let listed: Vec<&str> = card["supportedInterfaces"]
-            .as_array()
-            .expect("supportedInterfaces should be an array")
-            .iter()
-            .map(|i| {
-                i["protocolVersion"]
-                    .as_str()
-                    .unwrap()
-            })
-            .collect();
-        for version in crate::a2a::version::accepted_versions() {
-            assert!(listed.contains(version), "accepted version {version} must be advertised, got {listed:?}");
+        // No v0.3 field, including the top-level version that 1.0 moved onto
+        // each interface.
+        for legacy in
+            ["protocolVersion", "url", "preferredTransport", "agentProvider", "supportsAuthenticatedExtendedCard"]
+        {
+            assert!(card.get(legacy).is_none(), "`{legacy}` is a v0.3 card field, got {card}");
         }
-        assert!(iface["transport"].is_null(), "`transport` was renamed to `protocolBinding` in 1.0");
 
-        // Renamed / relocated / removed fields.
-        // The 1.0 spellings are canonical.
+        // The 1.0 spellings of the renamed and relocated fields.
         assert_eq!(card["provider"]["organization"], "Affinidi");
         assert_eq!(card["capabilities"]["extendedAgentCard"], false);
-
-        // While legacy compatibility is on, the v0.3 spellings are emitted too,
-        // so a v0.3 reader gets a card it can act on rather than one it can only
-        // partially parse. They track the 1.0 values rather than being hardcoded.
-        assert_eq!(card["agentProvider"], card["provider"]);
-        assert_eq!(card["supportsAuthenticatedExtendedCard"], card["capabilities"]["extendedAgentCard"]);
-
-        // Removed outright in 1.0 with no successor, so it is not resurrected.
         assert!(
             card["capabilities"]["stateTransitionHistory"].is_null(),
             "`stateTransitionHistory` was removed in 1.0"
         );
 
-        // Skills must carry `tags` (required in 1.0).
+        // Skills must carry `tags` (required in 1.0) and name the 1.0 method.
         assert!(
             card["skills"][0]["tags"]
                 .as_array()
                 .is_some_and(|t| !t.is_empty()),
             "skill `tags` are required in 1.0"
         );
-
-        // Legacy v0.3 fields stay dual-emitted so a 0.3 client can still reach the
-        // endpoint during the deprecation window.
-        assert_eq!(card["url"], "https://gateway.example/example/rpc");
-        assert_eq!(card["preferredTransport"], crate::a2a::version::PROTOCOL_BINDING_JSONRPC);
+        assert_eq!(card["skills"][0]["name"], "Text SendMessage");
 
         // The gateway never signs the cards it generates.
         assert!(card["signatures"].is_null());
     }
 
     #[test]
-    fn synthesized_card_is_1_0_only_when_legacy_compatibility_is_off() {
+    fn synthesized_card_stays_1_0_only_when_0_3_is_the_configured_default_version() {
         if !crate::a2a::version::run_isolated_from_other_tests() {
             return;
         }
-        use crate::storage::settings_store::{DashboardSettings, SettingsStore, set_global_settings_store};
-
-        let store = SettingsStore::new("unused-settings-dir");
-        store
-            .update(DashboardSettings {
-                feature_flags: [(crate::a2a::version::FLAG_A2A_LEGACY_COMPATIBILITY.to_string(), false)].into(),
-                ..DashboardSettings::default()
-            })
-            .expect("default settings are valid");
-        set_global_settings_store(Arc::new(store));
-        assert!(!crate::a2a::version::legacy_v0_3_enabled(), "the flag must be off for this test to mean anything");
-
-        let card = synthesize_agent_card(&proxy(None), &surface());
-
-        assert_eq!(
-            card["supportedInterfaces"],
-            json!([{
-                "url": "https://gateway.example/example/rpc",
-                "protocolBinding": "JSONRPC",
-                "protocolVersion": "1.0"
-            }]),
-            "only the version the gateway accepts may be advertised"
-        );
-        for legacy in ["url", "preferredTransport", "agentProvider", "supportsAuthenticatedExtendedCard"] {
-            assert!(card.get(legacy).is_none(), "`{legacy}` must not be emitted when v0.3 is refused, got {card}");
-        }
-        assert_eq!(card["provider"]["organization"], "Affinidi");
-        assert_eq!(card["capabilities"]["extendedAgentCard"], false);
-    }
-
-    #[test]
-    fn synthesized_card_never_names_a_refused_configured_version() {
-        if !crate::a2a::version::run_isolated_from_other_tests() {
-            return;
-        }
-        use crate::storage::settings_store::{DashboardSettings, SettingsStore, set_global_settings_store};
-
         crate::a2a::version::init_advertised_version("0.3");
-        let store = SettingsStore::new("unused-settings-dir");
-        store
-            .update(DashboardSettings {
-                feature_flags: [(crate::a2a::version::FLAG_A2A_LEGACY_COMPATIBILITY.to_string(), false)].into(),
-                ..DashboardSettings::default()
-            })
-            .expect("default settings are valid");
-        set_global_settings_store(Arc::new(store));
         assert_eq!(crate::a2a::version::advertised_version(), "0.3");
-        assert!(!crate::a2a::version::legacy_v0_3_enabled());
 
         let card = synthesize_agent_card(&proxy(None), &surface());
 
-        assert_eq!(card["protocolVersion"], "1.0", "the configured 0.3 is refused, so it must not be advertised");
         assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "1.0");
         assert_eq!(
             card["supportedInterfaces"]
                 .as_array()
                 .map(Vec::len),
-            Some(1)
+            Some(1),
+            "the surface refuses 0.3, so the card must not name it"
         );
+        assert!(
+            card.get("protocolVersion")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn synthesized_card_stays_1_0_only_whatever_the_surface_stores() {
+        let mut surface = surface();
+        surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
+            accepted_versions: vec!["0.3".to_string()],
+            validation: crate::config::agent_surface::A2aValidation::Full,
+        });
+
+        let card = synthesize_agent_card(&proxy(None), &surface);
+
+        assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "1.0");
+        assert!(card.get("url").is_none());
     }
 }

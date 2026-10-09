@@ -163,12 +163,14 @@ pub fn create_invalid_params_response(errors: &crate::a2a::validation::FieldErro
 }
 
 /// Build the A2A `VersionNotSupportedError` response (`-32009`) for a request whose
-/// resolved protocol version is not one this gateway accepts.
+/// resolved protocol version is not one the surface accepts.
 ///
-/// `data.supported` lists the versions actually accepted right now, which narrows
-/// to v1.0 alone when legacy A2A 0.3 compatibility is off, so a caller can
+/// `data.supported` lists the surface's `accepted` versions, so a caller can
 /// renegotiate without guessing.
-pub fn create_version_not_supported_response(requested: &str) -> Response {
+pub fn create_version_not_supported_response(
+    requested: &str,
+    accepted: &[&str],
+) -> Response {
     let error_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": null,
@@ -177,7 +179,7 @@ pub fn create_version_not_supported_response(requested: &str) -> Response {
             "message": format!("Unsupported A2A protocol version '{}'", requested),
             "data": {
                 "requested": requested,
-                "supported": crate::a2a::version::accepted_versions(),
+                "supported": accepted,
             }
         }
     });
@@ -193,24 +195,29 @@ pub fn create_version_not_supported_response(requested: &str) -> Response {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn version_not_supported_reports_supported_versions() {
-        let response = create_version_not_supported_response("2.0");
+    async fn version_not_supported_body(
+        requested: &str,
+        accepted: &[&str],
+    ) -> serde_json::Value {
+        let response = create_version_not_supported_response(requested, accepted);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn version_not_supported_reports_the_surface_accepted_versions() {
+        let body = version_not_supported_body("2.0", crate::a2a::version::SUPPORTED_VERSIONS).await;
         assert_eq!(body["error"]["code"], -32009);
+        assert_eq!(body["error"]["message"], "Unsupported A2A protocol version '2.0'");
         assert_eq!(body["error"]["data"]["requested"], "2.0");
-        assert_eq!(body["error"]["data"]["supported"], serde_json::json!(crate::a2a::version::accepted_versions()));
-        assert!(
-            body["error"]["data"]["supported"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("1.0"))
-        );
+        assert_eq!(body["error"]["data"]["supported"], serde_json::json!(["0.3", "1.0"]));
+
+        let body = version_not_supported_body("0.3", crate::a2a::version::VERSIONS_1_0_ONLY).await;
+        assert_eq!(body["error"]["data"]["requested"], "0.3");
+        assert_eq!(body["error"]["data"]["supported"], serde_json::json!(["1.0"]));
     }
 
     #[test]

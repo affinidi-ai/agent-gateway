@@ -179,6 +179,9 @@ fn write_single_surface_config_inner(
     if let Some(mcp_http) = &surface_config.mcp_http {
         surface_fixture = surface_fixture.with_mcp_http(mcp_http.clone());
     }
+    if let Some(a2a) = &surface_config.a2a_settings {
+        surface_fixture = surface_fixture.with_a2a_settings(a2a.clone());
+    }
     if let Some(policy) = &surface_config.request_policy {
         surface_fixture = surface_fixture.with_target_policy_definition_id(&policy.id);
     }

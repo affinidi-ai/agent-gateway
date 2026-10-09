@@ -1,3 +1,4 @@
+import { registry } from '../../elements';
 import { act, renderHook } from '@testing-library/react';
 import {
   BASE_VARIANT_ID,
@@ -362,6 +363,125 @@ describe('useVariantSnapshots', () => {
       const v2Wire = wire.variants.find(v => v.id === 'v2')!;
       expect((v2Wire.overrides?.access_point as any)?.listen_address).toBeUndefined();
       expect((v2Wire.overrides?.access_point as any)?.route).toBeUndefined();
+    });
+
+    it('keeps the base A2A settings when saving while viewing an A2A proxy variant', () => {
+      const ctx = (endpoint: string) => {
+        const nodes = [
+          {
+            id: 'access-point',
+            type: 'access-point',
+            config: {
+              route: '/a',
+              listen_address: '0.0.0.0:8443',
+              a2a_accepted_versions: ['0.3'],
+              a2a_validation: 'full',
+            },
+          },
+          { id: 'target', type: 'target', config: { endpoint } },
+        ] as any[];
+        return {
+          protocol: 'a2a' as const,
+          surfaceMeta: { name: 's', tags: [], status: 'active' as const },
+          allNodes: nodes,
+          nodesOfType: (t: string) => nodes.filter(n => n.type === t),
+          firstNodeOfType: (t: string) => nodes.find(n => n.type === t),
+        };
+      };
+      const base = registry.buildPayload(ctx('https://agent.example')) as any;
+      expect(base.access_point.a2a).toEqual({ accepted_versions: ['0.3'], validation: 'full' });
+
+      const { result } = renderHook(() => useVariantSnapshots());
+      act(() => {
+        result.current.hydrateFromPayload({
+          ...base,
+          variants: [
+            {
+              id: 'v2',
+              alias: 'p',
+              name: 'p',
+              overrides: { target: { endpoint: 'a2a-proxy://w' } },
+            },
+          ],
+        });
+      });
+      act(() => {
+        result.current.switchVariant('v2', base);
+      });
+      const live = registry.buildPayload(ctx('a2a-proxy://w')) as any;
+      expect(live.access_point).not.toHaveProperty('a2a');
+
+      const wire = result.current.buildVariantsWireSlice(live);
+      expect(wire.basePayload.access_point.a2a).toEqual({
+        accepted_versions: ['0.3'],
+        validation: 'full',
+      });
+    });
+
+    it('shares the A2A settings across variants and keeps them on the base payload', () => {
+      const { result } = renderHook(() => useVariantSnapshots());
+      act(() => {
+        result.current.hydrateFromPayload(urlPayload);
+      });
+      const a2a = { accepted_versions: ['1.0'], validation: 'full' };
+      const editedV1 = {
+        access_point: { ...urlPayload.access_point, a2a },
+        target: { endpoint: 'https://base/x', auth: { kind: 'none' } },
+      };
+      let v2Payload: any;
+      act(() => {
+        v2Payload = result.current.switchVariant('v2', editedV1);
+      });
+      expect(v2Payload.access_point.a2a).toEqual(a2a);
+      expect(v2Payload.access_point.rate_limit).toEqual({ rpm: 99 });
+
+      const wire = result.current.buildVariantsWireSlice(v2Payload);
+      expect(wire.basePayload.access_point.a2a).toEqual(a2a);
+      const v2Wire = wire.variants.find(v => v.id === 'v2')!;
+      expect((v2Wire.overrides?.access_point as any)?.a2a).toBeUndefined();
+    });
+
+    it('syncs the A2A settings inside every variant canvas blob', () => {
+      const { result } = renderHook(() => useVariantSnapshots());
+      const apCanvasConfig = (versions: string[], validate: boolean) => ({
+        listen_address: '0.0.0.0:8443',
+        route: '/agents/a',
+        protocol: 'a2a',
+        a2a_accepted_versions: versions,
+        a2a_validation: validate ? 'full' : 'envelope',
+      });
+      const canvasBlob = (versions: string[], validate: boolean) => ({
+        version: 1,
+        nodes: [
+          { id: 'access-point', type: 'access-point', config: apCanvasConfig(versions, validate) },
+        ],
+      });
+      act(() => {
+        result.current.hydrateFromPayload({
+          access_point: { listen_address: '0.0.0.0:8443', route: '/agents/a', protocol: 'a2a' },
+          canvas: canvasBlob(['0.3', '1.0'], false),
+          variants: [
+            {
+              id: 'v2',
+              alias: 'fast',
+              name: 'Fast',
+              overrides: { complete: true, canvas: canvasBlob(['0.3', '1.0'], false) },
+            },
+          ],
+          default_variant_id: 'v2',
+        });
+      });
+      act(() => {
+        result.current.switchVariant(BASE_VARIANT_ID, {
+          access_point: { listen_address: '0.0.0.0:8443', route: '/agents/a', protocol: 'a2a' },
+          canvas: canvasBlob(['1.0'], true),
+        });
+      });
+      const baseAp = result.current
+        .getSnapshot(BASE_VARIANT_ID)
+        .canvas.nodes.find((n: any) => n.id === 'access-point');
+      expect(baseAp.config.a2a_accepted_versions).toEqual(['1.0']);
+      expect(baseAp.config.a2a_validation).toBe('full');
     });
 
     it('syncs the access-point config inside every variant canvas blob (incl. route_prefix/suffix)', () => {

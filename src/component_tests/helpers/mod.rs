@@ -1580,3 +1580,26 @@ impl Drop for GatewayHarness {
         self._gw_server.shutdown();
     }
 }
+
+/// Declare `(id, name, prefix)` route prefixes in the gateway network config,
+/// so a test can serve more than one surface on the shared listener.
+pub fn configure_gateway_route_prefixes(
+    bootstrap: &crate::config::BootstrapConfig,
+    prefixes: &[(&str, &str, &str)],
+) {
+    let gateway_path = std::path::Path::new(&bootstrap.config_files.gateway);
+    let mut gateway_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(gateway_path).expect("read gateway network config"))
+            .expect("gateway network config JSON");
+    gateway_json["channels"] = serde_json::Value::Array(
+        prefixes
+            .iter()
+            .map(|(id, name, prefix)| serde_json::json!({ "id": id, "name": name, "prefix": prefix }))
+            .collect(),
+    );
+    std::fs::write(
+        gateway_path,
+        serde_json::to_string_pretty(&gateway_json).expect("serialize gateway network config"),
+    )
+    .expect("write gateway network config");
+}

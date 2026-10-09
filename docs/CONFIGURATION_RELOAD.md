@@ -35,8 +35,8 @@ The bootstrap `[a2a]` table maps to `A2aConfig` in [`src/config/types.rs`](../sr
 
 | Field | Default | Behavior |
 | --- | --- | --- |
-| `default_version` | `"1.0"` | The `protocolVersion` of the agent cards the Gateway generates. Must resolve on `Major.Minor` to `0.3` or `1.0` (`1.0.1` resolves to `1.0`). It is installed once at startup and held in a `OnceLock`, so a configuration reload does not change it; changing it needs a restart. It does not change which versions are accepted (the `a2a_legacy_compatibility` flag does), and a Managed Agent's own card keeps its own version. A generated card never names a version the Gateway refuses: with the flag off, `protocolVersion` and `supportedInterfaces[]` name `1.0` whatever this setting says. |
-| `validate_messages` | `true` | Gates the JSON-RPC envelope check and A2A request-shape validation (see [Error mapping](PROTOCOLS.md#error-mapping)). `false` forwards requests unchecked; `A2A-Version` negotiation still runs. |
+| `default_version` | `"1.0"` | The `protocolVersion` of the agent cards the Gateway generates. Must resolve on `Major.Minor` to `0.3` or `1.0` (`1.0.1` resolves to `1.0`). It is installed once at startup and held in a `OnceLock`, so a configuration reload does not change it; changing it needs a restart. It does not change which versions are accepted (each A2A surface sets that), and a Managed Agent's own card keeps its own version. A generated card never names a version its endpoint refuses: the A2A proxy card names `1.0` whatever this setting says. |
+| `validate_messages` | — | Deprecated. Validation is set per A2A surface (`access_point.a2a.validation`; see [A2A surface settings](PROTOCOLS.md#a2a-surface-settings)). It is only applied to A2A surfaces loaded without their own settings, which are then written with `validation = "off"` when it is `false` and `"envelope"` otherwise. A startup warning names it; remove it once every surface has its own settings. |
 | `max_body_size` | `10485760` (10 MiB) | On the direct inbound path, request bodies larger than this are refused with HTTP `413`. The check runs after `fabric://` dispatch, so it does not apply to fabric targets. It also caps every upstream response the gateway buffers (HTTP `502` when larger), on the Access Point, Transit Point and Fabric receive paths alike, including agent-card fetches, and one incomplete event of an event stream the gateway parses. A Legacy SSE session and MCP Proxy tool discovery always use the default (10 MiB), whatever is configured. It is read once at startup, and a reload keeps that value, so changing it needs a restart on every path. |
 | `timeout_seconds` | `30` | Request timeout in seconds. |
 | `fabric_gateway_timeout_ms` | `60000` | How long the sending gateway waits for a response over the fabric when the surface sets no request timeout. |
@@ -45,10 +45,9 @@ The bootstrap `[a2a]` table maps to `A2aConfig` in [`src/config/types.rs`](../sr
 | `sdk_inbound_cache_count` | `1024` | Unprocessed DIDComm messages the SDK inbound cache holds before it stops draining the websocket; must be greater than `0`. |
 | `sdk_inbound_cache_bytes` | `104857600` (100 MiB) | Bytes the SDK inbound cache holds before applying back-pressure; must be greater than `0`. |
 
-Whether A2A `0.3` is accepted is not a TOML field. It is the `a2a_legacy_compatibility` dashboard
-feature flag (Settings → System → Feature Flags, on by default; off serves `1.0` only), read from
-settings on every request, so it applies without a restart. See
-[Legacy compatibility](PROTOCOLS.md#legacy-compatibility).
+Which A2A versions a surface accepts, and whether it validates messages, are not TOML fields. They
+are the surface's `access_point.a2a` settings, saved with the surface and applied without a restart.
+See [A2A surface settings](PROTOCOLS.md#a2a-surface-settings).
 
 ## Reload entry points
 
@@ -147,6 +146,13 @@ interval; the RwLock-backed policy-definition and global-policy stores are **not
 loop and reconcile with disk only at startup; an explicit reload uses their in-memory state. Each
 store's periodic scans are serialized by a shared per-store lock, so two overlapping refreshes can
 never apply out of order and revert a record to an older on-disk snapshot.
+
+Nodes sharing storage must run the same version. A newer node can write a field an older one
+rejects; the older node's refresh then drops that record from its cache while it is still serving.
+Per-surface A2A settings are such a field: a newer node writes `access_point.a2a` into stored A2A
+surfaces on its first start. Upgrade nodes that share storage together, or set
+`cache_refresh_interval_secs` to `0` on the older node until it is upgraded (see
+[A2A surface settings](PROTOCOLS.md#a2a-surface-settings)).
 
 ## Fabric envelope lifetime
 
