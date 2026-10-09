@@ -17254,8 +17254,9 @@ mod tests {
         .unwrap();
         assert_eq!(status, axum::http::StatusCode::OK, "{response}");
         assert_eq!(response["result"]["resultType"], "input_required");
-        // With the switch off a `fabric://` Target skips consent even with a runtime and goes on
-        // to payment; with it on and no runtime, the request stops at the delegation gate.
+        // Two surfaces route to the same peer gateway. Only the opted-in one reaches the delegation
+        // gate, which stops it without a runtime; the other skips consent, even with a runtime, and
+        // goes on to payment.
         let fabric_root = tempfile::tempdir().unwrap();
         let peer = crate::gateways::types::Gateway::new(
             "Peer".into(),
@@ -17284,11 +17285,14 @@ mod tests {
             .register_test_listener(listener)
             .await;
         let listener_manager = Arc::new(tokio::sync::RwLock::new(Some(Arc::new(manager))));
-        for opted_in in [false, true] {
+        for (surface_id, opted_in, with_runtime) in
+            [("opted-out", false, false), ("opted-in", true, false), ("opted-out", false, true)]
+        {
             let mut fabric = state.clone();
             fabric.listener_manager = listener_manager.clone();
             let mut surface = (*state.surface).clone();
-            surface.target.endpoint = format!("fabric://{}/peer-surface", peer.id);
+            surface.surface_id = surface_id.into();
+            surface.target.endpoint = format!("fabric://{}/{surface_id}", peer.id);
             surface
                 .target
                 .fabric_delegated_credentials = opted_in;
@@ -17300,7 +17304,7 @@ mod tests {
                     fabric,
                     build_request(&message),
                     versions,
-                    (!opted_in).then(|| runtime.clone()),
+                    with_runtime.then(|| runtime.clone()),
                 )),
             )
             .await
@@ -17311,14 +17315,18 @@ mod tests {
                 .await
                 .unwrap();
             let body = String::from_utf8_lossy(&bytes);
-            assert!(!body.contains("input_required"), "opted_in={opted_in}: {status} {body}");
-            assert!(!body.contains("requestState"), "opted_in={opted_in}: {body}");
+            assert!(!body.contains("input_required"), "{surface_id} runtime={with_runtime}: {status} {body}");
+            assert!(!body.contains("requestState"), "{surface_id} runtime={with_runtime}: {body}");
             assert_eq!(
                 body.contains("MCP credential service unavailable"),
                 opted_in,
-                "opted_in={opted_in}: {status} {body}"
+                "{surface_id} runtime={with_runtime}: {status} {body}"
             );
-            assert_eq!(body.contains("payment delegation"), !opted_in, "opted_in={opted_in}: {status} {body}");
+            assert_eq!(
+                body.contains("payment delegation"),
+                !opted_in,
+                "{surface_id} runtime={with_runtime}: {status} {body}"
+            );
         }
         // Tampered, expired, cross-user and incapable MRTR retries, on a continuation of their
         // own so the flow below keeps its state.
