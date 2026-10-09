@@ -23,6 +23,9 @@ changes:
     - timestamp: '2026-10-10T00:00:02.000Z'
       title: Stop logging integration credentials and webhook URLs
       description: The integration test endpoint no longer logs the submitted configuration or content, and Slack, webhook and Redis Streams publishers no longer log webhook URLs, Redis connection strings or URLs inside HTTP errors, which can carry passwords and bearer tokens.
+    - timestamp: '2026-10-10T00:00:03.000Z'
+      title: Accept one connection setup per gateway invitation, and only that one
+      description: A gateway invitation now accepts a connection setup only on a User Connection Point with a secret, only when the setup's parent thread id names the invitation message the mediator served, and only once. Previously the parent thread id was ignored, a leaked invitation URL and secret could be redeemed repeatedly until it expired, and system Connection Points with an empty secret accepted setups, each one creating an approval request, an admin notification and integration calls. The secret is now compared in constant time.
   breaking:
     - timestamp: '2026-10-09T00:00:01.000Z'
       title: Stop sending target credentials for failed callers over MCP proxy and Fabric
@@ -30,4 +33,7 @@ changes:
     - timestamp: '2026-10-09T00:00:07.000Z'
       title: Refuse tenant token edits to records that belong to no tenant
       description: Tenant automations that updated, deleted or triggered appliance-wide records, including records created before tenant stamping, now get 403, and tenant tokens can no longer create Connection Points. Use an appliance-wide token, or have an operator assign the record with `PUT /v1/tenant-ownership/...`.
+    - timestamp: '2026-10-10T00:00:04.000Z'
+      title: Pair one gateway per invitation and recreate invitations made before upgrade
+      description: Each gateway invitation now pairs a single gateway; create a new invitation for every peer, including after rejecting a request. Invitations created before this release do not record their invitation message id and are refused, so create them again.
   internal: []

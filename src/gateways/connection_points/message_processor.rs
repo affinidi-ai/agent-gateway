@@ -955,10 +955,11 @@ async fn verify_channel_did_proof(
     .map_err(|e| e.to_string())
 }
 
-/// The connection point a connection-setup arrived on must still be a live
-/// invitation: present, enabled and not past `expires_at`. Listener activation
-/// prunes expired invitations, but a listener that was already running keeps
-/// accepting on its socket after the invitation expires.
+/// The connection point a connection-setup arrived on must still be a live,
+/// unused invitation: a User connection point with a secret, enabled, not past
+/// `expires_at`, never redeemed, and named by the setup's `pthid`. Listener
+/// activation prunes expired invitations, but a listener that was already
+/// running keeps accepting on its socket after the invitation expires.
 async fn load_invited_connection_point(
     message: &ReceivedMessage
 ) -> Result<crate::gateways::connection_points::types::GatewayConnectionPoint, String> {
@@ -973,6 +974,15 @@ async fn load_invited_connection_point(
         .await
         .map_err(|e| format!("failed to load connection point: {}", e))?
         .ok_or_else(|| "connection point not found".to_string())?;
+    if connection_point.cp_type != crate::gateways::connection_points::types::ConnectionPointType::User {
+        return Err("connection point is not an invitation".to_string());
+    }
+    if connection_point
+        .secret
+        .is_empty()
+    {
+        return Err("invitation has no secret".to_string());
+    }
     if !connection_point.enabled {
         return Err("connection point is disabled".to_string());
     }
@@ -982,7 +992,29 @@ async fn load_invited_connection_point(
     {
         return Err("invitation has expired".to_string());
     }
-    Ok(connection_point)
+    if connection_point.use_count > 0 {
+        return Err("invitation has already been used".to_string());
+    }
+    match (connection_point.invitation_message_id(), message.pthid.as_deref()) {
+        (Some(invitation_id), Some(pthid)) if invitation_id == pthid => Ok(connection_point),
+        _ => Err("connection-setup does not reference this invitation".to_string()),
+    }
+}
+
+/// Record that an invitation has paired a gateway, so a later connection-setup on it is refused.
+pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
+    store: &CS,
+    invitation: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+) -> Result<(), String> {
+    let mut redeemed = invitation.clone();
+    redeemed.use_count = redeemed
+        .use_count
+        .saturating_add(1);
+    redeemed.last_used_at = Some(chrono::Utc::now());
+    store
+        .update(&redeemed)
+        .await
+        .map_err(|e| format!("Failed to mark invitation {} as used: {}", invitation.id, e))
 }
 
 async fn process_connection_accepted(message: &ReceivedMessage) -> ProcessingResult {
@@ -10648,16 +10680,21 @@ mod tests {
         assert_ne!(response["status"], 403, "an Active registered peer must pass the sender check");
     }
 
+    const INVITATION_MESSAGE_ID: &str = "invitation-msg-1";
+
     async fn store_invitation(
         storage_root: &std::path::Path,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> crate::gateways::connection_points::types::GatewayConnectionPoint {
-        let store = crate::gateways::connection_points::FileSystemConnectionPointStore::new(
-            storage_root.join("connection_points"),
-        )
-        .await
-        .unwrap();
-        let connection_point = crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+        let connection_point = invitation(expires_at);
+        save_connection_point(storage_root, &connection_point).await;
+        connection_point
+    }
+
+    fn invitation(
+        expires_at: Option<chrono::DateTime<chrono::Utc>>
+    ) -> crate::gateways::connection_points::types::GatewayConnectionPoint {
+        crate::gateways::connection_points::types::GatewayConnectionPoint::new(
             "gw-test".to_string(),
             "mediator-test".to_string(),
             INVITER_TMP_DID.to_string(),
@@ -10665,16 +10702,26 @@ mod tests {
             String::new(),
             "oob-123".to_string(),
             "https://mediator.example/oob?_oobid=oob-123".to_string(),
-            serde_json::json!({}),
+            serde_json::json!({ "@id": INVITATION_MESSAGE_ID }),
             expires_at,
             crate::gateways::connection_points::ConnectionPointType::User,
             "s3cret".to_string(),
-        );
+        )
+    }
+
+    async fn save_connection_point(
+        storage_root: &std::path::Path,
+        connection_point: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+    ) {
+        let store = crate::gateways::connection_points::FileSystemConnectionPointStore::new(
+            storage_root.join("connection_points"),
+        )
+        .await
+        .unwrap();
         store
-            .create(&connection_point)
+            .update(connection_point)
             .await
             .unwrap();
-        connection_point
     }
 
     fn did_key_identity() -> (String, affinidi_tdk_common::secrets_resolver::secrets::Secret) {
@@ -10712,7 +10759,7 @@ mod tests {
         body: serde_json::Value,
         thid: Option<&str>,
     ) -> ReceivedMessage {
-        ReceivedMessage::new(
+        let mut message = ReceivedMessage::new(
             connection_point_id.to_string(),
             "gw-test".to_string(),
             MessageType::ConnectionSetup.to_string(),
@@ -10724,8 +10771,9 @@ mod tests {
             None,
             body,
             authcrypt_metadata(),
-        )
-        .with_context("agent_surface_storage_path", storage_context(storage_root))
+        );
+        message.pthid = Some(INVITATION_MESSAGE_ID.to_string());
+        message.with_context("agent_surface_storage_path", storage_context(storage_root))
     }
 
     async fn init_resolver() {
@@ -10905,6 +10953,135 @@ mod tests {
             }
             other => panic!("expected OOBConnectionSetup, got {other:?}"),
         }
+    }
+
+    async fn proven_setup_msg(
+        storage_root: &std::path::Path,
+        connection_point_id: &str,
+    ) -> ReceivedMessage {
+        let (did, key) = did_key_identity();
+        let challenge = channel_did_proof_challenge(ACCEPTOR_TMP_DID, INVITER_TMP_DID, &did);
+        let proof = sign_channel_did_proof(std::slice::from_ref(&key), &challenge).unwrap();
+        make_connection_setup_msg(storage_root, connection_point_id, setup_body(&did, Some(&proof)))
+    }
+
+    #[tokio::test]
+    async fn redeemed_invitation_refuses_a_second_setup() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let first = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
+        assert!(matches!(first, ProcessingResult::OOBConnectionSetup(_)), "{first:?}");
+        let store = crate::gateways::connection_points::FileSystemConnectionPointStore::new(
+            temp.path()
+                .join("connection_points"),
+        )
+        .await
+        .unwrap();
+
+        redeem_invitation(&store, &connection_point)
+            .await
+            .unwrap();
+
+        let stored = store
+            .get(&connection_point.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.use_count, 1);
+        assert!(stored.last_used_at.is_some());
+        let second = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
+        assert_eq!(failure_reason(&second), "invitation has already been used");
+    }
+
+    const NOT_THIS_INVITATION: &str = "connection-setup does not reference this invitation";
+
+    #[tokio::test]
+    async fn connection_setup_naming_another_invitation_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let mut msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+        msg.pthid = Some("another-invitation".to_string());
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), NOT_THIS_INVITATION);
+    }
+
+    #[tokio::test]
+    async fn connection_setup_without_pthid_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let mut msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+        msg.pthid = None;
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), NOT_THIS_INVITATION);
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_invitation_without_recorded_id_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.oob_message = serde_json::json!({});
+        save_connection_point(temp.path(), &connection_point).await;
+        let msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), NOT_THIS_INVITATION);
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_system_connection_point_is_refused() {
+        init_resolver().await;
+        for cp_type in [
+            crate::gateways::connection_points::ConnectionPointType::OobResponder,
+            crate::gateways::connection_points::ConnectionPointType::OobAcceptor,
+            crate::gateways::connection_points::ConnectionPointType::System,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut connection_point = invitation(None);
+            connection_point.cp_type = cp_type.clone();
+            save_connection_point(temp.path(), &connection_point).await;
+            let msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+
+            let result = process_connection_setup(&msg).await;
+
+            assert_eq!(failure_reason(&result), "connection point is not an invitation", "{cp_type:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_invitation_without_secret_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.secret = String::new();
+        save_connection_point(temp.path(), &connection_point).await;
+        let msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), "invitation has no secret");
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_used_invitation_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.use_count = 1;
+        save_connection_point(temp.path(), &connection_point).await;
+        let msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), "invitation has already been used");
     }
 
     fn x402_requirement(pay_to: &str) -> crate::config::types::X402PaymentRequirement {

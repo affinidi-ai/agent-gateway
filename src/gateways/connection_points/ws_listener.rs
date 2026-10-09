@@ -2674,6 +2674,7 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                 debug!("Message.from: {:?}, Message.to: {:?}", message.from, message.to);
                 let message_sha256_hash = metadata.sha256_hash.clone();
                 let mut received_msg = received_message(connection_point, connection_point_did, &message, &metadata);
+                received_msg.pthid = message.pthid.clone();
                 stream_listener.stamp(&mut received_msg);
 
                 // Attach pre-computed per-listener context. These values
@@ -3678,7 +3679,18 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
     info!("  Validating secret...");
 
     // Validate the secret
-    if connection_point.secret != provided_secret {
+    let secret_matches: bool = subtle::ConstantTimeEq::ct_eq(
+        connection_point
+            .secret
+            .as_bytes(),
+        provided_secret.as_bytes(),
+    )
+    .into();
+    if connection_point
+        .secret
+        .is_empty()
+        || !secret_matches
+    {
         error!("❌ Secret validation failed for connection point {}", connection_point.id);
 
         // Send connection-rejected message back to acceptor
@@ -3768,6 +3780,8 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
     crate::config::enforce_add("connections.gateways")
         .await
         .map_err(|e| format!("Inbound gateway connection refused (appliance limit): {}", e.message()))?;
+
+    super::message_processor::redeem_invitation(cp_store.as_ref(), connection_point).await?;
 
     // Step 2: Create our secure DID for the permanent connection
     info!("🔑 Creating our secure DID for permanent connection...");

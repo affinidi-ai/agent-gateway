@@ -107,6 +107,20 @@ already processed: `connection-setup` after it proves control of its `channel_di
 invitation, `connection-accepted` once its sender and `channel_did` are present; both verify their
 issuer attestation afterwards. A pairing message without `expires_time` is remembered for one hour.
 
+An invitation pairs one gateway. The inviting gateway records the id of the invitation message
+its mediator serves, and accepts a `connection-setup` only when all of these hold:
+
+- it arrives on a User Connection Point that has a secret, is enabled and has not expired;
+- the Connection Point has not already been redeemed;
+- the setup's `pthid` names that invitation message.
+
+The secret is compared in constant time. A successful setup increments the invitation's
+`use_count`, so every later setup on it is refused, even if an administrator rejects the resulting
+request; create a new invitation to pair again. The redeemed Connection Point is kept, because
+approval sends `connection-accepted` from its DID. System Connection Points (`oobresponder`,
+`oobacceptor`, `system`) never accept a `connection-setup`. Invitations created before the gateway
+recorded the message id are refused and must be created again.
+
 ## Peer issuer DIDs
 
 A gateway sends fabric envelopes from a per-pairing Connection Point DID but signs the identity

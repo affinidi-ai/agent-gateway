@@ -1233,19 +1233,26 @@ async fn create_oob_invitation(
     info!("  To mediator: {}", mediator_did);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let oob_result = oob_discovery
+    let oob_result = match oob_discovery
         .create_invite(&atm, &profile, expiry)
-        .await;
+        .await
+    {
+        Ok(oobid) => {
+            let oob_url = format!("{}/oob?_oobid={}", mediator_url, oobid);
+            oob_discovery
+                .retrieve_invite(&atm, &oob_url)
+                .await
+                .map(|invitation| (oobid, oob_url, invitation.id))
+        }
+        Err(e) => Err(e),
+    };
 
     // Cleanup: Graceful shutdown of ATM
     atm.graceful_shutdown().await;
 
     match oob_result {
-        Ok(oobid) => {
+        Ok((oobid, oob_url, invitation_message_id)) => {
             info!("✓ OOB invitation created successfully with ID: {}", oobid);
-
-            // Construct the OOB URL
-            let oob_url = format!("{}/oob?_oobid={}", mediator_url, oobid);
 
             // Create the message structure for storage
             let now = SystemTime::now()
@@ -1260,7 +1267,7 @@ async fn create_oob_invitation(
 
             let oob_message = json!({
                 "@type": MessageType::OOBInvitation.to_string(),
-                "@id": uuid::Uuid::new_v4().to_string(),
+                "@id": invitation_message_id,
                 "label": label,
                 "goal_code": "gateway-connection",
                 "goal": goal,
