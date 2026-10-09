@@ -27,6 +27,15 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
+fn is_visible(
+    tenant_id: Option<&str>,
+    secret_id: &str,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> bool {
+    can_access(tenant_id, context) && scope_allows_resource(scope, context, ResourceKind::Secrets, secret_id)
+}
+
 /// List all secrets (without sensitive values)
 pub async fn list_secrets(
     State(store): State<Arc<dyn SecretsStore>>,
@@ -37,10 +46,7 @@ pub async fn list_secrets(
         Ok(mut secrets) => {
             let context = tenant_context(&context);
             let scope = resource_scope(&scope);
-            secrets.retain(|secret| {
-                can_access(secret.tenant_id.as_deref(), context)
-                    && scope_allows_resource(scope, context, ResourceKind::Secrets, &secret.secret_id)
-            });
+            secrets.retain(|secret| is_visible(secret.tenant_id.as_deref(), &secret.secret_id, context, scope));
             (StatusCode::OK, Json(secrets)).into_response()
         }
         Err(e) => {
@@ -59,13 +65,12 @@ pub async fn get_secret(
 ) -> impl IntoResponse {
     match store.get(&id).await {
         Ok(Some(secret))
-            if can_access(secret.tenant_id.as_deref(), tenant_context(&context))
-                && scope_allows_resource(
-                    resource_scope(&scope),
-                    tenant_context(&context),
-                    ResourceKind::Secrets,
-                    &secret.secret_id,
-                ) =>
+            if is_visible(
+                secret.tenant_id.as_deref(),
+                &secret.secret_id,
+                tenant_context(&context),
+                resource_scope(&scope),
+            ) =>
         {
             (StatusCode::OK, Json(SecretListItem::from(secret))).into_response()
         }
@@ -160,16 +165,21 @@ pub async fn update_secret(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
+    if !is_visible(
+        old_secret
+            .tenant_id
+            .as_deref(),
+        &old_secret.secret_id,
+        tenant_context(&context),
+        resource_scope(&scope),
+    ) {
+        return (StatusCode::NOT_FOUND, "Secret not found").into_response();
+    }
     if !can_mutate(
         old_secret
             .tenant_id
             .as_deref(),
         tenant_context(&context),
-    ) || !scope_allows_resource(
-        resource_scope(&scope),
-        tenant_context(&context),
-        ResourceKind::Secrets,
-        &old_secret.secret_id,
     ) {
         return (
             StatusCode::FORBIDDEN,
@@ -249,14 +259,10 @@ pub async fn delete_secret(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
-    if !can_mutate(secret.tenant_id.as_deref(), tenant_context(&context))
-        || !scope_allows_resource(
-            resource_scope(&scope),
-            tenant_context(&context),
-            ResourceKind::Secrets,
-            &secret.secret_id,
-        )
-    {
+    if !is_visible(secret.tenant_id.as_deref(), &secret.secret_id, tenant_context(&context), resource_scope(&scope)) {
+        return (StatusCode::NOT_FOUND, "Secret not found").into_response();
+    }
+    if !can_mutate(secret.tenant_id.as_deref(), tenant_context(&context)) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "message": "Secret is outside this token's permitted scope" })),
@@ -311,10 +317,7 @@ pub async fn find_by_tag(
         Ok(mut secrets) => {
             let context = tenant_context(&context);
             let scope = resource_scope(&scope);
-            secrets.retain(|secret| {
-                can_access(secret.tenant_id.as_deref(), context)
-                    && scope_allows_resource(scope, context, ResourceKind::Secrets, &secret.secret_id)
-            });
+            secrets.retain(|secret| is_visible(secret.tenant_id.as_deref(), &secret.secret_id, context, scope));
             (StatusCode::OK, Json(secrets)).into_response()
         }
         Err(e) => {
@@ -555,14 +558,28 @@ mod tests {
         }))
     }
 
-    async fn update_and_delete_as_tenant_a(store: Arc<dyn SecretsStore>) -> (StatusCode, StatusCode) {
+    async fn status_and_body(response: axum::response::Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn update_and_delete_responses_as_tenant_a(
+        store: Arc<dyn SecretsStore>,
+        scope: Option<Extension<PatResourceScope>>,
+    ) -> ((StatusCode, String), (StatusCode, String)) {
         let update = update_secret(
             State(store.clone()),
             Extension(None),
             Extension(None),
             Path("internal-1".to_string()),
             tenant_a(),
-            None,
+            scope.clone(),
             Json(UpdateSecretRequest {
                 name: Some("Tenant key".to_string()),
                 description: None,
@@ -573,20 +590,71 @@ mod tests {
             }),
         )
         .await
-        .into_response()
-        .status();
+        .into_response();
         let delete = delete_secret(
             State(store),
             Extension(None),
             Extension(None),
             Path("internal-1".to_string()),
             tenant_a(),
-            None,
+            scope,
         )
         .await
-        .into_response()
-        .status();
+        .into_response();
+        (status_and_body(update).await, status_and_body(delete).await)
+    }
+
+    async fn update_and_delete_as_tenant_a(store: Arc<dyn SecretsStore>) -> (StatusCode, StatusCode) {
+        let ((update, _), (delete, _)) = update_and_delete_responses_as_tenant_a(store, None).await;
         (update, delete)
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_sees_another_tenants_secret_as_missing_on_update_and_delete() {
+        let recording = recording_store(Some("tenant-b"));
+        let store: Arc<dyn SecretsStore> = recording.clone();
+        let missing: Arc<dyn SecretsStore> = recording_store_with(None, Lookup::Missing);
+
+        let other_tenant = update_and_delete_responses_as_tenant_a(store, None).await;
+        let not_found = update_and_delete_responses_as_tenant_a(missing, None).await;
+
+        assert_eq!(other_tenant.0.0, StatusCode::NOT_FOUND);
+        assert_eq!(other_tenant, not_found);
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_sees_its_secret_outside_the_token_pattern_as_missing() {
+        let recording = recording_store(Some("tenant-a"));
+        let store: Arc<dyn SecretsStore> = recording.clone();
+        let missing: Arc<dyn SecretsStore> = recording_store_with(None, Lookup::Missing);
+        let scope = || {
+            Some(Extension(PatResourceScope(Arc::new(
+                regex::Regex::new("^TENANT:tenant-a:secrets:other_.*$").expect("pattern"),
+            ))))
+        };
+
+        let read = get_secret(State(store.clone()), Path("internal-1".to_string()), tenant_a(), scope())
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::NOT_FOUND);
+
+        let outside_pattern = update_and_delete_responses_as_tenant_a(store, scope()).await;
+        let not_found = update_and_delete_responses_as_tenant_a(missing, None).await;
+
+        assert_eq!(outside_pattern.0.0, StatusCode::NOT_FOUND);
+        assert_eq!(outside_pattern, not_found);
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]
