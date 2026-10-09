@@ -159,6 +159,7 @@ impl IntegrationPublisher for WebhookPublisher {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 error!("Failed to send webhook: {} (timeout: {}, connect: {})", e, e.is_timeout(), e.is_connect());
                 e
             })

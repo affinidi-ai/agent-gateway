@@ -129,7 +129,7 @@ impl IntegrationPublisher for SlackPublisher {
         }
 
         debug!("Slack payload: {:?}", payload);
-        info!("Sending Slack notification to webhook: {}", webhook_url);
+        info!("Sending Slack notification via integration: {}", integration.name);
 
         // Send HTTP POST to Slack webhook with timeout
         let client = crate::http_client::external()?;
@@ -139,6 +139,7 @@ impl IntegrationPublisher for SlackPublisher {
             .json(&payload)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to send Slack webhook")?;
 
         if response.status().is_success() {

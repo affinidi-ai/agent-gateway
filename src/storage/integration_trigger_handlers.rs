@@ -165,8 +165,6 @@ pub async fn test_notifier_handler(
     use crate::integrations::email_service::{SmtpConfig, send_email};
 
     tracing::info!("Test integration handler called for type: {}", payload.integration_type);
-    tracing::debug!("Test integration configuration: {:?}", payload.configuration);
-    tracing::debug!("Test integration content: {:?}", payload.content);
 
     match payload
         .integration_type
@@ -235,8 +233,6 @@ pub async fn test_notifier_handler(
                     (StatusCode::BAD_REQUEST, "Missing webhook_url in Slack configuration".to_string())
                 })?;
 
-            tracing::info!("Webhook URL found: {}", webhook_url);
-
             // Use content template if provided
             let text_template = if let Some(template_text) = payload
                 .content
@@ -292,7 +288,7 @@ pub async fn test_notifier_handler(
             }
 
             tracing::debug!("Slack payload: {:?}", slack_payload);
-            tracing::info!("Sending HTTP POST to Slack webhook URL: {}", webhook_url);
+            tracing::info!("Sending HTTP POST to Slack webhook");
 
             // Send HTTP POST to Slack webhook with timeout
             let client = crate::http_client::external().map_err(|e| {
@@ -306,25 +302,21 @@ pub async fn test_notifier_handler(
                 .send()
                 .await
                 .map_err(|e| {
-                    tracing::error!(
-                        "Failed to send Slack webhook: {} (is_timeout: {}, is_connect: {}, is_request: {})",
+                    let message = format!(
+                        "Failed to send Slack webhook: {} (timeout: {}, connect: {})",
                         e,
                         e.is_timeout(),
-                        e.is_connect(),
-                        e.is_request()
+                        e.is_connect()
                     );
-                    if let Some(url_error) = e.url() {
-                        tracing::error!("URL that failed: {}", url_error);
-                    }
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "Failed to send Slack webhook: {} (timeout: {}, connect: {})",
-                            e,
-                            e.is_timeout(),
-                            e.is_connect()
-                        ),
-                    )
+                    let (is_timeout, is_connect, is_request) = (e.is_timeout(), e.is_connect(), e.is_request());
+                    tracing::error!(
+                        "Failed to send Slack webhook: {} (is_timeout: {}, is_connect: {}, is_request: {})",
+                        e.without_url(),
+                        is_timeout,
+                        is_connect,
+                        is_request
+                    );
+                    (StatusCode::INTERNAL_SERVER_ERROR, message)
                 })?;
 
             tracing::info!("Slack webhook response status: {}", response.status());
@@ -403,7 +395,7 @@ pub async fn test_notifier_handler(
             })?;
 
             tracing::debug!("Webhook payload: {:?}", final_payload);
-            tracing::info!("Sending HTTP {} to webhook URL: {}", method, webhook_url);
+            tracing::info!("Sending HTTP {} to webhook", method);
 
             // Send HTTP request to webhook with timeout
             let client = crate::http_client::external()
@@ -464,22 +456,21 @@ pub async fn test_notifier_handler(
                 .send()
                 .await
                 .map_err(|e| {
-                    tracing::error!(
-                        "Failed to send webhook: {} (is_timeout: {}, is_connect: {}, is_request: {})",
+                    let message = format!(
+                        "Failed to send webhook: {} (timeout: {}, connect: {})",
                         e,
                         e.is_timeout(),
-                        e.is_connect(),
-                        e.is_request()
+                        e.is_connect()
                     );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "Failed to send webhook: {} (timeout: {}, connect: {})",
-                            e,
-                            e.is_timeout(),
-                            e.is_connect()
-                        ),
-                    )
+                    let (is_timeout, is_connect, is_request) = (e.is_timeout(), e.is_connect(), e.is_request());
+                    tracing::error!(
+                        "Failed to send webhook: {} (is_timeout: {}, is_connect: {}, is_request: {})",
+                        e.without_url(),
+                        is_timeout,
+                        is_connect,
+                        is_request
+                    );
+                    (StatusCode::INTERNAL_SERVER_ERROR, message)
                 })?;
 
             tracing::info!("Webhook response status: {}", response.status());

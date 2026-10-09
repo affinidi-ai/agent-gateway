@@ -14,14 +14,14 @@ impl StreamPublisher for RedisPublisher {
         topic: &str,
         event: &Value,
         config: &Value,
-        _integration_id: &str,
+        integration_id: &str,
     ) -> Result<()> {
         let redis_url = config
             .get("redis_url")
             .and_then(|v| v.as_str())
             .context("Redis URL is required for Redis Streams")?;
 
-        info!("Publishing to Redis Stream '{}' at '{}'", topic, redis_url);
+        info!("Publishing to Redis Stream '{}' for integration {}", topic, integration_id);
 
         use redis::AsyncCommands;
 
@@ -57,7 +57,7 @@ impl StreamPublisher for RedisPublisher {
             .and_then(|v| v.as_str())
             .context("Redis URL is required")?;
 
-        info!("Testing Redis Streams connection to: {}", redis_url);
+        info!("Testing Redis Streams connection for stream '{}'", topic);
 
         use redis::AsyncCommands;
 
