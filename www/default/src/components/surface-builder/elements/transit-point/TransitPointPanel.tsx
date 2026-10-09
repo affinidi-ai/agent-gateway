@@ -7,6 +7,10 @@ import TransitCredentialBindingSection, {
   type TransitCredentialsForm,
 } from '../_shared/TransitCredentialBindingSection';
 import RouteListenerSection from '../_shared/RouteListenerSection';
+import FabricDelegatedCredentialsSection, {
+  fabricPeerGatewayId,
+  hasOutboundCredentialBindings,
+} from '../_shared/FabricDelegatedCredentialsSection';
 import { AgentCardLocationHelp } from '../_shared/AgentCardLocationHelp';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
 import { filterSelectableGateways } from '../../../../utils/gateways';
@@ -46,6 +50,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
   updateFields,
   replaceCommit,
   hasAttemptedSave,
+  allNodes,
 }) => {
   // Mint a stable hidden id on first render so backend, metrics, and
   // task monitor have something durable to key off even before the
@@ -436,6 +441,21 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         rawValue={config.transit_credentials}
         onChange={next => updateField('transit_credentials', next)}
       />
+
+      {isFabricEndpoint(config.target_endpoint) &&
+        (hasOutboundCredentialBindings(allNodes) || !!config.transit_credentials) && (
+          <FabricDelegatedCredentialsSection
+            testIdPrefix="transit-point"
+            instanceKey={config.id}
+            checked={config.fabric_delegated_credentials === true}
+            peerName={
+              gateways.find(
+                g => g.id === fabricPeerGatewayId(config.target_endpoint, selectedGatewayId)
+              )?.name
+            }
+            onChange={next => updateField('fabric_delegated_credentials', next)}
+          />
+        )}
 
       <div className="config-section">
         <label>Security</label>

@@ -83,6 +83,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 - Payment setup dependency alerts stay hidden until the first Save attempt. Invalid
   payment configuration remains blocked on Save, while embedded safety warnings stay
   visible.
+- **Send delegated credentials over Fabric** is one shared section
+  (`_shared/FabricDelegatedCredentialsSection.tsx`) used by the Managed Agent and Transit
+  Point panels. It writes `fabric_delegated_credentials` and appears only when that route
+  is `fabric://` and the surface has credential bindings (a Credential Delegation row, or
+  the Transit Point's own `transit_credentials`). It defaults to off. When on, an
+  always-visible warning names the receiving gateway. Test ids:
+  `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
+  `-warning`. There is no surface-wide switch.
 
 ## Access Tokens page
 
