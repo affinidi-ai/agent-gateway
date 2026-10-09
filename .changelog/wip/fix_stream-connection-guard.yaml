@@ -1,0 +1,64 @@
+branch: fix/stream-connection-guard
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: End legacy MCP SSE passthroughs at the surface's stream idle and lifetime limits
+      description: >-
+        A legacy MCP text/event-stream passthrough now ends when the upstream sends nothing for
+        the surface's mcp_http.stream_idle_timeout_secs (default 60 s) or is still streaming at
+        mcp_http.stream_max_lifetime_secs (default 3600 s), as modern MCP streams already do.
+        Before, a passthrough could stay open indefinitely. Surfaces whose upstream is quiet for
+        longer than 60 s between events need a larger stream_idle_timeout_secs.
+  fixed:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Count MCP SSE streams as active connections until they end
+      description: >-
+        Legacy MCP SSE passthrough responses, legacy GET /sse streams on proxy:// and fabric://
+        surfaces, and the Streamable HTTP GET notification stream now hold their connection
+        guard until the response body ends or the client disconnects, as modern MCP streams
+        already did. Before, the guard was released when the response headers were sent, so
+        running streams were missing from the active-connection metrics.
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Keep idle long-lived streams in the active-connection count
+      description: >-
+        The task monitor no longer resets a task's active connections to zero after two
+        minutes without activity. Every request's connection guard releases its count when
+        the request or stream ends, so the reset only hid quiet streams and listens from the
+        dashboard, Prometheus, CloudWatch and OpenTelemetry active-connection gauges.
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Drop connections and streamed responses without panicking outside the runtime
+      description: >-
+        Dropping a connection guard, or any streamed MCP response body (legacy or modern),
+        outside a Tokio runtime, for example during shutdown, no longer panics. A modern
+        response's completion bookkeeping (connection count, bytes, errors, metrics) is skipped
+        with a warning instead of spawning a task, and a guard leaves its count as is. Releasing
+        a guard when its stream ends no longer logs the abnormal disconnect warning.
+  removed: []
+  security:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Cap Legacy SSE sessions at 10,000 and answer further GET /sse with 429
+      description: >-
+        GET /sse on proxy:// and fabric:// surfaces and on standalone MCP proxies created a
+        session with no limit, so a client could open sessions until memory ran out. The gateway
+        now holds at most 10,000 Legacy SSE sessions, matching the Streamable HTTP notification
+        stream cap; sessions whose client has disconnected are dropped first, and a request
+        beyond the cap gets 429 "Too many active SSE sessions".
+  breaking: []
+  internal:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Test that streamed responses hold the connection guard until the body ends
+      description: >-
+        A direct-router test covers the legacy SSE passthrough and a modern streamed response
+        (held until the body ends) and the Streamable HTTP GET, fabric:// GET /sse and proxy:// GET /sse streams
+        (released on client drop). Task monitor unit tests cover idle connections staying
+        counted and the count never going below zero.
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Test SSE session refusal, session cap, passthrough limits and guard release
+      description: >-
+        Unit tests cover the 429 session-limit response releasing its connection, the Legacy SSE
+        session cap reclaiming disconnected sessions, and ConnectionGuard release and drop with
+        and without a runtime, and a modern response completion inside and outside a runtime.
+        Component tests cover a legacy SSE passthrough ending at the
+        stream idle timeout and at the stream lifetime. A shared TaskInfo::running test
+        constructor replaces three copies.

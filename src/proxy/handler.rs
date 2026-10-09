@@ -1398,6 +1398,22 @@ pub(crate) fn listen_surface_key(surface: &crate::config::agent_surface::AgentSu
     format!("surface:{id}")
 }
 
+/// Keeps a streamed response counted as an active connection until its body
+/// ends or the client drops it.
+fn hold_connection_for_body(
+    connection_guard: ConnectionGuard,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    crate::mcp::modern_sse::observe_response(response, move |_| connection_guard.release())
+}
+
+/// Refuses a new SSE session because the session cap is reached, releasing the
+/// request's connection.
+fn sse_session_limit_response(connection_guard: ConnectionGuard) -> axum::response::Response {
+    connection_guard.release();
+    (StatusCode::TOO_MANY_REQUESTS, "Too many active SSE sessions").into_response()
+}
+
 async fn proxy_handler_with_mcp_runtime(
     addr: SocketAddr,
     state: ProxyState,
@@ -3118,9 +3134,12 @@ async fn proxy_handler_with_mcp_runtime(
         if method == "GET" && path_str.ends_with("/sse") {
             channel_info!(config_id, "🔌 SSE connect for fabric:// MCP channel (handled locally at GW1)");
 
-            let (session_id, rx_stream) = CHANNEL_SSE_SESSION_MGR
+            let Some((session_id, rx_stream)) = CHANNEL_SSE_SESSION_MGR
                 .create_session()
-                .await;
+                .await
+            else {
+                return Ok(sse_session_limit_response(connection_guard));
+            };
 
             // The `endpoint` event must advertise a path the client can POST to
             // through the gateway's public-facing router — i.e. the channel
@@ -3133,11 +3152,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .route()
                 .trim_end_matches('/');
             let response = crate::mcp::sse_server::build_legacy_sse_response(session_id, rx_stream, surface_route);
-
-            connection_guard
-                .decrement()
-                .await;
-            return Ok(response);
+            return Ok(hold_connection_for_body(connection_guard, response));
         }
 
         // POST /mcp/messages/?session_id=X → Forward JSON-RPC through Fabric,
@@ -3696,9 +3711,6 @@ async fn proxy_handler_with_mcp_runtime(
                 "🔌 MCP Streamable HTTP GET: opening notification stream session_id={:?}",
                 session_id_opt
             );
-            connection_guard
-                .decrement()
-                .await;
 
             let stream: std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>,
@@ -3709,10 +3721,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .await
                     {
                         Some(rx) => rx,
-                        None => {
-                            return Ok((axum::http::StatusCode::TOO_MANY_REQUESTS, "Too many active SSE sessions")
-                                .into_response());
-                        }
+                        None => return Ok(sse_session_limit_response(connection_guard)),
                     };
                     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
                 }
@@ -3721,7 +3730,7 @@ async fn proxy_handler_with_mcp_runtime(
                 }
             };
             let sse = axum::response::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default());
-            return Ok(axum::response::IntoResponse::into_response(sse));
+            return Ok(hold_connection_for_body(connection_guard, axum::response::IntoResponse::into_response(sse)));
         }
 
         // DELETE → terminate session.
@@ -3795,9 +3804,12 @@ async fn proxy_handler_with_mcp_runtime(
             let proxy_id = &state.surface.target.endpoint[8..];
             channel_info!(config_id, "🔌 SSE connect for proxy:// channel proxy_id={}", proxy_id);
 
-            let (session_id, rx_stream) = CHANNEL_SSE_SESSION_MGR
+            let Some((session_id, rx_stream)) = CHANNEL_SSE_SESSION_MGR
                 .create_session()
-                .await;
+                .await
+            else {
+                return Ok(sse_session_limit_response(connection_guard));
+            };
 
             // The `endpoint` event must advertise a path the client can POST to
             // through the gateway's public-facing router — i.e. the channel
@@ -3809,11 +3821,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .route()
                 .trim_end_matches('/');
             let response = crate::mcp::sse_server::build_legacy_sse_response(session_id, rx_stream, surface_route);
-
-            connection_guard
-                .decrement()
-                .await;
-            return Ok(response);
+            return Ok(hold_connection_for_body(connection_guard, response));
         }
 
         // POST /mcp/messages/?session_id=X → Legacy SSE session message
@@ -7204,18 +7212,16 @@ async fn proxy_handler_with_mcp_runtime(
                         });
                     }
 
-                    connection_guard
-                        .decrement()
-                        .await;
-
                     let sse_response = crate::mcp::sse_transport::create_sse_passthrough_response(
                         upstream_response,
                         resp_headers,
                         channel_name.to_string(),
                         state.config.a2a.max_body_size,
+                        modern_limits.idle_timeout,
+                        modern_limits.max_lifetime,
                     );
 
-                    return Ok(sse_response);
+                    return Ok(hold_connection_for_body(connection_guard, sse_response));
                 }
             }
         }
@@ -16431,6 +16437,242 @@ mod tests {
         assert_eq!(delivered["result"]["serverInfo"], server_info, "{delivered}");
     }
 
+    #[tokio::test]
+    async fn sse_session_limit_response_refuses_and_releases_the_connection() {
+        let monitor = std::sync::Arc::new(crate::observability::TaskMonitor::new(None));
+        monitor
+            .register_task(crate::observability::TaskInfo::running("limited"))
+            .await;
+        monitor
+            .increment_connections("limited")
+            .await;
+
+        let response = super::sse_session_limit_response(super::ConnectionGuard::new(
+            Some(monitor.clone()),
+            Some("limited".into()),
+        ));
+
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Too many active SSE sessions");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while monitor
+            .get_task("limited")
+            .await
+            .unwrap()
+            .active_connections
+            != 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            monitor
+                .get_task("limited")
+                .await
+                .unwrap()
+                .active_connections,
+            0
+        );
+    }
+
+    /// A streamed response stays counted as an active connection until its body
+    /// ends or the caller drops it, on legacy and modern paths alike.
+    async fn streamed_responses_hold_the_connection_until_the_body_ends(state: &crate::state::ProxyState) {
+        use futures::StreamExt;
+        use serde_json::json;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TASK: &str = "router-fixture";
+        let monitor = Arc::new(crate::observability::TaskMonitor::new(None));
+        monitor
+            .register_task(crate::observability::TaskInfo::running(TASK))
+            .await;
+        let state = crate::state::ProxyState {
+            task_monitor: Some(monitor.clone()),
+            ..state.clone()
+        };
+        let active = || {
+            let monitor = monitor.clone();
+            async move {
+                monitor
+                    .get_task(TASK)
+                    .await
+                    .unwrap()
+                    .active_connections
+            }
+        };
+        let settles_at = |expected: u64, context: &'static str| async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while active().await != expected && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(active().await, expected, "{context}");
+        };
+        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
+            &[crate::mcp::MCP_MODERN_VERSION],
+            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+        );
+        let send = |surface: crate::config::agent_surface::AgentSurface,
+                    request: axum::http::Request<axum::body::Body>| {
+            let router = direct_router_state(&state, surface);
+            async move {
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        router,
+                        request,
+                        versions,
+                        None,
+                    )),
+                )
+                .await
+                .expect("the gateway starts streaming");
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                assert!(
+                    response.headers()["content-type"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("text/event-stream")
+                );
+                response
+            }
+        };
+
+        // Upstream SSE that sends one progress event, then the result once
+        // `finish` fires, then closes.
+        let upstream = |result: serde_json::Value| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while !request
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+                {
+                    let read = socket
+                        .read(&mut buffer)
+                        .await
+                        .unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let progress = json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                    "params": {"progressToken": "work", "progress": 1}});
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {progress}\n\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let _ = finished.await;
+                let _ = socket
+                    .write_all(format!("data: {result}\n\n").as_bytes())
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+            (address, finish)
+        };
+        let surface = |route: &str, endpoint: String| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": format!("streams{route}"), "name": "Streams",
+                "access_point": {"listen_address": "https://gateway.example", "route": route, "protocol": "mcp"},
+                "target": {"endpoint": endpoint}
+            }))
+            .unwrap()
+        };
+        let tools_call = |route: &str, modern: bool| {
+            let mut body = json!({"jsonrpc": "2.0", "id": "work", "method": "tools/call", "params": {
+                "name": "slow", "arguments": {}, "_meta": {"progressToken": "work"}
+            }});
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(route)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if modern {
+                body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+                    json!(crate::mcp::MCP_MODERN_VERSION);
+                body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
+                request = request
+                    .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
+                    .header("mcp-method", "tools/call")
+                    .header("mcp-name", "slow");
+            }
+            request
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+
+        for (route, modern, result) in [
+            ("/legacy-stream", false, json!({"jsonrpc": "2.0", "id": "work", "result": {"content": []}})),
+            (
+                "/modern-stream",
+                true,
+                json!({"jsonrpc": "2.0", "id": "work", "result": {"resultType": "complete", "content": []}}),
+            ),
+        ] {
+            let (address, finish) = upstream(result).await;
+            let response = send(surface(route, format!("http://{address}")), tools_call(route, modern)).await;
+            assert_eq!(active().await, 1, "{route}: the running stream counts as a connection");
+            let mut body = response
+                .into_body()
+                .into_data_stream();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+                .await
+                .expect("the progress event arrives")
+                .unwrap()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&first).contains("notifications/progress"), "{route}");
+            assert_eq!(active().await, 1, "{route}: still counted after the first event");
+            finish.send(()).unwrap();
+            let rest = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut rest = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    rest.extend_from_slice(&chunk.unwrap());
+                }
+                rest
+            })
+            .await
+            .expect("the stream ends after the result");
+            assert!(String::from_utf8_lossy(&rest).contains(r#""id":"work""#), "{route}");
+            settles_at(0, route).await;
+        }
+
+        for (route, endpoint, path) in [
+            ("/notifications", "http://127.0.0.1:9".to_string(), "/notifications"),
+            ("/fabric-sse", "fabric://did:web:peer.example/remote".to_string(), "/fabric-sse/sse"),
+            ("/proxy-sse", "proxy://owned-tools".to_string(), "/proxy-sse/sse"),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("accept", "text/event-stream")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = send(surface(route, endpoint), request).await;
+            assert_eq!(active().await, 1, "{route}: the open stream counts as a connection");
+            drop(response);
+            settles_at(0, route).await;
+        }
+    }
+
     /// A caller that disconnects from a modern request stream stops the upstream
     /// request: the direct Access Point closes its upstream connection instead
     /// of leaving quiet tool work running.
@@ -16928,6 +17170,7 @@ mod tests {
         access_point_rejects_a_spoofed_identity_credential(&state).await;
         direct_access_point_preserves_every_result_field(&state).await;
         direct_access_point_caller_disconnect_cancels_quiet_upstream(&state).await;
+        streamed_responses_hold_the_connection_until_the_body_ends(&state).await;
         forwarded_discovery_narrows_unsupported_version_errors(&state).await;
         upstream_cache_hints_survive_unless_results_are_caller_scoped(&state).await;
         modern_routing_headers_reach_the_upstream(&state).await;
@@ -18291,7 +18534,8 @@ mod tests {
 
         let (session_id, _receiver) = CHANNEL_SSE_SESSION_MGR
             .create_session()
-            .await;
+            .await
+            .unwrap();
         headers.insert("mcp-session-id", HeaderValue::from_str(&session_id).unwrap());
         let known = resolve_legacy_mcp_session(&headers).await;
         assert_eq!(known, (LegacySessionEvidence::Known, Some(session_id.clone())));

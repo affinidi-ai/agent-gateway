@@ -162,8 +162,8 @@ Removing it takes a PATCH that sets `mcp_http.authorization` (or `mcp_http`) to
 | `max_accept_ranges` | `32` | Maximum nonempty parsed Accept media ranges across repeated fields. |
 | `max_response_bytes` | `1048576` | Maximum modern JSON response or normalized SSE event bytes. |
 | `max_chunk_bytes` | `262144` | Maximum modern upstream response chunk bytes. |
-| `stream_idle_timeout_secs` | `60` | Maximum wait for nonempty upstream response bytes. A forwarded `subscriptions/listen` stream is quiet between notifications, so it is bounded by `stream_max_lifetime_secs` instead. |
-| `stream_max_lifetime_secs` | `3600` | Maximum modern response read lifetime. |
+| `stream_idle_timeout_secs` | `60` | Maximum wait for nonempty upstream response bytes, on modern responses and on a legacy `text/event-stream` passthrough. A forwarded `subscriptions/listen` stream is quiet between notifications, so it is bounded by `stream_max_lifetime_secs` instead. |
+| `stream_max_lifetime_secs` | `3600` | Maximum modern response read lifetime, and maximum lifetime of a legacy `text/event-stream` passthrough. |
 | `authorization` | Absent | Resource Server token requirement; see [MCP Resource Authorization](#mcp-resource-authorization). |
 
 Numeric limits must be nonzero. These are project limits, not MCP constants.

@@ -21,7 +21,10 @@ per-store refresh lock prevents overlapping scans from applying snapshots out of
 [`ConnectionGuard`](../src/server/connection_guard.rs) owns active-connection accounting for a
 request. Normal completion calls `ConnectionGuard::decrement`; `Drop` schedules best-effort cleanup
 when an early return or abnormal disconnect bypasses that call. New request paths should retain the
-guard for the full lifetime of the counted operation.
+guard for the full lifetime of the counted operation. A streamed response (SSE passthrough, legacy
+`GET /sse`, the Streamable HTTP notification stream and modern MCP streams) moves its guard into the
+response body, so the connection stays counted until the body ends or the client drops it. Active
+connection counts are not reset on idle, so a quiet long-lived stream stays visible.
 
 ## Storage traits and composites
 
