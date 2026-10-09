@@ -109,7 +109,7 @@ fn write_config_uses_configured_surface_name() {
 #[test]
 fn write_config_writes_the_access_point_a2a_settings() {
     let temp_dir = TempDir::new().unwrap();
-    let a2a = serde_json::json!({ "accepted_versions": ["1.0"], "validate_messages": true });
+    let a2a = serde_json::json!({ "accepted_versions": ["1.0"], "validation": "full" });
     let surface_config = SurfaceConfigBuilder {
         protocol: "a2a".to_string(),
         a2a_settings: Some(a2a.clone()),

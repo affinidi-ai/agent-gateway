@@ -116,9 +116,9 @@ alongside `2024-11-05`. Resolve versions through `runtime_policy_for` /
 never an appliance-wide constant. See [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md).
 
 **A2A versions and message validation are set per surface.** An A2A Access Point's
-`access_point.a2a` lists its accepted versions (`0.3` and `1.0` by default) and whether the
-A2A message shape is validated (off by default); the JSON-RPC envelope is always checked. An
-`a2a-proxy://` Target is fixed at `1.0` without shape validation. Read them through `AgentSurface::a2a_settings`
+`access_point.a2a` lists its accepted versions (`0.3` and `1.0` by default) and its
+`validation` level: `off`, `envelope` (the JSON-RPC envelope, the default) or `full` (also the
+A2A request shape). An `a2a-proxy://` Target is fixed at `1.0` with `envelope`. Read them through `AgentSurface::a2a_settings`
 ([`src/config/agent_surface.rs`](src/config/agent_surface.rs)), never a global flag. See
 [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md#a2a-surface-settings).
 

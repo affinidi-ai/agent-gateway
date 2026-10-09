@@ -9,7 +9,7 @@ revision-specific behavior and limitations of the checked-out source.
 | Protocol | Status in this revision | Implementation note |
 | --- | --- | --- |
 | A2A `1.0` | Active, advertised | JSON-RPC messaging, discovery, identity extensions, policy, and proxy targets; implemented against spec revision [`1.0.1`](https://a2a-protocol.org/v1.0.1/specification/) |
-| A2A `0.3` | Accepted | Accepted on each A2A surface that selects it, which is the default; never on an A2A proxy surface. See [A2A Protocol Versions](#a2a-protocol-versions) |
+| A2A `0.3` | Accepted | Accepted on each A2A surface that selects it, which is the default; never by an A2A proxy Target. See [A2A Protocol Versions](#a2a-protocol-versions) |
 | MCP `2024-11-05` | Active | Admitted and advertised on every MCP endpoint |
 | MCP `2026-07-28` | Active | Admitted and advertised alongside `2024-11-05` on every MCP endpoint |
 | AP2 | Experimental | Disabled by default; production proof signing is not implemented |
@@ -110,12 +110,11 @@ the rest of this Gateway's pipeline (egress check, body-size limit, Trust Check,
 upstream), so a request it paid for can still be refused there.
 
 Negotiation runs on every request that reaches that point, whatever the HTTP method, and applies
-to Managed Agent and `a2a-proxy://` targets alike, each against its surface's accepted versions.
-Requests that
-return earlier are not negotiated: agent-card discovery (`/.well-known/agent-card.json` and
-`/.well-known/agent.json`), the DID Auth `/authenticate` endpoints on a `did_auth` surface, and
-onboarding surfaces. `fabric://` targets skip negotiation and validation (see
-[Fabric coverage gap](#fabric-coverage-gap)).
+to Managed Agent, `a2a-proxy://` and `fabric://` targets alike, each against its surface's
+accepted versions; for a `fabric://` target it runs on the sending gateway, before the request is
+dispatched (see [Fabric coverage gap](#fabric-coverage-gap)). Requests that return earlier are not
+negotiated: agent-card discovery (`/.well-known/agent-card.json` and `/.well-known/agent.json`), the
+DID Auth `/authenticate` endpoints on a `did_auth` surface, and onboarding surfaces.
 
 | `A2A-Version` header | Resolved as |
 | --- | --- |
@@ -125,9 +124,9 @@ onboarding surfaces. `fabric://` targets skip negotiation and validation (see
 | Anything else | Rejected with `-32009` |
 
 The accepted set is the surface's `access_point.a2a.accepted_versions`: `0.3` and `1.0` by default,
-and `1.0` only on an A2A proxy surface. It changes only what is accepted, never how the header is
-read: an absent header still resolves to `0.3`, and a surface that does not accept `0.3` then refuses
-it.
+and always `1.0` only for a request whose Target is an A2A proxy. It changes only what is accepted,
+never how the header is read: an absent header still resolves to `0.3`, and a surface that does not
+accept `0.3` then refuses it.
 
 ### A2A surface settings
 
@@ -137,30 +136,44 @@ Access Point of an A2A surface (**A2A Protocol**):
 | Field | Default | Effect |
 | --- | --- | --- |
 | `accepted_versions` | `["0.3", "1.0"]` | The versions [negotiation](#version-negotiation) accepts. At least one; each must be `0.3` or `1.0`. |
-| `validate_messages` | `false` | Whether the A2A request shape is [validated](#request-shape-validation) before forwarding. The JSON-RPC envelope is always checked, whatever this says. |
+| `validation` | `"envelope"` | How much of a request is checked before forwarding (see [Error mapping](#error-mapping)): `"off"` checks nothing; `"envelope"` checks the JSON-RPC envelope; `"full"` checks the envelope and the [request shape](#request-shape-validation). |
 
 ```json
-"access_point": { "protocol": "a2a", "a2a": { "accepted_versions": ["1.0"], "validate_messages": true } }
+"access_point": { "protocol": "a2a", "a2a": { "accepted_versions": ["1.0"], "validation": "full" } }
 ```
+
+The dashboard shows `validation` as **Message validation**: **Off**, **JSON-RPC envelope** (the
+default) or **Envelope + A2A fields**. A block stored with the earlier boolean `validate_messages`
+is still read: `true` as `"full"`, `false` as `"envelope"`; it is written back as `validation`.
 
 - The surface API stores the block explicitly on every save of an A2A or AP2 surface, the defaults
   when none is sent. A `PUT` that omits it keeps the stored one, and a JSON merge `PATCH` with
   `null` resets it to the defaults. A save that changes the protocol to anything other than A2A or
   AP2 drops the block.
-- An `a2a-proxy://` Target always serves `1.0` only without request-shape validation, whatever is
-  stored (its JSON-RPC envelope is still checked). The API refuses a block on such a surface that
-  says otherwise and stores none, so moving the Target off the proxy later starts from the
-  defaults. The dashboard locks both fields to those values when the
-  Target is an A2A proxy. This applies to a variant that points the Target at an A2A proxy too.
+- An `a2a-proxy://` Target always serves `1.0` only with `"envelope"` validation, whatever is
+  stored, and so does a variant that points the Target at an A2A proxy. The dashboard locks both
+  fields to those values while the Target in view is an A2A proxy, and leaves the block out of the
+  payload so the stored settings are kept.
+- On a surface whose Target is an A2A proxy, the block configures only the variants that point the
+  Target at a URL. With no such variant it applies to no request: the API then refuses a block that
+  differs from `1.0` with `"envelope"` and stores none, so moving the Target off the proxy later
+  starts from the defaults.
 - The block is surface-level: variants cannot override it. It is valid on A2A and AP2 Access Points
-  only.
+  only: a create, a `PUT` or a merge `PATCH` that sends it on another protocol is refused with `400`
+  ("access_point.a2a requires an A2A or AP2 Access Point"). A block left over from the stored
+  surface, as when a merge `PATCH` changes only the protocol, is dropped instead.
 - A surface stored before per-surface settings existed has no block. When surfaces are loaded, at
   startup or on a configuration reload, each such A2A or AP2 surface (other than an A2A proxy Target)
   is given one, and the block is written to storage: `accepted_versions` is `["1.0"]` if the retired
-  `a2a_legacy_compatibility` flag was off, and both versions otherwise; `validate_messages` is
-  `false`. The retired `[a2a] validate_messages` is not carried over: it gated the envelope check,
-  which is now always on. A log line reports how many surfaces were given settings, with a warning
-  when the retired flag was off.
+  `a2a_legacy_compatibility` flag was off, and both versions otherwise; `validation` is `"off"` if
+  the retired `[a2a] validate_messages` is `false`, and `"envelope"` otherwise. It is never carried
+  over as `"full"`: before the request-shape check existed, `validate_messages` gated the envelope
+  check alone, so `"full"` could refuse callers the gateway served before. A log line reports how
+  many surfaces were given settings, with a warning when the retired flag was off.
+- Rolling back to a version from before per-surface settings needs `access_point.a2a` removed from
+  every stored surface first. Those versions reject unknown Access Point fields, so they skip any
+  surface that has the block, and every A2A or AP2 surface other than an A2A proxy Target has it
+  after the first start.
 - A stored block that is invalid, which only editing storage by hand can produce, is not refused: a
   startup warning names the surface, and an empty or unrecognised `accepted_versions` serves both
   versions until the surface is saved with valid settings.
@@ -181,9 +194,9 @@ is contacted:
 `data.requested` on `-32009` is the trimmed header when it names no known version (`2.0`), and the
 resolved `Major.Minor` otherwise, so an absent header, `0.3` or `0.3.x` refused under v1.0-only
 answers `"requested": "0.3"`, and `data.supported` lists the surface's accepted versions. The
-envelope rows (`-32700`, `-32600`) apply to every non-empty body on an A2A or AP2 surface, A2A proxy
-Targets included. The request-shape row needs the surface's `access_point.a2a.validate_messages`
-(off by default) and never applies to an A2A proxy Target.
+envelope rows (`-32700`, `-32600`) apply to every non-empty body on an A2A or AP2 surface whose
+`validation` is `"envelope"` (the default) or `"full"`, A2A proxy Targets included. The
+request-shape row needs `"full"` and never applies to an A2A proxy Target.
 
 ### Method names
 
@@ -263,16 +276,17 @@ allow if input.a2a.message.parts[_].text
 including the agent identity extension, need no change.
 
 A JSON-RPC batch or a non-string `method` would reach policy with neither `input.a2a.method` nor
-`input.a2a.method_canonical`, so no rule keyed on the method would see it. The envelope check, which
-is always on, refuses both with `-32600` first. One gap remains: on a `fabric://` surface the request
-is never checked, so a batch or a non-string `method` reaches policy on both gateways that way.
+`input.a2a.method_canonical`, so no rule keyed on the method would see it. The envelope check refuses
+both with `-32600` first, so they reach policy only on a surface whose `validation` is `"off"`. A
+request a sending gateway forwards over the fabric is checked there, and is not checked again by the
+receiving gateway.
 
 The allow-list and message-shape patterns are pinned against the policy engine by the tests in
 [`src/surface_context/mod.rs`](../src/surface_context/mod.rs).
 
 ### Request-shape validation
 
-On a surface that validates messages (`access_point.a2a.validate_messages`), requests are checked against what A2A itself requires, and the problems found are reported together in one `-32602` response, up to 20
+On a surface whose `access_point.a2a.validation` is `"full"`, requests are checked against what A2A itself requires, and the problems found are reported together in one `-32602` response, up to 20
 of them: validation stops walking `parts` at the cap and sets `data.truncated: true` (the key is
 absent otherwise), and a caller-supplied `kind` echoed in a message is quoted and cut to 64
 characters, so a large body cannot inflate the error:
@@ -293,7 +307,7 @@ only `params.message` and text parts, and has no downstream agent that would ref
 
 The cards the Gateway generates (the synthesized A2A-proxy card and the onboarding card) are valid
 `1.0` documents. Each lists the versions its endpoint accepts: the A2A proxy card `1.0` only, since
-an A2A proxy surface serves `1.0` only, and the onboarding card, which belongs to no surface, both.
+an A2A proxy Target serves `1.0` only, and the onboarding card, which belongs to no surface, both.
 
 - `supportedInterfaces[]` lists one entry per accepted version, the preferred version first, all
   with the same URL and `protocolBinding: "JSONRPC"`. The preferred version is `[a2a]
@@ -351,11 +365,12 @@ does not accept `0.3` answers a `0.3` request, including one with no `A2A-Versio
 `400` `-32009` as well. Agent-card discovery is not negotiated, so a headerless client can still
 fetch the card; a Managed Agent's card lists whatever the agent published.
 
-An A2A proxy surface never accepts `0.3`: its callers must send `A2A-Version: 1.0`.
+An A2A proxy Target never accepts `0.3`: its callers must send `A2A-Version: 1.0`.
 
 Before removing `0.3` from a surface, check `agent_gateway_a2a_protocol_version_total` (see
 [Observability Internals](OBSERVABILITY.md#a2a-protocol-version-metric)) for remaining `0.3`
-traffic, bearing in mind it does not count [fabric traffic](#fabric-coverage-gap). Refused callers
+traffic. Fabric traffic is counted on the sending gateway only (see
+[Fabric coverage gap](#fabric-coverage-gap)). Refused callers
 are counted with `negotiated_version="rejected"`.
 
 The retired `a2a_legacy_compatibility` dashboard flag is read only when surfaces are loaded, to give
@@ -365,7 +380,7 @@ was off (see [A2A surface settings](#a2a-surface-settings)).
 ### Guidance for callers
 
 - Send `A2A-Version: 1.0` on every call. A request without the header counts as `0.3`, and is
-  refused by a surface that does not accept `0.3`, including every A2A proxy surface.
+  refused by a surface that does not accept `0.3`, and always by an A2A proxy Target.
 - Read the endpoint from `supportedInterfaces[0].url`, the preferred interface, and fall back to
   the top-level `url` only for v0.3 cards.
 - Confirm the Managed Agent behind a surface speaks v1.0 before switching, because the Gateway
@@ -407,18 +422,21 @@ Recorder writes that follow. This rests on the trust placed in the Managed Agent
 
 ### Fabric coverage gap
 
-Version negotiation, both validation layers and the protocol-version metric run only on the direct
-inbound path. They are skipped for a surface whose target is `fabric://`, and
-the [fabric receive pipeline](FABRIC.md#fabric-receive-pipeline) does not run them either. So on
-both G2G legs:
+Version negotiation, both validation layers and the protocol-version metric run on the inbound path
+of every A2A surface, including one whose target is `fabric://`: the sending gateway applies the
+surface's accepted versions and validation level before the request is paid for or dispatched over
+the fabric. The [fabric receive pipeline](FABRIC.md#fabric-receive-pipeline) on the receiving
+gateway does not run them again. So on a G2G hop:
 
-- a `0.3` request, an unsupported `A2A-Version` and a malformed A2A request all reach the remote
-  Target, whatever the surface's A2A settings, and the remote agent decides;
-- `agent_gateway_a2a_protocol_version_total` does not count the traffic, so it cannot show `0.3`
-  callers on G2G surfaces.
+- the sending surface's `access_point.a2a` decides what crosses the fabric; the receiving surface's
+  `access_point.a2a` is not applied to fabric requests;
+- a request from a sending gateway that does not run these checks (a version from before they
+  applied to `fabric://` targets) reaches the receiving gateway's Target unchecked, and the agent
+  decides;
+- `agent_gateway_a2a_protocol_version_total` counts the request on the sending gateway, not on the
+  receiving one.
 
-These are protocol-conformance checks, not access control. Source authentication, gateway and
-surface policy, and Trust Check still run on each leg.
+Source authentication, gateway and surface policy, and Trust Check run on each leg.
 
 Relevant implementation:
 

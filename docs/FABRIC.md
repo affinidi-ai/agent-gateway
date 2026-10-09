@@ -228,7 +228,8 @@ request received by the destination gateway:
 4. Run the destination surface's configured source authentication and MCP request-boundary
    validation. DIDComm authentication proves the sending Gateway; source authentication separately
    evaluates caller evidence presented to the destination surface. There is no A2A counterpart:
-   `A2A-Version` is not negotiated and A2A requests are not validated here (see below).
+   `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here
+   (see below).
 5. Build policy input containing the authenticated sending Gateway and any source-auth result. An
    identity presentation is attributed to the caller only when its issuer is one of the sending
    connection's issuers (see [Peer issuer DIDs](#peer-issuer-dids)).
@@ -270,7 +271,7 @@ Pair only with peers you would trust with those tokens, and remove `outbound_cre
 `fabric://` route whose peer must not receive them. See [Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
 
 A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
-`agent_gateway_a2a_protocol_version_total` metric do not run on either G2G leg. The sending gateway
-skips them for a `fabric://` target, and the receive pipeline above does not run them. So
-A2A `0.3` traffic crosses the fabric whatever the surface's accepted A2A versions; see
-[Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap).
+`agent_gateway_a2a_protocol_version_total` metric run on the sending gateway, against the sending
+surface's `access_point.a2a`, before a `fabric://` request is dispatched. The receive pipeline above
+does not run them again, so the receiving surface's A2A settings do not apply to fabric requests;
+see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap).

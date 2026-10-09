@@ -29,27 +29,33 @@ fn a2a_request_body() -> serde_json::Value {
     })
 }
 
-/// A managed-agent A2A surface that accepts both versions but explicitly
-/// validates no messages (`access_point.a2a.validate_messages = false`).
-fn surface_without_message_validation() -> crate::config::agent_surface::AgentSurface {
-    let mut surface = helpers::build_minimal_channel();
+/// `surface` with both versions and the given `access_point.a2a.validation`.
+fn with_validation(
+    mut surface: crate::config::agent_surface::AgentSurface,
+    validation: crate::config::agent_surface::A2aValidation,
+) -> crate::config::agent_surface::AgentSurface {
     surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
-        validate_messages: false,
+        validation,
         ..Default::default()
     });
     surface
 }
 
-/// The same surface with message validation switched on
-/// (`access_point.a2a.validate_messages = true`); it is off by default.
+/// `surface` with full validation: the envelope and the A2A request shape.
 fn with_message_validation(
-    mut surface: crate::config::agent_surface::AgentSurface
+    surface: crate::config::agent_surface::AgentSurface
 ) -> crate::config::agent_surface::AgentSurface {
-    surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
-        validate_messages: true,
-        ..Default::default()
-    });
-    surface
+    with_validation(surface, crate::config::agent_surface::A2aValidation::Full)
+}
+
+/// A managed-agent A2A surface that checks the envelope but not the request shape.
+fn surface_with_envelope_validation() -> crate::config::agent_surface::AgentSurface {
+    with_validation(helpers::build_minimal_channel(), crate::config::agent_surface::A2aValidation::Envelope)
+}
+
+/// A managed-agent A2A surface that validates nothing.
+fn surface_without_validation() -> crate::config::agent_surface::AgentSurface {
+    with_validation(helpers::build_minimal_channel(), crate::config::agent_surface::A2aValidation::Off)
 }
 
 /// Realistic A2A JSON-RPC response returned by the mock target.
@@ -530,7 +536,7 @@ async fn inbound_a2a_tampered_jwt_signature_forwarded_without_policy() {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_invalid_json_rejected() {
     //
-    // Given — a plain A2A channel; the envelope is checked whatever validate_messages says
+    // Given — a plain A2A channel, which checks the envelope by default
     //
     let h = GatewayHarness::start(|_, gw_config, _| {
         gw_config.surfaces = vec![helpers::build_minimal_channel()];
@@ -1468,12 +1474,12 @@ async fn inbound_a2a_well_formed_message_still_forwarded() {
 
 // ── Validation bypass ────────────────────────────────────────────────────────
 
-/// The JSON-RPC envelope is checked whatever `validate_messages` says: a body
-/// with neither `jsonrpc` nor `method` is refused and never forwarded.
+/// With envelope validation, the default, a body with neither `jsonrpc` nor
+/// `method` is refused and never forwarded, though the request shape is not checked.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_envelope_is_checked_when_message_validation_is_off() {
+async fn inbound_a2a_envelope_is_checked_without_shape_validation() {
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![surface_without_message_validation()];
+        gw_config.surfaces = vec![surface_with_envelope_validation()];
     })
     .await;
 
@@ -1485,7 +1491,7 @@ async fn inbound_a2a_envelope_is_checked_when_message_validation_is_off() {
         .await
         .expect("request failed");
 
-    assert_eq!(resp.status(), 400, "a malformed envelope is refused even with validation off");
+    assert_eq!(resp.status(), 400, "a malformed envelope is refused with envelope validation");
     let body: serde_json::Value = resp
         .json()
         .await
@@ -1501,11 +1507,11 @@ async fn inbound_a2a_envelope_is_checked_when_message_validation_is_off() {
 }
 
 /// A JSON-RPC batch carries no single `method`, so policy could not match it on
-/// one. It is refused as an invalid request whatever `validate_messages` says.
+/// one. Envelope validation refuses it as an invalid request.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_batch_is_refused_when_message_validation_is_off() {
+async fn inbound_a2a_batch_is_refused_with_envelope_validation() {
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![surface_without_message_validation()];
+        gw_config.surfaces = vec![surface_with_envelope_validation()];
     })
     .await;
 
@@ -1531,6 +1537,32 @@ async fn inbound_a2a_batch_is_refused_when_message_validation_is_off() {
             .is_none(),
         "the batch must not be forwarded"
     );
+}
+
+/// With validation `off`, a body that is not valid JSON-RPC, a batch included,
+/// is forwarded unmodified for the agent to decide.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_validation_off_forwards_a_malformed_envelope() {
+    let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![surface_without_validation()];
+    })
+    .await;
+
+    for request_str in
+        [r#"{"hello": "world"}"#, r#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t1"}}]"#]
+    {
+        let resp = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .body(request_str)
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), 200, "with validation off, {request_str} should be forwarded");
+        assert_mock_received_request(&h.mock, request_str);
+    }
 }
 
 /// Message-shape validation is off unless the surface turns it on, so a surface
@@ -1563,7 +1595,7 @@ async fn inbound_a2a_messages_are_not_validated_by_default() {
     assert_mock_received_request(&h.mock, request_str);
 }
 
-/// With `validate_messages = false` the A2A message-shape check is skipped, so a
+/// With envelope validation the A2A message-shape check is skipped, so a
 /// v1.0 `SendMessage` with a valid envelope but missing every required message
 /// field reaches the upstream.
 #[tokio::test(flavor = "multi_thread")]
@@ -1571,7 +1603,7 @@ async fn inbound_a2a_validation_disabled_forwards_v1_message_missing_required_fi
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![surface_without_message_validation()];
+        gw_config.surfaces = vec![surface_with_envelope_validation()];
     })
     .await;
 
@@ -1585,7 +1617,7 @@ async fn inbound_a2a_validation_disabled_forwards_v1_message_missing_required_fi
         .await
         .expect("request with validation disabled failed");
 
-    assert_eq!(resp.status(), 200, "with validate_messages=false the malformed message should be forwarded");
+    assert_eq!(resp.status(), 200, "without shape validation the malformed message should be forwarded");
     let body: serde_json::Value = resp
         .json()
         .await
@@ -1595,14 +1627,14 @@ async fn inbound_a2a_validation_disabled_forwards_v1_message_missing_required_fi
 }
 
 /// Version negotiation is not part of message validation: with
-/// `validate_messages = false` an unsupported `A2A-Version` is still refused with
+/// validation `off` an unsupported `A2A-Version` is still refused with
 /// -32009 and the upstream is never contacted.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_validation_disabled_still_rejects_unsupported_version() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![surface_without_message_validation()];
+        gw_config.surfaces = vec![surface_without_validation()];
     })
     .await;
 
@@ -1615,7 +1647,7 @@ async fn inbound_a2a_validation_disabled_still_rejects_unsupported_version() {
         .await
         .expect("request failed");
 
-    assert_eq!(resp.status(), 400, "an unsupported A2A-Version must be refused whatever validate_messages says");
+    assert_eq!(resp.status(), 400, "an unsupported A2A-Version must be refused whatever the validation level");
     let body: serde_json::Value = resp
         .json()
         .await
@@ -1972,10 +2004,10 @@ async fn inbound_a2a_valid_request_reaches_delegated_payment() {
     assert!(body.contains(DELEGATION_MISCONFIGURED), "got {body}");
 }
 
-/// A `fabric://` target is never version-negotiated: an unsupported version
-/// still reaches the delegated payment step and is not counted as refused.
+/// A `fabric://` target is version-negotiated on the sending gateway, ahead of
+/// delegated payment and before the request is dispatched over the fabric.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_fabric_target_is_not_version_negotiated() {
+async fn inbound_a2a_fabric_target_is_version_negotiated_before_delegated_payment() {
     let channel = "prepay-fabric";
     let h = GatewayHarness::start(|_, gw_config, _| {
         gw_config.surfaces = vec![agent_pay_surface(channel, Some("fabric://unknown/ch"))];
@@ -1985,10 +2017,65 @@ async fn inbound_a2a_fabric_target_is_not_version_negotiated() {
 
     let (status, body) = post_a2a(&h, "2.0", serde_json::to_string(&a2a_request_body()).unwrap()).await;
 
-    assert_ne!(jsonrpc_error_code(&body), Some(-32009), "fabric targets must not be negotiated, got {body}");
-    assert_eq!(status, 502, "expected the delegation step to answer, got {status}: {body}");
+    assert_eq!(status, 400, "expected -32009 ahead of payment, got {status}: {body}");
+    assert_eq!(jsonrpc_error_code(&body), Some(-32009), "got {body}");
+    assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
+    assert_eq!(rejected_version_count(channel), rejected_before + 1, "the refusal is counted");
+}
+
+/// Starts a gateway with one delegated-payment `fabric://` surface at `validation`.
+async fn fabric_harness(validation: crate::config::agent_surface::A2aValidation) -> GatewayHarness {
+    GatewayHarness::start(move |_, gw_config, _| {
+        let surface = agent_pay_surface(&format!("fabric-{}", validation.as_str()), Some("fabric://unknown/ch"));
+        gw_config.surfaces = vec![with_validation(surface, validation)];
+    })
+    .await
+}
+
+const BATCH_REQUEST: &str = r#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t1"}}]"#;
+
+fn message_without_message_id() -> String {
+    let mut request = a2a_request_body();
+    request["params"]["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("messageId");
+    serde_json::to_string(&request).unwrap()
+}
+
+/// With the default envelope validation, a `fabric://` target refuses a batch
+/// before payment, but lets a message missing A2A fields through to payment.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_fabric_target_checks_the_envelope_by_default() {
+    let h = fabric_harness(crate::config::agent_surface::A2aValidation::Envelope).await;
+
+    let (status, body) = post_a2a(&h, "1.0", BATCH_REQUEST.to_string()).await;
+    assert_eq!((status, jsonrpc_error_code(&body)), (400, Some(-32600)), "a batch is refused: {body}");
+    assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
+
+    let (status, body) = post_a2a(&h, "1.0", message_without_message_id()).await;
+    assert_eq!(status, 502, "a malformed message reaches payment: {status} {body}");
     assert!(body.contains(DELEGATION_MISCONFIGURED), "got {body}");
-    assert_eq!(rejected_version_count(channel), rejected_before);
+}
+
+/// With `full` validation, a `fabric://` target also refuses a malformed message.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_fabric_target_checks_the_request_shape_when_full() {
+    let h = fabric_harness(crate::config::agent_surface::A2aValidation::Full).await;
+
+    let (status, body) = post_a2a(&h, "1.0", message_without_message_id()).await;
+    assert_eq!((status, jsonrpc_error_code(&body)), (400, Some(-32602)), "got {body}");
+    assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
+}
+
+/// With validation `off`, a `fabric://` target lets a batch through to payment.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_fabric_target_checks_nothing_when_off() {
+    let h = fabric_harness(crate::config::agent_surface::A2aValidation::Off).await;
+
+    let (status, body) = post_a2a(&h, "1.0", BATCH_REQUEST.to_string()).await;
+    assert_eq!(status, 502, "a batch reaches payment: {status} {body}");
+    assert!(body.contains(DELEGATION_MISCONFIGURED), "got {body}");
 }
 
 /// An `a2a-proxy://` target is version-negotiated, ahead of delegated payment.

@@ -322,9 +322,9 @@ impl BootstrapConfig {
             .is_some()
         {
             tracing::warn!(
-                "[a2a] validate_messages is deprecated and ignored: the JSON-RPC envelope is always checked, and \
-                 A2A message-shape validation is set per A2A surface (access_point.a2a.validate_messages, off by \
-                 default). Remove it from the config file."
+                "[a2a] validate_messages is deprecated: validation is set per A2A surface \
+                 (access_point.a2a.validation). It is only applied to A2A surfaces loaded without their own \
+                 settings, as \"off\" when false and \"envelope\" otherwise. Remove it from the config file."
             );
         }
 

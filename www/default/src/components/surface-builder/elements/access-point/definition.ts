@@ -7,6 +7,7 @@ import {
   DEFAULT_A2A_SETTINGS,
   a2aSettingsForPayload,
   isA2aProxyEndpoint,
+  isA2aValidation,
   selectedA2aVersions,
 } from './a2aSettings';
 
@@ -116,10 +117,10 @@ export const accessPointDefinition: NodeDefinition = {
       c.a2a_accepted_versions = Array.isArray(a2a.accepted_versions)
         ? a2a.accepted_versions.slice()
         : [...DEFAULT_A2A_SETTINGS.accepted_versions];
-      c.a2a_validate_messages =
-        typeof a2a.validate_messages === 'boolean'
-          ? a2a.validate_messages
-          : DEFAULT_A2A_SETTINGS.validate_messages;
+      c.a2a_validation = isA2aValidation(a2a.validation)
+        ? a2a.validation
+        : DEFAULT_A2A_SETTINGS.validation;
+      delete c.a2a_validate_messages;
     }
     return c;
   },
@@ -186,7 +187,8 @@ export const accessPointDefinition: NodeDefinition = {
       ap.name = c.name.trim();
     }
     if (ap.protocol === 'a2a' || ap.protocol === 'ap2') {
-      ap.a2a = a2aSettingsForPayload(c, ctx.firstNodeOfType('target')?.config?.endpoint);
+      const a2a = a2aSettingsForPayload(c, ctx.firstNodeOfType('target')?.config?.endpoint);
+      if (a2a) ap.a2a = a2a;
     }
     return [{ path: 'access_point', value: ap }];
   },

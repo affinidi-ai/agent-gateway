@@ -29,27 +29,33 @@ describe('Access Point A2A settings payload', () => {
   it('sends the defaults when nothing is selected', () => {
     expect(accessPointPayload({}).a2a).toEqual({
       accepted_versions: ['0.3', '1.0'],
-      validate_messages: false,
+      validation: 'envelope',
     });
   });
 
-  it('sends the selected versions in A2A order and the validation choice', () => {
+  it('sends the selected versions in A2A order and the validation level', () => {
     expect(
-      accessPointPayload({ a2a_accepted_versions: ['1.0', '0.3'], a2a_validate_messages: true }).a2a
-    ).toEqual({ accepted_versions: ['0.3', '1.0'], validate_messages: true });
-    expect(accessPointPayload({ a2a_accepted_versions: ['1.0'] }).a2a).toEqual({
+      accessPointPayload({ a2a_accepted_versions: ['1.0', '0.3'], a2a_validation: 'full' }).a2a
+    ).toEqual({ accepted_versions: ['0.3', '1.0'], validation: 'full' });
+    expect(
+      accessPointPayload({ a2a_accepted_versions: ['1.0'], a2a_validation: 'off' }).a2a
+    ).toEqual({
       accepted_versions: ['1.0'],
-      validate_messages: false,
+      validation: 'off',
     });
   });
 
-  it('sends the fixed A2A proxy settings for an A2A proxy target, whatever is selected', () => {
-    expect(
-      accessPointPayload(
-        { a2a_accepted_versions: ['0.3'], a2a_validate_messages: true },
-        'a2a-proxy://worker'
-      ).a2a
-    ).toEqual({ accepted_versions: ['1.0'], validate_messages: false });
+  it('sends the default level for an unknown or missing node value', () => {
+    expect(accessPointPayload({ a2a_validation: 'strict' }).a2a.validation).toBe('envelope');
+    expect(accessPointPayload({ a2a_validate_messages: true }).a2a.validation).toBe('envelope');
+  });
+
+  it('sends no block for an A2A proxy target, so the stored settings are kept', () => {
+    const ap = accessPointPayload(
+      { a2a_accepted_versions: ['0.3'], a2a_validation: 'off' },
+      'a2a-proxy://worker'
+    );
+    expect(ap).not.toHaveProperty('a2a');
   });
 
   it('sends no A2A settings on an MCP surface', () => {
@@ -62,22 +68,28 @@ describe('Access Point A2A settings payload', () => {
         listen_address: '0.0.0.0:8443',
         route: '/agent',
         protocol: 'a2a',
-        a2a: { accepted_versions: ['1.0'], validate_messages: true },
+        a2a: { accepted_versions: ['1.0'], validation: 'full' },
       },
       {}
     );
     expect(config.a2a_accepted_versions).toEqual(['1.0']);
-    expect(config.a2a_validate_messages).toBe(true);
+    expect(config.a2a_validation).toBe('full');
     expect(config.a2a).toBeUndefined();
   });
 
-  it('loads the defaults when the stored surface has no block', () => {
+  it('loads the defaults when the stored surface has no block, and drops a stale flat field', () => {
     const config = definition.configFromPayload!(
-      { listen_address: '0.0.0.0:8443', route: '/agent', protocol: 'a2a' },
+      {
+        listen_address: '0.0.0.0:8443',
+        route: '/agent',
+        protocol: 'a2a',
+        a2a_validate_messages: true,
+      } as any,
       {}
     );
     expect(config.a2a_accepted_versions).toEqual(['0.3', '1.0']);
-    expect(config.a2a_validate_messages).toBe(false);
+    expect(config.a2a_validation).toBe('envelope');
+    expect(config.a2a_validate_messages).toBeUndefined();
 
     const mcp = definition.configFromPayload!(
       { listen_address: '0.0.0.0:8443', route: '/agent', protocol: 'mcp' },
@@ -87,12 +99,14 @@ describe('Access Point A2A settings payload', () => {
   });
 
   it('round-trips the block through the panel fields', () => {
-    const stored = { accepted_versions: ['0.3'], validate_messages: true };
-    const config = definition.configFromPayload!(
-      { listen_address: '0.0.0.0:8443', route: '/agent', protocol: 'a2a', a2a: stored },
-      {}
-    );
-    expect(accessPointPayload(config).a2a).toEqual(stored);
+    for (const validation of ['off', 'envelope', 'full']) {
+      const stored = { accepted_versions: ['0.3'], validation };
+      const config = definition.configFromPayload!(
+        { listen_address: '0.0.0.0:8443', route: '/agent', protocol: 'a2a', a2a: stored },
+        {}
+      );
+      expect(accessPointPayload(config).a2a).toEqual(stored);
+    }
   });
 
   it('blocks saving an A2A surface with no version selected, except for an A2A proxy target', () => {

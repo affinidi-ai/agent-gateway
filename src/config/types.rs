@@ -520,12 +520,12 @@ pub struct A2aConfig {
     #[serde(default = "default_a2a_version")]
     pub default_version: String,
 
-    /// Deprecated and ignored. The JSON-RPC envelope check it used to gate is
-    /// always on, and A2A message-shape validation is set per A2A Access Point
-    /// (`access_point.a2a.validate_messages`, off by default).
+    /// Deprecated: validation is set per A2A Access Point
+    /// (`access_point.a2a.validation`).
     ///
-    /// Still accepted so an existing config file starts; a startup warning
-    /// names it.
+    /// Only an A2A surface loaded without its own settings takes it, once: `false`
+    /// as `off`, `true` or unset as `envelope` (see
+    /// `crate::surfaces::carry_over_a2a_settings`). A startup warning names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validate_messages: Option<bool>,
 

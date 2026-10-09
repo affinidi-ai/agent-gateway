@@ -4,7 +4,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use tracing::{error, info, warn};
 
-use crate::config::agent_surface::{A2aAccessPointSettings, AgentSurface};
+use crate::config::agent_surface::{A2aAccessPointSettings, A2aValidation, AgentSurface};
 
 /// Trait for storing and retrieving Agent Surface configurations
 #[async_trait]
@@ -77,22 +77,21 @@ pub async fn strip_unsupported_header_metadata_mappings<S: AgentSurfaceStore + ?
 /// The retired dashboard feature flag that once turned A2A 0.3 off gateway-wide.
 const RETIRED_A2A_LEGACY_COMPATIBILITY_FLAG: &str = "a2a_legacy_compatibility";
 
-/// The gateway-wide A2A switch that per-surface accepted versions replaced,
-/// read so that a surface stored before those settings existed keeps the
-/// versions it was served with.
-///
-/// `[a2a] validate_messages` is not carried over: the JSON-RPC envelope check
-/// it used to gate is always on, and the A2A message-shape check stays off
-/// until a surface turns it on.
+/// The gateway-wide A2A switches that per-surface A2A settings replaced, read
+/// so that a surface stored before those settings existed keeps what it was
+/// served with.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetiredA2aSwitches {
+    /// `[a2a] validate_messages` from the bootstrap configuration, when set.
+    pub validate_messages: Option<bool>,
     /// The retired `a2a_legacy_compatibility` flag, when stored in settings.
     pub legacy_compatibility: Option<bool>,
 }
 
 impl RetiredA2aSwitches {
-    /// Read the flag from the settings file. The settings store is read directly
-    /// because surfaces load before the global settings store is registered.
+    /// Read both switches: the TOML value from `bootstrap`, the flag from the
+    /// settings file. The settings store is read directly because surfaces load
+    /// before the global settings store is registered.
     pub async fn read(bootstrap: &crate::config::BootstrapConfig) -> Self {
         let settings = crate::storage::settings_store::SettingsStore::new(
             &bootstrap
@@ -110,28 +109,41 @@ impl RetiredA2aSwitches {
                 None
             }
         };
-        Self { legacy_compatibility }
+        Self {
+            validate_messages: bootstrap
+                .a2a
+                .validate_messages,
+            legacy_compatibility,
+        }
     }
 
     /// The settings a surface without its own takes: A2A 1.0 only when the flag
-    /// turned 0.3 off, otherwise the defaults.
+    /// turned 0.3 off, and no validation when `[a2a] validate_messages` was
+    /// `false`. Otherwise `envelope` validation, never `full`: before the
+    /// request-shape check existed, `validate_messages` gated the envelope check
+    /// alone, so carrying `true` over as `full` could refuse callers a gateway
+    /// served before.
     pub fn settings(&self) -> A2aAccessPointSettings {
         let defaults = A2aAccessPointSettings::default();
-        if self.legacy_compatibility == Some(false) {
-            A2aAccessPointSettings {
-                accepted_versions: vec![crate::a2a::version::VERSION_1_0.to_string()],
-                ..defaults
-            }
-        } else {
-            defaults
+        A2aAccessPointSettings {
+            accepted_versions: if self.legacy_compatibility == Some(false) {
+                vec![crate::a2a::version::VERSION_1_0.to_string()]
+            } else {
+                defaults.accepted_versions
+            },
+            validation: if self.validate_messages == Some(false) {
+                A2aValidation::Off
+            } else {
+                A2aValidation::Envelope
+            },
         }
     }
 }
 
 /// Store `access_point.a2a` on every A2A or AP2 surface loaded without one,
-/// taken from the retired gateway-wide switch, and warn about a stored block
-/// that is invalid. A2A-proxy Targets are left without a block: the runtime
-/// fixes their settings.
+/// taken from the retired gateway-wide switches, and warn about a stored block
+/// that is invalid. A surface whose block would apply to no request (an A2A-proxy
+/// Target with no URL variant) is left without one: the runtime fixes its settings.
 ///
 /// An invalid stored block (only reachable by editing storage by hand) is not
 /// refused: the surface keeps being served, accepting both versions when its
@@ -160,14 +172,14 @@ pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
                     surface = %surface.name,
                     surface_id = %surface.surface_id,
                     "access_point.a2a in storage is invalid: {reason}. The surface is served with A2A {} and \
-                     validate_messages={} until it is corrected through the dashboard or API",
+                     validation={} until it is corrected through the dashboard or API",
                     served.accepted_versions.join(", "),
-                    served.validate_messages
+                    served.validation.as_str()
                 );
             }
             continue;
         }
-        if surface.is_a2a_proxy_target() {
+        if !surface.a2a_settings_apply() {
             continue;
         }
         surface.access_point.a2a = Some(carried.clone());
@@ -179,11 +191,11 @@ pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
     }
     if count > 0 {
         info!(
-            "Stored A2A settings on {count} A2A surface(s) that had none: accepted versions {}, validate_messages={}",
+            "Stored A2A settings on {count} A2A surface(s) that had none: accepted versions {}, validation={}",
             carried
                 .accepted_versions
                 .join(", "),
-            carried.validate_messages
+            carried.validation.as_str()
         );
         if retired.legacy_compatibility == Some(false) {
             warn!(
@@ -342,32 +354,36 @@ mod tests {
 
     fn settings(
         versions: &[&str],
-        validate_messages: bool,
+        validation: A2aValidation,
     ) -> A2aAccessPointSettings {
         A2aAccessPointSettings {
             accepted_versions: versions
                 .iter()
                 .map(|v| v.to_string())
                 .collect(),
-            validate_messages,
+            validation,
         }
     }
 
     #[test]
     fn retired_switches_map_to_surface_settings() {
+        let switches = |validate_messages, legacy_compatibility| RetiredA2aSwitches {
+            validate_messages,
+            legacy_compatibility,
+        };
         assert_eq!(
-            RetiredA2aSwitches::default().settings(),
-            settings(&["0.3", "1.0"], false),
-            "an unset flag means the defaults"
+            switches(None, None).settings(),
+            settings(&["0.3", "1.0"], A2aValidation::Envelope),
+            "unset means both versions with envelope validation, the old default"
         );
-        let legacy_on = RetiredA2aSwitches {
-            legacy_compatibility: Some(true),
-        };
-        assert_eq!(legacy_on.settings(), settings(&["0.3", "1.0"], false));
-        let legacy_off = RetiredA2aSwitches {
-            legacy_compatibility: Some(false),
-        };
-        assert_eq!(legacy_off.settings(), settings(&["1.0"], false), "0.3 stays off; shape validation stays off");
+        assert_eq!(
+            switches(Some(true), Some(true)).settings(),
+            settings(&["0.3", "1.0"], A2aValidation::Envelope),
+            "true carries over as envelope, never full"
+        );
+        assert_eq!(switches(Some(false), None).settings(), settings(&["0.3", "1.0"], A2aValidation::Off));
+        assert_eq!(switches(None, Some(false)).settings(), settings(&["1.0"], A2aValidation::Envelope));
+        assert_eq!(switches(Some(false), Some(false)).settings(), settings(&["1.0"], A2aValidation::Off));
     }
 
     #[tokio::test]
@@ -376,6 +392,7 @@ mod tests {
         let store = test_store(dir.path()).await;
         let mut surfaces = vec![a2a_surface("s-old", "https://a2a.internal/a2a", None)];
         let retired = RetiredA2aSwitches {
+            validate_messages: Some(false),
             legacy_compatibility: Some(false),
         };
 
@@ -383,24 +400,25 @@ mod tests {
             .await
             .expect("carry-over should succeed");
 
-        assert_eq!(surfaces[0].access_point.a2a, Some(settings(&["1.0"], false)));
+        let expected = settings(&["1.0"], A2aValidation::Off);
+        assert_eq!(surfaces[0].access_point.a2a, Some(expected.clone()));
         let stored = store
             .get("s-old")
             .await
             .expect("get")
             .expect("stored surface");
-        assert_eq!(stored.access_point.a2a, Some(settings(&["1.0"], false)), "the carried settings are persisted");
+        assert_eq!(stored.access_point.a2a, Some(expected), "the carried settings are persisted");
         assert_eq!(
             stored
                 .a2a_settings()
                 .accepted_versions,
             crate::a2a::version::VERSIONS_1_0_ONLY
         );
-        assert!(
-            !stored
+        assert_eq!(
+            stored
                 .a2a_settings()
-                .validate_messages,
-            "[a2a] validate_messages is not carried over"
+                .validation,
+            A2aValidation::Off
         );
     }
 
@@ -408,13 +426,14 @@ mod tests {
     async fn existing_proxy_and_non_a2a_surfaces_are_left_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(dir.path()).await;
-        let own = settings(&["0.3"], false);
+        let own = settings(&["0.3"], A2aValidation::Full);
         let mut surfaces = vec![
             a2a_surface("s-own", "https://a2a.internal/a2a", Some(serde_json::to_value(&own).unwrap())),
             a2a_surface("s-proxy", "a2a-proxy://worker", None),
             mcp_surface_with_mapping("s-mcp"),
         ];
         let retired = RetiredA2aSwitches {
+            validate_messages: Some(false),
             legacy_compatibility: Some(false),
         };
 
@@ -445,7 +464,7 @@ mod tests {
             a2a_surface(
                 "s-empty",
                 "https://a2a.internal/a2a",
-                Some(serde_json::json!({ "accepted_versions": [], "validate_messages": true })),
+                Some(serde_json::json!({ "accepted_versions": [], "validation": "full" })),
             ),
             a2a_surface(
                 "s-unknown",
@@ -458,17 +477,18 @@ mod tests {
             .await
             .expect("an invalid stored block must not fail the load");
 
-        assert_eq!(surfaces[0].access_point.a2a, Some(settings(&[], true)), "left as stored");
+        assert_eq!(surfaces[0].access_point.a2a, Some(settings(&[], A2aValidation::Full)), "left as stored");
         assert_eq!(
             surfaces[0]
                 .a2a_settings()
                 .accepted_versions,
             crate::a2a::version::SUPPORTED_VERSIONS
         );
-        assert!(
+        assert_eq!(
             surfaces[0]
                 .a2a_settings()
-                .validate_messages
+                .validation,
+            A2aValidation::Full
         );
         assert_eq!(
             surfaces[1]

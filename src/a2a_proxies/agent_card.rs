@@ -271,7 +271,7 @@ mod tests {
         let mut surface = surface();
         surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
             accepted_versions: vec!["0.3".to_string()],
-            validate_messages: true,
+            validation: crate::config::agent_surface::A2aValidation::Full,
         });
 
         let card = synthesize_agent_card(&proxy(None), &surface);

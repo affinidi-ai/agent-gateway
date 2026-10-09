@@ -3640,7 +3640,7 @@ fn surface_a2a_settings(world: &mut SurfaceWorld) -> &mut serde_json::Value {
     world
         .surface_config
         .a2a_settings
-        .get_or_insert_with(|| serde_json::json!({ "accepted_versions": ["0.3", "1.0"], "validate_messages": false }))
+        .get_or_insert_with(|| serde_json::json!({ "accepted_versions": ["0.3", "1.0"], "validation": "envelope" }))
 }
 
 #[given(expr = "the surface accepts A2A versions {string}")]
@@ -3655,7 +3655,10 @@ fn surface_accepts_a2a_versions(
     surface_a2a_settings(world)["accepted_versions"] = serde_json::json!(versions);
 }
 
-#[given("the surface validates A2A messages")]
-fn surface_validates_a2a_messages(world: &mut SurfaceWorld) {
-    surface_a2a_settings(world)["validate_messages"] = serde_json::json!(true);
+#[given(expr = "the surface's A2A validation is {string}")]
+fn surface_a2a_validation_is(
+    world: &mut SurfaceWorld,
+    validation: String,
+) {
+    surface_a2a_settings(world)["validation"] = serde_json::json!(validation);
 }

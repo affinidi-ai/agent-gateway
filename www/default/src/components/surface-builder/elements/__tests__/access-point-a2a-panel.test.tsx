@@ -43,31 +43,41 @@ function baseProps(
 }
 
 const version = (v: string) => screen.getByTestId(`access-point-a2a-version-${v}`);
-const validate = () => screen.getByTestId('access-point-a2a-validate-messages');
+const validation = () => screen.getByTestId('access-point-a2a-validation') as HTMLSelectElement;
 
 describe('AccessPointPanel A2A protocol settings', () => {
-  it('defaults to both versions with message validation off', () => {
+  it('defaults to both versions with JSON-RPC envelope validation', () => {
     render(<AccessPointPanel {...baseProps()} />);
 
     expect(screen.getByTestId('access-point-a2a-protocol')).toBeInTheDocument();
     expect(version('0.3')).toBeChecked();
     expect(version('1.0')).toBeChecked();
-    expect(validate()).not.toBeChecked();
+    expect(validation().value).toBe('envelope');
     expect(version('0.3')).toBeEnabled();
-    expect(validate()).toBeEnabled();
+    expect(validation()).toBeEnabled();
     expect(screen.queryByTestId('access-point-a2a-proxy-locked')).not.toBeInTheDocument();
+  });
+
+  it('offers the three validation levels with short labels', () => {
+    render(<AccessPointPanel {...baseProps()} />);
+
+    expect(Array.from(validation().options).map(o => [o.value, o.textContent])).toEqual([
+      ['off', 'Off'],
+      ['envelope', 'JSON-RPC envelope'],
+      ['full', 'Envelope + A2A fields'],
+    ]);
   });
 
   it('shows the stored selection', () => {
     render(
       <AccessPointPanel
-        {...baseProps({ config: { a2a_accepted_versions: ['1.0'], a2a_validate_messages: true } })}
+        {...baseProps({ config: { a2a_accepted_versions: ['1.0'], a2a_validation: 'full' } })}
       />
     );
 
     expect(version('0.3')).not.toBeChecked();
     expect(version('1.0')).toBeChecked();
-    expect(validate()).toBeChecked();
+    expect(validation().value).toBe('full');
   });
 
   it('updates the versions in A2A order when one is toggled', () => {
@@ -85,12 +95,14 @@ describe('AccessPointPanel A2A protocol settings', () => {
     expect(updateFields).toHaveBeenLastCalledWith({ a2a_accepted_versions: [] });
   });
 
-  it('toggles message validation', () => {
+  it('changes the validation level', () => {
     const updateFields = jest.fn();
     render(<AccessPointPanel {...baseProps({ updateFields })} />);
 
-    fireEvent.click(validate());
-    expect(updateFields).toHaveBeenCalledWith({ a2a_validate_messages: true });
+    fireEvent.change(validation(), { target: { value: 'off' } });
+    expect(updateFields).toHaveBeenLastCalledWith({ a2a_validation: 'off' });
+    fireEvent.change(validation(), { target: { value: 'full' } });
+    expect(updateFields).toHaveBeenLastCalledWith({ a2a_validation: 'full' });
   });
 
   it('asks for at least one version when none is selected', () => {
@@ -101,11 +113,11 @@ describe('AccessPointPanel A2A protocol settings', () => {
     );
   });
 
-  it('locks an A2A proxy target to 1.0 without validation, whatever is stored', () => {
+  it('locks an A2A proxy target to 1.0 with envelope validation, whatever is stored', () => {
     render(
       <AccessPointPanel
         {...baseProps(
-          { config: { a2a_accepted_versions: ['0.3'], a2a_validate_messages: true } },
+          { config: { a2a_accepted_versions: ['0.3'], a2a_validation: 'off' } },
           'a2a-proxy://worker'
         )}
       />
@@ -113,12 +125,12 @@ describe('AccessPointPanel A2A protocol settings', () => {
 
     expect(version('0.3')).not.toBeChecked();
     expect(version('1.0')).toBeChecked();
-    expect(validate()).not.toBeChecked();
+    expect(validation().value).toBe('envelope');
     expect(version('0.3')).toBeDisabled();
     expect(version('1.0')).toBeDisabled();
-    expect(validate()).toBeDisabled();
+    expect(validation()).toBeDisabled();
     expect(screen.getByTestId('access-point-a2a-proxy-locked')).toHaveTextContent(
-      'An A2A proxy target serves A2A 1.0 without message validation.'
+      'An A2A proxy target serves A2A 1.0 with JSON-RPC envelope validation only.'
     );
     expect(screen.queryByTestId('access-point-a2a-versions-error')).not.toBeInTheDocument();
   });
@@ -129,9 +141,9 @@ describe('AccessPointPanel A2A protocol settings', () => {
     fireEvent.focus(screen.getByTestId('field-help-access-point-a2a-versions'));
     expect(await screen.findByText(/counts as version 0\.3/)).toBeInTheDocument();
 
-    fireEvent.focus(screen.getByTestId('field-help-access-point-a2a-validate-messages'));
+    fireEvent.focus(screen.getByTestId('field-help-access-point-a2a-validation'));
     expect(
-      await screen.findByText(/including batch requests, are always\s+refused/)
+      await screen.findByText(/including batch requests\. Envelope \+ A2A fields/)
     ).toBeInTheDocument();
   });
 
@@ -140,7 +152,7 @@ describe('AccessPointPanel A2A protocol settings', () => {
 
     expect(screen.getByTestId('access-point-a2a-protocol')).toBeInTheDocument();
     expect(version('0.3')).toBeChecked();
-    expect(validate()).not.toBeChecked();
+    expect(validation().value).toBe('envelope');
   });
 
   it('is not shown on an MCP surface', () => {

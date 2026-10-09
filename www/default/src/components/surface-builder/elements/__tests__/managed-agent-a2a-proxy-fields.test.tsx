@@ -16,11 +16,14 @@ const renderFields = (selectedProxyId?: string) =>
   );
 
 describe('Managed Agent A2A proxy fields', () => {
-  it('states that an A2A proxy serves A2A 1.0 without message validation', () => {
+  it('states that an A2A proxy serves A2A 1.0 with envelope validation only', () => {
     renderFields('p1');
 
     const hint = screen.getByTestId('managed-agent-a2a-proxy-protocol-hint');
-    expect(hint).toHaveTextContent('A2A 1.0 only, without message validation.');
+    expect(hint).toHaveTextContent('A2A 1.0 only, JSON-RPC envelope validation only.');
+    expect(hint).toHaveTextContent(
+      'Only the JSON-RPC envelope is checked, not the A2A message fields'
+    );
     expect(hint).toHaveTextContent('callers must send the A2A-Version: 1.0 header');
     expect(hint).toHaveTextContent("The Access Point's A2A Protocol settings are locked");
   });

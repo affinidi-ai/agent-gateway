@@ -105,7 +105,7 @@ export const ACCESS_POINT_CANVAS_IDENTIFIER_FIELDS = [
   'route_prefix',
   'route_suffix',
   'a2a_accepted_versions',
-  'a2a_validate_messages',
+  'a2a_validation',
 ] as const;
 
 export interface SurfaceOverrides {

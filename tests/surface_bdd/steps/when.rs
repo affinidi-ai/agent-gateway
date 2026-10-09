@@ -1329,6 +1329,18 @@ async fn surface_without_a2a_versions_create_request_submitted(
     create_surface(world, payload).await;
 }
 
+#[when(expr = "the operator attempts to create an MCP surface for route {string} that carries A2A settings")]
+async fn mcp_surface_with_a2a_settings_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["access_point"]["protocol"] = serde_json::json!("mcp");
+    payload["access_point"]["a2a"] = serde_json::json!({ "accepted_versions": ["1.0"] });
+    create_surface(world, payload).await;
+}
+
 #[when(expr = "the operator attempts to create a surface for route {string} with invalid configuration")]
 async fn invalid_surface_create_request_submitted(
     world: &mut SurfaceWorld,

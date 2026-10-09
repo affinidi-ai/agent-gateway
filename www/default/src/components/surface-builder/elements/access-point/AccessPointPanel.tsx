@@ -6,8 +6,11 @@ import { AgentCardLocationHelp, AGENT_CARD_EXPLAINER } from '../_shared/AgentCar
 import FieldHelp from '../../../shared/FieldHelp';
 import {
   A2A_PROXY_SETTINGS,
+  A2A_VALIDATION_OPTIONS,
   A2A_VERSIONS,
   isA2aProxyEndpoint,
+  isA2aValidation,
+  selectedA2aValidation,
   selectedA2aVersions,
 } from './a2aSettings';
 
@@ -22,15 +25,15 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
 }) => {
   const isA2aLike = protocol === 'a2a' || protocol === 'ap2';
   const targetEndpoint = allNodes?.find(n => n.type === 'target')?.config?.endpoint;
-  // An A2A proxy Target serves A2A 1.0 without message validation, whatever
-  // was selected, so the controls show those values and are locked.
+  // An A2A proxy Target serves A2A 1.0 with envelope validation, whatever was
+  // selected, so the controls show those values and are locked.
   const isA2aProxyTarget = isA2aProxyEndpoint(targetEndpoint);
   const a2aVersions = isA2aProxyTarget
     ? A2A_PROXY_SETTINGS.accepted_versions
     : selectedA2aVersions(config);
-  const a2aValidateMessages = isA2aProxyTarget
-    ? A2A_PROXY_SETTINGS.validate_messages
-    : config.a2a_validate_messages === true;
+  const a2aValidation = isA2aProxyTarget
+    ? A2A_PROXY_SETTINGS.validation
+    : selectedA2aValidation(config);
 
   return (
     <>
@@ -54,7 +57,7 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
               style={{ fontSize: '10px' }}
               data-testid="access-point-a2a-proxy-locked"
             >
-              An A2A proxy target serves A2A 1.0 without message validation.
+              An A2A proxy target serves A2A 1.0 with JSON-RPC envelope validation only.
             </Form.Text>
           )}
           <Form.Group className="mb-2">
@@ -101,30 +104,43 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
               </Form.Text>
             )}
           </Form.Group>
-          <Form.Check
-            type="checkbox"
-            id="ap-a2a-validate-messages"
-            data-testid="access-point-a2a-validate-messages"
-            label={
-              <span className="d-flex align-items-center gap-1">
-                Validate messages
-                <FieldHelp
-                  testId="field-help-access-point-a2a-validate-messages"
-                  ariaLabel="About Validate messages"
-                >
-                  Check that each request carries the fields A2A requires, such as a message ID, a
-                  role and at least one message part, before it reaches your agent. A request
-                  missing one is refused with an error that names the field. When this is off, such
-                  requests are forwarded as they are and your agent decides. Requests that are not a
-                  single, well-formed JSON-RPC request, including batch requests, are always
-                  refused.
-                </FieldHelp>
-              </span>
-            }
-            checked={a2aValidateMessages}
-            disabled={isA2aProxyTarget}
-            onChange={e => updateFields({ a2a_validate_messages: e.target.checked })}
-          />
+          <Form.Group className="mb-0">
+            <div className="d-flex align-items-center gap-1 mb-1">
+              <Form.Label htmlFor="ap-a2a-validation" className="small text-muted mb-0">
+                Message validation
+              </Form.Label>
+              <FieldHelp
+                testId="field-help-access-point-a2a-validation"
+                ariaLabel="About Message validation"
+              >
+                How much of each request is checked before it reaches your agent. Off: requests are
+                forwarded as they are, so a batch request or a request without a valid method name
+                reaches your policies with no method to match. JSON-RPC envelope (recommended):
+                refuses anything that is not a single, well-formed JSON-RPC request, including batch
+                requests. Envelope + A2A fields: also requires the fields A2A defines, such as a
+                message ID, a role and at least one message part, and refuses a request that misses
+                one with an error that names the field.
+              </FieldHelp>
+            </div>
+            <Form.Select
+              size="sm"
+              id="ap-a2a-validation"
+              data-testid="access-point-a2a-validation"
+              value={a2aValidation}
+              disabled={isA2aProxyTarget}
+              onChange={e => {
+                if (isA2aValidation(e.target.value)) {
+                  updateFields({ a2a_validation: e.target.value });
+                }
+              }}
+            >
+              {A2A_VALIDATION_OPTIONS.map(option => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </Form.Select>
+          </Form.Group>
         </div>
       )}
 

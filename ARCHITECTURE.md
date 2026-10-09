@@ -115,8 +115,8 @@ flowchart TB
 
 A `fabric://` Target leaves after the delegated payment. It then runs its own paywall
 (skipped when the delegated payment already decided) and, for MCP, the MCP tool policies,
-before fabric dispatch. Version negotiation and request validation do not run on the
-fabric legs.
+before fabric dispatch. Version negotiation and request validation run on the sending gateway, before
+that; the fabric receive pipeline does not run them again.
 
 Each stage is driven from `handler.rs`; the column below names the module holding the
 logic.
@@ -132,7 +132,7 @@ logic.
 | Appliance-wide gateway policy | The global gateway-plane set, deny-overrides, ahead of the gateway's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Gateway OPA | The appliance-level policy gate | [`src/policies/gateway_manager.rs`](src/policies/gateway_manager.rs) |
 | AP2 gate | Refusing AP2 while `ap2_experimental` is off | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/ap2/`](src/ap2/) |
-| A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, checking the JSON-RPC envelope, and checking the request shape when the surface asks for it; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
+| A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, and checking the JSON-RPC envelope and the request shape as the surface's validation level asks; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
 | Delegated payment | `agent_pay` settlement through another gateway | [`src/x402/delegate.rs`](src/x402/delegate.rs) |
 | Egress check | Vetting the forward target before anything is charged locally | [`src/egress.rs`](src/egress.rs) |
 | Body-size limit | Refusing a body over `[a2a] max_body_size` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
@@ -194,7 +194,7 @@ source auth (or, on an MCP surface with `mcp_http.authorization`, the Resource S
 token, which refuses rather than passing to policy) → rate limit → body extraction → MCP
 wire validation and context → agent
 context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
-and request validation (A2A and AP2, not `fabric://`) → delegated `agent_pay` payment (a
+and request validation (A2A and AP2) → delegated `agent_pay` payment (a
 `fabric://` Target leaves here: its own paywall, MCP tool policies for MCP, then fabric
 dispatch) → forward-target egress check → body-size limit → local x402/MPP → MCP tool
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller

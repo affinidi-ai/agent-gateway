@@ -968,7 +968,7 @@ fn response_error_lists_only_supported_versions(
     );
 }
 
-#[then(expr = "the created surface accepts A2A versions {string} without message validation")]
+#[then(expr = "the created surface accepts A2A versions {string} with envelope validation")]
 fn created_surface_accepts_a2a_versions(
     world: &mut SurfaceWorld,
     expected: String,
@@ -980,7 +980,7 @@ fn created_surface_accepts_a2a_versions(
         .collect();
     assert_eq!(
         body.pointer("/access_point/a2a"),
-        Some(&serde_json::json!({ "accepted_versions": expected, "validate_messages": false })),
+        Some(&serde_json::json!({ "accepted_versions": expected, "validation": "envelope" })),
         "unexpected A2A settings in {body}"
     );
 }

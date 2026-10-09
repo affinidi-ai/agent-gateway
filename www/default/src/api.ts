@@ -1232,8 +1232,8 @@ export interface AgentSurface {
     };
     publish_to_did_document?: boolean;
     terminate_trace_id?: boolean;
-    /** Per-surface A2A settings (A2A and AP2 Access Points). Absent means both versions, no request-shape validation. */
-    a2a?: { accepted_versions: string[]; validate_messages: boolean };
+    /** Per-surface A2A settings (A2A and AP2 Access Points). Absent means both versions, envelope validation. */
+    a2a?: { accepted_versions: string[]; validation: 'off' | 'envelope' | 'full' };
   };
   target: {
     endpoint: string;
