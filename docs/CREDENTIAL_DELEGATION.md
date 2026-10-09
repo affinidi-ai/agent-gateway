@@ -75,8 +75,8 @@ stripped and the peer receives no delegated credential.
 
 With it on, the access token, never the refresh token, crosses to the peer, which can use it until
 it expires. On the Target only a modern (`2026-07-28`) request carries it, inside the encrypted
-framed stream; a legacy request never does. On a Transit Point, modern and legacy requests both
-carry it. A Transit Point on a surface without `outbound_credentials` uses only its own
+framed stream; a legacy MCP or A2A request never does. On a Transit Point, every protocol carries
+it, including A2A through header injection. A Transit Point on a surface without `outbound_credentials` uses only its own
 `transit_credentials`, never another Transit Point's, whatever its destination. Consent, refresh
 and revocation stay on the sending gateway. See
 [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric).
