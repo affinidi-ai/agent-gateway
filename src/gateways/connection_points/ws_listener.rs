@@ -485,6 +485,14 @@ impl ConnectionPointListenerManager {
         info!("Connection-point listener activation complete: {} started, {} failed", started, failed);
     }
 
+    /// Start the background check that the mediator still holds every active
+    /// listener's account (see [`super::account_watch`]).
+    pub fn start_account_watch_task(&self) {
+        if let Some(manager) = &self.self_ref {
+            super::account_watch::spawn(manager.clone());
+        }
+    }
+
     /// Start background cache maintenance task
     /// This task periodically evicts expired DID cache entries
     pub fn start_cache_maintenance_task(&self) {

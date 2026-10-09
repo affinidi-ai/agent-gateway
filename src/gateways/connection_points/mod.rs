@@ -1,3 +1,4 @@
+pub mod account_watch;
 pub mod envelope_replay;
 pub mod filesystem;
 pub mod handlers;

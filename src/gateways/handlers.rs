@@ -1218,68 +1218,6 @@ mod tests {
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
-    #[test]
-    fn account_not_found_is_recognised_only_from_its_problem_report() {
-        use affinidi_messaging_sdk::errors::ATMError;
-
-        let missing = ATMError::ProblemReport("e.p.account.not_found".into(), "gone".into(), "false".into());
-        assert!(is_account_not_found(&missing));
-
-        let other_report = ATMError::ProblemReport("e.p.access_list.denied".into(), "denied".into(), "false".into());
-        assert!(!is_account_not_found(&other_report));
-
-        let transport = ATMError::TransportError("account.not_found".into());
-        assert!(!is_account_not_found(&transport));
-
-        let near_miss = ATMError::ProblemReport("e.p.account.not_found_else".into(), "other".into(), "false".into());
-        assert!(!is_account_not_found(&near_miss));
-    }
-
-    fn probed_account(access_list_mode: &str) -> AccountProbe {
-        Ok(Ok(serde_json::from_value(serde_json::json!({
-            "did": "did:example:connection-point",
-            "accountType": "standard",
-            "acl": { "accessListMode": access_list_mode }
-        }))
-        .unwrap()))
-    }
-
-    fn probe_error(error: affinidi_messaging_sdk::errors::ATMError) -> AccountProbe {
-        Ok(Err(error))
-    }
-
-    #[tokio::test]
-    async fn a_ping_timeout_restarts_the_listener_only_when_the_account_is_missing() {
-        use affinidi_messaging_sdk::errors::ATMError;
-
-        let missing =
-            probe_error(ATMError::ProblemReport(ACCOUNT_NOT_FOUND_CODE.into(), "gone".into(), "false".into()));
-        assert_eq!(ping_timeout_recovery(&missing), PingTimeoutRecovery::RestartListener);
-
-        let other_report =
-            probe_error(ATMError::ProblemReport("e.p.access_list.denied".into(), "denied".into(), "false".into()));
-        assert_eq!(ping_timeout_recovery(&other_report), PingTimeoutRecovery::ReportTimeout);
-
-        let near_miss =
-            probe_error(ATMError::ProblemReport("e.p.account.not_found_else".into(), "other".into(), "false".into()));
-        assert_eq!(ping_timeout_recovery(&near_miss), PingTimeoutRecovery::ReportTimeout);
-
-        let transport = probe_error(ATMError::TransportError("connection reset".into()));
-        assert_eq!(ping_timeout_recovery(&transport), PingTimeoutRecovery::ReportTimeout);
-
-        let probe_timed_out: AccountProbe =
-            Err(tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
-                .await
-                .unwrap_err());
-        assert_eq!(ping_timeout_recovery(&probe_timed_out), PingTimeoutRecovery::ReportTimeout);
-    }
-
-    #[test]
-    fn a_ping_timeout_reopens_only_a_closed_receive_list() {
-        assert_eq!(ping_timeout_recovery(&probed_account("explicitDeny")), PingTimeoutRecovery::ReportTimeout);
-        assert_eq!(ping_timeout_recovery(&probed_account("explicitAllow")), PingTimeoutRecovery::ReopenReceiveList);
-    }
-
     #[tokio::test]
     async fn a_failed_restart_after_a_missing_account_still_reports_the_ping_timeout() {
         let root = TempDir::new().unwrap();
@@ -1997,10 +1935,6 @@ const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3)
 /// How long to wait for an in-place listener reconnect to complete.
 const LISTENER_RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// How long to wait for the mediator to return our own account when probing
-/// after a ping timeout.
-const ACCOUNT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// How long to wait for a get-surfaces response from a remote gateway.
 const SURFACES_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -2026,55 +1960,6 @@ async fn ensure_live_listener(
         .reconnect_listener(&listener.connection_point_id, LISTENER_RECONNECT_TIMEOUT)
         .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("Failed to reconnect connection point: {}", e)))
-}
-
-/// The problem-report code a mediator answers with when it no longer has the
-/// requesting account.
-const ACCOUNT_NOT_FOUND_CODE: &str = "e.p.account.not_found";
-
-/// Whether a mediator error is its `account.not_found` problem report.
-fn is_account_not_found(error: &affinidi_messaging_sdk::errors::ATMError) -> bool {
-    matches!(
-        error,
-        affinidi_messaging_sdk::errors::ATMError::ProblemReport(code, _, _) if code == ACCOUNT_NOT_FOUND_CODE
-    )
-}
-
-type AccountProbe = Result<
-    Result<trust_tasks_rs::specs::messaging::account::get::v0_1::Account, affinidi_messaging_sdk::errors::ATMError>,
-    tokio::time::error::Elapsed,
->;
-
-/// What a gateway-ping timeout leads to once our own mediator account has been
-/// probed.
-#[derive(Debug, PartialEq, Eq)]
-enum PingTimeoutRecovery {
-    /// The remote gateway did not answer, or our account could not be read.
-    ReportTimeout,
-    /// The mediator no longer has our account: restart the listener so it
-    /// re-authenticates and re-registers.
-    RestartListener,
-    /// Our account exists but its receive-list is closed: re-open it and retry.
-    ReopenReceiveList,
-}
-
-fn ping_timeout_recovery(probe: &AccountProbe) -> PingTimeoutRecovery {
-    match probe {
-        Ok(Ok(account)) => {
-            let receive_list_open = account
-                .acl
-                .access_list_mode
-                .as_ref()
-                .is_some_and(|mode| mode.to_string() == "explicitDeny");
-            if receive_list_open {
-                PingTimeoutRecovery::ReportTimeout
-            } else {
-                PingTimeoutRecovery::ReopenReceiveList
-            }
-        }
-        Ok(Err(error)) if is_account_not_found(error) => PingTimeoutRecovery::RestartListener,
-        Ok(Err(_)) | Err(_) => PingTimeoutRecovery::ReportTimeout,
-    }
 }
 
 fn ping_timed_out() -> Json<GatewayPingResponse> {
@@ -2107,7 +1992,7 @@ async fn restart_after_missing_account(
 }
 
 /// Handle a gateway-ping timeout by probing our own mediator account and
-/// acting on [`ping_timeout_recovery`]: a closed receive-list is re-opened and
+/// acting on the repair it calls for: a closed receive-list is re-opened and
 /// the ping retried once; a missing account restarts the Connection Point
 /// listener so it re-authenticates and re-registers; anything else is
 /// reported as a timeout.
@@ -2117,29 +2002,17 @@ async fn recover_ping_after_timeout(
     gateway_listener: &ListenerInfo,
     gateway: &Gateway,
 ) -> Result<Json<GatewayPingResponse>, (StatusCode, String)> {
+    use super::connection_points::account_watch::{AccountRepair, account_repair, probe_own_account};
     use affinidi_messaging_didcomm::Message as DIDCommMessage;
     use serde_json::json;
 
     // A ping timeout is ambiguous: the remote gateway may simply be down or
     // slow, OR our own mediator account/receive-list may have been reset (e.g.
     // after a mediator store flush) so the pong was silently dropped.
-    let account_probe: AccountProbe = tokio::time::timeout(
-        ACCOUNT_PROBE_TIMEOUT,
-        gateway_listener
-            .client
-            .atm()
-            .trust_tasks()
-            .account_get(
-                gateway_listener
-                    .client
-                    .profile(),
-                None,
-            ),
-    )
-    .await;
+    let account_probe = probe_own_account(&gateway_listener.client).await;
 
-    match ping_timeout_recovery(&account_probe) {
-        PingTimeoutRecovery::ReportTimeout => {
+    match account_repair(&account_probe) {
+        AccountRepair::Nothing => {
             match &account_probe {
                 Ok(Ok(_)) => {
                     debug!("[{request_id}] Own mediator receive-list is open; treating timeout as remote non-response.")
@@ -2154,13 +2027,13 @@ async fn recover_ping_after_timeout(
             }
             return Ok(ping_timed_out());
         }
-        PingTimeoutRecovery::RestartListener => {
+        AccountRepair::RestartListener => {
             warn!(
                 "[{request_id}] Mediator no longer has our account after ping timeout; restarting the Connection Point to re-authenticate and re-register. Reporting timeout."
             );
             return Ok(restart_after_missing_account(request_id, manager, gateway_listener).await);
         }
-        PingTimeoutRecovery::ReopenReceiveList => {}
+        AccountRepair::ReopenReceiveList => {}
     }
 
     warn!("[{request_id}] Own mediator receive-list is closed; re-opening ACL and retrying ping once.");

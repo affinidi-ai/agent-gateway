@@ -194,6 +194,12 @@ After a Gateway Ping timeout, the Gateway checks its mediator account. It reauth
 reregisters if the account has disappeared, or restores the receive list when the account remains
 but its ACL has been reset.
 
+Every connected Connection Point also runs this check on its own account every 30 seconds. A
+mediator can lose accounts while the connections stay open, for example when its store is flushed
+or fails over. It recreates an account only when that account sends, and refuses delivery to a
+missing account with `e.p.delivery.refused`. Without the periodic check, a gateway that only
+receives would stay unreachable.
+
 When the appliance is Standby, fabric and trust listeners are inactive and the node reports not
 ready. Periodic cache refresh keeps supported cached stores current on a Standby node.
 
