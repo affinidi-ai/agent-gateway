@@ -139,8 +139,8 @@ PAT cannot approve, rename or reconfigure them. Approving one needs an appliance
 credential, because an active appliance-wide peer reaches every tenant's Fabric surfaces.
 
 A tenant-owned Gateway record is limited the other way: its peer reaches only its own tenant's
-Agent Surfaces and appliance-wide ones over Fabric, whatever its exposure list says. See
-[`FABRIC.md`](FABRIC.md#fabric-receive-pipeline).
+Agent Surfaces and appliance-wide ones over Fabric, whatever its exposure mode says. See
+[`FABRIC.md`](FABRIC.md#peer-exposure).
 
 ### Ownership of child records
 

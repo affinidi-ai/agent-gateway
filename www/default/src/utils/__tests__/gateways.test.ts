@@ -2,7 +2,7 @@
  * Gateway selection helper tests.
  */
 
-import { isSelectableRemoteGateway, filterSelectableGateways } from '../gateways';
+import { isSelectableRemoteGateway, filterSelectableGateways, exposureModeOf } from '../gateways';
 
 describe('isSelectableRemoteGateway', () => {
   it('accepts an active remote gateway', () => {
@@ -63,5 +63,23 @@ describe('filterSelectableGateways', () => {
     expect(filterSelectableGateways(null)).toEqual([]);
     expect(filterSelectableGateways(undefined)).toEqual([]);
     expect(filterSelectableGateways({} as any)).toEqual([]);
+  });
+});
+
+describe('exposureModeOf', () => {
+  it('returns the stored mode', () => {
+    expect(exposureModeOf({ exposure_mode: 'none', exposed_channels: ['alpha'] })).toBe('none');
+    expect(exposureModeOf({ exposure_mode: 'all' })).toBe('all');
+    expect(exposureModeOf({ exposure_mode: 'list', exposed_channels: [] })).toBe('list');
+  });
+
+  it('derives the earlier meaning for a record without a mode', () => {
+    expect(exposureModeOf({ exposed_channels: [] })).toBe('all');
+    expect(exposureModeOf({})).toBe('all');
+    expect(exposureModeOf({ exposed_channels: ['alpha'] })).toBe('list');
+  });
+
+  it('ignores an unknown mode', () => {
+    expect(exposureModeOf({ exposure_mode: 'some', exposed_channels: ['alpha'] })).toBe('list');
   });
 });

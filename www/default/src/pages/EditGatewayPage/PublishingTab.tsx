@@ -1,4 +1,5 @@
 import React from 'react';
+import { ExposureMode } from '../../utils/gateways';
 
 interface GatewayForm {
   name: string;
@@ -7,6 +8,7 @@ interface GatewayForm {
   gateway_type: 'self' | 'remote';
   status: 'active' | 'disabled';
   exposed_channels?: string[];
+  exposure_mode?: ExposureMode;
 }
 
 interface PublishingTabProps {
@@ -20,8 +22,23 @@ interface PublishingTabProps {
   handleSaveExposedChannels: () => void;
 }
 
+const EXPOSURE_OPTIONS: { mode: ExposureMode; label: string; help: string }[] = [
+  {
+    mode: 'none',
+    label: 'No surfaces',
+    help: 'This gateway reaches no local surface. New gateways start here.',
+  },
+  {
+    mode: 'list',
+    label: 'Selected surfaces',
+    help: 'This gateway reaches only the surfaces selected below.',
+  },
+  { mode: 'all', label: 'All surfaces', help: 'This gateway reaches every active local surface.' },
+];
+
 const PublishingTab: React.FC<PublishingTabProps> = ({
   form,
+  setForm,
   allChannels,
   savingExposedChannels,
   success,
@@ -29,6 +46,15 @@ const PublishingTab: React.FC<PublishingTabProps> = ({
   handleToggleExposedChannel,
   handleSaveExposedChannels,
 }) => {
+  const exposureMode = form.exposure_mode ?? 'none';
+  const selectedCount = form.exposed_channels?.length ?? 0;
+  const exposureSummary =
+    exposureMode === 'all'
+      ? 'All active surfaces are exposed'
+      : exposureMode === 'none'
+        ? 'No surfaces are exposed'
+        : `${selectedCount} of ${allChannels.length} surfaces selected`;
+
   return (
     <>
       {success && (
@@ -63,29 +89,52 @@ const PublishingTab: React.FC<PublishingTabProps> = ({
         <div className="card-header bg-light">
           <div className="d-flex justify-content-between align-items-center">
             <h6 className="m-0 font-weight-bold text-primary">
-              <i className="fas fa-filter"></i> Exposed Surfaces Configuration
+              <i className="fas fa-filter"></i> Fabric Exposure
             </h6>
           </div>
         </div>
         <div className="card-body">
           <p className="text-muted mb-3">
-            Select which local surfaces should be visible to this remote gateway when it queries for
-            available surfaces.
-            {(form.exposed_channels?.length || 0) === 0 && (
-              <span className="text-info ms-1">
-                <strong>(Currently all active surfaces are exposed)</strong>
-              </span>
-            )}
+            Choose which local surfaces this remote gateway may reach over Fabric. A tenant-owned
+            gateway reaches only its own tenant&apos;s and appliance-wide surfaces in every mode.
           </p>
 
-          {allChannels.length === 0 ? (
-            <div className="alert alert-info mb-0">
-              <i className="fas fa-info-circle me-2"></i>
-              No local surfaces available. Create surfaces first to configure exposure.
-            </div>
-          ) : (
-            <>
-              <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
+          <div className="mb-3" role="radiogroup" aria-label="Exposure mode">
+            {EXPOSURE_OPTIONS.map(option => (
+              <div key={option.mode} className="form-check mb-2">
+                <input
+                  className="form-check-input"
+                  type="radio"
+                  name="exposure-mode"
+                  id={`exposure-mode-${option.mode}`}
+                  data-testid={`gateway-exposure-mode-${option.mode}`}
+                  checked={exposureMode === option.mode}
+                  onChange={() => setForm({ ...form, exposure_mode: option.mode })}
+                />
+                <label
+                  className="form-check-label"
+                  htmlFor={`exposure-mode-${option.mode}`}
+                  style={{ cursor: 'pointer' }}
+                >
+                  <strong>{option.label}</strong>
+                  <small className="text-muted d-block">{option.help}</small>
+                </label>
+              </div>
+            ))}
+          </div>
+
+          {exposureMode === 'list' &&
+            (allChannels.length === 0 ? (
+              <div className="alert alert-info mb-0">
+                <i className="fas fa-info-circle me-2"></i>
+                No local surfaces available. Create surfaces first to select them.
+              </div>
+            ) : (
+              <div
+                className="border-top pt-3"
+                style={{ maxHeight: '300px', overflowY: 'auto' }}
+                data-testid="gateway-exposure-surfaces"
+              >
                 {allChannels.map(channel => {
                   const isExposed = (form.exposed_channels || []).includes(channel.config_id);
                   return (
@@ -94,6 +143,7 @@ const PublishingTab: React.FC<PublishingTabProps> = ({
                         className="form-check-input"
                         type="checkbox"
                         id={`channel-${channel.config_id}`}
+                        data-testid={`gateway-exposure-surface-${channel.config_id}`}
                         checked={isExposed}
                         onChange={() => handleToggleExposedChannel(channel.config_id)}
                       />
@@ -114,36 +164,34 @@ const PublishingTab: React.FC<PublishingTabProps> = ({
                   );
                 })}
               </div>
+            ))}
 
-              <div className="mt-3 pt-3 border-top">
-                <button
-                  className="btn btn-sm btn-primary"
-                  onClick={handleSaveExposedChannels}
-                  disabled={savingExposedChannels}
-                >
-                  {savingExposedChannels ? (
-                    <>
-                      <span
-                        className="spinner-border spinner-border-sm me-2"
-                        role="status"
-                        aria-hidden="true"
-                      ></span>
-                      Saving...
-                    </>
-                  ) : (
-                    <>
-                      <i className="fas fa-save me-2"></i> Save Exposed Surfaces
-                    </>
-                  )}
-                </button>
-                <span className="ms-3 text-muted small">
-                  {(form.exposed_channels?.length || 0) === 0
-                    ? ' All active surfaces will be exposed'
-                    : ` ${form.exposed_channels?.length} of ${allChannels.length} surfaces selected`}
-                </span>
-              </div>
-            </>
-          )}
+          <div className="mt-3 pt-3 border-top">
+            <button
+              className="btn btn-sm btn-primary"
+              data-testid="gateway-exposure-save-button"
+              onClick={handleSaveExposedChannels}
+              disabled={savingExposedChannels}
+            >
+              {savingExposedChannels ? (
+                <>
+                  <span
+                    className="spinner-border spinner-border-sm me-2"
+                    role="status"
+                    aria-hidden="true"
+                  ></span>
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <i className="fas fa-save me-2"></i> Save Exposure
+                </>
+              )}
+            </button>
+            <span className="ms-3 text-muted small" data-testid="gateway-exposure-summary">
+              {exposureSummary}
+            </span>
+          </div>
         </div>
       </div>
     </>

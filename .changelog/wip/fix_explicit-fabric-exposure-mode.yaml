@@ -1,0 +1,38 @@
+branch: fix/explicit-fabric-exposure-mode
+changes:
+  added:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Add an explicit Fabric exposure mode for Remote gateways
+      description: >-
+        A Remote gateway record now has `exposure_mode` (`all`, `none` or `list`), replacing the
+        rule that an empty exposure list means every surface. The management API
+        (`PUT /v1/gateways/{id}/exposed-surfaces`) and the dashboard Publishing tab show and edit
+        it. On boot, records without a mode are migrated and persisted: an empty list becomes `all`
+        and a non-empty list `list`, so existing peers keep their access.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: ⭐ Newly paired Remote gateways reach no surface until one is exposed
+      description: >-
+        Every pairing path, including the inbound handshake, now creates the peer with exposure
+        mode `none`, so it can neither forward to nor list any local surface until an operator
+        exposes one. An exposure update without `exposure_mode` and with an empty list now means
+        `none`, not every surface. The capability query now filters on the authenticated sender's
+        exposure and returns nothing when that lookup fails, instead of every surface.
+  internal:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Expose g2g BDD surfaces on the receiver's peer record in list mode
+      description: >-
+        The g2g harness exposed surfaces on the receiver's self gateway, which had no effect; it now
+        adds each surface to the receiver's record for the sending peer in list mode. Adds the
+        scenario where a newly paired peer is refused with 403, plus unit, store, handler and
+        dashboard tests for the mode, its evaluation and the boot migration.
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Tag the g2g issuer request scenario as a known bug
+      description: >-
+        The scenario fails most runs because the accepting gateway can send from its temporary
+        pairing Connection Point just after the peer turns Active, and the reply to that DID is
+        lost. It is skipped by default until the gateway fix lands; BDD_INCLUDE_KNOWN_BUGS=1 runs it.
