@@ -949,7 +949,10 @@ impl GatewayAdminClient {
         self.send_json(
             Method::PUT,
             &format!("/v1/gateways/{gateway_id}/exposed-surfaces"),
-            Some(&UpdateExposedSurfacesRequest { exposed_surfaces: surface_ids }),
+            Some(&UpdateExposedSurfacesRequest {
+                exposure_mode: "list",
+                exposed_surfaces: surface_ids,
+            }),
         )
         .await
     }
@@ -1149,6 +1152,9 @@ pub struct GatewayRecord {
     /// Issuer DIDs an operator trusts for presentations arriving over this connection.
     #[serde(default)]
     pub trusted_issuer_dids: Vec<String>,
+    /// Surfaces exposed to a Remote record in `list` mode.
+    #[serde(default, rename = "exposed_channels")]
+    pub exposed_surfaces: Vec<String>,
 }
 
 /// Response of `POST /v1/gateways/{id}/issuer`.
@@ -1237,6 +1243,7 @@ struct ApproveGatewayRequest {
 
 #[derive(Debug, Serialize)]
 struct UpdateExposedSurfacesRequest {
+    exposure_mode: &'static str,
     #[serde(rename = "exposed_channels")]
     exposed_surfaces: Vec<String>,
 }
