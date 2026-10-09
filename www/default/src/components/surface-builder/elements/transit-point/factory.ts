@@ -381,6 +381,11 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     ? { header_metadata_mapping: headerMetadataMapping }
                     : {}),
                   require_transit_token: c.require_transit_token !== false,
+                  ...(typeof c.target_endpoint === 'string' &&
+                  c.target_endpoint.startsWith('fabric://') &&
+                  c.fabric_delegated_credentials === true
+                    ? { fabric_delegated_credentials: true }
+                    : {}),
                   ...(() => {
                     // Project the panel's auth_* fields onto the
                     // backend `TargetAuthConfig` shape (externally-tagged
