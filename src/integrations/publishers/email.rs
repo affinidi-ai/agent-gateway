@@ -103,38 +103,6 @@ impl IntegrationPublisher for EmailPublisher {
         Ok(())
     }
 
-    async fn test(
-        &self,
-        config: &Value,
-        content: &Value,
-        variables: &HashMap<String, String>,
-    ) -> Result<String> {
-        use crate::integrations::email_service::{SmtpConfig, send_email};
-
-        let smtp_config = SmtpConfig::from_json(config).context("Failed to parse SMTP configuration")?;
-
-        let subject = content
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Test Email");
-
-        let body = content
-            .get("body")
-            .and_then(|v| v.as_str())
-            .unwrap_or("This is a test email from the integration system.");
-
-        // Perform template variable substitution
-        let actual_subject = substitute_variables(subject, None, variables);
-        let actual_body = substitute_variables(body, None, variables);
-
-        let is_html = is_html_template(content, body);
-
-        send_email(&smtp_config, &actual_subject, &actual_body, is_html)
-            .await
-            .context("Failed to send test email")?;
-
-        Ok(format!("Test email sent successfully to {}", smtp_config.to.join(", ")))
-    }
     async fn publish_batch(
         &self,
         integration: &Integration,

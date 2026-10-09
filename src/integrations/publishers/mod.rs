@@ -76,15 +76,6 @@ pub trait IntegrationPublisher: Send + Sync {
         }
         Ok(results)
     }
-
-    /// Test the integration configuration
-    #[allow(dead_code)]
-    async fn test(
-        &self,
-        config: &Value,
-        content: &Value,
-        variables: &HashMap<String, String>,
-    ) -> Result<String>;
 }
 
 /// Registry for managing integration publishers
