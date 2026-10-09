@@ -68,12 +68,16 @@ degrades to the 401 response, and `fail` fails the tool call with a JSON-RPC err
 
 ## Across Fabric
 
-When a surface's Target is `fabric://`, its delegated credential depends on the request's MCP
-revision. A legacy request never carries it to the peer. A modern (`2026-07-28`) request
-does: the sending gateway applies the credential after stripping the caller's token,
-and sends the access token, never the refresh token, inside the encrypted framed stream to the
-peer, which can use it until it expires. Consent, refresh and revocation stay on the sending
-gateway. See [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric).
+When a surface's Target or Transit Point is `fabric://`, its delegated credential reaches the peer
+only if that Target or Transit Point opts in with `fabric_delegated_credentials: true`. The setting
+is off by default, including on existing surfaces. With it off, the caller's own token is still
+stripped and the peer receives no delegated credential.
+
+With it on, the access token, never the refresh token, crosses to the peer, which can use it until
+it expires. On the Target only a modern (`2026-07-28`) request carries it, inside the encrypted
+framed stream; a legacy request never does. On a Transit Point, modern and legacy requests both
+carry it. Consent, refresh and revocation stay on the sending gateway. See
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric).
 
 ## Consent flow
 
