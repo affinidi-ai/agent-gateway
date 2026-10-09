@@ -465,6 +465,11 @@ pub struct Target {
     /// Maximum amount per auto-pay request (safety cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mpp_auto_pay_max_amount: Option<String>,
+
+    /// Lets the surface's `outbound_credentials` access tokens cross Fabric
+    /// to a `fabric://` peer on modern MCP requests. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fabric_delegated_credentials: bool,
 }
 
 /// Payment policy configuration.
@@ -1125,9 +1130,22 @@ pub struct TransitPoint {
     /// observation only) for this transit point.
     #[serde(default)]
     pub extension_inspection: ExtensionInspectionConfig,
+
+    /// Lets the surface's `outbound_credentials` cross Fabric when this
+    /// Transit Point's `target_endpoint` is `fabric://`. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fabric_delegated_credentials: bool,
 }
 
 impl TransitPoint {
+    /// Whether delegated credentials must be kept from this Transit Point's
+    /// destination: a `fabric://` peer that has not opted in.
+    pub fn withholds_delegated_credentials(&self) -> bool {
+        self.target_endpoint
+            .starts_with("fabric://")
+            && !self.fabric_delegated_credentials
+    }
+
     fn new_id() -> String {
         uuid::Uuid::new_v4().to_string()
     }
@@ -2781,6 +2799,7 @@ mod tests {
                 fabric_target_name: None,
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
+                fabric_delegated_credentials: false,
             },
             transit: None,
             canvas: None,
@@ -2854,6 +2873,7 @@ mod tests {
                 fabric_target_name: None,
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
+                fabric_delegated_credentials: false,
             },
             transit: Some(TransitConfig {
                 points: vec![
@@ -2882,6 +2902,7 @@ mod tests {
                         listen_path: None,
                         require_transit_token: true,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
+                        fabric_delegated_credentials: false,
                     },
                     TransitPoint {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -2908,6 +2929,7 @@ mod tests {
                         listen_path: None,
                         require_transit_token: true,
                         extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
+                        fabric_delegated_credentials: false,
                     },
                 ],
                 outbound_listen_address: None,

@@ -9671,6 +9671,15 @@ async fn resolve_configured_caller_identity(
     Ok(Some(identity))
 }
 
+fn delegates_credentials_over_fabric(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+    surface
+        .target
+        .fabric_delegated_credentials
+        && !surface
+            .outbound_credentials
+            .is_empty()
+}
+
 /// The Access Point's answer to a modern MCP request the Fabric transport
 /// could not complete.
 fn modern_fabric_failure_response(
@@ -10632,11 +10641,7 @@ async fn handle_fabric_request(
                 .await;
             return Err(ModernDelegationError::from(ContinuationError::Denied).response(request));
         }
-        if !state
-            .surface
-            .outbound_credentials
-            .is_empty()
-        {
+        if delegates_credentials_over_fabric(&state.surface) {
             let Some(runtime) = mcp_continuations.as_deref() else {
                 connection_guard
                     .decrement()
@@ -15451,9 +15456,9 @@ mod tests {
     use super::{
         Ap2InboundDecision, CHANNEL_SSE_SESSION_MGR, a2a_proxy_connection_status, agent_card_fabric_forward_path,
         agent_card_response, ap2_experimental_enabled_from_flags, decode_bearer_jwt_claims,
-        evaluate_ap2_inbound_decision, is_forwarded_on_credentialed_card_fetch, modern_fabric_failure_response,
-        normalize_route_for_match, resolve_direct_surface_auth_config, resolve_legacy_mcp_session,
-        route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
+        delegates_credentials_over_fabric, evaluate_ap2_inbound_decision, is_forwarded_on_credentialed_card_fetch,
+        modern_fabric_failure_response, normalize_route_for_match, resolve_direct_surface_auth_config,
+        resolve_legacy_mcp_session, route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
@@ -18690,6 +18695,52 @@ mod tests {
     fn ap2_gate_flag_on_and_transform_success_forwards() {
         let decision = evaluate_ap2_inbound_decision(true, true, Some(true));
         assert_eq!(decision, Ap2InboundDecision::ForwardTransformed);
+    }
+
+    #[test]
+    fn fabric_send_delegates_credentials_only_for_opted_in_targets() {
+        let surface = |id: &str, target: serde_json::Value, outbound: serde_json::Value| {
+            serde_json::from_value::<crate::config::agent_surface::AgentSurface>(serde_json::json!({
+                "surface_id": id, "name": id,
+                "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": "mcp"},
+                "target": target, "outbound_credentials": outbound
+            }))
+            .unwrap()
+        };
+        let bindings = serde_json::json!([{"credential_provider_id": "provider", "scopes": ["read"]}]);
+        let existing = surface("existing", serde_json::json!({"endpoint": "fabric://peer/existing"}), bindings.clone());
+        let opted_in = surface(
+            "opted-in",
+            serde_json::json!({"endpoint": "fabric://peer/opted-in", "fabric_delegated_credentials": true}),
+            bindings.clone(),
+        );
+        let opted_out = surface(
+            "opted-out",
+            serde_json::json!({"endpoint": "fabric://peer/opted-out", "fabric_delegated_credentials": false}),
+            bindings,
+        );
+        let without_bindings = surface(
+            "without-bindings",
+            serde_json::json!({"endpoint": "fabric://peer/none", "fabric_delegated_credentials": true}),
+            serde_json::json!([]),
+        );
+
+        assert!(
+            !existing
+                .target
+                .fabric_delegated_credentials
+        );
+        assert!(!delegates_credentials_over_fabric(&existing));
+        assert!(delegates_credentials_over_fabric(&opted_in));
+        assert!(!delegates_credentials_over_fabric(&opted_out));
+        assert!(!delegates_credentials_over_fabric(&without_bindings));
+        assert!(
+            serde_json::to_value(&existing.target)
+                .unwrap()
+                .get("fabric_delegated_credentials")
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(&opted_in.target).unwrap()["fabric_delegated_credentials"], true);
     }
 
     #[tokio::test]
