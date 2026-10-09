@@ -16,7 +16,18 @@ make user trigger mappings safe to save, and make the dashboard able to attach t
 | 4 | Minimal Agent Watch `user` template | Done (gateway side; Agent Watch docs pending, see follow-ups) |
 | 5 | SAML: `user.created` and role-change `user.updated` | Done |
 | 6 | SAML: keep the primary administrator's role (security fix) | Done |
-| 7 | Fix `component_tests::mcp_record_compat` failing in the full suite | Disabled with `#[ignore]`; fix moved to next steps |
+| 7 | Fix `component_tests::mcp_record_compat` failing in the full suite | Disabled with `#[ignore]`; fix moved to follow-ups |
+
+## Before the merge request
+
+- [ ] `cargo test --no-fail-fast --all-targets --all-features` (includes the Gherkin suites) and
+  `make lint`. Done so far: `cargo test --bin agent-gateway`, `cargo clippy` and `cargo fmt` on
+  the changed files, dashboard `npm run test`, `lint` and `format`.
+- [ ] End-to-end on a gateway with Agent Watch: attach an integration in the UI with only
+  "New User Registered", register a passkey user, and confirm Agent Watch receives
+  `user.created` without passkeys; confirm a login sends nothing.
+- [ ] Remove this file (AGENTS.md rule 7).
+- [ ] Push and open the merge request (done by a person; agents never push).
 
 Every phase is test-first: write the failing test, run it and see it fail for the expected
 reason, write the smallest code that passes, run it green, then refactor.
@@ -133,13 +144,17 @@ listener lifecycle (if Standby should not unbind the surface port) or the test i
 
 ## Follow-ups (not on this branch)
 
+- Fix `mcp_record_compat` and remove its `#[ignore]`: see Phase 7 for the cause and the
+  reproduction test to write first.
+
 - Agent Watch (`docs/INTEGRATION_PAYLOADS.md`, `user` section): describe `state.old`/`state.new`
   with the allow-listed fields, and offer the minimal template the gateway now suggests.
 
 - Agent Stream: same user triggers, selector and (if present) SAML provisioning.
 - Allow-list review of other triggers that serialise whole entities: identity first, then
   gateway, connection point, mediator.
-- SAML sign-in writes the session token into `sessionStorage` from an inline script.
+- SAML sign-in writes the session token into `sessionStorage` from an inline script; the SAML
+  security pack marks this mandatory to fix (token in an `HttpOnly` cookie only).
 - Identity events are never sent: `trigger_identity_integrations` is a stub.
 - The dashboard offers event types from the `user`/`identity` category metadata in
   `gateway.json`; the built-in default categories carry none, so a `gateway.json` without
