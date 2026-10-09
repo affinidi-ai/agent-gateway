@@ -31,6 +31,13 @@ Configured on the Access Point as `caller_authentication.methods`. Each method i
 ([`AgentSurface::source_auth`](../src/config/agent_surface_accessors.rs)); later entries
 are accepted and ignored.
 
+The gateway builds one source authentication middleware at startup. If its JWT
+verification strategy store (`jwt_verification_strategies/`, next to the secrets storage
+directory) cannot be opened, the gateway refuses to start and names that path, rather
+than serving surfaces whose caller authentication would be skipped. A request, direct or
+over Fabric, that reaches a surface with caller authentication configured while no middleware
+is installed is refused with `500` rather than forwarded unauthenticated.
+
 A missing or invalid credential does not refuse the request. That includes an mTLS
 certificate that lacks the configured binding field. The request continues with no caller
 identity, and policy sees `input.source_auth` as

@@ -62,7 +62,9 @@ the stores, listeners, and middleware.
 5. Seed built-in surface templates from the configured templates directory.
 6. Start trust registry listeners.
 7. Create the connection point manager for fabric peers, and pre-warm the DID cache.
-8. Build the management and dashboard routers, and hand them to the surface task manager.
+8. Build the source authentication middleware, then the management and dashboard routers,
+   and hand them to the surface task manager. Startup aborts if the JWT verification
+   strategy store cannot be opened.
 9. Bind listeners and start each surface.
 10. Mark the process ready, at which point `/api/v1/health` returns 200.
 

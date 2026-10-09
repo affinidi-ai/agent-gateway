@@ -4028,9 +4028,15 @@ async fn process_forward_request_with_mcp_runtime(
                 .map(to_header_iter)
                 .map(axum::http::HeaderMap::from_iter).unwrap_or_else(axum::http::HeaderMap::new));
 
-            if let (Some(auth_config), Some(sa_middleware)) =
-                (surface.source_auth(), get_source_auth_middleware())
-            {
+            if let Some(auth_config) = surface.source_auth() {
+                let sa_middleware = match crate::source_auth::middleware::require_installed(get_source_auth_middleware()) {
+                    Ok(middleware) => middleware,
+                    Err(e) => {
+                        channel_warn!(config_id, "GW2: Source authentication unavailable (reason={}) — blocking", e);
+                        let deny = crate::source_auth::errors::deny_response(&surface.access_point.protocol, auth_config, &e);
+                        return axum_response_to_forward_result(deny).await;
+                    }
+                };
                 let resolved_auth_config = match resolve_fabric_surface_auth_config(
                     auth_config,
                     GLOBAL_VC_ISSUER.get().map(Arc::as_ref),

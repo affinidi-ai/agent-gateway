@@ -14,6 +14,15 @@ changes:
     - timestamp: '2026-10-09T00:00:03.000Z'
       title: ⭐ Refuse tenant token writes to appliance-wide management records
       description: A tenant access token can still read records that belong to no tenant, but now gets 403 when it updates, deletes or otherwise changes them in JWT verification strategies, secrets, STS clients, mediators, credential providers, certificates, trust authorities, issuers, trust registries, surface templates and integrations (including triggering an appliance-wide integration), and on the appliance Gateway's Connection Points, which tenant tokens can therefore no longer create. Previously these write paths used the read rule, so a tenant could, for example, replace a global JWT strategy's keys. Tenant automations that edited untenanted records need an appliance-wide token, or an operator can assign the record with `PUT /v1/tenant-ownership/...`.
+    - timestamp: '2026-10-10T00:00:00.000Z'
+      title: Refuse to start when source authentication cannot initialise
+      description: A gateway in Active or Standby mode now exits at startup if the JWT verification strategy store cannot be opened, instead of running with source authentication silently disabled and attaching target credentials for every caller. A Fabric message that reaches a surface with caller authentication before source authentication is ready, or a direct request on a surface whose source authentication is missing, now gets 500. A fresh install is unaffected, because the store directory is created on first start.
+    - timestamp: '2026-10-10T00:00:01.000Z'
+      title: Answer 404 for secrets a tenant token cannot see on update and delete
+      description: Updating or deleting another tenant's secret, or one outside the token's resource pattern, now returns the same 404 as a missing secret, matching reads, so a tenant token cannot probe which secret ids exist. Appliance-wide secrets a tenant can read but not change still return 403.
+    - timestamp: '2026-10-10T00:00:02.000Z'
+      title: Stop logging integration credentials and webhook URLs
+      description: The integration test endpoint no longer logs the submitted configuration or content, and Slack, webhook and Redis Streams publishers no longer log webhook URLs, Redis connection strings or URLs inside HTTP errors, which can carry passwords and bearer tokens.
   breaking:
     - timestamp: '2026-10-09T00:00:01.000Z'
       title: Stop sending target credentials for failed callers over MCP proxy and Fabric

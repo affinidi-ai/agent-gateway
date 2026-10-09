@@ -1754,8 +1754,25 @@ async fn proxy_handler_with_mcp_runtime(
             Err(error) => return Ok(authorization.challenge(error)),
         }
     } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-        && let (Some(auth_config), Some(sa_middleware)) = (state.surface.source_auth(), &state.source_auth_middleware)
+        && let (Some(auth_config), installed_middleware) = (state.surface.source_auth(), &state.source_auth_middleware)
     {
+        let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
+            Ok(middleware) => middleware,
+            Err(e) => {
+                channel_warn!(config_id, "Source authentication unavailable (reason={}) — blocking", e);
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(crate::source_auth::errors::deny_response(
+                    &state
+                        .surface
+                        .access_point
+                        .protocol,
+                    auth_config,
+                    &e,
+                ));
+            }
+        };
         let resolved_auth_config = match resolve_direct_surface_auth_config(
             auth_config,
             state.vc_issuer.as_deref(),
@@ -16839,6 +16856,53 @@ allow if {
         );
     }
 
+    async fn direct_access_point_blocks_when_source_auth_is_unavailable(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::atomic::Ordering;
+
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": "unauthenticated", "result": {"tools": []}}).to_string(),
+        )
+        .await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "source-auth-unavailable", "name": "Source auth unavailable",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/guarded", "protocol": "mcp",
+                "caller_authentication": {"methods": [{
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []
+                }]}},
+            "target": {"endpoint": target.url()}
+        }))
+        .unwrap();
+        let mut router_state = direct_router_state(state, surface);
+        router_state.source_auth_middleware = None;
+        let body = json!({"jsonrpc": "2.0", "id": "unauthenticated", "method": "tools/list"});
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/guarded")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            router_state,
+            request,
+            crate::mcp::request_validation::LEGACY_ONLY_POLICY,
+            None,
+        ))
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
     /// An upstream result carrying every preservation field
     /// reaches the caller of a direct Access Point intact, in JSON and SSE.
     async fn direct_access_point_preserves_every_result_field(state: &crate::state::ProxyState) {
@@ -17676,6 +17740,7 @@ allow if {
         access_point_admission_rejects_every_negative_case(&state).await;
         access_point_refuses_methods_and_bodies_outside_post(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;
+        direct_access_point_blocks_when_source_auth_is_unavailable(&state).await;
         direct_access_point_preserves_every_result_field(&state).await;
         direct_access_point_caller_disconnect_cancels_quiet_upstream(&state).await;
         streamed_responses_hold_the_connection_until_the_body_ends(&state).await;
