@@ -1,0 +1,152 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Version increment to apply
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare ${{ inputs.release_type }} release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Create release app token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.x'
+
+      - name: Install changelog dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Require no open release PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          open="$(gh pr list --state open --base main --json number,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("release/"))] | .[0].number // empty')"
+          if [[ -n "${open}" ]]; then
+            echo "::error::Release PR #${open} is already open; merge or close it first."
+            exit 1
+          fi
+
+      - name: Validate changelog fragments
+        run: python3 .github/scripts/changelog.py check
+
+      - name: Calculate next version
+        id: version
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+        run: |
+          current="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
+          # If the version already in Cargo.toml has never been tagged (e.g. the first
+          # release, or a previous prepare run that bumped it but was never merged),
+          # release it as-is instead of always bumping past it: the reviewed flow
+          # would otherwise never be able to produce that exact version.
+          if git rev-parse --verify "refs/tags/v${current}" >/dev/null 2>&1; then
+            read -r bump version <<< "$(python3 .github/scripts/changelog.py next-version "${current}" --bump "${RELEASE_TYPE}")"
+          else
+            bump="none (v${current} is not yet tagged)"
+            version="${current}"
+          fi
+          tag="v${version}"
+          if git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::Tag ${tag} already exists."
+            exit 1
+          fi
+          echo "Preparing ${current} -> ${version} (${bump})"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Bump Cargo version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ['VERSION']
+          cargo_toml = Path('Cargo.toml')
+          text = cargo_toml.read_text()
+          pattern = re.compile(r'(?m)^version = "\d+\.\d+\.\d+"$')
+          updated, count = pattern.subn(f'version = "{version}"', text, count=1)
+          if count != 1:
+              raise SystemExit('Could not update the package version in Cargo.toml')
+          cargo_toml.write_text(updated)
+          PY
+          cargo update -p agent-gateway --precise "${VERSION}"
+
+      - name: Build reviewed changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python3 .github/scripts/changelog.py release "${VERSION}"
+
+      - name: Open release PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          branch="release/${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git add Cargo.toml Cargo.lock CHANGELOG.md .changelog
+          git commit -m "chore(release): prepare ${TAG}"
+          git push --force origin "${branch}"
+
+          fragment_count="$(find ".changelog/history/${VERSION}" -maxdepth 1 -name '*.yaml' | wc -l | tr -d ' ')"
+          {
+            echo "## Release ${TAG}"
+            echo
+            echo "This PR consolidates ${fragment_count} changelog fragments and bumps the package to ${VERSION}."
+            echo
+            echo "### Review checklist"
+            echo
+            echo "- [ ] Review the new ${TAG} section in \`CHANGELOG.md\`."
+            echo "- [ ] Edit release wording in this PR if needed."
+            echo "- [ ] Confirm \`Cargo.toml\` and \`Cargo.lock\` both use ${VERSION}."
+            echo
+            echo "Merging this PR tags the reviewed merge commit, builds the release binary, and creates the GitHub Release."
+            echo
+          } > "${RUNNER_TEMP}/body.md"
+
+          url="$(gh pr create --base main --head "${branch}" --title "Release ${TAG}" --body-file "${RUNNER_TEMP}/body.md")"
+          echo "Release PR: ${url}" >> "${GITHUB_STEP_SUMMARY}"

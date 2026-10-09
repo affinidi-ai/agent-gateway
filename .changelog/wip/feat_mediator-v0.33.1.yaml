@@ -13,6 +13,21 @@ changes:
         so a gateway whose DID lives on a private host needs `[did_cache] allow_private_hosts`.
         The ALLOW_ALL account ACL is built through the trust-tasks builder. The local, E2E and EC2
         mediator scripts run `public.ecr.aws/affinidi/messaging-mediator:v0.33.1`.
+    - timestamp: '2026-10-05T13:57:17.000Z'
+      title: Raise mediator queue capacity for local and E2E environments
+      description: >-
+        Local and end-to-end mediator configurations now allow up to 150 queued messages per
+        peer, preventing higher-concurrency Fabric traffic from timing out.
+    - timestamp: '2026-10-06T12:00:00.000Z'
+      title: Use the messaging SDK's hash for DID resolver cache keys
+      description: >-
+        Resolver cache keys are now derived via the SDK's `hash_did` instead of a separate local
+        implementation, so the two cannot drift apart. The direct `highway` dependency is dropped.
+    - timestamp: '2026-10-06T12:00:00.000Z'
+      title: Document DID resolution host policy and cache behavior
+      description: >-
+        The documentation now explains public-host restrictions, the opt-in private-host setting,
+        per-method host rules, and mediator document caching.
   fixed:
     - timestamp: '2026-10-05T13:57:17.000Z'
       title: Restart the Connection Point when the mediator reports its account missing
@@ -24,13 +39,18 @@ changes:
         it restarts only the listener instance it probed, so concurrent pings do not tear down a
         session another one just restored. A stored mediator DID document is also cached before
         the messaging profile is built, so the profile finds its mediator at start.
+    - timestamp: '2026-10-05T13:57:17.000Z'
+      title: Refresh mediator functions after an EC2 redeploy
+      description: >-
+        EC2 mediator redeploys now refresh the bundled Redis functions before starting the
+        mediator, so upgrades do not retain stale functions or report a degraded readiness state.
   removed: []
   security:
     - timestamp: '2026-10-06T12:00:00.000Z'
       title: Resolve did:web in VP and VC verification through the host-policy resolver
       description: >-
         Presentation and credential verification resolved `did:web` with a resolver that had no
-        host policy and followed redirects, so a presentation naming a DID on an internal host
+        host policy and followed redirects, so a presentation naming a DID on a private host
         made the gateway fetch it. `did:web` now goes through the shared resolver, the same as
         `did:webvh`, and is refused on non-public hosts unless `[did_cache] allow_private_hosts`
         is on.
@@ -47,48 +67,3 @@ changes:
         `[did_cache] allow_private_hosts = true`, which logs a warning at startup and also
         reopens cloud metadata. `scripts/_prepare.sh` turns it on for local and Docker dev
         stacks, and the BDD configs turn it on too.
-  internal:
-    - timestamp: '2026-10-05T13:57:17.000Z'
-      title: Refresh the mediator Lua functions from the image on every EC2 redeploy
-      description: >-
-        `scripts/mediator/user-data-v2.sh` keeps an existing mediator's DID and secrets on
-        redeploy, and the mounted `conf/` directory hid the image's `atm-functions.lua`. A host
-        upgraded to a newer mediator therefore loaded the old Redis functions, which left the
-        per-peer queue limit inert and `/readyz` reporting `degraded`. The redeploy now copies
-        the file from the image first, through a temporary file so a failed read leaves the
-        existing copy in place.
-    - timestamp: '2026-10-05T13:57:17.000Z'
-      title: Raise the E2E and local mediators' per-peer queue cap to 150
-      description: >-
-        Mediator v0.27+ refuses a forward once one sender has 50 messages queued for one
-        recipient, and a gateway keeps each fabric message queued until it has processed it, so
-        the 50-request concurrency scenario timed out one request. `scripts/g2g-mediator.sh` and
-        `make mediator-up` now set `queued_send_messages_per_peer = "150"`.
-        `reconcile-mediator-config.sh` adds or replaces it under `[limits]` when
-        `user-data-v2.sh` is given the cap. Both scripts rewrite `mediator.toml` in place, so
-        Docker Desktop bind mounts do not serve the replaced copy. `docs/FABRIC.md` documents the
-        cap for operators.
-    - timestamp: '2026-10-06T12:00:00.000Z'
-      title: Record why DID resolution uses the resolver's host policy
-      description: >-
-        `docs/POLICY.md` explains why DID fetches rely on the SDK's `HostPolicy` instead of
-        `src/egress.rs`, the cloud-metadata trade-off of `allow_private_hosts` (also listed
-        under Known limitations), the per-method host-name lists, and that a cached mediator
-        document lasts only for the resolver TTL. `ARCHITECTURE.md`, `docs/FABRIC.md`,
-        `docs/CONFIGURATION_REFERENCE.md` and the docker-compose deployment note point to it.
-    - timestamp: '2026-10-06T12:00:00.000Z'
-      title: Compute DID resolver cache keys with the SDK's hash_did
-      description: >-
-        DID documents seeded into a resolver cache are keyed with `DIDCacheClient::hash_did`
-        instead of a local copy of the hash, so the key cannot drift from the SDK's. The direct
-        `highway` dependency is dropped.
-    - timestamp: '2026-10-05T13:57:17.000Z'
-      title: Cover the DID host policy, ALLOW_ALL ACL and mediator recovery
-      description: >-
-        Adds unit tests for the `allow_private_hosts` default and parsing, for public-only
-        resolvers (DIDComm and VP verification) refusing `did:web:localhost` while
-        private-allowing ones do not, and for the ACL builder output. The recovery tests cover
-        which probe outcomes restart the listener (only `e.p.account.not_found`, not a near-miss
-        code, another report, a transport error or a probe timeout), that a listener another
-        caller already replaced is not restarted, that a failed restart still reports the ping
-        timeout, and that a supplied mediator document lets the profile find its mediator.

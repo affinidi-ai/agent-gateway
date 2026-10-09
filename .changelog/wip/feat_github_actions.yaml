@@ -1,0 +1,59 @@
+branch: feat/github_actions
+changes:
+  added:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Run the MCP conformance harness in CI for MCP-path changes
+      description: >-
+        A new mcp-conformance job runs make mcp-conformance on an arm64 runner, gated on pull
+        requests to changes under src/mcp/**, src/mcp_proxies/** or scripts/mcp-conformance/**
+        (pushes to main always run it), per the AGENTS.md rule for MCP admission and forwarding
+        changes.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Document the release process
+      description: >-
+        docs/development/RELEASING.md describes the Prepare/Publish release workflows, the
+        release environment and RELEASE_BOT_* secrets, and how the next version is chosen.
+  changed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Skip Rust and frontend CI jobs on docs-only pull requests
+      description: >-
+        A changes-detection job filters touched paths; test, coverage, surface-bdd, g2g-bdd and
+        smoke now only run for Rust changes, and the frontend job only for www/default changes,
+        on pull requests (pushes to main always run everything).
+  removed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Remove the unused version-bump check script
+      description: >-
+        scripts/check-version-bumps.sh was never wired into any workflow and described the old
+        tag-per-PR release model, which the Prepare/Publish release workflows replace.
+  breaking: []
+  security:
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Pin GitHub Actions and reusable workflows
+      description: Pin CI dependencies to immutable commits and scope checks to read-only repository access.
+  fixed:
+    - timestamp: '2026-10-07T00:00:00.000Z'
+      title: Pull G2G BDD images from workflow version variables
+      description: Fix the gateway-to-gateway CI image pre-pull step by using explicit mediator and Valkey version variables.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Stop checks workflow failing at startup on every job
+      description: >-
+        The workflow-level permissions block caps every job at contents: read, but the audit
+        job's reusable workflow needs issues: write to annotate RustSec issues. That mismatch
+        failed the entire checks workflow at startup, so fmt, clippy, cargo-deny and rust-scan
+        never ran either; the audit job now declares its own permissions to cover this.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Restrict publish to release-PR merges and recoverable re-runs
+      description: >-
+        The publish workflow now only runs for commits that merge a release/vX.Y.Z branch, so an
+        unrelated push to main touching Cargo.toml or CHANGELOG.md (such as a Dependabot merge)
+        can no longer trigger a release. It also checks out the exact triggering commit instead
+        of main's tip, so the built binary always matches the tagged commit, and re-tagging is
+        skipped when a prior run already tagged that same commit.
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Let the reviewed release flow publish an untagged current version
+      description: >-
+        Prepare release always bumped forward from the version in Cargo.toml, so it could never
+        produce the first release if that version was already set but never tagged. It now
+        releases the current version as-is when it has no matching tag yet, and only bumps once
+        that version has been published.
