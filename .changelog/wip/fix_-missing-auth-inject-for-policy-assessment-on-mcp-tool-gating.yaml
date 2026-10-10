@@ -1,0 +1,22 @@
+branch: fix/-missing-auth-inject-for-policy-assessment-on-mcp-tool-gating
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-10T18:30:00.000Z'
+      title: Give the fabric tools/list gate the caller identity it decides on
+      description: >-
+        An MCP tool gate whose condition reads the caller - anything under
+        input.source_auth - could never match when tools/list was answered over
+        the fabric leg: that filter built its policy input without the caller's
+        source authentication, so the condition was unknowable. An unknowable
+        condition forces an Allow gate inactive, so under a deny-by-default
+        gating config every tool the gate would have granted was hidden, with no
+        error and an empty tool list. The filter now carries source_auth and
+        identity_binding and normalizes the caller DID, exactly as the tools/call
+        gate on the same leg already did, so a tool shown in the list is the one
+        the call gate admits.
+  removed: []
+  security: []
+  breaking: []
+  internal: []

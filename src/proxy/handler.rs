@@ -12789,6 +12789,11 @@ async fn handle_fabric_request(
                                     Some(config_id.to_string()),
                                     &state.surface.name,
                                 );
+                                // The caller's identity, as the `tools/call` gate on this
+                                // leg sees it: a gate condition on `source_auth.claims`
+                                // is otherwise unknowable here, which forces an `Allow`
+                                // gate inactive and hides every tool it would have granted.
+                                policy_input.source_auth = source_auth_context.clone();
                                 policy_input.mcp = modern_mcp_context
                                     .clone()
                                     .or_else(|| {
@@ -12801,6 +12806,8 @@ async fn handle_fabric_request(
                                             ..Default::default()
                                         })
                                     });
+                                policy_input.identity_binding = identity_binding.clone();
+                                policy_input.normalize_caller_did();
                                 serde_json::to_value(&policy_input).unwrap_or_default()
                             } else {
                                 serde_json::Value::Null
