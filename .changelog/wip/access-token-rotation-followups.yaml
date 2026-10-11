@@ -1,0 +1,21 @@
+branch: access-token-rotation-followups
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Skip the token lock for access token uses inside the usage write interval
+      description: A use of an access token within 60 seconds of its last recorded use no longer waits on the token's lock, so concurrent requests with the same token do not queue behind a file write. The 60 second check is repeated under the lock before writing.
+  fixed:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Reject an access token secret rotated while its request was being authenticated
+      description: A request that presented a token's old secret and was still being authenticated when a rotation replaced that secret is now refused with 401, instead of being let through once. A token revoked or expired in that window is refused the same way.
+  removed: []
+  security:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Escape the token id from the request path in access token log events
+      description: The token id taken from the request path on access token update, revoke and rotate log events, including access_token.rotated and access_token.rotate_denied on the audit target, is now logged as an escaped string, so a newline in the path cannot start a forged line in the plain log format. In the plain log format the value is now double-quoted, for example token_id="agat_...", so a search for token_id=agat_ no longer matches these lines.
+  breaking: []
+  internal:
+    - timestamp: '2026-10-08T00:00:00.000Z'
+      title: Add rotation tests and clarify rotation refusals in the docs
+      description: Adds store tests that a use inside the usage write interval skips the token lock and is refused once the cached record is rotated or revoked, and component tests for child and sibling PATs rotating their parent or each other, a PAT rotating an unknown token id, a PAT scoped by required headers alone refused by the rotate handler, a newline in the rotated token id staying on one plain log line, the rotated event level for own and other users' tokens, rotate_denied on 409 and 500, Cache-Control no-store on the router response, a resource-pattern PAT refused before the handler, and expiry, resource pattern and required headers kept after rotation. The test audit capture now records each event's level. The access token and observability docs say a PAT caller gets 403 on rotate, update and revoke for any id it does not control, including unknown ids, and that any refusal by the authentication middleware, such as a PAT with a resource pattern, emits no rotate_denied event. The dashboard type now marks rotation_generation as always present.

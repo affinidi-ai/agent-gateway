@@ -73,6 +73,15 @@ pub(crate) enum StreamErrorCode {
     /// as a legacy-only endpoint would.
     #[error("Fabric stream surface serves legacy MCP only")]
     LegacyOnly,
+    /// A stream cap on the receiver is full, so the sender's caller is told
+    /// to retry rather than that the transport failed.
+    #[error("Fabric stream capacity reached")]
+    CapacityReached,
+    /// A code this gateway does not recognise, sent by a newer peer. The
+    /// sender treats it as `Unavailable` instead of dropping the frame.
+    #[serde(other)]
+    #[error("Fabric stream failed with an unrecognised code")]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +339,23 @@ mod tests {
         let invalid = json!({"stream_id": Uuid::new_v4(), "payload": {"kind": "data", "sequence": 0, "offset": 0, "data": "x".repeat(MAX_FRAME_BYTES)}});
         assert!(StreamFrame::parse(invalid).is_err());
         assert!(StreamFrame::parse(json!({"stream_id": Uuid::nil(), "payload": {"kind": "cancel"}})).is_err());
+    }
+
+    #[test]
+    fn an_unrecognised_error_code_parses_as_unknown() {
+        let stream_id = Uuid::new_v4();
+        let frame = StreamFrame::parse(
+            json!({"stream_id": stream_id, "payload": {"kind": "error", "code": "from_a_newer_peer"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            frame,
+            StreamFrame {
+                stream_id,
+                payload: FramePayload::Error { code: StreamErrorCode::Unknown },
+            }
+        );
+        assert!(StreamFrame::parse(json!({"stream_id": stream_id, "payload": {"kind": "error", "code": 7}})).is_err());
     }
 
     #[test]

@@ -24,10 +24,6 @@ use crate::storage::Integration;
 /// Integration category whose integrations receive governance audit records.
 pub const AUDIT_CATEGORY: &str = "audit";
 
-/// Integration types an audit integration may use. Every VP Audit Log write is
-/// a delivery, more than Email or Slack can carry.
-pub const AUDIT_INTEGRATION_TYPES: [&str; 2] = ["stream", "webhook"];
-
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Every audit record category, as `(category, name, description)`. Its event
@@ -93,15 +89,10 @@ pub fn is_audit_integration(integration: &Integration) -> bool {
         == Some(AUDIT_CATEGORY)
 }
 
-/// Audit records carry appliance-wide evidence, so only active Stream or
-/// Webhook integrations without a tenant owner receive them.
+/// Audit records carry appliance-wide evidence, so only active integrations
+/// without a tenant owner receive them, whatever their type.
 fn receives_audit_records(integration: &Integration) -> bool {
     is_audit_integration(integration)
-        && AUDIT_INTEGRATION_TYPES.contains(
-            &integration
-                .integration_type
-                .as_str(),
-        )
         && integration.status == "active"
         && integration
             .tenant_id
@@ -699,10 +690,10 @@ mod tests {
         assert!(!receives_audit_records(&integration(Some("gateway"), "active", None)));
         assert!(!receives_audit_records(&integration(None, "active", None)));
 
-        for (integration_type, receives) in [("webhook", true), ("email", false), ("slack", false)] {
+        for integration_type in ["stream", "webhook", "email", "slack"] {
             let mut typed = integration(Some("audit"), "active", None);
             typed.integration_type = integration_type.to_string();
-            assert_eq!(receives_audit_records(&typed), receives, "{integration_type}");
+            assert!(receives_audit_records(&typed), "{integration_type}");
         }
     }
 

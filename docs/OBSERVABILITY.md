@@ -124,12 +124,16 @@ to Governance Audit integrations, so ship the `audit` target off the appliance t
 `caller_auth_method` is `access_token` for a PAT caller and `session` otherwise; `caller_token_id`
 is the calling PAT's id and empty for a session caller. `access_token.rotate_denied` carries no
 owner and covers only refusals made by the handler: `401` for a request with no authenticated
-caller, `403` for a non-administrator rotating another user's token or a PAT caller outside its
-lineage or using a resource-scoped PAT, `404` for an unknown token id, and `409` for a revoked,
-expired, inactive-lineage or concurrently rotated token. It is also emitted with status `500`
-when loading the caller or saving the rotated token fails; the error detail is logged only on
-the default target. Requests refused by the authentication
-or `access_tokens.edit` route checks before the handler runs emit neither event.
+caller, `403` for a non-administrator rotating another user's token, a PAT caller naming a token
+id outside its lineage (including an unknown id) or a PAT scoped by `required_headers` alone,
+`404` for a session caller naming an unknown token id, and `409` for a revoked, expired,
+inactive-lineage or concurrently rotated token. It is also emitted with status `500` when
+loading the caller or saving the rotated token fails; the error detail is logged only on the
+default target. Requests refused before the handler runs emit neither event: the
+`access_tokens.edit` route check and any refusal by the authentication middleware, for example a
+missing or invalid credential, the `403` it returns to a PAT with a `resource_pattern` because the
+access-token routes are not a resource-scoped path family, a required header that does not
+match, or Terms the token owner has not accepted.
 
 ## Governance audit forwarding
 
@@ -140,10 +144,10 @@ holds, including the signed VP stamped on each record of a proxied request. A re
 appended once the write is flushed; a record the log could not append or flush is not
 forwarded.
 
-**Recipients.** Every integration with category `audit`, type Stream (Kafka, Kinesis, Pulsar or
-Redis Streams) or Webhook, status `active` and no tenant owner. Email and Slack are refused on
-create and update: every record is a delivery, more than either can carry, and the records hold
-administrator-only evidence: the caller's email and name, request details and the signed VP
+**Recipients.** Every integration with category `audit`, status `active` and no tenant owner,
+whatever its type. Every record is one delivery, so Email and Slack send one message per record;
+Stream (Kafka, Kinesis, Pulsar or Redis Streams) and Webhook suit busy appliances. The records
+hold administrator-only evidence: the caller's email and name, request details and the signed VP
 leave the appliance with each record, so point audit integrations only at destinations cleared
 for that data. There is no per-integration event filter: each recipient gets every record, and
 `EVENT_TYPE` (`audit.<category>`) lets the consumer filter. The offered event types are listed

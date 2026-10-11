@@ -214,6 +214,7 @@ const UserIntegrationsTab: React.FC<UserIntegrationsTabProps> = ({
         category="user"
         availableEventTypes={availableEventTypes}
         requireEventTypes
+        applianceWide
       />
     </div>
   );

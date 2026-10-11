@@ -352,6 +352,17 @@ lazy_static! {
         counter
     };
 
+    /// Consent epoch reads that failed, each closing every MCP subscription on the vault.
+    pub static ref MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE: IntCounter = {
+        let opts = Opts::new(
+            names::MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE_TOTAL,
+            "Consent epoch reads that failed, each closing every MCP subscription on the vault",
+        );
+        let counter = IntCounter::with_opts(opts).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     pub static ref AFFINIDI_TERMS_REFRESH: IntCounterVec = {
         let opts = Opts::new(
             names::AFFINIDI_TERMS_REFRESH_TOTAL,
@@ -691,6 +702,12 @@ pub fn track_audit_forward(
     AUDIT_FORWARD
         .with_label_values(&[result, integration_id.unwrap_or_default()])
         .inc();
+}
+
+/// Track a failed consent epoch read that closed every MCP subscription on
+/// its vault.
+pub fn track_mcp_subscription_epoch_unavailable() {
+    MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE.inc();
 }
 
 /// Update active connections gauge

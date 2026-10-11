@@ -18,6 +18,7 @@ interface IntegrationsStepProps {
     type: string;
     content?: any;
     category?: string;
+    tenant_id?: string | null;
   }>;
   runtimeVariables?: Record<string, { label: string; example: string }>;
   onValidationChange?: (hasErrors: boolean) => void;
@@ -29,6 +30,11 @@ interface IntegrationsStepProps {
   bareSelector?: boolean;
   /** Every attached integration must name at least one of `availableEventTypes` */
   requireEventTypes?: boolean;
+  /**
+   * The events describe the whole appliance (user, identity), so only categorised integrations
+   * without a tenant owner can receive them, as the gateway enforces
+   */
+  applianceWide?: boolean;
 }
 
 /**
@@ -45,17 +51,23 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
   availableEventTypes = [],
   bareSelector = false,
   requireEventTypes = false,
+  applianceWide = false,
 }) => {
   const [expandedIntegrations, setExpandedIntegrations] = useState<Set<number>>(new Set());
 
-  // Offer integrations of this category or 'general' (or uncategorised, for backward
-  // compatibility) that are not attached yet
-  const filteredIntegrations = availableIntegrations.filter(integration => {
-    if (integrations.some(attached => attached.integration_id === integration.id)) return false;
-    if (!integration.category) return true;
-    if (integration.category === 'general') return true;
-    return integration.category === category;
-  });
+  // An integration of this category or 'general' can be attached. An uncategorised one only on
+  // resource pages (backward compatibility), and a tenant-owned one never to appliance-wide events.
+  const isAttachable = (integration: IntegrationsStepProps['availableIntegrations'][number]) => {
+    if (applianceWide && integration.tenant_id) return false;
+    if (!integration.category) return !applianceWide;
+    return integration.category === 'general' || integration.category === category;
+  };
+
+  const filteredIntegrations = availableIntegrations.filter(
+    integration =>
+      !integrations.some(attached => attached.integration_id === integration.id) &&
+      isAttachable(integration)
+  );
 
   // Get all variables from a integration's template
   const getIntegrationTemplateVariables = (integration: any): TemplateVariable[] => {
@@ -97,6 +109,13 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
 
   const handleRemoveIntegration = (index: number) => {
     const updated = integrations.filter((_, i) => i !== index);
+    setExpandedIntegrations(
+      new Set(
+        Array.from(expandedIntegrations)
+          .filter(open => open !== index)
+          .map(open => (open > index ? open - 1 : open))
+      )
+    );
     onChange(updated);
   };
 
@@ -123,18 +142,23 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
     onChange([...integrations, { integration_id: integrationId, variables, event_types: [] }]);
   };
 
-  const hasMissingVariables = integrations.some(integration => {
+  // A stored mapping whose integration is gone or no longer attachable: shown so it can be removed
+  const isUnavailable = (integration: integrationIntegration) => {
     const config = getIntegrationById(integration.integration_id);
-    const names = config
-      ? getCustomVariableNames(config)
-      : Object.keys(integration.variables).filter(name => name.startsWith('_'));
-    return names.some(name => !integration.variables[name]?.trim());
+    return !config || !isAttachable(config);
+  };
+  const attachable = integrations.filter(integration => !isUnavailable(integration));
+
+  const hasUnavailable = attachable.length < integrations.length;
+  const hasMissingVariables = attachable.some(integration => {
+    const config = getIntegrationById(integration.integration_id);
+    return getCustomVariableNames(config).some(name => !integration.variables[name]?.trim());
   });
   const hasMissingEventTypes =
     requireEventTypes &&
     availableEventTypes.length > 0 &&
-    integrations.some(integration => (integration.event_types ?? []).length === 0);
-  const hasValidationErrors = hasMissingVariables || hasMissingEventTypes;
+    attachable.some(integration => (integration.event_types ?? []).length === 0);
+  const hasValidationErrors = hasUnavailable || hasMissingVariables || hasMissingEventTypes;
 
   useEffect(() => {
     onValidationChange?.(hasValidationErrors);
@@ -172,6 +196,13 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
 
   return (
     <>
+      {hasUnavailable && (
+        <div className="alert alert-warning mb-4">
+          <i className="fas fa-exclamation-triangle me-1"></i>
+          Some integrations can no longer be attached here. Remove the integrations marked NOT
+          AVAILABLE before saving.
+        </div>
+      )}
       {hasMissingVariables && (
         <div className="alert alert-warning mb-4">
           <i className="fas fa-exclamation-triangle me-1"></i>
@@ -224,7 +255,32 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
       {/* Integrations List */}
       {integrations.map((integration, index) => {
         const integrationConfig = getIntegrationById(integration.integration_id);
-        if (!integrationConfig) return null;
+        if (!integrationConfig || isUnavailable(integration)) {
+          return (
+            <div
+              key={index}
+              className="card mb-2 border-warning"
+              data-testid={`integration-${index}-unavailable`}
+            >
+              <div className="card-body py-2 px-3 d-flex justify-content-between align-items-center">
+                <div className="d-flex align-items-center">
+                  {integrationConfig && (
+                    <span className="font-weight-bold me-2">{integrationConfig.name}</span>
+                  )}
+                  <code>{integration.integration_id}</code>
+                  <span className="badge text-bg-warning ms-2">NOT AVAILABLE</span>
+                </div>
+                <button
+                  className="btn btn-sm btn-outline-danger"
+                  onClick={() => handleRemoveIntegration(index)}
+                  title="Remove integration"
+                >
+                  <i className="fas fa-trash"></i>
+                </button>
+              </div>
+            </div>
+          );
+        }
         const isExpanded = expandedIntegrations.has(index);
         // Get variable metadata for labels - this dynamically extracts from current template
         const variableMetadata = getIntegrationTemplateVariables(integrationConfig);
@@ -301,8 +357,9 @@ export const IntegrationsStep: React.FC<IntegrationsStepProps> = ({
                           Trigger Events
                         </h6>
                         <p className="text-muted small">
-                          Select which events should trigger this integration. If none are selected,
-                          all events will trigger this integration.
+                          {requireEventTypes
+                            ? 'Select at least one event to trigger this integration.'
+                            : 'Select which events should trigger this integration. If none are selected, all events will trigger this integration.'}
                         </p>
                         <div className="row">
                           {availableEventTypes.map(eventType => (

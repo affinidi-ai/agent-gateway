@@ -7,7 +7,6 @@ import {
   AUDIT_INTEGRATION_CATEGORY,
   auditPayloadTemplate,
   selectableCategories,
-  selectableTypes,
 } from '../utils/auditIntegrations';
 import { usePermissions } from '../context/PermissionsContext';
 import EmailIntegrationForm from '../components/integration-forms/EmailIntegrationForm';
@@ -216,19 +215,6 @@ const AddIntegrationWizardPage: React.FC = () => {
     () => selectableCategories(integrationConfig?.categories ?? [], canViewAudit),
     [integrationConfig, canViewAudit]
   );
-  const types = useMemo(
-    () => selectableTypes(integrationConfig?.types ?? [], category),
-    [integrationConfig, category]
-  );
-
-  // A category that allows fewer types (audit: Stream and Webhook) moves an
-  // incompatible type onto the first one it allows.
-  useEffect(() => {
-    if (types.length > 0 && !types.some(t => t.enum_value === type)) {
-      setType(types[0].enum_value);
-    }
-  }, [types, type]);
-
   // Untouched content follows the category's sample; the JSON payload forms
   // keep their own editor state, so they remount to show a replaced sample.
   const applySamples = useCallback((replacements: Partial<IntegrationContents>) => {
@@ -728,7 +714,7 @@ const AddIntegrationWizardPage: React.FC = () => {
                       disabled={isSubmitting}
                       required
                     >
-                      {types.map(t => (
+                      {integrationConfig.types.map(t => (
                         <option key={t.enum_value} value={t.enum_value} title={t.description}>
                           {t.name}
                         </option>

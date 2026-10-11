@@ -215,28 +215,155 @@ pub struct SubscriptionLifetime {
     slot: Option<ListenSlot>,
 }
 
+type SharedVault = std::sync::Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>;
+
+async fn read_revision(
+    vault: &dyn crate::delegation_vault::storage::DelegationVaultStorage
+) -> Result<Option<uuid::Uuid>, std::io::Error> {
+    tokio::time::timeout(ACCESS_CHECK_TIMEOUT, vault.access_revision())
+        .await
+        .map_err(|_| std::io::Error::other("MCP subscription access check timed out"))?
+        .map_err(|_| std::io::Error::other("MCP subscription authorization unavailable"))
+}
+
+/// The last consent epoch a [`ConsentEpochWatcher`] read from its vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpochReading {
+    Read(Option<uuid::Uuid>),
+    Unavailable,
+}
+
+/// Reads one vault's consent epoch every [`ACCESS_RECHECK_INTERVAL`] on
+/// behalf of every subscription on that vault, so vault reads stay flat as
+/// subscriptions grow. Stops when the last subscription holding it drops.
+struct ConsentEpochWatcher {
+    key: usize,
+    task: tokio::task::AbortHandle,
+    epochs: tokio::sync::watch::Receiver<EpochReading>,
+}
+
+type ConsentEpochWatchers = std::sync::Mutex<std::collections::HashMap<usize, std::sync::Weak<ConsentEpochWatcher>>>;
+
+fn consent_epoch_watchers() -> &'static ConsentEpochWatchers {
+    static WATCHERS: std::sync::OnceLock<ConsentEpochWatchers> = std::sync::OnceLock::new();
+    WATCHERS.get_or_init(Default::default)
+}
+
+impl ConsentEpochWatcher {
+    /// The running watcher for `vault`, or a new one seeded with `revision`.
+    /// Vaults are told apart by instance; the watcher's task holds the vault,
+    /// so a live entry's address cannot be reused by another vault.
+    fn shared(
+        vault: SharedVault,
+        revision: Option<uuid::Uuid>,
+    ) -> std::sync::Arc<Self> {
+        let key = std::sync::Arc::as_ptr(&vault).cast::<()>() as usize;
+        let mut watchers = consent_epoch_watchers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(watcher) = watchers
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return watcher;
+        }
+        let (sender, epochs) = tokio::sync::watch::channel(EpochReading::Read(revision));
+        let task = tokio::spawn(Self::run(vault, sender)).abort_handle();
+        let watcher = std::sync::Arc::new(Self { key, task, epochs });
+        watchers.insert(key, std::sync::Arc::downgrade(&watcher));
+        watcher
+    }
+
+    async fn run(
+        vault: SharedVault,
+        epochs: tokio::sync::watch::Sender<EpochReading>,
+    ) {
+        let mut ticks =
+            tokio::time::interval_at(tokio::time::Instant::now() + ACCESS_RECHECK_INTERVAL, ACCESS_RECHECK_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let reading = match read_revision(vault.as_ref()).await {
+                Ok(revision) => EpochReading::Read(revision),
+                Err(error) => {
+                    tracing::warn!(%error, "MCP subscription consent epoch read failed; closing the vault's subscriptions");
+                    crate::metrics::backends::prometheus::track_mcp_subscription_epoch_unavailable();
+                    EpochReading::Unavailable
+                }
+            };
+            epochs.send_replace(reading);
+        }
+    }
+}
+
+impl Drop for ConsentEpochWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+        let mut watchers = consent_epoch_watchers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if watchers
+            .get(&self.key)
+            .is_some_and(|watcher| watcher.strong_count() == 0)
+        {
+            watchers.remove(&self.key);
+        }
+    }
+}
+
+/// One subscription's view of its vault's consent epoch.
 struct VaultAccess {
-    vault: std::sync::Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>,
     revision: Option<uuid::Uuid>,
-    next_check: tokio::time::Instant,
+    epochs: tokio::sync::watch::Receiver<EpochReading>,
+    _watcher: std::sync::Arc<ConsentEpochWatcher>,
 }
 
 impl VaultAccess {
-    async fn read_revision(
-        vault: &dyn crate::delegation_vault::storage::DelegationVaultStorage
-    ) -> Result<Option<uuid::Uuid>, std::io::Error> {
-        tokio::time::timeout(ACCESS_CHECK_TIMEOUT, vault.access_revision())
-            .await
-            .map_err(|_| std::io::Error::other("MCP subscription access check timed out"))?
-            .map_err(|_| std::io::Error::other("MCP subscription authorization unavailable"))
-    }
-
-    async fn revalidate(&mut self) -> Result<(), std::io::Error> {
-        if Self::read_revision(self.vault.as_ref()).await? != self.revision {
+    /// Joins `vault`'s watcher for a subscription that read `revision`. The
+    /// watcher's last reading can predate that read, so a differing reading is
+    /// checked with one more read, and the join fails only if that read
+    /// differs too or fails.
+    async fn join(
+        vault: SharedVault,
+        revision: Option<uuid::Uuid>,
+    ) -> Result<Self, std::io::Error> {
+        let watcher = ConsentEpochWatcher::shared(vault.clone(), revision);
+        let mut epochs = watcher.epochs.clone();
+        if *epochs.borrow_and_update() != EpochReading::Read(revision)
+            && read_revision(vault.as_ref()).await? != revision
+        {
             return Err(std::io::Error::other("MCP subscription credentials were revoked"));
         }
-        self.next_check = tokio::time::Instant::now() + ACCESS_RECHECK_INTERVAL;
-        Ok(())
+        Ok(Self {
+            revision,
+            epochs,
+            _watcher: watcher,
+        })
+    }
+
+    /// Waits until a reading published after the subscription joined differs
+    /// from the epoch it started under, or the epoch can no longer be read.
+    async fn revoked(&mut self) -> std::io::Error {
+        loop {
+            if self
+                .epochs
+                .changed()
+                .await
+                .is_err()
+            {
+                return std::io::Error::other("MCP subscription authorization unavailable");
+            }
+            match *self
+                .epochs
+                .borrow_and_update()
+            {
+                EpochReading::Read(revision) if revision == self.revision => {}
+                EpochReading::Read(_) => return std::io::Error::other("MCP subscription credentials were revoked"),
+                EpochReading::Unavailable => {
+                    return std::io::Error::other("MCP subscription authorization unavailable");
+                }
+            }
+        }
     }
 }
 
@@ -303,14 +430,10 @@ impl SubscriptionLifetime {
 
     pub async fn watch_vault(
         &mut self,
-        vault: std::sync::Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+        vault: SharedVault,
     ) -> Result<(), std::io::Error> {
-        let revision = VaultAccess::read_revision(vault.as_ref()).await?;
-        self.vault_access = Some(VaultAccess {
-            vault,
-            revision,
-            next_check: tokio::time::Instant::now(),
-        });
+        let revision = read_revision(vault.as_ref()).await?;
+        self.vault_access = Some(VaultAccess::join(vault, revision).await?);
         Ok(())
     }
 
@@ -363,36 +486,25 @@ impl SubscriptionLifetime {
         let body = futures::stream::try_unfold(
             (body.into_data_stream(), self),
             |(mut source, mut lifetime)| async move {
-                loop {
-                    if lifetime.pending_change() || tokio::time::Instant::now() >= lifetime.deadline {
-                        return Err(std::io::Error::other("MCP subscription access must be revalidated"));
-                    }
-                    let next_check = lifetime
-                        .vault_access
-                        .as_ref()
-                        .map_or(lifetime.deadline, |access| access.next_check);
-                    let next = tokio::select! {
-                        biased;
-                        _ = change_in_scope(&mut lifetime.changes, lifetime.owner.as_ref()) => return Err(std::io::Error::other("MCP subscription access changed")),
-                        _ = tokio::time::sleep_until(lifetime.deadline) => return Err(std::io::Error::other("MCP subscription authorization expired")),
-                        _ = tokio::time::sleep_until(next_check), if lifetime.vault_access.is_some() => {
-                            if let Some(access) = lifetime.vault_access.as_mut() {
-                                tokio::select! {
-                                    biased;
-                                    _ = change_in_scope(&mut lifetime.changes, lifetime.owner.as_ref()) => return Err(std::io::Error::other("MCP subscription access changed")),
-                                    _ = tokio::time::sleep_until(lifetime.deadline) => return Err(std::io::Error::other("MCP subscription authorization expired")),
-                                    result = access.revalidate() => result?,
-                                }
-                            }
-                            continue;
+                if lifetime.pending_change() || tokio::time::Instant::now() >= lifetime.deadline {
+                    return Err(std::io::Error::other("MCP subscription access must be revalidated"));
+                }
+                let next = tokio::select! {
+                    biased;
+                    _ = change_in_scope(&mut lifetime.changes, lifetime.owner.as_ref()) => return Err(std::io::Error::other("MCP subscription access changed")),
+                    _ = tokio::time::sleep_until(lifetime.deadline) => return Err(std::io::Error::other("MCP subscription authorization expired")),
+                    error = async {
+                        match lifetime.vault_access.as_mut() {
+                            Some(access) => access.revoked().await,
+                            None => std::future::pending().await,
                         }
-                        next = source.next() => next,
-                    };
-                    return match next {
-                        Some(Ok(bytes)) => Ok(Some((bytes, (source, lifetime)))),
-                        Some(Err(error)) => Err(std::io::Error::other(error)),
-                        None => Ok(None),
-                    };
+                    } => return Err(error),
+                    next = source.next() => next,
+                };
+                match next {
+                    Some(Ok(bytes)) => Ok(Some((bytes, (source, lifetime)))),
+                    Some(Err(error)) => Err(std::io::Error::other(error)),
+                    None => Ok(None),
                 }
             },
         );
@@ -1092,13 +1204,6 @@ mod tests {
             .watch_vault(vault.clone())
             .await
             .unwrap();
-        lifetime
-            .vault_access
-            .as_mut()
-            .unwrap()
-            .revalidate()
-            .await
-            .unwrap();
         let (sender, upstream) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
         let response = axum::response::Response::new(axum::body::Body::from_stream(
             tokio_stream::wrappers::ReceiverStream::new(upstream),
@@ -1168,13 +1273,6 @@ mod tests {
             .watch_vault(vault.clone())
             .await
             .unwrap();
-        lifetime
-            .vault_access
-            .as_mut()
-            .unwrap()
-            .revalidate()
-            .await
-            .unwrap();
         let (sender, upstream) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
         let response = axum::response::Response::new(axum::body::Body::from_stream(
             tokio_stream::wrappers::ReceiverStream::new(upstream),
@@ -1213,6 +1311,286 @@ mod tests {
         );
         assert!(sender.is_closed());
         assert_eq!(changes.receiver_count(), 0);
+    }
+
+    #[derive(Default)]
+    struct CountingVault {
+        reads: std::sync::atomic::AtomicUsize,
+        revision: std::sync::Mutex<Option<uuid::Uuid>>,
+        unavailable: std::sync::atomic::AtomicBool,
+    }
+
+    impl CountingVault {
+        fn reads(&self) -> usize {
+            self.reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::delegation_vault::storage::DelegationVaultStorage for CountingVault {
+        async fn store(
+            &self,
+            _token: crate::delegation_vault::DelegationToken,
+        ) -> anyhow::Result<crate::delegation_vault::DelegationToken> {
+            anyhow::bail!("unused")
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::delegation_vault::DelegationToken>> {
+            anyhow::bail!("unused")
+        }
+        async fn lookup(
+            &self,
+            _agent_did: &str,
+            _user_identity_hash: &str,
+            _provider_id: &str,
+        ) -> anyhow::Result<crate::delegation_vault::VaultLookupResult> {
+            anyhow::bail!("unused")
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::delegation_vault::DelegationToken>> {
+            anyhow::bail!("unused")
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("unused")
+        }
+        async fn delete_by_user(
+            &self,
+            _user_identity_hash: &str,
+        ) -> anyhow::Result<usize> {
+            anyhow::bail!("unused")
+        }
+        async fn update(
+            &self,
+            _token: crate::delegation_vault::DelegationToken,
+        ) -> anyhow::Result<crate::delegation_vault::DelegationToken> {
+            anyhow::bail!("unused")
+        }
+        async fn mark_used(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+        async fn access_revision(&self) -> anyhow::Result<Option<uuid::Uuid>> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::ensure!(
+                !self
+                    .unavailable
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "vault unavailable"
+            );
+            Ok(*self.revision.lock().unwrap())
+        }
+    }
+
+    async fn subscribe_on(
+        vault: &std::sync::Arc<CountingVault>,
+        changes: &tokio::sync::broadcast::Sender<AccessScope>,
+    ) -> axum::body::Body {
+        let mut lifetime = SubscriptionLifetime::new(std::time::Duration::from_secs(600), None);
+        lifetime.changes = changes.subscribe();
+        lifetime
+            .watch_vault(vault.clone())
+            .await
+            .unwrap();
+        lifetime
+            .wrap(axum::response::Response::new(axum::body::Body::from_stream(futures::stream::pending::<
+                Result<bytes::Bytes, std::io::Error>,
+            >())))
+            .into_body()
+    }
+
+    async fn reads_over_two_seconds(vault: &CountingVault) -> usize {
+        let before = vault.reads();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        vault.reads() - before
+    }
+
+    async fn closure(body: &mut axum::body::Body) -> String {
+        use http_body_util::BodyExt;
+
+        tokio::time::timeout(ACCESS_RECHECK_INTERVAL + ACCESS_CHECK_TIMEOUT, body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+    }
+
+    fn consent_epoch_subscribers(vault: &std::sync::Arc<CountingVault>) -> usize {
+        consent_epoch_watchers()
+            .lock()
+            .unwrap()
+            .get(&(std::sync::Arc::as_ptr(vault).cast::<()>() as usize))
+            .map_or(0, std::sync::Weak::strong_count)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_consent_epoch_watcher_serves_every_subscription_on_a_vault() {
+        use http_body_util::BodyExt;
+
+        let (changes, _) = tokio::sync::broadcast::channel::<AccessScope>(16);
+        let vault = std::sync::Arc::new(CountingVault::default());
+        let other = std::sync::Arc::new(CountingVault::default());
+
+        let mut bodies = vec![subscribe_on(&vault, &changes).await];
+        let mut other_body = subscribe_on(&other, &changes).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(reads_over_two_seconds(&vault).await, 2);
+        for _ in 1..32 {
+            bodies.push(subscribe_on(&vault, &changes).await);
+        }
+        assert_eq!(consent_epoch_subscribers(&vault), 32);
+        assert_eq!(consent_epoch_subscribers(&other), 1);
+        assert_eq!(reads_over_two_seconds(&vault).await, 2);
+        for body in &mut bodies {
+            assert!(futures::poll!(body.frame()).is_pending());
+        }
+
+        *vault.revision.lock().unwrap() = Some(uuid::Uuid::new_v4());
+        for body in &mut bodies {
+            assert_eq!(closure(body).await, "MCP subscription credentials were revoked");
+        }
+        assert!(futures::poll!(other_body.frame()).is_pending());
+
+        drop(bodies);
+        assert_eq!(consent_epoch_subscribers(&vault), 0);
+        assert_eq!(reads_over_two_seconds(&vault).await, 0);
+
+        other
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(closure(&mut other_body).await, "MCP subscription authorization unavailable");
+        drop(other_body);
+        assert_eq!(consent_epoch_subscribers(&other), 0);
+    }
+
+    async fn stays_open(access: &mut VaultAccess) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(100), access.revoked())
+            .await
+            .is_err()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_joining_with_a_newer_epoch_than_the_watcher_stays_open() {
+        let vault = std::sync::Arc::new(CountingVault::default());
+        let earlier = Some(uuid::Uuid::new_v4());
+        *vault.revision.lock().unwrap() = earlier;
+        let mut existing = VaultAccess::join(vault.clone(), earlier)
+            .await
+            .unwrap();
+        let newer = Some(uuid::Uuid::new_v4());
+        *vault.revision.lock().unwrap() = newer;
+
+        let mut joiner = VaultAccess::join(vault.clone(), newer)
+            .await
+            .unwrap();
+        assert!(stays_open(&mut joiner).await);
+        assert_eq!(
+            tokio::time::timeout(ACCESS_RECHECK_INTERVAL + ACCESS_CHECK_TIMEOUT, existing.revoked())
+                .await
+                .unwrap()
+                .to_string(),
+            "MCP subscription credentials were revoked"
+        );
+        assert!(stays_open(&mut joiner).await);
+        tokio::time::sleep(ACCESS_RECHECK_INTERVAL * 2).await;
+        assert!(stays_open(&mut joiner).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_joining_an_unavailable_watcher_closes_only_if_the_outage_lasts() {
+        let vault = std::sync::Arc::new(CountingVault::default());
+        let mut existing = VaultAccess::join(vault.clone(), None)
+            .await
+            .unwrap();
+        vault
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            tokio::time::timeout(ACCESS_RECHECK_INTERVAL + ACCESS_CHECK_TIMEOUT, existing.revoked())
+                .await
+                .unwrap()
+                .to_string(),
+            "MCP subscription authorization unavailable"
+        );
+        vault
+            .unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let mut recovered = VaultAccess::join(vault.clone(), None)
+            .await
+            .unwrap();
+        assert!(stays_open(&mut recovered).await);
+        tokio::time::sleep(ACCESS_RECHECK_INTERVAL * 2).await;
+        assert!(stays_open(&mut recovered).await);
+
+        vault
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(ACCESS_RECHECK_INTERVAL).await;
+        vault
+            .unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut joined_in_outage = VaultAccess::join(vault.clone(), None)
+            .await
+            .unwrap();
+        vault
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            tokio::time::timeout(ACCESS_RECHECK_INTERVAL + ACCESS_CHECK_TIMEOUT, joined_in_outage.revoked())
+                .await
+                .unwrap()
+                .to_string(),
+            "MCP subscription authorization unavailable"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_joining_with_an_older_epoch_than_the_vault_fails() {
+        let vault = std::sync::Arc::new(CountingVault::default());
+        let current = Some(uuid::Uuid::new_v4());
+        *vault.revision.lock().unwrap() = current;
+        let mut unchanged = VaultAccess::join(vault.clone(), current)
+            .await
+            .unwrap();
+        assert_eq!(
+            VaultAccess::join(vault.clone(), None)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "MCP subscription credentials were revoked"
+        );
+        vault
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            VaultAccess::join(vault.clone(), None)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "MCP subscription authorization unavailable"
+        );
+        vault
+            .unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut joined = VaultAccess::join(vault.clone(), current)
+            .await
+            .unwrap();
+        assert!(stays_open(&mut unchanged).await);
+        assert!(stays_open(&mut joined).await);
+        assert_eq!(consent_epoch_subscribers(&vault), 2);
+        drop((unchanged, joined));
+        assert_eq!(consent_epoch_subscribers(&vault), 0);
     }
 
     #[test]

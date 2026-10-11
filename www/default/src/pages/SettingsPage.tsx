@@ -5,6 +5,7 @@ import { usePermissions } from '../context/PermissionsContext';
 import { Settings, UserSettingsOverrides } from '../types';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { showToast } from '../utils/toaster';
+import { clearRuntimeVariablesCache } from '../utils/runtimeVariables';
 import UserPreferencesTab from './SettingsPage/UserPreferencesTab';
 import SystemSettingsTab from './SettingsPage/SystemSettingsTab';
 import SystemTab from './SettingsPage/SystemTab';
@@ -107,6 +108,11 @@ const SettingsPage: React.FC = () => {
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
+    if (e.target.type !== 'number') {
+      setFormData(prev => ({ ...prev, [name]: value }));
+      setMessage(null);
+      return;
+    }
     const numValue = parseInt(value, 10) || 0;
 
     // Validate metrics_retention range
@@ -179,6 +185,7 @@ const SettingsPage: React.FC = () => {
 
     try {
       await actions.updateSettings(formData);
+      clearRuntimeVariablesCache();
       showToast('success', 'Settings saved successfully!');
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Failed to save settings';

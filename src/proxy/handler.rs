@@ -9665,6 +9665,25 @@ async fn resolve_configured_caller_identity(
     Ok(Some(identity))
 }
 
+/// The Access Point's answer to a modern MCP request the Fabric transport
+/// could not complete.
+fn modern_fabric_failure_response(
+    error: crate::proxy::fabric_forward::FabricForwardError,
+    id: Option<serde_json::Value>,
+) -> Response {
+    let status = match error {
+        crate::proxy::fabric_forward::FabricForwardError::RemoteLegacyOnly => {
+            return crate::mcp::request_validation::McpRequestValidationError::legacy_only(id).into_response();
+        }
+        crate::proxy::fabric_forward::FabricForwardError::CapacityReached => {
+            return crate::proxy::fabric_forward::capacity_response(id);
+        }
+        crate::proxy::fabric_forward::FabricForwardError::NoResponse(_) => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    create_error_response(status, "Modern Fabric transport is unavailable")
+}
+
 /// Handle requests through the fabric:// protocol by forwarding via gateway
 async fn handle_fabric_request(
     state: ProxyState,
@@ -11572,19 +11591,12 @@ async fn handle_fabric_request(
         .await
         .map_err(|error| {
             warn!(%error, "Modern Access Point Fabric transport failed");
-            let status = match error {
-                crate::proxy::fabric_forward::FabricForwardError::RemoteLegacyOnly => {
-                    return crate::mcp::request_validation::McpRequestValidationError::legacy_only(
-                        modern_request
-                            .as_ref()
-                            .and_then(|request| request.id.clone()),
-                    )
-                    .into_response();
-                }
-                crate::proxy::fabric_forward::FabricForwardError::NoResponse(_) => StatusCode::GATEWAY_TIMEOUT,
-                _ => StatusCode::BAD_GATEWAY,
-            };
-            create_error_response(status, "Modern Fabric transport is unavailable")
+            modern_fabric_failure_response(
+                error,
+                modern_request
+                    .as_ref()
+                    .and_then(|request| request.id.clone()),
+            )
         })?;
         (Some(response), Ok(None))
     } else {
@@ -15433,9 +15445,9 @@ mod tests {
     use super::{
         Ap2InboundDecision, CHANNEL_SSE_SESSION_MGR, a2a_proxy_connection_status, agent_card_fabric_forward_path,
         agent_card_response, ap2_experimental_enabled_from_flags, decode_bearer_jwt_claims,
-        evaluate_ap2_inbound_decision, is_forwarded_on_credentialed_card_fetch, normalize_route_for_match,
-        resolve_direct_surface_auth_config, resolve_legacy_mcp_session, route_tail_to_uri_path,
-        should_forward_ap_request_header_with_mapping,
+        evaluate_ap2_inbound_decision, is_forwarded_on_credentialed_card_fetch, modern_fabric_failure_response,
+        normalize_route_for_match, resolve_direct_surface_auth_config, resolve_legacy_mcp_session,
+        route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
@@ -18434,5 +18446,43 @@ mod tests {
     fn ap2_gate_flag_on_and_transform_success_forwards() {
         let decision = evaluate_ap2_inbound_decision(true, true, Some(true));
         assert_eq!(decision, Ap2InboundDecision::ForwardTransformed);
+    }
+
+    #[tokio::test]
+    async fn access_point_answers_a_full_fabric_stream_cap_with_a_retryable_429() {
+        use crate::proxy::fabric_forward::FabricForwardError;
+
+        let response =
+            modern_fabric_failure_response(FabricForwardError::CapacityReached, Some(serde_json::json!("call-1")));
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "5"
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["id"], "call-1");
+        assert_eq!(body["error"]["code"], crate::mcp::errors::error_codes::INTERNAL_ERROR);
+
+        for (error, status) in [
+            (FabricForwardError::StreamingUnavailable, axum::http::StatusCode::BAD_GATEWAY),
+            (FabricForwardError::NoResponse("gw".into()), axum::http::StatusCode::GATEWAY_TIMEOUT),
+        ] {
+            let response = modern_fabric_failure_response(error, Some(serde_json::json!("call-1")));
+            assert_eq!(response.status(), status);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none()
+            );
+        }
     }
 }

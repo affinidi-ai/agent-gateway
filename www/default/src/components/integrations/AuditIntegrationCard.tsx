@@ -1,6 +1,6 @@
 import React from 'react';
 import { AppButton } from '../shared/AppButton';
-import { AUDIT_INTEGRATION_TYPES } from '../../utils/auditIntegrations';
+import { AUDIT_PAYLOAD_TYPES } from '../../utils/auditIntegrations';
 
 interface AuditIntegrationCardProps {
   type: string;
@@ -38,9 +38,9 @@ const AuditIntegrationCard: React.FC<AuditIntegrationCardProps> = ({
         Only users with the <code>audit.view</code> permission can see or change these integrations,
         and they always apply to the whole appliance.
       </p>
-      <p className="mb-2">
-        Every record is a delivery, so these integrations must be Stream or Webhook: Email and Slack
-        can&rsquo;t carry that volume.
+      <p className="mb-2" data-testid="integration-audit-volume-note">
+        Every record is one delivery. Email and Slack work too, but send one message per record, so
+        prefer Stream or Webhook for busy appliances.
       </p>
       <p className="mb-2 text-warning" data-testid="integration-audit-data-warning">
         <i className="fas fa-exclamation-triangle me-1" aria-hidden="true"></i>
@@ -53,7 +53,7 @@ const AuditIntegrationCard: React.FC<AuditIntegrationCardProps> = ({
         for it (counted by <code>agent_gateway_audit_forward_total</code>). The VP Audit Log keeps
         every record.
       </p>
-      {AUDIT_INTEGRATION_TYPES.includes(type) && (
+      {AUDIT_PAYLOAD_TYPES.includes(type) && (
         <AppButton
           variant="outline-primary"
           className="w-100 mt-3"

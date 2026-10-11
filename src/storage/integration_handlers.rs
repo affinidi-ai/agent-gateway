@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::config::GatewayConfig;
-use crate::integrations::audit_integration_triggers::{AUDIT_CATEGORY, AUDIT_INTEGRATION_TYPES, is_audit_integration};
+use crate::integrations::audit_integration_triggers::{AUDIT_CATEGORY, is_audit_integration};
 use crate::storage::{Integration, IntegrationStorage};
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
 
@@ -62,9 +62,11 @@ impl<'a> AuditCaller<'a> {
 }
 
 /// Management routes for integrations. Each route is gated on its
-/// `integrations.*` permission when an RBAC guard is supplied; governance
-/// audit integrations are additionally authorised in-handler against that
-/// guard and refused without one.
+/// `integrations.*` permission by the RBAC guard and refuses every request
+/// without one; governance audit integrations are additionally authorised
+/// in-handler against that guard. The user and identity mapping routes live
+/// here because their PUT handlers validate each referenced integration
+/// against this store.
 pub fn integration_router(
     storage: Arc<IntegrationStorage>,
     guard: Option<RbacGuard>,
@@ -122,22 +124,6 @@ fn ensure_audit_integration_is_global(
         return Err((
             StatusCode::BAD_REQUEST,
             "Governance audit integrations are appliance-wide and cannot belong to a tenant".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Every write to the VP Audit Log becomes a delivery, far more than Email or
-/// Slack can carry, and the records hold admin-only evidence, so audit
-/// integrations are Stream or Webhook only.
-fn ensure_audit_integration_type(
-    category: Option<&str>,
-    integration_type: &str,
-) -> Result<(), (StatusCode, String)> {
-    if category == Some(AUDIT_CATEGORY) && !AUDIT_INTEGRATION_TYPES.contains(&integration_type) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Governance audit integrations must be of type {}", AUDIT_INTEGRATION_TYPES.join(" or ")),
         ));
     }
     Ok(())
@@ -276,7 +262,6 @@ pub async fn create_notifier(
     req.tenant_id = tenant_for_create(req.tenant_id.take(), pat.is_some(), tenant_context(&context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     ensure_audit_integration_is_global(req.category.as_deref(), req.tenant_id.as_deref())?;
-    ensure_audit_integration_type(req.category.as_deref(), &req.integration_type)?;
     // Validate name
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Integration name is required".to_string()));
@@ -450,7 +435,6 @@ pub async fn update_notifier(
             .await?;
     }
     ensure_audit_integration_is_global(req.category.as_deref(), existing.tenant_id.as_deref())?;
-    ensure_audit_integration_type(req.category.as_deref(), &req.integration_type)?;
 
     // Create updated integration
     let now = chrono::Utc::now().to_rfc3339();
@@ -923,24 +907,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_integrations_are_stream_or_webhook_only() {
+    async fn audit_integrations_accept_every_integration_type() {
         let f = fixture().await;
-        for (integration_type, expected) in
-            [("email", Err(StatusCode::BAD_REQUEST)), ("slack", Err(StatusCode::BAD_REQUEST)), ("webhook", Ok(()))]
-        {
+        for integration_type in ["stream", "webhook", "email", "slack"] {
             let mut typed = request("audit", None);
             typed.integration_type = integration_type.to_string();
             let created = f
                 .create(Some(ADMIN), None, f.guard(), typed)
                 .await
                 .map(|_| ());
-            assert_eq!(created, expected, "{integration_type}");
+            assert_eq!(created, Ok(()), "{integration_type}");
         }
-        assert_eq!(f.stored().await.len(), 1, "only the webhook was stored");
+        assert_eq!(f.stored().await.len(), 4);
     }
 
     #[tokio::test]
-    async fn a_slack_integration_cannot_move_into_the_audit_category() {
+    async fn a_slack_integration_can_move_into_the_audit_category() {
         let f = fixture().await;
         let mut slack = f.seed("general").await;
         slack.integration_type = "slack".to_string();
@@ -952,7 +934,7 @@ mod tests {
         assert_eq!(
             f.update(ADMIN, &slack, "audit")
                 .await,
-            StatusCode::BAD_REQUEST
+            StatusCode::OK
         );
     }
 
@@ -1318,7 +1300,8 @@ mod tests {
             call(router(), OPERATOR, "PUT", "/v1/users/integrations", Some(mapping_body(&user.id, "user.created")))
                 .await;
         assert_eq!(status, StatusCode::OK);
-        let (_, stored) = call(router(), OPERATOR, "GET", "/v1/users/integrations", None).await;
+        let (status, stored) = call(router(), OPERATOR, "GET", "/v1/users/integrations", None).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(stored["integration_integrations"][0]["integration_id"], user.id.as_str());
         assert_eq!(stored["integration_integrations"][0]["event_types"][0], "user.created");
 
@@ -1331,6 +1314,48 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Every read and write of the appliance-wide user and identity mappings is refused for a
+    /// caller whose token `scoped` narrows to a tenant or a resource pattern.
+    async fn assert_scoped_caller_refused_on_mapping_routes(
+        f: &Fixture,
+        scoped: impl Fn(axum::Router) -> axum::Router,
+    ) {
+        let user = f.seed("user").await;
+        for (method, uri, body) in [
+            ("GET", "/v1/users/integrations", None),
+            ("PUT", "/v1/users/integrations", Some(mapping_body(&user.id, "user.created"))),
+            ("GET", "/v1/identities/integrations", None),
+            ("PUT", "/v1/identities/integrations", Some(mapping_body(&user.id, "identity.created"))),
+        ] {
+            let (status, body) = call(scoped(f.router(Some(f.guard.clone()))), OPERATOR, method, uri, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert!(
+                body.get("integration_integrations")
+                    .is_none(),
+                "{method} {uri} returned mappings"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_read_or_change_user_or_identity_mappings() {
+        let f = fixture().await;
+        let tenant = PatTenantContext {
+            token_id: "agat_test".into(),
+            tenant_id: "tenant-a".into(),
+        };
+
+        assert_scoped_caller_refused_on_mapping_routes(&f, |router| router.layer(Extension(tenant.clone()))).await;
+    }
+
+    #[tokio::test]
+    async fn a_resource_scoped_token_cannot_read_or_change_user_or_identity_mappings() {
+        let f = fixture().await;
+        let scope = PatResourceScope(Arc::new(regex::Regex::new("^integrations/.*$").unwrap()));
+
+        assert_scoped_caller_refused_on_mapping_routes(&f, |router| router.layer(Extension(scope.clone()))).await;
     }
 
     #[tokio::test]

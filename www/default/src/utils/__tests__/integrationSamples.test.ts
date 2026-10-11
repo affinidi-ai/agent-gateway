@@ -23,6 +23,7 @@ const category = (name: string, label: string, variables: [string, string][]) =>
 const CATALOGUE: RuntimeVariablesResponse = {
   categories: [
     category('general', 'General', [
+      ['APPLIANCE_ID', 'Appliance ID'],
       ['OLD_STATE', 'Old State'],
       ['NEW_STATE', 'New State'],
       ['EVENT_TYPE', 'Event Type'],
@@ -90,6 +91,7 @@ describe('buildIntegrationSamples', () => {
   it('builds a connection point payload from its own variables', () => {
     const { webhook } = buildIntegrationSamples(CATALOGUE, 'connection_point');
     expect(webhook).toEqual({
+      appliance_id: '${APPLIANCE_ID}',
       event_type: '${EVENT_TYPE}',
       timestamp: '${TIMESTAMP}',
       server: '${SERVER_NAME}',
@@ -104,6 +106,7 @@ describe('buildIntegrationSamples', () => {
       },
     });
     expect(Object.keys(webhook)).toEqual([
+      'appliance_id',
       'event_type',
       'timestamp',
       'server',
@@ -121,6 +124,7 @@ describe('buildIntegrationSamples', () => {
   it('sends user events with only the fields that correlate them', () => {
     const { webhook, stream } = buildIntegrationSamples(CATALOGUE, 'user');
     const minimal = {
+      appliance_id: '${APPLIANCE_ID}',
       event_type: '${EVENT_TYPE}',
       timestamp: '${TIMESTAMP}',
       user: { user_id: '${USER_ID}', user_role: '${USER_ROLE}', user_status: '${USER_STATUS}' },
@@ -135,6 +139,7 @@ describe('buildIntegrationSamples', () => {
     expect(email.subject).toBe('${EVENT_TYPE} on ${SERVER_NAME}');
     expect(email.body).toContain('Connection Point\nConnection Point ID: ${CP_ID}');
     expect(email.body).toContain('Old State: ${OLD_STATE}');
+    expect(email.body).toContain('Appliance ID: ${APPLIANCE_ID}');
     expect(slack.text).toBe(
       [
         '*${EVENT_TYPE}* on ${SERVER_NAME} at ${TIMESTAMP}',
@@ -168,6 +173,7 @@ describe('buildIntegrationSamples', () => {
   it('falls back to general variables for a category the backend has none for', () => {
     const { webhook } = buildIntegrationSamples(CATALOGUE, 'pipe');
     expect(Object.keys(webhook)).toEqual([
+      'appliance_id',
       'event_type',
       'timestamp',
       'server',
@@ -180,6 +186,15 @@ describe('buildIntegrationSamples', () => {
     const samples = buildIntegrationSamples(CATALOGUE, 'audit');
     expect(samples.webhook).toEqual(auditPayloadTemplate());
     expect(samples.stream).toEqual(auditPayloadTemplate());
+  });
+
+  it('leaves the full record and signed VP out of audit Email and Slack messages', () => {
+    const { email, slack } = buildIntegrationSamples(CATALOGUE, 'audit');
+    const used = placeholders({ email, slack });
+
+    expect(used).toContain('AUDIT_TRACE_ID');
+    expect(used).not.toContain('AUDIT_RECORD');
+    expect(used).not.toContain('AUDIT_VP_JWT');
   });
 });
 

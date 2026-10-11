@@ -1,6 +1,6 @@
 /* eslint-disable no-template-curly-in-string */
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import UserIntegrationsPage from '../UserIntegrationsPage';
@@ -120,6 +120,80 @@ describe('UserIntegrationsPage', () => {
       })
     );
     expect(await screen.findByText(/updated successfully/)).toBeInTheDocument();
+  });
+
+  it('shows a stored mapping whose integration is gone and saves once it is removed', async () => {
+    respond(() =>
+      Promise.resolve({
+        data: {
+          integration_integrations: [
+            { integration_id: 'int-deleted', variables: {}, event_types: ['user.created'] },
+            { integration_id: 'int-general', variables: {}, event_types: ['user.created'] },
+          ],
+        },
+      })
+    );
+    mockPut.mockResolvedValue({ data: {} });
+    renderPage();
+
+    const orphan = await screen.findByTestId('integration-0-unavailable');
+    expect(within(orphan).getByText('int-deleted')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Agent Watch'));
+    fireEvent.click(screen.getByTestId('integration-1-event-user.login'));
+    expect(saveButton()).toBeDisabled();
+
+    fireEvent.click(within(orphan).getByTitle('Remove integration'));
+    expect(saveButton()).toBeEnabled();
+    fireEvent.click(saveButton());
+
+    await waitFor(() =>
+      expect(mockPut).toHaveBeenCalledWith('/users/integrations', {
+        integration_integrations: [
+          {
+            integration_id: 'int-general',
+            variables: {},
+            event_types: ['user.created', 'user.login'],
+          },
+        ],
+      })
+    );
+  });
+
+  it('flags stored mappings to integrations user events cannot use', async () => {
+    mockGet.mockImplementation((url: string) => {
+      switch (url) {
+        case '/users/integrations':
+          return Promise.resolve({
+            data: {
+              integration_integrations: [
+                { integration_id: 'int-legacy', variables: {}, event_types: ['user.created'] },
+                { integration_id: 'int-tenant', variables: {}, event_types: ['user.created'] },
+              ],
+            },
+          });
+        case '/integrations':
+          return Promise.resolve({
+            data: [
+              { id: 'int-legacy', name: 'Legacy hook', type: 'webhook' },
+              {
+                id: 'int-tenant',
+                name: 'Tenant sink',
+                type: 'webhook',
+                category: 'general',
+                tenant_id: 'tenant-a',
+              },
+            ],
+          });
+        case '/integrations/config':
+          return Promise.resolve({ data: CONFIG });
+        default:
+          return Promise.reject(new Error(`unexpected GET ${url}`));
+      }
+    });
+    renderPage();
+
+    expect(await screen.findByTestId('integration-0-unavailable')).toBeInTheDocument();
+    expect(screen.getByTestId('integration-1-unavailable')).toBeInTheDocument();
   });
 
   it('shows a save failure instead of reporting success', async () => {

@@ -39,9 +39,9 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
           pipeline, and only while VP Auditing is enabled in Settings › Security.
         </p>
         <p className="mb-2">
-          To send every entry to Kafka, Kinesis, Pulsar, Redis Streams or a webhook as it is
-          written, add a Stream or Webhook integration in the <strong>Governance Audit</strong>{' '}
-          category. Forwarding is best-effort; this log stays the record of truth.
+          To send every entry to Kafka, Kinesis, Pulsar, Redis Streams, a webhook, email, or Slack
+          as it is written, add an integration in the <strong>Governance Audit</strong> category.
+          Forwarding is best-effort; this log stays the record of truth.
         </p>
         <p className="mb-1 fw-semibold">Categories</p>
         <ul className="mb-0 ps-3">

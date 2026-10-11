@@ -1,0 +1,29 @@
+branch: feat/integrations-fix
+changes:
+  added:
+    - timestamp: "2026-10-06T15:00:00.000Z"
+      title: Add an operator-set Appliance ID that fills ${APPLIANCE_ID} in integrations
+      description: >-
+        Settings › System Settings now has an Appliance ID (for example the appliance's id in
+        Agent Watch). Integration templates can use the general ${APPLIANCE_ID} variable, which
+        is filled only from that setting, never from event or caller values, and stays unfilled
+        while none is set. Every integration sample leads with appliance_id, matching Agent Stream.
+  changed:
+    - timestamp: "2026-10-06T15:00:00.000Z"
+      title: Allow Governance Audit integrations of any type, including Email and Slack
+      description: >-
+        Audit integrations are no longer limited to Stream and Webhook. The gateway accepts and
+        forwards to any active, appliance-wide audit integration, and the dashboard keeps the
+        chosen type when the Governance Audit category is selected, matching Agent Stream.
+        Email and Slack samples leave out the full record and signed VP.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: "2026-10-09T12:00:00.000Z"
+      title: Escape variable values in Slack messages so they cannot mention or link
+      description: >-
+        Slack integrations now escape &, < and > in substituted variable values. Caller-supplied
+        text, such as a JWT name or a registration username, can no longer render as a
+        channel-wide mention or a disguised link. Admin-written templates are unchanged.
+  breaking: []
+  internal: []

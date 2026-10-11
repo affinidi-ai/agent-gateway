@@ -47,8 +47,8 @@ configured destination.
 
 An integration with the category `general` serves every resource type. An integration with
 the category `audit` is a Governance Audit integration: it receives every record the audit
-log writes, must be a `stream` or `webhook` integration, cannot belong to a tenant, and
-never receives resource events. See
+log writes, may be of any type (Email and Slack send one message per record), cannot
+belong to a tenant, and never receives resource events. See
 [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
 ## Publishers
@@ -62,6 +62,10 @@ never receives resource events. See
 
 All four stream platforms are compiled into the binary; which one is used is a matter of
 configuration.
+
+Slack messages are sent as mrkdwn. Variable values have `&`, `<`, and `>` escaped before
+substitution, so caller-supplied text such as a JWT `name` claim cannot produce mentions
+(`<!channel>`) or links. The admin-written template is not escaped.
 
 ## Events
 
@@ -107,10 +111,11 @@ two of them, and on every event for the third.
 ### User and identity events
 
 User and identity events describe the whole appliance, so their trigger configurations
-(`PUT /v1/users/integrations`, `PUT /v1/identities/integrations`, validated in
-[`trigger_mappings.rs`](../src/integrations/trigger_mappings.rs)) accept only:
+(`/v1/users/integrations`, `/v1/identities/integrations`) can be read and changed only by an
+appliance-wide caller: a tenant or resource-scoped PAT gets `403` on `GET` and `PUT`, before
+any storage is touched. A `PUT` (validated in
+[`trigger_mappings.rs`](../src/integrations/trigger_mappings.rs)) accepts only:
 
-- An appliance-wide caller. A tenant or resource-scoped PAT gets `403`.
 - Integrations that exist, have no tenant owner, are not `audit`, and are in the
   resource's category (`user` or `identity`) or `general`.
 - Event types the resource raises, at least one per integration. An integration already
@@ -126,10 +131,12 @@ When an event is sent, tenant-owned integrations are skipped as well.
 
 ## Template variables
 
-Every event provides four variables, plus the resource's own.
+Every event provides four variables, plus the resource's own. `APPLIANCE_ID` is available
+to every category too.
 
 | Variable | Value |
 | --- | --- |
+| `APPLIANCE_ID` | The **Appliance ID** set in Settings › System Settings (`appliance_id` in `settings.json`), such as the appliance's id in Agent Watch. It never comes from event or trigger values, is never the appliance DID, and is unrelated to any Kafka topic name. While unset, `${APPLIANCE_ID}` is left unfilled. |
 | `EVENT_TYPE` | For example `gateway.created` |
 | `TIMESTAMP` | RFC 3339 |
 | `NEW_STATE` | The resource after the change, as JSON. Empty for a delete. |
@@ -148,6 +155,11 @@ variables for a template that needs them.
 
 Placeholders are filled in one pass: a substituted value is never scanned for placeholders
 again, so a value such as a username of `${_TOKEN}` stays literal.
+
+The placeholder syntax is `integration.variable_pattern` in `gateway.json`, and custom
+variables start with `integration.custom_variable_prefix` (default `_`). Both are fixed once at
+startup ([`runtime_variables.rs`](../src/integrations/runtime_variables.rs)); a pattern that
+is not a valid regular expression stops the gateway from starting.
 
 ## Outbound requests
 

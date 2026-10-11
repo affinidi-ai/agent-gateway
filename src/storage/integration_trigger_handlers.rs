@@ -1,7 +1,6 @@
 use axum::{Extension, Json, extract::Path, http::StatusCode, response::IntoResponse};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
@@ -12,16 +11,6 @@ use crate::integrations::trigger_integrations;
 use crate::storage::integration_handlers::AuditCaller;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource};
 
-/// Global storage for variable pattern from config
-static VARIABLE_PATTERN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(r"\$\{([^:}]+)(?::[^}]+)?\}".to_string()));
-
-/// Update the variable pattern from config (called during startup)
-pub fn set_variable_pattern(pattern: String) {
-    if let Ok(mut p) = VARIABLE_PATTERN.write() {
-        *p = pattern;
-    }
-}
-
 /// Substitute template variables in a string
 fn substitute_variables(
     template: &str,
@@ -29,18 +18,15 @@ fn substitute_variables(
 ) -> String {
     let mut result = template.to_string();
 
-    // Get pattern from global config
-    let pattern = VARIABLE_PATTERN
-        .read()
-        .unwrap()
-        .clone();
-    let re = regex::Regex::new(&pattern).unwrap();
-    for cap in re.captures_iter(template) {
+    for cap in crate::integrations::runtime_variables::patterns()
+        .regex
+        .captures_iter(template)
+    {
         let var_name = cap[1].trim();
         let placeholder = &cap[0];
 
-        if let Some(value) = variables.get(var_name) {
-            result = result.replace(placeholder, value);
+        if let Some(value) = crate::integrations::runtime_variables::variable_value(var_name, variables) {
+            result = result.replace(placeholder, &value);
         }
     }
 

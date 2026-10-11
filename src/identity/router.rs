@@ -122,7 +122,7 @@ pub fn create_identity_api_router(
     listener_manager: Option<std::sync::Arc<crate::gateways::ConnectionPointListenerManager>>,
     message_store: Option<std::sync::Arc<crate::gateways::MessageStore>>,
     pending_connection_store: std::sync::Arc<crate::gateways::PendingConnectionStore>,
-    integration_storage: Option<std::sync::Arc<crate::storage::IntegrationStorage>>,
+    integration_storage: std::sync::Arc<crate::storage::IntegrationStorage>,
     jwt_verification_strategy_store: Option<std::sync::Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     jwks_client: Option<std::sync::Arc<crate::jwt_bearer::JwksClient>>,
     issuer_store: Option<std::sync::Arc<crate::issuers::FileSystemIssuerStore>>,
@@ -928,7 +928,7 @@ pub fn create_identity_api_router(
         Router::new()
     };
 
-    let integration_storage_for_gateways = integration_storage.clone();
+    let integration_storage_for_gateways = Some(integration_storage.clone());
 
     // Create gateway routes if store is provided
     let gateway_router = if let Some(ref store) = gateway_store {
@@ -1269,7 +1269,7 @@ pub fn create_identity_api_router(
     // These clones will be used for the mediator router layers
     let connection_point_store_for_mediator = connection_point_store.clone();
     let listener_manager_for_mediator = listener_manager.clone();
-    let integration_storage_for_connection_points = integration_storage.clone();
+    let integration_storage_for_connection_points = Some(integration_storage.clone());
     let surface_store_for_connection_points = state
         .agent_surface_store
         .clone();
@@ -1828,20 +1828,16 @@ pub fn create_identity_api_router(
         Router::new()
     };
 
-    // Create integration routes if storage is provided
-    let integration_router = match integration_storage {
-        Some(storage) => crate::storage::integration_handlers::integration_router(
-            storage,
-            passkey_storage_for_manager
-                .as_ref()
-                .map(|auth_storage| {
-                    crate::auth_manager::middleware::RbacGuard::new(auth_storage.clone(), rbac_config.clone())
-                }),
-            state.config.clone(),
-            state.bootstrap_config.clone(),
-        ),
-        None => Router::new(),
-    };
+    let integration_router = crate::storage::integration_handlers::integration_router(
+        integration_storage,
+        passkey_storage_for_manager
+            .as_ref()
+            .map(|auth_storage| {
+                crate::auth_manager::middleware::RbacGuard::new(auth_storage.clone(), rbac_config.clone())
+            }),
+        state.config.clone(),
+        state.bootstrap_config.clone(),
+    );
 
     // Create trust registry routes if store is provided
     let trust_registry_router = if let Some(store) = trust_registry_store {

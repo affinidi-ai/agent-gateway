@@ -92,7 +92,7 @@ export interface AccessTokenMeta {
   last_used_at?: string;
   expires_at?: string;
   revoked_at?: string;
-  rotation_generation?: number;
+  rotation_generation: number;
   rotated_at?: string;
   rotated_by?: string;
   active: boolean;
@@ -771,6 +771,7 @@ export interface Settings {
     trust_checks?: boolean;
     identity?: boolean;
   };
+  appliance_id?: string; // Fills ${APPLIANCE_ID}; empty leaves it unfilled
 }
 
 /** Per-user settings overrides (display preferences only) */

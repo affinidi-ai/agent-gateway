@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import IdentityIntegrationsPage from '../IdentityIntegrationsPage';
@@ -26,6 +26,7 @@ const CONFIG = {
       metadata: {
         event_types: [
           { event_type: 'identity.created', name: 'Identity Created', description: 'Created' },
+          { event_type: 'identity.updated', name: 'Identity Updated', description: 'Updated' },
         ],
       },
     },
@@ -83,6 +84,43 @@ describe('IdentityIntegrationsPage', () => {
 
     fireEvent.click(screen.getByTestId('integration-0-event-identity.created'));
     expect(saveButton()).toBeEnabled();
+  });
+
+  it('shows a stored mapping whose integration is gone and saves once it is removed', async () => {
+    respond(() =>
+      Promise.resolve({
+        data: {
+          integration_integrations: [
+            { integration_id: 'int-deleted', variables: {}, event_types: ['identity.created'] },
+            { integration_id: 'int-general', variables: {}, event_types: ['identity.created'] },
+          ],
+        },
+      })
+    );
+    mockPut.mockResolvedValue({ data: {} });
+    renderPage();
+
+    const orphan = await screen.findByTestId('integration-0-unavailable');
+    expect(within(orphan).getByText('int-deleted')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Agent Watch'));
+    fireEvent.click(screen.getByTestId('integration-1-event-identity.updated'));
+    expect(saveButton()).toBeDisabled();
+
+    fireEvent.click(within(orphan).getByTitle('Remove integration'));
+    expect(saveButton()).toBeEnabled();
+    fireEvent.click(saveButton());
+
+    await waitFor(() =>
+      expect(mockPut).toHaveBeenCalledWith('/identities/integrations', {
+        integration_integrations: [
+          {
+            integration_id: 'int-general',
+            variables: {},
+            event_types: ['identity.created', 'identity.updated'],
+          },
+        ],
+      })
+    );
   });
 
   it('shows a save failure instead of reporting success', async () => {

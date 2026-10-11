@@ -6,7 +6,7 @@ use tracing::error;
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::PatResourceScope;
 use crate::config::BootstrapConfig;
-use crate::integrations::trigger_mappings::{Caller, MappingsRequest, replace_mappings};
+use crate::integrations::trigger_mappings::{Caller, MappingsRequest, ensure_appliance_wide_caller, replace_mappings};
 use crate::integrations::user_integration_triggers::USER_MAPPING_RULES;
 use crate::integrations::user_integrations_storage::UserIntegrationsStorage;
 use crate::storage::IntegrationStorage;
@@ -15,8 +15,18 @@ use crate::tenancy::PatTenantContext;
 /// GET /api/v1/users/integrations
 /// Get the current user integrations configuration
 pub async fn get_user_integrations(
-    Extension(config): Extension<Arc<BootstrapConfig>>
+    Extension(config): Extension<Arc<BootstrapConfig>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    ensure_appliance_wide_caller(
+        context
+            .as_ref()
+            .map(|Extension(context)| context),
+        scope
+            .as_ref()
+            .map(|Extension(scope)| scope),
+    )?;
     let storage_path = std::path::PathBuf::from(
         &config
             .storage_paths

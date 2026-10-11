@@ -4,12 +4,44 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tracing::Level;
 use tracing::field::{Field, Visit};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 
-pub(crate) type AuditEvent = HashMap<String, String>;
+use super::thread_subscriber::set_thread_default;
+
+/// One captured event: its level and its fields rendered as strings.
+#[derive(Clone)]
+pub(crate) struct AuditEvent {
+    pub(crate) level: Level,
+    fields: HashMap<String, String>,
+}
+
+impl AuditEvent {
+    pub(crate) fn get(
+        &self,
+        field: &str,
+    ) -> Option<&str> {
+        self.fields
+            .get(field)
+            .map(String::as_str)
+    }
+}
+
+impl std::ops::Index<&str> for AuditEvent {
+    type Output = String;
+
+    fn index(
+        &self,
+        field: &str,
+    ) -> &String {
+        self.fields
+            .get(field)
+            .unwrap_or_else(|| panic!("audit event has no `{field}` field"))
+    }
+}
 
 pub(crate) struct AuditEvents {
     events: Arc<Mutex<Vec<AuditEvent>>>,
@@ -22,7 +54,7 @@ impl AuditEvents {
         let subscriber = tracing_subscriber::registry().with(AuditLayer(events.clone()));
         Self {
             events,
-            _guard: tracing::subscriber::set_default(subscriber),
+            _guard: set_thread_default(subscriber),
         }
     }
 
@@ -35,12 +67,7 @@ impl AuditEvents {
             .lock()
             .unwrap()
             .iter()
-            .filter(|event| {
-                event
-                    .get("event")
-                    .map(String::as_str)
-                    == Some(name)
-            })
+            .filter(|event| event.get("event") == Some(name))
             .cloned()
             .collect()
     }
@@ -62,11 +89,14 @@ impl<S: tracing::Subscriber> Layer<S> for AuditLayer {
         self.0
             .lock()
             .unwrap()
-            .push(fields.0);
+            .push(AuditEvent {
+                level: *event.metadata().level(),
+                fields: fields.0,
+            });
     }
 }
 
-struct FieldCollector(AuditEvent);
+struct FieldCollector(HashMap<String, String>);
 
 impl Visit for FieldCollector {
     fn record_str(

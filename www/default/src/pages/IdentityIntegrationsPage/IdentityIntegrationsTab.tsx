@@ -216,6 +216,7 @@ const IdentityIntegrationsTab: React.FC<IdentityIntegrationsTabProps> = ({
         category="identity"
         availableEventTypes={availableEventTypes}
         requireEventTypes
+        applianceWide
       />
     </div>
   );

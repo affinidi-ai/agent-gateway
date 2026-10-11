@@ -1,0 +1,49 @@
+branch: fix/fabric-stream-cap-429
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-08T08:53:14.000Z'
+      title: Answer Fabric stream-cap refusals with 429 and Retry-After
+      description: >-
+        A modern MCP request refused because a framed Fabric stream cap is full on the sending
+        gateway now gets `429` with `Retry-After: 5` and a JSON-RPC error body on both Access Points
+        and Transit Points, instead of `502` or `UpstreamConnectionFailed`. Senders also recognise a
+        new `capacity_reached` stream error code and answer it with `429`, and treat any stream
+        error code they do not recognise as `unavailable` instead of dropping the frame. Receivers
+        still refuse a full cap with `unavailable` (`502`), because a 1.0.0 sender cannot parse
+        `capacity_reached` and would hold its stream until the response deadline.
+    - timestamp: '2026-10-08T08:53:14.000Z'
+      title: Give forwarded Fabric listens their own per-peer and per-surface budget
+      description: >-
+        Forwarded `subscriptions/listen` streams now count against their own caps (8 per peer, 16
+        per surface) apart from request streams, so a partner's long-lived listens no longer use
+        up the slots its other modern MCP requests need. The effective ceilings double: one peer
+        can hold 16 inbound streams and one surface 32. The total of 128 streams per direction
+        still counts both.
+    - timestamp: '2026-10-08T14:00:00.000Z'
+      title: Log which Fabric stream cap refused a stream and for which peer
+      description: >-
+        A stream refused by a full Fabric cap is logged at `warn` as `Fabric stream cap reached`
+        with the peer DID, surface, stream kind, direction and which cap was hit (`total`,
+        `per_peer`, `per_surface` or `open_replay`), and the receiver's `Rejecting Fabric Open`
+        warning carries the sending peer's DID, so refusals for one partner can be traced. A
+        refused Open left unanswered because 16 refusals are already awaiting an answer is now
+        logged at `warn` instead of `debug`.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-08T11:30:00.000Z'
+      title: Test the Access Point answer to a full Fabric stream cap
+      description: >-
+        The Access Point's mapping of modern Fabric transport failures to responses is now its own
+        function, with a unit test that a full stream cap answers 429 with Retry-After while a
+        transport failure keeps 502 and a timeout keeps 504.
+    - timestamp: '2026-10-08T14:00:00.000Z'
+      title: Test the Transit Point answer to modern Fabric failures
+      description: >-
+        The Transit Point's mapping of modern Fabric failures to pipeline errors is now its own
+        function, tested so a full cap keeps the request id and answers 429 while other failures
+        keep their status, and the listen-budget test checks a slot is admitted again once held
+        streams end.

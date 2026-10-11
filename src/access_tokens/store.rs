@@ -147,9 +147,10 @@ impl FsAccessTokenStore {
     }
 
     /// Atomically replaces the token file, readable only by the owner. Once the
-    /// rename has replaced the file the record counts as written: a failed directory
-    /// sync is logged and the call succeeds, so the cache always matches the file
-    /// that readers and a restarted gateway see.
+    /// rename has replaced the file the record counts as written, so the cache matches
+    /// what a restarted process reads. If only the directory sync fails, the failure is
+    /// logged and the call succeeds; a power loss before the directory reaches disk can
+    /// then roll the file back to its previous content.
     async fn persist(
         &self,
         token: &AccessToken,
@@ -408,27 +409,33 @@ impl FsAccessTokenStore {
         Ok(RotateOutcome::Rotated(Box::new(token)))
     }
 
-    /// Records a use of the secret whose hash is `authenticated_hash`. Skips the write
-    /// when the token was rotated after that secret was checked, so an old-secret use
-    /// never lands on the rotated record.
+    /// Records a use of the secret whose hash is `authenticated_hash` and reports
+    /// whether that secret still belongs to an active record. Returns false when the
+    /// token was rotated or deactivated after the secret was checked, so an old-secret
+    /// use never lands on the rotated record. A use inside the persist interval skips
+    /// the mutation lock and only re-checks the cached record.
     async fn touch_last_used(
         &self,
         id: &str,
         authenticated_hash: &str,
-    ) {
+    ) -> bool {
+        if self.persisted_recently(id, std::time::Instant::now()) {
+            return self
+                .cache
+                .get(id)
+                .is_some_and(|entry| Self::is_current(entry.value(), authenticated_hash));
+        }
         let mutation_lock = self.mutation_lock(id);
         let _guard = mutation_lock.lock().await;
-        let now = std::time::Instant::now();
-        if let Some(previous) = self.last_persist.get(id)
-            && now.duration_since(*previous.value()) < LAST_USED_PERSIST_INTERVAL
-        {
-            return;
-        }
-        let Some(mut token) = self.get(id) else {
-            return;
+        let Some(mut token) = self
+            .get(id)
+            .filter(|token| Self::is_current(token, authenticated_hash))
+        else {
+            return false;
         };
-        if token.token_hash != authenticated_hash || !token.is_active(Utc::now()) {
-            return;
+        let now = std::time::Instant::now();
+        if self.persisted_recently(id, now) {
+            return true;
         }
         self.last_persist
             .insert(id.to_string(), now);
@@ -438,6 +445,24 @@ impl FsAccessTokenStore {
         }
         self.cache
             .insert(token.id.clone(), token);
+        true
+    }
+
+    fn persisted_recently(
+        &self,
+        id: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        self.last_persist
+            .get(id)
+            .is_some_and(|previous| now.duration_since(*previous.value()) < LAST_USED_PERSIST_INTERVAL)
+    }
+
+    fn is_current(
+        token: &AccessToken,
+        authenticated_hash: &str,
+    ) -> bool {
+        constant_time_eq(&token.token_hash, authenticated_hash) && token.is_active(Utc::now())
     }
 
     fn find_by_secret(
@@ -553,8 +578,12 @@ impl PatAuthenticator for FsAccessTokenStore {
         let resource_scope = self
             .compiled_scope_for(&record)
             .ok()?;
-        self.touch_last_used(&record.id, &record.token_hash)
-            .await;
+        if !self
+            .touch_last_used(&record.id, &record.token_hash)
+            .await
+        {
+            return None;
+        }
         Some(PatPrincipal {
             user_id: record.user_id,
             scopes: (!record.scopes.is_empty()).then_some(record.scopes),
@@ -568,6 +597,7 @@ impl PatAuthenticator for FsAccessTokenStore {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::task::Poll;
 
     use chrono::Duration;
 
@@ -840,7 +870,7 @@ mod tests {
 
         drop(guard);
         revoke.await.unwrap();
-        touch.await.unwrap();
+        assert!(!touch.await.unwrap());
 
         assert!(
             store
@@ -1246,9 +1276,11 @@ mod tests {
                 .unwrap(),
             RotateOutcome::Rotated(_)
         ));
-        store
-            .touch_last_used(&authenticated.id, &authenticated.token_hash)
-            .await;
+        assert!(
+            !store
+                .touch_last_used(&authenticated.id, &authenticated.token_hash)
+                .await
+        );
 
         assert_eq!(
             store
@@ -1281,6 +1313,117 @@ mod tests {
                 .last_used_at
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn authentication_waiting_on_a_rotation_rejects_the_old_secret() {
+        let store = Arc::new(store().await);
+        let old_secret = "agpat_waiting_old";
+        let new_secret = "agpat_waiting_new";
+        let token = record(&hash_secret(old_secret), vec![]);
+        let id = token.id.clone();
+        store
+            .create(token)
+            .await
+            .unwrap();
+
+        let mutation_lock = store.mutation_lock(&id);
+        let guard = mutation_lock.lock().await;
+
+        let rotate_store = store.clone();
+        let rotate_id = id.clone();
+        let rotate = tokio::spawn(async move {
+            rotate_store
+                .rotate(&rotate_id, "admin-1", 0, hash_secret(new_secret))
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+
+        let mut authenticate = Box::pin(store.authenticate(old_secret));
+        assert!(futures::poll!(authenticate.as_mut()).is_pending());
+
+        drop(guard);
+        assert!(authenticate.await.is_none());
+        assert!(matches!(rotate.await.unwrap(), RotateOutcome::Rotated(_)));
+        assert_eq!(
+            store
+                .get(&id)
+                .unwrap()
+                .last_used_at,
+            None
+        );
+        assert!(
+            store
+                .authenticate(new_secret)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_use_inside_the_persist_interval_does_not_wait_on_the_token_lock() {
+        let store = store().await;
+        let secret = "agpat_fast_path";
+        let token = record(&hash_secret(secret), vec![]);
+        let id = token.id.clone();
+        store
+            .create(token)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .authenticate(secret)
+                .await
+                .is_some()
+        );
+
+        let mutation_lock = store.mutation_lock(&id);
+        let _guard = mutation_lock.lock().await;
+
+        let mut authenticate = Box::pin(store.authenticate(secret));
+        assert!(matches!(futures::poll!(authenticate.as_mut()), Poll::Ready(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn a_use_inside_the_persist_interval_is_refused_once_the_cached_record_changes() {
+        let store = store().await;
+        let secret = "agpat_fast_path_stale";
+        let authenticated_hash = hash_secret(secret);
+        let token = record(&authenticated_hash, vec![]);
+        let id = token.id.clone();
+        store
+            .create(token)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .authenticate(secret)
+                .await
+                .is_some()
+        );
+
+        let mutation_lock = store.mutation_lock(&id);
+        let _guard = mutation_lock.lock().await;
+
+        // Rotate and revoke update the cache before clearing the persist time, so a
+        // lock-free use can see the new record while the interval still applies.
+        let mut rotated = store.get(&id).unwrap();
+        rotated.token_hash = hash_secret("agpat_fast_path_rotated");
+        store
+            .cache
+            .insert(id.clone(), rotated);
+        let mut touch = Box::pin(store.touch_last_used(&id, &authenticated_hash));
+        assert!(matches!(futures::poll!(touch.as_mut()), Poll::Ready(false)));
+
+        let mut revoked = store.get(&id).unwrap();
+        revoked.token_hash = authenticated_hash.clone();
+        revoked.revoked_at = Some(Utc::now());
+        store
+            .cache
+            .insert(id.clone(), revoked);
+        let mut touch = Box::pin(store.touch_last_used(&id, &authenticated_hash));
+        assert!(matches!(futures::poll!(touch.as_mut()), Poll::Ready(false)));
     }
 
     #[cfg(unix)]

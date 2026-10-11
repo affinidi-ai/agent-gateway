@@ -100,7 +100,7 @@ fn register_resource_limit_counters(
     delegation_vault_store: &Option<Arc<crate::delegation_vault::storage::FileSystemDelegationVaultStore>>,
     mcp_proxy_store: &Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
     a2a_proxy_store: &Option<Arc<crate::a2a_proxies::FileSystemA2aProxyStore>>,
-    integration_storage: &Option<Arc<crate::storage::IntegrationStorage>>,
+    integration_storage: &Arc<crate::storage::IntegrationStorage>,
 ) {
     use crate::config::register_counter;
     use crate::credential_providers::storage::CredentialProviderStorage as _;
@@ -292,18 +292,16 @@ fn register_resource_limit_counters(
     }
 
     // integrations — notifier definitions.
-    if let Some(store) = integration_storage {
-        let s = store.clone();
-        register_counter("integrations", move || {
-            let s = s.clone();
-            async move {
-                s.list()
-                    .await
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-            }
-        });
-    }
+    let s = integration_storage.clone();
+    register_counter("integrations", move || {
+        let s = s.clone();
+        async move {
+            s.list()
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0)
+        }
+    });
 }
 
 fn count_remote_gateways(gateways: Vec<crate::gateways::types::Gateway>) -> usize {
@@ -2257,7 +2255,7 @@ pub async fn run_axum_proxy(
         }
 
         // Initialize integration storage
-        let integration_storage: Option<Arc<crate::storage::IntegrationStorage>> = {
+        let integration_storage: Arc<crate::storage::IntegrationStorage> = {
             let storage = crate::storage::IntegrationStorage::new(PathBuf::from(
                 &bootstrap_config
                     .storage_paths
@@ -2279,9 +2277,9 @@ pub async fn run_axum_proxy(
             // Validate all active integrations
             crate::integrations::validation::validate_all_integrations(&storage_arc).await;
 
-            Some(storage_arc)
+            storage_arc
         };
-        identity_state.integration_store = integration_storage.clone();
+        identity_state.integration_store = Some(integration_storage.clone());
 
         // Register appliance resource-limit counters now that every entity store
         // has been constructed. `credentials.jwt`, `secrets.apikeys`, and

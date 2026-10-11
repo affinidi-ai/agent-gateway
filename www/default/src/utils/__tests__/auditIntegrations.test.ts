@@ -1,7 +1,6 @@
-import { auditPayloadTemplate, selectableCategories, selectableTypes } from '../auditIntegrations';
+import { auditPayloadTemplate, selectableCategories } from '../auditIntegrations';
 
 const categories = [{ enum_value: 'general' }, { enum_value: 'audit' }, { enum_value: 'gateway' }];
-const types = ['email', 'slack', 'webhook', 'stream'].map(enum_value => ({ enum_value }));
 const values = (items: { enum_value: string }[]) => items.map(item => item.enum_value);
 
 describe('selectableCategories', () => {
@@ -9,30 +8,12 @@ describe('selectableCategories', () => {
     expect(values(selectableCategories(categories, true))).toEqual(['general', 'audit', 'gateway']);
     expect(values(selectableCategories(categories, false))).toEqual(['general', 'gateway']);
   });
-
-  it('offers the audit category only to Stream and Webhook integrations', () => {
-    expect(values(selectableCategories(categories, true, 'stream'))).toContain('audit');
-    expect(values(selectableCategories(categories, true, 'webhook'))).toContain('audit');
-    expect(values(selectableCategories(categories, true, 'email'))).toEqual(['general', 'gateway']);
-    expect(values(selectableCategories(categories, true, 'slack'))).toEqual(['general', 'gateway']);
-  });
-});
-
-describe('selectableTypes', () => {
-  it('limits the audit category to Stream and Webhook and leaves others alone', () => {
-    expect(values(selectableTypes(types, 'audit'))).toEqual(['webhook', 'stream']);
-    expect(values(selectableTypes(types, 'general'))).toEqual([
-      'email',
-      'slack',
-      'webhook',
-      'stream',
-    ]);
-  });
 });
 
 describe('auditPayloadTemplate', () => {
   it('embeds the full record alongside the routing fields', () => {
     expect(auditPayloadTemplate()).toEqual({
+      appliance_id: '${APPLIANCE_ID}', // eslint-disable-line no-template-curly-in-string
       event_type: '${EVENT_TYPE}', // eslint-disable-line no-template-curly-in-string
       category: '${AUDIT_CATEGORY}', // eslint-disable-line no-template-curly-in-string
       timestamp: '${TIMESTAMP}', // eslint-disable-line no-template-curly-in-string

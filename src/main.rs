@@ -404,13 +404,7 @@ async fn async_main() -> Result<()> {
         info!("✓ Encryption at rest ENABLED - whole-file storage encryption active");
     }
 
-    // Initialize variable patterns from config for runtime use
-    crate::storage::integration_trigger_handlers::set_variable_pattern(
-        config
-            .integration
-            .variable_pattern
-            .clone(),
-    );
+    // Fix the template-variable syntax before anything substitutes or validates a template
     crate::integrations::runtime_variables::set_variable_patterns(
         config
             .integration
@@ -420,7 +414,7 @@ async fn async_main() -> Result<()> {
             .integration
             .custom_variable_prefix
             .clone(),
-    );
+    )?;
 
     info!("Initialized variable patterns from config");
 

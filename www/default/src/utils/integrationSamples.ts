@@ -24,24 +24,29 @@ export interface IntegrationSamples {
 const GENERAL_CATEGORY = 'general';
 
 /** General variables summarising the event, in display order. */
-const SUMMARY_VARIABLES = ['EVENT_TYPE', 'TIMESTAMP', 'SERVER_NAME', 'MESSAGE_ID'];
+const SUMMARY_VARIABLES = ['APPLIANCE_ID', 'EVENT_TYPE', 'TIMESTAMP', 'SERVER_NAME', 'MESSAGE_ID'];
 
 /** JSON keys for the summary variables in Stream/Webhook payloads. */
 const SUMMARY_KEYS: Record<string, string> = {
+  APPLIANCE_ID: 'appliance_id',
   EVENT_TYPE: 'event_type',
   TIMESTAMP: 'timestamp',
   SERVER_NAME: 'server',
   MESSAGE_ID: 'message_id',
 };
 
+/** Variables too large for an Email or Slack message. */
+const MESSAGE_EXCLUDED_VARIABLES = ['AUDIT_RECORD', 'AUDIT_VP_JWT'];
+
 const placeholder = (name: string): string => `\${${name}}`;
 
 /**
- * User events carry only what correlates them: the event, its time, and the user's id, role
- * and status. Names, emails and the state blocks stay on the appliance unless an operator
- * adds them.
+ * User events carry only what correlates them: the appliance, the event, its time, and the
+ * user's id, role and status. Names, emails and the state blocks stay on the appliance unless
+ * an operator adds them.
  */
 const userPayloadTemplate = (): Record<string, unknown> => ({
+  appliance_id: placeholder('APPLIANCE_ID'),
   event_type: placeholder('EVENT_TYPE'),
   timestamp: placeholder('TIMESTAMP'),
   user: {
@@ -76,6 +81,7 @@ export function buildIntegrationSamples(
       ? { label: '', variables: [] }
       : categoryVariables(catalogue, category);
   const specific = own.variables.filter(v => !generalByName.has(v.name));
+  const messageSpecific = specific.filter(v => !MESSAGE_EXCLUDED_VARIABLES.includes(v.name));
   const summary = SUMMARY_VARIABLES.flatMap(name => generalByName.get(name) ?? []);
   const state = ['OLD_STATE', 'NEW_STATE'].flatMap(n => generalByName.get(n) ?? []);
   const has = (name: string) => generalByName.has(name);
@@ -100,8 +106,8 @@ export function buildIntegrationSamples(
 
   const bodySections = [
     summary.map(v => `${v.label}: ${placeholder(v.name)}`),
-    specific.length > 0
-      ? [own.label, ...specific.map(v => `${v.label}: ${placeholder(v.name)}`)]
+    messageSpecific.length > 0
+      ? [own.label, ...messageSpecific.map(v => `${v.label}: ${placeholder(v.name)}`)]
       : [],
     state.map(v => `${v.label}: ${placeholder(v.name)}`),
   ].filter(section => section.length > 0);
@@ -117,7 +123,9 @@ export function buildIntegrationSamples(
     stream: { ...json },
     email: { subject, body: bodySections.map(lines => lines.join('\n')).join('\n\n') },
     slack: {
-      text: [headline, ...specific.map(v => `• *${v.label}:* ${placeholder(v.name)}`)].join('\n'),
+      text: [headline, ...messageSpecific.map(v => `• *${v.label}:* ${placeholder(v.name)}`)].join(
+        '\n'
+      ),
     },
   };
 }

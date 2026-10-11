@@ -126,7 +126,7 @@ pub async fn validate_mappings(
     }
     let prefix = crate::integrations::runtime_variables::custom_variable_prefix();
     for mapping in &mappings {
-        validate_variables(&mapping.variables, &prefix)?;
+        validate_variables(&mapping.variables, prefix)?;
         validate_event_types(mapping, rules, previously_unfiltered)?;
         ensure_attachable(integrations, &mapping.integration_id, rules).await?;
     }

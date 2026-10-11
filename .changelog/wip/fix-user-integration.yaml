@@ -7,8 +7,14 @@ changes:
   changed:
     - timestamp: '2026-10-08T16:50:00.000Z'
       title: Start new user Stream and Webhook integrations with a minimal payload
-      description: The suggested payload for a user integration now holds only the event type, timestamp and the user's id, role and status. Usernames, emails and the before and after state are left out unless an operator adds them.
+      description: The suggested payload for a user integration now holds only the appliance id, event type, timestamp and the user's id, role and status. Usernames, emails and the before and after state are left out unless an operator adds them.
   fixed:
+    - timestamp: '2026-10-11T09:00:00.000Z'
+      title: Stop startup on an invalid integration variable pattern
+      description: An invalid integration.variable_pattern was silently ignored for substitution but crashed template validation later, and a failed lock read delivered placeholders as literal text with no log. The pattern and custom prefix are now fixed once at startup, an invalid pattern stops the gateway with a clear error, and every reader uses the same compiled pattern.
+    - timestamp: '2026-10-09T13:00:00.000Z'
+      title: Show integrations that can no longer be attached so they can be removed
+      description: A stored mapping whose integration was deleted, re-categorised or given a tenant was invisible on the integration pages but still sent on save, so the user and identity pages could not be saved once the API began refusing such mappings. These now show as NOT AVAILABLE rows with a Remove button and block Save until removed, and the selector offers only integrations the page can attach.
     - timestamp: '2026-10-08T16:20:00.000Z'
       title: ⭐ Attach an integration to events as soon as it is selected
       description: Choosing an integration on the gateway, connection point, user and identity integration pages did nothing, so Save stayed disabled and no events could be wired up. Selecting one now attaches it with its template's custom variables, opens it to choose events, and removes it from the selector.
@@ -20,6 +26,9 @@ changes:
       description: Save stays disabled until every attached integration names at least one event, matching the API, and missing custom variables are checked against the integration's template.
   removed: []
   security:
+    - timestamp: '2026-10-09T12:00:00.000Z'
+      title: Refuse tenant and resource-scoped tokens reading user and identity mappings
+      description: GET /v1/users/integrations and /v1/identities/integrations returned the appliance-wide mappings, custom variable values included, to any caller with integrations.view, so a tenant or resource-scoped token could read what it may not change. Both now return 403 to such tokens before touching storage, like the PUT routes.
     - timestamp: '2026-10-08T17:40:00.000Z'
       title: ⭐ Keep the primary administrator's role across SAML sign-ins
       description: Every SAML sign-in overwrote the stored role with the identity provider's, so the primary administrator, made Administrator on first sign-in, was demoted to User on the next sign-in whenever the identity provider sent no administrator role. The primary administrator now keeps the role, and a sign-in that would have changed it logs a warning.
@@ -40,6 +49,9 @@ changes:
       description: User events (created, approved, updated, deleted, login, accessed) put the whole user record into OLD_STATE and NEW_STATE, including passkey credentials, the SAML subject, email, names, department, job title and avatar path. They now carry only user_id, role, status, is_primary, created_at and updated_at, and trigger logs name the user by id instead of username.
   breaking: []
   internal:
+    - timestamp: '2026-10-09T14:00:00.000Z'
+      title: Require integration storage when building the management API router
+      description: The identity API router took the integration store as optional and mounted no integration routes without it, so the user and identity mapping routes could silently disappear. Startup always creates the store, so the router now requires it and always mounts those routes; a component test checks the management API serves both mapping routes.
     - timestamp: '2026-10-09T09:00:00.000Z'
       title: Ignore the MCP record compatibility test that fails in the full run
       description: every_stored_surface_admits_modern_and_legacy_mcp passes alone but fails in the full test run, on main as well, because its gateway refuses connections after other tests change the process-wide server mode. It is ignored until the isolation is fixed.
