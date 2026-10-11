@@ -53,6 +53,20 @@ impl FileSystemGatewayStore {
         Ok(store)
     }
 
+    /// Persist an explicit exposure mode on every remote record that predates
+    /// it, keeping the access it had. Returns how many records changed.
+    pub async fn migrate_exposure_modes(&self) -> Result<usize> {
+        let mut migrated = 0usize;
+        for mut gateway in self.list_all().await? {
+            if gateway.migrate_exposure_mode() {
+                tracing::info!(gateway_id = %gateway.id, mode = ?gateway.exposure_mode, "Migrating remote gateway exposure mode");
+                self.update(&gateway).await?;
+                migrated += 1;
+            }
+        }
+        Ok(migrated)
+    }
+
     /// Reconcile the in-memory cache with the shared-storage directory, so a
     /// node promoted from standby recompiles gateway OPA from the active
     /// writer's latest gateway records rather than a stale boot snapshot.
@@ -167,5 +181,77 @@ mod tests {
 
         assert_eq!(by_did.issuer_did, Some("did:web:peer.example".to_string()));
         assert_eq!(reopened.issuer_did, Some("did:web:peer.example".to_string()));
+    }
+
+    fn legacy_remote(
+        did: &str,
+        exposed_channels: &[&str],
+    ) -> Gateway {
+        let mut gateway = Gateway::new("peer".into(), String::new(), did.into(), GatewayType::Remote);
+        gateway.exposure_mode = None;
+        gateway.exposed_channels = exposed_channels
+            .iter()
+            .map(|surface| surface.to_string())
+            .collect();
+        gateway
+    }
+
+    #[tokio::test]
+    async fn migrate_exposure_modes_persists_the_previous_access() {
+        use crate::gateways::types::ExposureMode;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), Some("did:web:self.example".to_string()))
+            .await
+            .expect("store");
+        let open = legacy_remote("did:web:open.example", &[]);
+        let listed = legacy_remote("did:web:listed.example", &["alpha"]);
+        let mut closed = legacy_remote("did:web:closed.example", &[]);
+        closed.exposure_mode = Some(ExposureMode::None);
+        for gateway in [&open, &listed, &closed] {
+            store
+                .create(gateway)
+                .await
+                .expect("create");
+        }
+
+        let migrated = store
+            .migrate_exposure_modes()
+            .await
+            .expect("migrate");
+        let reopened = FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+            .await
+            .expect("reopen");
+        let mode_of = async |id: &str| {
+            reopened
+                .get(id)
+                .await
+                .expect("get")
+                .expect("record")
+        };
+
+        assert_eq!(migrated, 2);
+        assert_eq!(
+            mode_of(&open.id)
+                .await
+                .exposure_mode,
+            Some(ExposureMode::All)
+        );
+        let listed_after = mode_of(&listed.id).await;
+        assert_eq!(listed_after.exposure_mode, Some(ExposureMode::List));
+        assert_eq!(listed_after.exposed_channels, vec!["alpha".to_string()]);
+        assert_eq!(
+            mode_of(&closed.id)
+                .await
+                .exposure_mode,
+            Some(ExposureMode::None)
+        );
+        assert_eq!(
+            reopened
+                .migrate_exposure_modes()
+                .await
+                .expect("second run"),
+            0,
+            "a second run is a no-op"
+        );
     }
 }

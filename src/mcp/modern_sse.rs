@@ -97,8 +97,13 @@ struct ResponseObserver<Complete: FnOnce(ResponseOutcome)> {
 
 impl<Complete: FnOnce(ResponseOutcome)> Drop for ResponseObserver<Complete> {
     fn drop(&mut self) {
-        if let Some(complete) = self.complete.take() {
+        let Some(complete) = self.complete.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
             complete(self.outcome);
+        } else {
+            tracing::warn!("Response dropped outside the async runtime; completion skipped");
         }
     }
 }
@@ -2124,6 +2129,34 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn response_dropped_outside_a_runtime_skips_its_completion_without_panicking() {
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = completed.clone();
+        let response = observe_response(axum::response::Response::new(axum::body::Body::empty()), move |_| {
+            tokio::spawn(async {});
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        drop(response);
+
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn response_dropped_inside_a_runtime_runs_its_completion() {
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = completed.clone();
+        let response = observe_response(axum::response::Response::new(axum::body::Body::empty()), move |_| {
+            tokio::spawn(async {});
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        drop(response);
+
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

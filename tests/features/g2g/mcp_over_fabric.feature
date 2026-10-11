@@ -209,3 +209,11 @@ Feature: MCP requests travel across gateways over fabric
     Then all 50 responses have status 200
     And each MCP response matches the request that produced it
     And MCP server "bravo" received 50 forwarded MCP requests
+
+  Scenario: A newly paired peer reaches nothing until a surface is exposed
+    Given gateway 1 and gateway 2 have just been paired
+    And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
+    And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha" that is not exposed to it
+    When the caller asks gateway 1 surface "charlie" for available MCP tools
+    Then the response status is 403
+    And MCP server "bravo" was not called

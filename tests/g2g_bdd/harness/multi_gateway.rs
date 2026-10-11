@@ -419,7 +419,8 @@ impl MultiGatewayHarness {
     }
 
     /// Point `from_gw`'s `surface_id` at `to_gw`'s `peer_surface_id` over the
-    /// fabric, then publish `peer_surface_id` as an exposed surface on `to_gw`.
+    /// fabric and, when `expose` is set, expose `peer_surface_id` to `from_gw`
+    /// on `to_gw`.
     ///
     /// The fabric target is applied via the surface admin API (GET → patch
     /// `target.endpoint` → PUT) rather than a file rewrite + config reload:
@@ -432,6 +433,7 @@ impl MultiGatewayHarness {
         surface_id: &str,
         to_gw: usize,
         peer_surface_id: &str,
+        expose: bool,
     ) -> Result<()> {
         let remote_id = self
             .remote_id(from_gw, to_gw)
@@ -455,17 +457,10 @@ impl MultiGatewayHarness {
         tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
 
         // Publish the destination surface so the receiving gateway accepts fabric forwards to it.
-        let to = self.gw(to_gw);
-        let self_gw = to
-            .admin
-            .find_self_gateway()
-            .await
-            .with_context(|| format!("locate gateway {to_gw} self gateway"))?;
-        to.admin
-            .update_gateway_exposed_surfaces(&self_gw.id, vec![peer_surface_id.to_string()])
-            .await
-            .with_context(|| format!("publish exposed surface {peer_surface_id} on gateway {to_gw}"))?;
-        tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
+        if expose {
+            self.expose_surface_to_peer(to_gw, from_gw, peer_surface_id)
+                .await?;
+        }
         Ok(())
     }
 
@@ -548,16 +543,40 @@ impl MultiGatewayHarness {
             })?;
         tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
 
-        let to = self.gw(to_gw);
-        let self_gw = to
-            .admin
-            .find_self_gateway()
+        self.expose_surface_to_peer(to_gw, from_gw, peer_surface_id)
             .await
-            .with_context(|| format!("locate gateway {to_gw} self gateway"))?;
-        to.admin
-            .update_gateway_exposed_surfaces(&self_gw.id, vec![peer_surface_id.to_string()])
+    }
+
+    /// Add `surface_id` to the surfaces `gw_index` exposes to `peer_gw`, in
+    /// list mode, keeping the surfaces already exposed to it.
+    pub async fn expose_surface_to_peer(
+        &self,
+        gw_index: usize,
+        peer_gw: usize,
+        surface_id: &str,
+    ) -> Result<()> {
+        let peer_id = self
+            .remote_id(gw_index, peer_gw)
+            .map(str::to_string)
+            .with_context(|| {
+                format!("no remote gateway id for gateway {peer_gw} on gateway {gw_index}; federate first")
+            })?;
+        let admin = &self.gw(gw_index).admin;
+        let mut exposed = admin
+            .get_gateway(&peer_id)
             .await
-            .with_context(|| format!("publish exposed surface {peer_surface_id} on gateway {to_gw}"))?;
+            .with_context(|| format!("read gateway {peer_gw} record on gateway {gw_index}"))?
+            .exposed_surfaces;
+        if !exposed
+            .iter()
+            .any(|exposed| exposed == surface_id)
+        {
+            exposed.push(surface_id.to_string());
+        }
+        admin
+            .update_gateway_exposed_surfaces(&peer_id, exposed)
+            .await
+            .with_context(|| format!("expose surface {surface_id} to gateway {peer_gw} on gateway {gw_index}"))?;
         tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
         Ok(())
     }

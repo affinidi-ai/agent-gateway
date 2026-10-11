@@ -108,6 +108,7 @@ fn gateway() -> crate::gateways::types::Gateway {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         exposed_channels: Vec::new(),
+        exposure_mode: None,
         opa_policy_config: Some(GatewayOpaPolicyConfig {
             enabled: true,
             policy: "package gateway.policy\ndefault allow = true".into(),

@@ -7,7 +7,8 @@
 //! caller's `Accept` makes the request SSE-shaped. A `text/event-stream`
 //! passthrough is not buffered and keeps streaming past that idle deadline,
 //! except a `tools/list` answered as SSE, which is buffered for tool gating and
-//! gets the same bounds.
+//! gets the same bounds. The passthrough itself ends at the surface's
+//! `mcp_http` stream idle timeout and maximum lifetime.
 //! The same bounds apply to every other protocol's buffered responses, shown
 //! here for A2A.
 
@@ -192,6 +193,79 @@ async fn access_point_keeps_streaming_an_sse_passthrough_past_the_idle_deadline(
 
     assert!(received.contains("notifications/progress"), "{received}");
     assert!(started.elapsed() >= Duration::from_secs(2), "result arrived after {:?}", started.elapsed());
+}
+
+fn sse_stream_limits(
+    idle_secs: u64,
+    lifetime_secs: u64,
+) -> AgentSurface {
+    let mut surface = access_point_surface(None);
+    surface.mcp_http = Some(
+        serde_json::from_value(json!({
+            "stream_idle_timeout_secs": idle_secs,
+            "stream_max_lifetime_secs": lifetime_secs
+        }))
+        .expect("McpHttpConfig JSON"),
+    );
+    surface
+}
+
+async fn read_sse_passthrough_until_it_ends(url: &str) -> (String, Duration) {
+    let started = Instant::now();
+    let mut response = sse_shaped_request(url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut received = String::new();
+    while let Some(chunk) = tokio::time::timeout(STALL_BUDGET, response.chunk())
+        .await
+        .expect("SSE passthrough must end at its stream limit")
+        .unwrap()
+    {
+        received.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    (received, started.elapsed())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_point_ends_a_quiet_sse_passthrough_at_the_stream_idle_timeout() {
+    let progress =
+        r#"data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":1}}"#;
+    let mock =
+        MockServer::start_with_streamed_body("text/event-stream", vec![(Duration::ZERO, format!("{progress}\n\n"))])
+            .await;
+    let harness = GatewayHarness::start_with_mock(mock, |_, config, _| {
+        config.surfaces = vec![sse_stream_limits(1, 60)];
+    })
+    .await;
+
+    let (received, elapsed) = read_sse_passthrough_until_it_ends(&harness.gateway_url).await;
+
+    assert!(received.contains("notifications/progress"), "{received}");
+    assert!(elapsed >= Duration::from_secs(1), "stream ended after {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_point_ends_a_busy_sse_passthrough_at_the_stream_lifetime() {
+    let chunks = (0..20)
+        .map(|n| {
+            let event = json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                "params": {"progressToken": 1, "progress": n}});
+            (Duration::from_millis(if n == 0 { 0 } else { 300 }), format!("data: {event}\n\n"))
+        })
+        .collect();
+    let mock = MockServer::start_with_streamed_body("text/event-stream", chunks).await;
+    let harness = GatewayHarness::start_with_mock(mock, |_, config, _| {
+        config.surfaces = vec![sse_stream_limits(1, 2)];
+    })
+    .await;
+
+    let (received, elapsed) = read_sse_passthrough_until_it_ends(&harness.gateway_url).await;
+
+    assert!(received.contains(r#""progress":0"#), "{received}");
+    assert!(!received.contains(r#""progress":19"#), "stream outlived its lifetime: {received}");
+    assert!(elapsed >= Duration::from_secs(2), "stream ended after {elapsed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

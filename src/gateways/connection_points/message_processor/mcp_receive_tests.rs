@@ -8,7 +8,7 @@ use crate::component_tests::helpers::MockServer;
 use crate::config::agent_surface::AgentSurface;
 use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
 use crate::gateways::test_helpers::install_listener_manager_with_peers;
-use crate::gateways::types::{Gateway, GatewayType};
+use crate::gateways::types::{ExposureMode, Gateway, GatewayType};
 use crate::gateways::{FileSystemGatewayStore, GatewayStore};
 use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
 use crate::messages::MessageType;
@@ -29,6 +29,7 @@ fn remote_peer(
         connection_point_did.to_string(),
         GatewayType::Remote,
     );
+    peer.exposure_mode = Some(ExposureMode::All);
     peer.issuer_did = issuer_did.map(str::to_string);
     peer.trusted_issuer_dids = trusted_issuer_dids
         .iter()
@@ -380,13 +381,11 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     )
     .await
     .unwrap();
+    let mut sender =
+        Gateway::new("Sender".to_string(), String::new(), "did:web:sender.example".to_string(), GatewayType::Remote);
+    sender.exposure_mode = Some(ExposureMode::All);
     gateway_store
-        .create(&Gateway::new(
-            "Sender".to_string(),
-            String::new(),
-            "did:web:sender.example".to_string(),
-            GatewayType::Remote,
-        ))
+        .create(&sender)
         .await
         .unwrap();
     let surface: AgentSurface = serde_json::from_value(json!({

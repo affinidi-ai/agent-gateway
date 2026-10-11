@@ -131,6 +131,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             exposed_channels: Vec::new(),
+            exposure_mode: None,
             opa_policy_config: policy.map(|p| GatewayOpaPolicyConfig {
                 enabled: true,
                 policy: p.to_string(),

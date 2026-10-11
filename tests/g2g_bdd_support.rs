@@ -31,6 +31,7 @@ fn topology_with_link(
         from_surface: "charlie".to_string(),
         to_gw: 2,
         to_surface: "alpha".to_string(),
+        exposed: true,
     };
     (topology, link)
 }
@@ -140,6 +141,15 @@ fn fabric_route_probe_uses_a2a_body_for_a2a_sources() {
         fabric_route_probe(&topology, &link, FabricRouteProbeStage::AfterPolicies).expect("probe should be built");
 
     assert_eq!(probe.body["method"], "message/send");
+}
+
+#[test]
+fn fabric_route_probe_skips_a_link_whose_target_is_not_exposed() {
+    let (topology, mut link) = topology_with_link("mcp", target_surface());
+    link.exposed = false;
+
+    assert!(fabric_route_probe(&topology, &link, FabricRouteProbeStage::AfterPolicies).is_none());
+    assert!(fabric_route_probe(&topology, &link, FabricRouteProbeStage::BeforeBlockingPolicies).is_none());
 }
 
 #[test]

@@ -3058,6 +3058,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                         created_at: temp_connection_point.created_at,
                         updated_at: chrono::Utc::now(),
                         exposed_channels: Vec::new(),
+                        exposure_mode: Some(crate::gateways::types::ExposureMode::None),
                         opa_policy_config: None,
                     }
                 }
@@ -3186,6 +3187,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                 created_at: pending_conn.created_at,
                 updated_at: chrono::Utc::now(),
                 exposed_channels: Vec::new(),
+                exposure_mode: Some(crate::gateways::types::ExposureMode::None),
                 opa_policy_config: None,
             })
         })

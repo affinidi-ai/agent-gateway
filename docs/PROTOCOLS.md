@@ -423,7 +423,13 @@ card that fails the bounds is treated as missing.
 An SSE stream the Gateway parses event by event rather than buffering whole (an MCP
 `text/event-stream` passthrough, and Legacy SSE sessions) holds at most `[a2a] max_body_size` of
 one incomplete event (the default 10 MB for Legacy SSE sessions). An event that grows past that
-ends the stream, and a Legacy SSE session ends with it.
+ends the stream, and a Legacy SSE session ends with it. An MCP `text/event-stream` passthrough also
+ends when the upstream sends nothing for the surface's `mcp_http.stream_idle_timeout_secs` (default
+60 s) or is still streaming at `mcp_http.stream_max_lifetime_secs` (default 3600 s).
+
+The gateway holds at most 10,000 Legacy SSE sessions (`GET /sse` on `proxy://` and `fabric://`
+surfaces, and on standalone MCP proxies). A `GET /sse` beyond that, after sessions whose client has
+disconnected are dropped, is answered with HTTP `429` "Too many active SSE sessions".
 
 - A body larger than `[a2a] max_body_size` (default 10 MB, which also caps requests) is answered
   with HTTP `502` "Upstream response too large".

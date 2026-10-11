@@ -172,7 +172,7 @@ Gateway OPA runs before surface-level or transit-level OPA, and a gateway deny i
 
 | Term               | Meaning                                                                                                                                                               |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Gateway record** | A stored record describing one gateway: its DID, type, status, exposed surfaces, and gateway-level OPA policy. The persisted `exposed_channels` field is a legacy code/wire name for exposed surfaces. Distinct from a Gateway instance. |
+| **Gateway record** | A stored record describing one gateway: its DID, type, status, exposure mode and exposed surfaces, and gateway-level OPA policy. The persisted `exposed_channels` field is a legacy code/wire name for exposed surfaces. Distinct from a Gateway instance. |
 | **Self gateway**   | The Gateway record representing the local Gateway instance.                                                                                                           |
 | **Remote gateway** | A Gateway record representing a peer Gateway instance in the fabric.                                                                                                  |
 | **Issuer**         | The ownership unit for surfaces. Carries a DID and DID document.                                                                                                      |

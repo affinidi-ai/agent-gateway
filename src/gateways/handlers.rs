@@ -15,7 +15,7 @@ use super::GatewayStore;
 use super::connection_points::ConnectionPointStore;
 use super::connection_points::ws_listener::{ConnectionPointListenerManager, ListenerInfo};
 use super::surface_cache::GatewaySurfaceCache;
-use super::types::{Gateway, GatewayStatus, GatewayType};
+use super::types::{ExposureMode, Gateway, GatewayStatus, GatewayType};
 use crate::auth::storage::PasskeyStorage;
 use crate::auth::types::UserRole;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
@@ -84,10 +84,29 @@ pub struct TrustedIssuerRequest {
     pub issuer_did: String,
 }
 
-/// Request body for updating exposed channels
+/// Request body for updating a remote gateway's exposure. Without
+/// `exposure_mode`, a non-empty list selects `list` and an empty one `none`.
 #[derive(Debug, Deserialize)]
 pub struct UpdateExposedChannelsRequest {
+    #[serde(default)]
+    pub exposure_mode: Option<ExposureMode>,
+    #[serde(default)]
     pub exposed_channels: Vec<String>,
+}
+
+impl UpdateExposedChannelsRequest {
+    fn mode(&self) -> ExposureMode {
+        self.exposure_mode.unwrap_or(
+            if self
+                .exposed_channels
+                .is_empty()
+            {
+                ExposureMode::None
+            } else {
+                ExposureMode::List
+            },
+        )
+    }
 }
 
 fn authorize_gateway_delete(
@@ -408,15 +427,21 @@ pub async fn update_gateway_exposed_surfaces<S: GatewayStore>(
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
+    if gateway.gateway_type != GatewayType::Remote {
+        return Err((StatusCode::BAD_REQUEST, "Exposure applies only to remote gateways".to_string()));
+    }
+    let mode = req.mode();
+    let exposed_channels = if mode == ExposureMode::List {
+        req.exposed_channels
+    } else {
+        Vec::new()
+    };
 
-    if !req
-        .exposed_channels
-        .is_empty()
-    {
+    if !exposed_channels.is_empty() {
         let surface_store = surface_store
             .as_ref()
             .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Surface store not configured".to_string()))?;
-        for surface_id in &req.exposed_channels {
+        for surface_id in &exposed_channels {
             let surface = surface_store
                 .get(surface_id)
                 .await
@@ -435,7 +460,8 @@ pub async fn update_gateway_exposed_surfaces<S: GatewayStore>(
         }
     }
 
-    gateway.exposed_channels = req.exposed_channels;
+    gateway.exposure_mode = Some(mode);
+    gateway.exposed_channels = exposed_channels;
     gateway.updated_at = chrono::Utc::now();
 
     store
@@ -948,7 +974,10 @@ mod tests {
                 Path(id),
                 context,
                 None,
-                Json(UpdateExposedChannelsRequest { exposed_channels: Vec::new() }),
+                Json(UpdateExposedChannelsRequest {
+                    exposure_mode: Some(ExposureMode::All),
+                    exposed_channels: Vec::new(),
+                }),
             )
         };
 
@@ -984,6 +1013,82 @@ mod tests {
                 .is_ok(),
             "an appliance-wide caller is unaffected"
         );
+    }
+
+    async fn update_exposure(
+        store: &Arc<crate::gateways::FileSystemGatewayStore>,
+        id: &str,
+        body: serde_json::Value,
+    ) -> Result<Json<Gateway>, (StatusCode, String)> {
+        update_gateway_exposed_surfaces(
+            Extension(store.clone()),
+            Extension(None),
+            Path(id.to_string()),
+            None,
+            None,
+            Json(serde_json::from_value(body).expect("valid exposure request")),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn exposure_update_stores_the_mode_and_clears_the_list_outside_list_mode() {
+        let mut gateway = remote_gateway();
+        gateway.exposure_mode = Some(ExposureMode::List);
+        gateway.exposed_channels = vec!["alpha".into()];
+        let (store, _dir) = gateway_store_with(&gateway).await;
+
+        for (mode, expected) in [("all", ExposureMode::All), ("none", ExposureMode::None)] {
+            let Json(updated) = update_exposure(
+                &store,
+                &gateway.id,
+                serde_json::json!({ "exposure_mode": mode, "exposed_channels": ["alpha"] }),
+            )
+            .await
+            .expect("update");
+            assert_eq!(updated.exposure_mode, Some(expected));
+            assert!(
+                updated
+                    .exposed_channels
+                    .is_empty(),
+                "{mode}"
+            );
+            let stored = store
+                .get(&gateway.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.exposure_mode, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn exposure_update_without_a_mode_never_means_all() {
+        let gateway = remote_gateway();
+        let (store, _dir) = gateway_store_with(&gateway).await;
+
+        let Json(updated) = update_exposure(&store, &gateway.id, serde_json::json!({ "exposed_channels": [] }))
+            .await
+            .expect("update");
+
+        assert_eq!(updated.exposure_mode, Some(ExposureMode::None));
+        assert!(!updated.exposes_surface("alpha"));
+    }
+
+    #[tokio::test]
+    async fn exposure_update_rejects_an_unknown_mode_and_the_self_gateway() {
+        assert!(
+            serde_json::from_value::<UpdateExposedChannelsRequest>(serde_json::json!({ "exposure_mode": "some" }))
+                .is_err()
+        );
+        let (store, _dir) = gateway_store_with(&remote_gateway()).await;
+        let self_id = self_gateway_id(&store).await;
+
+        let err = update_exposure(&store, &self_id, serde_json::json!({ "exposure_mode": "all" }))
+            .await
+            .expect_err("the self gateway has no exposure");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     async fn self_gateway_id(store: &crate::gateways::FileSystemGatewayStore) -> String {

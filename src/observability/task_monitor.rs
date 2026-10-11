@@ -236,39 +236,6 @@ impl TaskMonitor {
         }
     }
 
-    /// Reset stale active connections (cleanup method)
-    pub async fn reset_stale_active_connections(&self) {
-        let mut tasks = self.tasks.write().await;
-        let now = Utc::now();
-
-        for task in tasks.values_mut() {
-            // Reset active connections if last activity was more than 2 minutes ago
-            if let Some(last_activity) = task.last_activity {
-                let inactive_duration = (now - last_activity).num_seconds();
-                if inactive_duration > 120 {
-                    // 2 minutes
-                    if task.active_connections > 0 {
-                        tracing::warn!(
-                            "Resetting {} stale active connections for task {} (inactive for {} seconds)",
-                            task.active_connections,
-                            task.task_id,
-                            inactive_duration
-                        );
-                        task.active_connections = 0;
-                    }
-                }
-            } else if task.active_connections > 0 {
-                // No last activity recorded but has active connections - reset them
-                tracing::warn!(
-                    "Resetting {} orphaned active connections for task {} (no activity recorded)",
-                    task.active_connections,
-                    task.task_id
-                );
-                task.active_connections = 0;
-            }
-        }
-    }
-
     /// Reset task activity windows when settings change
     #[allow(dead_code)]
     pub async fn reset_activity_windows(&self) {
@@ -558,10 +525,6 @@ impl TaskMonitor {
 
     /// Get summary statistics for all tasks
     pub async fn get_summary(&self) -> TaskStatsSummary {
-        // Clean up stale connections before generating summary
-        self.reset_stale_active_connections()
-            .await;
-
         let tasks = self.tasks.read().await;
 
         // Note: total_tasks only counts channel tasks
@@ -627,5 +590,114 @@ impl TaskMonitor {
 impl Default for TaskMonitor {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+#[cfg(test)]
+impl TaskInfo {
+    /// A running task with no connections or traffic yet.
+    pub(crate) fn running(task_id: &str) -> Self {
+        let now = Utc::now();
+        Self {
+            task_id: task_id.into(),
+            config_id: None,
+            channel_name: task_id.into(),
+            transit_point: None,
+            listen_address: "127.0.0.1:0".into(),
+            target_endpoint: String::new(),
+            started_at: now,
+            status: TaskStatus::Running,
+            total_connections: 0,
+            active_connections: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            last_activity: None,
+            error_count: 0,
+            recent_bytes_sent: 0,
+            recent_bytes_received: 0,
+            recent_window_start: now,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(
+        task_id: &str,
+        active_connections: u64,
+        last_activity: Option<DateTime<Utc>>,
+    ) -> TaskInfo {
+        TaskInfo {
+            total_connections: active_connections,
+            active_connections,
+            last_activity,
+            ..TaskInfo::running(task_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_keeps_connections_that_have_been_idle_for_minutes() {
+        let monitor = TaskMonitor::new(None);
+        monitor
+            .register_task(task("idle-stream", 2, Some(Utc::now() - chrono::Duration::minutes(10))))
+            .await;
+        monitor
+            .register_task(task("no-activity", 1, None))
+            .await;
+
+        let summary = monitor.get_summary().await;
+
+        assert_eq!(summary.total_active_connections, 3);
+        assert_eq!(
+            monitor
+                .get_task("idle-stream")
+                .await
+                .unwrap()
+                .active_connections,
+            2
+        );
+        assert_eq!(
+            monitor
+                .get_task("no-activity")
+                .await
+                .unwrap()
+                .active_connections,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn active_connections_drop_only_when_released_and_never_below_zero() {
+        let monitor = TaskMonitor::new(None);
+        monitor
+            .register_task(task("stream", 0, None))
+            .await;
+
+        monitor
+            .increment_connections("stream")
+            .await;
+        assert_eq!(
+            monitor
+                .get_summary()
+                .await
+                .total_active_connections,
+            1
+        );
+
+        monitor
+            .decrement_active_connections("stream")
+            .await;
+        monitor
+            .decrement_active_connections("stream")
+            .await;
+        assert_eq!(
+            monitor
+                .get_summary()
+                .await
+                .total_active_connections,
+            0
+        );
     }
 }
