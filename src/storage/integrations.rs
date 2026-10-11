@@ -134,10 +134,18 @@ impl IntegrationStorage {
         &self,
         id: &str,
     ) -> Result<Integration> {
-        self.storage
-            .get(id)
+        self.find(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Integration not found: {}", id))
+    }
+
+    /// The integration with `id`, or `None` when there is none. An error means the store could
+    /// not answer: an invalid id, or a record it failed to read, decrypt or parse.
+    pub async fn find(
+        &self,
+        id: &str,
+    ) -> Result<Option<Integration>> {
+        self.storage.get(id).await
     }
 
     pub async fn delete(

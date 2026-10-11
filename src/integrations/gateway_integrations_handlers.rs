@@ -147,12 +147,11 @@ pub async fn update_gateway_integrations(
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Integration store not configured" })))
     })?;
     for assignment in &payload.integration_integrations {
-        let integration = integration_store
-            .load(&assignment.integration_id)
-            .await
-            .map_err(|_| {
-                (StatusCode::BAD_REQUEST, Json(json!({ "error": "Integration reference is not accessible" })))
-            })?;
+        let integration = crate::integrations::trigger_mappings::load_referenced_integration(
+            &integration_store,
+            &assignment.integration_id,
+        )
+        .await?;
         ensure_linkable(gateway.tenant_id.as_deref(), &integration, &context, &scope)?;
     }
     info!(

@@ -9,6 +9,9 @@ changes:
       title: Start new user Stream and Webhook integrations with a minimal payload
       description: The suggested payload for a user integration now holds only the appliance id, event type, timestamp and the user's id, role and status. Usernames, emails and the before and after state are left out unless an operator adds them.
   fixed:
+    - timestamp: '2026-10-11T16:00:00.000Z'
+      title: Report unreadable integrations as server errors when saving mappings
+      description: Saving gateway, user or identity integration mappings turned any failure to load a referenced integration, including a corrupt or undecryptable record, into a 400 saying the reference was not accessible, with nothing logged. Unknown or malformed ids still get that 400; a record the store cannot read now gets a 500 and is logged with the integration id.
     - timestamp: '2026-10-11T09:00:00.000Z'
       title: Stop startup on an invalid integration variable pattern
       description: An invalid integration.variable_pattern was silently ignored for substitution but crashed template validation later, and a failed lock read delivered placeholders as literal text with no log. The pattern and custom prefix are now fixed once at startup, an invalid pattern stops the gateway with a clear error, and every reader uses the same compiled pattern.

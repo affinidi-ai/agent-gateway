@@ -195,16 +195,38 @@ fn validate_event_types(
     }
 }
 
+/// The integration a mapping references. A malformed or unknown id is the caller's mistake
+/// (400); a record the store cannot read is a server failure (500), logged here.
+pub(crate) async fn load_referenced_integration(
+    integrations: &IntegrationStorage,
+    integration_id: &str,
+) -> Result<crate::storage::Integration, Rejection> {
+    if crate::storage::validate_storage_id(integration_id).is_err() {
+        return Err(not_accessible());
+    }
+    match integrations
+        .find(integration_id)
+        .await
+    {
+        Ok(Some(integration)) => Ok(integration),
+        Ok(None) => Err(not_accessible()),
+        Err(error) => {
+            error!(integration_id = ?integration_id, %error, "Failed to load a referenced integration");
+            Err(reject(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load integrations"))
+        }
+    }
+}
+
+fn not_accessible() -> Rejection {
+    reject(StatusCode::BAD_REQUEST, "Integration reference is not accessible")
+}
+
 async fn ensure_attachable(
     integrations: &IntegrationStorage,
     integration_id: &str,
     rules: &MappingRules,
 ) -> Result<(), Rejection> {
-    let not_accessible = || reject(StatusCode::BAD_REQUEST, "Integration reference is not accessible");
-    let integration = integrations
-        .load(integration_id)
-        .await
-        .map_err(|_| not_accessible())?;
+    let integration = load_referenced_integration(integrations, integration_id).await?;
     if integration
         .tenant_id
         .is_some()
@@ -247,7 +269,7 @@ mod tests {
     };
 
     struct Fixture {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         store: IntegrationStorage,
     }
 
@@ -257,7 +279,21 @@ mod tests {
             let store = IntegrationStorage::new(dir.path().to_path_buf())
                 .await
                 .expect("integration storage");
-            Self { _dir: dir, store }
+            Self { dir, store }
+        }
+
+        /// Writes a record the store cannot parse, as a corrupted or truncated file would be.
+        fn corrupt(
+            &self,
+            integration_id: &str,
+        ) {
+            std::fs::write(
+                self.dir
+                    .path()
+                    .join(format!("{integration_id}.json")),
+                "{not json",
+            )
+            .expect("write corrupt record");
         }
 
         async fn add(
@@ -372,6 +408,67 @@ mod tests {
                 .await,
             StatusCode::BAD_REQUEST,
             "Integration reference is not accessible",
+        );
+    }
+
+    fn status_and_error(result: Result<Integration, Rejection>) -> (StatusCode, String) {
+        let (status, body) = result.expect_err("the reference is refused");
+        let error = body.0["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (status, error)
+    }
+
+    #[tokio::test]
+    async fn a_referenced_integration_that_exists_is_loaded() {
+        let fixture = Fixture::new().await;
+        let id = fixture
+            .add("user", None)
+            .await;
+
+        let integration = load_referenced_integration(&fixture.store, &id)
+            .await
+            .expect("loaded");
+
+        assert_eq!(integration.id, id);
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_malformed_reference_is_refused_as_inaccessible() {
+        let fixture = Fixture::new().await;
+
+        for id in ["missing", "../escape", ""] {
+            assert_eq!(
+                status_and_error(load_referenced_integration(&fixture.store, id).await),
+                (StatusCode::BAD_REQUEST, "Integration reference is not accessible".to_string()),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_referenced_integration_is_a_server_error() {
+        let fixture = Fixture::new().await;
+        fixture.corrupt("broken");
+
+        assert_eq!(
+            status_and_error(load_referenced_integration(&fixture.store, "broken").await),
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load integrations".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_integration_refuses_the_mapping_with_a_server_error() {
+        let fixture = Fixture::new().await;
+        fixture.corrupt("broken");
+
+        assert_rejected(
+            fixture
+                .validate(vec![mapping("broken")])
+                .await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load integrations",
         );
     }
 

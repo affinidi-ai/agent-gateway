@@ -108,6 +108,12 @@ and lists, for each attached integration:
 So one Slack integration can be attached to three gateways, fire on `status_changed` for
 two of them, and on every event for the third.
 
+Saving a trigger configuration loads every integration it names
+([`trigger_mappings.rs`](../src/integrations/trigger_mappings.rs)). An unknown or malformed
+id is refused with `400` "Integration reference is not accessible". A record the store
+cannot read, decrypt, or parse is a server failure: `500` "Failed to load integrations",
+logged with the integration id, and nothing is saved.
+
 ### User and identity events
 
 User and identity events describe the whole appliance, so their trigger configurations
