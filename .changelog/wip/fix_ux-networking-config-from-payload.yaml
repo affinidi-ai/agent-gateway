@@ -1,0 +1,15 @@
+branch: fix/ux-networking-config-from-payload
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-11T00:00:00.000Z'
+      title: Show the Networking settings of a surface configured through the API
+      description: The surface builder's Networking element converted its panel settings to the stored shape on save but could not read the stored shape back, so a surface whose `target.networking` was set through the API (or by another tool) showed Networking as unconfigured with empty fields, although the timeouts, retries and circuit breaker were in force. The element now reads the stored timeout, retry (including retryable status codes), circuit breaker and mirror settings into the panel, on the surface and on each transit point. Settings that are not stored stay off; no defaults are filled in.
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: '2026-10-11T00:00:01.000Z'
+      title: Test reading the Networking element back from its stored shape
+      description: Adds round-trip tests (panel settings to stored shape and back, and stored shape to panel settings and back), a test that a payload in the shape Boris sends is not reported incomplete, and empty-payload cases. Corrects the element round-trip test, which asserted the unconverted stored shape.

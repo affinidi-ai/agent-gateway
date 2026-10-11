@@ -64,6 +64,57 @@ export function networkingConfigToWire(c: any): Record<string, any> | undefined 
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * Inverse of `networkingConfigToWire`: convert the wire-format
+ * NetworkingConfig (`target.networking` or `transit.points[].networking`)
+ * back into the panel's flat config. Numeric fields become strings (the
+ * panel inputs are text). Missing blocks stay absent, so the sub-feature
+ * is off and no default is invented for a value that was never set.
+ */
+export function networkingConfigFromWire(w: any): Record<string, any> {
+  const out: Record<string, any> = {};
+  if (!w || typeof w !== 'object') return out;
+  const has = (v: unknown) => v !== undefined && v !== null;
+  const put = (key: string, v: unknown) => {
+    if (has(v)) out[key] = String(v);
+  };
+  const t = w.timeout;
+  if (t && typeof t === 'object') {
+    put('timeout_secs', t.request_secs);
+    put('connect_timeout_secs', t.connect_secs);
+    put('idle_timeout_secs', t.idle_secs);
+  }
+  const r = w.retry;
+  if (r && typeof r === 'object') {
+    out.retry_enabled = true;
+    put('retry_max', r.max_attempts);
+    put('retry_initial_backoff_ms', r.initial_backoff_ms);
+    put('retry_max_backoff_ms', r.max_backoff_ms);
+    put('retry_backoff_multiplier', r.backoff_multiplier);
+    if (Array.isArray(r.retryable_status_codes) && r.retryable_status_codes.length > 0) {
+      out.retry_status_codes = r.retryable_status_codes.join(',');
+    }
+  }
+  const cb = w.circuit_breaker;
+  if (cb && typeof cb === 'object') {
+    out.circuit_breaker_enabled = true;
+    put('cb_threshold', cb.failure_threshold);
+    put('cb_recovery_secs', cb.timeout_secs);
+    put('cb_success_threshold', cb.success_threshold);
+    put('cb_window_secs', cb.window_secs);
+  }
+  const m = w.mirror;
+  if (m && typeof m === 'object') {
+    out.mirror_enabled = true;
+    out.mirror_endpoint = has(m.endpoint) ? String(m.endpoint) : '';
+    put('mirror_percentage', m.percentage);
+    // Inverse of the wait_for_response mapping in networkingConfigToWire.
+    if (has(m.wait_for_response)) out.mirror_async = !m.wait_for_response;
+    put('mirror_timeout_secs', m.timeout_secs);
+  }
+  return out;
+}
+
 export const networkingDefinition: NodeDefinition = {
   type: 'networking',
   label: 'Networking',
@@ -144,6 +195,7 @@ export const networkingDefinition: NodeDefinition = {
   ],
   ConfigPanel: NetworkingPanel,
   payloadPath: 'target.networking',
+  configFromPayload: slice => networkingConfigFromWire(slice),
   // Pre-fill sensible defaults for every numeric option so toggling
   // a sub-feature on (retry / circuit breaker / mirror) gives a working
   // configuration immediately, with no empty fields to interpret.
