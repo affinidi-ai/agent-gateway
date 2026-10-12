@@ -16,3 +16,6 @@ changes:
     - timestamp: '2026-10-11T00:00:01.000Z'
       title: Test reading the Networking element back from its stored shape
       description: Adds round-trip tests (panel settings to stored shape and back, and stored shape to panel settings and back), a test that a payload in the shape an AI agent writes through the management API is not reported incomplete, empty-payload and malformed-block cases, and canvas tests that Networking set through the API on the Target and on a Transit Point is shown configured and saved unchanged, including after a save and a reload. Corrects the element round-trip test, which asserted the unconverted stored shape.
+    - timestamp: '2026-10-12T11:00:00.000Z'
+      title: Test the caller-scoped tool gate on the fabric send leg
+      description: The fabric send leg's tools/list filter and tools/call gate now build their condition input in one function, so they cannot drift apart again. Unit tests show that a gate condition on the caller's source authentication lists and admits a granted tool, hides it from other callers and from an unauthenticated request, and that the input carries the identity binding but no credential headers.
