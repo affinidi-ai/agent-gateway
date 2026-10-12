@@ -149,6 +149,23 @@ impl IdentityResolutionError {
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
+/// What an upstream response body carries, for identity resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityResponseKind {
+    /// A protocol message or JSON-RPC result.
+    Message,
+    /// A public agent card served on discovery, which has no inbound caller.
+    PublicAgentCard,
+    /// An extended agent card, which is always fetched by an authenticated caller.
+    ExtendedAgentCard,
+}
+
+impl IdentityResponseKind {
+    pub fn is_agent_card(self) -> bool {
+        !matches!(self, Self::Message)
+    }
+}
+
 /// Resolve the protected agent's identity from a response.
 ///
 /// - Returns `Ok(Anonymous)` when `managed_identity` is **not** configured (identity management disabled).
@@ -163,7 +180,7 @@ pub async fn resolve_protected_agent_identity(
     identity_selector: Option<&Arc<crate::identity::IdentitySelector>>,
     identity_rules_engine: Option<&Arc<crate::proxy::RulesEngine>>,
     channel_name: &str,
-    is_agent_card: bool,
+    response_kind: IdentityResponseKind,
     source_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
     resolve_agent_identity_for_slot(
@@ -173,7 +190,7 @@ pub async fn resolve_protected_agent_identity(
         identity_selector,
         identity_rules_engine,
         channel_name,
-        is_agent_card,
+        response_kind,
         source_identity,
     )
     .await
@@ -192,7 +209,7 @@ pub async fn resolve_external_agent_identity(
     identity_selector: Option<&Arc<crate::identity::IdentitySelector>>,
     identity_rules_engine: Option<&Arc<crate::proxy::RulesEngine>>,
     channel_name: &str,
-    is_agent_card: bool,
+    response_kind: IdentityResponseKind,
     source_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
     resolve_agent_identity_for_slot(
@@ -202,7 +219,7 @@ pub async fn resolve_external_agent_identity(
         identity_selector,
         identity_rules_engine,
         channel_name,
-        is_agent_card,
+        response_kind,
         source_identity,
     )
     .await
@@ -246,9 +263,10 @@ pub async fn resolve_agent_identity_for_slot(
     identity_selector: Option<&Arc<crate::identity::IdentitySelector>>,
     identity_rules_engine: Option<&Arc<crate::proxy::RulesEngine>>,
     channel_name: &str,
-    is_agent_card: bool,
+    response_kind: IdentityResponseKind,
     source_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
+    let is_agent_card = response_kind.is_agent_card();
     if !is_agent_card
         && surface.channel_protocol() == crate::config::ChannelProtocol::Mcp
         && let Ok(body) = serde_json::from_slice::<JsonValue>(response_body)
@@ -295,10 +313,10 @@ pub async fn resolve_agent_identity_for_slot(
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
         let Some(claims) = source_identity.and_then(|i| i.jwt_claims()) else {
-            // No validated token in scope. For agent-card fetches there is no
-            // inbound caller, so treat as anonymous; otherwise the surface is
+            // No validated token in scope. A public agent card has no inbound
+            // caller, so treat it as anonymous; otherwise the surface is
             // misconfigured (FromJwtClaim without jwt_bearer source auth).
-            if is_agent_card {
+            if response_kind == IdentityResponseKind::PublicAgentCard {
                 return Ok(ProtectedAgentIdentity::Anonymous);
             }
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
@@ -1053,6 +1071,62 @@ mod tests {
     use serde_json::json;
 
     const EXT_URI: &str = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
+
+    // ── from_jwt_claim without validated claims ──────────────────────────
+
+    fn from_jwt_claim_surface() -> crate::config::agent_surface::AgentSurface {
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim {
+            claim: "oid".to_string(),
+            namespace_claims: vec![],
+        });
+        surface
+    }
+
+    #[tokio::test]
+    async fn from_jwt_claim_without_claims_is_anonymous_for_public_agent_card() {
+        let resolved = resolve_protected_agent_identity(
+            br#"{"name":"agent"}"#,
+            &from_jwt_claim_surface(),
+            None,
+            None,
+            "test",
+            IdentityResponseKind::PublicAgentCard,
+            None,
+        )
+        .await;
+        assert!(matches!(resolved, Ok(ProtectedAgentIdentity::Anonymous)), "{resolved:?}");
+    }
+
+    #[tokio::test]
+    async fn from_jwt_claim_without_claims_fails_for_extended_card_and_messages() {
+        let expected = crate::identity::credential_identity::CredentialIdentityError::JwtClaimsUnavailable.to_string();
+        for kind in [IdentityResponseKind::ExtendedAgentCard, IdentityResponseKind::Message] {
+            let resolved = resolve_protected_agent_identity(
+                br#"{"name":"agent"}"#,
+                &from_jwt_claim_surface(),
+                None,
+                None,
+                "test",
+                kind,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(&resolved, Err(IdentityResolutionError::DidCreationFailed(message)) if *message == expected),
+                "{kind:?}: {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_response_kind_reports_agent_cards() {
+        assert!(!IdentityResponseKind::Message.is_agent_card());
+        assert!(IdentityResponseKind::PublicAgentCard.is_agent_card());
+        assert!(IdentityResponseKind::ExtendedAgentCard.is_agent_card());
+    }
 
     // ── extract_a2a_identity_from_message ────────────────────────────────
 

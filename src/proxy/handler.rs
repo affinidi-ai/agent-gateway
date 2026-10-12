@@ -923,7 +923,7 @@ pub async fn handle_agent_card(
             card_identity_selector,
             card_identity_rules,
             &channel_name,
-            true,
+            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
             None,
         )
         .await
@@ -962,7 +962,7 @@ pub async fn handle_agent_card(
                 .external_rules_engine
                 .as_ref(),
             &channel_name,
-            true,
+            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
             None, // agent-card fetch has no inbound caller token
         )
         .await
@@ -7444,10 +7444,8 @@ async fn proxy_handler_with_mcp_runtime(
             "Request completed"
         );
 
-        // Determine if this is an agent card response (used by multiple steps below)
-        let is_agent_card_request = (crate::proxy::paths::is_well_known_agent_card_path(uri.path())
-            || is_rest_extended_card_request)
-            && status.is_success();
+        let is_well_known_card_response =
+            crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status.is_success();
 
         // ── Step 12: Resolve Protected Agent Identity ───────────────────────────
         // Must happen FIRST, before any injection or rewriting.
@@ -7485,7 +7483,17 @@ async fn proxy_handler_with_mcp_runtime(
                     .and_then(|c| c.method.as_deref())
                     .is_some_and(crate::a2a::is_extended_agent_card_method),
         );
-        let is_agent_card_request = is_agent_card_request || extended_card_envelope.is_some();
+        let is_extended_card_response =
+            (is_rest_extended_card_request && status.is_success()) || extended_card_envelope.is_some();
+        // Determine if this is an agent card response (used by multiple steps below)
+        let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
+        let identity_response_kind = if is_extended_card_response {
+            crate::proxy::backend_identity::IdentityResponseKind::ExtendedAgentCard
+        } else if is_agent_card_request {
+            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard
+        } else {
+            crate::proxy::backend_identity::IdentityResponseKind::Message
+        };
 
         let resolved_identity = if status.is_success() && !response_body.is_empty() {
             match crate::proxy::backend_identity::resolve_protected_agent_identity(
@@ -7494,7 +7502,7 @@ async fn proxy_handler_with_mcp_runtime(
                 response_identity_selector,
                 response_identity_rules,
                 &channel_name,
-                is_agent_card_request,
+                identity_response_kind,
                 authenticated_identity.as_ref(),
             )
             .await
@@ -7552,7 +7560,7 @@ async fn proxy_handler_with_mcp_runtime(
                     .external_rules_engine
                     .as_ref(),
                 &channel_name,
-                is_agent_card_request,
+                identity_response_kind,
                 authenticated_identity.as_ref(),
             )
             .await
@@ -7586,6 +7594,13 @@ async fn proxy_handler_with_mcp_runtime(
                 Ok(rewritten) => {
                     info!(channel = channel_name, "Rewrote agent card URLs to point to proxy");
                     rewritten
+                }
+                Err(e) if is_extended_card_response => {
+                    error!(channel = channel_name, error = %e, "Failed to rewrite extended agent card URLs");
+                    return Err(create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "Failed to process extended agent card",
+                    ));
                 }
                 Err(e) => {
                     warn!(channel = channel_name, error = %e, "Failed to rewrite agent card URLs, returning original");
@@ -12511,13 +12526,20 @@ async fn handle_fabric_request(
                     } else {
                         (response_body, None)
                     };
-                let is_extended_card_response = extended_card_envelope.is_some() || is_rest_extended_card_request;
+                let is_extended_card_response =
+                    extended_card_envelope.is_some() || (is_rest_extended_card_request && status < 400);
+                let is_well_known_card_response =
+                    crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
 
                 // ── Step 12: Resolve Protected Agent Identity (fabric path) ─────
-                let is_agent_card_request = (crate::proxy::paths::is_well_known_agent_card_path(uri.path())
-                    || is_rest_extended_card_request)
-                    && status < 400
-                    || extended_card_envelope.is_some();
+                let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
+                let identity_response_kind = if is_extended_card_response {
+                    crate::proxy::backend_identity::IdentityResponseKind::ExtendedAgentCard
+                } else if is_agent_card_request {
+                    crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard
+                } else {
+                    crate::proxy::backend_identity::IdentityResponseKind::Message
+                };
                 let fabric_response_identity_selector = state
                     .protected_selector
                     .as_ref()
@@ -12537,7 +12559,7 @@ async fn handle_fabric_request(
                         fabric_response_identity_selector,
                         fabric_response_identity_rules,
                         channel_name,
-                        is_agent_card_request,
+                        identity_response_kind,
                         authenticated_identity.as_ref(),
                     )
                     .await
@@ -12595,7 +12617,7 @@ async fn handle_fabric_request(
                             .external_rules_engine
                             .as_ref(),
                         channel_name,
-                        is_agent_card_request,
+                        identity_response_kind,
                         authenticated_identity.as_ref(),
                     )
                     .await
@@ -12635,6 +12657,16 @@ async fn handle_fabric_request(
                         Ok(rewritten) => {
                             channel_info!(config_id, "Rewrote agent card URLs to point to proxy");
                             String::from_utf8_lossy(&rewritten).to_string()
+                        }
+                        Err(e) if is_extended_card_response => {
+                            channel_error!(config_id, "Failed to rewrite extended agent card URLs: {}", e);
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(create_error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "Failed to process extended agent card",
+                            ));
                         }
                         Err(e) => {
                             channel_warn!(
@@ -14944,7 +14976,7 @@ async fn handle_mcp_proxy_request(
                         recorder_selector,
                         recorder_rules,
                         channel_name,
-                        false,
+                        crate::proxy::backend_identity::IdentityResponseKind::Message,
                         authenticated_identity,
                     )
                     .await

@@ -5769,7 +5769,7 @@ async fn process_forward_request_with_mcp_runtime(
                         gw2_identity_selector,
                         gw2_identity_rules,
                         channel_id,
-                        true,
+                        crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
                         None, // agent-card response has no inbound caller token
                     )
                     .await
@@ -7558,7 +7558,7 @@ async fn spawn_mcp_proxy_trust_recorder(
         selector,
         rules,
         &surface.name,
-        false,
+        crate::proxy::backend_identity::IdentityResponseKind::Message,
         None,
     )
     .await

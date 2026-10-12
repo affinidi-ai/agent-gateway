@@ -299,7 +299,13 @@ HTTP+JSON binding (`GET {route}/extendedAgentCard` in `1.0`, `GET {route}/v1/car
 endpoint URLs are rewritten on inbound, fabric and outbound paths, and on inbound paths it gets the
 same identity treatment when agent identity is configured. Like the public card, it skips response
 extension inspection, so response validation rules do not apply to it. JSON-RPC error responses are
-forwarded unchanged.
+forwarded unchanged. The URL rewrite fails closed for an extended card: a card that cannot be
+rewritten is answered with `502` rather than forwarded. A public card that cannot be rewritten is
+still forwarded as received.
+
+An extended card is always fetched by a caller, so with `from_jwt_claim` managed identity it needs
+the caller's validated JWT claims like any other response; without them the request fails with
+`JwtClaimsUnavailable`. Only the public card, which has no caller, resolves as anonymous.
 
 A surface's agent card (the synthesized A2A-proxy card or a Managed Agent's rewritten card) is
 served as `application/a2a+json` only when the caller's `A2A-Version` resolves to `1.0` or the

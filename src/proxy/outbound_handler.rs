@@ -4657,21 +4657,12 @@ fn compute_outbound_remainder_path(
         .to_string()
 }
 
-/// Check whether the upstream response is an agent card: a well-known card, or on
-/// an A2A/AP2 surface an extended card fetched over the HTTP+JSON binding.
+/// Check whether the upstream response is a well-known agent card based on the request path and status.
 fn is_agent_card_response(
-    ctx: &OutboundPipelineContext,
+    request_path: &str,
     status: reqwest::StatusCode,
 ) -> bool {
-    status.is_success()
-        && (crate::proxy::paths::is_well_known_agent_card_path(&ctx.request_path)
-            || (matches!(
-                ctx.surface.channel_protocol(),
-                crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
-            ) && crate::proxy::paths::is_rest_extended_agent_card_request(
-                ctx.original_method.as_str(),
-                &ctx.request_path,
-            )))
+    status.is_success() && crate::proxy::paths::is_well_known_agent_card_path(request_path)
 }
 
 /// [12] Response Processing — strips headers and optionally rewrites agent card URLs.
@@ -5073,7 +5064,14 @@ fn process_outbound_response_body(
     // through the gateway. `TransitPoint.gateway_url` is declared
     // "computed" but never assigned, so derive it here from the surface
     // + listener config.
-    let body_bytes = if is_agent_card_response(ctx, status) {
+    let is_a2a_surface = matches!(
+        ctx.surface.channel_protocol(),
+        crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
+    );
+    let is_rest_extended_card_response = status.is_success()
+        && is_a2a_surface
+        && crate::proxy::paths::is_rest_extended_agent_card_request(ctx.original_method.as_str(), &ctx.request_path);
+    let body_bytes = if is_agent_card_response(&ctx.request_path, status) || is_rest_extended_card_response {
         let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
             &ctx.surface,
             &ctx.virtual_channel,
@@ -5087,6 +5085,12 @@ fn process_outbound_response_body(
                 );
                 rewritten
             }
+            Err(e) if is_rest_extended_card_response => {
+                warn!(request_id = %ctx.request_id, error = %e, "Failed to rewrite outbound extended agent card URLs");
+                return Err(OutboundPipelineError::ResponseValidationFailed(
+                    "Failed to process extended agent card".to_string(),
+                ));
+            }
             Err(e) => {
                 warn!(
                     request_id = %ctx.request_id,
@@ -5097,6 +5101,7 @@ fn process_outbound_response_body(
             }
         }
     } else if status.is_success()
+        && is_a2a_surface
         && ctx
             .operation
             .as_deref()

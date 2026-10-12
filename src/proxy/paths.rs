@@ -40,6 +40,9 @@ pub fn is_rest_extended_agent_card_request(
     method: &str,
     path: &str,
 ) -> bool {
+    let path = path
+        .strip_suffix('/')
+        .unwrap_or(path);
     method.eq_ignore_ascii_case("GET") && (path.ends_with("/extendedAgentCard") || path.ends_with("/v1/card"))
 }
 
@@ -144,7 +147,9 @@ mod tests {
 
     #[test]
     fn rest_extended_agent_card_request_matches_get_on_both_eras() {
-        for path in ["/surface/extendedAgentCard", "/surface/v1/card"] {
+        for path in
+            ["/surface/extendedAgentCard", "/surface/v1/card", "/surface/extendedAgentCard/", "/surface/v1/card/"]
+        {
             assert!(is_rest_extended_agent_card_request("GET", path), "{path}");
             assert!(is_rest_extended_agent_card_request("get", path), "{path}");
             for method in ["POST", "HEAD", "PUT", "DELETE"] {
