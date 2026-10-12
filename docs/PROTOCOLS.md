@@ -299,9 +299,11 @@ HTTP+JSON binding (`GET {route}/extendedAgentCard` in `1.0`, `GET {route}/v1/car
 endpoint URLs are rewritten on inbound, fabric and outbound paths, and on inbound paths it gets the
 same identity treatment when agent identity is configured. Like the public card, it skips response
 extension inspection, so response validation rules do not apply to it. JSON-RPC error responses are
-forwarded unchanged. The URL rewrite fails closed for an extended card: a successful response that
-is neither a JSON-RPC error nor a card the gateway can rewrite (for example an SSE stream, or a
-`result` that is not an object) is answered with `502` rather than forwarded. A public card that
+forwarded unchanged; a JSON-RPC error is an object `error` with no `result`, and a `null` member
+counts as absent, so `"error": null` next to a card still has the card rewritten. The URL rewrite
+fails closed for an extended card: a successful response that is neither a JSON-RPC error nor a
+card the gateway can rewrite (for example an SSE stream, a `result` that is not an object, or both
+`result` and `error`) is answered with `502` rather than forwarded. A public card that
 cannot be rewritten is still forwarded as received. A JSON-RPC batch that contains an extended-card
 request is rejected with `-32600` before it is forwarded, whatever `validate_messages` is set to,
 because a card inside a batch response cannot be rewritten.

@@ -429,24 +429,27 @@ pub fn is_extended_agent_card_method(method: &str) -> bool {
 }
 
 /// Split a 2xx response to an extended-card request into its envelope and the
-/// serialized card from `result`. Returns `Ok(None)` for a JSON-RPC error response,
-/// which passes through unchanged. Any other body (not a JSON object, or without an
-/// object `result`) cannot be rewritten and is an error, so callers fail closed.
+/// serialized card from `result`. Returns `Ok(None)` for a JSON-RPC error response
+/// (an object `error` and no `result`), which passes through unchanged. A `null`
+/// member counts as absent. Any other body (not a JSON object, a non-object
+/// `result`, or both `result` and `error`) cannot be rewritten and is an error, so
+/// callers fail closed.
 fn extended_agent_card_result(body: &[u8]) -> Result<Option<(serde_json::Value, axum::body::Bytes)>, anyhow::Error> {
     let envelope: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("extended agent card response is not JSON: {e}"))?;
-    if envelope
-        .get("error")
-        .is_some()
-    {
-        return Ok(None);
+    let member = |key: &str| {
+        envelope
+            .get(key)
+            .filter(|v| !v.is_null())
+    };
+    match (member("result"), member("error")) {
+        (None, Some(error)) if error.is_object() => Ok(None),
+        (Some(card), None) if card.is_object() => {
+            let card_bytes = serde_json::to_vec(card)?;
+            Ok(Some((envelope.clone(), axum::body::Bytes::from(card_bytes))))
+        }
+        _ => Err(anyhow::anyhow!("extended agent card response is neither a card nor a JSON-RPC error")),
     }
-    let card = envelope
-        .get("result")
-        .filter(|r| r.is_object())
-        .ok_or_else(|| anyhow::anyhow!("extended agent card response has no object result"))?;
-    let card_bytes = serde_json::to_vec(card)?;
-    Ok(Some((envelope, axum::body::Bytes::from(card_bytes))))
 }
 
 fn calls_extended_agent_card_method(call: &serde_json::Value) -> bool {
@@ -1330,10 +1333,38 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 1, "result": "https://backend.internal"}),
             json!({"jsonrpc": "2.0", "id": 1}),
             json!([{"jsonrpc": "2.0", "id": 1, "result": {"url": "https://backend.internal"}}]),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"url": "https://backend.internal"}, "error": {"code": -32603}}),
+            json!({"jsonrpc": "2.0", "id": 1, "error": "failed"}),
+            json!({"jsonrpc": "2.0", "id": 1, "result": null, "error": null}),
         ] {
             let body = serde_json::to_vec(&envelope).unwrap();
             assert!(process_outbound_extended_agent_card(&body, PROXY_URL, "test").is_err(), "{envelope}");
         }
+    }
+
+    #[test]
+    fn extended_card_with_null_error_is_rewritten() {
+        let out = rewrite_extended_card(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"name": "Agent", "supportedInterfaces": [{"url": "https://backend.internal/a2a"}]},
+            "error": null
+        }))
+        .unwrap();
+        assert_eq!(out["result"]["supportedInterfaces"][0]["url"], PROXY_URL);
+        assert!(out["error"].is_null());
+        assert!(
+            !serde_json::to_string(&out)
+                .unwrap()
+                .contains("backend.internal")
+        );
+    }
+
+    #[test]
+    fn extended_card_error_with_null_result_is_untouched() {
+        let envelope =
+            json!({"jsonrpc": "2.0", "id": 1, "result": null, "error": {"code": -32007, "message": "no card"}});
+        assert!(rewrite_extended_card(envelope).is_none());
     }
 
     #[test]

@@ -219,6 +219,15 @@ async fn inbound_extended_card_v03_shape_is_rewritten_for_both_methods() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_card_with_null_error_member_is_rewritten() {
+    let upstream = json!({"jsonrpc": "2.0", "id": 1, "result": v1_card(), "error": null}).to_string();
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let response = send_through_gateway(direction, upstream.clone(), "GetExtendedAgentCard").await;
+        assert_v1_card_rewritten(&response);
+    }
+}
+
 // ── Outbound ─────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,7 +1,14 @@
 branch: feat/extended_agent_card_support
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-10-12T14:00:00.000Z'
+      title: Require JWT claims for extended agent cards on from_jwt_claim surfaces
+      description: >-
+        A surface using from_jwt_claim managed identity without jwt_bearer source authentication
+        used to return extended agent cards with no agent identity. Those requests now fail with
+        JwtClaimsUnavailable, like other responses on that surface; add jwt_bearer source
+        authentication to keep serving extended cards. Public agent cards are unaffected.
   fixed: []
   removed: []
   security:
@@ -15,7 +22,8 @@ changes:
         identity treatment as the public card on inbound paths, so authenticated callers no longer
         learn the backend address. Like the public card, extended cards now skip response extension
         inspection. A successful extended-card response that is neither a JSON-RPC error nor a card
-        the gateway can rewrite is answered with 502 instead of being forwarded, and a JSON-RPC batch
+        the gateway can rewrite is answered with 502 instead of being forwarded; a null error member
+        next to a card does not count as an error, so the card is still rewritten. A JSON-RPC batch
         containing an extended-card request is rejected with -32600 before forwarding. With
         from_jwt_claim managed identity an extended card fetched without validated JWT claims fails
         with JwtClaimsUnavailable instead of resolving as anonymous. A trailing slash on the
