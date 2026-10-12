@@ -131,9 +131,11 @@ connection point moves.
 
 1. `connect-via-oob` takes an optional `acceptor_mediator_id`
    ([src/gateways/handlers.rs](../src/gateways/handlers.rs)). It must name a
-   `Mediator` within the caller's tenant and token scope that is `Active` and
-   registered (`our_did` and `our_secrets` set), or the request gets `400`
-   before any outbound call. An unknown mediator and one outside the caller's
+   `Mediator` within the caller's tenant and token scope that the new gateway's
+   tenant may reference (its own tenant's or a global mediator; a global
+   gateway may use only global mediators), that is `Active` and registered
+   (`our_did` and `our_secrets` set), or the request gets `400` before any
+   outbound call. An unknown mediator and one outside the caller's
    scope get the same response; a disabled and an unregistered one get one
    generic response.
 2. The acceptor's permanent DID is minted on the selected mediator. Its
@@ -145,8 +147,9 @@ connection point moves.
    takes the mediator from the pending connection, so the stored `mediator_id`
    and the listener it starts agree. The temporary connection point records the
    same mediator and its record id, so recovery after the pending connection is
-   lost rebuilds the acceptor's choice. Finalize and recovery read only that
-   record, by id, never a mediator found by DID. Recovery onto a mediator other
+   lost rebuilds the acceptor's choice. The permanent connection point stores
+   that record id as its `mediator_id`, so finalize, recovery and its listener
+   read only that record, never a mediator found by DID. Recovery onto a mediator other
    than the temporary connection point's own requires that record to be
    `Active` with the same DID, and fails without it or without a store. A
    shared-mediator connection reads no mediator record.

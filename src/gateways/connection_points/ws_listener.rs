@@ -678,38 +678,12 @@ impl ConnectionPointListenerManager {
 
         info!("✓ Loaded {} secret(s) for connection point DID", secrets.len());
 
-        let mediator_did_document = {
-            use crate::mediators::filesystem::MediatorStore;
-
-            match &self.mediator_store {
-                Some(store) => match store
-                    .get(&connection_point.mediator_id)
+        let mediator_did_document = match &self.mediator_store {
+            Some(store) => {
+                listener_mediator_document(store, &connection_point.mediator_id, &mediator_did, &connection_point.name)
                     .await
-                {
-                    Ok(Some(mediator)) if mediator.did == mediator_did => mediator.did_document,
-                    Ok(Some(_)) | Ok(None) => match store.list_all().await {
-                        Ok(mediators) => mediators
-                            .into_iter()
-                            .find(|mediator| mediator.did == mediator_did)
-                            .and_then(|mediator| mediator.did_document),
-                        Err(e) => {
-                            warn!(
-                                "Failed to list mediators while preloading DID document for listener '{}': {}",
-                                connection_point.name, e
-                            );
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        warn!(
-                            "Failed to load mediator '{}' while preloading DID document for listener '{}': {}",
-                            connection_point.mediator_id, connection_point.name, e
-                        );
-                        None
-                    }
-                },
-                None => None,
             }
+            None => None,
         };
 
         // did:key DIDs are self-describing - no need to build/cache DID document
@@ -3260,6 +3234,55 @@ fn permanent_mediator_url(
         .map_err(|e| format!("Failed to resolve mediator URL: {}", e))
 }
 
+/// The mediator DID document preloaded for a listener: the record named by the
+/// connection point's `mediator_id` when it carries the listener's mediator
+/// DID, otherwise the first record with that DID.
+async fn listener_mediator_document(
+    store: &crate::mediators::FileSystemMediatorStore,
+    cp_mediator_id: &str,
+    mediator_did: &str,
+    listener_name: &str,
+) -> Option<serde_json::Value> {
+    use crate::mediators::filesystem::MediatorStore;
+
+    match store
+        .get(cp_mediator_id)
+        .await
+    {
+        Ok(Some(mediator)) if mediator.did == mediator_did => mediator.did_document,
+        Ok(Some(_)) | Ok(None) => match store.list_all().await {
+            Ok(mediators) => mediators
+                .into_iter()
+                .find(|mediator| mediator.did == mediator_did)
+                .and_then(|mediator| mediator.did_document),
+            Err(e) => {
+                warn!("Failed to list mediators while preloading DID document for listener '{}': {}", listener_name, e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!(
+                "Failed to load mediator '{}' while preloading DID document for listener '{}': {}",
+                cp_mediator_id, listener_name, e
+            );
+            None
+        }
+    }
+}
+
+/// The `mediator_id` stored on the acceptor's permanent connection point: the
+/// acceptor mediator's record id when one was selected, so restarts, deletion
+/// checks and tenant ownership use that exact record; otherwise the inviter's
+/// mediator DID, for which the acceptor has no record.
+fn permanent_mediator_reference(
+    mediator_record_id: Option<&str>,
+    mediator_did: &str,
+) -> String {
+    mediator_record_id
+        .unwrap_or(mediator_did)
+        .to_string()
+}
+
 /// Finalize OOB connection as ACCEPTOR after receiving connection-accepted
 async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::ConnectionPointStore>(
     inviter_temporary_did: &str,
@@ -3660,7 +3683,12 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
 
     let mut connection_point = super::types::GatewayConnectionPoint::new(
         gateway.id.clone(),
-        connection_mediator_did.clone(),
+        permanent_mediator_reference(
+            pending_conn
+                .mediator_record_id
+                .as_deref(),
+            &connection_mediator_did,
+        ),
         cp_did.clone(),
         format!("Listener for {}", gateway.name),
         "Gateway listener endpoint (acceptor side)".to_string(),
@@ -5196,6 +5224,34 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_listener_uses_the_recorded_mediator_when_tenants_share_a_did() {
+        let root = tempfile::tempdir().unwrap();
+        let shared_did = "did:web:m2.example.com:.well-known";
+        let mut other_tenants = mediator(shared_did, crate::mediators::types::MediatorStatus::Active);
+        other_tenants.id = "mediator-tenant-b".to_string();
+        other_tenants.tenant_id = Some("tenant-b".to_string());
+        other_tenants.did_document = Some(serde_json::json!({ "id": shared_did, "owner": "tenant-b" }));
+        let mut own = mediator(shared_did, crate::mediators::types::MediatorStatus::Active);
+        own.id = "mediator-tenant-a".to_string();
+        own.tenant_id = Some("tenant-a".to_string());
+        own.did_document = Some(serde_json::json!({ "id": shared_did, "owner": "tenant-a" }));
+        let store = mediator_store_with(root.path(), &[other_tenants, own]).await;
+
+        let document = super::listener_mediator_document(&store, "mediator-tenant-a", shared_did, "listener").await;
+
+        assert_eq!(document.unwrap()["owner"], "tenant-a");
+    }
+
+    #[test]
+    fn the_permanent_connection_point_names_the_selected_mediator_record() {
+        assert_eq!(
+            super::permanent_mediator_reference(Some("mediator-tenant-a"), "did:web:m2.example.com"),
+            "mediator-tenant-a"
+        );
+        assert_eq!(super::permanent_mediator_reference(None, "did:web:m1.example.com"), "did:web:m1.example.com");
     }
 
     #[tokio::test]

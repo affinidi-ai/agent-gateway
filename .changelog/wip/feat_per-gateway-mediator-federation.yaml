@@ -54,12 +54,17 @@ changes:
       title: Scope and validate the acceptor mediator selection
       description: >-
         `acceptor_mediator_id` goes through the same tenant and resource-scope check as every
-        other mediator lookup. An unknown mediator and one outside the caller's scope get the
-        same 400, so a scoped caller cannot learn that it exists. An in-scope mediator that is
+        other mediator lookup, and the new gateway's tenant must be allowed to reference the
+        mediator, as for connection points: a tenant gateway may use its own tenant's
+        mediators or global ones, a global gateway only global ones. An unknown mediator,
+        one outside the caller's scope and one the gateway may not reference get the same
+        400, so a scoped caller cannot learn that it exists. An in-scope mediator that is
         disabled, unregistered or has no usable endpoint gets one generic 400 that names
-        neither the mediator nor its state; the detail is logged server-side. Finalize and
-        recovery read only the mediator record validated at accept time, by id, so another
-        tenant's record with the same DID is never used. On the acceptor's cache-miss
+        neither the mediator nor its state; the detail is logged server-side. Finalize,
+        recovery and the permanent connection point's listener use only the mediator record
+        validated at accept time, by id: the connection point stores that record id as its
+        `mediator_id`, so another tenant's record with the same DID is not used for it, and
+        deleting the mediator stops its listener. On the acceptor's cache-miss
         recovery path, a recovered mediator other than the temporary connection point's own
         must be that record, still Active, and recovery fails closed without it or without a
         mediator store. Shared-mediator recovery needs no registered inviter mediator.

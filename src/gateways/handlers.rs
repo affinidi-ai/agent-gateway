@@ -1399,8 +1399,14 @@ mod tests {
     #[test]
     fn acceptor_mediator_in_scope_active_and_registered_is_accepted() {
         let (context, scope) = tenant_a_caller();
-        let mediator =
-            check_acceptor_mediator("mediator-a", Some(acceptor_mediator("tenant-a")), &context, &scope).unwrap();
+        let mediator = check_acceptor_mediator(
+            "mediator-a",
+            Some(acceptor_mediator("tenant-a")),
+            Some("tenant-a"),
+            &context,
+            &scope,
+        )
+        .unwrap();
         assert_eq!(mediator.id, "mediator-a");
         assert_eq!(mediator.did, "did:example:acceptor-mediator");
     }
@@ -1408,9 +1414,15 @@ mod tests {
     #[test]
     fn acceptor_mediator_outside_caller_tenant_is_indistinguishable_from_unknown() {
         let (context, scope) = tenant_a_caller();
-        let out_of_scope =
-            check_acceptor_mediator("mediator-a", Some(acceptor_mediator("tenant-b")), &context, &scope).unwrap_err();
-        let unknown = check_acceptor_mediator("mediator-a", None, &context, &scope).unwrap_err();
+        let out_of_scope = check_acceptor_mediator(
+            "mediator-a",
+            Some(acceptor_mediator("tenant-b")),
+            Some("tenant-a"),
+            &context,
+            &scope,
+        )
+        .unwrap_err();
+        let unknown = check_acceptor_mediator("mediator-a", None, Some("tenant-a"), &context, &scope).unwrap_err();
 
         assert_eq!(out_of_scope, (StatusCode::BAD_REQUEST, "Mediator not found: mediator-a".to_string()));
         assert_eq!(out_of_scope, unknown);
@@ -1423,9 +1435,14 @@ mod tests {
             regex::Regex::new(r"\ATENANT:tenant-a:mediators:mediator-b\z").unwrap(),
         ))));
 
-        let error =
-            check_acceptor_mediator("mediator-a", Some(acceptor_mediator("tenant-a")), &context, &other_resource_only)
-                .unwrap_err();
+        let error = check_acceptor_mediator(
+            "mediator-a",
+            Some(acceptor_mediator("tenant-a")),
+            Some("tenant-a"),
+            &context,
+            &other_resource_only,
+        )
+        .unwrap_err();
 
         assert_eq!(error, (StatusCode::BAD_REQUEST, "Mediator not found: mediator-a".to_string()));
     }
@@ -1440,8 +1457,42 @@ mod tests {
         unregistered.our_secrets = None;
 
         let expected = (StatusCode::BAD_REQUEST, "Selected mediator is unavailable".to_string());
-        assert_eq!(check_acceptor_mediator("mediator-a", Some(disabled), &context, &scope).unwrap_err(), expected);
-        assert_eq!(check_acceptor_mediator("mediator-a", Some(unregistered), &context, &scope).unwrap_err(), expected);
+        assert_eq!(
+            check_acceptor_mediator("mediator-a", Some(disabled), Some("tenant-a"), &context, &scope).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            check_acceptor_mediator("mediator-a", Some(unregistered), Some("tenant-a"), &context, &scope).unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn an_appliance_caller_cannot_home_a_tenant_gateway_on_another_tenants_mediator() {
+        let error =
+            check_acceptor_mediator("mediator-a", Some(acceptor_mediator("tenant-a")), Some("tenant-b"), &None, &None)
+                .unwrap_err();
+
+        assert_eq!(error, (StatusCode::BAD_REQUEST, "Mediator not found: mediator-a".to_string()));
+    }
+
+    #[test]
+    fn a_global_gateway_cannot_use_a_tenant_mediator() {
+        let error =
+            check_acceptor_mediator("mediator-a", Some(acceptor_mediator("tenant-a")), None, &None, &None).unwrap_err();
+
+        assert_eq!(error, (StatusCode::BAD_REQUEST, "Mediator not found: mediator-a".to_string()));
+    }
+
+    #[test]
+    fn a_tenant_gateway_may_use_a_global_mediator() {
+        let (context, _) = tenant_a_caller();
+        let mut global = acceptor_mediator("tenant-a");
+        global.tenant_id = None;
+
+        let mediator = check_acceptor_mediator("mediator-a", Some(global), Some("tenant-a"), &context, &None).unwrap();
+
+        assert_eq!(mediator.tenant_id, None);
     }
 }
 
@@ -1484,6 +1535,7 @@ fn check_acceptor_mediator_allowed_by_flag(
 async fn resolve_acceptor_mediator<M: crate::mediators::MediatorStore>(
     mediator_store: &M,
     mediator_id: &str,
+    gateway_tenant_id: Option<&str>,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<(String, String), (StatusCode, String)> {
@@ -1494,7 +1546,7 @@ async fn resolve_acceptor_mediator<M: crate::mediators::MediatorStore>(
             error!(mediator_id, error = %e, "Failed to look up acceptor mediator");
             (StatusCode::INTERNAL_SERVER_ERROR, "Failed to look up mediator".to_string())
         })?;
-    let mediator = check_acceptor_mediator(mediator_id, mediator, context, scope)?;
+    let mediator = check_acceptor_mediator(mediator_id, mediator, gateway_tenant_id, context, scope)?;
     let endpoint = crate::gateways::connection_points::handlers::resolve_mediator_endpoint(
         &mediator.did,
         mediator.did_document.as_ref(),
@@ -1510,19 +1562,23 @@ const ACCEPTOR_MEDIATOR_UNAVAILABLE: &str = "Selected mediator is unavailable";
 
 /// Validates the mediator named by `ConnectViaOOBRequest::acceptor_mediator_id`.
 ///
-/// An unknown mediator and one outside the caller's tenant or resource scope get
-/// the same `400`, so a scoped caller cannot learn that the mediator exists. An
+/// An unknown mediator, one outside the caller's tenant or resource scope, and
+/// one the gateway's tenant may not reference (a tenant gateway may use its own
+/// tenant's mediators or global ones, a global gateway only global ones) get the
+/// same `400`, so a scoped caller cannot learn that the mediator exists. An
 /// in-scope mediator that is not Active or not registered (`our_did` /
 /// `our_secrets`) gets one generic message; the detail is logged server-side.
 fn check_acceptor_mediator(
     mediator_id: &str,
     mediator: Option<crate::mediators::types::Mediator>,
+    gateway_tenant_id: Option<&str>,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<crate::mediators::types::Mediator, (StatusCode, String)> {
     let not_found = || (StatusCode::BAD_REQUEST, format!("Mediator not found: {}", mediator_id));
     let mediator = mediator.ok_or_else(not_found)?;
-    if !mediator_allowed(&mediator, context, scope) {
+    if !mediator_allowed(&mediator, context, scope) || !can_reference(gateway_tenant_id, mediator.tenant_id.as_deref())
+    {
         return Err(not_found());
     }
     if mediator.status != crate::mediators::types::MediatorStatus::Active
@@ -1592,9 +1648,10 @@ pub async fn connect_via_oob<
         .acceptor_mediator_id
         .as_deref()
     {
-        Some(mediator_id) => {
-            Some(resolve_acceptor_mediator(mediator_store.as_ref(), mediator_id, &context, &scope).await?)
-        }
+        Some(mediator_id) => Some(
+            resolve_acceptor_mediator(mediator_store.as_ref(), mediator_id, req.tenant_id.as_deref(), &context, &scope)
+                .await?,
+        ),
         None => None,
     };
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
