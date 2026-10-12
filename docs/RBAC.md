@@ -51,8 +51,8 @@ the `Authorization` header or the `session_token` cookie.
 
 [`get_permissions`](../src/auth_manager/permissions.rs) defines the frontend-exposed key set. It is
 not an enumeration of every backend `Feature`: route-only capabilities can be enforced without
-appearing in this response. The response currently also includes `departments.*` aliases for legacy
-dashboard compatibility; new UI uses `issuers.*`.
+appearing in this response. It carries no `departments.*` aliases: the RBAC loader normalises those
+keys to `issuers.*`, so they are not valid access-token scopes.
 
 ## Token info endpoint
 

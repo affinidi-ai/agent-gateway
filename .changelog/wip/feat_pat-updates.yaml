@@ -1,0 +1,27 @@
+branch: feat/pat-updates
+changes:
+  added:
+    - timestamp: "2026-10-12T00:00:00.000Z"
+      title: Preset the new access token form from link query parameters
+      description: /access-tokens/new reads name, description, scope or scopes, expires_at, resource_pattern and header query parameters into the form, so an external link opens a filled-in form. The link never saves; the operator still clicks Create, and preset scopes they cannot grant block submission.
+    - timestamp: "2026-10-12T00:00:00.000Z"
+      title: Copy a permalink to the new access token form with its current settings
+      description: Create Access Token has a Copy creation link button that copies a /access-tokens/new URL carrying the configured name, description, scopes, expiry, resource pattern and headers, so the same form can be shared and reopened prefilled.
+  changed:
+    - timestamp: "2026-10-12T00:00:00.000Z"
+      title: Hide a new access token's secret and offer it only through Copy
+      description: The created-token page no longer renders the secret. The field shows a masked placeholder and the Copy button puts the real value on the clipboard.
+  fixed:
+    - timestamp: "2026-10-12T00:00:00.000Z"
+      title: Stop offering invalid departments.* scopes for access tokens
+      description: The permissions endpoint no longer emits the legacy departments.* aliases. The token form built its scope list from that map, and creating a token with one of them failed with unknown scope because the RBAC loader normalises them to issuers.*.
+  removed: []
+  security: []
+  breaking: []
+  internal:
+    - timestamp: "2026-10-12T00:00:00.000Z"
+      title: Test that every permissions key is an accepted access token scope
+      description: A unit test checks that each key the permissions endpoint returns, which the token form offers as a scope, exists in the RBAC permission map that token creation validates against, so an alias like departments.* cannot reappear.
+    - timestamp: "2026-10-12T00:00:00.000Z"
+      title: Add CLAUDE.md that imports AGENTS.md and lists common make targets
+      description: Claude Code loads CLAUDE.md, so it imports the canonical AGENTS.md and adds a short command table from the Makefile.

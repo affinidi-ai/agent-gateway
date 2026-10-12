@@ -1450,7 +1450,7 @@ async fn permissions_route_reports_only_a_scoped_pats_own_scopes() {
         .filter(|(_, value)| value.as_bool() == Some(true))
         .map(|(name, _)| name.as_str())
         .collect();
-    let mut expected = vec!["departments.view", "issuers.view", "secrets.view"];
+    let mut expected = vec!["issuers.view", "secrets.view"];
     let mut granted = granted;
     granted.sort_unstable();
     expected.sort_unstable();

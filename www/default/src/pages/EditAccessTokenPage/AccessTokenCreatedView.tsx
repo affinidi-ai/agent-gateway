@@ -6,6 +6,8 @@ import { CopyButton } from '../../components/shared/CopyButton';
 import { showToast } from '../../utils/toaster';
 import AccessTokenEditHeader from './AccessTokenEditHeader';
 
+const MASKED_SECRET = 'agpat_' + '•'.repeat(24);
+
 interface AccessTokenCreatedViewProps {
   token: AccessTokenCreated;
   onDone: () => void;
@@ -15,7 +17,7 @@ const AccessTokenCreatedView: React.FC<AccessTokenCreatedViewProps> = ({ token, 
   <div className="container-fluid" data-testid="page-access-token-created">
     <AccessTokenEditHeader
       title="Access Token Created"
-      subtitle="Copy the token secret now. It is shown only once."
+      subtitle="Copy the token secret now. It is never displayed and cannot be retrieved later."
       onBack={onDone}
     />
     <div className="row">
@@ -34,9 +36,9 @@ const AccessTokenCreatedView: React.FC<AccessTokenCreatedViewProps> = ({ token, 
               <InputGroup>
                 <Form.Control
                   className="font-monospace"
-                  value={token.token}
+                  value={MASKED_SECRET}
                   readOnly
-                  onFocus={event => event.currentTarget.select()}
+                  aria-label="Token secret (hidden)"
                   data-testid="access-token-secret"
                 />
                 <CopyButton
@@ -48,7 +50,7 @@ const AccessTokenCreatedView: React.FC<AccessTokenCreatedViewProps> = ({ token, 
                   onCopyError={() =>
                     showToast(
                       'error',
-                      'Could not copy the token. Select the secret and copy it manually.'
+                      'Could not copy the token. Allow clipboard access and try again.'
                     )
                   }
                   data-testid="access-token-copy-secret-button"
@@ -57,7 +59,7 @@ const AccessTokenCreatedView: React.FC<AccessTokenCreatedViewProps> = ({ token, 
             </Form.Group>
             <Alert variant="warning" className="small mt-3">
               <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
-              Copy this now. It cannot be retrieved later. Send it as an{' '}
+              Copy this now. It is not shown on screen and cannot be retrieved later. Send it as an{' '}
               <code>Authorization: Bearer</code> credential to the management API.
             </Alert>
             <div className="d-flex justify-content-end">

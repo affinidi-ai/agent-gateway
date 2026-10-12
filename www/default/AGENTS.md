@@ -100,7 +100,19 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 - Create and edit use full-page routes with the same visual pattern:
   `/access-tokens/new` and `/access-tokens/:id`.
-- A successful create replaces the editor with the one-time secret page.
+- `/access-tokens/new` presets the form from its query string so an external link can
+  open a filled-in form: `name`, `description`, `scope` (repeatable) or `scopes`
+  (comma-separated), `expires_at` (ISO 8601; clears **Never**), `resource_pattern`, and
+  `header=<name>:<pattern>` (repeatable). The link never saves; the operator still clicks
+  Create, and preset scopes they cannot grant render as red unavailable pills. The
+  resource-scope card opens when a pattern or header is preset.
+- In create mode the form footer has a **Copy creation link** button
+  (`access-token-copy-permalink-button`) that copies an absolute `/access-tokens/new` URL
+  encoding the current name, description, scopes, expiry, resource pattern and headers
+  in the parameters above. It is not shown in edit mode.
+- A successful create replaces the editor with the secret page. The secret is never
+  rendered: the field shows a masked placeholder and only **Copy** puts the real value on
+  the clipboard.
 - The right column always shows **About Access Tokens**. Edit mode also shows **Access
   Token Details**, resolving the bound user UUID to a name and email while keeping the
   UUID as a fallback.
