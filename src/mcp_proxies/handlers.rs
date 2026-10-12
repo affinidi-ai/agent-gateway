@@ -1195,6 +1195,9 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "MCP Proxy not found".to_string()))?;
+    if !mcp_proxy_allowed(&proxy, tenant_context(&context), resource_scope(&scope)) {
+        return Err((StatusCode::NOT_FOUND, "MCP Proxy not found".to_string()));
+    }
     if !mcp_proxy_writable(&proxy, tenant_context(&context), resource_scope(&scope)) {
         return Err((StatusCode::FORBIDDEN, "MCP Proxy is outside this token's permitted scope".into()));
     }
@@ -1370,6 +1373,9 @@ pub async fn delete_mcp_proxy<S: McpProxyStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "MCP Proxy not found".to_string()))?;
+    if !mcp_proxy_allowed(&proxy, tenant_context(&context), resource_scope(&scope)) {
+        return Err((StatusCode::NOT_FOUND, "MCP Proxy not found".to_string()));
+    }
     if !mcp_proxy_writable(&proxy, tenant_context(&context), resource_scope(&scope)) {
         return Err((StatusCode::FORBIDDEN, "MCP Proxy is outside this token's permitted scope".into()));
     }
@@ -5323,7 +5329,7 @@ mod tests {
                 .await
                 .expect_err("other tenant")
                 .0,
-            StatusCode::FORBIDDEN
+            StatusCode::NOT_FOUND
         );
         assert!(
             super::update_mcp_proxy(

@@ -186,6 +186,14 @@ impl GatewayConnectionPoint {
             runtime_status: None,
         }
     }
+
+    /// The id of the invitation message the mediator serves for this connection point.
+    /// An acceptor's connection-setup names it as `pthid`.
+    pub fn invitation_message_id(&self) -> Option<&str> {
+        self.oob_message
+            .get("@id")
+            .and_then(|v| v.as_str())
+    }
 }
 impl StorableEntity for GatewayConnectionPoint {
     fn id(&self) -> &str {

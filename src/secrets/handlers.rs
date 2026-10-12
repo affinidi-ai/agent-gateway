@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tracing::error;
 
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+};
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
@@ -25,6 +27,15 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
+fn is_visible(
+    tenant_id: Option<&str>,
+    secret_id: &str,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> bool {
+    can_access(tenant_id, context) && scope_allows_resource(scope, context, ResourceKind::Secrets, secret_id)
+}
+
 /// List all secrets (without sensitive values)
 pub async fn list_secrets(
     State(store): State<Arc<dyn SecretsStore>>,
@@ -35,10 +46,7 @@ pub async fn list_secrets(
         Ok(mut secrets) => {
             let context = tenant_context(&context);
             let scope = resource_scope(&scope);
-            secrets.retain(|secret| {
-                can_access(secret.tenant_id.as_deref(), context)
-                    && scope_allows_resource(scope, context, ResourceKind::Secrets, &secret.secret_id)
-            });
+            secrets.retain(|secret| is_visible(secret.tenant_id.as_deref(), &secret.secret_id, context, scope));
             (StatusCode::OK, Json(secrets)).into_response()
         }
         Err(e) => {
@@ -57,13 +65,12 @@ pub async fn get_secret(
 ) -> impl IntoResponse {
     match store.get(&id).await {
         Ok(Some(secret))
-            if can_access(secret.tenant_id.as_deref(), tenant_context(&context))
-                && scope_allows_resource(
-                    resource_scope(&scope),
-                    tenant_context(&context),
-                    ResourceKind::Secrets,
-                    &secret.secret_id,
-                ) =>
+            if is_visible(
+                secret.tenant_id.as_deref(),
+                &secret.secret_id,
+                tenant_context(&context),
+                resource_scope(&scope),
+            ) =>
         {
             (StatusCode::OK, Json(SecretListItem::from(secret))).into_response()
         }
@@ -150,17 +157,30 @@ pub async fn update_secret(
     scope: Option<Extension<PatResourceScope>>,
     Json(request): Json<UpdateSecretRequest>,
 ) -> impl IntoResponse {
-    // Get old secret first for triggers
-    let old_secret_result = store.get(&id).await;
-    if let Ok(Some(secret)) = old_secret_result.as_ref()
-        && (!can_access(secret.tenant_id.as_deref(), tenant_context(&context))
-            || !scope_allows_resource(
-                resource_scope(&scope),
-                tenant_context(&context),
-                ResourceKind::Secrets,
-                &secret.secret_id,
-            ))
-    {
+    let old_secret = match store.get(&id).await {
+        Ok(Some(secret)) => secret,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Secret not found").into_response(),
+        Err(e) => {
+            error!("Failed to load secret {}: {}", id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
+        }
+    };
+    if !is_visible(
+        old_secret
+            .tenant_id
+            .as_deref(),
+        &old_secret.secret_id,
+        tenant_context(&context),
+        resource_scope(&scope),
+    ) {
+        return (StatusCode::NOT_FOUND, "Secret not found").into_response();
+    }
+    if !can_mutate(
+        old_secret
+            .tenant_id
+            .as_deref(),
+        tenant_context(&context),
+    ) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "message": "Secret is outside this token's permitted scope" })),
@@ -173,39 +193,36 @@ pub async fn update_secret(
         .await
     {
         Ok(secret) => {
-            // Trigger integration event if we have the old secret
-            if let Ok(Some(old_secret)) = old_secret_result {
-                let old_trigger = crate::integrations::secrets_integration_triggers::Secret {
-                    id: old_secret.id.clone(),
-                    name: old_secret.name.clone(),
-                    description: old_secret
-                        .description
-                        .clone()
-                        .unwrap_or_default(),
-                    tags: old_secret.tags.clone(),
-                    created_at: old_secret
-                        .created_at
-                        .to_rfc3339(),
-                    updated_at: old_secret
-                        .updated_at
-                        .to_rfc3339(),
-                };
-                let new_trigger = crate::integrations::secrets_integration_triggers::Secret {
-                    id: secret.id.clone(),
-                    name: secret.name.clone(),
-                    description: secret
-                        .description
-                        .clone()
-                        .unwrap_or_default(),
-                    tags: secret.tags.clone(),
-                    created_at: secret.created_at.to_rfc3339(),
-                    updated_at: secret.updated_at.to_rfc3339(),
-                };
-                if let Some(store) = notification_store {
-                    tokio::spawn(async move {
-                        crate::integrations::trigger_secret_updated(&store, &old_trigger, &new_trigger).await;
-                    });
-                }
+            let old_trigger = crate::integrations::secrets_integration_triggers::Secret {
+                id: old_secret.id.clone(),
+                name: old_secret.name.clone(),
+                description: old_secret
+                    .description
+                    .clone()
+                    .unwrap_or_default(),
+                tags: old_secret.tags.clone(),
+                created_at: old_secret
+                    .created_at
+                    .to_rfc3339(),
+                updated_at: old_secret
+                    .updated_at
+                    .to_rfc3339(),
+            };
+            let new_trigger = crate::integrations::secrets_integration_triggers::Secret {
+                id: secret.id.clone(),
+                name: secret.name.clone(),
+                description: secret
+                    .description
+                    .clone()
+                    .unwrap_or_default(),
+                tags: secret.tags.clone(),
+                created_at: secret.created_at.to_rfc3339(),
+                updated_at: secret.updated_at.to_rfc3339(),
+            };
+            if let Some(store) = notification_store {
+                tokio::spawn(async move {
+                    crate::integrations::trigger_secret_updated(&store, &old_trigger, &new_trigger).await;
+                });
             }
 
             if let Some(cache) = secrets_cache {
@@ -234,17 +251,18 @@ pub async fn delete_secret(
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> impl IntoResponse {
-    // Get secret before deletion for triggers
-    let secret_result = store.get(&id).await;
-    if let Ok(Some(secret)) = secret_result.as_ref()
-        && (!can_access(secret.tenant_id.as_deref(), tenant_context(&context))
-            || !scope_allows_resource(
-                resource_scope(&scope),
-                tenant_context(&context),
-                ResourceKind::Secrets,
-                &secret.secret_id,
-            ))
-    {
+    let secret = match store.get(&id).await {
+        Ok(Some(secret)) => secret,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Secret not found").into_response(),
+        Err(e) => {
+            error!("Failed to load secret {}: {}", id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
+        }
+    };
+    if !is_visible(secret.tenant_id.as_deref(), &secret.secret_id, tenant_context(&context), resource_scope(&scope)) {
+        return (StatusCode::NOT_FOUND, "Secret not found").into_response();
+    }
+    if !can_mutate(secret.tenant_id.as_deref(), tenant_context(&context)) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "message": "Secret is outside this token's permitted scope" })),
@@ -254,28 +272,25 @@ pub async fn delete_secret(
 
     match store.delete(&id).await {
         Ok(_) => {
-            // Trigger integration event if we have the secret
-            if let Ok(Some(secret)) = secret_result {
-                let trigger_secret = crate::integrations::secrets_integration_triggers::Secret {
-                    id: secret.id.clone(),
-                    name: secret.name.clone(),
-                    description: secret
-                        .description
-                        .clone()
-                        .unwrap_or_default(),
-                    tags: secret.tags.clone(),
-                    created_at: secret.created_at.to_rfc3339(),
-                    updated_at: secret.updated_at.to_rfc3339(),
-                };
-                if let Some(store) = notification_store {
-                    tokio::spawn(async move {
-                        crate::integrations::trigger_secret_deleted(&store, &trigger_secret).await;
-                    });
-                }
+            let trigger_secret = crate::integrations::secrets_integration_triggers::Secret {
+                id: secret.id.clone(),
+                name: secret.name.clone(),
+                description: secret
+                    .description
+                    .clone()
+                    .unwrap_or_default(),
+                tags: secret.tags.clone(),
+                created_at: secret.created_at.to_rfc3339(),
+                updated_at: secret.updated_at.to_rfc3339(),
+            };
+            if let Some(store) = notification_store {
+                tokio::spawn(async move {
+                    crate::integrations::trigger_secret_deleted(&store, &trigger_secret).await;
+                });
+            }
 
-                if let Some(cache) = secrets_cache {
-                    crate::a2a::clear_secret_cache(&secret.secret_id, &cache);
-                }
+            if let Some(cache) = secrets_cache {
+                crate::a2a::clear_secret_cache(&secret.secret_id, &cache);
             }
 
             (StatusCode::NO_CONTENT, "").into_response()
@@ -302,10 +317,7 @@ pub async fn find_by_tag(
         Ok(mut secrets) => {
             let context = tenant_context(&context);
             let scope = resource_scope(&scope);
-            secrets.retain(|secret| {
-                can_access(secret.tenant_id.as_deref(), context)
-                    && scope_allows_resource(scope, context, ResourceKind::Secrets, &secret.secret_id)
-            });
+            secrets.retain(|secret| is_visible(secret.tenant_id.as_deref(), &secret.secret_id, context, scope));
             (StatusCode::OK, Json(secrets)).into_response()
         }
         Err(e) => {
@@ -452,5 +464,247 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let (text, json) = body_json(response).await;
         assert_metadata_only(&json, &text);
+    }
+
+    #[derive(Clone, Copy)]
+    enum Lookup {
+        Found,
+        Missing,
+        Fails,
+    }
+
+    struct RecordingSecretStore {
+        secret: Secret,
+        lookup: Lookup,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SecretsStore for RecordingSecretStore {
+        async fn create(
+            &self,
+            _request: CreateSecretRequest,
+        ) -> Result<Secret> {
+            unreachable!()
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> Result<Option<Secret>> {
+            match self.lookup {
+                Lookup::Found => Ok(Some(self.secret.clone())),
+                Lookup::Missing => Ok(None),
+                Lookup::Fails => anyhow::bail!("secret backend unavailable"),
+            }
+        }
+        async fn list_all(&self) -> Result<Vec<SecretListItem>> {
+            Ok(vec![self.secret.clone().into()])
+        }
+        async fn update(
+            &self,
+            _id: &str,
+            _request: UpdateSecretRequest,
+        ) -> Result<Secret> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.secret.clone())
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> Result<()> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn find_by_tag(
+            &self,
+            _tag: &str,
+        ) -> Result<Vec<SecretListItem>> {
+            Ok(vec![self.secret.clone().into()])
+        }
+    }
+
+    fn recording_store(tenant_id: Option<&str>) -> Arc<RecordingSecretStore> {
+        recording_store_with(tenant_id, Lookup::Found)
+    }
+
+    fn recording_store_with(
+        tenant_id: Option<&str>,
+        lookup: Lookup,
+    ) -> Arc<RecordingSecretStore> {
+        Arc::new(RecordingSecretStore {
+            lookup,
+            secret: Secret {
+                id: "internal-1".to_string(),
+                tenant_id: tenant_id.map(str::to_string),
+                name: "Billing API key".to_string(),
+                secret_id: "billing_api_key".to_string(),
+                description: None,
+                value: PLAINTEXT.to_string(),
+                secret_type: "ApiKey".to_string(),
+                tags: Vec::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    async fn status_and_body(response: axum::response::Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn update_and_delete_responses_as_tenant_a(
+        store: Arc<dyn SecretsStore>,
+        scope: Option<Extension<PatResourceScope>>,
+    ) -> ((StatusCode, String), (StatusCode, String)) {
+        let update = update_secret(
+            State(store.clone()),
+            Extension(None),
+            Extension(None),
+            Path("internal-1".to_string()),
+            tenant_a(),
+            scope.clone(),
+            Json(UpdateSecretRequest {
+                name: Some("Tenant key".to_string()),
+                description: None,
+                value: None,
+                update_value: None,
+                secret_type: None,
+                tags: None,
+            }),
+        )
+        .await
+        .into_response();
+        let delete = delete_secret(
+            State(store),
+            Extension(None),
+            Extension(None),
+            Path("internal-1".to_string()),
+            tenant_a(),
+            scope,
+        )
+        .await
+        .into_response();
+        (status_and_body(update).await, status_and_body(delete).await)
+    }
+
+    async fn update_and_delete_as_tenant_a(store: Arc<dyn SecretsStore>) -> (StatusCode, StatusCode) {
+        let ((update, _), (delete, _)) = update_and_delete_responses_as_tenant_a(store, None).await;
+        (update, delete)
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_sees_another_tenants_secret_as_missing_on_update_and_delete() {
+        let recording = recording_store(Some("tenant-b"));
+        let store: Arc<dyn SecretsStore> = recording.clone();
+        let missing: Arc<dyn SecretsStore> = recording_store_with(None, Lookup::Missing);
+
+        let other_tenant = update_and_delete_responses_as_tenant_a(store, None).await;
+        let not_found = update_and_delete_responses_as_tenant_a(missing, None).await;
+
+        assert_eq!(other_tenant.0.0, StatusCode::NOT_FOUND);
+        assert_eq!(other_tenant, not_found);
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_sees_its_secret_outside_the_token_pattern_as_missing() {
+        let recording = recording_store(Some("tenant-a"));
+        let store: Arc<dyn SecretsStore> = recording.clone();
+        let missing: Arc<dyn SecretsStore> = recording_store_with(None, Lookup::Missing);
+        let scope = || {
+            Some(Extension(PatResourceScope(Arc::new(
+                regex::Regex::new("^TENANT:tenant-a:secrets:other_.*$").expect("pattern"),
+            ))))
+        };
+
+        let read = get_secret(State(store.clone()), Path("internal-1".to_string()), tenant_a(), scope())
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::NOT_FOUND);
+
+        let outside_pattern = update_and_delete_responses_as_tenant_a(store, scope()).await;
+        let not_found = update_and_delete_responses_as_tenant_a(missing, None).await;
+
+        assert_eq!(outside_pattern.0.0, StatusCode::NOT_FOUND);
+        assert_eq!(outside_pattern, not_found);
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_update_or_delete_an_appliance_wide_secret() {
+        let recording = recording_store(None);
+        let store: Arc<dyn SecretsStore> = recording.clone();
+
+        let read = get_secret(State(store.clone()), Path("internal-1".to_string()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+
+        assert_eq!(update_and_delete_as_tenant_a(store).await, (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN));
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_and_delete_its_own_secret() {
+        let recording = recording_store(Some("tenant-a"));
+        let store: Arc<dyn SecretsStore> = recording.clone();
+
+        assert_eq!(update_and_delete_as_tenant_a(store).await, (StatusCode::OK, StatusCode::NO_CONTENT));
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_fail_closed_when_the_secret_cannot_be_loaded() {
+        for (lookup, expected) in
+            [(Lookup::Fails, StatusCode::INTERNAL_SERVER_ERROR), (Lookup::Missing, StatusCode::NOT_FOUND)]
+        {
+            let recording = recording_store_with(None, lookup);
+            let store: Arc<dyn SecretsStore> = recording.clone();
+
+            assert_eq!(update_and_delete_as_tenant_a(store).await, (expected, expected));
+            assert_eq!(
+                recording
+                    .writes
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+        }
     }
 }

@@ -22,7 +22,7 @@ use crate::rbac::{Feature, RbacConfig};
 use crate::secrets::SecretsStore;
 use crate::sts::store::{StsClient, StsClientStorage};
 use crate::tenancy::{
-    PatTenantContext, ResourceKind, can_access, can_reference, scope_allows_resource, tenant_for_create,
+    PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
 };
 
 /// Axum state for the STS client admin handlers.
@@ -169,6 +169,17 @@ fn client_allowed(
         && scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::StsClients, &client.id)
 }
 
+/// May this caller change or delete the client? Requires [`can_mutate`]
+/// ownership and a resource scope that matches the client id.
+fn client_writable(
+    client: &StsClient,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> bool {
+    can_mutate(client.tenant_id.as_deref(), tenant_context(context))
+        && scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::StsClients, &client.id)
+}
+
 async fn validate_secret_reference(
     owner_tenant_id: Option<&str>,
     secret_ref: Option<&str>,
@@ -305,7 +316,7 @@ pub async fn create_client(
         }
     }
     let client = to_client(uuid::Uuid::new_v4().to_string(), body);
-    if !client_allowed(&client, &context, &scope) {
+    if !client_writable(&client, &context, &scope) {
         return (StatusCode::FORBIDDEN, ErrorBody::json("STS client is outside this token's permitted scope"))
             .into_response();
     }
@@ -427,6 +438,9 @@ pub async fn update_client(
         }
     };
     if !client_allowed(&existing, &context, &scope) {
+        return (StatusCode::NOT_FOUND, ErrorBody::json("client not found")).into_response();
+    }
+    if !client_writable(&existing, &context, &scope) {
         return (StatusCode::FORBIDDEN, ErrorBody::json("STS client is outside this token's permitted scope"))
             .into_response();
     }
@@ -503,12 +517,12 @@ pub async fn delete_client(
         return e.into_response();
     }
     match store.get(&id).await {
-        Ok(Some(client)) if client_allowed(&client, &context, &scope) => {}
-        Ok(Some(_)) => {
+        Ok(Some(client)) if client_writable(&client, &context, &scope) => {}
+        Ok(Some(client)) if client_allowed(&client, &context, &scope) => {
             return (StatusCode::FORBIDDEN, ErrorBody::json("STS client is outside this token's permitted scope"))
                 .into_response();
         }
-        Ok(None) => return (StatusCode::NOT_FOUND, ErrorBody::json("client not found")).into_response(),
+        Ok(Some(_)) | Ok(None) => return (StatusCode::NOT_FOUND, ErrorBody::json("client not found")).into_response(),
         Err(e) => {
             error!(id = %id, error = %e, "Failed to load STS client before delete");
             return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Internal server error")).into_response();
@@ -771,9 +785,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn approved_user_permission_is_still_ceilinged_by_pat_scope() {
-        let temp = tempdir().unwrap();
+    async fn admin_storage(temp: &tempfile::TempDir) -> PasskeyStorage {
         let storage = PasskeyStorage::new(
             temp.path()
                 .join("users")
@@ -808,6 +820,13 @@ mod tests {
             })
             .await
             .unwrap();
+        storage
+    }
+
+    #[tokio::test]
+    async fn approved_user_permission_is_still_ceilinged_by_pat_scope() {
+        let temp = tempdir().unwrap();
+        let storage = admin_storage(&temp).await;
         let rbac = RbacConfig::default();
         let excluded = PatContext(Some(vec!["surfaces.view".into()]));
         let allowed = PatContext(Some(vec!["sts_clients.view".into()]));
@@ -820,6 +839,172 @@ mod tests {
             require_permission("admin", &storage, &rbac, &Feature::StsClientsView, Some(&allowed))
                 .await
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_tenant_may_read_an_appliance_wide_sts_client_but_not_change_it() {
+        let tenant = Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+        let mut record = to_client("client-a".into(), base_request());
+        record.tenant_id = None;
+        assert!(client_allowed(&record, &tenant, &None));
+        assert!(!client_writable(&record, &tenant, &None));
+        assert!(client_writable(&record, &None, &None));
+
+        record.tenant_id = Some("tenant-a".into());
+        assert!(client_writable(&record, &tenant, &None));
+
+        record.tenant_id = Some("tenant-b".into());
+        assert!(!client_writable(&record, &tenant, &None));
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    struct StsFixture {
+        _temp: tempfile::TempDir,
+        storage: Arc<PasskeyStorage>,
+        store: StsClientAdminState,
+        client: crate::sts::store::StsClient,
+    }
+
+    async fn sts_fixture(tenant_id: Option<&str>) -> StsFixture {
+        let temp = tempdir().unwrap();
+        let storage = Arc::new(admin_storage(&temp).await);
+        let store: StsClientAdminState = Arc::new(
+            crate::sts::store::FileSystemStsClientStore::new(temp.path().join("sts"))
+                .await
+                .unwrap(),
+        );
+        let mut client = to_client(String::new(), base_request());
+        client.tenant_id = tenant_id.map(str::to_string);
+        let client = store
+            .create(client)
+            .await
+            .unwrap();
+        StsFixture {
+            _temp: temp,
+            storage,
+            store,
+            client,
+        }
+    }
+
+    async fn update_as_tenant_a(fixture: &StsFixture) -> StatusCode {
+        let mut body = base_request();
+        body.name = "Tenant agent".into();
+        body.client_secret_ref = None;
+        update_client(
+            Extension("admin".to_string()),
+            Extension(fixture.storage.clone()),
+            Extension(Arc::new(RbacConfig::default())),
+            State(fixture.store.clone()),
+            Path(fixture.client.id.clone()),
+            None,
+            Extension(Arc::new(crate::sts::resource_owners::NoResourceOwners)),
+            None,
+            tenant_a(),
+            None,
+            Json(body),
+        )
+        .await
+        .into_response()
+        .status()
+    }
+
+    async fn delete_as_tenant_a(fixture: &StsFixture) -> StatusCode {
+        delete_client(
+            Extension("admin".to_string()),
+            Extension(fixture.storage.clone()),
+            Extension(Arc::new(RbacConfig::default())),
+            State(fixture.store.clone()),
+            Path(fixture.client.id.clone()),
+            None,
+            tenant_a(),
+            None,
+        )
+        .await
+        .into_response()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_update_or_delete_an_appliance_wide_sts_client() {
+        let fixture = sts_fixture(None).await;
+
+        let read = get_client(
+            Extension("admin".to_string()),
+            Extension(fixture.storage.clone()),
+            Extension(Arc::new(RbacConfig::default())),
+            State(fixture.store.clone()),
+            Path(fixture.client.id.clone()),
+            None,
+            tenant_a(),
+            None,
+        )
+        .await
+        .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+
+        assert_eq!(update_as_tenant_a(&fixture).await, StatusCode::FORBIDDEN);
+        assert_eq!(delete_as_tenant_a(&fixture).await, StatusCode::FORBIDDEN);
+
+        let after = fixture
+            .store
+            .get(&fixture.client.id)
+            .await
+            .unwrap()
+            .expect("appliance-wide client must survive");
+        assert_eq!(after.name, "Agent");
+        assert_eq!(after.updated_at, fixture.client.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_sts_client_is_not_found_on_update_or_delete() {
+        let fixture = sts_fixture(Some("tenant-b")).await;
+
+        assert_eq!(update_as_tenant_a(&fixture).await, StatusCode::NOT_FOUND);
+        assert_eq!(delete_as_tenant_a(&fixture).await, StatusCode::NOT_FOUND);
+
+        let after = fixture
+            .store
+            .get(&fixture.client.id)
+            .await
+            .unwrap()
+            .expect("another tenant's client must survive");
+        assert_eq!(after.name, "Agent");
+        assert_eq!(after.updated_at, fixture.client.updated_at);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_and_delete_its_own_sts_client() {
+        let fixture = sts_fixture(Some("tenant-a")).await;
+
+        assert_eq!(update_as_tenant_a(&fixture).await, StatusCode::OK);
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.client.id)
+                .await
+                .unwrap()
+                .map(|client| client.name),
+            Some("Tenant agent".to_string())
+        );
+        assert_eq!(delete_as_tenant_a(&fixture).await, StatusCode::NO_CONTENT);
+        assert!(
+            fixture
+                .store
+                .get(&fixture.client.id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

@@ -7,7 +7,9 @@ use super::AuthorityStore;
 use super::types::{Authority, AuthorityResponse};
 use super::validation::{normalize_context, normalize_description, validate_context, validate_did, validate_name};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+};
 use crate::trust_registries::TrustRegistryListenerManager;
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +186,9 @@ pub async fn update_authority<S: AuthorityStore>(
             &authority.id,
         )
     {
+        return Err((StatusCode::NOT_FOUND, "Authority not found".to_string()));
+    }
+    if !can_mutate(authority.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "Authority is outside this token's permitted scope".into()));
     }
 
@@ -228,6 +233,9 @@ pub async fn delete_authority<S: AuthorityStore>(
             &authority.id,
         )
     {
+        return Err((StatusCode::NOT_FOUND, "Authority not found".to_string()));
+    }
+    if !can_mutate(authority.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "Authority is outside this token's permitted scope".into()));
     }
 
@@ -604,5 +612,144 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    async fn create_for_tenant(
+        store: &Arc<FileSystemAuthorityStore>,
+        tenant_id: Option<&str>,
+        did: &str,
+    ) -> AuthorityResponse {
+        let (_, Json(created)) = create_authority(
+            Extension(store.clone()),
+            None,
+            None,
+            None,
+            Json(CreateAuthorityRequest {
+                tenant_id: tenant_id.map(str::to_string),
+                name: "Operator anchor".to_string(),
+                did: did.to_string(),
+                description: None,
+                context: None,
+            }),
+        )
+        .await
+        .unwrap();
+        created
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn rename(did: &str) -> Json<UpdateAuthorityRequest> {
+        Json(UpdateAuthorityRequest {
+            name: "Tenant anchor".to_string(),
+            did: did.to_string(),
+            description: None,
+            context: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_update_or_delete_an_appliance_wide_authority() {
+        let (store, _dir) = test_store().await;
+        let created = create_for_tenant(&store, None, "did:web:operator.example.com").await;
+
+        let Json(read) = get_authority(Extension(store.clone()), Path(created.id.clone()), tenant_a(), None)
+            .await
+            .unwrap();
+        assert_eq!(read.did, "did:web:operator.example.com");
+
+        let update = update_authority(
+            Extension(store.clone()),
+            Extension(None),
+            Path(created.id.clone()),
+            tenant_a(),
+            None,
+            rename(&created.did),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let delete = delete_authority(Extension(store.clone()), Path(created.id.clone()), tenant_a(), None).await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let Json(after) = get_authority(Extension(store), Path(created.id), None, None)
+            .await
+            .unwrap();
+        assert_eq!(after.name, "Operator anchor");
+        assert_eq!(after.updated_at, created.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_authority_is_not_found_on_update_or_delete() {
+        let (store, _dir) = test_store().await;
+        let created = create_for_tenant(&store, Some("tenant-b"), "did:web:operator.example.com").await;
+
+        let update = update_authority(
+            Extension(store.clone()),
+            Extension(None),
+            Path(created.id.clone()),
+            tenant_a(),
+            None,
+            rename(&created.did),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let delete = delete_authority(Extension(store.clone()), Path(created.id.clone()), tenant_a(), None).await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let Json(after) = get_authority(Extension(store), Path(created.id), None, None)
+            .await
+            .unwrap();
+        assert_eq!(after.name, "Operator anchor");
+        assert_eq!(after.updated_at, created.updated_at);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_and_delete_its_own_authority() {
+        let (store, _dir) = test_store().await;
+        let created = create_for_tenant(&store, Some("tenant-a"), "did:web:tenant.example.com").await;
+
+        let Json(updated) = update_authority(
+            Extension(store.clone()),
+            Extension(None),
+            Path(created.id.clone()),
+            tenant_a(),
+            None,
+            rename(&created.did),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.name, "Tenant anchor");
+
+        let status = delete_authority(Extension(store), Path(created.id), tenant_a(), None)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 }

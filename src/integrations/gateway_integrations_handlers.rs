@@ -36,20 +36,13 @@ async fn load_gateway(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to load gateway" })))
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "Gateway not found" }))))?;
-    let tenant_allowed = if mutation {
-        can_mutate(gateway.tenant_id.as_deref(), tenant_context(context))
-    } else {
-        can_access(gateway.tenant_id.as_deref(), tenant_context(context))
-    };
-    let allowed = tenant_allowed
-        && scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Gateways, &gateway.id);
-    if !allowed {
-        let status = if mutation {
-            StatusCode::FORBIDDEN
-        } else {
-            StatusCode::NOT_FOUND
-        };
-        return Err((status, Json(json!({ "error": "Gateway not accessible" }))));
+    if !can_access(gateway.tenant_id.as_deref(), tenant_context(context))
+        || !scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Gateways, &gateway.id)
+    {
+        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "Gateway not found" }))));
+    }
+    if mutation && !can_mutate(gateway.tenant_id.as_deref(), tenant_context(context)) {
+        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "Gateway not accessible" }))));
     }
     Ok(gateway)
 }
@@ -306,5 +299,20 @@ mod tests {
                 .is_ok(),
             "an appliance-wide caller is unaffected"
         );
+        let other_tenant = Some(Extension(PatTenantContext {
+            token_id: "agat_other".into(),
+            tenant_id: "tenant-b".into(),
+        }));
+        for mutation in [false, true] {
+            let (status, axum::Json(body)) = load_gateway(&store, "tenant-peer", &other_tenant, &None, mutation)
+                .await
+                .expect_err("another tenant's gateway is hidden");
+            let (missing_status, axum::Json(missing_body)) =
+                load_gateway(&store, "no-such-peer", &other_tenant, &None, mutation)
+                    .await
+                    .expect_err("a missing gateway is not found");
+            assert_eq!(status, StatusCode::NOT_FOUND, "mutation: {mutation}");
+            assert_eq!((status, body), (missing_status, missing_body), "mutation: {mutation}");
+        }
     }
 }

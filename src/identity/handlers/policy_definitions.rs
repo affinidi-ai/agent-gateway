@@ -372,6 +372,9 @@ pub async fn update_policy_definition(
         .get(&policy_id)
         .await
         .ok_or_else(|| AppError::NotFound(format!("Policy definition not found: {}", policy_id)))?;
+    if !policy_allowed(existing.tenant_id.as_deref(), &existing.id, &context, &scope) {
+        return Err(AppError::NotFound(format!("Policy definition not found: {}", policy_id)));
+    }
     if !policy_writable(existing.tenant_id.as_deref(), &existing.id, &context, &scope) {
         return Err(AppError::Forbidden("Policy definition is not this token's to change".into()));
     }
@@ -526,6 +529,9 @@ pub async fn delete_policy_definition(
         .get(&policy_id)
         .await
         .ok_or_else(|| AppError::NotFound(format!("Policy definition not found: {}", policy_id)))?;
+    if !policy_allowed(policy.tenant_id.as_deref(), &policy.id, &context, &scope) {
+        return Err(AppError::NotFound(format!("Policy definition not found: {}", policy_id)));
+    }
     if !policy_writable(policy.tenant_id.as_deref(), &policy.id, &context, &scope) {
         return Err(AppError::Forbidden("Policy definition is not this token's to delete".into()));
     }
@@ -1437,6 +1443,14 @@ mod tests {
 
     fn scope(pattern: &str) -> Option<Extension<PatResourceScope>> {
         Some(Extension(PatResourceScope(std::sync::Arc::new(regex::Regex::new(pattern).unwrap()))))
+    }
+
+    #[test]
+    fn policy_allowed_hides_another_tenants_or_out_of_scope_policy() {
+        assert!(policy_allowed(None, POL, &tenant("tenant-a"), &None));
+        assert!(!policy_allowed(Some("tenant-b"), POL, &tenant("tenant-a"), &None));
+        let scope = scope(r"\ATENANT:tenant-a:policy-definitions:other\z");
+        assert!(!policy_allowed(Some("tenant-a"), POL, &tenant("tenant-a"), &scope));
     }
 
     #[test]

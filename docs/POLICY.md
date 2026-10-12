@@ -143,11 +143,19 @@ addressable from policy while `name` is only a label. Counts are code points, no
 
 Source auth does not refuse a request whose credential is missing or invalid. The
 request continues with no caller identity, `input.source_auth` is
-`{"method": "failed", "attempted_method": ..., "reason": ...}`. On the direct inbound
-path the stored target credential is not attached when forwarding. A surface that
-must reject such callers needs a policy that denies
-`input.source_auth.method == "failed"`. Server-side
-source-auth errors (missing configuration, internal failures) still block with `500`.
+`{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
+path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
+Fabric receive) the stored target credential, or the A2A proxy's Direct Line secret,
+is not attached, because it vouches that the gateway vetted the caller. A surface that
+must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
+Server-side source-auth errors (missing configuration, internal failures) still block
+with `500`.
+
+Over Fabric, the sending Gateway strips the credential header its own surface consumed
+before forwarding. A receiving surface that requires source authentication on that same
+header therefore sees every Fabric caller as failed and forwards without its target
+credential. Require caller authentication on one side of the Fabric hop, or use a
+different credential header on each side.
 
 ## Caller identity verification in policy input
 

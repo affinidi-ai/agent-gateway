@@ -95,6 +95,7 @@ impl A2aProxyTargetAdapter {
         body_bytes: &[u8],
         secrets_store: Option<&Arc<dyn SecretsStore>>,
         channel_name: &str,
+        caller: crate::proxy::handler::CallerAssertion,
     ) -> Response {
         let proxy = match self
             .load_active_proxy(proxy_id, channel_name)
@@ -104,7 +105,7 @@ impl A2aProxyTargetAdapter {
             Err(err) => return json_rpc_target_error(body_bytes, err),
         };
 
-        super::runtime::handle_a2a_proxy_request(&proxy, body_bytes, secrets_store, channel_name).await
+        super::runtime::handle_a2a_proxy_request(&proxy, body_bytes, secrets_store, channel_name, caller).await
     }
 
     async fn load_active_proxy(

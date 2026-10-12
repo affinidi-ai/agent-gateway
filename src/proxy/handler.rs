@@ -520,6 +520,21 @@ impl CallerAssertion {
             Self::Authenticated
         }
     }
+
+    /// A caller request the gateway forwards to its target. A caller whose
+    /// source authentication failed has been vetted by nobody, whatever the
+    /// path; otherwise [`Self::for_request`] decides.
+    pub(crate) fn for_forwarded_request(
+        method: &str,
+        path: &str,
+        source_auth_failed: bool,
+    ) -> Self {
+        if source_auth_failed {
+            Self::Unauthenticated
+        } else {
+            Self::for_request(method, path)
+        }
+    }
 }
 
 pub(crate) async fn inject_target_auth_header(
@@ -533,7 +548,7 @@ pub(crate) async fn inject_target_auth_header(
     if !caller.permits_target_credential() {
         warn!(
             channel = %channel_name,
-            "Refusing to inject target credentials: the inbound request skipped caller authentication"
+            "Refusing to inject target credentials: the caller was not authenticated"
         );
         return Ok(None);
     }
@@ -1739,8 +1754,25 @@ async fn proxy_handler_with_mcp_runtime(
             Err(error) => return Ok(authorization.challenge(error)),
         }
     } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-        && let (Some(auth_config), Some(sa_middleware)) = (state.surface.source_auth(), &state.source_auth_middleware)
+        && let (Some(auth_config), installed_middleware) = (state.surface.source_auth(), &state.source_auth_middleware)
     {
+        let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
+            Ok(middleware) => middleware,
+            Err(e) => {
+                channel_warn!(config_id, "Source authentication unavailable (reason={}) — blocking", e);
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(crate::source_auth::errors::deny_response(
+                    &state
+                        .surface
+                        .access_point
+                        .protocol,
+                    auth_config,
+                    &e,
+                ));
+            }
+        };
         let resolved_auth_config = match resolve_direct_surface_auth_config(
             auth_config,
             state.vc_issuer.as_deref(),
@@ -3910,6 +3942,7 @@ async fn proxy_handler_with_mcp_runtime(
                 start_time,
                 trace_id.clone(),
                 authenticated_identity.as_ref(),
+                source_auth_failed,
                 &policy_input,
                 mcp_context.as_ref(),
             )
@@ -4011,6 +4044,7 @@ async fn proxy_handler_with_mcp_runtime(
                 start_time,
                 trace_id.clone(),
                 authenticated_identity.as_ref(),
+                source_auth_failed,
                 &policy_input,
                 mcp_context.as_ref(),
             )
@@ -4132,6 +4166,7 @@ async fn proxy_handler_with_mcp_runtime(
                 start_time,
                 trace_id.clone(),
                 authenticated_identity.as_ref(),
+                source_auth_failed,
                 &policy_input,
                 mcp_context.as_ref(),
             )
@@ -5542,7 +5577,8 @@ async fn proxy_handler_with_mcp_runtime(
             return Ok(response);
         };
         channel_info!(config_id, "🔌 Routing A2A request through A2A proxy backend proxy_id={}", proxy_id);
-        let response = handle_a2a_proxy_target_request(&state, proxy_id, &body_bytes, &channel_name).await;
+        let caller = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
+        let response = handle_a2a_proxy_target_request(&state, proxy_id, &body_bytes, &channel_name, caller).await;
         let response = record_a2a_proxy_connection_metric(
             &state,
             proxy_id,
@@ -5994,11 +6030,7 @@ async fn proxy_handler_with_mcp_runtime(
 
     // Inject target authentication credentials (if configured)
     if let Some(target_auth) = state.surface.target_auth() {
-        let caller_assertion = if source_auth_failed {
-            CallerAssertion::Unauthenticated
-        } else {
-            CallerAssertion::for_request(method.as_str(), uri.path())
-        };
+        let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
         match inject_target_auth_header(target_auth, &state.secrets_store, &channel_name, caller_assertion).await {
             Ok(Some((header_name, header_value))) => {
                 upstream_req = upstream_req.header(&header_name, &header_value);
@@ -9796,6 +9828,8 @@ async fn handle_fabric_request(
     subscription_lifetime: Option<crate::mcp::subscriptions::SubscriptionLifetime>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> Result<Response, Response> {
+    let source_auth_failed =
+        matches!(source_auth_context, Some(crate::surface_context::SourceAuthContext::Failed { .. }));
     let modern_mcp_context = mcp_classification.and_then(crate::mcp::modern_mcp_context);
     let mut modern_request = match mcp_classification {
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
@@ -11491,7 +11525,7 @@ async fn handle_fabric_request(
             target_auth,
             &state.secrets_store,
             channel_name,
-            CallerAssertion::for_request(method.as_str(), uri.path()),
+            CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
         )
         .await
         {
@@ -14118,6 +14152,7 @@ async fn handle_a2a_proxy_target_request(
     proxy_id: &str,
     body_bytes: &[u8],
     channel_name: &str,
+    caller: CallerAssertion,
 ) -> Response {
     let adapter = match crate::a2a_proxies::A2aProxyTargetAdapter::from_optional_store(state.a2a_proxy_store.clone()) {
         Ok(adapter) => adapter,
@@ -14125,7 +14160,7 @@ async fn handle_a2a_proxy_target_request(
     };
 
     adapter
-        .dispatch_message_send(proxy_id, body_bytes, state.secrets_store.as_ref(), channel_name)
+        .dispatch_message_send(proxy_id, body_bytes, state.secrets_store.as_ref(), channel_name, caller)
         .await
 }
 
@@ -14488,6 +14523,7 @@ async fn handle_mcp_proxy_request(
     start_time: std::time::Instant,
     trace_id: String,
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
+    source_auth_failed: bool,
     policy_input: &crate::surface_context::PolicyInput,
     mcp_context: Option<&crate::surface_context::McpContext>,
 ) -> Result<Response, Response> {
@@ -14688,7 +14724,7 @@ async fn handle_mcp_proxy_request(
             target_auth,
             &state.secrets_store,
             channel_name,
-            CallerAssertion::for_request(method.as_str(), uri.path()),
+            CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
         )
         .await
         {
@@ -15618,6 +15654,26 @@ mod caller_assertion_tests {
         assert!(CallerAssertion::Authenticated.permits_target_credential());
         assert!(CallerAssertion::GatewayOriginated.permits_target_credential());
         assert!(!CallerAssertion::Unauthenticated.permits_target_credential());
+    }
+
+    #[test]
+    fn a_failed_source_authentication_never_carries_the_target_credential() {
+        for (method, path) in [("POST", "/surface/mcp"), ("GET", "/payments/garlic/station")] {
+            let assertion = CallerAssertion::for_forwarded_request(method, path, true);
+            assert_eq!(assertion, CallerAssertion::Unauthenticated, "{method} {path}");
+            assert!(!assertion.permits_target_credential(), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn a_forwarded_request_without_a_failure_keeps_the_path_rule() {
+        for (method, path, expected) in [
+            ("POST", "/surface/mcp", CallerAssertion::Authenticated),
+            ("GET", "/surface/.well-known/agent-card.json", CallerAssertion::Unauthenticated),
+            ("HEAD", "/surface/agent.json", CallerAssertion::Unauthenticated),
+        ] {
+            assert_eq!(CallerAssertion::for_forwarded_request(method, path, false), expected, "{method} {path}");
+        }
     }
 }
 
@@ -16800,6 +16856,53 @@ allow if {
         );
     }
 
+    async fn direct_access_point_blocks_when_source_auth_is_unavailable(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::atomic::Ordering;
+
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": "unauthenticated", "result": {"tools": []}}).to_string(),
+        )
+        .await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "source-auth-unavailable", "name": "Source auth unavailable",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/guarded", "protocol": "mcp",
+                "caller_authentication": {"methods": [{
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []
+                }]}},
+            "target": {"endpoint": target.url()}
+        }))
+        .unwrap();
+        let mut router_state = direct_router_state(state, surface);
+        router_state.source_auth_middleware = None;
+        let body = json!({"jsonrpc": "2.0", "id": "unauthenticated", "method": "tools/list"});
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/guarded")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            router_state,
+            request,
+            crate::mcp::request_validation::LEGACY_ONLY_POLICY,
+            None,
+        ))
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
     /// An upstream result carrying every preservation field
     /// reaches the caller of a direct Access Point intact, in JSON and SSE.
     async fn direct_access_point_preserves_every_result_field(state: &crate::state::ProxyState) {
@@ -17637,6 +17740,7 @@ allow if {
         access_point_admission_rejects_every_negative_case(&state).await;
         access_point_refuses_methods_and_bodies_outside_post(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;
+        direct_access_point_blocks_when_source_auth_is_unavailable(&state).await;
         direct_access_point_preserves_every_result_field(&state).await;
         direct_access_point_caller_disconnect_cancels_quiet_upstream(&state).await;
         streamed_responses_hold_the_connection_until_the_body_ends(&state).await;

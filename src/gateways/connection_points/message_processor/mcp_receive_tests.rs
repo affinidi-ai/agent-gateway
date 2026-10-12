@@ -950,6 +950,32 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             .load(Ordering::SeqCst),
         8
     );
+
+    let mut guarded = surface.clone();
+    guarded
+        .access_point
+        .caller_authentication = Some(
+        serde_json::from_value(json!({"methods": [{
+            "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []
+        }]}))
+        .unwrap(),
+    );
+    store
+        .save(&guarded)
+        .await
+        .unwrap();
+    let unauthenticated = forward_message(
+        json!({"jsonrpc": "2.0", "id": "unauthenticated", "method": "tools/list"}),
+        json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION}),
+    );
+    let response = refused(&unauthenticated).await;
+    assert_eq!(response["status"], 500, "source auth unavailable must block: {response}");
+    assert_eq!(
+        target
+            .request_count
+            .load(Ordering::SeqCst),
+        6
+    );
 }
 
 #[test]

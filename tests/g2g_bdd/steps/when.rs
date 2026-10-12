@@ -111,6 +111,37 @@ pub async fn a2a_request_sent_to_surface(
     send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &[]).await;
 }
 
+#[when(expr = "the caller fetches the agent card from gateway {int} surface {string}")]
+pub async fn agent_card_fetched_from_surface(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    world.start().await;
+    let (_gw, surface_id) = world.surface(&surface_name);
+    let port = world
+        .harness()
+        .gw(gw_index)
+        .port;
+    let response = Client::new()
+        .get(format!("http://127.0.0.1:{port}/{surface_id}/.well-known/agent-card.json"))
+        .send()
+        .await
+        .expect("caller request must succeed at the transport layer");
+
+    let status = response.status().as_u16();
+    let content_type = collect_headers(response.headers())
+        .get("content-type")
+        .cloned();
+    let raw = response
+        .text()
+        .await
+        .unwrap_or_default();
+    world.response_body = Some(parse_json_or_sse_body(&raw, content_type.as_deref()));
+    world.response_status = Some(status);
+    world.response_content_type = content_type;
+}
+
 /// Send a Fabric A2A request carrying a specific JSON-RPC method name.
 ///
 /// Proves a v1.0 method survives the DIDComm hop between gateways unchanged: the

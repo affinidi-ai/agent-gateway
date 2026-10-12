@@ -135,6 +135,10 @@ A node runs in one of two modes, set by `server_mode` in the bootstrap config (d
 - **Active** serves traffic and runs the fabric and trust listeners.
 - **Standby** keeps the fabric and trust listeners inactive and reports not ready.
 
+Both modes build the source authentication middleware at startup, so a node whose JWT
+verification strategy store cannot be opened refuses to start in either mode (see
+[Source authentication](SOURCE_AUTH.md#source-authentication)).
+
 The default API mount exposes `GET /api/v1/health` (200 when Active and ready, 503 when Standby)
 and `GET /api/v1/alive` (always 200); the router-relative paths are `/v1/health` and `/v1/alive`.
 

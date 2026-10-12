@@ -974,6 +974,9 @@ pub async fn update_surface(
         .await
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to get surface: {}", e)))?;
     let existing = existing.ok_or_else(|| SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id)))?;
+    if !surface_visible(existing.tenant_id.as_deref(), &surface_id, tenant_context(&context), resource_scope(&scope)) {
+        return Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id)));
+    }
     if !surface_writable(existing.tenant_id.as_deref(), &surface_id, tenant_context(&context), resource_scope(&scope)) {
         return Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()));
     }
@@ -1367,8 +1370,17 @@ pub async fn delete_surface(
                 message: format!("Surface '{}' deleted", surface_id),
             }))
         }
-        Some(_) => Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string())),
-        None => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
+        Some(surface)
+            if surface_visible(
+                surface.tenant_id.as_deref(),
+                &surface_id,
+                tenant_context(&context),
+                resource_scope(&scope),
+            ) =>
+        {
+            Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()))
+        }
+        _ => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
     }
 }
 
@@ -1659,6 +1671,15 @@ pub struct UpdateVariantRequest {
 
 /// May this caller change or delete the surface? Reading an operator's surface
 /// through a tenant PAT is allowed; changing it is not.
+fn surface_visible(
+    tenant_id: Option<&str>,
+    surface_id: &str,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> bool {
+    can_access(tenant_id, context) && scope_allows_resource(scope, context, ResourceKind::Surfaces, surface_id)
+}
+
 fn surface_writable(
     tenant_id: Option<&str>,
     surface_id: &str,
@@ -1696,9 +1717,7 @@ async fn load_surface_or_404(
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to get surface: {}", e)))?
         .ok_or_else(|| SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id)))?;
 
-    if !can_access(surface.tenant_id.as_deref(), context)
-        || !scope_allows_resource(scope, context, ResourceKind::Surfaces, surface_id)
-    {
+    if !surface_visible(surface.tenant_id.as_deref(), surface_id, context, scope) {
         return Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id)));
     }
     if access == SurfaceAccess::Mutate && !surface_writable(surface.tenant_id.as_deref(), surface_id, context, scope) {
@@ -2900,6 +2919,16 @@ mod tenancy_tests {
         let open = scope(r"\ATENANT:tenant-a:surfaces:.*\z");
         assert!(can_access(None, Some(&tenant)), "reading stays allowed");
         assert!(!surface_writable(None, "operator-surface", Some(&tenant), Some(&open)));
+    }
+
+    #[test]
+    fn another_tenants_or_out_of_scope_surface_is_hidden_but_an_operators_is_visible() {
+        let tenant = tenant("tenant-a");
+        let prefixed = scope(r"\ATENANT:tenant-a:surfaces:boris-.*\z");
+        assert!(surface_visible(None, "boris-op", Some(&tenant), Some(&prefixed)));
+        assert!(surface_visible(Some("tenant-a"), "boris-s1", Some(&tenant), Some(&prefixed)));
+        assert!(!surface_visible(Some("tenant-b"), "boris-s1", Some(&tenant), Some(&prefixed)));
+        assert!(!surface_visible(Some("tenant-a"), "other-s1", Some(&tenant), Some(&prefixed)));
     }
 
     #[test]

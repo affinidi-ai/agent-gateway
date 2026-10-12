@@ -955,10 +955,11 @@ async fn verify_channel_did_proof(
     .map_err(|e| e.to_string())
 }
 
-/// The connection point a connection-setup arrived on must still be a live
-/// invitation: present, enabled and not past `expires_at`. Listener activation
-/// prunes expired invitations, but a listener that was already running keeps
-/// accepting on its socket after the invitation expires.
+/// The connection point a connection-setup arrived on must still be a live,
+/// unused invitation: a User connection point with a secret, enabled, not past
+/// `expires_at`, never redeemed, and named by the setup's `pthid`. Listener
+/// activation prunes expired invitations, but a listener that was already
+/// running keeps accepting on its socket after the invitation expires.
 async fn load_invited_connection_point(
     message: &ReceivedMessage
 ) -> Result<crate::gateways::connection_points::types::GatewayConnectionPoint, String> {
@@ -973,6 +974,15 @@ async fn load_invited_connection_point(
         .await
         .map_err(|e| format!("failed to load connection point: {}", e))?
         .ok_or_else(|| "connection point not found".to_string())?;
+    if connection_point.cp_type != crate::gateways::connection_points::types::ConnectionPointType::User {
+        return Err("connection point is not an invitation".to_string());
+    }
+    if connection_point
+        .secret
+        .is_empty()
+    {
+        return Err("invitation has no secret".to_string());
+    }
     if !connection_point.enabled {
         return Err("connection point is disabled".to_string());
     }
@@ -982,7 +992,93 @@ async fn load_invited_connection_point(
     {
         return Err("invitation has expired".to_string());
     }
-    Ok(connection_point)
+    if connection_point.use_count > 0 {
+        return Err("invitation has already been used".to_string());
+    }
+    match (connection_point.invitation_message_id(), message.pthid.as_deref()) {
+        (Some(invitation_id), Some(pthid)) if invitation_id == pthid => Ok(connection_point),
+        _ => Err("connection-setup does not reference this invitation".to_string()),
+    }
+}
+
+/// Why an invitation was not redeemed for a connection-setup.
+#[derive(Debug, PartialEq)]
+pub(crate) enum InvitationRefusal {
+    InvalidSecret,
+    Unavailable(String),
+}
+
+/// Redeem the invitation whose DID a connection-setup was addressed to, returning the redeemed record.
+///
+/// The record is read again here, so edits made since the setup arrived are kept, and only
+/// `use_count` and `last_used_at` change. Single use relies on connection-setup being dispatched
+/// inline (`dispatches_inline` in ws_listener.rs), so two setups on one listener cannot both pass
+/// the `use_count` check before either writes.
+pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
+    store: &CS,
+    connection_point_did: &str,
+    provided_secret: &str,
+) -> Result<crate::gateways::connection_points::types::GatewayConnectionPoint, InvitationRefusal> {
+    use subtle::ConstantTimeEq;
+
+    let unavailable = |reason: &str| InvitationRefusal::Unavailable(reason.to_string());
+    let mut invitation = store
+        .list_all()
+        .await
+        .map_err(|e| InvitationRefusal::Unavailable(format!("failed to list connection points: {}", e)))?
+        .into_iter()
+        .find(|cp| cp.connection_point_did == connection_point_did)
+        .ok_or_else(|| unavailable("connection point not found"))?;
+    if invitation.cp_type != crate::gateways::connection_points::types::ConnectionPointType::User {
+        return Err(unavailable("connection point is not an invitation"));
+    }
+    if !invitation.enabled {
+        return Err(unavailable("connection point is disabled"));
+    }
+    if invitation.use_count > 0 {
+        return Err(unavailable("invitation has already been used"));
+    }
+    let secret_matches: bool = invitation
+        .secret
+        .as_bytes()
+        .ct_eq(provided_secret.as_bytes())
+        .into();
+    if invitation.secret.is_empty() || !secret_matches {
+        return Err(InvitationRefusal::InvalidSecret);
+    }
+    invitation.use_count += 1;
+    invitation.last_used_at = Some(chrono::Utc::now());
+    store
+        .update(&invitation)
+        .await
+        .map_err(|e| InvitationRefusal::Unavailable(format!("failed to mark invitation as used: {}", e)))?;
+    Ok(invitation)
+}
+
+/// Return a redeemed invitation to unused after the connection-setup it was redeemed for failed
+/// before any gateway record was kept, so the peer can retry with the same invitation.
+pub(crate) async fn release_invitation<CS: ConnectionPointStore + ?Sized>(
+    store: &CS,
+    connection_point_id: &str,
+) {
+    let mut invitation = match store
+        .get(connection_point_id)
+        .await
+    {
+        Ok(Some(invitation)) if invitation.use_count > 0 => invitation,
+        Ok(_) => return,
+        Err(e) => {
+            error!("Failed to load invitation {} to release it: {}", connection_point_id, e);
+            return;
+        }
+    };
+    invitation.use_count -= 1;
+    if let Err(e) = store
+        .update(&invitation)
+        .await
+    {
+        error!("Failed to release invitation {}: {}", connection_point_id, e);
+    }
 }
 
 async fn process_connection_accepted(message: &ReceivedMessage) -> ProcessingResult {
@@ -4028,9 +4124,15 @@ async fn process_forward_request_with_mcp_runtime(
                 .map(to_header_iter)
                 .map(axum::http::HeaderMap::from_iter).unwrap_or_else(axum::http::HeaderMap::new));
 
-            if let (Some(auth_config), Some(sa_middleware)) =
-                (surface.source_auth(), get_source_auth_middleware())
-            {
+            if let Some(auth_config) = surface.source_auth() {
+                let sa_middleware = match crate::source_auth::middleware::require_installed(get_source_auth_middleware()) {
+                    Ok(middleware) => middleware,
+                    Err(e) => {
+                        channel_warn!(config_id, "GW2: Source authentication unavailable (reason={}) — blocking", e);
+                        let deny = crate::source_auth::errors::deny_response(&surface.access_point.protocol, auth_config, &e);
+                        return axum_response_to_forward_result(deny).await;
+                    }
+                };
                 let resolved_auth_config = match resolve_fabric_surface_auth_config(
                     auth_config,
                     GLOBAL_VC_ISSUER.get().map(Arc::as_ref),
@@ -4083,6 +4185,8 @@ async fn process_forward_request_with_mcp_runtime(
         } else {
             None
         };
+
+    let source_auth_failed = source_auth_failure.is_some();
 
     // Merged source-auth context for policy inputs: the verified identity on
     // success, or a `Failed` marker on a non-blocking caller-attributable
@@ -4763,6 +4867,7 @@ async fn process_forward_request_with_mcp_runtime(
             proxy_id,
             body_bytes,
             caller_identity,
+            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
         )
         .await;
     }
@@ -4783,6 +4888,7 @@ async fn process_forward_request_with_mcp_runtime(
             headers,
             body_bytes,
             caller_identity,
+            source_auth_failed,
         )
         .await;
     }
@@ -4946,12 +5052,12 @@ async fn process_forward_request_with_mcp_runtime(
             }
         };
 
-        match crate::proxy::handler::inject_target_auth_header(
-            target_auth,
-            &secrets_store,
-            &surface.name,
-            crate::proxy::handler::CallerAssertion::Authenticated,
-        )
+        let caller = if is_agent_card_request {
+            crate::proxy::handler::CallerAssertion::GatewayOriginated
+        } else {
+            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed)
+        };
+        match crate::proxy::handler::inject_target_auth_header(target_auth, &secrets_store, &surface.name, caller)
         .await
         {
             Ok(Some((header_name, header_value))) => {
@@ -7197,6 +7303,7 @@ async fn handle_a2a_proxy_forward(
     proxy_id: &str,
     body_bytes: bytes::Bytes,
     caller_identity: Option<String>,
+    caller: crate::proxy::handler::CallerAssertion,
 ) -> ProcessingResult {
     let config_id = surface
         .config_id()
@@ -7257,7 +7364,7 @@ async fn handle_a2a_proxy_forward(
 
     let secrets_store = get_secrets_store();
     let response = adapter
-        .dispatch_message_send(proxy_id, &body_bytes, secrets_store.as_ref(), &surface.name)
+        .dispatch_message_send(proxy_id, &body_bytes, secrets_store.as_ref(), &surface.name, caller)
         .await;
 
     let request_body_bytes = body_bytes;
@@ -7469,11 +7576,12 @@ async fn handle_mcp_proxy_forward(
     surface: &crate::config::agent_surface::AgentSurface,
     channel_id: &str,
     proxy_id: &str,
-    _method: &str,
-    _path: &str,
+    method: &str,
+    path: &str,
     _headers: Option<serde_json::Map<String, serde_json::Value>>,
     body_bytes: bytes::Bytes,
     caller_identity: Option<String>,
+    source_auth_failed: bool,
 ) -> ProcessingResult {
     // Record fields in the span
     tracing::Span::current().record("channel_id", channel_id);
@@ -7651,7 +7759,7 @@ async fn handle_mcp_proxy_forward(
             target_auth,
             &secrets_store,
             &surface.name,
-            crate::proxy::handler::CallerAssertion::Authenticated,
+            crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
         )
         .await
         {
@@ -10636,16 +10744,21 @@ mod tests {
         assert_ne!(response["status"], 403, "an Active registered peer must pass the sender check");
     }
 
+    const INVITATION_MESSAGE_ID: &str = "invitation-msg-1";
+
     async fn store_invitation(
         storage_root: &std::path::Path,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> crate::gateways::connection_points::types::GatewayConnectionPoint {
-        let store = crate::gateways::connection_points::FileSystemConnectionPointStore::new(
-            storage_root.join("connection_points"),
-        )
-        .await
-        .unwrap();
-        let connection_point = crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+        let connection_point = invitation(expires_at);
+        save_connection_point(storage_root, &connection_point).await;
+        connection_point
+    }
+
+    fn invitation(
+        expires_at: Option<chrono::DateTime<chrono::Utc>>
+    ) -> crate::gateways::connection_points::types::GatewayConnectionPoint {
+        crate::gateways::connection_points::types::GatewayConnectionPoint::new(
             "gw-test".to_string(),
             "mediator-test".to_string(),
             INVITER_TMP_DID.to_string(),
@@ -10653,16 +10766,26 @@ mod tests {
             String::new(),
             "oob-123".to_string(),
             "https://mediator.example/oob?_oobid=oob-123".to_string(),
-            serde_json::json!({}),
+            serde_json::json!({ "@id": INVITATION_MESSAGE_ID }),
             expires_at,
             crate::gateways::connection_points::ConnectionPointType::User,
             "s3cret".to_string(),
-        );
+        )
+    }
+
+    async fn save_connection_point(
+        storage_root: &std::path::Path,
+        connection_point: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+    ) {
+        let store = crate::gateways::connection_points::FileSystemConnectionPointStore::new(
+            storage_root.join("connection_points"),
+        )
+        .await
+        .unwrap();
         store
-            .create(&connection_point)
+            .update(connection_point)
             .await
             .unwrap();
-        connection_point
     }
 
     fn did_key_identity() -> (String, affinidi_tdk_common::secrets_resolver::secrets::Secret) {
@@ -10700,7 +10823,7 @@ mod tests {
         body: serde_json::Value,
         thid: Option<&str>,
     ) -> ReceivedMessage {
-        ReceivedMessage::new(
+        let mut message = ReceivedMessage::new(
             connection_point_id.to_string(),
             "gw-test".to_string(),
             MessageType::ConnectionSetup.to_string(),
@@ -10712,8 +10835,9 @@ mod tests {
             None,
             body,
             authcrypt_metadata(),
-        )
-        .with_context("agent_surface_storage_path", storage_context(storage_root))
+        );
+        message.pthid = Some(INVITATION_MESSAGE_ID.to_string());
+        message.with_context("agent_surface_storage_path", storage_context(storage_root))
     }
 
     async fn init_resolver() {
@@ -10893,6 +11017,312 @@ mod tests {
             }
             other => panic!("expected OOBConnectionSetup, got {other:?}"),
         }
+    }
+
+    async fn proven_setup_msg(
+        storage_root: &std::path::Path,
+        connection_point_id: &str,
+    ) -> ReceivedMessage {
+        let (did, key) = did_key_identity();
+        let challenge = channel_did_proof_challenge(ACCEPTOR_TMP_DID, INVITER_TMP_DID, &did);
+        let proof = sign_channel_did_proof(std::slice::from_ref(&key), &challenge).unwrap();
+        make_connection_setup_msg(storage_root, connection_point_id, setup_body(&did, Some(&proof)))
+    }
+
+    async fn invitation_store(
+        storage_root: &std::path::Path
+    ) -> crate::gateways::connection_points::FileSystemConnectionPointStore {
+        crate::gateways::connection_points::FileSystemConnectionPointStore::new(storage_root.join("connection_points"))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn redeeming_an_invitation_refuses_a_later_setup() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+
+        let redeemed = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+
+        assert_eq!(redeemed.id, connection_point.id);
+        assert_eq!(redeemed.use_count, 1);
+        assert!(
+            redeemed
+                .last_used_at
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .use_count,
+            1
+        );
+        let later = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
+        assert_eq!(failure_reason(&later), "invitation has already been used");
+        assert_eq!(
+            redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+                .await
+                .unwrap_err(),
+            InvitationRefusal::Unavailable("invitation has already been used".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_released_invitation_accepts_the_retried_setup() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+        redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+
+        release_invitation(&store, &connection_point.id).await;
+
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .use_count,
+            0
+        );
+        let retry = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
+        assert!(matches!(retry, ProcessingResult::OOBConnectionSetup(_)), "retry was refused: {retry:?}");
+        let redeemed = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+        assert_eq!(redeemed.use_count, 1);
+    }
+
+    #[tokio::test]
+    async fn releasing_an_unused_invitation_leaves_it_unused() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+
+        release_invitation(&store, &connection_point.id).await;
+        release_invitation(&store, "missing-connection-point").await;
+
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .use_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn redeeming_keeps_edits_made_after_the_setup_arrived() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+        connection_point.name = "Renamed".to_string();
+        store
+            .update(&connection_point)
+            .await
+            .unwrap();
+
+        let redeemed = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+
+        assert_eq!(redeemed.name, "Renamed");
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "Renamed"
+        );
+    }
+
+    #[tokio::test]
+    async fn redeeming_with_a_wrong_secret_leaves_the_invitation_unused() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+
+        let refused = redeem_invitation(&store, INVITER_TMP_DID, "wrong")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused, InvitationRefusal::InvalidSecret);
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .use_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn redeeming_an_invitation_without_a_secret_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.secret = String::new();
+        save_connection_point(temp.path(), &connection_point).await;
+        let store = invitation_store(temp.path()).await;
+
+        let refused = redeem_invitation(&store, INVITER_TMP_DID, "")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused, InvitationRefusal::InvalidSecret);
+    }
+
+    #[tokio::test]
+    async fn redeeming_an_invitation_disabled_or_deleted_after_the_setup_arrived_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+        connection_point.enabled = false;
+        store
+            .update(&connection_point)
+            .await
+            .unwrap();
+
+        let disabled = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+        store
+            .delete(&connection_point.id)
+            .await
+            .unwrap();
+        let deleted = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+
+        assert_eq!(disabled, InvitationRefusal::Unavailable("connection point is disabled".to_string()));
+        assert_eq!(deleted, InvitationRefusal::Unavailable("connection point not found".to_string()));
+        assert!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn redeeming_a_system_connection_point_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.cp_type = crate::gateways::connection_points::ConnectionPointType::OobResponder;
+        save_connection_point(temp.path(), &connection_point).await;
+        let store = invitation_store(temp.path()).await;
+
+        let refused = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused, InvitationRefusal::Unavailable("connection point is not an invitation".to_string()));
+    }
+
+    const NOT_THIS_INVITATION: &str = "connection-setup does not reference this invitation";
+
+    #[tokio::test]
+    async fn connection_setup_naming_another_invitation_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let mut msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+        msg.pthid = Some("another-invitation".to_string());
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), NOT_THIS_INVITATION);
+    }
+
+    #[tokio::test]
+    async fn connection_setup_without_pthid_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let mut msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+        msg.pthid = None;
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), NOT_THIS_INVITATION);
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_invitation_without_recorded_id_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.oob_message = serde_json::json!({});
+        save_connection_point(temp.path(), &connection_point).await;
+        let msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), NOT_THIS_INVITATION);
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_system_connection_point_is_refused() {
+        init_resolver().await;
+        for cp_type in [
+            crate::gateways::connection_points::ConnectionPointType::OobResponder,
+            crate::gateways::connection_points::ConnectionPointType::OobAcceptor,
+            crate::gateways::connection_points::ConnectionPointType::System,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut connection_point = invitation(None);
+            connection_point.cp_type = cp_type.clone();
+            save_connection_point(temp.path(), &connection_point).await;
+            let msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+
+            let result = process_connection_setup(&msg).await;
+
+            assert_eq!(failure_reason(&result), "connection point is not an invitation", "{cp_type:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_invitation_without_secret_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.secret = String::new();
+        save_connection_point(temp.path(), &connection_point).await;
+        let msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), "invitation has no secret");
+    }
+
+    #[tokio::test]
+    async fn connection_setup_on_used_invitation_is_refused() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut connection_point = invitation(None);
+        connection_point.use_count = 1;
+        save_connection_point(temp.path(), &connection_point).await;
+        let msg = proven_setup_msg(temp.path(), &connection_point.id).await;
+
+        let result = process_connection_setup(&msg).await;
+
+        assert_eq!(failure_reason(&result), "invitation has already been used");
     }
 
     fn x402_requirement(pay_to: &str) -> crate::config::types::X402PaymentRequirement {

@@ -27,6 +27,10 @@ pub struct ReceivedMessage {
     /// Thread ID from the DIDComm message (for correlation)
     pub didcomm_thid: Option<String>,
 
+    /// Parent thread ID from the DIDComm message; a connection-setup names its invitation here
+    #[serde(default)]
+    pub pthid: Option<String>,
+
     /// Sender DID (from metadata)
     pub from_did: Option<String>,
 
@@ -96,6 +100,7 @@ impl ReceivedMessage {
             message_type,
             didcomm_message_id,
             didcomm_thid,
+            pthid: None,
             from_did,
             to_dids,
             created_time,

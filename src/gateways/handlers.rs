@@ -377,6 +377,9 @@ pub async fn update_gateway<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
@@ -424,6 +427,9 @@ pub async fn update_gateway_exposed_surfaces<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
@@ -520,6 +526,9 @@ pub async fn update_gateway_policy<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
@@ -670,6 +679,9 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
@@ -1002,11 +1014,19 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            update(owned.id.clone(), tenant)
+            update(owned.id.clone(), tenant.clone())
                 .await
                 .is_ok(),
             "a tenant manages its own gateway"
         );
+        let other_tenant = Some(Extension(PatTenantContext {
+            token_id: "agat_other".into(),
+            tenant_id: "tenant-b".into(),
+        }));
+        let err = update(owned.id.clone(), other_tenant)
+            .await
+            .expect_err("another tenant's gateway is out of reach");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert!(
             update(appliance.id.clone(), None)
                 .await
@@ -1898,6 +1918,9 @@ pub async fn request_gateway_issuer<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
     }
@@ -1941,6 +1964,9 @@ async fn load_remote_gateway_for_issuers<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, context, scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, context, scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
     }
@@ -2234,7 +2260,7 @@ pub async fn ping_gateway<S: GatewayStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
     if !gateway_allowed(&gateway, &context, &scope) {
-        return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
     }
 
     info!("[{request_id}] Gateway found: {} (DID: {})", gateway.name, gateway.did);
