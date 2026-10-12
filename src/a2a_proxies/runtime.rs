@@ -762,7 +762,7 @@ mod tests {
 
         assert!(
             matches!(&result, Err(A2aProxyRuntimeError::Internal(message)) if message.contains("Secrets store")),
-            "an authenticated caller must look up the stored credential, got {result:?}"
+            "an authenticated caller must look up the stored credential"
         );
     }
 

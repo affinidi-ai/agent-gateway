@@ -834,7 +834,7 @@ async fn a2a_proxy_accepts_a_message_a_managed_agent_would_refuse() {
 const SOURCE_API_KEY_SECRET_ID: &str = "a2a-proxy-source-key";
 const SOURCE_API_KEY: &str = "valid-caller-key";
 
-async fn start_a2a_proxy_harness_requiring_api_key(fake_direct_line: &FakeDirectLine) -> GatewayHarness {
+async fn start_a2a_proxy_harness_requiring_caller_auth(fake_direct_line: &FakeDirectLine) -> GatewayHarness {
     let direct_line_base_url = fake_direct_line
         .base_url
         .clone();
@@ -901,7 +901,7 @@ async fn send_a2a_text(
 #[tokio::test(flavor = "multi_thread")]
 async fn a2a_proxy_withholds_the_direct_line_credential_from_a_caller_whose_source_auth_failed() {
     let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
-    let h = start_a2a_proxy_harness_requiring_api_key(&fake_direct_line).await;
+    let h = start_a2a_proxy_harness_requiring_caller_auth(&fake_direct_line).await;
 
     let body = send_a2a_text(&h, "wrong-key").await;
 
@@ -923,7 +923,7 @@ async fn a2a_proxy_withholds_the_direct_line_credential_from_a_caller_whose_sour
 #[tokio::test(flavor = "multi_thread")]
 async fn a2a_proxy_sends_the_direct_line_credential_for_an_authenticated_caller() {
     let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
-    let h = start_a2a_proxy_harness_requiring_api_key(&fake_direct_line).await;
+    let h = start_a2a_proxy_harness_requiring_caller_auth(&fake_direct_line).await;
 
     let body = send_a2a_text(&h, SOURCE_API_KEY).await;
 

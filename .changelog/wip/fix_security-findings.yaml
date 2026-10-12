@@ -45,4 +45,7 @@ changes:
     - timestamp: '2026-10-12T00:00:01.000Z'
       title: Publish Docker Compose ports on 127.0.0.1 instead of every interface
       description: A gateway started with docker-compose.yml is no longer reachable from other hosts on ports 8443 and 8080. Remove the 127.0.0.1 prefix in docker-compose.yml to expose it deliberately.
-  internal: []
+  internal:
+    - timestamp: '2026-10-12T00:00:02.000Z'
+      title: Keep secret-named values out of two test assertions and helpers
+      description: A Direct Line credential test no longer prints its result in the assertion message, and the A2A proxy component-test harness that requires caller authentication is renamed, so code scanning no longer reports test-only values as logged or sent in cleartext.
