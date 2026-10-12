@@ -4149,9 +4149,13 @@ async fn process_forward_request_with_mcp_runtime(
             if let Err(error) = http_policy.validate_headers(&mcp_headers) {
                 return axum_response_to_forward_result(error.into_response(None)).await;
             }
-            if let Ok(http_method) = axum::http::Method::from_bytes(method.as_bytes())
-                && let Some(response) = http_policy.non_post_response(&http_method, &mcp_headers)
+            // An unparseable method maps to an extension method, which is refused with 405.
+            let http_method = axum::http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+                .unwrap_or_else(|_| axum::http::Method::from_bytes(b"INVALID").expect("static method token"));
+            if let Some(response) = http_policy.non_post_response(&http_method, &mcp_headers)
+                .or_else(|| http_policy.non_post_body_response(&http_method, &body_bytes))
             {
+                channel_warn!(config_id, "Rejecting fabric MCP {} request at admission", http_method);
                 return axum_response_to_forward_result(response).await;
             }
             None

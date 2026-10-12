@@ -1968,6 +1968,15 @@ async fn proxy_handler_with_mcp_runtime(
         }
         create_error_response(StatusCode::BAD_REQUEST, "Failed to read request body")
     })?;
+    if let Some(policy) = &mcp_http
+        && let Some(response) = policy.non_post_body_response(&method, &body_bytes)
+    {
+        channel_warn!(config_id, "Rejecting MCP {} request with a body at admission", method);
+        connection_guard
+            .decrement()
+            .await;
+        return Ok(response);
+    }
 
     let (mcp_metadata_context, validated_mcp_session_id, mcp_verified_binding, mcp_classification) = if let Some(policy) =
         &mcp_http

@@ -1737,6 +1737,17 @@ async fn step_extract_protocol_context_with_versions(
         })?;
         ctx.body_bytes = Some(body_bytes);
     }
+    if let Some(policy) = &mcp_http
+        && let Some(response) = policy.non_post_body_response(
+            &ctx.original_method,
+            ctx.body_bytes
+                .as_deref()
+                .unwrap_or_default(),
+        )
+    {
+        warn!(request_id = %ctx.request_id, method = %ctx.original_method, "Rejecting MCP request with a body at admission");
+        return Ok(Some(response));
+    }
 
     if let Some(policy) = &mcp_http
         && ctx.original_method == Method::POST
