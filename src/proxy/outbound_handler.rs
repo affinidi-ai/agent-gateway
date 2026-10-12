@@ -7619,7 +7619,7 @@ mod tests {
             let response = send(method, body).await;
             assert_eq!(response.status(), status, "{method}");
             if status == StatusCode::METHOD_NOT_ALLOWED {
-                assert_eq!(response.headers()["allow"], "POST, GET, DELETE", "{method}");
+                assert_eq!(response.headers()["allow"], "POST, GET, DELETE, HEAD, OPTIONS", "{method}");
             } else {
                 let error: serde_json::Value = serde_json::from_slice(
                     &axum::body::to_bytes(response.into_body(), 4096)

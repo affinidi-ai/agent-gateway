@@ -2362,9 +2362,10 @@ pub async fn handle_mcp_get<S: McpProxyStore>(
     if method == axum::http::Method::DELETE {
         let mut response = axum::response::Response::new(axum::body::Body::empty());
         *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-        response
-            .headers_mut()
-            .insert("allow", axum::http::HeaderValue::from_static("GET,HEAD,POST"));
+        response.headers_mut().insert(
+            "allow",
+            axum::http::HeaderValue::from_static(crate::mcp::modern_http::OWNED_PROXY_ALLOWED_METHODS),
+        );
         return Ok(response);
     }
 

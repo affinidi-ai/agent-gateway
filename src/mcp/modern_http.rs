@@ -30,6 +30,8 @@ pub struct EndpointHttpPolicy {
     origins: Option<OriginPolicy>,
     limits: HttpLimits,
     versions: McpVersionPolicy<'static>,
+    /// The `Allow` header of a 405: the methods this endpoint admits.
+    allowed_methods: &'static str,
 }
 
 impl EndpointHttpPolicy {
@@ -38,7 +40,12 @@ impl EndpointHttpPolicy {
         public_endpoints: &[String],
         path: super::request_validation::McpPathKind,
     ) -> Result<Self, String> {
-        Self::with_versions(config, public_endpoints, super::request_validation::runtime_policy_for(path))
+        let mut policy =
+            Self::with_versions(config, public_endpoints, super::request_validation::runtime_policy_for(path))?;
+        if path == super::request_validation::McpPathKind::OwnedProxy {
+            policy.allowed_methods = OWNED_PROXY_ALLOWED_METHODS;
+        }
+        Ok(policy)
     }
 
     pub(crate) fn with_versions(
@@ -52,6 +59,7 @@ impl EndpointHttpPolicy {
             origins: Some(OriginPolicy::new(public_endpoints, &config.allowed_origins)?),
             limits: config.into(),
             versions,
+            allowed_methods: MCP_ALLOWED_METHODS,
         })
     }
 
@@ -105,7 +113,7 @@ impl EndpointHttpPolicy {
     ) -> Option<axum::response::Response> {
         use axum::http::Method;
         if !matches!(*method, Method::POST | Method::GET | Method::DELETE | Method::HEAD | Method::OPTIONS) {
-            return Some(method_not_allowed(MCP_ALLOWED_METHODS));
+            return Some(method_not_allowed(self.allowed_methods));
         }
         if !matches!(*method, Method::GET | Method::DELETE) {
             return None;
@@ -213,7 +221,12 @@ const NON_POST_BODY: HttpAdmissionError = HttpAdmissionError {
     status: StatusCode::BAD_REQUEST,
     message: "Only MCP POST requests may carry a body",
 };
-const MCP_ALLOWED_METHODS: &str = "POST, GET, DELETE";
+/// Methods the gateway's MCP endpoints admit: POST, GET and DELETE for the
+/// transport, and HEAD and OPTIONS, which pass admission without a body.
+const MCP_ALLOWED_METHODS: &str = "POST, GET, DELETE, HEAD, OPTIONS";
+/// Methods a standalone MCP Proxy serves: its router routes POST, GET (and so
+/// HEAD) and DELETE, and it refuses DELETE.
+pub const OWNED_PROXY_ALLOWED_METHODS: &str = "POST, GET, HEAD";
 
 fn method_not_allowed(allow: &'static str) -> axum::response::Response {
     let mut response = axum::response::Response::new(axum::body::Body::empty());
@@ -683,7 +696,7 @@ mod tests {
                     .non_post_response(&method, &headers)
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
-                assert_eq!(response.headers()[header::ALLOW], "POST, GET, DELETE");
+                assert_eq!(response.headers()[header::ALLOW], "POST, GET, DELETE, HEAD, OPTIONS");
             }
         }
         for method in [axum::http::Method::HEAD, axum::http::Method::OPTIONS] {
@@ -693,6 +706,14 @@ mod tests {
                     .is_none()
             );
         }
+        // A standalone MCP Proxy refuses DELETE, so it doesn't advertise it.
+        let owned =
+            EndpointHttpPolicy::new(None, &[], crate::mcp::request_validation::McpPathKind::OwnedProxy).unwrap();
+        let response = owned
+            .non_post_response(&axum::http::Method::PUT, &HeaderMap::new())
+            .unwrap();
+        assert_eq!(response.headers()[header::ALLOW], OWNED_PROXY_ALLOWED_METHODS);
+        assert!(!OWNED_PROXY_ALLOWED_METHODS.contains("DELETE"));
     }
 
     #[test]

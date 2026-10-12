@@ -5066,7 +5066,10 @@ async fn process_forward_request_with_mcp_runtime(
                     user_hash,
                     surface.target_endpoint(),
                     config_id,
-                    None, // MCP tool name not available in DIDComm path
+                    // Admission refused batches and ambiguous keys above, so this is
+                    // the tool the Target reads. The Target is this gateway's own, so a
+                    // tool-scoped binding may apply here, unlike on a Transit Point.
+                    crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref(),
                     &vault_store,
                     &provider_store,
                     &secrets_store,

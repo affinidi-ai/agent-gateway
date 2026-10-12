@@ -12225,7 +12225,11 @@ async fn handle_fabric_request(
                     ));
                 }
 
-                channel_debug!(config_id, "📨 Received ForwardResponse message body: {:?}", response_msg.message_body);
+                channel_debug!(
+                    config_id,
+                    "📨 Received ForwardResponse: {}",
+                    forward_response_log_summary(&response_msg.message_body)
+                );
 
                 // Capture the raw fabric envelope from GW2 (status/headers/body) so the
                 // capture UX on GW1 can show what the remote gateway actually returned,
@@ -15048,6 +15052,35 @@ async fn handle_mcp_proxy_request(
 }
 
 /// The surface's MCP tool gating, when it has any gates installed.
+/// A ForwardResponse for the logs: its status, header names and body size.
+/// Header values and the body stay out, since `Set-Cookie`,
+/// `WWW-Authenticate` or a custom header may carry a credential.
+fn forward_response_log_summary(message_body: &serde_json::Value) -> String {
+    let header_names: Vec<&str> = message_body
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .map(|headers| {
+            headers
+                .keys()
+                .map(String::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
+    let body_bytes = match message_body.get("body") {
+        Some(serde_json::Value::String(body)) => body.len(),
+        Some(serde_json::Value::Null) | None => 0,
+        Some(body) => body.to_string().len(),
+    };
+    format!(
+        "status={} headers={:?} body_bytes={}",
+        message_body
+            .get("status")
+            .unwrap_or(&serde_json::Value::Null),
+        header_names,
+        body_bytes
+    )
+}
+
 fn surface_mcp_tool_gating(state: &ProxyState) -> Option<Arc<crate::policies::mcp_tool_gating::CompiledMcpToolGating>> {
     let config_id = state.surface.config_id()?;
     state
@@ -15515,6 +15548,28 @@ fn compute_transit_token_caller_context(
             map
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod forward_response_log_tests {
+    #[test]
+    fn forward_response_log_summary_keeps_header_values_and_body_out() {
+        let message_body = serde_json::json!({
+            "status": 401,
+            "headers": {
+                "set-cookie": "session=secret-cookie",
+                "www-authenticate": "Bearer error=\"secret-challenge\"",
+                "x-api-key": "secret-key"
+            },
+            "body": "{\"token\":\"secret-body\"}"
+        });
+
+        let summary = super::forward_response_log_summary(&message_body);
+
+        assert_eq!(summary, r#"status=401 headers=["set-cookie", "www-authenticate", "x-api-key"] body_bytes=23"#);
+        assert!(!summary.contains("secret"), "{summary}");
+        assert_eq!(super::forward_response_log_summary(&serde_json::json!({})), "status=null headers=[] body_bytes=0");
+    }
 }
 
 #[cfg(test)]
@@ -16524,7 +16579,7 @@ allow if {
                 let response = send(surface(endpoint.clone()), method, body).await;
                 assert_eq!(response.status(), status, "{path} {method}");
                 if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
-                    assert_eq!(response.headers()["allow"], "POST, GET, DELETE", "{path} {method}");
+                    assert_eq!(response.headers()["allow"], "POST, GET, DELETE, HEAD, OPTIONS", "{path} {method}");
                 } else {
                     let error: serde_json::Value = serde_json::from_slice(
                         &axum::body::to_bytes(response.into_body(), 4096)

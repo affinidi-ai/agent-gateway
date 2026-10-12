@@ -754,7 +754,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         };
         assert_eq!(response_body["status"], status, "{method}: {response_body}");
         if status == 405 {
-            assert_eq!(response_body["headers"]["allow"], "POST, GET, DELETE", "{method}");
+            assert_eq!(response_body["headers"]["allow"], "POST, GET, DELETE, HEAD, OPTIONS", "{method}");
         } else {
             let envelope: Value = serde_json::from_str(
                 response_body["body"]
