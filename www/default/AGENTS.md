@@ -257,6 +257,13 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
   both. Off, they serve 1.0 only, and a 0.3 or version-less call gets an
   unsupported-version error.
 
+## Restore from backup
+
+Settings → **System** → **Restore from Backup** (`SettingsPage/SystemTab.tsx`) accepts
+`.agbak` and legacy `.tgwbak` files. The legacy support is stated on the page
+(`data-testid="restore-legacy-format-note"`), and the wrong-file toast names both extensions.
+The hidden file input is `data-testid="restore-file-input"`.
+
 ## Schema capture and A2A versions
 
 - Schema capture (`utils/schemaUtils.ts`) detects the protocol when none is given, in this

@@ -164,6 +164,10 @@ fn build_zip(
                         continue;
                     }
                 };
+                if manifest::is_manifest_path(&relative_str) {
+                    warn!("Backup: skipping stray manifest file {}", relative_str);
+                    continue;
+                }
                 if normalize {
                     // An encrypted sibling is authoritative: when it can be decrypted,
                     // skip the raw plaintext `.json` so the archive carries one plaintext
@@ -176,6 +180,10 @@ fn build_zip(
                         }
                     }
                     let (entry_name, out) = normalize::backup_entry_for_file(&relative_str, &content, decrypt_service);
+                    if manifest::is_manifest_path(&entry_name) {
+                        warn!("Backup: skipping stray manifest file {}", relative_str);
+                        continue;
+                    }
                     zip.start_file(&entry_name, options)?;
                     zip.write_all(&out)?;
                 } else {
@@ -829,7 +837,8 @@ fn validate_zip_entries_with_limits(
         if uncompressed_bytes > limits.max_entry_uncompressed_bytes {
             anyhow::bail!("ZIP entry exceeds the uncompressed size limit: {}", entry.name());
         }
-        if entry.name() == manifest::MANIFEST_PATH && (entry.is_dir() || uncompressed_bytes > limits.max_manifest_bytes)
+        if manifest::is_manifest_path(entry.name())
+            && (entry.is_dir() || uncompressed_bytes > limits.max_manifest_bytes)
         {
             anyhow::bail!("backup manifest exceeds the size limit");
         }
@@ -880,7 +889,7 @@ fn extract_zip_bytes_to_dir(
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        if entry.name() == manifest::MANIFEST_PATH {
+        if manifest::is_manifest_path(entry.name()) {
             continue;
         }
 
@@ -1025,17 +1034,154 @@ mod tests {
         );
     }
 
+    fn write_stray_manifests(storage_root: &std::path::Path) {
+        let meta_inf = storage_root.join("META-INF");
+        fs::create_dir_all(&meta_inf).unwrap();
+        fs::write(meta_inf.join("agent-gateway-backup.json"), b"untrusted").unwrap();
+        fs::write(
+            meta_inf.join("trust-gateway-backup.json"),
+            br#"{"format_version":2,"product":"trust-gateway","source_domain":"other.example.com","created_at":"2025-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        fs::write(meta_inf.join("other.json"), b"{}").unwrap();
+    }
+
     #[test]
-    fn portable_zip_rejects_storage_collision_with_reserved_manifest() {
+    fn portable_zip_excludes_stray_manifest_files_from_storage() {
         let dir = create_test_storage();
         let storage_root = dir.path().join("_storage");
-        let reserved = storage_root.join(manifest::MANIFEST_PATH);
-        fs::create_dir_all(reserved.parent().unwrap()).unwrap();
-        fs::write(reserved, b"untrusted").unwrap();
+        write_stray_manifests(&storage_root);
 
-        let result = build_portable_zip(&storage_root, "gateway.example.com");
+        let zip_bytes = build_portable_zip(&storage_root, "gateway.example.com").unwrap();
+        let entries = zip_entries(&zip_bytes);
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
 
-        assert!(result.is_err());
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| manifest::is_manifest_path(name))
+                .collect::<Vec<_>>(),
+            vec![&manifest::MANIFEST_PATH]
+        );
+        assert!(names.contains(&"META-INF/other.json"), "non-manifest META-INF files are kept: {names:?}");
+        let manifest = manifest::validate_backup_manifest(&zip_bytes, "gateway.example.com").unwrap();
+        assert_eq!(manifest.source_domain, "gateway.example.com");
+        assert_eq!(manifest.product, "agent-gateway");
+    }
+
+    #[test]
+    fn full_zip_excludes_stray_manifest_files_from_storage() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        write_stray_manifests(&storage_root);
+
+        let names: Vec<String> = zip_entries(&build_full_zip(&storage_root).unwrap())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        assert!(
+            !names
+                .iter()
+                .any(|name| manifest::is_manifest_path(name)),
+            "{names:?}"
+        );
+        assert!(names.contains(&"META-INF/other.json".to_string()));
+    }
+
+    #[test]
+    fn startup_restores_backup_taken_from_storage_with_stray_manifests() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        write_stray_manifests(&storage_root);
+        let backup_restore_dir = dir
+            .path()
+            .join("_backup_restore");
+        fs::create_dir_all(&backup_restore_dir).unwrap();
+        let key = [0x31; 32];
+        let zip_bytes = build_portable_zip(&storage_root, "gateway.example.com").unwrap();
+        fs::write(backup_restore_dir.join("backup.tgwbak"), encryption::encrypt_backup(&key, &zip_bytes).unwrap())
+            .unwrap();
+
+        let restored =
+            check_and_restore_backup_with_keys(&storage_root, &backup_restore_dir, &key, &[], "gateway.example.com");
+
+        assert!(restored);
+        assert!(
+            !storage_root
+                .join("META-INF/agent-gateway-backup.json")
+                .exists()
+        );
+        assert!(
+            !storage_root
+                .join("META-INF/trust-gateway-backup.json")
+                .exists()
+        );
+        assert_eq!(fs::read(storage_root.join("META-INF/other.json")).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn startup_restores_archive_carrying_both_manifests_without_writing_them() {
+        let dir = create_test_storage();
+        let storage_root = dir.path().join("_storage");
+        let backup_restore_dir = dir
+            .path()
+            .join("_backup_restore");
+        fs::create_dir_all(&backup_restore_dir).unwrap();
+        let current = manifest::BackupManifest::new("gateway.example.com", false).unwrap();
+        let mut legacy = current.clone();
+        legacy.product = "trust-gateway".to_string();
+        legacy.source_domain = "other.example.com".to_string();
+        let zip_bytes = make_zip_with_entries(
+            &[
+                ("channels/restored.json", b"{\"restored\":true}"),
+                ("META-INF/trust-gateway-backup.json", &serde_json::to_vec(&legacy).unwrap()),
+                (manifest::MANIFEST_PATH, &serde_json::to_vec(&current).unwrap()),
+            ],
+            zip::CompressionMethod::Deflated,
+        );
+        let key = [0x31; 32];
+        fs::write(backup_restore_dir.join("backup.tgwbak"), encryption::encrypt_backup(&key, &zip_bytes).unwrap())
+            .unwrap();
+
+        let restored =
+            check_and_restore_backup_with_keys(&storage_root, &backup_restore_dir, &key, &[], "gateway.example.com");
+
+        assert!(restored);
+        assert_eq!(fs::read(storage_root.join("channels/restored.json")).unwrap(), b"{\"restored\":true}");
+        assert!(
+            !storage_root
+                .join("META-INF")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn extract_skips_both_manifest_paths() {
+        let target = TempDir::new().unwrap();
+        let zip_bytes = make_zip_with_entries(
+            &[("record.json", b"{}"), ("META-INF/trust-gateway-backup.json", b"{}"), (manifest::MANIFEST_PATH, b"{}")],
+            zip::CompressionMethod::Stored,
+        );
+
+        let count = extract_zip_bytes_to_dir(&zip_bytes, target.path()).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(
+            target
+                .path()
+                .join("record.json")
+                .exists()
+        );
+        assert!(
+            !target
+                .path()
+                .join("META-INF")
+                .exists()
+        );
     }
 
     #[test]
