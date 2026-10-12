@@ -4629,7 +4629,7 @@ async fn process_forward_request_with_mcp_runtime(
 
     // Derived variables used by the forwarding and response-processing code below.
     let surface_protocol = surface.channel_protocol();
-    let mut outbound_creds = surface.outbound_credentials();
+    let mut outbound_creds = surface.target_outbound_credentials();
     if let Some(prepared) = modern_delegation.as_ref() {
         outbound_creds.retain(|binding| !prepared.handled_provider_ids.contains(&binding.credential_provider_id));
     }

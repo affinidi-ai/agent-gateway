@@ -5991,7 +5991,7 @@ async fn proxy_handler_with_mcp_runtime(
     let mut delegation_actions_for_vp: Option<serde_json::Value> = None;
     let mut outbound_credentials = state
         .surface
-        .outbound_credentials();
+        .target_outbound_credentials();
     if let Some(prepared) = modern_delegation.as_ref() {
         outbound_credentials.retain(|binding| {
             !prepared

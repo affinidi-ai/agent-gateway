@@ -150,7 +150,9 @@ impl AgentSurface {
     /// surface-level `outbound_credentials` field; falls back to projecting
     /// `transit.points[*].transit_credentials` when only the per-hop shape
     /// is populated. Mirrors the conversion in
-    /// `agent_surface_compat::to_channel_mapping`.
+    /// `agent_surface_compat::to_channel_mapping`. For display only: inject
+    /// with [`Self::target_outbound_credentials`] or
+    /// [`Self::transit_point_outbound_credentials`].
     pub fn outbound_credentials(&self) -> Vec<crate::config::types::OutboundCredentialBinding> {
         if !self
             .outbound_credentials
@@ -174,6 +176,14 @@ impl AgentSurface {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Outbound credential bindings for an Access Point request to the
+    /// surface's Target. Only the surface-level `outbound_credentials`;
+    /// never a Transit Point's `transit_credentials`.
+    pub fn target_outbound_credentials(&self) -> Vec<crate::config::types::OutboundCredentialBinding> {
+        self.outbound_credentials
+            .clone()
     }
 
     /// Outbound credential bindings for a request through one Transit Point.
@@ -875,6 +885,10 @@ mod tests {
         );
         assert_eq!(providers(s.transit_point_outbound_credentials(&partner)), vec!["provider-a"]);
         assert_eq!(providers(s.outbound_credentials()), vec!["provider-a"]);
+        assert!(
+            s.target_outbound_credentials()
+                .is_empty()
+        );
 
         let peer_with_own = point(serde_json::json!({"alias": "peer", "target_endpoint": "fabric://peer/surface",
             "fabric_delegated_credentials": true, "transit_credentials": {"credential_provider_id": "provider-b"}}));
@@ -883,5 +897,6 @@ mod tests {
         s.outbound_credentials =
             vec![serde_json::from_value(serde_json::json!({"credential_provider_id": "surface-provider"})).unwrap()];
         assert_eq!(providers(s.transit_point_outbound_credentials(&peer_with_own)), vec!["surface-provider"]);
+        assert_eq!(providers(s.target_outbound_credentials()), vec!["surface-provider"]);
     }
 }
