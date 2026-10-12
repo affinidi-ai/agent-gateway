@@ -456,6 +456,15 @@ export interface NodeDefinition {
   configFromPayload?: (slice: any, payload?: any) => any;
 
   /**
+   * The stored payload is the only source of this element's config. On load
+   * the canvas blob supplies layout but no config, and a blob node whose
+   * slice is missing from the payload is dropped. Set it when
+   * `configFromPayload` rebuilds every panel field, so a value changed or
+   * removed outside the dashboard is not restored from a stale blob.
+   */
+  payloadOwnsConfig?: boolean;
+
+  /**
    * Returns the payload slices this element contributes. Called once per
    * surface (not once per node — implementations look up their own nodes via
    * `ctx.nodesOfType(this.type)` when they support multiple instances).

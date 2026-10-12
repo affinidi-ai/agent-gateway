@@ -935,7 +935,8 @@ class ElementRegistry {
       // hydrated nodes — that still points at the discarded blob id,
       // otherwise `validateSurface` fires a "references missing parent"
       // warning for legacy blobs where a chain-spliced node was
-      // parented on the drifted id.
+      // parented on the drifted id. A dropped `payloadOwnsConfig` blob
+      // node maps to its own parent, so its children stay attached.
       const renameMap = new Map<string, string>();
       for (const bn of blob.nodes) {
         let target = byId.get(bn.id);
@@ -981,6 +982,10 @@ class ElementRegistry {
         }
         if (!target) {
           if (!bn.type) continue;
+          if (this.get(bn.type)?.payloadOwnsConfig) {
+            if (typeof bn.parentId === 'string') renameMap.set(bn.id, bn.parentId);
+            continue;
+          }
           // Compute `configured` from the blob's config rather than
           // hard-coding `true`. Otherwise an element that the user
           // dropped but never finished configuring (no payload slice
@@ -1010,7 +1015,12 @@ class ElementRegistry {
           target.slotId = bn.slotId;
         }
         const blobConfig = bn.config;
-        if (target && blobConfig && typeof blobConfig === 'object') {
+        if (
+          target &&
+          blobConfig &&
+          typeof blobConfig === 'object' &&
+          !this.get(target.type)?.payloadOwnsConfig
+        ) {
           // Backend-truth fields (set by `nodesFromPayload`) win on key
           // collision; canvas-blob fields fill in UI-only keys (e.g.
           // `endpoint_type`, `route_prefix`, `route_suffix`,

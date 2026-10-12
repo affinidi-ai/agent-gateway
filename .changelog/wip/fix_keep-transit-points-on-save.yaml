@@ -11,7 +11,44 @@ changes:
         had credentials, so the gateway lost its Transit Points while the canvas still
         showed them. The Surface Builder now accepts the credentials in the shape they
         are loaded in, so every Transit Point on the canvas is saved.
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Keep explicit empty or zero retry values when saving from the dashboard
+      description: >-
+        Saving a surface from the dashboard dropped an empty list of retryable status
+        codes, so the gateway fell back to its default codes and retried calls on 5xx
+        that the operator had limited to transport errors. Zeros for retry attempts,
+        the circuit-breaker failure threshold and its timeout were saved as 3, 5 and
+        30. The dashboard now keeps these values as stored.
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Stop the dashboard restoring Networking settings removed through the API
+      description: >-
+        After Networking was changed or removed through the API, the next dashboard
+        save could write the old settings back from the canvas layout data. The
+        dashboard now takes Networking settings only from the stored surface, for the
+        Target and for each Transit Point.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Apply MCP tool gates that read the caller DID or payment on Fabric routes
+      description: >-
+        On a fabric:// target, the MCP tool gate's policy input left out the caller's
+        extension identity, and so input.agent.did, and the payment context. A Deny
+        gate whose condition read them switched off, so its tools were listed and
+        callable over Fabric while the same gate blocked them on a direct target, and
+        an Allow gate hid every tool it grants. The input now carries both, as on the
+        direct path.
   breaking: []
-  internal: []
+  internal:
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Test Fabric tool gates on caller DID, payment and deny conditions
+      description: >-
+        Adds unit tests for a caller-scoped Deny gate under allow-by-default, an Allow
+        gate on the caller DID from the extension identity, and the Fabric gate input
+        carrying the payment context, and moves the handle_fabric_request doc comment
+        back above that function.
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Test Networking values and stale canvas data across load and save
+      description: >-
+        Adds dashboard tests that an empty status-code list and stored zeros survive a
+        load and save, that Networking removed through the API is not restored from the
+        canvas data for the Target and for a Transit Point, and that its layout still is.
