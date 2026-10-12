@@ -310,6 +310,8 @@ const cases: Case[] = [
     config: { timeout_secs: '30' },
     payloadPath: 'target.networking',
     expectedSlice: { timeout: { request_secs: 30 } },
+    // configFromPayload converts the wire shape back to the flat panel config.
+    expectedRecoveredConfig: { timeout_secs: '30' },
   },
   {
     type: 'extension-validation',
