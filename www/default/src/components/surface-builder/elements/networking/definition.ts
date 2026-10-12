@@ -242,7 +242,19 @@ export const networkingDefinition: NodeDefinition = {
       }
       return false;
     };
-    const node = ctx.nodesOfType('networking').find(reachesTarget);
+    // A reloaded surface chains request middleware ahead of the Target,
+    // so a node on the Access Point to Target edge is one of the
+    // Target's ancestors instead.
+    const targetAncestors = new Set<string>();
+    let cur = ctx.firstNodeOfType('target');
+    while (cur?.parentId && !targetAncestors.has(cur.parentId)) {
+      const parentId: string = cur.parentId;
+      targetAncestors.add(parentId);
+      cur = ctx.allNodes.find(p => p.id === parentId);
+    }
+    const node = ctx
+      .nodesOfType('networking')
+      .find(n => targetAncestors.has(n.id) || reachesTarget(n));
     const out = networkingConfigToWire(node?.config);
     if (!out) return undefined;
     return [{ path: 'target.networking', value: out }];
