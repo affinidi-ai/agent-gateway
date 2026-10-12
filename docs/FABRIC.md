@@ -238,7 +238,8 @@ applies on top of every mode.
 Records written before the mode existed have no `exposure_mode`. On boot,
 [`migrate_exposure_modes`](../src/gateways/filesystem.rs) persists `all` for a record with an empty
 list (its earlier meaning) and `list` for a record with a non-empty one, so existing peers keep their
-access. Until a record is migrated, it is read with that same earlier meaning, never with more access.
+access. On this version, until a record is migrated, it is read with that same earlier meaning,
+never with more access.
 
 Upgrade every node that shares gateway storage, such as both nodes of an active/standby pair,
 before failing back to a node on an earlier version, and do not pair peers or change exposure
@@ -391,6 +392,10 @@ for peers you would trust with those tokens. In the dashboard it is the **Send d
 credentials over Fabric** switch on the Managed Agent or Transit Point panel, shown for a
 `fabric://` route on a surface with credential bindings. See
 [Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
+
+The receiving gateway applies its own surface's `outbound_credentials` toward its Target. Since it
+forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
+whose `params.name` it lists, read after admission has refused batches and ambiguous keys.
 
 A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 `agent_gateway_a2a_protocol_version_total` metric do not run on either G2G leg. The sending gateway
