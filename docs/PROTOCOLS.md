@@ -468,6 +468,9 @@ Harness section of [`MCP_METADATA.md`](MCP_METADATA.md).
 | Missing, malformed, or mismatched mirrored headers | HTTP `400`, `-32020` |
 | Modern-signaled POST with an empty body | HTTP `400`, `-32700` |
 | Modern metadata declaring legacy `2024-11-05` | HTTP `400`, `-32602`, mixed-era diagnostic |
+| Modern POST body with duplicate keys, keys differing only in case, or a case-variant field the gateway reads | HTTP `400`, `-32600` (legacy: HTTP `200`, `-32600`) |
+| PUT, PATCH or an extension method on an Access Point, Transit Point or Fabric receive | HTTP `405`, `Allow: POST, GET, DELETE, HEAD, OPTIONS` |
+| A body on any method but POST, on an Access Point, Transit Point or Fabric receive | HTTP `400`, `-32600` |
 | Legacy `initialize` asking for a revision the endpoint does not serve | Forwarded asking for `2024-11-05`, so the session settles on a revision the endpoint serves |
 
 The `initialize` cap is `cap_legacy_initialize` in `src/mcp/request_validation.rs`, applied
@@ -482,6 +485,9 @@ markers remain plain ASCII, and overlapping markers fail without panicking.
 Wire validation runs before generic method-prefix protocol classification. Modern `tasks/*`
 requests therefore receive MCP validation errors instead of being classified as A2A. Requests
 without modern signals retain legacy protocol-family handling.
+
+The full single-object rules (batches, non-JSON and non-object bodies, and which fields are
+case-checked) are in the HTTP Endpoint Admission section of [`MCP_METADATA.md`](MCP_METADATA.md#http-endpoint-admission).
 
 ## MCP Metadata Compatibility
 

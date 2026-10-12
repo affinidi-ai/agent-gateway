@@ -733,6 +733,57 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(response_body["headers"]["allow"], "POST");
         assert_eq!(response_body["body"], "");
     }
+    // Fabric carries the method as a string: it is uppercased, and one that is
+    // not an HTTP token is an extension method. PUT, PATCH and extension
+    // methods get 405 with `Allow`, and a body on any other method gets 400.
+    let forwarded_before = target
+        .request_count
+        .load(Ordering::SeqCst);
+    for (method, body, status) in [
+        ("PUT", Value::Null, 405),
+        ("put", Value::Null, 405),
+        ("PATCH", Value::Null, 405),
+        ("BAD METHOD", Value::Null, 405),
+        ("GET", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), 400),
+        ("delete", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), 400),
+    ] {
+        let mut message = forward_message(body, json!({}));
+        message.message_body["method"] = json!(method);
+        let ProcessingResult::RequiresResponse { response_body, .. } = process_forward_request(&message).await else {
+            panic!("expected a Fabric method rejection for {method}");
+        };
+        assert_eq!(response_body["status"], status, "{method}: {response_body}");
+        if status == 405 {
+            assert_eq!(response_body["headers"]["allow"], "POST, GET, DELETE, HEAD, OPTIONS", "{method}");
+        } else {
+            let envelope: Value = serde_json::from_str(
+                response_body["body"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(envelope["error"]["code"], -32600, "{method}");
+        }
+    }
+    assert_eq!(
+        target
+            .request_count
+            .load(Ordering::SeqCst),
+        forwarded_before,
+        "no refused method reaches the Target"
+    );
+    for (forwarded, method) in [(1, "GET"), (2, "delete")] {
+        let mut message = forward_message(Value::Null, json!({}));
+        message.message_body["method"] = json!(method);
+        process_forward_request(&message).await;
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            forwarded_before + forwarded,
+            "an unmarked {method} without a body is forwarded"
+        );
+    }
     let mut oversized_origin =
         forward_message(Value::Null, json!({"Origin": format!("https://{}.example", "a".repeat(500))}));
     oversized_origin.message_body["method"] = json!("GET");
@@ -890,13 +941,14 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             }
         );
     }
-    // Includes the capped initialize, the one envelope-replay delivery and the
-    // legacy request whose forwarded Origin is not rechecked.
+    // Includes the capped initialize, the one envelope-replay delivery, the
+    // legacy request whose forwarded Origin is not rechecked, and the unmarked
+    // GET and DELETE without a body.
     assert_eq!(
         target
             .request_count
             .load(Ordering::SeqCst),
-        6
+        8
     );
 }
 
@@ -2379,4 +2431,292 @@ allow if {
         "a request the policy rejects is refused: {response_body}"
     );
     assert_ne!(last_body(), Some(denied), "a request the policy rejects never reaches the Target");
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(
+        &mut self,
+        buf: &[u8],
+    ) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap()
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn fabric_receive_logs_forwarded_header_names_without_values() {
+    use tracing::instrument::WithSubscriber;
+
+    if std::env::var_os("AG_MCP_RECEIVE_REGRESSION_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .expect("test thread name")
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("AG_MCP_RECEIVE_REGRESSION_CHILD", "1")
+            .output()
+            .expect("run receiver regression with isolated globals");
+        assert!(
+            output.status.success(),
+            "isolated receiver regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let target_response = json!({"jsonrpc": "2.0", "id": "header-logs", "result": {"tools": []}});
+    let target = MockServer::start_with_response(target_response.to_string()).await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-header-logs",
+        "name": "Fabric header logs",
+        "access_point": {
+            "listen_address": "127.0.0.1:8080",
+            "route": "/mcp",
+            "protocol": "mcp"
+        },
+        "target": { "endpoint": format!("http://{}", target.addr) }
+    }))
+    .unwrap();
+    store
+        .save(&surface)
+        .await
+        .unwrap();
+
+    let credentials = [
+        ("authorization", "Bearer delegated-access-token"),
+        ("proxy-authorization", "Basic proxy-credential"),
+        ("cookie", "session=cookie-credential"),
+        ("x-api-key", "api-key-credential"),
+        ("x-transit-token", "transit-credential"),
+        ("x-upstream-auth", "custom-header-credential"),
+    ];
+    let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+    for (name, value) in credentials {
+        headers[name] = json!(value);
+    }
+    let message = ReceivedMessage::new(
+        "receiver-connection".to_string(),
+        "receiver-gateway".to_string(),
+        MessageType::ForwardRequest.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        None,
+        Some(SENDER_CONNECTION_POINT_DID.to_string()),
+        vec!["did:web:receiver.example".to_string()],
+        None,
+        Some(super::super::envelope_replay::now_secs() + 60),
+        json!({
+            "channel_id": surface.surface_id,
+            "method": "POST",
+            "path": "/mcp",
+            "headers": headers,
+            "body": {"jsonrpc": "2.0", "id": "header-logs", "method": "tools/list"}
+        }),
+        MessageMetadata {
+            encrypted: true,
+            authenticated: true,
+            from_key: None,
+            extra: Value::Null,
+        },
+    )
+    .with_context("agent_surface_storage_path", json!(storage_path));
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+    let (forward_response, envelope) = receive(&message)
+        .with_subscriber(subscriber)
+        .await;
+    assert_eq!(forward_response["status"], 200);
+    assert_eq!(envelope, target_response);
+
+    let forwarded = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("request reached the Target");
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    for (name, value) in credentials {
+        assert_eq!(forwarded.headers[name], value, "{name} was not forwarded");
+        assert!(logs.contains(&format!("Header: {name}\n")), "header name {name} was not logged:\n{logs}");
+        assert!(!logs.contains(value), "credential value for {name} was logged:\n{logs}");
+    }
+}
+
+#[test]
+fn fabric_tool_call_batches_are_refused_before_tool_level_controls() {
+    if std::env::var_os("ATG_FABRIC_TOOL_CALL_BATCH_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap()
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("ATG_FABRIC_TOOL_CALL_BATCH_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Fabric tool-call batch test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(fabric_tool_call_batch_flow()));
+}
+
+async fn fabric_tool_call_batch_flow() {
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 2, "result": {"content": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-batch", "name": "fabric-batch",
+        "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": format!("http://{}", target.addr), "mcp_tool_gating": {"gates": [{"id": "g1",
+            "name": "no admin", "action": {"effect": "deny", "patterns": ["^admin_"]}}]}},
+        "outbound_credentials": [{"credential_provider_id": "provider", "required_for": {"tools": ["scoped_tool"]}}]
+    }))
+    .unwrap();
+    store
+        .save(&surface)
+        .await
+        .unwrap();
+    let policies = std::sync::Arc::new(crate::policies::SurfacePolicyManager::new());
+    policies
+        .update_channel_policy(&surface)
+        .await
+        .unwrap();
+    super::init_policy_manager(policies).await;
+
+    let now_secs = super::super::envelope_replay::now_secs();
+    for tool in ["admin_reset", "scoped_tool"] {
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool, "arguments": {}}}
+        ]);
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now_secs + 60),
+            json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": {}, "body": batch}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+
+        let (response, body) = receive(&message).await;
+
+        assert_eq!(response["status"], 422, "{tool}: {response}");
+        assert_eq!(response["headers"]["content-type"], "application/problem+json", "{tool}");
+        assert_eq!(
+            body,
+            json!({"type": "https://a2a-protocol.org/errors/proxy-error", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
+            "{tool}"
+        );
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "{tool}"
+        );
+    }
+
+    // A field the gateway reads, spelled in another case, is refused at
+    // admission: a case-folding Target would read it as the method or tool.
+    // A `tools/call` with no readable tool name is denied by the gate.
+    for (body, code) in [
+        (json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"Name": "admin_reset"}}), -32600),
+        (json!({"jsonrpc": "2.0", "id": 4, "Method": "tools/call", "params": {"name": "admin_reset"}}), -32600),
+        // A string body reaches admission byte for byte, so its duplicate key survives.
+        (
+            json!(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","name":"admin_reset"}}"#),
+            -32600,
+        ),
+        (json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {}}), -32001),
+        (json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": 42}}), -32001),
+    ] {
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now_secs + 60),
+            json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": {}, "body": body}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+
+        let (response, envelope) = receive(&message).await;
+
+        assert_eq!(envelope["error"]["code"], code, "{body}: {response} {envelope}");
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "{body}"
+        );
+    }
 }

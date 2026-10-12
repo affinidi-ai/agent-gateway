@@ -238,12 +238,22 @@ applies on top of every mode.
 Records written before the mode existed have no `exposure_mode`. On boot,
 [`migrate_exposure_modes`](../src/gateways/filesystem.rs) persists `all` for a record with an empty
 list (its earlier meaning) and `list` for a record with a non-empty one, so existing peers keep their
-access. Until a record is migrated, it is read with that same earlier meaning, never with more access.
+access. On this version, until a record is migrated, it is read with that same earlier meaning,
+never with more access.
+
+Upgrade every node that shares gateway storage, such as both nodes of an active/standby pair,
+before failing back to a node on an earlier version, and do not pair peers or change exposure
+until every node runs a version with exposure modes. An earlier version ignores `exposure_mode`.
+It reads a record with mode `none` and an empty list as every surface, and drops the mode when
+it saves the record, including a background update, so the peer then reaches every surface on
+the new version too. If a node on an earlier version ran after the upgrade, check each Remote
+record's `exposure_mode` and set it again.
 
 Set the mode with `PUT /v1/gateways/{id}/exposed-surfaces` (`gateways.edit`), body
 `{"exposure_mode": "list", "exposed_channels": ["surface-id"]}`. The list is stored only in `list`
 mode. A body without `exposure_mode` selects `list` for a non-empty list and `none` for an empty
-one, so an empty list never means every surface. The dashboard sets it on the **Publishing** tab of
+one, so an empty list never means every surface. On a gateway that is not Remote, such as the
+self gateway, the request is refused with 400. The dashboard sets it on the **Publishing** tab of
 a remote gateway.
 
 ### Revoking access ends running streams
@@ -362,7 +372,9 @@ own token, applies the delegated credential, and sends it inside the authcrypt f
 Legacy MCP and A2A Access Point requests never carry it. On a Transit Point the setting applies to
 every protocol: modern MCP requests, legacy MCP `_meta` injection, and header injection on any
 request, including A2A. The receiving gateway, and its Target, can use that access token until it
-expires.
+expires. When the receiving gateway forwards the request to its Target it logs the name of each
+forwarded header, never its value, so a delegated credential stays out of the logs whatever header
+carries it.
 
 The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without
@@ -380,6 +392,10 @@ for peers you would trust with those tokens. In the dashboard it is the **Send d
 credentials over Fabric** switch on the Managed Agent or Transit Point panel, shown for a
 `fabric://` route on a surface with credential bindings. See
 [Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
+
+The receiving gateway applies its own surface's `outbound_credentials` toward its Target. Since it
+forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
+whose `params.name` it lists, read after admission has refused batches and ambiguous keys.
 
 A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 `agent_gateway_a2a_protocol_version_total` metric do not run on either G2G leg. The sending gateway

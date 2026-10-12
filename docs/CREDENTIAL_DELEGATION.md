@@ -41,7 +41,7 @@ Each entry in `AgentSurface.outbound_credentials`
 
 | Field | Options | Default |
 | --- | --- | --- |
-| `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names | `all` |
+| `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names, matched against `params.name` of a `tools/call` on Access Points and Fabric receive, never on Transit Points | `all` |
 | `consent_mode` | `on_demand`, `pre_authorize`, or `elicit` | `on_demand` |
 | `inject_as` | `bearer_header`, `custom_header { name, format }`, or `meta { field }` | `bearer_header` |
 | `scopes` | Scopes to request | The provider's defaults |
@@ -49,6 +49,21 @@ Each entry in `AgentSurface.outbound_credentials`
 `custom_header` takes a format string, so a provider that expects `token {value}` rather
 than `Bearer {value}` still works. `meta` writes the token into a JSON-RPC `_meta` field
 instead of a header.
+
+A binding carries no destination, so where it applies depends on the hop.
+
+- **Access Points and Fabric receive** forward only to their own Target, so a `tools`
+  binding applies to a `tools/call` whose `params.name` it lists.
+- **Transit Points** never apply a `tools` binding. A partner upstream names its own tools,
+  so matching its tool names would hand it a credential meant for the Target's tools. A
+  `tools` binding that lists a JSON-RPC method, such as `tools/call` or `message/send`,
+  does not apply there either.
+
+An `all` binding applies on every Transit Point of the surface, so every partner upstream
+behind them receives the delegated credential. A surface with no `outbound_credentials` reads
+each Transit Point's `transit_credentials` as an `all` binding, which therefore also reaches
+every Transit Point, not only the one that declares it. Use `all` only when every Transit
+Point's upstream should hold the credential.
 
 ## When a token is missing
 

@@ -51,6 +51,24 @@ pub struct PreparedDelegation {
     payment: Option<ContinuationPayment>,
 }
 
+#[cfg(test)]
+impl PreparedDelegation {
+    /// A prepared delegation with no injections that claims `handled_provider_ids`.
+    pub(crate) fn handling(
+        request: ValidatedModernMessage,
+        handled_provider_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            request,
+            injections: Vec::new(),
+            handled_provider_ids,
+            response_binding: None,
+            claimed: None,
+            payment: None,
+        }
+    }
+}
+
 pub enum ModernDelegationError {
     Continuation(ContinuationError),
     Protocol(Box<McpRequestValidationError>),
@@ -320,8 +338,11 @@ impl ModernDelegationContext<'_> {
             .surface
             .outbound_credentials
         {
+            // Tool-scoped bindings never apply on a Transit Point: a partner
+            // upstream names its own tools, and bindings carry no destination.
             if let CredentialRequirement::Tools(tools) = &config.required_for
-                && (request.method != "tools/call"
+                && (matches!(self.route, ContinuationRoute::TransitPoint { .. })
+                    || request.method != "tools/call"
                     || !request
                         .params
                         .as_ref()
@@ -1871,6 +1892,28 @@ mod tests {
                 .unwrap(),
             complete
         );
+        // A binding scoped to a listed tool is selected on the Access Point but
+        // never on a Transit Point, whose partner upstream names its own tools.
+        let mut scoped_surface = surface.clone();
+        scoped_surface.outbound_credentials[0].required_for = CredentialRequirement::Tools(vec!["read".into()]);
+        for (route, selected) in
+            [(ContinuationRoute::AccessPoint, 1), (ContinuationRoute::TransitPoint { alias: "partner".into() }, 0)]
+        {
+            let scoped = ModernDelegationContext {
+                surface: &scoped_surface,
+                route,
+                variant_id: context.variant_id.clone(),
+                ..context
+            };
+            assert_eq!(
+                scoped
+                    .select(&request)
+                    .await
+                    .unwrap()
+                    .len(),
+                selected
+            );
+        }
         let mut filtered_surface = surface.clone();
         filtered_surface.outbound_credentials[0].required_for = CredentialRequirement::Tools(vec!["other".into()]);
         filtered_surface.outbound_credentials[0].credential_provider_id = "unneeded-provider".into();

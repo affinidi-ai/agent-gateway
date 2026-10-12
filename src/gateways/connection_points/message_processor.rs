@@ -4149,14 +4149,22 @@ async fn process_forward_request_with_mcp_runtime(
             if let Err(error) = http_policy.validate_headers(&mcp_headers) {
                 return axum_response_to_forward_result(error.into_response(None)).await;
             }
-            if let Ok(http_method) = axum::http::Method::from_bytes(method.as_bytes())
-                && let Some(response) = http_policy.non_post_response(&http_method, &mcp_headers)
+            // An unparseable method maps to an extension method, which is refused with 405.
+            let http_method = axum::http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+                .unwrap_or_else(|_| axum::http::Method::from_bytes(b"INVALID").expect("static method token"));
+            if let Some(response) = http_policy.non_post_response(&http_method, &mcp_headers)
+                .or_else(|| http_policy.non_post_body_response(&http_method, &body_bytes))
             {
+                channel_warn!(config_id, "Rejecting fabric MCP {} request at admission", http_method);
                 return axum_response_to_forward_result(response).await;
             }
             None
         };
         if let Some(classification) = classification {
+        if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body_bytes) {
+            channel_warn!(config_id, "Rejecting fabric MCP request body at admission: {}", refusal.reason());
+            return axum_response_to_forward_result(refusal.into_response_for(&classification, &body_bytes)).await;
+        }
         let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(&classification, surface.mcp_legacy_metadata_output);
         if let Err(error) = surface.validate_mcp_metadata_base() {
             channel_warn!(config_id, "Invalid MCP metadata configuration: {}", error);
@@ -4908,8 +4916,8 @@ async fn process_forward_request_with_mcp_runtime(
                 Some(request) => request.headers.get_all(key).iter().filter_map(|value| value.to_str().ok()).collect::<Vec<_>>(),
                 None => value.as_str().into_iter().collect(),
             };
+            channel_info!(config_id, "    Header: {}", key);
             for value_str in values {
-                channel_info!(config_id, "    Header: {}: {}", key, value_str);
                 req = req.header(key.as_str(), value_str);
             }
         }
@@ -5058,7 +5066,10 @@ async fn process_forward_request_with_mcp_runtime(
                     user_hash,
                     surface.target_endpoint(),
                     config_id,
-                    None, // MCP tool name not available in DIDComm path
+                    // Admission refused batches and ambiguous keys above, so this is
+                    // the tool the Target reads. The Target is this gateway's own, so a
+                    // tool-scoped binding may apply here, unlike on a Transit Point.
+                    crate::mcp::tool_analyzer::called_tool_name(&body_bytes).as_deref(),
                     &vault_store,
                     &provider_store,
                     &secrets_store,
@@ -6992,10 +7003,36 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
     let gating = policy_manager
         .compiled_mcp_tool_gating(config_id, variant_alias)
         .filter(|g| !g.is_empty())?;
-    let tool_request = crate::mcp::McpToolRequest::from_json_rpc(body_bytes).ok()?;
-    let tool_name = tool_request
-        .tool_name()?
-        .to_string();
+    // Fail closed: with gating installed, a `tools/call` whose tool name can't
+    // be read can't be checked against the gates, so it must not reach the
+    // Target ungated.
+    let tool_request = crate::mcp::McpToolRequest::from_json_rpc(body_bytes).ok();
+    let Some((tool_request, tool_name)) = tool_request.and_then(|request| {
+        let name = request
+            .tool_name()?
+            .to_string();
+        Some((request, name))
+    }) else {
+        crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+            scope: crate::observability::PolicyScope::McpTool,
+            flow: crate::observability::PolicyFlow::Fabric,
+            allow: false,
+            reason: Some("tools/call without a readable tool name under MCP tool gating"),
+            policy_id: Some("mcp_tool_gating"),
+            surface_id: Some(config_id),
+            http_method: Some(method),
+            path: Some(path),
+            identity: authenticated_identity,
+            actor_did: caller_identity.map(String::as_str),
+            trace_id,
+            ..Default::default()
+        });
+        channel_warn!(config_id, "GW2: MCP tool gating blocked tools/call without a readable tool name");
+        let id = serde_json::from_slice::<Value>(body_bytes)
+            .ok()
+            .and_then(|request| request.get("id").cloned());
+        return Some(mcp_forward_error_response(id, -32001, "Tool is not available"));
+    };
 
     let input_value = if gating.has_policy_conditions() {
         build_fabric_gating_input(

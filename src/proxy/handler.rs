@@ -1968,6 +1968,15 @@ async fn proxy_handler_with_mcp_runtime(
         }
         create_error_response(StatusCode::BAD_REQUEST, "Failed to read request body")
     })?;
+    if let Some(policy) = &mcp_http
+        && let Some(response) = policy.non_post_body_response(&method, &body_bytes)
+    {
+        channel_warn!(config_id, "Rejecting MCP {} request with a body at admission", method);
+        connection_guard
+            .decrement()
+            .await;
+        return Ok(response);
+    }
 
     let (mcp_metadata_context, validated_mcp_session_id, mcp_verified_binding, mcp_classification) = if let Some(policy) =
         &mcp_http
@@ -1993,6 +2002,13 @@ async fn proxy_handler_with_mcp_runtime(
                 .into_response());
             }
         };
+        if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body_bytes) {
+            channel_warn!(config_id, "Rejecting MCP request body at admission: {}", refusal.reason());
+            connection_guard
+                .decrement()
+                .await;
+            return Ok(refusal.into_response_for(&classification, &body_bytes));
+        }
         let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
             &classification,
             state
@@ -5420,10 +5436,35 @@ async fn proxy_handler_with_mcp_runtime(
                     .as_deref(),
             )
             .filter(|g| !g.is_empty())
-        && let Some(tool_name) = mcp_context
+    {
+        // Fail closed: a `tools/call` whose tool name can't be read can't be
+        // checked against the gates, so it must not reach the upstream ungated.
+        let Some(tool_name) = mcp_context
             .as_ref()
             .and_then(|m| m.tool_name.as_deref())
-    {
+        else {
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::McpTool,
+                allow: false,
+                reason: Some("tools/call without a readable tool name under MCP tool gating"),
+                policy_id: Some("mcp_tool_gating"),
+                surface_id: Some(config_id_str),
+                trace_id: Some(&trace_id),
+                http_method: Some(method.as_ref()),
+                path: Some(uri.path()),
+                identity: authenticated_identity.as_ref(),
+                actor_did: request_agent_did.as_deref(),
+                ..Default::default()
+            });
+            channel_warn!(config_id_str, "MCP tool gating blocked tools/call without a readable tool name");
+            connection_guard
+                .decrement()
+                .await;
+            return Err(crate::mcp::build_tools_call_policy_denied_response(
+                &body_bytes,
+                Some("Tool is not available"),
+            ));
+        };
         // Only build + serialize the request context when a gate carries an OPA
         // condition; pure-regex gating decides on the tool name alone.
         let input_value = if gating.has_policy_conditions() {
@@ -6050,7 +6091,7 @@ async fn proxy_handler_with_mcp_runtime(
         ) {
             let mcp_tool = mcp_context
                 .as_ref()
-                .and_then(|ctx| ctx.tool_name.as_deref());
+                .and_then(crate::surface_context::McpContext::called_tool_name);
 
             // Use the agent DID from request-path identity extraction.
             // Fall back to channel_id as the workload identity when no
@@ -6216,7 +6257,8 @@ async fn proxy_handler_with_mcp_runtime(
                             evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
                             evt.mcp_tool_name = mcp_context
                                 .as_ref()
-                                .and_then(|c| c.tool_name.clone());
+                                .and_then(crate::surface_context::McpContext::called_tool_name)
+                                .map(str::to_string);
                             evt.caller = authenticated_identity
                                 .as_ref()
                                 .map(crate::delegation_vault::audit::build_caller_context);
@@ -6549,7 +6591,8 @@ async fn proxy_handler_with_mcp_runtime(
                     evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
                     evt.mcp_tool_name = mcp_context
                         .as_ref()
-                        .and_then(|c| c.tool_name.clone());
+                        .and_then(crate::surface_context::McpContext::called_tool_name)
+                        .map(str::to_string);
                     evt.vp_jwt = Some(final_vp_jwt.clone());
                     evt.vp_fingerprint = Some(crate::delegation_vault::audit::vp_fingerprint(&final_vp_jwt));
                     evt.trace_id = Some(trace_id.clone());
@@ -10593,9 +10636,42 @@ async fn handle_fabric_request(
                     .as_deref(),
             )
             .filter(|g| !g.is_empty())
-        && let Ok(tool_request) = crate::mcp::McpToolRequest::from_json_rpc(&body_bytes)
-        && let Some(tool_name) = tool_request.tool_name()
     {
+        // Fail closed, as on the direct path: an unreadable tool name can't be
+        // checked against the gates.
+        let parsed_request = crate::mcp::McpToolRequest::from_json_rpc(&body_bytes).ok();
+        let Some((tool_request, tool_name)) = parsed_request
+            .as_ref()
+            .and_then(|request| {
+                request
+                    .tool_name()
+                    .map(|name| (request, name))
+            })
+        else {
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::McpTool,
+                allow: false,
+                reason: Some("tools/call without a readable tool name under MCP tool gating"),
+                policy_id: Some("mcp_tool_gating"),
+                surface_id: Some(config_id_str),
+                trace_id: Some(&trace_id),
+                http_method: Some(method.as_ref()),
+                path: Some(uri.path()),
+                identity: authenticated_identity.as_ref(),
+                ..Default::default()
+            });
+            channel_warn!(
+                config_id_str,
+                "MCP tool gating blocked tools/call without a readable tool name (fabric send leg)"
+            );
+            connection_guard
+                .decrement()
+                .await;
+            return Err(crate::mcp::build_tools_call_policy_denied_response(
+                &body_bytes,
+                Some("Tool is not available"),
+            ));
+        };
         let input_value = if gating.has_policy_conditions() {
             fabric_mcp_gate_input(
                 method.as_ref(),
@@ -12149,7 +12225,11 @@ async fn handle_fabric_request(
                     ));
                 }
 
-                channel_debug!(config_id, "📨 Received ForwardResponse message body: {:?}", response_msg.message_body);
+                channel_debug!(
+                    config_id,
+                    "📨 Received ForwardResponse: {}",
+                    forward_response_log_summary(&response_msg.message_body)
+                );
 
                 // Capture the raw fabric envelope from GW2 (status/headers/body) so the
                 // capture UX on GW1 can show what the remote gateway actually returned,
@@ -13178,8 +13258,8 @@ async fn handle_fabric_request(
                             .into_iter()
                             .collect()
                     };
+                    channel_info!(config_id, "  Header: {}", key);
                     for value_str in values {
-                        channel_info!(config_id, "  Header: {}: {}", key, value_str);
                         response_builder = response_builder.header(key.as_str(), value_str);
                     }
                 }
@@ -14567,11 +14647,13 @@ async fn handle_mcp_proxy_request(
     if rpc_method == "tools/call"
         && let Some((gating, input)) = tool_gating.as_ref()
     {
+        // Fail closed: an unreadable tool name can't be checked against the
+        // gates. Checking `""` instead would pass a deny-pattern gate.
         let tool_name = json_request
             .pointer("/params/name")
-            .and_then(|n| n.as_str())
-            .unwrap_or_default();
-        let allowed = gating.is_tool_call_allowed(tool_name, input);
+            .and_then(|n| n.as_str());
+        let allowed = tool_name.is_some_and(|tool_name| gating.is_tool_call_allowed(tool_name, input));
+        let tool_name = tool_name.unwrap_or_default();
         crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
             scope: crate::observability::PolicyScope::McpTool,
             allow: allowed,
@@ -14970,6 +15052,35 @@ async fn handle_mcp_proxy_request(
 }
 
 /// The surface's MCP tool gating, when it has any gates installed.
+/// A ForwardResponse for the logs: its status, header names and body size.
+/// Header values and the body stay out, since `Set-Cookie`,
+/// `WWW-Authenticate` or a custom header may carry a credential.
+fn forward_response_log_summary(message_body: &serde_json::Value) -> String {
+    let header_names: Vec<&str> = message_body
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .map(|headers| {
+            headers
+                .keys()
+                .map(String::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
+    let body_bytes = match message_body.get("body") {
+        Some(serde_json::Value::String(body)) => body.len(),
+        Some(serde_json::Value::Null) | None => 0,
+        Some(body) => body.to_string().len(),
+    };
+    format!(
+        "status={} headers={:?} body_bytes={}",
+        message_body
+            .get("status")
+            .unwrap_or(&serde_json::Value::Null),
+        header_names,
+        body_bytes
+    )
+}
+
 fn surface_mcp_tool_gating(state: &ProxyState) -> Option<Arc<crate::policies::mcp_tool_gating::CompiledMcpToolGating>> {
     let config_id = state.surface.config_id()?;
     state
@@ -15437,6 +15548,28 @@ fn compute_transit_token_caller_context(
             map
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod forward_response_log_tests {
+    #[test]
+    fn forward_response_log_summary_keeps_header_values_and_body_out() {
+        let message_body = serde_json::json!({
+            "status": 401,
+            "headers": {
+                "set-cookie": "session=secret-cookie",
+                "www-authenticate": "Bearer error=\"secret-challenge\"",
+                "x-api-key": "secret-key"
+            },
+            "body": "{\"token\":\"secret-body\"}"
+        });
+
+        let summary = super::forward_response_log_summary(&message_body);
+
+        assert_eq!(summary, r#"status=401 headers=["set-cookie", "www-authenticate", "x-api-key"] body_bytes=23"#);
+        assert!(!summary.contains("secret"), "{summary}");
+        assert_eq!(super::forward_response_log_summary(&serde_json::json!({})), "status=null headers=[] body_bytes=0");
+    }
 }
 
 #[cfg(test)]
@@ -16370,13 +16503,139 @@ allow if {
         }
     }
 
+    /// Methods and bodies outside POST on the three paths the Access Point
+    /// router serves: PUT, PATCH and extension methods get 405 with `Allow`,
+    /// and a body on any other method gets 400, before the Target, the Fabric
+    /// leg or the MCP Proxy is reached. Each refusal releases its connection.
+    /// An unmarked GET without a body still reaches an HTTP Target, and DELETE
+    /// still ends the session at the gateway.
+    async fn access_point_refuses_methods_and_bodies_outside_post(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        const TASK: &str = "router-fixture";
+        let monitor = Arc::new(crate::observability::TaskMonitor::new(None));
+        monitor
+            .register_task(crate::observability::TaskInfo::running(TASK))
+            .await;
+        let state = crate::state::ProxyState {
+            task_monitor: Some(monitor.clone()),
+            ..state.clone()
+        };
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+        )
+        .await;
+        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
+            &[crate::mcp::MCP_MODERN_VERSION],
+            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+        );
+        let surface = |endpoint: String| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "method-cases", "name": "Method cases",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/methods", "protocol": "mcp"},
+                "target": {"endpoint": endpoint}
+            }))
+            .unwrap()
+        };
+        let send = |surface: crate::config::agent_surface::AgentSurface, method: &'static str, body: &'static str| {
+            let router = direct_router_state(&state, surface);
+            async move {
+                let request = axum::http::Request::builder()
+                    .method(method)
+                    .uri("/methods")
+                    .body(axum::body::Body::from(body))
+                    .unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        router,
+                        request,
+                        versions,
+                        None,
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{method} was not answered at admission"))
+            }
+        };
+
+        for (path, endpoint) in [
+            ("direct Access Point", target.url()),
+            ("Fabric send", "fabric://gw/ch".to_string()),
+            ("proxy:// Access Point", "proxy://method-cases".to_string()),
+        ] {
+            for (method, body, status) in [
+                ("PUT", "", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+                ("PATCH", "", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+                ("FOO", "", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+                ("GET", "{}", axum::http::StatusCode::BAD_REQUEST),
+                ("DELETE", "{}", axum::http::StatusCode::BAD_REQUEST),
+            ] {
+                let response = send(surface(endpoint.clone()), method, body).await;
+                assert_eq!(response.status(), status, "{path} {method}");
+                if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+                    assert_eq!(response.headers()["allow"], "POST, GET, DELETE, HEAD, OPTIONS", "{path} {method}");
+                } else {
+                    let error: serde_json::Value = serde_json::from_slice(
+                        &axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(error["error"]["code"], crate::mcp::error_codes::INVALID_REQUEST, "{path} {method}");
+                }
+                assert_eq!(
+                    monitor
+                        .get_task(TASK)
+                        .await
+                        .unwrap()
+                        .active_connections,
+                    0,
+                    "{path} {method}: a refusal releases its connection"
+                );
+            }
+        }
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "no refused method reaches the Target"
+        );
+
+        send(surface(target.url()), "GET", "").await;
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            1,
+            "an unmarked GET without a body is forwarded"
+        );
+        let response = send(surface(target.url()), "DELETE", "").await;
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            monitor
+                .get_task(TASK)
+                .await
+                .unwrap()
+                .active_connections,
+            0,
+            "DELETE releases its connection"
+        );
+    }
+
     /// The shared negative admission cases, and modern GET and
     /// DELETE, on the three paths the Access Point router serves: an HTTP
     /// Target, a `fabric://` Target (Fabric send) and a `proxy://` Target. Each
     /// is rejected by admission, before the Target, the Fabric leg or the MCP
     /// Proxy is reached.
     async fn access_point_admission_rejects_every_negative_case(state: &crate::state::ProxyState) {
-        use crate::mcp::admission_cases::{ALLOWED_ORIGIN, admission_cases, assert_rejected};
+        use crate::mcp::admission_cases::{ALLOWED_ORIGIN, admission_cases, assert_rejected, body_refusal_cases};
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
@@ -16400,7 +16659,10 @@ allow if {
                 "target": {"endpoint": endpoint}
             }))
             .unwrap();
-            for case in admission_cases() {
+            for case in admission_cases()
+                .into_iter()
+                .chain(body_refusal_cases())
+            {
                 let mut request = axum::http::Request::builder()
                     .method("POST")
                     .uri("/negative");
@@ -17373,6 +17635,7 @@ allow if {
         mounted_access_point_uses_the_direct_access_point_policy(&state).await;
         direct_access_point_caps_legacy_initialize(&state).await;
         access_point_admission_rejects_every_negative_case(&state).await;
+        access_point_refuses_methods_and_bodies_outside_post(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;
         direct_access_point_preserves_every_result_field(&state).await;
         direct_access_point_caller_disconnect_cancels_quiet_upstream(&state).await;

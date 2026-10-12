@@ -225,6 +225,24 @@ pub(crate) fn admission_cases() -> Vec<AdmissionCase> {
     ]
 }
 
+/// Modern requests with duplicate keys, refused by the single-object admission
+/// step on Access Points, Transit Points and Fabric receive. serde keeps the
+/// last duplicate, so these pass protocol validation first. The id is echoed
+/// unless it is the duplicated key.
+pub(crate) fn body_refusal_cases() -> Vec<AdmissionCase> {
+    let duplicated = |name: &'static str, prefix: &str| {
+        let body = serde_json::to_vec(&request(name, "tools/list", json!({"_meta": modern_meta()}))).unwrap();
+        AdmissionCase {
+            body: [format!("{{{prefix},").as_bytes(), &body[1..]].concat(),
+            ..case(name, Value::Null, modern_headers("tools/list"), error_codes::INVALID_REQUEST)
+        }
+    };
+    vec![
+        duplicated("duplicate-method-key", r#""method":"tools/list""#),
+        duplicated("duplicate-id-key", r#""id":"other""#),
+    ]
+}
+
 /// Asserts a rejection against its case, from the status and the JSON-RPC body.
 pub(crate) fn assert_rejected(
     case: &AdmissionCase,
@@ -236,8 +254,8 @@ pub(crate) fn assert_rejected(
     assert_eq!(status, case.status, "{path} {name}: {body}");
     assert_eq!(body["error"]["code"], case.code, "{path} {name}: {body}");
     if case.echoes_id {
-        // A batch has no single request id to echo.
-        let expected = if name == "batch" {
+        // A batch, or a body with a duplicated id, has no single request id to echo.
+        let expected = if matches!(name, "batch" | "duplicate-id-key") {
             Value::Null
         } else {
             case.id()

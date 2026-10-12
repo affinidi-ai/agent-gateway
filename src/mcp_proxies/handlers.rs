@@ -2362,9 +2362,10 @@ pub async fn handle_mcp_get<S: McpProxyStore>(
     if method == axum::http::Method::DELETE {
         let mut response = axum::response::Response::new(axum::body::Body::empty());
         *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-        response
-            .headers_mut()
-            .insert("allow", axum::http::HeaderValue::from_static("GET,HEAD,POST"));
+        response.headers_mut().insert(
+            "allow",
+            axum::http::HeaderValue::from_static(crate::mcp::modern_http::OWNED_PROXY_ALLOWED_METHODS),
+        );
         return Ok(response);
     }
 
@@ -2494,6 +2495,12 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
         Ok(classification) => classification,
         Err(error) => return Ok((*error).into_response()),
     };
+    // As on Access Points, Transit Points and Fabric receive: one JSON-RPC
+    // object that reads the same to every parser, or nothing reaches the server.
+    if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body) {
+        warn!(proxy = %proxy.name, reason = refusal.reason(), "Rejecting MCP request body at admission");
+        return Ok(refusal.into_response_for(&classification, &body));
+    }
     if let crate::mcp::request_validation::McpRequestClassification::Modern(request) = classification {
         let response = owned_modern_http_response(
             &proxy,
@@ -4716,11 +4723,14 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_mcp_http_rejects_every_admission_negative_case() {
-        use crate::mcp::admission_cases::{admission_cases, assert_rejected};
+        use crate::mcp::admission_cases::{admission_cases, assert_rejected, body_refusal_cases};
         use tower::ServiceExt;
 
         let (router, _sessions, _directory) = standalone_mcp_router().await;
-        for case in admission_cases() {
+        for case in admission_cases()
+            .into_iter()
+            .chain(body_refusal_cases())
+        {
             let mut request = axum::http::Request::builder()
                 .method("POST")
                 .uri("/mcp/owned");
@@ -4744,6 +4754,46 @@ mod tests {
             )
             .unwrap();
             assert_rejected(&case, status, &body, "standalone MCP Proxy");
+        }
+
+        // Legacy bodies that are not one unambiguous JSON-RPC object. Each would
+        // otherwise run `initialize`: a batch, a duplicate `method` (serde keeps
+        // the last) and a case-variant `Method` a case-folding parser reads.
+        for (body, status, code) in [
+            (r#"[{"jsonrpc":"2.0","id":1,"method":"initialize"}]"#, StatusCode::UNPROCESSABLE_ENTITY, None),
+            (r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","method":"initialize"}"#, StatusCode::OK, Some(-32600)),
+            (r#"{"jsonrpc":"2.0","id":1,"method":"initialize","Method":"tools/list"}"#, StatusCode::OK, Some(-32600)),
+            (r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_Meta":{}}}"#, StatusCode::OK, Some(-32600)),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/mcp/owned")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{body}");
+            let response: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                response
+                    .get("result")
+                    .is_none(),
+                "{body}: {response}"
+            );
+            if let Some(code) = code {
+                assert_eq!(response["error"]["code"], code, "{body}: {response}");
+                assert_eq!(response["id"], serde_json::Value::Null, "{body}: {response}");
+            }
         }
     }
 
