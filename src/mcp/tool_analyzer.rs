@@ -106,6 +106,11 @@ pub enum BodyRefusal {
     NotJson(String),
     /// JSON that is not an object: JSON-RPC `-32600`.
     NotObject,
+    /// An object with a duplicate key, or envelope keys that differ only in
+    /// case: JSON-RPC `-32600`. An upstream parser that keeps the first
+    /// duplicate, or folds case, would read a different method or tool from
+    /// the one the gateway checked.
+    AmbiguousKeys,
 }
 
 impl BodyRefusal {
@@ -114,6 +119,7 @@ impl BodyRefusal {
             Self::Batch => "JSON-RPC batch",
             Self::NotJson(_) => "invalid JSON",
             Self::NotObject => "not a JSON-RPC object",
+            Self::AmbiguousKeys => "duplicate or case-variant JSON keys",
         }
     }
 
@@ -131,7 +137,7 @@ impl BodyRefusal {
                 "Invalid JSON",
                 Some(serde_json::json!({ "details": details })),
             ),
-            Self::NotObject => super::create_mcp_error_response(
+            Self::NotObject | Self::AmbiguousKeys => super::create_mcp_error_response(
                 None,
                 super::error_codes::INVALID_REQUEST,
                 "Invalid JSON-RPC request",
@@ -150,13 +156,127 @@ impl BodyRefusal {
 /// batch or a body serde can't parse. An upstream may still accept such a
 /// body (a lenient parser strips a UTF-8 BOM, for example) and run every
 /// call in it unchecked.
+///
+/// The object must also read the same to every parser: no duplicate key at
+/// any depth, since serde keeps the last and some parsers keep the first, and
+/// no two keys of the envelope or its `params` that differ only in case,
+/// since Go's `encoding/json` matches field names case-insensitively.
 pub fn single_object_refusal(body: &[u8]) -> Option<BodyRefusal> {
-    match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Object(_)) => None,
-        Ok(Value::Array(_)) => Some(BodyRefusal::Batch),
-        Ok(_) => Some(BodyRefusal::NotObject),
-        Err(error) => Some(BodyRefusal::NotJson(error.to_string())),
+    let object = match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(object)) => object,
+        Ok(Value::Array(_)) => return Some(BodyRefusal::Batch),
+        Ok(_) => return Some(BodyRefusal::NotObject),
+        Err(error) => return Some(BodyRefusal::NotJson(error.to_string())),
+    };
+    let params = object
+        .get("params")
+        .and_then(Value::as_object);
+    if serde_json::from_slice::<UniqueKeys>(body).is_err()
+        || has_case_variant_keys(&object)
+        || params.is_some_and(has_case_variant_keys)
+    {
+        return Some(BodyRefusal::AmbiguousKeys);
     }
+    None
+}
+
+/// Deserializes any JSON value, failing on an object with a duplicate key.
+struct UniqueKeys;
+
+impl<'de> Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueKeys)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeys {
+    type Value = UniqueKeys;
+
+    fn expecting(
+        &self,
+        formatter: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(
+        self,
+        _: bool,
+    ) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_i64<E>(
+        self,
+        _: i64,
+    ) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_u64<E>(
+        self,
+        _: u64,
+    ) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_f64<E>(
+        self,
+        _: f64,
+    ) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_str<E>(
+        self,
+        _: &str,
+    ) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self, A::Error> {
+        while seq
+            .next_element::<UniqueKeys>()?
+            .is_some()
+        {}
+        Ok(self)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key) {
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            map.next_value::<UniqueKeys>()?;
+        }
+        Ok(self)
+    }
+}
+
+/// Whether two keys of `object` are equal under case folding. Folding goes
+/// through upper then lower case, so `ſ` (U+017F) and the Kelvin sign
+/// (U+212A) match `s` and `k`, as they do in Go's `encoding/json`.
+fn has_case_variant_keys(object: &serde_json::Map<String, Value>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    !object.keys().all(|key| {
+        seen.insert(
+            key.chars()
+                .flat_map(char::to_uppercase)
+                .flat_map(char::to_lowercase)
+                .collect::<String>(),
+        )
+    })
 }
 
 /// The tool a request calls: `params.name` of a single JSON-RPC `tools/call`,
@@ -289,6 +409,44 @@ mod tests {
             (b"{} {}", Some("invalid JSON")),
             (b"\"tools/call\"", Some("not a JSON-RPC object")),
             (b"42", Some("not a JSON-RPC object")),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"admin_reset","name":"echo"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"admin_reset"},"method":"ping"}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"admin_reset"},"params":{"name":"echo"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","name":"admin_reset"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"a":[{"k":1,"k":2}]}}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","Name":"admin_reset"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"Method":"tools/call","method":"ping"}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"},\"param\u{17f}\":{}}".as_bytes(),
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            // Case variants deeper than `params` are tool arguments the gateway never reads.
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"id":1,"ID":2}}}"#,
+                None,
+            ),
+            (br#"{"a":{"k":1},"b":{"k":2},"c":[{"k":1},{"k":2}]}"#, None),
         ] {
             assert_eq!(
                 single_object_refusal(body)
