@@ -3316,6 +3316,53 @@ fn agent_card_first_endpoint_url_points_to_gateway(world: &mut SurfaceWorld) {
     );
 }
 
+#[then("the extended agent card interfaces point to the gateway listen address in their original order")]
+fn extended_agent_card_interfaces_point_to_gateway(world: &mut SurfaceWorld) {
+    let gateway_port = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must be initialised before asserting on the agent card")
+        .gateway_port;
+    let body = get_response_body_value(world);
+    let interfaces = body
+        .pointer("/result/supportedInterfaces")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("extended agent card must expose result.supportedInterfaces, got: {}", body));
+    let bindings: Vec<&str> = interfaces
+        .iter()
+        .filter_map(|iface| {
+            iface
+                .get("protocolBinding")
+                .and_then(|b| b.as_str())
+        })
+        .collect();
+    assert_eq!(bindings, ["JSONRPC", "GRPC"], "interface order must be preserved, got: {}", body);
+    let needle = format!("localhost:{}", gateway_port);
+    for iface in interfaces {
+        let url = iface
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("every interface must keep a url, got: {}", body));
+        assert!(
+            url.contains(&needle),
+            "extended agent card interface url should point to the gateway listen address (contains '{}'), got '{}'",
+            needle,
+            url
+        );
+    }
+}
+
+#[then("the response does not contain the managed agent endpoint")]
+fn response_excludes_managed_agent_endpoint(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world).to_string();
+    assert!(
+        !body.contains(PUBLISHED_MANAGED_AGENT_HOST),
+        "response leaks the managed agent endpoint '{}': {}",
+        PUBLISHED_MANAGED_AGENT_HOST,
+        body
+    );
+}
+
 /// Assert the Target's host appears **nowhere** in the served agent card.
 ///
 /// Stronger than the per-field assertions: it covers nested arrays such as

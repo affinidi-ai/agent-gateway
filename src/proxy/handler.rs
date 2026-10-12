@@ -7429,12 +7429,7 @@ async fn proxy_handler_with_mcp_runtime(
     .recording_versions(access_point_upstream_key(&state));
     let is_modern_response = modern_request.is_some();
     let is_rest_extended_card_request =
-        matches!(
-            state
-                .surface
-                .channel_protocol(),
-            crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
-        ) && crate::proxy::paths::is_rest_extended_agent_card_request(method.as_str(), uri.path());
+        is_a2a_surface && crate::proxy::paths::is_rest_extended_agent_card_request(method.as_str(), uri.path());
     let process_response = async move |status: StatusCode, response_headers: HeaderMap, response_body: bytes::Bytes| {
         let config_id = state
             .surface

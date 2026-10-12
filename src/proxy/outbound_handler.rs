@@ -1856,8 +1856,8 @@ async fn step_extract_protocol_context_with_versions(
     ctx.operation = operation;
 
     // An extended agent card inside a JSON-RPC batch response cannot be
-    // rewritten, so such a batch is refused on A2A/AP2 surfaces.
-    if matches!(ctx.surface.channel_protocol(), ChannelProtocol::A2a | ChannelProtocol::Ap2)
+    // rewritten, so such a batch is refused on A2A/AP2 transit points.
+    if transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
         && crate::a2a::is_extended_agent_card_batch(body)
     {
         warn!(request_id = %ctx.request_id, "Rejected JSON-RPC batch containing an extended agent card request");
@@ -5081,13 +5081,20 @@ fn process_outbound_response_body(
     // through the gateway. `TransitPoint.gateway_url` is declared
     // "computed" but never assigned, so derive it here from the surface
     // + listener config.
-    let is_a2a_surface = matches!(
-        ctx.surface.channel_protocol(),
-        crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
-    );
+    let is_a2a_transit = transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a");
     let is_rest_extended_card_response = status.is_success()
-        && is_a2a_surface
-        && crate::proxy::paths::is_rest_extended_agent_card_request(ctx.original_method.as_str(), &ctx.request_path);
+        && is_a2a_transit
+        && crate::proxy::paths::is_rest_extended_agent_card_request(
+            ctx.original_method.as_str(),
+            &compute_outbound_remainder_path(
+                &ctx.request_path,
+                &ctx.surface.access_point.route,
+                &ctx.virtual_channel.alias,
+                ctx.virtual_channel
+                    .listen_path
+                    .as_deref(),
+            ),
+        );
     let body_bytes = if is_agent_card_response(&ctx.request_path, status) || is_rest_extended_card_response {
         let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
             &ctx.surface,
@@ -5118,7 +5125,7 @@ fn process_outbound_response_body(
             }
         }
     } else if status.is_success()
-        && is_a2a_surface
+        && is_a2a_transit
         && ctx
             .operation
             .as_deref()

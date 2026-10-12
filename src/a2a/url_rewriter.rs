@@ -360,6 +360,15 @@ pub(crate) fn build_transit_point_proxy_endpoint(
     format!("{}{}", base_url, path)
 }
 
+/// Parse an agent card body, which must be a JSON object.
+fn parse_agent_card(body: &[u8]) -> Result<serde_json::Value, anyhow::Error> {
+    let agent_card: serde_json::Value = serde_json::from_slice(body)?;
+    if !agent_card.is_object() {
+        anyhow::bail!("agent card is not a JSON object");
+    }
+    Ok(agent_card)
+}
+
 // Process agent card: rewrite URLs to point at the proxy.
 pub async fn process_agent_card(
     body: &[u8],
@@ -368,7 +377,7 @@ pub async fn process_agent_card(
     network_config: &crate::config::NetworkConfig,
     _resolved_identity: &ProtectedAgentIdentity,
 ) -> Result<axum::body::Bytes, anyhow::Error> {
-    let mut agent_card: serde_json::Value = serde_json::from_slice(body)?;
+    let mut agent_card = parse_agent_card(body)?;
 
     let proxy_endpoint = build_proxy_endpoint(surface, network_config);
 
@@ -414,7 +423,7 @@ pub fn process_outbound_agent_card(
     proxy_endpoint: &str,
     channel_name: &str,
 ) -> Result<axum::body::Bytes, anyhow::Error> {
-    let mut agent_card: serde_json::Value = serde_json::from_slice(body)?;
+    let mut agent_card = parse_agent_card(body)?;
 
     rewrite_urls_in_agent_card(&mut agent_card, proxy_endpoint, channel_name);
 
@@ -430,11 +439,15 @@ pub fn is_extended_agent_card_method(method: &str) -> bool {
 
 /// Split a 2xx response to an extended-card request into its envelope and the
 /// serialized card from `result`. Returns `Ok(None)` for a JSON-RPC error response
-/// (an object `error` and no `result`), which passes through unchanged. A `null`
+/// (an object `error` and no `result`) or an empty body (the reply to a
+/// notification), which pass through unchanged. A `null`
 /// member counts as absent. Any other body (not a JSON object, a non-object
 /// `result`, or both `result` and `error`) cannot be rewritten and is an error, so
 /// callers fail closed.
 fn extended_agent_card_result(body: &[u8]) -> Result<Option<(serde_json::Value, axum::body::Bytes)>, anyhow::Error> {
+    if body.is_empty() {
+        return Ok(None);
+    }
     let envelope: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("extended agent card response is not JSON: {e}"))?;
     let member = |key: &str| {
@@ -1372,6 +1385,27 @@ mod tests {
         let sse = b"event: message\ndata: {\"result\":{\"url\":\"https://backend.internal\"}}\n\n";
         assert!(process_outbound_extended_agent_card(sse, PROXY_URL, "test").is_err());
         assert!(unwrap_extended_agent_card(axum::body::Bytes::from_static(sse), true).is_err());
+    }
+
+    #[test]
+    fn extended_card_empty_body_passes_through() {
+        assert!(
+            process_outbound_extended_agent_card(b"", PROXY_URL, "test")
+                .unwrap()
+                .is_none()
+        );
+        let (body, envelope) = unwrap_extended_agent_card(axum::body::Bytes::new(), true).unwrap();
+        assert!(body.is_empty());
+        assert!(envelope.is_none());
+    }
+
+    #[test]
+    fn agent_card_that_is_not_an_object_is_rejected() {
+        for body in [&b"[]"[..], br#"["https://backend.internal"]"#, br#""https://backend.internal""#, b"42"] {
+            assert!(process_outbound_agent_card(body, PROXY_URL, "test").is_err(), "{body:?}");
+        }
+        let card = process_outbound_agent_card(br#"{"url":"https://backend.internal"}"#, PROXY_URL, "test").unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&card).unwrap()["url"], PROXY_URL);
     }
 
     #[test]

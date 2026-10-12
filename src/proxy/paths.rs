@@ -36,14 +36,14 @@ pub fn is_well_known_agent_card_path(path: &str) -> bool {
 
 /// Whether a request fetches the extended agent card over the A2A HTTP+JSON
 /// binding: `GET {route}/extendedAgentCard` (1.0) or `GET {route}/v1/card` (0.3).
+/// `route_relative_path` is the request path after the surface route, so a deeper
+/// path that only ends the same way (such as `{route}/payments/v1/card`) does not match.
 pub fn is_rest_extended_agent_card_request(
     method: &str,
-    path: &str,
+    route_relative_path: &str,
 ) -> bool {
-    let path = path
-        .strip_suffix('/')
-        .unwrap_or(path);
-    method.eq_ignore_ascii_case("GET") && (path.ends_with("/extendedAgentCard") || path.ends_with("/v1/card"))
+    let path = route_relative_path.trim_matches('/');
+    method.eq_ignore_ascii_case("GET") && (path == "extendedAgentCard" || path == "v1/card")
 }
 
 /// Whether a request is a public discovery read that bypasses the request
@@ -147,9 +147,7 @@ mod tests {
 
     #[test]
     fn rest_extended_agent_card_request_matches_get_on_both_eras() {
-        for path in
-            ["/surface/extendedAgentCard", "/surface/v1/card", "/surface/extendedAgentCard/", "/surface/v1/card/"]
-        {
+        for path in ["/extendedAgentCard", "/v1/card", "/extendedAgentCard/", "v1/card", "extendedAgentCard"] {
             assert!(is_rest_extended_agent_card_request("GET", path), "{path}");
             assert!(is_rest_extended_agent_card_request("get", path), "{path}");
             for method in ["POST", "HEAD", "PUT", "DELETE"] {
@@ -157,11 +155,15 @@ mod tests {
             }
         }
         for path in [
-            "/surface/extendedAgentCard/extra",
-            "/surface/card",
-            "/surface/v1/cards",
-            "/surface/.well-known/agent-card.json",
-            "/surface/rpc",
+            "/extendedAgentCard/extra",
+            "/foo/v1/card",
+            "/payments/v1/card",
+            "/foo/extendedAgentCard",
+            "/card",
+            "/v1/cards",
+            "/.well-known/agent-card.json",
+            "/rpc",
+            "/",
         ] {
             assert!(!is_rest_extended_agent_card_request("GET", path), "{path}");
         }
