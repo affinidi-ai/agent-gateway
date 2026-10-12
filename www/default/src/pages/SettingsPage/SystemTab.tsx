@@ -59,7 +59,7 @@ const SystemTab: React.FC<SystemTabProps> = ({
     e.target.value = '';
 
     if (!file.name.endsWith('.agbak') && !file.name.endsWith('.tgwbak')) {
-      showToast('error', 'Please select a .agbak backup file');
+      showToast('error', 'Please select a .agbak or legacy .tgwbak backup file');
       return;
     }
 
@@ -305,6 +305,9 @@ const SystemTab: React.FC<SystemTabProps> = ({
                 current storage will be automatically backed up before the restore begins. The
                 service will restart twice to complete the procedure.
               </p>
+              <p className="text-muted small mb-2" data-testid="restore-legacy-format-note">
+                Legacy <code>.tgwbak</code> backups are still supported.
+              </p>
               <ol className="small text-muted mb-2">
                 <li>
                   Upload triggers the service to save <code>backup.agbak</code> to{' '}
@@ -323,6 +326,7 @@ const SystemTab: React.FC<SystemTabProps> = ({
                 ref={restoreFileInputRef}
                 type="file"
                 accept=".agbak,.tgwbak"
+                data-testid="restore-file-input"
                 style={{ display: 'none' }}
                 onChange={handleRestoreFileSelected}
               />
