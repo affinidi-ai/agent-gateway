@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use reqwest::Method;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::mediator::{
     MediatorAuthTestResult, MediatorTrustPingResult, cache_did_document, cache_did_document_in_tdk_state,
@@ -217,23 +217,31 @@ impl DIDCommClient {
         {
             Some(mediator) => {
                 let recipient_uri = self
-                    .recipient_messaging_uri(to_did)
-                    .await;
-                forward_target(
-                    &mediator.did,
-                    mediator
-                        .rest_endpoint
-                        .as_deref(),
-                    recipient_uri.as_deref(),
-                )
+                    .resolved_document(to_did)
+                    .await
+                    .and_then(|doc| messaging_service_uri(&doc));
+                let own_endpoints: Vec<String> = mediator
+                    .rest_endpoint
+                    .iter()
+                    .cloned()
+                    .chain(
+                        self.resolved_document(&mediator.did)
+                            .await
+                            .map(|doc| service_uris(&doc))
+                            .unwrap_or_default(),
+                    )
+                    .collect();
+                forward_target(&mediator.did, &own_endpoints, recipient_uri.as_deref())
             }
             None => None,
         };
         match forward_via {
             Some(own_mediator_did) => {
-                debug!(
-                    "Forwarding message {} via own mediator {} to recipient {}",
-                    message.id, own_mediator_did, to_did
+                info!(
+                    message_id = %message.id,
+                    mediator_did = %own_mediator_did,
+                    recipient_did = %to_did,
+                    "Recipient is on another mediator; forwarding through our own mediator"
                 );
                 self.atm
                     .forward_and_send_message(
@@ -261,26 +269,25 @@ impl DIDCommClient {
         Ok(())
     }
 
-    /// The `DIDCommMessaging` service URI of the recipient's DID document, or
-    /// `None` when it cannot be resolved or has no such service.
-    async fn recipient_messaging_uri(
+    /// The resolved DID document as JSON, or `None` when it cannot be
+    /// resolved. Documents already used for packing come from the resolver
+    /// cache.
+    async fn resolved_document(
         &self,
-        to_did: &str,
-    ) -> Option<String> {
-        let resolved = match self
+        did: &str,
+    ) -> Option<serde_json::Value> {
+        match self
             .tdk_state
             .did_resolver()
-            .resolve(to_did)
+            .resolve(did)
             .await
         {
-            Ok(resolved) => resolved,
+            Ok(resolved) => serde_json::to_value(&resolved.doc).ok(),
             Err(e) => {
-                debug!("Could not resolve {} to choose a route; sending directly: {:?}", to_did, e);
-                return None;
+                debug!("Could not resolve {} to choose a route: {:?}", did, e);
+                None
             }
-        };
-        let doc = serde_json::to_value(&resolved.doc).ok()?;
-        messaging_service_uri(&doc)
+        }
     }
 
     pub async fn live_stream_next(
@@ -393,30 +400,37 @@ pub(crate) fn atm_config(cache_config: Option<&super::gateway::CacheConfig>) -> 
 /// shares our mediator, or the route cannot be told, the message goes
 /// directly. URLs are compared by host and port, since connection point DIDs
 /// carry the mediator's origin while the profile carries its REST endpoint.
-/// Our mediator is known by both its REST endpoint and the origin derived from
-/// its `did:web`, because connection point DIDs may carry either.
+/// Our mediator is known by every endpoint in `own_endpoints` (its REST
+/// endpoint and its DID document's service endpoints) and by the origin
+/// derived from its `did:web`, because connection point DIDs may carry any of
+/// them. DIDs are compared without a trailing `:.well-known`.
 fn forward_target<'a>(
     own_mediator_did: &'a str,
-    own_rest_endpoint: Option<&str>,
+    own_endpoints: &[String],
     recipient_uri: Option<&str>,
 ) -> Option<&'a str> {
     let recipient_uri = recipient_uri?;
     if recipient_uri.starts_with("did:") {
-        return (recipient_uri != own_mediator_did).then_some(own_mediator_did);
+        return (normalized_did(recipient_uri) != normalized_did(own_mediator_did)).then_some(own_mediator_did);
     }
     let recipient = endpoint_authority(recipient_uri)?;
     let derived = crate::gateways::connection_points::extract_mediator_url(own_mediator_did)
         .ok()
         .and_then(|url| endpoint_authority(&url));
-    let own: Vec<(String, u16)> = own_rest_endpoint
-        .and_then(endpoint_authority)
-        .into_iter()
+    let own: Vec<(String, u16)> = own_endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint_authority(endpoint))
         .chain(derived)
         .collect();
     if own.is_empty() || own.contains(&recipient) {
         return None;
     }
     Some(own_mediator_did)
+}
+
+fn normalized_did(did: &str) -> &str {
+    did.strip_suffix(":.well-known")
+        .unwrap_or(did)
 }
 
 fn endpoint_authority(uri: &str) -> Option<(String, u16)> {
@@ -442,6 +456,29 @@ fn messaging_service_uri(doc: &serde_json::Value) -> Option<String> {
             _ => false,
         })
         .find_map(|service| endpoint_uri(service.get("serviceEndpoint")?))
+}
+
+/// Every service endpoint URI in a DID document, of any service type.
+fn service_uris(doc: &serde_json::Value) -> Vec<String> {
+    let Some(services) = doc
+        .get("service")
+        .and_then(|services| services.as_array())
+    else {
+        return Vec::new();
+    };
+    services
+        .iter()
+        .filter_map(|service| service.get("serviceEndpoint"))
+        .flat_map(|endpoint| match endpoint {
+            serde_json::Value::Array(entries) => entries
+                .iter()
+                .filter_map(endpoint_uri)
+                .collect(),
+            other => endpoint_uri(other)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        })
+        .collect()
 }
 
 fn endpoint_uri(endpoint: &serde_json::Value) -> Option<String> {
@@ -601,7 +638,7 @@ mod tests {
         assert_eq!(
             super::forward_target(
                 OWN_MEDIATOR,
-                Some("https://m1.example.com/mediator/v1"),
+                &["https://m1.example.com/mediator/v1".to_string()],
                 Some("https://m1.example.com")
             ),
             None
@@ -613,7 +650,7 @@ mod tests {
         assert_eq!(
             super::forward_target(
                 OWN_MEDIATOR,
-                Some("https://m1.example.com/mediator/v1"),
+                &["https://m1.example.com/mediator/v1".to_string()],
                 Some("https://m2.example.com")
             ),
             Some(OWN_MEDIATOR)
@@ -623,13 +660,13 @@ mod tests {
     #[test]
     fn mediators_on_one_host_but_different_ports_are_different_mediators() {
         assert_eq!(
-            super::forward_target(OWN_MEDIATOR, Some("http://127.0.0.1:7037"), Some("http://127.0.0.1:7038")),
+            super::forward_target(OWN_MEDIATOR, &["http://127.0.0.1:7037".to_string()], Some("http://127.0.0.1:7038")),
             Some(OWN_MEDIATOR)
         );
         assert_eq!(
             super::forward_target(
                 OWN_MEDIATOR,
-                Some("http://127.0.0.1:7037/mediator/v1"),
+                &["http://127.0.0.1:7037/mediator/v1".to_string()],
                 Some("http://127.0.0.1:7037")
             ),
             None
@@ -638,29 +675,72 @@ mod tests {
 
     #[test]
     fn a_did_service_uri_is_compared_with_our_mediator_did() {
-        assert_eq!(super::forward_target(OWN_MEDIATOR, None, Some(OWN_MEDIATOR)), None);
-        assert_eq!(super::forward_target(OWN_MEDIATOR, None, Some("did:web:m2.example.com")), Some(OWN_MEDIATOR));
+        assert_eq!(super::forward_target(OWN_MEDIATOR, &[], Some(OWN_MEDIATOR)), None);
+        assert_eq!(super::forward_target(OWN_MEDIATOR, &[], Some("did:web:m2.example.com")), Some(OWN_MEDIATOR));
     }
 
     #[test]
     fn without_a_known_route_the_message_is_sent_directly() {
-        assert_eq!(super::forward_target(OWN_MEDIATOR, Some("https://m1.example.com"), None), None);
-        assert_eq!(super::forward_target(OWN_MEDIATOR, Some("https://m1.example.com"), Some("not a url")), None);
-        assert_eq!(super::forward_target("did:peer:2.mediator", None, Some("https://m2.example.com")), None);
+        assert_eq!(super::forward_target(OWN_MEDIATOR, &["https://m1.example.com".to_string()], None), None);
+        assert_eq!(
+            super::forward_target(OWN_MEDIATOR, &["https://m1.example.com".to_string()], Some("not a url")),
+            None
+        );
+        assert_eq!(super::forward_target("did:peer:2.mediator", &[], Some("https://m2.example.com")), None);
     }
 
     #[test]
     fn a_recipient_minted_with_our_did_web_origin_is_on_our_mediator() {
         let own = "did:web:localhost%3A7037";
-        assert_eq!(super::forward_target(own, Some("http://mediator:7037"), Some("https://localhost:7037")), None);
-        assert_eq!(super::forward_target(own, Some("http://mediator:7037"), Some("http://mediator:7037")), None);
-        assert_eq!(super::forward_target(own, Some("http://mediator:7037"), Some("http://other:7037")), Some(own));
+        assert_eq!(
+            super::forward_target(own, &["http://mediator:7037".to_string()], Some("https://localhost:7037")),
+            None
+        );
+        assert_eq!(
+            super::forward_target(own, &["http://mediator:7037".to_string()], Some("http://mediator:7037")),
+            None
+        );
+        assert_eq!(
+            super::forward_target(own, &["http://mediator:7037".to_string()], Some("http://other:7037")),
+            Some(own)
+        );
     }
 
     #[test]
     fn our_rest_endpoint_falls_back_to_the_did_web_origin() {
-        assert_eq!(super::forward_target(OWN_MEDIATOR, None, Some("https://m1.example.com")), None);
-        assert_eq!(super::forward_target(OWN_MEDIATOR, None, Some("https://m2.example.com")), Some(OWN_MEDIATOR));
+        assert_eq!(super::forward_target(OWN_MEDIATOR, &[], Some("https://m1.example.com")), None);
+        assert_eq!(super::forward_target(OWN_MEDIATOR, &[], Some("https://m2.example.com")), Some(OWN_MEDIATOR));
+    }
+
+    #[test]
+    fn any_endpoint_in_our_mediator_document_counts_as_our_mediator() {
+        let own_endpoints = vec!["https://m1.example.com".to_string(), "http://m1.internal:7037".to_string()];
+
+        assert_eq!(super::forward_target(OWN_MEDIATOR, &own_endpoints, Some("http://m1.internal:7037")), None);
+        assert_eq!(
+            super::forward_target(OWN_MEDIATOR, &own_endpoints, Some("http://m2.internal:7037")),
+            Some(OWN_MEDIATOR)
+        );
+    }
+
+    #[test]
+    fn mediator_dids_are_compared_without_the_well_known_suffix() {
+        assert_eq!(super::forward_target(OWN_MEDIATOR, &[], Some("did:web:m1.example.com:.well-known")), None);
+        assert_eq!(super::forward_target("did:web:m1.example.com:.well-known", &[], Some(OWN_MEDIATOR)), None);
+    }
+
+    #[test]
+    fn every_service_uri_is_collected_from_a_document() {
+        let doc = serde_json::json!({ "service": [
+            { "type": "DIDCommMessaging", "serviceEndpoint": [{ "uri": "https://m1.example.com" }, { "uri": "wss://m1.example.com/ws" }] },
+            { "type": "Other", "serviceEndpoint": "http://m1.internal:7037" }
+        ]});
+
+        assert_eq!(
+            super::service_uris(&doc),
+            vec!["https://m1.example.com", "wss://m1.example.com/ws", "http://m1.internal:7037"]
+        );
+        assert!(super::service_uris(&serde_json::json!({})).is_empty());
     }
 
     #[test]

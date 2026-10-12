@@ -100,10 +100,12 @@ therefore chooses the route for each send (`forward_target`):
   no mediator on the profile, an unresolvable DID), the message is sent
   directly.
 
-A service endpoint that is a DID is compared with the sender's mediator DID. A
-URL is compared by host and port with the sender's mediator REST endpoint and
-with the origin derived from its `did:web`, because connection point DIDs may
-carry either. Two mediators on the same host and port are treated as one.
+A service endpoint that is a DID is compared with the sender's mediator DID,
+ignoring a trailing `:.well-known`. A URL is compared by host and port with
+every endpoint the sender's mediator is known by: its REST endpoint, the service
+endpoints in its DID document, and the origin derived from its `did:web`. Two
+mediators on the same host and port are treated as one. A forward is logged at
+`info`.
 
 The route follows the connection, not the feature flag. Shared-mediator
 connections are always sent directly, and a connection homed on another
@@ -142,10 +144,12 @@ connection point moves.
    [src/gateways/connection_points/ws_listener.rs](../src/gateways/connection_points/ws_listener.rs))
    takes the mediator from the pending connection, so the stored `mediator_id`
    and the listener it starts agree. The temporary connection point records the
-   same mediator, so recovery after the pending connection is lost rebuilds the
-   acceptor's choice. Recovery onto a mediator other than the temporary
-   connection point's own requires a known, `Active` mediator in the acceptor's
-   store, and fails without a store. A shared-mediator recovery needs no lookup.
+   same mediator and its record id, so recovery after the pending connection is
+   lost rebuilds the acceptor's choice. Finalize and recovery read only that
+   record, by id, never a mediator found by DID. Recovery onto a mediator other
+   than the temporary connection point's own requires that record to be
+   `Active` with the same DID, and fails without it or without a store. A
+   shared-mediator connection reads no mediator record.
 
 Disabling a mediator stops it from being selected for a new connection and from
 being used by recovery. Connection points already homed on it keep running.

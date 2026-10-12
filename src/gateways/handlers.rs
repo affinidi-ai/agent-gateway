@@ -1850,6 +1850,9 @@ pub async fn connect_via_oob<
         expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
         secure_cp_id: Some(secure_cp_id.clone()),
         temporary_cp_id: Some(temp_cp_id.clone()),
+        mediator_record_id: req
+            .acceptor_mediator_id
+            .clone(),
     };
 
     info!("  Pending connection details:");
@@ -2050,6 +2053,7 @@ pub async fn connect_via_oob<
             "secure_cp_id": secure_cp_id,
             "secure_did": secure_did,
             "secure_mediator_did": acceptor_mediator_did,
+            "secure_mediator_id": req.acceptor_mediator_id,
         }),
         None,
         super::connection_points::types::ConnectionPointType::System, // Temporary system CP

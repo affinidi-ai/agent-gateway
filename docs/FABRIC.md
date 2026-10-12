@@ -131,7 +131,8 @@ scope, Active, and registered (`our_did` / `our_secrets`), otherwise the request
 before any outbound call. If the pending connection is lost before `connection-accepted` arrives, the
 acceptor recovers its mediator from the temporary connection point. If that is the temporary
 connection point's own (the inviter's) mediator, recovery proceeds; otherwise it refuses to finish
-unless the mediator is a known, Active record. See [per-gateway mediators](PER_GATEWAY_MEDIATOR_FEDERATION.md).
+unless the acceptor mediator record recorded at accept time is still Active with that DID. Finalize
+and recovery read that record by id, never a mediator found by DID. See [per-gateway mediators](PER_GATEWAY_MEDIATOR_FEDERATION.md).
 
 `pack_and_send_message` chooses each send's route from the recipient's DID: when its
 `DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
