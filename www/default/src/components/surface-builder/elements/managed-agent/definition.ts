@@ -214,12 +214,9 @@ export const managedAgentDefinition: NodeDefinition = {
         fallback: c.target_auth_fallback || 'reject',
       };
     }
-    if (
-      typeof c.endpoint === 'string' &&
-      c.endpoint.startsWith('fabric://') &&
-      c.fabric_target_name
-    ) {
-      tgt.fabric_target_name = c.fabric_target_name;
+    if (typeof c.endpoint === 'string' && c.endpoint.startsWith('fabric://')) {
+      if (c.fabric_target_name) tgt.fabric_target_name = c.fabric_target_name;
+      if (c.fabric_delegated_credentials === true) tgt.fabric_delegated_credentials = true;
     }
     if (c.mpp_auto_pay) {
       tgt.mpp_auto_pay = true;

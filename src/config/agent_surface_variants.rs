@@ -417,6 +417,9 @@ pub struct TargetOverrides {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mpp_auto_pay_max_amount: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric_delegated_credentials: Option<bool>,
 }
 
 impl TargetOverrides {
@@ -516,6 +519,13 @@ impl TargetOverrides {
             base.mpp_auto_pay_max_amount = self.mpp_auto_pay_max_amount;
         } else if let Some(v) = self.mpp_auto_pay_max_amount {
             base.mpp_auto_pay_max_amount = Some(v);
+        }
+        if complete {
+            base.fabric_delegated_credentials = self
+                .fabric_delegated_credentials
+                .unwrap_or(false);
+        } else if let Some(v) = self.fabric_delegated_credentials {
+            base.fabric_delegated_credentials = v;
         }
     }
 }
@@ -894,6 +904,7 @@ mod tests {
                 fabric_target_name: None,
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
+                fabric_delegated_credentials: false,
             },
             transit: None,
             canvas: None,
@@ -1381,6 +1392,73 @@ mod tests {
             .resolve_variant(None)
             .unwrap();
         assert!(prod.transit.is_some(), "default keeps transit");
+    }
+
+    #[test]
+    fn fabric_delegated_credentials_override_fails_closed_in_complete_mode() {
+        let mut s = base_surface();
+        s.target
+            .fabric_delegated_credentials = true;
+        let target = |value: Option<bool>| {
+            Some(TargetOverrides {
+                fabric_delegated_credentials: value,
+                ..Default::default()
+            })
+        };
+        s.variants = vec![
+            variant(
+                "id-sparse",
+                "sparse",
+                SurfaceOverrides {
+                    target: target(None),
+                    ..Default::default()
+                },
+            ),
+            variant(
+                "id-frozen",
+                "frozen",
+                SurfaceOverrides {
+                    complete: true,
+                    target: target(None),
+                    ..Default::default()
+                },
+            ),
+            variant(
+                "id-off",
+                "off",
+                SurfaceOverrides {
+                    target: target(Some(false)),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let resolved = |alias| {
+            s.resolve_variant(Some(alias))
+                .unwrap()
+                .target
+                .fabric_delegated_credentials
+        };
+        assert!(resolved("sparse"));
+        assert!(!resolved("frozen"));
+        assert!(!resolved("off"));
+
+        s.target
+            .fabric_delegated_credentials = false;
+        s.variants = vec![variant(
+            "id-on",
+            "on",
+            SurfaceOverrides {
+                target: target(Some(true)),
+                ..Default::default()
+            },
+        )];
+        assert!(
+            s.resolve_variant(Some("on"))
+                .unwrap()
+                .target
+                .fabric_delegated_credentials
+        );
     }
 
     // ── JSON round-trip ─────────────────────────────────────────────────
