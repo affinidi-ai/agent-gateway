@@ -1,0 +1,42 @@
+branch: feat/mcp-fabric-follow-ups
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-09T10:40:00.000Z'
+      title: Reconnect a Connection Point whose account the mediator has lost
+      description: A mediator can lose accounts while connections stay open, for example when its store is flushed or fails over. It recreates an account only when that account sends and refuses delivery to a missing one, so a gateway that only received stayed unreachable until it sent, restarted or was reconnected by hand. Every connected Connection Point now checks its own mediator account every 30 seconds, four at a time, reauthenticates and reregisters when the account is gone, and re-opens the receive list, within 10 seconds, when it was closed. An account that cannot be read on consecutive checks is logged at warn, and a Connection Point stopped or removed while it is checked is not started again. The Gateway Ping timeout uses the same check.
+    - timestamp: '2026-10-09T12:30:00.000Z'
+      title: Keep concurrent first Fabric stream requests to one peer from failing
+      description: When several first requests to a peer negotiated stream capabilities at once, a later disclosure replaced the earlier agreement and the request still waiting for it failed, and a burst of first requests could use up the peer's share of the receiver's offer table. Concurrent first requests to a peer now share one capability query and all get its answer for up to 5 seconds, after which the next request sends a new query; a query that cannot be sent fails them at once, and a request keeps the agreement negotiated for its own query when a later one replaces it.
+  removed: []
+  security:
+    - timestamp: '2026-10-09T12:30:00.000Z'
+      title: ⭐ Give each Fabric peer and tenant its own share of the shared stream tables
+      description: One peer could fill the capability offer, capability probe or Open replay table and get every other peer refused. Once a table is half full, each peer may hold an eighth of it and the peers of one tenant half, so a second peer is still served after one peer sends hundreds of refused requests, while a single busy peer is not capped while the table has room. The tenant share applies only while other tenants' or untenanted peers hold entries, and the values are fixed. A full capability probe table or share on the sending gateway now answers the caller 429 with Retry-After 5 instead of 502. The listener also admits Opens off its reader loop, at most 16 at a time, holding up to 8 early frames per stream until its Open is admitted or its admission ends, so a slow admission no longer stalls every other message.
+    - timestamp: '2026-10-09T17:00:00.000Z'
+      title: End running Fabric streams when a peer's access is revoked
+      description: Running framed streams kept going after a peer left active or was removed, a surface was un-exposed, or a Connection Point was disabled, and a disabled Connection Point still admitted new streams until its listener restarted. A gateway or Connection Point write through this node now ends, at once, only the streams a narrowing change no longer allows. A change picked up from shared storage, or a write that cannot read the record it replaces, ends the running streams the stored records no longer admit. An Open admitted while a revocation runs is refused, and admission reads the Connection Point's current record.
+  breaking:
+    - timestamp: '2026-10-09T12:30:00.000Z'
+      title: Answer full Fabric stream caps on the receiving gateway with capacity_reached
+      description: A full framed-stream cap, Open replay table or table share, a full admission pool, or a peer past its Open rate, is now refused with capacity_reached instead of unavailable, so the sending gateway's caller gets 429 with Retry-After instead of 502. A 1.0.0 sender cannot parse capacity_reached, so while a pair runs mixed versions its callers wait for their response deadline, holding its stream slots, whenever the upgraded receiver is out of room. Normal traffic is unaffected. Upgrade both gateways of a pair together, or the sending gateway first, as an upgraded sender understands both codes.
+  internal:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: Test mediator account problem reports with the envelope the mediator sends
+      description: The Connection Point reader's account.not_found decision and its envelope-to-record conversion are now functions of their own, and unit tests drive them with a problem report built the way the mediator's WebSocket handler packages it. A report from the mediator ends the reader so the listener reconnects and re-registers, also when the configured mediator DID carries a fragment; the same report from another DID, another mediator problem code and a non-report message keep the socket. Matching stays on the base DID.
+    - timestamp: '2026-10-09T10:40:00.000Z'
+      title: Let g2g scenarios flush the scenario mediator's store
+      description: The g2g harness can empty the scenario mediator's store while the mediator and the gateways' connections keep running. A scenario uses it to show that a gateway that only receives is reachable again after the mediator loses every account.
+    - timestamp: '2026-10-09T15:00:00.000Z'
+      title: Test a modern Fabric sender against a legacy-only receiver
+      description: A g2g scenario runs the receiving gateway on the legacy-only Fabric receive policy, switched on for the g2g suite by AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY and read only in test mode, and shows that a modern MCP request fails within 5 seconds with 400 and -32022 listing only 2024-11-05, without reaching the MCP server.
+    - timestamp: '2026-10-09T15:00:00.000Z'
+      title: Replace the Open replay proof test with one built on the current admission
+      description: One replay proof test, admitting Opens through the receiver's own entry point with both envelope times set, shows that a captured Open is refused after its stream ends and after its clamped lifetime, and that a captured capability query cannot recreate the expired offer the Open was bound to. It fails when the capability-query replay check is removed, and replaces two tests that duplicated their setup and admitted Opens under a hand-built version policy.
+    - timestamp: '2026-10-09T15:00:00.000Z'
+      title: Document the shared pepper and per-node OAuth state checks for multiple nodes
+      description: The deployment docs say to set the same AG_IDENTITY_HASH_PEPPER on every node of a multi-node gateway, and that used OAuth state nonces are checked per node, not across nodes.
+    - timestamp: '2026-10-12T10:00:00.000Z'
+      title: Test Fabric Open admission and revocation races against real records
+      description: Open admission now reads its records through a part of its own, tested with a stub Connection Point store over a real Open, which shows that a disabled, narrowed or removed Connection Point, a revocation during admission, and an admission past its 2 second deadline each refuse the Open and drop its held frames. Further tests cover an admission aborted with its listener or panicking, an outbound stream registered while a revocation ran, a change another node made, a write that cannot read the previous record, and each account repair with a stubbed mediator.

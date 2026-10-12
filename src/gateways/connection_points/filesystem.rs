@@ -108,6 +108,72 @@ impl FileSystemConnectionPointStore {
 
         Ok(cleaned)
     }
+
+    /// The store's record changes, including those another node made that the
+    /// shared-storage refresh picked up.
+    pub fn subscribe(
+        &self
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::storage::filesystem::StorageEvent<GatewayConnectionPoint>>>
+    {
+        self.storage.subscribe()
+    }
+
+    /// Ends the running Fabric streams the stored Connection Point records no
+    /// longer admit. When the records cannot be listed, every stream ends, as
+    /// no new one could be admitted either.
+    pub async fn revoke_streams_not_admitted(&self) {
+        match self.storage.list_all().await {
+            Ok(connection_points) => crate::proxy::fabric_stream::revoke(
+                crate::proxy::fabric_stream::Revocation::ConnectionPointsOutside(&connection_points),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "Could not list Connection Point records; ending every Fabric stream");
+                crate::proxy::fabric_stream::revoke(crate::proxy::fabric_stream::Revocation::ConnectionPointsOutside(
+                    &[],
+                ));
+            }
+        }
+    }
+
+    /// Saves `connection_point` and ends the running Fabric streams the change
+    /// revokes. When the previous record cannot be read, the running streams
+    /// are checked against the stored records instead.
+    async fn save_and_revoke(
+        &self,
+        connection_point: &GatewayConnectionPoint,
+    ) -> Result<()> {
+        let previous = self
+            .storage
+            .get(&connection_point.id)
+            .await;
+        self.storage
+            .save(connection_point)
+            .await?;
+        self.revoke_change(previous, Some(connection_point))
+            .await;
+        Ok(())
+    }
+
+    async fn revoke_change(
+        &self,
+        previous: Result<Option<GatewayConnectionPoint>>,
+        current: Option<&GatewayConnectionPoint>,
+    ) {
+        match &previous {
+            Ok(Some(previous)) => {
+                if let Some(revocation) =
+                    crate::proxy::fabric_stream::Revocation::of_connection_point_change(previous, current)
+                {
+                    crate::proxy::fabric_stream::revoke(revocation);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.revoke_streams_not_admitted()
+                    .await
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -116,8 +182,7 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         &self,
         connection_point: &GatewayConnectionPoint,
     ) -> Result<()> {
-        self.storage
-            .save(connection_point)
+        self.save_and_revoke(connection_point)
             .await
     }
 
@@ -166,9 +231,7 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         &self,
         connection_point: &GatewayConnectionPoint,
     ) -> Result<()> {
-        // Update is the same as store
-        self.storage
-            .save(connection_point)
+        self.save_and_revoke(connection_point)
             .await
     }
 
@@ -176,7 +239,13 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         &self,
         id: &str,
     ) -> Result<()> {
-        self.storage.delete(id).await
+        let previous = self.storage.get(id).await;
+        self.storage
+            .delete(id)
+            .await?;
+        self.revoke_change(previous, None)
+            .await;
+        Ok(())
     }
 }
 

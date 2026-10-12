@@ -93,6 +93,16 @@ impl ScenarioDockerMediator {
         Self::start_impl().await
     }
 
+    /// Empties the mediator's store while the mediator keeps running, so every
+    /// account, session and access list it held is gone, as after a database
+    /// flush or failover. Open WebSocket connections stay up.
+    #[allow(dead_code)]
+    pub async fn flush_store(&self) -> Result<()> {
+        run_docker_compose(&self.compose_dir, &["exec", "-T", "redis", "valkey-cli", "FLUSHALL"])
+            .await
+            .with_context(|| format!("flush the store of mediator {}", self.label))
+    }
+
     async fn start_impl() -> Result<Self> {
         let parallelism = configured_parallelism().map_err(anyhow::Error::msg)?;
         let mut port = mediator_port(parallelism)?;

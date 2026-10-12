@@ -4,6 +4,7 @@ mod access_tokens_pat;
 mod channel_e2e;
 #[cfg(feature = "didwebvh")]
 mod didwebvh_e2e;
+mod fabric_stream_revocation;
 mod global_policy_e2e;
 mod header_metadata_mapping_e2e;
 pub(crate) mod helpers;

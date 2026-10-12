@@ -107,16 +107,41 @@ pub(crate) struct FabricStreamForwardRequest<'request> {
     pub trace_id: uuid::Uuid,
 }
 
+/// A request's part in a capability probe, which ends with the probe's last
+/// request.
 struct CapabilityProbe {
     runtime: Arc<super::fabric_stream::StreamRuntime>,
     nonce: uuid::Uuid,
+    /// The request is to send the probe's query and has not sent it yet. If it
+    /// ends now nothing will answer the probe, so the probe ends for every
+    /// request waiting for it.
+    query_unsent: bool,
+}
+
+impl CapabilityProbe {
+    fn new(
+        runtime: Arc<super::fabric_stream::StreamRuntime>,
+        start: &super::fabric_stream::peer::ProbeStart,
+    ) -> Self {
+        Self {
+            runtime,
+            nonce: start.nonce(),
+            query_unsent: matches!(start, super::fabric_stream::peer::ProbeStart::Query(_)),
+        }
+    }
 }
 
 impl Drop for CapabilityProbe {
     fn drop(&mut self) {
-        self.runtime
-            .peers
-            .cancel_probe(self.nonce);
+        if self.query_unsent {
+            self.runtime
+                .peers
+                .cancel_probe(self.nonce);
+        } else {
+            self.runtime
+                .peers
+                .leave_probe(self.nonce);
+        }
     }
 }
 
@@ -136,6 +161,7 @@ async fn forward_stream_with_runtime(
     runtime: Arc<super::fabric_stream::StreamRuntime>,
 ) -> Result<axum::response::Response, FabricForwardError> {
     use super::fabric_stream::{
+        peer::ProbeStart,
         registry::{StreamBinding, StreamKind},
         transport, wire,
     };
@@ -175,7 +201,8 @@ async fn forward_stream_with_runtime(
         .get_listener(gateway_id)
         .await
         .ok_or_else(|| FabricForwardError::GatewayNotConnected(gateway_id.to_string()))?;
-    let peer_did = manager
+    let revocations = runtime.registry.revocations();
+    let (peer_did, peer_tenant_id) = manager
         .get_active_stream_peer(gateway_id)
         .await
         .ok_or(FabricForwardError::StreamingUnavailable)?;
@@ -209,38 +236,39 @@ async fn forward_stream_with_runtime(
         None => {
             let probe = runtime
                 .peers
-                .begin(binding.clone(), std::time::Instant::now())
+                .begin(binding.clone(), peer_tenant_id, std::time::Instant::now())
+                .map_err(registration_failure)?;
+            let nonce = probe.nonce();
+            let mut membership = CapabilityProbe::new(runtime.clone(), &probe);
+            if let ProbeStart::Query(query) = &probe {
+                // The receiver admits a query only with an expiry, and remembers it
+                // until then, so a replayed query cannot recreate an expired offer.
+                let created_time = crate::gateways::connection_points::envelope_replay::now_secs();
+                let message = affinidi_messaging_didcomm::Message::build(
+                    nonce.to_string(),
+                    crate::messages::MessageType::ForwardStreamQuery.to_string(),
+                    serde_json::to_value(query).map_err(|_| FabricForwardError::StreamingUnavailable)?,
+                )
+                .from(binding.recipient_did.clone())
+                .to(binding.peer_did.clone())
+                .thid(nonce.to_string())
+                .created_time(created_time)
+                .expires_time(created_time + CAPABILITY_QUERY_ENVELOPE_LIFETIME_SECS)
+                .finalize();
+                tokio::time::timeout_at(
+                    header_deadline,
+                    listener
+                        .client
+                        .pack_and_send_message(&message, &binding.peer_did, &binding.recipient_did),
+                )
+                .await
+                .map_err(|_| FabricForwardError::NoResponse(gateway_id.to_string()))?
                 .map_err(|_| FabricForwardError::StreamingUnavailable)?;
-            let _probe = CapabilityProbe {
-                runtime: runtime.clone(),
-                nonce: probe.nonce,
-            };
-            // The receiver admits a query only with an expiry, and remembers it
-            // until then, so a replayed query cannot recreate an expired offer.
-            let created_time = crate::gateways::connection_points::envelope_replay::now_secs();
-            let message = affinidi_messaging_didcomm::Message::build(
-                probe.nonce.to_string(),
-                crate::messages::MessageType::ForwardStreamQuery.to_string(),
-                serde_json::to_value(&probe).map_err(|_| FabricForwardError::StreamingUnavailable)?,
-            )
-            .from(binding.recipient_did.clone())
-            .to(binding.peer_did.clone())
-            .thid(probe.nonce.to_string())
-            .created_time(created_time)
-            .expires_time(created_time + CAPABILITY_QUERY_ENVELOPE_LIFETIME_SECS)
-            .finalize();
-            tokio::time::timeout_at(
-                header_deadline,
-                listener
-                    .client
-                    .pack_and_send_message(&message, &binding.peer_did, &binding.recipient_did),
-            )
-            .await
-            .map_err(|_| FabricForwardError::NoResponse(gateway_id.to_string()))?
-            .map_err(|_| FabricForwardError::StreamingUnavailable)?;
+                membership.query_unsent = false;
+            }
             runtime
                 .peers
-                .wait(&binding, probe.nonce, header_deadline.min(now + Duration::from_secs(5)))
+                .wait(&binding, nonce, header_deadline)
                 .await
                 .map_err(|_| FabricForwardError::StreamingUnavailable)?
         }
@@ -300,30 +328,8 @@ async fn forward_stream_with_runtime(
         .capabilities
         .validate_frame(&open)
         .map_err(|_| FabricForwardError::StreamingUnavailable)?;
-    let receiver = runtime
-        .registry
-        .register_negotiated(
-            stream_id,
-            binding.clone(),
-            kind,
-            wire::StreamDirection::Response,
-            agreement
-                .capabilities
-                .max_window_bytes as usize,
-            &agreement.capabilities,
-        )
-        .map_err(registration_failure)?;
-    let sender = runtime
-        .registry
-        .register_sender_negotiated(
-            stream_id,
-            binding.clone(),
-            kind,
-            wire::StreamDirection::Request,
-            wire::MAX_CHUNK_BYTES,
-            &agreement.capabilities,
-        )
-        .map_err(registration_failure)?;
+    let (receiver, sender) =
+        register_outbound(&runtime.registry, stream_id, &binding, kind, &agreement.capabilities, revocations)?;
     // Waits for the peer's Credit on the upload; the response itself may be
     // quiet for as long as the target takes.
     sender
@@ -360,6 +366,45 @@ async fn forward_stream_with_runtime(
         .extensions_mut()
         .insert(agreement.capabilities);
     Ok(response)
+}
+
+/// Registers both halves of an outbound stream. Refused when a revocation ran
+/// since `revocations` was read, along with the peer: it could not end
+/// registrations that did not exist yet.
+fn register_outbound(
+    registry: &Arc<super::fabric_stream::registry::ReceiveRegistry>,
+    stream_id: uuid::Uuid,
+    binding: &super::fabric_stream::registry::StreamBinding,
+    kind: super::fabric_stream::registry::StreamKind,
+    capabilities: &super::fabric_stream::peer::StreamCapabilities,
+    revocations: u64,
+) -> Result<(super::fabric_stream::registry::ReceiveLease, super::fabric_stream::registry::SendLease), FabricForwardError>
+{
+    use super::fabric_stream::wire;
+    let receiver = registry
+        .register_negotiated(
+            stream_id,
+            binding.clone(),
+            kind,
+            wire::StreamDirection::Response,
+            capabilities.max_window_bytes as usize,
+            capabilities,
+        )
+        .map_err(registration_failure)?;
+    let sender = registry
+        .register_sender_negotiated(
+            stream_id,
+            binding.clone(),
+            kind,
+            wire::StreamDirection::Request,
+            wire::MAX_CHUNK_BYTES,
+            capabilities,
+        )
+        .map_err(registration_failure)?;
+    if registry.revocations() != revocations {
+        return Err(FabricForwardError::StreamingUnavailable);
+    }
+    Ok((receiver, sender))
 }
 
 fn registration_failure(error: super::fabric_stream::registry::RegisterError) -> FabricForwardError {
@@ -616,6 +661,101 @@ pub(crate) async fn forward_via_fabric(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_outbound_stream_registered_while_a_revocation_ran_is_refused() {
+        use crate::proxy::fabric_stream::registry::{ReceiveRegistry, RegistryLimits, StreamBinding, StreamKind};
+
+        let registry = ReceiveRegistry::new(RegistryLimits {
+            max_streams: 4,
+            max_peer_streams: 4,
+            max_surface_streams: 4,
+            max_peer_listens: 4,
+            max_surface_listens: 4,
+        })
+        .unwrap();
+        let binding = StreamBinding {
+            peer_did: "did:example:peer".into(),
+            recipient_did: "did:example:local".into(),
+            connection_point_id: "cp".into(),
+            listener_instance_id: "instance".into(),
+            surface_id: "peer-channel".into(),
+        };
+        let capabilities = crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true);
+
+        let unchanged = uuid::Uuid::new_v4();
+        let leases = register_outbound(
+            &registry,
+            unchanged,
+            &binding,
+            StreamKind::Request,
+            &capabilities,
+            registry.revocations(),
+        )
+        .expect("no revocation ran");
+        assert!(registry.is_running(&unchanged));
+        drop(leases);
+
+        let raced = uuid::Uuid::new_v4();
+        let read_before = registry.revocations();
+        registry.revoke(|_, _| false);
+        assert!(matches!(
+            register_outbound(&registry, raced, &binding, StreamKind::Request, &capabilities, read_before),
+            Err(FabricForwardError::StreamingUnavailable)
+        ));
+        assert!(!registry.is_running(&raced), "the refused stream leaves nothing registered");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_ends_before_sending_its_probe_query_ends_the_probe_for_requests_waiting_for_it() {
+        use crate::proxy::fabric_stream::{StreamRuntime, peer::ProbeStart, registry::StreamBinding};
+
+        let runtime = StreamRuntime::test_runtime();
+        let binding = || StreamBinding {
+            peer_did: "did:example:peer".into(),
+            recipient_did: "did:example:local".into(),
+            connection_point_id: "cp".into(),
+            listener_instance_id: "instance".into(),
+            surface_id: "peer-channel".into(),
+        };
+        let now = std::time::Instant::now();
+        let begin = || {
+            runtime
+                .peers
+                .begin(binding(), None, now)
+                .unwrap()
+        };
+
+        let unsent = begin();
+        let leader = CapabilityProbe::new(runtime.clone(), &unsent);
+        let joined = begin();
+        assert_eq!(joined, ProbeStart::Joined(unsent.nonce()));
+        let joiner = CapabilityProbe::new(runtime.clone(), &joined);
+        drop(leader);
+        let waited = runtime
+            .peers
+            .wait(&binding(), unsent.nonce(), tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(
+            waited
+                .unwrap_err()
+                .contains("cancelled"),
+            "a request waiting for the probe fails at once"
+        );
+        drop(joiner);
+
+        let sent = begin();
+        assert!(matches!(sent, ProbeStart::Query(_)), "the next request sends a new query");
+        let mut leader = CapabilityProbe::new(runtime.clone(), &sent);
+        leader.query_unsent = false;
+        let _joiner = CapabilityProbe::new(runtime.clone(), &begin());
+        drop(leader);
+        assert_eq!(
+            begin(),
+            ProbeStart::Joined(sent.nonce()),
+            "a probe whose query was sent stays for the requests waiting for it"
+        );
+    }
 
     async fn drive_mediator_peer(
         runtime: Arc<crate::proxy::fabric_stream::StreamRuntime>,

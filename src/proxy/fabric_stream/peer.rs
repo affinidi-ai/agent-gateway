@@ -5,15 +5,22 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::registry::StreamBinding;
+use super::registry::{RegisterError, StreamBinding};
+use super::share::{ShareOwner, SharedTable};
 use super::wire::{
     FramePayload, MAX_CHUNK_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES, MAX_WINDOW_BYTES, StreamFrame, decode_chunk,
 };
 use crate::gateways::connection_points::messages::ReceivedMessage;
 
+/// Capability probes this gateway may have in flight to its peers.
 const MAX_PROBES: usize = 256;
+/// Capability offers this gateway may hold for its peers.
+const MAX_OFFERS: usize = 256;
 const MAX_PEERS: usize = 256;
 const PROBE_TTL: Duration = Duration::from_secs(30);
+/// How long a probe's requests wait for the peer's answer. A query unanswered
+/// by then is taken as lost, so later requests send a new one.
+const PROBE_ANSWER_WINDOW: Duration = Duration::from_secs(5);
 const PEER_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +175,41 @@ impl From<&StreamBinding> for PeerKey {
 struct PendingProbe {
     binding: StreamBinding,
     deadline: Instant,
+    /// The end of the probe's answer window: requests join it and wait for its
+    /// answer only until then.
+    answer_by: Instant,
+    /// What the peer disclosed for this probe. Kept for the probe's own
+    /// waiters, as a later probe to the same peer may replace the cached
+    /// agreement.
+    agreement: Option<CapabilityMessage>,
+    /// The requests waiting for this probe's answer.
+    members: usize,
+}
+
+/// How a request takes part in negotiating with a peer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeStart {
+    /// No probe to the peer is pending: the request sends this query.
+    Query(CapabilityMessage),
+    /// A probe to the peer is pending: the request waits for its answer.
+    Joined(Uuid),
+}
+
+impl ProbeStart {
+    pub fn nonce(&self) -> Uuid {
+        match self {
+            Self::Query(query) => query.nonce,
+            Self::Joined(nonce) => *nonce,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn into_query(self) -> CapabilityMessage {
+        match self {
+            Self::Query(query) => query,
+            Self::Joined(nonce) => panic!("joined the pending probe {nonce} instead of starting one"),
+        }
+    }
 }
 
 struct InboundOffer {
@@ -177,9 +219,9 @@ struct InboundOffer {
 }
 
 struct PeerState {
-    probes: HashMap<Uuid, PendingProbe>,
+    probes: SharedTable<Uuid, PendingProbe>,
     peers: HashMap<PeerKey, (CapabilityMessage, Instant)>,
-    offers: HashMap<Uuid, InboundOffer>,
+    offers: SharedTable<Uuid, InboundOffer>,
 }
 
 pub(crate) struct PeerCapabilities {
@@ -193,19 +235,23 @@ impl PeerCapabilities {
         Self {
             local,
             state: Mutex::new(PeerState {
-                probes: HashMap::new(),
+                probes: SharedTable::new(MAX_PROBES),
                 peers: HashMap::new(),
-                offers: HashMap::new(),
+                offers: SharedTable::new(MAX_OFFERS),
             }),
             changed: tokio::sync::Notify::new(),
         }
     }
 
+    /// Answers a peer's capability query with an offer. A peer may hold several
+    /// live offers, so its concurrent first requests each negotiate, up to its
+    /// share of the offer table; `tenant_id` is the tenant owning its record.
     pub fn offer(
         &self,
         message: &ReceivedMessage,
         binding: StreamBinding,
         query: CapabilityMessage,
+        tenant_id: Option<String>,
         now: Instant,
     ) -> Result<CapabilityMessage, String> {
         binding.validate(query.nonce)?;
@@ -227,18 +273,32 @@ impl PeerCapabilities {
         if state
             .offers
             .contains_key(&query.nonce)
-            || state.offers.len() >= MAX_PROBES
         {
-            return Err("Fabric capability offer is duplicate or capacity is unavailable".to_string());
+            return Err("Fabric capability offer is a duplicate".to_string());
         }
-        state.offers.insert(
-            query.nonce,
-            InboundOffer {
-                binding,
-                capabilities: capabilities.clone(),
-                deadline: now + PEER_TTL,
-            },
-        );
+        let owner = ShareOwner {
+            peer_did: binding.peer_did.clone(),
+            tenant_id,
+        };
+        state
+            .offers
+            .insert(
+                query.nonce,
+                owner,
+                InboundOffer {
+                    binding,
+                    capabilities: capabilities.clone(),
+                    deadline: now + PEER_TTL,
+                },
+            )
+            .map_err(|limit| {
+                tracing::warn!(
+                    peer_did = %message.from_did.as_deref().unwrap_or_default(),
+                    cap = limit.as_str(),
+                    "Fabric capability offer cap reached"
+                );
+                "Fabric capability offer capacity is unavailable".to_string()
+            })?;
         Ok(CapabilityMessage {
             nonce: query.nonce,
             capabilities,
@@ -260,11 +320,19 @@ impl PeerCapabilities {
         (PeerKey::from(&offer.binding) == PeerKey::from(binding)).then(|| (offer.capabilities.clone(), offer.deadline))
     }
 
+    /// Starts negotiating with a peer, or joins the probe to it that is
+    /// waiting for an answer within its answer window, so concurrent first
+    /// requests send one query.
+    /// A new probe takes a slot in the peer's share of the probe table;
+    /// `tenant_id` is the tenant owning the peer's record. A full share is
+    /// `CapacityReached`, so the caller is told to retry. Each start is ended
+    /// with [`Self::leave_probe`].
     pub fn begin(
         &self,
         binding: StreamBinding,
+        tenant_id: Option<String>,
         now: Instant,
-    ) -> Result<CapabilityMessage, String> {
+    ) -> Result<ProbeStart, RegisterError> {
         let nonce = Uuid::new_v4();
         binding.validate(nonce)?;
         let mut state = self
@@ -274,20 +342,62 @@ impl PeerCapabilities {
         state
             .probes
             .retain(|_, probe| probe.deadline > now);
-        if state.probes.len() >= MAX_PROBES {
-            return Err("Fabric capability probe limit reached".to_string());
+        let key = PeerKey::from(&binding);
+        if let Some((pending, probe)) = state
+            .probes
+            .iter_mut()
+            .find(|(_, probe)| {
+                probe.agreement.is_none() && probe.answer_by > now && PeerKey::from(&probe.binding) == key
+            })
+        {
+            probe.members = probe
+                .members
+                .saturating_add(1);
+            return Ok(ProbeStart::Joined(*pending));
         }
-        state.probes.insert(
-            nonce,
-            PendingProbe {
-                binding,
-                deadline: now + PROBE_TTL,
-            },
-        );
-        Ok(CapabilityMessage {
+        let owner = ShareOwner {
+            peer_did: binding.peer_did.clone(),
+            tenant_id,
+        };
+        state
+            .probes
+            .insert(
+                nonce,
+                owner,
+                PendingProbe {
+                    binding,
+                    deadline: now + PROBE_TTL,
+                    answer_by: now + PROBE_ANSWER_WINDOW,
+                    agreement: None,
+                    members: 1,
+                },
+            )
+            .map_err(|limit| {
+                tracing::warn!(cap = limit.as_str(), "Fabric capability probe cap reached");
+                RegisterError::CapacityReached("Fabric capability probe limit reached")
+            })?;
+        Ok(ProbeStart::Query(CapabilityMessage {
             nonce,
             capabilities: self.local.clone(),
-        })
+        }))
+    }
+
+    /// Ends one request's part in the probe under `nonce`; the probe ends with
+    /// its last request.
+    pub fn leave_probe(
+        &self,
+        nonce: Uuid,
+    ) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(probe) = state.probes.get_mut(&nonce)
+        {
+            probe.members = probe
+                .members
+                .saturating_sub(1);
+            if probe.members == 0 {
+                state.probes.remove(&nonce);
+            }
+        }
     }
 
     pub fn accept(
@@ -311,6 +421,9 @@ impl PeerCapabilities {
             .probes
             .get(&disclosure.nonce)
             .ok_or("Unsolicited or expired Fabric stream capability disclosure")?;
+        if probe.agreement.is_some() {
+            return Err("Fabric capability disclosure was already accepted".to_string());
+        }
         if !probe
             .binding
             .matches(message, listener_instance_id, disclosure.nonce)
@@ -324,19 +437,19 @@ impl PeerCapabilities {
         if !state.peers.contains_key(&key) && state.peers.len() >= MAX_PEERS {
             return Err("Fabric peer capability cache limit reached".to_string());
         }
-        state
+        let agreement = CapabilityMessage {
+            nonce: disclosure.nonce,
+            capabilities: negotiated.clone(),
+        };
+        if let Some(probe) = state
             .probes
-            .remove(&disclosure.nonce);
-        state.peers.insert(
-            key,
-            (
-                CapabilityMessage {
-                    nonce: disclosure.nonce,
-                    capabilities: negotiated.clone(),
-                },
-                now + PEER_TTL,
-            ),
-        );
+            .get_mut(&disclosure.nonce)
+        {
+            probe.agreement = Some(agreement.clone());
+        }
+        state
+            .peers
+            .insert(key, (agreement, now + PEER_TTL));
         drop(state);
         self.changed.notify_waiters();
         Ok(negotiated)
@@ -387,23 +500,19 @@ impl PeerCapabilities {
             .map(|agreement| agreement.capabilities)
     }
 
+    /// Waits for the answer to the probe under `nonce` until `deadline` or the
+    /// end of the probe's answer window, whichever comes first.
     pub async fn wait(
         &self,
         binding: &StreamBinding,
         nonce: Uuid,
         deadline: tokio::time::Instant,
     ) -> Result<CapabilityMessage, String> {
-        let _probe = ProbeWait { peers: self, nonce };
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(agreement) = self.agreement(binding, Instant::now())
-                && agreement.nonce == nonce
-            {
-                return Ok(agreement);
-            }
-            {
+            let answer_window_ends = {
                 let state = self
                     .state
                     .lock()
@@ -412,16 +521,28 @@ impl PeerCapabilities {
                     .probes
                     .get(&nonce)
                     .ok_or("Fabric capability probe was cancelled")?;
-                if probe.deadline <= Instant::now() || PeerKey::from(&probe.binding) != PeerKey::from(binding) {
+                if PeerKey::from(&probe.binding) != PeerKey::from(binding) {
                     return Err("Fabric capability probe is expired or mismatched".to_string());
                 }
-            }
-            tokio::time::timeout_at(deadline, notified)
+                if let Some(agreement) = &probe.agreement {
+                    return Ok(agreement.clone());
+                }
+                let window_left = probe
+                    .answer_by
+                    .saturating_duration_since(Instant::now());
+                if window_left.is_zero() {
+                    return Err("Fabric capability probe timed out".to_string());
+                }
+                tokio::time::Instant::now() + window_left
+            };
+            tokio::time::timeout_at(deadline.min(answer_window_ends), notified)
                 .await
                 .map_err(|_| "Fabric capability probe timed out")?;
         }
     }
 
+    /// Ends the probe under `nonce` for every request waiting for it: its
+    /// query could not be sent.
     pub fn cancel_probe(
         &self,
         nonce: Uuid,
@@ -467,21 +588,6 @@ impl PeerCapabilities {
                 });
         }
         self.changed.notify_waiters();
-    }
-}
-
-struct ProbeWait<'peers> {
-    peers: &'peers PeerCapabilities,
-    nonce: Uuid,
-}
-
-impl Drop for ProbeWait<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.peers.state.lock() {
-            state
-                .probes
-                .remove(&self.nonce);
-        }
     }
 }
 
@@ -590,8 +696,9 @@ mod tests {
         let peers = PeerCapabilities::new(StreamCapabilities::local(true, false));
         let now = Instant::now();
         let probe = peers
-            .begin(binding(), now)
-            .unwrap();
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
         let disclosure = CapabilityMessage {
             nonce: probe.nonce,
             capabilities: StreamCapabilities::local(true, true),
@@ -631,8 +738,9 @@ mod tests {
         let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
         let now = Instant::now();
         let probe = peers
-            .begin(binding(), now)
-            .unwrap();
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
         let disclosure = CapabilityMessage {
             nonce: probe.nonce,
             capabilities: StreamCapabilities::local(true, true),
@@ -661,8 +769,9 @@ mod tests {
         let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
         let now = Instant::now();
         let probe = peers
-            .begin(binding(), now)
-            .unwrap();
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
         let disclosure = CapabilityMessage {
             nonce: probe.nonce,
             capabilities: StreamCapabilities::local(true, true),
@@ -673,8 +782,9 @@ mod tests {
                 .is_err()
         );
         let probe = peers
-            .begin(binding(), now)
-            .unwrap();
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
         peers
             .accept(&message(probe.nonce), "instance", probe.clone(), now)
             .unwrap();
@@ -684,8 +794,9 @@ mod tests {
                 .is_none()
         );
         let probe = peers
-            .begin(binding(), now)
-            .unwrap();
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
         peers
             .accept(&message(probe.nonce), "instance", probe, now)
             .unwrap();
@@ -738,7 +849,7 @@ mod tests {
         let mut message = message(nonce);
         message.didcomm_message_id = nonce.to_string();
         let offered = peers
-            .offer(&message, binding(), query.clone(), now)
+            .offer(&message, binding(), query.clone(), None, now)
             .unwrap();
         assert!(
             offered
@@ -758,7 +869,7 @@ mod tests {
         );
         assert!(
             peers
-                .offer(&message, binding(), query, now)
+                .offer(&message, binding(), query, None, now)
                 .is_err()
         );
         let mut other = binding();
@@ -788,8 +899,9 @@ mod tests {
         let now = Instant::now();
         let peer_binding = binding();
         let probe = peers
-            .begin(binding(), now)
-            .unwrap();
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
         let wait = peers.wait(&peer_binding, probe.nonce, tokio::time::Instant::now() + Duration::from_secs(1));
         let disclose = async {
             tokio::task::yield_now().await;
@@ -801,26 +913,30 @@ mod tests {
         assert_eq!(result.unwrap(), probe);
 
         let probe = peers
-            .begin(binding(), now)
-            .unwrap();
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
         assert!(
             peers
                 .wait(&binding(), probe.nonce, tokio::time::Instant::now())
                 .await
                 .is_err()
         );
+        peers.leave_probe(probe.nonce);
         assert!(
             !peers
                 .state
                 .lock()
                 .unwrap()
                 .probes
-                .contains_key(&probe.nonce)
+                .contains_key(&probe.nonce),
+            "the probe ends with its last request"
         );
 
         let probe = peers
-            .begin(binding(), now)
-            .unwrap();
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
         let wait = peers.wait(&peer_binding, probe.nonce, tokio::time::Instant::now() + Duration::from_secs(1));
         let replace = async {
             tokio::task::yield_now().await;
@@ -831,6 +947,293 @@ mod tests {
             result
                 .unwrap_err()
                 .contains("cancelled")
+        );
+    }
+
+    fn query_from(
+        peer: &str,
+        nonce: Uuid,
+    ) -> (ReceivedMessage, StreamBinding, CapabilityMessage) {
+        let mut message = message(nonce);
+        message.from_did = Some(format!("did:example:{peer}"));
+        message.didcomm_message_id = nonce.to_string();
+        let mut binding = binding();
+        binding.peer_did = format!("did:example:{peer}");
+        let query = CapabilityMessage {
+            nonce,
+            capabilities: StreamCapabilities::local(true, true),
+        };
+        (message, binding, query)
+    }
+
+    /// Offers `attempts` queries from `peer` and returns the nonces offered.
+    fn offer_queries(
+        peers: &PeerCapabilities,
+        peer: &str,
+        tenant_id: Option<&str>,
+        attempts: usize,
+        now: Instant,
+    ) -> Vec<Uuid> {
+        (0..attempts)
+            .filter_map(|_| {
+                let (message, binding, query) = query_from(peer, Uuid::new_v4());
+                peers
+                    .offer(&message, binding, query.clone(), tenant_id.map(str::to_string), now)
+                    .ok()
+                    .map(|_| query.nonce)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_the_offer_table() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+
+        let alpha_offers = offer_queries(&peers, "alpha", None, MAX_OFFERS + 1, now);
+        assert_eq!(alpha_offers.len(), MAX_OFFERS / 2, "a peer alone fills at most half the table");
+        let (_, alpha, _) = query_from("alpha", Uuid::new_v4());
+        assert!(
+            alpha_offers
+                .iter()
+                .all(|nonce| peers
+                    .offered(&alpha, *nonce, now)
+                    .is_some()),
+            "every offer within the share stays live, so concurrent first requests each negotiate"
+        );
+
+        let (message, bravo, query) = query_from("bravo", Uuid::new_v4());
+        let offered = peers
+            .offer(&message, bravo.clone(), query.clone(), None, now)
+            .expect("another peer is still offered capabilities");
+        assert_eq!(offered.nonce, query.nonce);
+        assert!(
+            peers
+                .offered(&bravo, query.nonce, now)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn one_tenants_peers_cannot_fill_the_offer_table() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        assert_eq!(offer_queries(&peers, "appliance", None, 1, now).len(), 1);
+        let held: usize = (0..8)
+            .map(|peer| offer_queries(&peers, &format!("tenant-a-{peer}"), Some("tenant-a"), MAX_OFFERS, now).len())
+            .sum();
+        assert_eq!(held, MAX_OFFERS / 2, "the peers of one tenant hold at most the tenant's share");
+        assert!(offer_queries(&peers, "tenant-a-late", Some("tenant-a"), 1, now).is_empty());
+        assert_eq!(offer_queries(&peers, "tenant-b-0", Some("tenant-b"), 1, now).len(), 1);
+        assert_eq!(offer_queries(&peers, "appliance", None, 1, now).len(), 1);
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_the_probe_table() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        // Probes through different Connection Points to the one peer.
+        let refusal = (0..=MAX_PROBES).find_map(|connection_point| {
+            let mut through = binding();
+            through.connection_point_id = format!("cp-{connection_point}");
+            peers
+                .begin(through, None, now)
+                .err()
+        });
+        assert_eq!(
+            refusal,
+            Some(RegisterError::CapacityReached("Fabric capability probe limit reached")),
+            "a full share is a capacity refusal, so the caller is told to retry"
+        );
+        assert_eq!(
+            peers
+                .state
+                .lock()
+                .unwrap()
+                .probes
+                .len(),
+            MAX_PROBES / 2,
+            "a peer alone fills at most half the table"
+        );
+
+        let mut other = binding();
+        other.peer_did = "did:example:other".into();
+        assert!(
+            peers
+                .begin(other, None, now)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_requests_to_one_peer_share_one_probe() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        let query = peers
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
+        for _ in 0..2 {
+            assert_eq!(peers.begin(binding(), None, now), Ok(ProbeStart::Joined(query.nonce)));
+        }
+        let mut elsewhere = binding();
+        elsewhere.connection_point_id = "other-cp".into();
+        assert!(
+            matches!(peers.begin(elsewhere, None, now), Ok(ProbeStart::Query(_))),
+            "a probe through another Connection Point is its own"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let (first, second, third) = (binding(), binding(), binding());
+        let disclose = async {
+            tokio::task::yield_now().await;
+            peers
+                .accept(&message(query.nonce), "instance", query.clone(), now)
+                .unwrap();
+        };
+        let (first, second, third, ()) = tokio::join!(
+            peers.wait(&first, query.nonce, deadline),
+            peers.wait(&second, query.nonce, deadline),
+            peers.wait(&third, query.nonce, deadline),
+            disclose
+        );
+        for agreement in [first, second, third] {
+            assert_eq!(
+                agreement
+                    .expect("every request waiting for the probe gets its answer")
+                    .nonce,
+                query.nonce
+            );
+        }
+
+        let probes = |peers: &PeerCapabilities| {
+            peers
+                .state
+                .lock()
+                .unwrap()
+                .probes
+                .contains_key(&query.nonce)
+        };
+        peers.leave_probe(query.nonce);
+        peers.leave_probe(query.nonce);
+        assert!(probes(&peers), "a request still waits for the probe");
+        peers.leave_probe(query.nonce);
+        assert!(!probes(&peers), "the probe ends with its last request");
+    }
+
+    #[tokio::test]
+    async fn a_probe_whose_query_was_not_sent_fails_every_request_waiting_for_it() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        let query = peers
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
+        assert_eq!(peers.begin(binding(), None, now), Ok(ProbeStart::Joined(query.nonce)));
+        let peer_binding = binding();
+        let joined = peers.wait(&peer_binding, query.nonce, tokio::time::Instant::now() + Duration::from_secs(5));
+        let cancel = async {
+            tokio::task::yield_now().await;
+            peers.cancel_probe(query.nonce);
+        };
+        let started = std::time::Instant::now();
+        let (joined, ()) = tokio::join!(joined, cancel);
+        assert!(
+            joined
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "the joined request fails at once");
+        assert!(
+            matches!(peers.begin(binding(), None, now), Ok(ProbeStart::Query(_))),
+            "the next request starts a new probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_probe_is_joined_and_waited_for_only_within_its_answer_window() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        let query = peers
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
+        let window_end = now + PROBE_ANSWER_WINDOW;
+        assert_eq!(
+            peers.begin(binding(), None, window_end - Duration::from_millis(1)),
+            Ok(ProbeStart::Joined(query.nonce))
+        );
+        let fresh = peers
+            .begin(binding(), None, window_end)
+            .expect("a request after the answer window starts a new probe")
+            .into_query();
+        assert_ne!(fresh.nonce, query.nonce);
+
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let started_late = Instant::now()
+            .checked_sub(PROBE_ANSWER_WINDOW - Duration::from_millis(200))
+            .expect("the monotonic clock started more than an answer window ago");
+        let late = peers
+            .begin(binding(), None, started_late)
+            .unwrap()
+            .into_query()
+            .nonce;
+        let waited = Instant::now();
+        let caller_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        assert!(
+            peers
+                .wait(&binding(), late, caller_deadline)
+                .await
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(waited.elapsed() < Duration::from_secs(2), "a request waits no longer than the probe's answer window");
+    }
+
+    #[tokio::test]
+    async fn a_probe_started_after_an_answer_keeps_each_requests_own_agreement() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        let first = peers
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
+        peers
+            .accept(&message(first.nonce), "instance", first.clone(), now)
+            .unwrap();
+        // The peer refused a stream under the first agreement, so the next
+        // request negotiates again while the first request still reads its own.
+        peers.forget(&binding(), first.nonce);
+        let second = peers
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
+        assert_ne!(first.nonce, second.nonce, "an answered probe is not joined");
+        peers
+            .accept(&message(second.nonce), "instance", second.clone(), now)
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            peers
+                .wait(&binding(), first.nonce, deadline)
+                .await
+                .unwrap()
+                .nonce,
+            first.nonce,
+            "a later disclosure does not replace an earlier request's agreement"
+        );
+        assert_eq!(
+            peers
+                .agreement(&binding(), now)
+                .map(|agreement| agreement.nonce),
+            Some(second.nonce),
+            "the latest agreement serves the next request"
+        );
+        assert!(
+            peers
+                .accept(&message(first.nonce), "instance", first, now)
+                .is_err(),
+            "a disclosure is accepted once"
         );
     }
 }

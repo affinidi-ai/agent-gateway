@@ -515,6 +515,17 @@ promotes it and `SIGUSR2` steps it down. Two instances sharing storage can keep 
 caches in step with a periodic refresh. See
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#server-mode).
 
+Set the same `AG_IDENTITY_HASH_PEPPER` on every node of a multi-node gateway. The pepper
+derives the DIDs of agents identified by mTLS, API key or a JWT claim, so nodes with
+different peppers give the same agent different DIDs. With encryption at rest off it also
+seals the OAuth delegation `state`, so a callback that lands on another node can open the
+state only when both nodes share the pepper.
+
+Used OAuth `state` nonces are checked per node, not across nodes. Each node remembers for
+15 minutes the nonces its own callbacks used, so a state already used on one node is not
+known to another. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#consent-flow).
+
 ## Related
 
 - [`../README.md`](../README.md): the short introduction.
