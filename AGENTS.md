@@ -132,6 +132,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | MCP metadata contract and the tool-gating firewall                             | [`docs/MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md)                 |
 | MCP 2026-07-28, modern admission, `mcp_http`, Resource Server, conformance     | [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md)                       |
 | Fabric, peer issuer DIDs, envelope replay                                      | [`docs/FABRIC.md`](docs/FABRIC.md)                                   |
+| Per-gateway mediators, send routing, mediator relay setup                      | [`docs/PER_GATEWAY_MEDIATOR_FEDERATION.md`](docs/PER_GATEWAY_MEDIATOR_FEDERATION.md) |
 | Token exchange and ID-JAG                                                      | [`docs/STS.md`](docs/STS.md)                                         |
 | Management tokens and tenant ownership                                         | [`docs/ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md)                     |
 | Management RBAC                                                                | [`docs/RBAC.md`](docs/RBAC.md)                                       |

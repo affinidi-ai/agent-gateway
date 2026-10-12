@@ -112,7 +112,7 @@ impl ScenarioDockerMediator {
     /// Start the mediator on a dynamically-reserved free port, bypassing the
     /// fixed-port fast path `mediator_port` otherwise takes when
     /// `G2G_BDD_PARALLELISM` <= 1. Used to spin up a *second* independent
-    /// mediator in the same test process (per-gateway mediator federation)
+    /// mediator in the same test process (gateways on different mediators)
     /// so it never collides with a first mediator already bound to the
     /// default/fixed port.
     pub async fn start_with_free_port() -> Result<Self> {
@@ -357,7 +357,7 @@ impl Drop for MediatorPortBridge {
 /// Bridges cross-mediator relay traffic between two `ScenarioDockerMediator`
 /// instances that each own an isolated Docker bridge network.
 ///
-/// Per-gateway mediator federation gives every mediator its own compose
+/// Each scenario mediator gets its own compose
 /// project and its own `<label>_mediatornet` bridge network, so a container
 /// on mediator A's network cannot resolve mediator B's advertised
 /// `http://localhost:<port>` service endpoint (that hostname/port only means
@@ -486,7 +486,7 @@ async fn network_gateway_ip(network: &str) -> Result<String> {
 /// Bridges every ordered pair of Docker-backed mediators so relay traffic
 /// from one mediator's own container reaches its peer's real published
 /// port instead of the sender's own loopback. A no-op for a single mediator
-/// (the historical, most common case) and for any mediator transport that
+/// (the most common case) and for any mediator transport that
 /// does not run as a Docker container (`container_name()`/`docker_network()`
 /// unset). See [`MediatorCrossBridge`] for why this is needed.
 pub async fn bridge_mediator_pairs(mediators: &[&dyn Mediator]) -> Result<Vec<MediatorCrossBridge>> {

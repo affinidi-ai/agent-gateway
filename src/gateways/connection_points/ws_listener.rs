@@ -3250,6 +3250,25 @@ async fn find_mediator_by_did(
         .find(|m| m.did == did))
 }
 
+/// The endpoint the acceptor's permanent connection point advertises.
+///
+/// The mediator's stored DID document wins. Without one, a connection on the
+/// handshake mediator (shared mode) uses the handshake mediator's URL, taken
+/// from the OOB invitation, since the acceptor usually has no record of the
+/// inviter's mediator. Otherwise the URL is derived from the mediator DID.
+fn permanent_mediator_url(
+    mediator_did: &str,
+    mediator_doc: Option<&serde_json::Value>,
+    handshake_mediator_did: &str,
+    handshake_mediator_url: &str,
+) -> Result<String, String> {
+    if mediator_doc.is_none() && mediator_did == handshake_mediator_did && !handshake_mediator_url.is_empty() {
+        return Ok(handshake_mediator_url.to_string());
+    }
+    super::handlers::resolve_mediator_endpoint(mediator_did, mediator_doc)
+        .map_err(|e| format!("Failed to resolve mediator URL: {}", e))
+}
+
 /// Finalize OOB connection as ACCEPTOR after receiving connection-accepted
 async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::ConnectionPointStore>(
     inviter_temporary_did: &str,
@@ -3262,8 +3281,8 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     cp_store: &Arc<CS>,
     listener_manager: &Arc<ConnectionPointListenerManager>,
     current_connection_point: Option<&super::types::GatewayConnectionPoint>,
-    _mediator_did: &str,
-    _mediator_url: &str,
+    handshake_mediator_did: &str,
+    handshake_mediator_url: &str,
 ) -> Result<crate::gateways::types::Gateway, String> {
     info!("🔧 Finalizing OOB connection as ACCEPTOR");
     info!("  Inviter temporary DID: {}", inviter_temporary_did);
@@ -3548,20 +3567,14 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     // IMPORTANT: Use the SAME DID that we sent in the connection-setup message!
     info!("🎧 Creating gateway listener endpoint...");
 
-    // Use the mediator recorded on the pending connection: our own permanent
-    // mediator when one was selected at accept time, otherwise the inviter's
-    // mediator (shared-mediator fallback). This is deliberately NOT the
-    // mediator_did/_mediator_url parameters above, which are the temporary
-    // handshake listener's mediator (always the inviter's).
+    // The pending connection records the permanent connection point's mediator:
+    // the acceptor mediator when one was selected, otherwise the inviter's,
+    // which is also the handshake mediator.
     let connection_mediator_did = pending_conn
         .mediator_did
         .clone();
     info!("   Using mediator from connection: {}", connection_mediator_did);
 
-    // Prefer the mediator's own DID document (its real, possibly-http service
-    // endpoint) over the DID-string-derived guess, which always assumes https
-    // and is wrong for locally-hosted/plaintext mediators.
-    use super::handlers::resolve_mediator_endpoint;
     let connection_mediator_doc = if let Some(mediator_store) = listener_manager
         .mediator_store
         .as_ref()
@@ -3580,8 +3593,12 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     } else {
         None
     };
-    let connection_mediator_url = resolve_mediator_endpoint(&connection_mediator_did, connection_mediator_doc.as_ref())
-        .map_err(|e| format!("Failed to resolve mediator URL: {}", e))?;
+    let connection_mediator_url = permanent_mediator_url(
+        &connection_mediator_did,
+        connection_mediator_doc.as_ref(),
+        handshake_mediator_did,
+        handshake_mediator_url,
+    )?;
 
     // Extract the UUID from our_secure_did (format: did:web:domain:connection-points:{UUID})
     let cp_id = pending_conn
@@ -5102,6 +5119,50 @@ mod tests {
             super::validate_recovered_mediator(None, inviter_mediator, inviter_mediator, "cp-1")
                 .await
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_shared_mediator_without_a_record_keeps_the_invitation_url() {
+        let inviter_mediator = "did:web:127.0.0.1%3A7037";
+
+        assert_eq!(
+            super::permanent_mediator_url(
+                inviter_mediator,
+                None,
+                inviter_mediator,
+                "http://127.0.0.1:7037/mediator/v1"
+            )
+            .unwrap(),
+            "http://127.0.0.1:7037/mediator/v1"
+        );
+    }
+
+    #[test]
+    fn a_stored_mediator_document_wins_over_the_invitation_url() {
+        let inviter_mediator = "did:web:m1.example.com";
+        let doc = serde_json::json!({ "service": [
+            { "type": "DIDCommMessaging", "serviceEndpoint": [{ "uri": "http://m1.internal:7037" }] }
+        ]});
+
+        assert_eq!(
+            super::permanent_mediator_url(inviter_mediator, Some(&doc), inviter_mediator, "https://m1.example.com")
+                .unwrap(),
+            "http://m1.internal:7037"
+        );
+    }
+
+    #[test]
+    fn an_acceptor_mediator_without_a_record_is_derived_from_its_did() {
+        assert_eq!(
+            super::permanent_mediator_url(
+                "did:web:m2.example.com",
+                None,
+                "did:web:m1.example.com",
+                "https://m1.example.com"
+            )
+            .unwrap(),
+            "https://m2.example.com"
         );
     }
 

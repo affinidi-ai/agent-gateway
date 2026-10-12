@@ -50,9 +50,8 @@ pub struct GatewayNode {
     pub mediator_id: String,
     /// Index into `MultiGatewayHarness::mediators` this node registered its
     /// mediator record against. Two nodes sharing an index share the same
-    /// underlying `ScenarioDockerMediator`; differing indices means each
-    /// federates over its own independent mediator (per-gateway mediator
-    /// federation).
+    /// underlying `ScenarioDockerMediator`; differing indices mean each
+    /// gateway is on its own mediator.
     pub mediator_index: usize,
     extra_env: HashMap<String, String>,
     _temp_dir: TempDirGuard,
@@ -149,10 +148,9 @@ pub struct MultiGatewayHarness {
     remote_views: HashMap<(usize, usize), GatewayRecord>,
     /// One entry per distinct mediator alias requested by the scenario
     /// (`gateway N uses mediator "M"`); a scenario that never declares an
-    /// alias gets exactly one entry here, shared by every gateway, matching
-    /// the historical single-mediator topology.
+    /// alias gets exactly one entry here, shared by every gateway.
     mediators: Vec<ScenarioDockerMediator>,
-    /// Cross-mediator relay sidecars (per-gateway mediator federation only;
+    /// Cross-mediator relay sidecars (only when gateways use different mediators;
     /// empty when there is a single shared mediator). Held here purely for
     /// their `Drop` cleanup — see [`bridge_mediator_pairs`].
     _mediator_cross_bridges: Vec<MediatorCrossBridge>,
@@ -189,9 +187,8 @@ impl MultiGatewayHarness {
             let index = if let Some(&index) = alias_to_index.get(&key) {
                 index
             } else {
-                // The first mediator in a scenario keeps the historical fast
-                // path (fixed default port unless `G2G_BDD_PARALLELISM` > 1),
-                // so every existing single-mediator scenario is unaffected.
+                // The first mediator in a scenario takes the fast path (fixed
+                // default port unless `G2G_BDD_PARALLELISM` > 1).
                 // A second (or later) distinct alias always reserves its own
                 // free port so it never collides with an already-running
                 // mediator in this same test process.
@@ -258,6 +255,16 @@ impl MultiGatewayHarness {
     /// one mediator, so this is simply *the* mediator.
     pub fn mediator(&self) -> &ScenarioDockerMediator {
         &self.mediators[0]
+    }
+
+    /// The mediator a gateway registered against.
+    pub fn mediator_of(
+        &self,
+        one_based_index: usize,
+    ) -> &ScenarioDockerMediator {
+        &self.mediators[self
+            .gw(one_based_index)
+            .mediator_index]
     }
 
     /// 1-indexed accessor.
@@ -417,11 +424,9 @@ impl MultiGatewayHarness {
     ) -> Result<()> {
         let inviter = self.gw(inviter_index);
         let acceptor = self.gw(acceptor_index);
-        // When each gateway is configured with its own mediator, the acceptor
-        // must home its permanent identity on its OWN mediator record rather
-        // than falling back to the inviter's, so pass its already-registered
-        // mediator id explicitly. Gateways sharing one mediator keep passing
-        // `None`, preserving today's tested behaviour byte-for-byte.
+        // A gateway on its own mediator accepts with that mediator selected, so
+        // its permanent connection point is homed there. Gateways sharing one
+        // mediator accept without selecting one.
         let acceptor_mediator_id = if acceptor.mediator_index != inviter.mediator_index {
             Some(acceptor.mediator_id.clone())
         } else {

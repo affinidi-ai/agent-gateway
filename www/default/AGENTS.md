@@ -264,6 +264,12 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
   on, the gateway's rule. On, surfaces accept A2A 1.0 and 0.3 and generated agent cards list
   both. Off, they serve 1.0 only, and a 0.3 or version-less call gets an
   unsupported-version error.
+- `mediator_federation` is default off and experimental. On, the Connect via OOB wizard's
+  details step (`gateway-add-via-oob/EnterDetailsStep.tsx`) shows a mediator picker
+  (`wizard-oob-acceptor-mediator`) that lists only mediators with `status === 'active'` and
+  `registered` true, and sends the choice as `acceptor_mediator_id`; the default option
+  sends nothing. When the list is empty it shows `wizard-oob-acceptor-mediator-empty`, and
+  when `/mediators` fails, `wizard-oob-acceptor-mediator-load-error`.
 
 ## Restore from backup
 

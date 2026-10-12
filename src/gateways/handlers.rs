@@ -1456,9 +1456,8 @@ pub struct ConnectViaOOBRequest {
     pub description: String,
     #[serde(default)]
     pub did_method: Option<crate::gateways::connection_points::types::ConnectionPointDidMethod>,
-    /// Mediator (by id) to home the acceptor's permanent connection point on,
-    /// enabling per-gateway mediator federation. Omitted falls back to the
-    /// inviter's mediator (today's shared-mediator behavior).
+    /// Mediator (by id) to home the acceptor's permanent connection point on.
+    /// Omitted, the acceptor uses the inviter's mediator.
     #[serde(default)]
     pub acceptor_mediator_id: Option<String>,
 }
@@ -1479,6 +1478,35 @@ fn check_acceptor_mediator_allowed_by_flag(
     }
     Ok(())
 }
+
+/// Looks up and validates the acceptor mediator, returning its DID and the
+/// endpoint the permanent connection point advertises.
+async fn resolve_acceptor_mediator<M: crate::mediators::MediatorStore>(
+    mediator_store: &M,
+    mediator_id: &str,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<(String, String), (StatusCode, String)> {
+    let mediator = mediator_store
+        .get(mediator_id)
+        .await
+        .map_err(|e| {
+            error!(mediator_id, error = %e, "Failed to look up acceptor mediator");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to look up mediator".to_string())
+        })?;
+    let mediator = check_acceptor_mediator(mediator_id, mediator, context, scope)?;
+    let endpoint = crate::gateways::connection_points::handlers::resolve_mediator_endpoint(
+        &mediator.did,
+        mediator.did_document.as_ref(),
+    )
+    .map_err(|e| {
+        warn!(mediator_id, error = %e, "Acceptor mediator endpoint could not be resolved");
+        (StatusCode::BAD_REQUEST, ACCEPTOR_MEDIATOR_UNAVAILABLE.to_string())
+    })?;
+    Ok((mediator.did, endpoint))
+}
+
+const ACCEPTOR_MEDIATOR_UNAVAILABLE: &str = "Selected mediator is unavailable";
 
 /// Validates the mediator named by `ConnectViaOOBRequest::acceptor_mediator_id`.
 ///
@@ -1508,7 +1536,7 @@ fn check_acceptor_mediator(
             mediator.status,
             mediator.our_did.is_some() && mediator.our_secrets.is_some()
         );
-        return Err((StatusCode::BAD_REQUEST, "Selected mediator is unavailable".to_string()));
+        return Err((StatusCode::BAD_REQUEST, ACCEPTOR_MEDIATOR_UNAVAILABLE.to_string()));
     }
     Ok(mediator)
 }
@@ -1560,6 +1588,15 @@ pub async fn connect_via_oob<
             .is_some(),
         crate::mediators::federation::mediator_federation_enabled(),
     )?;
+    let acceptor_mediator = match req
+        .acceptor_mediator_id
+        .as_deref()
+    {
+        Some(mediator_id) => {
+            Some(resolve_acceptor_mediator(mediator_store.as_ref(), mediator_id, &context, &scope).await?)
+        }
+        None => None,
+    };
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("🔗 Starting OOB connection flow (ACCEPTOR role)");
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -1688,42 +1725,17 @@ pub async fn connect_via_oob<
 
     info!("");
 
-    // Step 4.5: Resolve the ACCEPTOR's own mediator for the permanent connection
-    // point. Optional: when req.acceptor_mediator_id names a registered
-    // mediator, Step 6's secure DID is homed on it instead of the inviter's
-    // mediator, enabling per-gateway mediator federation (GW1 on M1, GW2 on
-    // M2). Omitted, the acceptor falls back to the inviter's mediator (today's
-    // shared-mediator behavior). The one-time handshake (Steps 5, 9-11) always
-    // stays on the inviter's mediator regardless of this selection.
-    info!("🔍 Step 4.5: Resolving acceptor's own mediator for the permanent connection...");
-    let (acceptor_mediator_did, acceptor_mediator_endpoint) = match req
-        .acceptor_mediator_id
-        .as_deref()
-    {
-        Some(mediator_id) => {
-            let mediator = mediator_store
-                .get(mediator_id)
-                .await
-                .map_err(|e| {
-                    error!(mediator_id, error = %e, "Failed to look up acceptor mediator");
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to look up mediator".to_string())
-                })?;
-            let mediator = check_acceptor_mediator(mediator_id, mediator, &context, &scope)?;
-
-            // Prefer the mediator's own DID document (its real, possibly-http
-            // service endpoint) over the DID-string-derived guess, which always
-            // assumes https and is wrong for locally-hosted/plaintext mediators
-            // (see resolve_mediator_endpoint's doc comment).
-            use crate::gateways::connection_points::handlers::resolve_mediator_endpoint;
-            let endpoint = resolve_mediator_endpoint(&mediator.did, mediator.did_document.as_ref()).map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Mediator '{}' has an unsupported DID method: {}", mediator.name, e))
-            })?;
-
-            debug!("  Using acceptor's own mediator: {} ({})", mediator.did, endpoint);
-            (mediator.did, endpoint)
+    // Step 4.5: The permanent connection point is homed on the acceptor
+    // mediator when one was selected, otherwise on the inviter's mediator. The
+    // handshake (Steps 5, 9-11) always uses the inviter's mediator.
+    info!("🔍 Step 4.5: Choosing the mediator for the permanent connection...");
+    let (acceptor_mediator_did, acceptor_mediator_endpoint) = match acceptor_mediator {
+        Some((did, endpoint)) => {
+            debug!("  Using acceptor's own mediator: {} ({})", did, endpoint);
+            (did, endpoint)
         }
         None => {
-            info!("  No acceptor mediator selected - falling back to inviter's mediator (shared mediator mode)");
+            info!("  No acceptor mediator selected - using the inviter's mediator (shared mediator mode)");
             (their_mediator_did.clone(), their_mediator_endpoint.clone())
         }
     };

@@ -11867,7 +11867,7 @@ async fn handle_fabric_request(
         );
 
         async {
-        // Sent through the shared helper so mediator federation applies here too.
+        // Sent through the shared helper so it is routed like every other gateway send.
         gateway_listener.client.pack_and_send_message(
         &forward_request_msg,
         &remote_gateway_did,

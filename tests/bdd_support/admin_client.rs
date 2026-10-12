@@ -528,19 +528,34 @@ impl GatewayAdminClient {
         Ok(())
     }
 
-    /// Set the system feature flags (`POST /v1/settings`). Replaces the whole
-    /// flag map, so pass every flag the scenario needs.
+    /// Set system feature flags (`POST /v1/settings`), keeping the flags already
+    /// set. The settings API replaces the whole map, so the current flags are
+    /// read first; `terms` is left out because the API reports it from the
+    /// network configuration rather than storing it.
     pub async fn set_feature_flags(
         &self,
         flags: &[(&str, bool)],
     ) -> Result<()> {
-        let flags: serde_json::Map<String, Value> = flags
-            .iter()
-            .map(|(name, enabled)| ((*name).to_string(), Value::Bool(*enabled)))
-            .collect();
+        let current = self
+            .client
+            .send_recorded_json::<Value>(Method::GET, "/v1/settings", None)
+            .await?;
+        if !(200..300).contains(&current.status) {
+            bail!("read settings failed with status {}: {}", current.status, current.body);
+        }
+        let mut merged: serde_json::Map<String, Value> = current
+            .body
+            .get("feature_flags")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        merged.remove("terms");
+        for (name, enabled) in flags {
+            merged.insert((*name).to_string(), Value::Bool(*enabled));
+        }
         let response = self
             .client
-            .send_recorded_json(Method::POST, "/v1/settings", Some(&serde_json::json!({ "feature_flags": flags })))
+            .send_recorded_json(Method::POST, "/v1/settings", Some(&serde_json::json!({ "feature_flags": merged })))
             .await?;
         if !(200..300).contains(&response.status) {
             bail!("set feature flags failed with status {}: {}", response.status, response.body);

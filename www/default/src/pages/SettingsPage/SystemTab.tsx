@@ -464,10 +464,10 @@ const SystemTab: React.FC<SystemTabProps> = ({
                   description={
                     <>
                       Lets a connection be homed on this gateway's own mediator instead of the
-                      inviter's: adds the mediator picker to the <code>Connect via OOB</code> wizard
-                      and sends gateway messages through this gateway's own mediator. Requires every
-                      mediator to list its own URL in <code>local_endpoints</code>. Off by default:
-                      cross-mediator relay between two gateways is not yet verified end to end.
+                      inviter's, by adding a mediator picker to the <code>Connect via OOB</code>{' '}
+                      wizard. Experimental: such a connection becomes Active, but requests between
+                      gateways on different mediators are not relayed yet. Turning this off does not
+                      affect existing connections.
                     </>
                   }
                   onChangeMessages={{

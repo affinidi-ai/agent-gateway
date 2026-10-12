@@ -64,10 +64,9 @@ pub struct TopologyBuilder {
     pub transit_point_fabric_links: Vec<TransitPointFabricLink>,
     pub gateway_policies: HashMap<usize, String>,
     /// gw_index -> the own mediator alias declared by `gateway N uses
-    /// mediator "M"`. Gateways with no entry share one default mediator
-    /// (today's single-shared-mediator topology); gateways naming distinct
-    /// aliases each get their own independent `ScenarioDockerMediator`,
-    /// proving mediator-to-mediator federation.
+    /// mediator "M"`. Gateways with no entry share one default mediator;
+    /// gateways naming distinct aliases each get their own independent
+    /// `ScenarioDockerMediator`.
     pub gateway_mediator_alias: HashMap<usize, String>,
     /// Gateways that turn on the `mediator_federation` feature flag after boot,
     /// before any pairing.

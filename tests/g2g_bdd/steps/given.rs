@@ -860,8 +860,10 @@ pub async fn managed_agent_has_obtained_identity_presentation(
     world.response_body = None;
 }
 
-#[given(regex = r#"^gateway (\d+) has a disabled mediator "([^"]+)"$"#)]
-pub async fn gateway_has_a_disabled_mediator(
+/// The mediator is both disabled and unregistered (no gateway identity on it),
+/// which the API refuses with one generic response.
+#[given(regex = r#"^gateway (\d+) has an unavailable mediator "([^"]+)"$"#)]
+pub async fn gateway_has_an_unavailable_mediator(
     world: &mut G2gWorld,
     gateway: usize,
     mediator_name: String,
@@ -874,8 +876,8 @@ pub async fn gateway_has_a_disabled_mediator(
         .clone();
     let mediator = admin
         .create_mediator(
-            &format!("bdd-disabled-mediator-{mediator_name}"),
-            "disabled mediator for negative-path BDD coverage",
+            &format!("bdd-unavailable-mediator-{mediator_name}"),
+            "unavailable mediator for negative-path BDD coverage",
             &ExternalMediatorBlob {
                 did: format!("did:key:z6MkBddDisabledMediator{}", uuid::Uuid::new_v4()),
                 did_document: None,

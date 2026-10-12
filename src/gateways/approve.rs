@@ -184,16 +184,13 @@ pub async fn approve_gateway<
         // We need to send the gateway CP DID in the connection-accepted message
         info!("📝 Creating connection points for gateway communication...");
 
-        // IMPORTANT: Use the SAME mediator as the OOB connection point (already retrieved above)
-        // Both sides of the connection MUST use the same mediator for the handshake to work!
+        // The inviter's permanent connection point uses its OOB connection point's
+        // mediator. The acceptor's may be on another mediator.
         let gw_mediator_did = mediator_did.clone();
         let gw_mediator_id = connection_point
             .mediator_id
             .clone();
 
-        // Prefer the mediator's own DID document (its real, possibly-http service
-        // endpoint) over the DID-string-derived guess, which always assumes https
-        // and is wrong for locally-hosted/plaintext mediators.
         use crate::gateways::connection_points::handlers::resolve_mediator_endpoint;
         let gw_mediator_url = resolve_mediator_endpoint(&gw_mediator_did, mediator.did_document.as_ref())
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resolve mediator URL: {}", e)))?;

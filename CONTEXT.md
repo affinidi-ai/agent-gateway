@@ -177,6 +177,8 @@ Gateway OPA runs before surface-level or transit-level OPA, and a gateway deny i
 | **Remote gateway** | A Gateway record representing a peer Gateway instance in the fabric.                                                                                                  |
 | **Issuer**         | The ownership unit for surfaces. Carries a DID and DID document.                                                                                                      |
 | **Mediator**       | A stored record describing a DIDComm mediator.                                                                                                                        |
+| **Acceptor mediator** | The acceptor's own registered Mediator, chosen when accepting an OOB invitation, on which its permanent Connection Point is homed instead of the inviter's. The `mediator_federation` feature flag enables choosing one. |
+| **Mediator federation** | Relay between independent DIDComm mediators, provided by the mediator layer, that carries traffic between gateways homed on different mediators. Names the mediator layer only: gateways are not "federated", they are in one fabric. |
 | **Certificate**    | A stored TLS certificate typed by purpose, such as server leaf, client leaf, or CA. It may also carry tags or a pre-bound identity DID.                               |
 | **API key**        | A credential used for source auth or managed identity.                                                                                                                |
 | **Deployment operator** | The party that controls deployment-time appliance configuration. In an Affinidi-managed deployment this is Affinidi; in a self-hosted deployment it is the deployer. |

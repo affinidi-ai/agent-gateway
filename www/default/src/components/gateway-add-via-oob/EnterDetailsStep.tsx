@@ -6,7 +6,7 @@ import { useApp } from '../../context/AppContext';
 interface Mediator {
   id: string;
   name: string;
-  our_did?: string;
+  registered?: boolean;
   status: 'active' | 'disabled';
 }
 
@@ -37,6 +37,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
   const [didMethod, setDidMethod] = useState(initialDidMethod);
   const [acceptorMediatorId, setAcceptorMediatorId] = useState(initialAcceptorMediatorId);
   const [mediators, setMediators] = useState<Mediator[]>([]);
+  const [mediatorsLoadFailed, setMediatorsLoadFailed] = useState(false);
   const [error, setError] = useState('');
   const { state } = useApp();
   const mediatorFederationEnabled = state.settings?.feature_flags?.mediator_federation === true;
@@ -45,13 +46,17 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
     if (!mediatorFederationEnabled) return;
     apiClient
       .get('/mediators')
-      .then(response => setMediators(response.data))
-      .catch(() => setMediators([]));
+      .then(response => {
+        setMediators(Array.isArray(response.data) ? response.data : []);
+        setMediatorsLoadFailed(false);
+      })
+      .catch(() => {
+        setMediators([]);
+        setMediatorsLoadFailed(true);
+      });
   }, [mediatorFederationEnabled]);
 
-  // Only a mediator already registered on this gateway (our_did present) can
-  // be selected — the backend rejects an unregistered mediator with a 400.
-  const registeredMediators = mediators.filter(m => m.our_did && m.status === 'active');
+  const registeredMediators = mediators.filter(m => m.registered && m.status === 'active');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -145,6 +150,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
               <select
                 className="form-select"
                 id="acceptorMediatorId"
+                data-testid="wizard-oob-acceptor-mediator"
                 value={acceptorMediatorId}
                 onChange={e => setAcceptorMediatorId(e.target.value)}
               >
@@ -155,10 +161,27 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
                   </option>
                 ))}
               </select>
-              <small className="form-text text-muted">
-                By default the permanent connection is homed on the inviter's mediator. Select one
-                of your own registered mediators to keep this gateway's traffic on its own mediator
-                instead (cross-mediator federation).
+              {mediatorsLoadFailed ? (
+                <small
+                  className="form-text text-danger d-block"
+                  data-testid="wizard-oob-acceptor-mediator-load-error"
+                >
+                  Your mediators could not be loaded, so only the inviter's mediator is offered.
+                </small>
+              ) : (
+                registeredMediators.length === 0 && (
+                  <small
+                    className="form-text text-muted d-block"
+                    data-testid="wizard-oob-acceptor-mediator-empty"
+                  >
+                    You have no active, registered mediator to select.
+                  </small>
+                )
+              )}
+              <small className="form-text text-muted d-block">
+                By default the permanent connection is homed on the inviter's mediator. Selecting
+                one of your own active, registered mediators homes it there instead. Experimental:
+                requests between gateways on different mediators are not relayed yet.
               </small>
             </div>
           )}

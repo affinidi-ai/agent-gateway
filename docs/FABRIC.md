@@ -125,19 +125,19 @@ recorded the message id are refused and must be created again.
 
 The handshake always runs on the inviter's mediator. The acceptor's permanent connection point uses
 the inviter's mediator too, unless `connect-via-oob` names one of the acceptor's own mediators in
-`acceptor_mediator_id`. The field is refused with `400` unless the `mediator_federation` feature
-flag is on (it is off by default). That mediator must be within the caller's tenant and token scope, Active,
-and registered (`our_did` / `our_secrets`), otherwise the request fails with `400`. If the pending
-connection is lost before `connection-accepted` arrives, the acceptor recovers its mediator from the
-temporary connection point. If that is the temporary connection point's own (the inviter's) mediator,
-recovery proceeds; otherwise it refuses to finish unless the mediator is a known, Active record. See
-[per-gateway mediator federation](PER_GATEWAY_MEDIATOR_FEDERATION.md).
+`acceptor_mediator_id`. The field is refused with `400` unless the experimental `mediator_federation`
+feature flag is on (it is off by default). That mediator must be within the caller's tenant and token
+scope, Active, and registered (`our_did` / `our_secrets`), otherwise the request fails with `400`
+before any outbound call. If the pending connection is lost before `connection-accepted` arrives, the
+acceptor recovers its mediator from the temporary connection point. If that is the temporary
+connection point's own (the inviter's) mediator, recovery proceeds; otherwise it refuses to finish
+unless the mediator is a known, Active record. See [per-gateway mediators](PER_GATEWAY_MEDIATOR_FEDERATION.md).
 
-With `mediator_federation` on, `pack_and_send_message` wraps each send in a `routing/2.0/forward`
-addressed to the sender's own mediator when the sending profile has one. The mediator then delivers
-locally or relays to the recipient's mediator, so each mediator must list its own public URL in
-`server.local_endpoints`. With the flag off, sends go directly to the recipient. Fabric stream
-frames and the x402 facilitator always send directly.
+`pack_and_send_message` chooses each send's route from the recipient's DID: when its
+`DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
+in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
+directly. The route does not depend on the feature flag. Fabric stream frames and the x402
+facilitator always send directly.
 
 ## Peer issuer DIDs
 

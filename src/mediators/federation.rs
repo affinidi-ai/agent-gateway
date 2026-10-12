@@ -1,10 +1,10 @@
 //! The `mediator_federation` dashboard feature flag.
 //!
-//! Off by default. While off, gateways send directly through their mediator
-//! and `connect-via-oob` refuses `acceptor_mediator_id`. While on, sends are
-//! wrapped in a `routing/2.0/forward` to the sender's own mediator and the
-//! acceptor may home its permanent connection point on its own mediator.
-//! Read per request from settings, like `ap2_experimental`.
+//! Off by default. While off, `connect-via-oob` refuses `acceptor_mediator_id`.
+//! While on, the acceptor may home its permanent connection point on its own
+//! mediator. The flag does not change how messages are sent: a send is
+//! forwarded through the sender's own mediator whenever the recipient is on
+//! another one. Read per request from settings, like `ap2_experimental`.
 
 use std::collections::HashMap;
 
