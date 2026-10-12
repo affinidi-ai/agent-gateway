@@ -122,7 +122,7 @@ pub fn create_identity_api_router(
     listener_manager: Option<std::sync::Arc<crate::gateways::ConnectionPointListenerManager>>,
     message_store: Option<std::sync::Arc<crate::gateways::MessageStore>>,
     pending_connection_store: std::sync::Arc<crate::gateways::PendingConnectionStore>,
-    integration_storage: Option<std::sync::Arc<crate::storage::IntegrationStorage>>,
+    integration_storage: std::sync::Arc<crate::storage::IntegrationStorage>,
     jwt_verification_strategy_store: Option<std::sync::Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     jwks_client: Option<std::sync::Arc<crate::jwt_bearer::JwksClient>>,
     issuer_store: Option<std::sync::Arc<crate::issuers::FileSystemIssuerStore>>,
@@ -928,7 +928,7 @@ pub fn create_identity_api_router(
         Router::new()
     };
 
-    let integration_storage_for_gateways = integration_storage.clone();
+    let integration_storage_for_gateways = Some(integration_storage.clone());
 
     // Create gateway routes if store is provided
     let gateway_router = if let Some(ref store) = gateway_store {
@@ -1269,7 +1269,7 @@ pub fn create_identity_api_router(
     // These clones will be used for the mediator router layers
     let connection_point_store_for_mediator = connection_point_store.clone();
     let listener_manager_for_mediator = listener_manager.clone();
-    let integration_storage_for_connection_points = integration_storage.clone();
+    let integration_storage_for_connection_points = Some(integration_storage.clone());
     let surface_store_for_connection_points = state
         .agent_surface_store
         .clone();
@@ -1828,82 +1828,16 @@ pub fn create_identity_api_router(
         Router::new()
     };
 
-    // Create integration routes if storage is provided
-    let integration_router = match integration_storage {
-        Some(storage) => crate::storage::integration_handlers::integration_router(
-            storage,
-            passkey_storage_for_manager
-                .as_ref()
-                .map(|auth_storage| {
-                    crate::auth_manager::middleware::RbacGuard::new(auth_storage.clone(), rbac_config.clone())
-                }),
-            state.config.clone(),
-            state.bootstrap_config.clone(),
-        ),
-        None => Router::new(),
-    };
-
-    // Create user integrations routes
-    let user_integrations_router = {
-        use crate::auth_manager::middleware::require_feature;
-        use crate::rbac::Feature;
-        let storage_opt = passkey_storage_for_manager.clone();
-        let rbac = rbac_config.clone();
-        let gate = |route: axum::routing::MethodRouter, feature: Feature| -> axum::routing::MethodRouter {
-            if let Some(auth_storage) = storage_opt.as_ref() {
-                route.layer(require_feature(auth_storage.clone(), rbac.clone(), feature))
-            } else {
-                route
-            }
-        };
-        Router::new()
-            .route(
-                "/v1/users/integrations",
-                gate(
-                    get(crate::integrations::user_integrations_handlers::get_user_integrations),
-                    Feature::IntegrationsView,
-                ),
-            )
-            .route(
-                "/v1/users/integrations",
-                gate(
-                    put(crate::integrations::user_integrations_handlers::update_user_integrations),
-                    Feature::IntegrationsEdit,
-                ),
-            )
-            .layer(Extension(state.bootstrap_config.clone()))
-    };
-
-    // Create identity integrations routes
-    let identity_integrations_router = {
-        use crate::auth_manager::middleware::require_feature;
-        use crate::rbac::Feature;
-        let storage_opt = passkey_storage_for_manager.clone();
-        let rbac = rbac_config.clone();
-        let gate = |mr: axum::routing::MethodRouter, feat: Feature| -> axum::routing::MethodRouter {
-            if let Some(s) = storage_opt.as_ref() {
-                mr.layer(require_feature(s.clone(), rbac.clone(), feat))
-            } else {
-                mr.layer(axum::middleware::from_fn(crate::auth_manager::middleware::deny_unguarded_request))
-            }
-        };
-        Router::new()
-            .route(
-                "/v1/identities/integrations",
-                gate(
-                    get(crate::integrations::identity_integrations_handlers::get_identity_integrations),
-                    Feature::IntegrationsView,
-                ),
-            )
-            .route(
-                "/v1/identities/integrations",
-                gate(
-                    put(crate::integrations::identity_integrations_handlers::update_identity_integrations),
-                    Feature::IntegrationsEdit,
-                ),
-            )
-            .layer(Extension(state.bootstrap_config.clone()))
-    };
+    let integration_router = crate::storage::integration_handlers::integration_router(
+        integration_storage,
+        passkey_storage_for_manager
+            .as_ref()
+            .map(|auth_storage| {
+                crate::auth_manager::middleware::RbacGuard::new(auth_storage.clone(), rbac_config.clone())
+            }),
+        state.config.clone(),
+        state.bootstrap_config.clone(),
+    );
 
     // Create trust registry routes if store is provided
     let trust_registry_router = if let Some(store) = trust_registry_store {
@@ -2223,8 +2157,6 @@ pub fn create_identity_api_router(
         .merge(mcp_proxy_router)
         .merge(a2a_proxy_router)
         .merge(integration_router)
-        .merge(user_integrations_router)
-        .merge(identity_integrations_router)
         .merge(trust_registry_router)
         .merge(notification_router)
         .merge(auth_manager_router)

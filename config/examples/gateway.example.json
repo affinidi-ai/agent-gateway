@@ -17,12 +17,12 @@
     "global_runtime_variables": [
       {
         "name": "OLD_STATE",
-        "description": "JSON representation of the entity's state before the event. Empty for CREATE events. Contains complete entity object (Gateway, User, etc.) for UPDATE and DELETE events.",
+        "description": "JSON representation of the entity's state before the event. Empty for CREATE events. Contains the entity object (Gateway, User, etc.) for UPDATE and DELETE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.",
         "example": "{\"id\":\"gateway-123\",\"name\":\"My Gateway\",\"status\":\"Enabled\",...}"
       },
       {
         "name": "NEW_STATE",
-        "description": "JSON representation of the entity's state after the event. Empty for DELETE events. Contains complete entity object (Gateway, User, etc.) for CREATE and UPDATE events.",
+        "description": "JSON representation of the entity's state after the event. Empty for DELETE events. Contains the entity object (Gateway, User, etc.) for CREATE and UPDATE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.",
         "example": "{\"id\":\"gateway-123\",\"name\":\"Updated Gateway\",\"status\":\"Disabled\",...}"
       },
       {
@@ -374,7 +374,7 @@
               "runtime_variables": [
                 {
                   "name": "NEW_STATE",
-                  "description": "Complete user object as JSON (user_id, username, email, role, status, is_primary, first_name, last_name, department, job_title, avatar_path, created_at, updated_at, last_logged_in)"
+                  "description": "The user as JSON (user_id, role, status, is_primary, created_at, updated_at)"
                 },
                 {
                   "name": "OLD_STATE",
@@ -397,7 +397,7 @@
               "runtime_variables": [
                 {
                   "name": "NEW_STATE",
-                  "description": "Complete user object as JSON after approval (user_id, username, email, role, status, is_primary, first_name, last_name, department, job_title, avatar_path, created_at, updated_at, last_logged_in)"
+                  "description": "The user as JSON after approval (user_id, role, status, is_primary, created_at, updated_at)"
                 },
                 {
                   "name": "OLD_STATE",
@@ -420,11 +420,11 @@
               "runtime_variables": [
                 {
                   "name": "OLD_STATE",
-                  "description": "Complete user object as JSON before the update (user_id, username, email, role, status, is_primary, first_name, last_name, department, job_title, avatar_path, created_at, updated_at, last_logged_in)"
+                  "description": "The user as JSON before the update (user_id, role, status, is_primary, created_at, updated_at)"
                 },
                 {
                   "name": "NEW_STATE",
-                  "description": "Complete user object as JSON after the update (user_id, username, email, role, status, is_primary, first_name, last_name, department, job_title, avatar_path, created_at, updated_at, last_logged_in)"
+                  "description": "The user as JSON after the update (user_id, role, status, is_primary, created_at, updated_at)"
                 },
                 {
                   "name": "EVENT_TYPE",
@@ -443,7 +443,7 @@
               "runtime_variables": [
                 {
                   "name": "OLD_STATE",
-                  "description": "Complete user object as JSON before deletion (user_id, username, email, role, status, is_primary, first_name, last_name, department, job_title, avatar_path, created_at, updated_at, last_logged_in)"
+                  "description": "The user as JSON before deletion (user_id, role, status, is_primary, created_at, updated_at)"
                 },
                 {
                   "name": "NEW_STATE",
@@ -466,7 +466,7 @@
               "runtime_variables": [
                 {
                   "name": "NEW_STATE",
-                  "description": "Complete user object as JSON (user_id, username, email, role, status, is_primary, first_name, last_name, department, job_title, avatar_path, created_at, updated_at, last_logged_in)"
+                  "description": "The user as JSON (user_id, role, status, is_primary, created_at, updated_at)"
                 },
                 {
                   "name": "OLD_STATE",
@@ -489,7 +489,7 @@
               "runtime_variables": [
                 {
                   "name": "NEW_STATE",
-                  "description": "Complete user object as JSON being accessed"
+                  "description": "The user as JSON being accessed (user_id, role, status, is_primary, created_at, updated_at)"
                 },
                 {
                   "name": "OLD_STATE",

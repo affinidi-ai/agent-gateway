@@ -311,7 +311,9 @@ The Audit Log header shows `audit-forward-button` beside Refresh for users with
   runtime-variable catalogue (`GET /integrations/runtime-variables`: the general
   variables plus the category's own), so a sample only uses variables that category can
   substitute. `audit` keeps its curated full-record JSON payload, and Email and Slack
-  leave out `AUDIT_RECORD` and `AUDIT_VP_JWT`.
+  leave out `AUDIT_RECORD` and `AUDIT_VP_JWT`. `user` has a curated minimal JSON payload
+  (`appliance_id`, `event_type`, `timestamp`, and the user's id, role and status) so names,
+  emails and the state blocks leave the appliance only when an operator adds them.
 - Every sample leads with `appliance_id: ${APPLIANCE_ID}`. The backend fills it on every
   delivery from the **Appliance ID** in Settings › System Settings (`appliance_id`,
   `settings-appliance-id-input`, e.g. the appliance's Agent Watch id), never from event or
@@ -324,6 +326,31 @@ The Audit Log header shows `audit-forward-button` beside Refresh for users with
   is replaced with the new sample, and edited content is kept.
 - The Edit page starts only after the integration has loaded, so stored content is never
   replaced on open.
+
+## Attaching integrations to events
+
+`components/connection-points/IntegrationsStep.tsx` attaches integrations to a resource's
+events on the gateway, connection point, user, and identity pages.
+
+- Choosing an integration in the selector (`data-testid="integrations-step-select"`)
+  attaches it at once with its template's custom (`_`-prefixed) variables set empty, opens
+  its card, and drops it from the selector. Event checkboxes carry
+  `data-testid="integration-<index>-event-<event type>"`.
+- Missing custom variables are judged against the integration's template, not only the
+  stored values.
+- `requireEventTypes` (user and identity pages) blocks saving until every attached
+  integration names an event, matching the API, which refuses a new mapping without one.
+- One attachability rule drives both the selector and the stored list: an integration of the
+  page's category or `general` can be attached, an uncategorised one only on resource pages,
+  and with `applianceWide` (user and identity pages, mirroring the API) never an uncategorised
+  or tenant-owned one. A stored mapping whose integration is missing or not attachable renders
+  as a `NOT AVAILABLE` row (`data-testid="integration-<index>-unavailable"`) with its id and a
+  Remove button, and blocks saving until removed. Stored mappings are never dropped without
+  the operator removing them.
+- The user and identity pages show a failed load as an error with no editor, so an empty
+  list can never be saved over the stored mappings, and a failed save as an error, never as
+  success. Save buttons are `user-integrations-save-button` and
+  `identity-integrations-save-button`.
 
 ## Validation
 

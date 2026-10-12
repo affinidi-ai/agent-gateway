@@ -213,6 +213,8 @@ const UserIntegrationsTab: React.FC<UserIntegrationsTabProps> = ({
         onValidationChange={onValidationChange}
         category="user"
         availableEventTypes={availableEventTypes}
+        requireEventTypes
+        applianceWide
       />
     </div>
   );

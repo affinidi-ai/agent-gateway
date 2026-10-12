@@ -1,16 +1,42 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::OnceLock;
 
-/// Global storage for variable patterns from config
-static VARIABLE_PATTERN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(r"\$\{([^:}]+)(?::[^}]+)?\}".to_string()));
+const DEFAULT_VARIABLE_PATTERN: &str = r"\$\{([^:}]+)(?::[^}]+)?\}";
+const DEFAULT_CUSTOM_PREFIX: &str = "_";
 
-static CUSTOM_VARIABLE_PREFIX: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("_".to_string()));
+/// The template-variable syntax, fixed at startup from `integration.*` config.
+pub(crate) struct VariablePatterns {
+    pub regex: Regex,
+    pub custom_prefix: String,
+}
 
-/// Cached compiled regex for variable substitution
-static VAR_REGEX: Lazy<RwLock<Regex>> = Lazy::new(|| RwLock::new(Regex::new(r"\$\{([^:}]+)(?::[^}]+)?\}").unwrap()));
+impl VariablePatterns {
+    fn new(
+        pattern: &str,
+        custom_prefix: String,
+    ) -> Result<Self, regex::Error> {
+        Ok(Self {
+            regex: Regex::new(pattern)?,
+            custom_prefix,
+        })
+    }
+
+    fn defaults() -> Self {
+        Self::new(DEFAULT_VARIABLE_PATTERN, DEFAULT_CUSTOM_PREFIX.to_string())
+            .expect("default variable pattern compiles")
+    }
+}
+
+static PATTERNS: OnceLock<VariablePatterns> = OnceLock::new();
+
+/// The configured patterns, or the defaults if startup never set them.
+pub(crate) fn patterns() -> &'static VariablePatterns {
+    PATTERNS.get_or_init(VariablePatterns::defaults)
+}
 
 /// Variable filled only from the Appliance ID set in System Settings.
 pub const APPLIANCE_ID_VARIABLE: &str = "APPLIANCE_ID";
@@ -24,42 +50,43 @@ fn configured_appliance_id() -> Option<String> {
 /// from the appliance's settings, never from event or caller values, so no
 /// trigger can make an event look like it came from another appliance; while
 /// no Appliance ID is set it stays unfilled.
-pub fn variable_value(
+pub fn variable_value<'a>(
     name: &str,
-    values: &HashMap<String, String>,
-) -> Option<String> {
+    values: &'a HashMap<String, String>,
+) -> Option<Cow<'a, str>> {
     variable_value_with(name, values, configured_appliance_id)
 }
 
-fn variable_value_with(
+fn variable_value_with<'a>(
     name: &str,
-    values: &HashMap<String, String>,
+    values: &'a HashMap<String, String>,
     appliance_id: impl FnOnce() -> Option<String>,
-) -> Option<String> {
+) -> Option<Cow<'a, str>> {
     if name == APPLIANCE_ID_VARIABLE {
-        appliance_id()
+        appliance_id().map(Cow::Owned)
     } else {
-        values.get(name).cloned()
+        values
+            .get(name)
+            .map(|value| Cow::Borrowed(value.as_str()))
     }
 }
 
-/// Update the variable patterns from config (called during startup)
+/// Fixes the template-variable syntax from config. Must run once, before any template is
+/// substituted or validated; a second call, or a call after a read, is a startup bug.
 pub fn set_variable_patterns(
     variable_pattern: String,
     custom_prefix: String,
-) {
-    if let Ok(mut p) = VARIABLE_PATTERN.write() {
-        *p = variable_pattern.clone();
-    }
-    if let Ok(mut p) = CUSTOM_VARIABLE_PREFIX.write() {
-        *p = custom_prefix;
-    }
-    // Update the cached regex when pattern changes
-    if let Ok(new_regex) = Regex::new(&variable_pattern)
-        && let Ok(mut regex) = VAR_REGEX.write()
-    {
-        *regex = new_regex;
-    }
+) -> anyhow::Result<()> {
+    let patterns = VariablePatterns::new(&variable_pattern, custom_prefix)
+        .map_err(|e| anyhow::anyhow!("integration.variable_pattern is not a valid regex: {e}"))?;
+    PATTERNS
+        .set(patterns)
+        .map_err(|_| anyhow::anyhow!("variable patterns were read or set before startup configured them"))
+}
+
+/// The prefix that marks a template variable as custom (operator-supplied) rather than runtime.
+pub fn custom_variable_prefix() -> &'static str {
+    &patterns().custom_prefix
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,14 +162,14 @@ fn get_general_variables() -> RuntimeVariableCategory {
             RuntimeVariable {
                 name: "OLD_STATE".to_string(),
                 label: "Old State".to_string(),
-                description: "JSON representation of the entity's state before the event. Empty for CREATE events. Contains complete entity object (Gateway, User, etc.) for UPDATE and DELETE events.".to_string(),
+                description: "JSON representation of the entity's state before the event. Empty for CREATE events. Contains the entity object (Gateway, User, etc.) for UPDATE and DELETE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.".to_string(),
                 example: r#"${OLD_STATE}"#.to_string(),
                 category: "general".to_string(),
             },
             RuntimeVariable {
                 name: "NEW_STATE".to_string(),
                 label: "New State".to_string(),
-                description: "JSON representation of the entity's state after the event. Empty for DELETE events. Contains complete entity object (Gateway, User, etc.) for CREATE and UPDATE events.".to_string(),
+                description: "JSON representation of the entity's state after the event. Empty for DELETE events. Contains the entity object (Gateway, User, etc.) for CREATE and UPDATE events; a user carries only user_id, role, status, is_primary, created_at and updated_at.".to_string(),
                 example: r#"${NEW_STATE}"#.to_string(),
                 category: "general".to_string(),
             },
@@ -789,22 +816,17 @@ pub fn validate_template_variables(
     category: &str,
 ) -> Vec<String> {
     let allowed_variables = get_variable_names_for_category(category);
-
-    // Get patterns from global config
-    let var_pattern = VARIABLE_PATTERN
-        .read()
-        .unwrap()
-        .clone();
-    let custom_prefix = CUSTOM_VARIABLE_PREFIX
-        .read()
-        .unwrap()
-        .clone();
-
-    let re = regex::Regex::new(&var_pattern).unwrap();
+    let patterns = patterns();
+    let custom_prefix = patterns
+        .custom_prefix
+        .as_str();
 
     let mut invalid_vars = Vec::new();
 
-    for cap in re.captures_iter(template) {
+    for cap in patterns
+        .regex
+        .captures_iter(template)
+    {
         let var_name = cap
             .get(1)
             .unwrap()
@@ -812,7 +834,7 @@ pub fn validate_template_variables(
             .trim();
 
         // Custom variables (start with custom prefix) are always valid
-        if var_name.starts_with(&custom_prefix) {
+        if var_name.starts_with(custom_prefix) {
             continue;
         }
 
@@ -840,44 +862,22 @@ pub fn substitute_variables(
     category: Option<&str>,
     values: &HashMap<String, String>,
 ) -> String {
-    let mut result = template.to_string();
-
-    // Get variable names for the category if specified
     let allowed_variables: Option<Vec<String>> = category.map(get_variable_names_for_category);
+    let patterns = patterns();
 
-    // Get custom prefix from global config
-    let custom_prefix = CUSTOM_VARIABLE_PREFIX
-        .read()
-        .unwrap()
-        .clone();
-
-    // Use cached regex
-    let re = VAR_REGEX.read().unwrap();
-
-    // Collect all matches first to avoid issues with multiple replacements
-    let mut replacements = Vec::new();
-    for cap in re.captures_iter(template) {
-        // Variable name is in capture group 1
-        let var_name = cap
-            .get(1)
-            .unwrap()
-            .as_str()
-            .trim();
-        let placeholder = &cap[0];
-
-        if is_variable_allowed(var_name, allowed_variables.as_deref(), &custom_prefix)
-            && let Some(value) = variable_value(var_name, values)
-        {
-            replacements.push((placeholder.to_string(), value));
-        }
-    }
-
-    // Apply all replacements
-    for (placeholder, value) in replacements {
-        result = result.replace(&placeholder, &value);
-    }
-
-    result
+    // One pass over the template: a substituted value is never scanned for placeholders again.
+    patterns
+        .regex
+        .replace_all(template, |cap: &regex::Captures| {
+            let var_name = cap[1].trim();
+            match variable_value(var_name, values) {
+                Some(value) if is_variable_allowed(var_name, allowed_variables.as_deref(), &patterns.custom_prefix) => {
+                    value
+                }
+                _ => Cow::Owned(cap[0].to_string()),
+            }
+        })
+        .into_owned()
 }
 
 /// Custom variables are always allowed; runtime variables must belong to the
@@ -902,29 +902,22 @@ fn embedded_json_value(
     category: Option<&str>,
     values: &HashMap<String, String>,
 ) -> Option<serde_json::Value> {
-    let var_name = {
-        let re = VAR_REGEX.read().ok()?;
-        let cap = re.captures(template)?;
-        if cap.get(0)?.as_str() != template {
-            return None;
-        }
-        cap.get(1)?
-            .as_str()
-            .trim()
-            .to_string()
-    };
-    if !JSON_VALUED_VARIABLES.contains(&var_name.as_str()) {
+    let patterns = patterns();
+    let cap = patterns
+        .regex
+        .captures(template)?;
+    if cap.get(0)?.as_str() != template {
+        return None;
+    }
+    let var_name = cap.get(1)?.as_str().trim();
+    if !JSON_VALUED_VARIABLES.contains(&var_name) {
         return None;
     }
     let allowed_variables = category.map(get_variable_names_for_category);
-    let custom_prefix = CUSTOM_VARIABLE_PREFIX
-        .read()
-        .ok()?
-        .clone();
-    if !is_variable_allowed(&var_name, allowed_variables.as_deref(), &custom_prefix) {
+    if !is_variable_allowed(var_name, allowed_variables.as_deref(), &patterns.custom_prefix) {
         return None;
     }
-    serde_json::from_str(values.get(&var_name)?).ok()
+    serde_json::from_str(values.get(var_name)?).ok()
 }
 
 /// Substitute variables in a JSON value structure (recursive, JSON-safe)
@@ -1018,13 +1011,13 @@ mod tests {
         values.insert("EVENT_TYPE".to_string(), "user.created".to_string());
 
         assert_eq!(
-            variable_value_with(APPLIANCE_ID_VARIABLE, &values, || Some("aw-appliance-42".to_string())),
-            Some("aw-appliance-42".to_string())
+            variable_value_with(APPLIANCE_ID_VARIABLE, &values, || Some("aw-appliance-42".to_string())).as_deref(),
+            Some("aw-appliance-42")
         );
         assert_eq!(variable_value_with(APPLIANCE_ID_VARIABLE, &values, || None), None);
         assert_eq!(
-            variable_value_with("EVENT_TYPE", &values, || Some("aw-appliance-42".to_string())),
-            Some("user.created".to_string())
+            variable_value_with("EVENT_TYPE", &values, || Some("aw-appliance-42".to_string())).as_deref(),
+            Some("user.created")
         );
     }
 
@@ -1040,6 +1033,35 @@ mod tests {
         let json =
             substitute_variables_in_json(&serde_json::json!({ "appliance_id": "${APPLIANCE_ID}" }), None, &values);
         assert_eq!(json, serde_json::json!({ "appliance_id": "${APPLIANCE_ID}" }));
+    }
+
+    // `set_variable_patterns` fixes process-wide state, so these tests only call it in ways that
+    // fail before anything is stored: an invalid pattern, or the default pattern after a read.
+    #[test]
+    fn set_variable_patterns_rejects_an_invalid_regex() {
+        let error = set_variable_patterns("([".to_string(), "_".to_string()).expect_err("invalid pattern");
+
+        assert!(
+            error
+                .to_string()
+                .contains("integration.variable_pattern"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn set_variable_patterns_fails_after_patterns_were_read() {
+        assert_eq!(custom_variable_prefix(), "_");
+
+        let error = set_variable_patterns(r"\$\{([^:}]+)(?::[^}]+)?\}".to_string(), "_".to_string())
+            .expect_err("patterns were already read");
+
+        assert!(
+            error
+                .to_string()
+                .contains("before startup configured them"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1196,5 +1218,26 @@ mod tests {
         let template = serde_json::json!({"record": "${AUDIT_RECORD}"});
         let result = substitute_variables_in_json(&template, Some("audit"), &values);
         assert_eq!(result["record"], "not json");
+    }
+
+    #[test]
+    fn test_a_substituted_value_is_never_expanded_again() {
+        let values = HashMap::from([
+            ("USERNAME".to_string(), "${_TOKEN}".to_string()),
+            ("_TOKEN".to_string(), "operator-secret".to_string()),
+        ]);
+
+        let result = substitute_variables("user=${USERNAME} token=${_TOKEN}", Some("user"), &values);
+
+        assert_eq!(result, "user=${_TOKEN} token=operator-secret");
+    }
+
+    #[test]
+    fn test_a_repeated_placeholder_is_filled_everywhere() {
+        let values = HashMap::from([("USER_ID".to_string(), "u-1".to_string())]);
+
+        let result = substitute_variables("${USER_ID}/${USER_ID}", Some("user"), &values);
+
+        assert_eq!(result, "u-1/u-1");
     }
 }

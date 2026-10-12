@@ -215,6 +215,8 @@ const IdentityIntegrationsTab: React.FC<IdentityIntegrationsTabProps> = ({
         onValidationChange={onValidationChange}
         category="identity"
         availableEventTypes={availableEventTypes}
+        requireEventTypes
+        applianceWide
       />
     </div>
   );

@@ -43,6 +43,8 @@ const CATALOGUE: RuntimeVariablesResponse = {
       ['USER_ID', 'User ID'],
       ['USERNAME', 'Username'],
       ['USER_EMAIL', 'User Email'],
+      ['USER_ROLE', 'User Role'],
+      ['USER_STATUS', 'User Status'],
       ['EVENT_TYPE', 'Event Type'],
     ]),
     category('audit', 'Governance Audit', [
@@ -115,13 +117,21 @@ describe('buildIntegrationSamples', () => {
   });
 
   it('lists general variables once even when a category repeats them', () => {
-    const { webhook, email } = buildIntegrationSamples(CATALOGUE, 'user');
-    expect(webhook.user).toEqual({
-      user_id: '${USER_ID}',
-      username: '${USERNAME}',
-      user_email: '${USER_EMAIL}',
-    });
+    const { email } = buildIntegrationSamples(CATALOGUE, 'user');
     expect(email.body.match(/\$\{EVENT_TYPE\}/g)).toHaveLength(1);
+  });
+
+  it('sends user events with only the fields that correlate them', () => {
+    const { webhook, stream } = buildIntegrationSamples(CATALOGUE, 'user');
+    const minimal = {
+      appliance_id: '${APPLIANCE_ID}',
+      event_type: '${EVENT_TYPE}',
+      timestamp: '${TIMESTAMP}',
+      user: { user_id: '${USER_ID}', user_role: '${USER_ROLE}', user_status: '${USER_STATUS}' },
+    };
+
+    expect(webhook).toEqual(minimal);
+    expect(stream).toEqual(minimal);
   });
 
   it('writes readable Email and Slack messages with labelled fields', () => {

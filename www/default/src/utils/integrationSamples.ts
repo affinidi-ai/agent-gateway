@@ -1,8 +1,8 @@
 /**
  * Starting content for each integration type, built from the runtime variables
  * the backend offers for a category, so a sample never references a variable
- * the category cannot substitute. The Governance Audit Stream/Webhook payload
- * is the curated full-record template.
+ * the category cannot substitute. Some Stream/Webhook payloads are curated instead:
+ * the Governance Audit full-record template and the minimal user template.
  */
 import { RuntimeVariable, RuntimeVariablesResponse } from './runtimeVariables';
 import { AUDIT_INTEGRATION_CATEGORY, auditPayloadTemplate } from './auditIntegrations';
@@ -39,6 +39,28 @@ const SUMMARY_KEYS: Record<string, string> = {
 const MESSAGE_EXCLUDED_VARIABLES = ['AUDIT_RECORD', 'AUDIT_VP_JWT'];
 
 const placeholder = (name: string): string => `\${${name}}`;
+
+/**
+ * User events carry only what correlates them: the appliance, the event, its time, and the
+ * user's id, role and status. Names, emails and the state blocks stay on the appliance unless
+ * an operator adds them.
+ */
+const userPayloadTemplate = (): Record<string, unknown> => ({
+  appliance_id: placeholder('APPLIANCE_ID'),
+  event_type: placeholder('EVENT_TYPE'),
+  timestamp: placeholder('TIMESTAMP'),
+  user: {
+    user_id: placeholder('USER_ID'),
+    user_role: placeholder('USER_ROLE'),
+    user_status: placeholder('USER_STATUS'),
+  },
+});
+
+/** Stream/Webhook payloads curated per category instead of built from its variables. */
+const CURATED_PAYLOADS: Record<string, () => Record<string, unknown>> = {
+  [AUDIT_INTEGRATION_CATEGORY]: auditPayloadTemplate,
+  user: userPayloadTemplate,
+};
 
 function categoryVariables(
   catalogue: RuntimeVariablesResponse,
@@ -77,7 +99,7 @@ export function buildIntegrationSamples(
       specific.map(v => [v.name.toLowerCase(), placeholder(v.name)])
     );
   }
-  const json = category === AUDIT_INTEGRATION_CATEGORY ? auditPayloadTemplate() : payload;
+  const json = CURATED_PAYLOADS[category]?.() ?? payload;
 
   const title = has('EVENT_TYPE') ? placeholder('EVENT_TYPE') : own.label || 'Notification';
   const subject = has('SERVER_NAME') ? `${title} on ${placeholder('SERVER_NAME')}` : title;
