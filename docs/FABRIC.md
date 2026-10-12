@@ -69,7 +69,14 @@ framed-stream cap, the Open replay table or the peer's or its tenant's share of 
 peer is past its Open rate, or `unavailable`. A sender treats a `capacity_reached` it receives as a
 full cap and answers its caller `429` with `Retry-After`, and treats any code it does not recognise
 as `unavailable`; a 1.0.0 sender cannot parse `capacity_reached` and waits for its response deadline
-instead. An Open's
+instead.
+
+While a pair runs mixed versions, this matters only when the upgraded receiver is out of room: a
+1.0.0 sender's callers then wait for their response deadline, holding the sender's own stream slots
+meanwhile, instead of getting a fast `502`. Normal traffic is unaffected. Upgrade both gateways of a
+pair together. Where that is not possible, upgrade the gateway that sends the requests first: an
+upgraded sender understands both `capacity_reached` and the `unavailable` a 1.0.0 receiver answers
+with. An Open's
 envelope must carry a valid `expires_time`, as a `forward-request`'s must. See the Framed Fabric Transport section of
 [`MCP_METADATA.md`](MCP_METADATA.md#framed-fabric-transport).
 
@@ -203,6 +210,13 @@ or fails over. It recreates an account only when that account sends, and refuses
 missing account with `e.p.delivery.refused`. Without the periodic check, a gateway that only
 receives would stay unreachable.
 
+Four Connection Points are checked at a time, so one slow mediator does not hold up the others.
+Each probe waits up to 5 seconds, a restart up to 20 seconds, and re-opening a receive list up to
+10 seconds; a repair that fails is tried again at the next check and logged at `warn`. An account
+that cannot be read changes nothing. When that happens on consecutive checks it is logged at
+`warn` on the second, then at doubling intervals, so a check that cannot reach its mediator is
+visible. A Connection Point stopped or removed while it is being checked is not started again.
+
 When the appliance is Standby, fabric and trust listeners are inactive and the node reports not
 ready. Periodic cache refresh keeps supported cached stores current on a Standby node.
 
@@ -234,10 +248,9 @@ a remote gateway.
 
 ### Revoking access ends running streams
 
-A change that narrows a peer's access also ends, at once, the framed streams it no longer allows on
-this node. They end the way a replaced listener ends its streams: each side is told `unavailable`,
-and the caller's response ends with an error. The gateway and Connection Point stores apply it on
-every write of a record ([`Revocation`](../src/proxy/fabric_stream/mod.rs)):
+A change that narrows a peer's access also ends the framed streams it no longer allows on this
+node ([`Revocation`](../src/proxy/fabric_stream/mod.rs)). They end the way a replaced listener ends
+its streams: each side is told `unavailable`, and the caller's response ends with an error.
 
 | Change | Streams that end |
 | --- | --- |
@@ -245,6 +258,20 @@ every write of a record ([`Revocation`](../src/proxy/fabric_stream/mod.rs)):
 | The peer's exposure no longer admits a surface (`none`, or a list without it) | The streams the peer opened here to that surface |
 | A Connection Point is disabled or removed | Every stream it carries |
 | A Connection Point's exposure list no longer admits a surface | The streams opened here through it to that surface |
+
+When the streams end depends on where the change comes from:
+
+- A write through this node's gateway or Connection Point store ends them at once. Only a change
+  that narrows access does: a widened or reordered exposure list ends nothing.
+- A change this node did not write ends them when its cache picks the change up: another node's
+  write, read by the periodic cache refresh (`cache_refresh_interval_secs`) or by the refresh on
+  promotion. The running streams are then checked against the stored records, and those the records
+  no longer admit end.
+- A write that cannot read the record it replaces checks the running streams against the stored
+  records the same way.
+
+Configuration reload does not re-read gateway or Connection Point records, and a backup restore
+restarts the gateway, which ends every stream.
 
 Streams of other peers, surfaces and Connection Points keep running. An Open admitted while a
 revocation runs is refused, so it cannot outlive the change. Admission reads the Connection Point's
@@ -307,7 +334,9 @@ Pair single-tenant or trusted deployments first, and do not pair a
 multi-tenant or internet-facing gateway: some gateway-wide tables and signals
 are shared across tenants and peers (appliance-wide access changes still end
 every subscription), and apart from the per-peer and per-tenant shares of the capability offer and
-probe tables and of the Open replay table, the limits are per caller, per peer or per surface.
+probe tables and of the Open replay table, the limits are per caller, per peer or per surface. The
+shares apply once a table is half full, and a peer whose Remote gateway record has no tenant counts
+against no tenant's share; see [how the shares apply](MCP_METADATA.md#framed-fabric-limits).
 Framed streams are capped at 8 per peer and 16 per surface,
 with listens counted apart from request streams under their own caps of the same size, so a partner's
 long-lived listens do not use up its request slots. One peer can therefore hold 16 inbound streams and

@@ -2037,6 +2037,35 @@ pub async fn run_axum_proxy(
                 }
             };
 
+        // Writes through this node's stores end the Fabric streams they revoke
+        // at once. Record changes this node did not write (another node's,
+        // picked up by the shared-storage refresh or the refresh on promotion)
+        // end them here, by checking every running stream against the records.
+        if let Some(store) = gateway_store.clone()
+            && let Some(events) = store.subscribe()
+        {
+            tokio::spawn(crate::proxy::fabric_stream::revoke_on_remote_changes(events, move || {
+                let store = Arc::clone(&store);
+                async move {
+                    store
+                        .revoke_streams_not_admitted()
+                        .await
+                }
+            }));
+        }
+        if let Some(store) = connection_point_store.clone()
+            && let Some(events) = store.subscribe()
+        {
+            tokio::spawn(crate::proxy::fabric_stream::revoke_on_remote_changes(events, move || {
+                let store = Arc::clone(&store);
+                async move {
+                    store
+                        .revoke_streams_not_admitted()
+                        .await
+                }
+            }));
+        }
+
         let notification_store: Option<Arc<crate::integrations::FileSystemNotificationStore>> = {
             let auth_storage_ref = auth_state
                 .as_ref()

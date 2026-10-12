@@ -5,6 +5,9 @@ pub(crate) mod share;
 pub(crate) mod transport;
 pub(crate) mod wire;
 
+#[cfg(test)]
+pub(crate) mod test_fixture;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -780,6 +783,14 @@ pub(crate) enum Revocation<'change> {
     /// Streams a peer opened here through the Connection Point to a surface it
     /// no longer exposes.
     ConnectionPointExposure(&'change crate::gateways::connection_points::types::GatewayConnectionPoint),
+    /// Every stream these gateway records do not admit: its peer has no
+    /// active Remote record, or (for a stream it opened here) that record does
+    /// not expose the surface. For a change with no previous record to compare.
+    PeersOutside(&'change [crate::gateways::types::Gateway]),
+    /// Every stream these Connection Point records do not admit: its
+    /// Connection Point has no enabled record, or (for a stream a peer opened
+    /// here) that record does not expose the surface.
+    ConnectionPointsOutside(&'change [crate::gateways::connection_points::types::GatewayConnectionPoint]),
 }
 
 impl<'change> Revocation<'change> {
@@ -799,38 +810,60 @@ impl<'change> Revocation<'change> {
             Self::ConnectionPointExposure(connection_point) => {
                 inbound
                     && binding.connection_point_id == connection_point.id
-                    && !connection_point
-                        .exposed_channels
-                        .is_empty()
-                    && !connection_point
-                        .exposed_channels
-                        .contains(&binding.surface_id)
+                    && !connection_point_exposes(connection_point, &binding.surface_id)
             }
+            Self::PeersOutside(gateways) => !gateways.iter().any(|peer| {
+                peer.did == binding.peer_did
+                    && peer.gateway_type == crate::gateways::types::GatewayType::Remote
+                    && peer.status == crate::gateways::types::GatewayStatus::Active
+                    && (!inbound || peer.exposes_surface(&binding.surface_id))
+            }),
+            Self::ConnectionPointsOutside(connection_points) => !connection_points
+                .iter()
+                .any(|connection_point| {
+                    connection_point.id == binding.connection_point_id
+                        && connection_point.enabled
+                        && (!inbound || connection_point_exposes(connection_point, &binding.surface_id))
+                }),
         }
     }
 
     /// What a write of a gateway record revokes, from `previous` to `current`
     /// (`None` when it was removed). Only an active Remote gateway has streams,
-    /// and only a change that narrows its access revokes them.
+    /// and only a change that narrows its access revokes them: a widened or
+    /// reordered exposure revokes nothing.
     pub fn of_gateway_change(
         previous: &'change crate::gateways::types::Gateway,
         current: Option<&'change crate::gateways::types::Gateway>,
     ) -> Option<Self> {
-        use crate::gateways::types::{GatewayStatus, GatewayType};
+        use crate::gateways::types::{ExposureMode, GatewayStatus, GatewayType};
         if previous.gateway_type != GatewayType::Remote || previous.status != GatewayStatus::Active {
             return None;
         }
         match current {
-            Some(current) if current.status == GatewayStatus::Active && current.did == previous.did => {
-                (current.exposure() != previous.exposure() || current.exposed_channels != previous.exposed_channels)
-                    .then_some(Self::PeerExposure(current))
+            Some(current)
+                if current.status == GatewayStatus::Active
+                    && current.gateway_type == GatewayType::Remote
+                    && current.did == previous.did =>
+            {
+                let narrowed = match (previous.exposure(), current.exposure()) {
+                    (ExposureMode::None, _) | (_, ExposureMode::All) => false,
+                    (ExposureMode::All, _) => true,
+                    (ExposureMode::List, _) => previous
+                        .exposed_channels
+                        .iter()
+                        .any(|surface| !current.exposes_surface(surface)),
+                };
+                narrowed.then_some(Self::PeerExposure(current))
             }
             _ => Some(Self::Peer(&previous.did)),
         }
     }
 
     /// What a write of a Connection Point revokes, from `previous` to
-    /// `current` (`None` when it was removed).
+    /// `current` (`None` when it was removed). Only a change that narrows its
+    /// exposure list (an empty list exposes every surface) revokes streams to
+    /// surfaces.
     pub fn of_connection_point_change(
         previous: &'change crate::gateways::connection_points::types::GatewayConnectionPoint,
         current: Option<&'change crate::gateways::connection_points::types::GatewayConnectionPoint>,
@@ -839,10 +872,82 @@ impl<'change> Revocation<'change> {
             return None;
         }
         match current {
-            Some(current) if current.enabled => (current.exposed_channels != previous.exposed_channels)
-                .then_some(Self::ConnectionPointExposure(current)),
+            Some(current) if current.enabled && current.id == previous.id => {
+                let narrowed = !current
+                    .exposed_channels
+                    .is_empty()
+                    && (previous
+                        .exposed_channels
+                        .is_empty()
+                        || previous
+                            .exposed_channels
+                            .iter()
+                            .any(|surface| {
+                                !current
+                                    .exposed_channels
+                                    .contains(surface)
+                            }));
+                narrowed.then_some(Self::ConnectionPointExposure(current))
+            }
             _ => Some(Self::ConnectionPoint(&previous.id)),
         }
+    }
+}
+
+/// Whether the Connection Point's exposure list admits `surface_id`; an empty
+/// list admits every surface.
+fn connection_point_exposes(
+    connection_point: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+    surface_id: &str,
+) -> bool {
+    connection_point
+        .exposed_channels
+        .is_empty()
+        || connection_point
+            .exposed_channels
+            .iter()
+            .any(|exposed| exposed == surface_id)
+}
+
+/// Ends the running streams on this node that `records` no longer admit, after
+/// each burst of record changes this node did not write itself (another node's
+/// writes picked up by the shared-storage refresh, or the refresh on
+/// promotion). Events this subscriber missed are treated the same way. Returns
+/// when the store's event channel closes.
+pub(crate) async fn revoke_on_remote_changes<T, Records, Check>(
+    mut events: tokio::sync::broadcast::Receiver<crate::storage::filesystem::StorageEvent<T>>,
+    mut records: Records,
+) where
+    T: crate::storage::filesystem::StorableEntity,
+    Records: FnMut() -> Check,
+    Check: std::future::Future<Output = ()>,
+{
+    use crate::storage::filesystem::{StorageEvent, StorageEventSource};
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    loop {
+        match events.recv().await {
+            Ok(
+                StorageEvent::Upsert {
+                    source: StorageEventSource::RemoteWrite,
+                    ..
+                }
+                | StorageEvent::Delete {
+                    source: StorageEventSource::RemoteWrite,
+                    ..
+                },
+            ) => {}
+            Ok(_) => continue,
+            Err(RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "Fabric stream revocation missed record changes; checking every running stream"
+                );
+            }
+            Err(RecvError::Closed) => return,
+        }
+        // One refresh emits an event per changed record: check once for all.
+        while let Ok(_) | Err(TryRecvError::Lagged(_)) = events.try_recv() {}
+        records().await;
     }
 }
 
@@ -2039,6 +2144,35 @@ mod tests {
         let mut closed = previous.clone();
         closed.exposure_mode = Some(ExposureMode::None);
         assert!(matches!(Revocation::of_gateway_change(&previous, Some(&closed)), Some(Revocation::PeerExposure(_))));
+        assert!(
+            matches!(
+                Revocation::of_gateway_change(
+                    &active_peer(ExposureMode::All, &[]),
+                    Some(&active_peer(ExposureMode::List, &["x"]))
+                ),
+                Some(Revocation::PeerExposure(_))
+            ),
+            "all to a list narrows"
+        );
+
+        let widened = [
+            active_peer(ExposureMode::List, &["x", "y", "z"]),
+            active_peer(ExposureMode::List, &["y", "x"]),
+            active_peer(ExposureMode::All, &[]),
+        ];
+        for current in &widened {
+            assert!(
+                Revocation::of_gateway_change(&previous, Some(current)).is_none(),
+                "a widened or reordered list revokes nothing: {:?}",
+                current.exposed_channels
+            );
+        }
+        let none = active_peer(ExposureMode::None, &[]);
+        assert!(Revocation::of_gateway_change(&none, Some(&previous)).is_none(), "none to a list widens");
+        assert!(
+            Revocation::of_gateway_change(&active_peer(ExposureMode::List, &[]), Some(&none)).is_none(),
+            "an empty list exposes nothing to lose"
+        );
 
         for status in [GatewayStatus::Disabled, GatewayStatus::Pending, GatewayStatus::Failed] {
             let mut left = previous.clone();
@@ -2082,10 +2216,172 @@ mod tests {
         assert!(Revocation::of_connection_point_change(&disabled, None).is_none());
         let mut narrowed = connection_point.clone();
         narrowed.exposed_channels = vec!["only".into()];
+        assert!(
+            matches!(
+                Revocation::of_connection_point_change(&connection_point, Some(&narrowed)),
+                Some(Revocation::ConnectionPointExposure(_))
+            ),
+            "every surface to a list narrows"
+        );
+        let mut listed = connection_point.clone();
+        listed.exposed_channels = vec!["x".into(), "y".into()];
+        let mut dropped = listed.clone();
+        dropped.exposed_channels = vec!["y".into()];
         assert!(matches!(
-            Revocation::of_connection_point_change(&connection_point, Some(&narrowed)),
+            Revocation::of_connection_point_change(&listed, Some(&dropped)),
             Some(Revocation::ConnectionPointExposure(_))
         ));
+        for widened in [vec!["y".into(), "x".into()], vec!["x".into(), "y".into(), "z".into()], vec![]] {
+            let mut current = listed.clone();
+            current.exposed_channels = widened;
+            assert!(
+                Revocation::of_connection_point_change(&listed, Some(&current)).is_none(),
+                "a widened or reordered list revokes nothing: {:?}",
+                current.exposed_channels
+            );
+        }
+    }
+
+    #[test]
+    fn checking_streams_against_current_records_ends_those_they_do_not_admit() {
+        use crate::gateways::types::{ExposureMode, GatewayStatus, GatewayType};
+
+        let inbound = |peer: &str, cp: &str, surface: &str| (revocation_binding(peer, cp, surface), true);
+        let outbound = |peer: &str, cp: &str| (revocation_binding(peer, cp, "peer-channel"), false);
+
+        let listed = active_peer(ExposureMode::List, &["kept"]);
+        let mut disabled = active_peer(ExposureMode::All, &[]);
+        disabled.did = "did:example:disabled".into();
+        disabled.status = GatewayStatus::Disabled;
+        let mut own = active_peer(ExposureMode::All, &[]);
+        own.did = "did:example:own".into();
+        own.gateway_type = GatewayType::SelfGateway;
+        let gateways = [listed, disabled, own];
+        let peers = Revocation::PeersOutside(&gateways);
+        for (binding, opened_here) in [inbound("did:example:peer", "cp", "kept"), outbound("did:example:peer", "cp")] {
+            assert!(!peers.covers(&binding, opened_here), "{binding:?}");
+        }
+        for (binding, opened_here) in [
+            inbound("did:example:peer", "cp", "lost"),
+            inbound("did:example:removed", "cp", "kept"),
+            outbound("did:example:removed", "cp"),
+            outbound("did:example:disabled", "cp"),
+            outbound("did:example:own", "cp"),
+        ] {
+            assert!(peers.covers(&binding, opened_here), "{binding:?}");
+        }
+        assert!(
+            Revocation::PeersOutside(&[]).covers(&outbound("did:example:peer", "cp").0, false),
+            "no records admit no stream"
+        );
+
+        let connection_point = |id: &str, enabled: bool, surfaces: &[&str]| {
+            let mut connection_point = crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+                "gateway".into(),
+                "mediator".into(),
+                format!("did:example:{id}"),
+                id.into(),
+                String::new(),
+                "oob".into(),
+                String::new(),
+                serde_json::json!({}),
+                None,
+                crate::gateways::connection_points::types::ConnectionPointType::User,
+                String::new(),
+            );
+            connection_point.id = id.into();
+            connection_point.enabled = enabled;
+            connection_point.exposed_channels = surfaces
+                .iter()
+                .map(|surface| surface.to_string())
+                .collect();
+            connection_point
+        };
+        let connection_points = [
+            connection_point("every", true, &[]),
+            connection_point("listed", true, &["kept"]),
+            connection_point("off", false, &[]),
+        ];
+        let carried = Revocation::ConnectionPointsOutside(&connection_points);
+        for (binding, opened_here) in [
+            inbound("did:example:peer", "every", "any"),
+            inbound("did:example:peer", "listed", "kept"),
+            outbound("did:example:peer", "listed"),
+        ] {
+            assert!(!carried.covers(&binding, opened_here), "{binding:?}");
+        }
+        for (binding, opened_here) in [
+            inbound("did:example:peer", "listed", "lost"),
+            inbound("did:example:peer", "off", "any"),
+            outbound("did:example:peer", "off"),
+            outbound("did:example:peer", "removed"),
+        ] {
+            assert!(carried.covers(&binding, opened_here), "{binding:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_record_changes_this_node_did_not_write_check_running_streams() {
+        use crate::storage::filesystem::{StorageEvent, StorageEventSource};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let gateway = active_peer(crate::gateways::types::ExposureMode::All, &[]);
+        let upsert = |source| StorageEvent::Upsert {
+            id: gateway.id.clone(),
+            entity: gateway.clone(),
+            source,
+        };
+        let (events, receiver) = tokio::sync::broadcast::channel(4);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        let watch = tokio::spawn(revoke_on_remote_changes(receiver, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async {}
+        }));
+        let settled = || async {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        };
+
+        assert!(
+            events
+                .send(upsert(StorageEventSource::LocalWrite))
+                .is_ok()
+        );
+        settled().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 0, "a write through this node revoked what it changed already");
+
+        for _ in 0..3 {
+            assert!(
+                events
+                    .send(upsert(StorageEventSource::RemoteWrite))
+                    .is_ok()
+            );
+        }
+        assert!(
+            events
+                .send(StorageEvent::Delete {
+                    id: gateway.id.clone(),
+                    source: StorageEventSource::RemoteWrite,
+                })
+                .is_ok()
+        );
+        settled().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1, "one refresh's changes are checked once");
+
+        for _ in 0..6 {
+            assert!(
+                events
+                    .send(upsert(StorageEventSource::LocalWrite))
+                    .is_ok()
+            );
+        }
+        settled().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 2, "missed changes are checked too");
+
+        drop(events);
+        watch.await.unwrap();
     }
 
     #[test]
@@ -2207,243 +2503,15 @@ mod tests {
         );
     }
 
-    /// A receiving gateway with one surface and one paired peer, fed the
-    /// capability queries and Opens the peer's current sender builds: both
-    /// envelope times set, and an Open naming its capability offer.
-    struct ReplayFixture {
-        runtime: Arc<StreamRuntime>,
-        listener: ListenerGeneration,
-        connection: crate::gateways::connection_points::types::GatewayConnectionPoint,
-        peer: crate::gateways::types::Gateway,
-        surfaces_path: std::path::PathBuf,
-        _directory: tempfile::TempDir,
-        _paired_dir: tempfile::TempDir,
-    }
-
-    impl ReplayFixture {
-        const SURFACE_ID: &'static str = "surface";
-
-        async fn new() -> Self {
-            use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
-            use crate::gateways::types::{Gateway, GatewayType};
-            use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
-
-            let directory = tempfile::tempdir().unwrap();
-            let surfaces_path = directory
-                .path()
-                .join("surfaces");
-            let store = FileSystemAgentSurfaceStore::new(surfaces_path.clone())
-                .await
-                .unwrap();
-            // The stream lifetime is clamped to 1 s, far below the Open's
-            // deadline, envelope expiry and offer lifetime.
-            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
-                "surface_id": Self::SURFACE_ID, "name": "Surface",
-                "mcp_http": {"stream_idle_timeout_secs": 1, "stream_max_lifetime_secs": 1},
-                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
-                "target": {"endpoint": "https://target.example/mcp"}
-            }))
-            .unwrap();
-            store
-                .save(&surface)
-                .await
-                .unwrap();
-            let mut connection = GatewayConnectionPoint::new(
-                "gateway".into(),
-                "mediator".into(),
-                "did:example:local".into(),
-                "Connection".into(),
-                String::new(),
-                "oob".into(),
-                String::new(),
-                serde_json::json!({}),
-                None,
-                ConnectionPointType::User,
-                String::new(),
-            );
-            connection.id = "cp".into();
-            let mut peer = Gateway::new("Peer".into(), String::new(), "did:example:peer".into(), GatewayType::Remote);
-            peer.exposure_mode = Some(crate::gateways::types::ExposureMode::All);
-            let mut paired = peer.clone();
-            paired.issuer_did = Some("did:example:peer-gateway".into());
-            let paired_dir =
-                crate::gateways::test_helpers::install_listener_manager_with_peers(directory.path(), &[paired]).await;
-            let capabilities = StreamCapabilities::local(true, true);
-            let runtime = Arc::new(StreamRuntime {
-                registry: ReceiveRegistry::new(RegistryLimits {
-                    max_streams: 4,
-                    max_peer_streams: 4,
-                    max_surface_streams: 4,
-                    max_peer_listens: 4,
-                    max_surface_listens: 4,
-                })
-                .unwrap(),
-                peers: PeerCapabilities::new(capabilities.clone()),
-                local_capabilities: capabilities,
-                listeners: Mutex::new(HashMap::new()),
-            });
-            let listener = runtime
-                .listener(
-                    connection.id.clone(),
-                    connection
-                        .connection_point_did
-                        .clone(),
-                )
-                .unwrap();
-            Self {
-                runtime,
-                listener,
-                connection,
-                peer,
-                surfaces_path,
-                _directory: directory,
-                _paired_dir: paired_dir,
-            }
-        }
-
-        fn envelope(
-            &self,
-            message_type: MessageType,
-            id: Uuid,
-            thid: Uuid,
-            body: serde_json::Value,
-        ) -> ReceivedMessage {
-            let now = crate::gateways::connection_points::envelope_replay::now_secs();
-            let mut message = ReceivedMessage::new(
-                self.connection.id.clone(),
-                self.peer.id.clone(),
-                message_type.to_string(),
-                id.to_string(),
-                Some(thid.to_string()),
-                Some(self.peer.did.clone()),
-                vec![
-                    self.connection
-                        .connection_point_did
-                        .clone(),
-                ],
-                Some(now),
-                Some(now + 60),
-                body,
-                MessageMetadata {
-                    authenticated: true,
-                    encrypted: true,
-                    from_key: None,
-                    extra: serde_json::Value::Null,
-                },
-            )
-            .with_context("agent_surface_storage_path", serde_json::json!(self.surfaces_path));
-            self.listener
-                .stamp(&mut message);
-            message
-        }
-
-        fn capability_query(
-            &self,
-            nonce: Uuid,
-        ) -> ReceivedMessage {
-            let query = CapabilityMessage {
-                nonce,
-                capabilities: StreamCapabilities::local(true, true),
-            };
-            self.envelope(MessageType::ForwardStreamQuery, nonce, nonce, serde_json::to_value(query).unwrap())
-        }
-
-        fn open(
-            &self,
-            capability_nonce: Uuid,
-        ) -> ReceivedMessage {
-            let stream_id = Uuid::new_v4();
-            let request = wire::OpenRequest {
-                capability_nonce,
-                channel_id: Self::SURFACE_ID.into(),
-                variant_alias: None,
-                path: "/mcp".into(),
-                headers: std::collections::BTreeMap::from([
-                    ("mcp-protocol-version".into(), vec![crate::mcp::MCP_MODERN_VERSION.into()]),
-                    ("mcp-method".into(), vec!["tools/list".into()]),
-                ]),
-                body_bytes: 0,
-                response_window_bytes: wire::MAX_CHUNK_BYTES as u32,
-                deadline_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000,
-                trace_id: Uuid::new_v4(),
-            };
-            let frame = wire::StreamFrame {
-                stream_id,
-                payload: wire::FramePayload::Open { request },
-            };
-            self.envelope(
-                MessageType::ForwardStreamFrame,
-                Uuid::new_v4(),
-                stream_id,
-                serde_json::to_value(frame).unwrap(),
-            )
-        }
-
-        /// Whether the offer for `nonce` is live at `at`. Asking about a later
-        /// instant drops the offers that have expired by then.
-        fn offered(
-            &self,
-            query: &ReceivedMessage,
-            nonce: Uuid,
-            at: Instant,
-        ) -> bool {
-            let binding = registry::StreamBinding {
-                peer_did: self.peer.did.clone(),
-                recipient_did: self
-                    .connection
-                    .connection_point_did
-                    .clone(),
-                connection_point_id: self.connection.id.clone(),
-                listener_instance_id: query.context[INSTANCE_CONTEXT]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-                surface_id: "capabilities".into(),
-            };
-            self.runtime
-                .peers
-                .offered(&binding, nonce, at)
-                .is_some()
-        }
-    }
-
-    /// Runs the calling test alone in a child process: the fixture installs the
-    /// process-wide listener manager. Returns false in the parent, which has
-    /// checked the child's outcome.
-    async fn in_isolated_child(what: &str) -> bool {
-        if std::env::var_os("ATG_FABRIC_STREAM_ADMISSION_CHILD").is_some() {
-            return true;
-        }
-        let test_name = std::thread::current()
-            .name()
-            .unwrap()
-            .to_string();
-        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test_name, "--nocapture"])
-            .env("ATG_FABRIC_STREAM_ADMISSION_CHILD", "1")
-            .env("RUST_MIN_STACK", "8388608")
-            .kill_on_drop(true)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "isolated {what} failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        false
-    }
-
     /// The replay proof: a captured Open is never admitted twice, and a
     /// captured capability query cannot recreate the expired offer the Open
     /// was bound to. Removing the capability-query replay check fails it.
     #[tokio::test]
     async fn replay_proof_refuses_a_replayed_open_and_a_replayed_capability_query() {
-        if !in_isolated_child("replay proof").await {
+        if !test_fixture::in_isolated_child("replay proof").await {
             return;
         }
-        let fixture = ReplayFixture::new().await;
+        let fixture = test_fixture::OpenFixture::new().await;
         let nonce = Uuid::new_v4();
         let query = fixture.capability_query(nonce);
         assert!(matches!(

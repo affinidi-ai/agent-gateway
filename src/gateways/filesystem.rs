@@ -78,9 +78,32 @@ impl FileSystemGatewayStore {
 }
 
 impl FileSystemGatewayStore {
+    /// The store's record changes, including those another node made that the
+    /// shared-storage refresh picked up.
+    pub fn subscribe(
+        &self
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::storage::filesystem::StorageEvent<Gateway>>> {
+        self.storage.subscribe()
+    }
+
+    /// Ends the running Fabric streams the stored gateway records no longer
+    /// admit. When the records cannot be listed, every stream with a peer
+    /// ends, as no new one could be admitted either.
+    pub async fn revoke_streams_not_admitted(&self) {
+        match self.storage.list_all().await {
+            Ok(gateways) => {
+                crate::proxy::fabric_stream::revoke(crate::proxy::fabric_stream::Revocation::PeersOutside(&gateways))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Could not list gateway records; ending every Fabric stream");
+                crate::proxy::fabric_stream::revoke(crate::proxy::fabric_stream::Revocation::PeersOutside(&[]));
+            }
+        }
+    }
+
     /// Saves `gateway` and ends the running Fabric streams the change revokes.
-    /// When the previous record cannot be read, every stream with the peer
-    /// ends.
+    /// When the previous record cannot be read, the running streams are
+    /// checked against the stored records instead.
     async fn save_and_revoke(
         &self,
         gateway: &Gateway,
@@ -92,18 +115,29 @@ impl FileSystemGatewayStore {
         self.storage
             .save(gateway)
             .await?;
+        self.revoke_change(previous, Some(gateway))
+            .await;
+        Ok(())
+    }
+
+    async fn revoke_change(
+        &self,
+        previous: Result<Option<Gateway>>,
+        current: Option<&Gateway>,
+    ) {
         match &previous {
             Ok(Some(previous)) => {
-                if let Some(revocation) =
-                    crate::proxy::fabric_stream::Revocation::of_gateway_change(previous, Some(gateway))
+                if let Some(revocation) = crate::proxy::fabric_stream::Revocation::of_gateway_change(previous, current)
                 {
                     crate::proxy::fabric_stream::revoke(revocation);
                 }
             }
             Ok(None) => {}
-            Err(_) => crate::proxy::fabric_stream::revoke(crate::proxy::fabric_stream::Revocation::Peer(&gateway.did)),
+            Err(_) => {
+                self.revoke_streams_not_admitted()
+                    .await
+            }
         }
-        Ok(())
     }
 }
 
@@ -149,11 +183,8 @@ impl GatewayStore for FileSystemGatewayStore {
         self.storage
             .delete(id)
             .await?;
-        if let Ok(Some(previous)) = &previous
-            && let Some(revocation) = crate::proxy::fabric_stream::Revocation::of_gateway_change(previous, None)
-        {
-            crate::proxy::fabric_stream::revoke(revocation);
-        }
+        self.revoke_change(previous, None)
+            .await;
         Ok(())
     }
 

@@ -4,12 +4,14 @@
 //! when its store is flushed or fails over. It recreates an account only when
 //! that account sends, and refuses delivery to a missing one, so a Connection
 //! Point that only receives would stay unreachable. Every active listener's
-//! own account is therefore probed on an interval and repaired.
+//! own account is therefore probed on an interval and repaired, a few listeners
+//! at a time.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use affinidi_messaging_sdk::errors::ATMError;
+use futures::StreamExt;
 use tracing::{debug, warn};
 use trust_tasks_rs::specs::messaging::account::get::v0_1::Account;
 
@@ -24,6 +26,12 @@ const ACCOUNT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a restarted listener may take to re-authenticate and re-register.
 const LISTENER_RESTART_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long the mediator may take to re-open a closed receive list.
+const RECEIVE_LIST_REOPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many listeners are checked at once.
+const CONCURRENT_ACCOUNT_CHECKS: usize = 4;
 
 /// The problem-report code a mediator answers with when it no longer has the
 /// requesting account.
@@ -48,7 +56,46 @@ pub(crate) enum AccountRepair {
 enum AccountCheck {
     /// The listener is not connected, so its mediator session is not probed.
     Skipped,
-    Probed(AccountRepair),
+    /// The account could not be read, so nothing was changed.
+    Unreadable,
+    /// The account accepts messages.
+    Healthy,
+    /// The account needed `repair`, with the repair's outcome.
+    Repaired(AccountRepair, Result<(), String>),
+}
+
+/// The mediator calls a check makes for one listener.
+#[async_trait::async_trait]
+trait MediatorAccount: Sync {
+    async fn probe(
+        &self,
+        listener: &ListenerInfo,
+    ) -> AccountProbe;
+
+    async fn reopen_receive_list(
+        &self,
+        listener: &ListenerInfo,
+    ) -> Result<(), String>;
+}
+
+/// The listener's own mediator session.
+struct ListenerSession;
+
+#[async_trait::async_trait]
+impl MediatorAccount for ListenerSession {
+    async fn probe(
+        &self,
+        listener: &ListenerInfo,
+    ) -> AccountProbe {
+        probe_own_account(&listener.client).await
+    }
+
+    async fn reopen_receive_list(
+        &self,
+        listener: &ListenerInfo,
+    ) -> Result<(), String> {
+        set_acl_to_allow_everything_and_more(listener.client.atm(), Arc::clone(listener.client.profile())).await
+    }
 }
 
 pub(crate) async fn probe_own_account(client: &DIDCommClient) -> AccountProbe {
@@ -92,24 +139,66 @@ pub(crate) fn spawn(manager: Weak<ConnectionPointListenerManager>) {
         let mut interval =
             tokio::time::interval_at(tokio::time::Instant::now() + ACCOUNT_CHECK_INTERVAL, ACCOUNT_CHECK_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut unreadable = std::collections::HashMap::new();
         loop {
             interval.tick().await;
             let Some(manager) = manager.upgrade() else {
                 break;
             };
-            for listener in manager
-                .get_active_listeners()
-                .await
-            {
-                check_listener(&manager, &listener).await;
+            let checks = futures::stream::iter(
+                manager
+                    .get_active_listeners()
+                    .await,
+            )
+            .map(|listener| {
+                let manager = &manager;
+                async move {
+                    let check = check_listener(manager, &listener, &ListenerSession).await;
+                    (listener, check)
+                }
+            })
+            .buffer_unordered(CONCURRENT_ACCOUNT_CHECKS)
+            .collect::<Vec<_>>()
+            .await;
+            let checked = checks
+                .iter()
+                .map(|(listener, _)| {
+                    listener
+                        .connection_point_id
+                        .clone()
+                })
+                .collect::<std::collections::HashSet<_>>();
+            unreadable.retain(|connection_point_id, _| checked.contains(connection_point_id));
+            for (listener, check) in checks {
+                let failures = unreadable
+                    .entry(listener.connection_point_id)
+                    .or_insert(0u32);
+                *failures = match check {
+                    AccountCheck::Unreadable => failures.saturating_add(1),
+                    _ => 0,
+                };
+                if warns_of_unreadable_account(*failures) {
+                    warn!(
+                        connection_point = %listener.name,
+                        consecutive_failures = *failures,
+                        "The mediator account could not be read; missing accounts are not being repaired"
+                    );
+                }
             }
         }
     });
 }
 
+/// Whether the `consecutive`th failure in a row to read an account is logged
+/// at `warn`: the second, then at doubling intervals.
+fn warns_of_unreadable_account(consecutive: u32) -> bool {
+    consecutive >= 2 && consecutive.is_power_of_two()
+}
+
 async fn check_listener(
     manager: &ConnectionPointListenerManager,
     listener: &ListenerInfo,
+    mediator: &impl MediatorAccount,
 ) -> AccountCheck {
     let connected = matches!(
         listener
@@ -123,42 +212,42 @@ async fn check_listener(
         return AccountCheck::Skipped;
     }
 
-    let probe = probe_own_account(&listener.client).await;
+    let probe = mediator.probe(listener).await;
     let repair = account_repair(&probe);
-    match repair {
+    let repaired = match repair {
         AccountRepair::Nothing if !matches!(probe, Ok(Ok(_))) => {
             debug!(connection_point = %listener.name, "Could not read the mediator account; leaving the listener as it is");
+            return AccountCheck::Unreadable;
         }
-        AccountRepair::Nothing => {}
+        AccountRepair::Nothing => return AccountCheck::Healthy,
         AccountRepair::RestartListener => {
             warn!(
                 connection_point = %listener.name,
                 "The mediator no longer has this Connection Point's account; restarting it to re-authenticate and re-register"
             );
-            if let Err(error) = manager
+            manager
                 .restart_listener_if_current(
                     &listener.connection_point_id,
                     &listener.instance_id,
                     LISTENER_RESTART_TIMEOUT,
                 )
                 .await
-            {
-                warn!(connection_point = %listener.name, "Connection Point restart failed: {error}");
-            }
+                .map(|_| ())
         }
         AccountRepair::ReopenReceiveList => {
             warn!(
                 connection_point = %listener.name,
                 "The mediator account's receive list is closed; re-opening it"
             );
-            if let Err(error) =
-                set_acl_to_allow_everything_and_more(listener.client.atm(), Arc::clone(listener.client.profile())).await
-            {
-                warn!(connection_point = %listener.name, "Re-opening the receive list failed: {error}");
-            }
+            tokio::time::timeout(RECEIVE_LIST_REOPEN_TIMEOUT, mediator.reopen_receive_list(listener))
+                .await
+                .unwrap_or_else(|_| Err(format!("timed out after {RECEIVE_LIST_REOPEN_TIMEOUT:?}")))
         }
+    };
+    if let Err(error) = &repaired {
+        warn!(connection_point = %listener.name, ?repair, "Repairing the mediator account failed: {error}");
     }
-    AccountCheck::Probed(repair)
+    AccountCheck::Repaired(repair, repaired)
 }
 
 #[cfg(test)]
@@ -222,14 +311,76 @@ mod tests {
         assert_eq!(account_repair(&probed_account("explicitAllow")), AccountRepair::ReopenReceiveList);
     }
 
-    #[tokio::test]
-    async fn a_listener_that_is_not_connected_is_not_probed() {
-        let root = tempfile::TempDir::new().unwrap();
-        let (manager, _issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root.path()).await;
-        let listener = crate::gateways::test_helpers::test_listener("reconnecting").await;
+    /// A mediator that answers every probe with `probe`, and counts the
+    /// receive-list re-openings, each taking `reopen_delay`.
+    struct StubMediator {
+        probe: fn() -> AccountProbe,
+        reopen_delay: Duration,
+        reopened: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubMediator {
+        fn answering(probe: fn() -> AccountProbe) -> Self {
+            Self {
+                probe,
+                reopen_delay: Duration::ZERO,
+                reopened: Default::default(),
+            }
+        }
+
+        fn reopened(&self) -> usize {
+            self.reopened
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MediatorAccount for StubMediator {
+        async fn probe(
+            &self,
+            _: &ListenerInfo,
+        ) -> AccountProbe {
+            (self.probe)()
+        }
+
+        async fn reopen_receive_list(
+            &self,
+            _: &ListenerInfo,
+        ) -> Result<(), String> {
+            self.reopened
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.reopen_delay).await;
+            Ok(())
+        }
+    }
+
+    fn missing_account() -> AccountProbe {
+        probe_error(ATMError::ProblemReport(ACCOUNT_NOT_FOUND_CODE.into(), "gone".into(), "false".into()))
+    }
+
+    /// A manager running one connected listener, `instance_id`.
+    async fn connected_listener(
+        root: &std::path::Path,
+        instance_id: &str,
+    ) -> (ConnectionPointListenerManager, ListenerInfo, tempfile::TempDir) {
+        let (manager, issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root).await;
+        let listener = crate::gateways::test_helpers::test_listener(instance_id).await;
+        listener
+            .metrics
+            .write()
+            .await
+            .status = ConnectionStatus::Connected;
         manager
             .register_test_listener(listener.clone())
             .await;
+        (manager, listener, issuer_dir)
+    }
+
+    #[tokio::test]
+    async fn a_listener_that_is_not_connected_is_not_probed() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (manager, listener, _issuer_dir) = connected_listener(root.path(), "reconnecting").await;
+        let mediator = StubMediator::answering(missing_account);
 
         for status in [ConnectionStatus::Reconnecting, ConnectionStatus::Failed] {
             listener
@@ -237,7 +388,86 @@ mod tests {
                 .write()
                 .await
                 .status = status;
-            assert_eq!(check_listener(&manager, &listener).await, AccountCheck::Skipped);
+            assert_eq!(check_listener(&manager, &listener, &mediator).await, AccountCheck::Skipped);
         }
+    }
+
+    #[tokio::test]
+    async fn an_open_account_is_left_alone_and_an_unreadable_one_is_reported() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (manager, listener, _issuer_dir) = connected_listener(root.path(), "probed").await;
+
+        let open = StubMediator::answering(|| probed_account("explicitDeny"));
+        assert_eq!(check_listener(&manager, &listener, &open).await, AccountCheck::Healthy);
+        assert_eq!(open.reopened(), 0);
+
+        let unreachable = StubMediator::answering(|| probe_error(ATMError::TransportError("connection reset".into())));
+        assert_eq!(check_listener(&manager, &listener, &unreachable).await, AccountCheck::Unreadable);
+        assert_eq!(unreachable.reopened(), 0);
+        assert!(
+            manager
+                .get_listener("cp-1")
+                .await
+                .is_some_and(|current| current.instance_id == "probed"),
+            "the listener keeps running"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_receive_list_is_reopened_within_its_timeout() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (manager, listener, _issuer_dir) = connected_listener(root.path(), "probed").await;
+
+        let closed = StubMediator::answering(|| probed_account("explicitAllow"));
+        assert_eq!(
+            check_listener(&manager, &listener, &closed).await,
+            AccountCheck::Repaired(AccountRepair::ReopenReceiveList, Ok(()))
+        );
+        assert_eq!(closed.reopened(), 1);
+
+        tokio::time::pause();
+        let hanging = StubMediator {
+            reopen_delay: RECEIVE_LIST_REOPEN_TIMEOUT * 2,
+            ..StubMediator::answering(|| probed_account("explicitAllow"))
+        };
+        assert_eq!(
+            check_listener(&manager, &listener, &hanging).await,
+            AccountCheck::Repaired(
+                AccountRepair::ReopenReceiveList,
+                Err(format!("timed out after {RECEIVE_LIST_REOPEN_TIMEOUT:?}"))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_account_restarts_only_the_listener_that_was_probed() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (manager, listener, _issuer_dir) = connected_listener(root.path(), "probed").await;
+        let mediator = StubMediator::answering(missing_account);
+
+        assert_eq!(
+            check_listener(&manager, &listener, &mediator).await,
+            AccountCheck::Repaired(AccountRepair::RestartListener, Err("Connection point 'cp-1' not found".into())),
+            "the restart reads the Connection Point to start it again"
+        );
+
+        let replacement = crate::gateways::test_helpers::test_listener("replacement").await;
+        manager
+            .register_test_listener(replacement)
+            .await;
+        assert_eq!(
+            check_listener(&manager, &listener, &mediator).await,
+            AccountCheck::Repaired(AccountRepair::RestartListener, Ok(())),
+            "a listener another caller replaced is kept"
+        );
+        assert_eq!(mediator.reopened(), 0);
+    }
+
+    #[test]
+    fn repeated_unreadable_accounts_warn_at_doubling_intervals() {
+        let warned = (0..=40)
+            .filter(|failures| warns_of_unreadable_account(*failures))
+            .collect::<Vec<_>>();
+        assert_eq!(warned, [2, 4, 8, 16, 32]);
     }
 }

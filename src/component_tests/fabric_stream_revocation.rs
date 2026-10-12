@@ -1,6 +1,7 @@
 //! Revoking a peer's access ends its running Fabric streams: a peer that
 //! leaves active, a surface its record stops exposing, and a disabled
-//! Connection Point each end only the streams they cover.
+//! Connection Point each end only the streams they cover, whether the change
+//! was written through this node or picked up from shared storage.
 
 use crate::gateways::connection_points::ConnectionPointStore;
 use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
@@ -102,6 +103,18 @@ impl Running {
     ) {
         assert_eq!(self.ended_with(), (None, None), "{context}");
     }
+
+    /// Waits for a revocation that runs off the calling task.
+    async fn wait_ended(
+        &self,
+        context: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.ended_with() == (None, None) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.assert_ended(context);
+    }
 }
 
 fn registry() -> &'static std::sync::Arc<crate::proxy::fabric_stream::registry::ReceiveRegistry> {
@@ -153,6 +166,59 @@ fn connection_point(name: &str) -> GatewayConnectionPoint {
         ConnectionPointType::User,
         String::new(),
     )
+}
+
+/// Writes `record` to a store's directory the way another node sharing the
+/// storage does: on disk only, so this node learns of it from a refresh.
+fn write_as_another_node(
+    directory: &std::path::Path,
+    id: &str,
+    record: &impl serde::Serialize,
+) {
+    std::fs::write(directory.join(format!("{id}.json")), serde_json::to_string_pretty(record).unwrap()).unwrap();
+}
+
+/// Ends the streams a store's records stop admitting after a refresh, as the
+/// orchestrator wires it.
+fn revoke_on_refresh<T, Store, Check>(
+    events: tokio::sync::broadcast::Receiver<crate::storage::filesystem::StorageEvent<T>>,
+    store: std::sync::Arc<Store>,
+    check: fn(std::sync::Arc<Store>) -> Check,
+) where
+    T: crate::storage::filesystem::StorableEntity,
+    Store: Send + Sync + 'static,
+    Check: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(crate::proxy::fabric_stream::revoke_on_remote_changes(events, move || {
+        check(std::sync::Arc::clone(&store))
+    }));
+}
+
+/// A store directory that can be written but not listed, so a store reading
+/// a record it has not cached fails. Restored on drop.
+#[cfg(unix)]
+struct Unlistable(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Unlistable {
+    fn new(directory: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o300)).unwrap();
+        Self(directory.to_path_buf())
+    }
+
+    /// Whether listing fails for this user: root lists it anyway.
+    fn applies(&self) -> bool {
+        std::fs::read_dir(&self.0).is_err()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unlistable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
 }
 
 /// Runs the calling test alone in a child process, as revocation acts on the
@@ -338,4 +404,175 @@ async fn disabling_a_connection_point_ends_only_the_streams_it_carries() {
         .await
         .unwrap();
     y_on_two.assert_ended("a stream the removed Connection Point carried");
+}
+
+#[tokio::test]
+async fn a_change_another_node_made_ends_the_streams_it_revokes() {
+    if !in_isolated_child().await {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let gateways_dir = directory
+        .path()
+        .join("gateways");
+    let gateways = std::sync::Arc::new(
+        FileSystemGatewayStore::new(gateways_dir.clone(), None)
+            .await
+            .unwrap(),
+    );
+    let connection_points_dir = directory
+        .path()
+        .join("connection_points");
+    let connection_points = std::sync::Arc::new(
+        FileSystemConnectionPointStore::new(connection_points_dir.clone())
+            .await
+            .unwrap(),
+    );
+    let alpha = remote("alpha", ExposureMode::List, &["surface-x", "surface-y"]);
+    let bravo = remote("bravo", ExposureMode::All, &[]);
+    for gateway in [&alpha, &bravo] {
+        gateways
+            .create(gateway)
+            .await
+            .unwrap();
+    }
+    let one = connection_point("one");
+    let two = connection_point("two");
+    for connection_point in [&one, &two] {
+        connection_points
+            .create(connection_point)
+            .await
+            .unwrap();
+    }
+    revoke_on_refresh(gateways.subscribe().unwrap(), std::sync::Arc::clone(&gateways), |store| async move {
+        store
+            .revoke_streams_not_admitted()
+            .await
+    });
+    revoke_on_refresh(
+        connection_points
+            .subscribe()
+            .unwrap(),
+        std::sync::Arc::clone(&connection_points),
+        |store| async move {
+            store
+                .revoke_streams_not_admitted()
+                .await
+        },
+    );
+    let alpha_to_x = Running::inbound(&alpha.did, &two.id, "surface-x");
+    let alpha_to_y = Running::inbound(&alpha.did, &two.id, "surface-y");
+    let bravo_on_one = Running::inbound(&bravo.did, &one.id, "surface-x");
+    let bravo_outbound_on_one = Running::outbound(&bravo.did, &one.id);
+    let bravo_on_two = Running::inbound(&bravo.did, &two.id, "surface-x");
+
+    let mut narrowed = alpha.clone();
+    narrowed.exposed_channels = vec!["surface-y".into()];
+    write_as_another_node(&gateways_dir, &narrowed.id, &narrowed);
+    gateways
+        .refresh_from_disk()
+        .await
+        .unwrap();
+    alpha_to_x
+        .wait_ended("a stream to a surface another node stopped exposing to the peer")
+        .await;
+    alpha_to_y.assert_running("the peer's stream to a surface it keeps");
+    bravo_on_two.assert_running("another peer's stream");
+
+    let mut disabled = one.clone();
+    disabled.enabled = false;
+    write_as_another_node(&connection_points_dir, &disabled.id, &disabled);
+    connection_points
+        .refresh_from_disk()
+        .await
+        .unwrap();
+    bravo_on_one
+        .wait_ended("an inbound stream on a Connection Point another node disabled")
+        .await;
+    bravo_outbound_on_one
+        .wait_ended("an outbound stream on a Connection Point another node disabled")
+        .await;
+    alpha_to_y.assert_running("a stream on another Connection Point");
+    bravo_on_two.assert_running("a stream on another Connection Point");
+
+    std::fs::remove_file(gateways_dir.join(format!("{}.json", bravo.id))).unwrap();
+    gateways
+        .refresh_from_disk()
+        .await
+        .unwrap();
+    bravo_on_two
+        .wait_ended("a stream with a peer another node removed")
+        .await;
+    alpha_to_y.assert_running("another peer's stream");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_write_that_cannot_read_the_previous_record_checks_streams_against_the_records() {
+    if !in_isolated_child().await {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let gateways_dir = directory
+        .path()
+        .join("gateways");
+    let gateways = FileSystemGatewayStore::new(gateways_dir.clone(), None)
+        .await
+        .unwrap();
+    let bravo = remote("bravo", ExposureMode::All, &[]);
+    gateways
+        .create(&bravo)
+        .await
+        .unwrap();
+    // This node has no record for alpha cached, and its file is gone already
+    // (another node removed it), so the delete removes nothing.
+    let alpha = remote("alpha", ExposureMode::All, &[]);
+    let alpha_inbound = Running::inbound(&alpha.did, "cp-one", "surface-x");
+    let bravo_inbound = Running::inbound(&bravo.did, "cp-one", "surface-x");
+
+    let unlistable = Unlistable::new(&gateways_dir);
+    let previous_unreadable = unlistable.applies();
+    gateways
+        .delete(&alpha.id)
+        .await
+        .expect("a delete that cannot read the previous record still runs");
+    drop(unlistable);
+    bravo_inbound.assert_running("a stream the stored records admit");
+    if previous_unreadable {
+        alpha_inbound.assert_ended("a stream no stored gateway record admits");
+    } else {
+        eprintln!("storage stays listable for this user; the unreadable-record case was not reached");
+    }
+
+    let connection_points_dir = directory
+        .path()
+        .join("connection_points");
+    let connection_points = FileSystemConnectionPointStore::new(connection_points_dir.clone())
+        .await
+        .unwrap();
+    let two = connection_point("two");
+    connection_points
+        .create(&two)
+        .await
+        .unwrap();
+    let one = connection_point("one");
+    write_as_another_node(&connection_points_dir, &one.id, &one);
+    let on_one = Running::inbound(&bravo.did, &one.id, "surface-x");
+    let on_two = Running::inbound(&bravo.did, &two.id, "surface-x");
+    let on_removed = Running::inbound(&bravo.did, "cp-removed", "surface-x");
+
+    let unlistable = Unlistable::new(&connection_points_dir);
+    let previous_unreadable = unlistable.applies();
+    let mut disabled = one.clone();
+    disabled.enabled = false;
+    connection_points
+        .update(&disabled)
+        .await
+        .unwrap();
+    drop(unlistable);
+    on_one.assert_ended("a stream on the Connection Point the write disabled");
+    on_two.assert_running("a stream the remaining records admit");
+    if previous_unreadable {
+        on_removed.assert_ended("a stream no Connection Point record admits");
+    }
 }

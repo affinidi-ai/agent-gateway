@@ -9,9 +9,7 @@ changes:
         gateway now gets `429` with `Retry-After: 5` and a JSON-RPC error body on both Access Points
         and Transit Points, instead of `502` or `UpstreamConnectionFailed`. Senders also recognise a
         new `capacity_reached` stream error code and answer it with `429`, and treat any stream
-        error code they do not recognise as `unavailable` instead of dropping the frame. Receivers
-        still refuse a full cap with `unavailable` (`502`), because a 1.0.0 sender cannot parse
-        `capacity_reached` and would hold its stream until the response deadline.
+        error code they do not recognise as `unavailable` instead of dropping the frame.
     - timestamp: '2026-10-08T08:53:14.000Z'
       title: Give forwarded Fabric listens their own per-peer and per-surface budget
       description: >-

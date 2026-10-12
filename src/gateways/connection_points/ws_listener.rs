@@ -1146,17 +1146,22 @@ impl ConnectionPointListenerManager {
     /// When the current listener is no longer `instance_id`, another caller
     /// has already replaced it; that listener is returned without a restart,
     /// so concurrent callers do not tear down each other's fresh session.
+    /// When there is no current listener, the Connection Point was stopped
+    /// (removed, or being restarted by another caller) since the caller read
+    /// it, so it is not started again.
     pub async fn restart_listener_if_current(
         &self,
         connection_point_id: &str,
         instance_id: &str,
         timeout: std::time::Duration,
     ) -> Result<ListenerInfo, String> {
-        if let Some(current) = self
+        let Some(current) = self
             .get_listener(connection_point_id)
             .await
-            && current.instance_id != instance_id
-        {
+        else {
+            return Err(format!("Connection point '{connection_point_id}' has no running listener; not restarting it"));
+        };
+        if current.instance_id != instance_id {
             return Ok(current);
         }
 
@@ -2286,18 +2291,19 @@ fn spawn_refused_open_answer(
 }
 
 /// Starts admitting an `Open` off the reader loop. The frames that arrive for
-/// its stream are held until `admission` releases them, and at most
+/// its stream are held until `admission` releases them, or until it ends
+/// without doing so (aborted with the listener, or panicking), and at most
 /// `admissions` `Open`s are admitted at once. Returns at once; a refusal here
 /// is the caller's to answer.
 fn start_open_admission<Admission, Task>(
     stream_tasks: &mut tokio::task::JoinSet<()>,
     admissions: &Arc<tokio::sync::Semaphore>,
-    registry: &crate::proxy::fabric_stream::registry::ReceiveRegistry,
+    registry: &Arc<crate::proxy::fabric_stream::registry::ReceiveRegistry>,
     message: &ReceivedMessage,
     admission: Admission,
 ) -> Result<(), crate::proxy::fabric_stream::OpenRefusal>
 where
-    Admission: FnOnce(uuid::Uuid, tokio::sync::OwnedSemaphorePermit) -> Task,
+    Admission: FnOnce(crate::proxy::fabric_stream::registry::HeldStream, tokio::sync::OwnedSemaphorePermit) -> Task,
     Task: std::future::Future<Output = ()> + Send + 'static,
 {
     let Ok(permit) = Arc::clone(admissions).try_acquire_owned() else {
@@ -2316,82 +2322,46 @@ where
         .from_did
         .as_deref()
         .ok_or("Fabric sender is missing")?;
-    registry.hold(stream_id, peer_did)?;
-    stream_tasks.spawn(admission(stream_id, permit));
+    let held = registry.hold(stream_id, peer_did)?;
+    stream_tasks.spawn(admission(held, permit));
     Ok(())
 }
 
-/// What admitting one `Open` off the reader loop needs.
-struct OpenAdmission<CS> {
+/// What admitting one `Open` reads: the sender's gateway record and the
+/// Connection Point's current one.
+struct OpenGate<CS> {
     runtime: Arc<crate::proxy::fabric_stream::StreamRuntime>,
     message: ReceivedMessage,
     connection_point: Arc<GatewayConnectionPoint>,
     cp_store: Option<Arc<CS>>,
     gateway_store: Option<Arc<crate::gateways::FileSystemGatewayStore>>,
-    client: DIDCommClient,
-    bootstrap_config: Option<Arc<crate::config::BootstrapConfig>>,
-    refusals: Arc<tokio::sync::Semaphore>,
 }
 
-impl<CS: super::ConnectionPointStore + 'static> OpenAdmission<CS> {
-    /// Admits the `Open`, releases the frames held for its stream and runs the
-    /// stream. A refused `Open` is answered, so its sender fails at once.
-    async fn admit_and_run(
-        self,
-        stream_id: uuid::Uuid,
-        permit: tokio::sync::OwnedSemaphorePermit,
-    ) {
+impl<CS: super::ConnectionPointStore + 'static> OpenGate<CS> {
+    /// Admits the `Open` within `OPEN_ADMISSION_TIMEOUT` and ends the hold on
+    /// its stream's frames: delivered when it is admitted, dropped otherwise.
+    /// `Ok(None)` is an admitted stream that broke the hold by sending more
+    /// frames than it may before admission.
+    async fn admit_held(
+        &self,
+        held: crate::proxy::fabric_stream::registry::HeldStream,
+    ) -> Result<Option<crate::proxy::fabric_stream::IncomingStream>, crate::proxy::fabric_stream::OpenRefusal> {
         let admitted = tokio::time::timeout(OPEN_ADMISSION_TIMEOUT, self.admit())
             .await
             .unwrap_or_else(|_| Err("Fabric Open admission timed out".into()));
-        drop(permit);
         match admitted {
-            Ok(incoming) => {
-                if let Err(error) = self
-                    .runtime
-                    .registry
-                    .release(&stream_id, true)
-                {
+            Ok(incoming) => match held.release(true) {
+                Ok(()) => Ok(Some(incoming)),
+                Err(error) => {
                     warn!(from = ?self.message.from_did, %error, "Ending an admitted Fabric stream");
-                    return;
+                    Ok(None)
                 }
-                let sink = Arc::new(crate::proxy::fabric_stream::transport::DidCommFrameSink {
-                    client: self.client,
-                    binding: incoming.binding.clone(),
-                    capabilities: incoming.capabilities.clone(),
-                    max_envelope_bytes: stream_envelope_limit(self.bootstrap_config.as_ref()),
-                });
-                incoming.run(sink).await;
-            }
+            },
             Err(refusal) => {
-                if let Err(error) = self
-                    .runtime
-                    .registry
-                    .release(&stream_id, false)
-                {
+                if let Err(error) = held.release(false) {
                     warn!(%error, "Could not drop the frames held for a refused Fabric Open");
                 }
-                warn!(
-                    from = ?self.message.from_did,
-                    error = %refusal,
-                    code = ?refusal.code,
-                    "Rejecting Fabric Open"
-                );
-                let Ok(_answering) = self
-                    .refusals
-                    .try_acquire_owned()
-                else {
-                    warn!(from = ?self.message.from_did, "Too many refused Fabric Opens awaiting an answer; leaving this one unanswered");
-                    return;
-                };
-                answer_refused_open(
-                    &self.client,
-                    &self.message,
-                    refusal.code,
-                    self.gateway_store.as_deref(),
-                    &self.bootstrap_config,
-                )
-                .await;
+                Err(refusal)
             }
         }
     }
@@ -2450,6 +2420,68 @@ impl<CS: super::ConnectionPointStore + 'static> OpenAdmission<CS> {
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "Fabric Connection Point no longer exists".into()),
             None => Ok((*self.connection_point).clone()),
+        }
+    }
+}
+
+/// What admitting one `Open` off the reader loop needs.
+struct OpenAdmission<CS> {
+    gate: OpenGate<CS>,
+    client: DIDCommClient,
+    bootstrap_config: Option<Arc<crate::config::BootstrapConfig>>,
+    refusals: Arc<tokio::sync::Semaphore>,
+}
+
+impl<CS: super::ConnectionPointStore + 'static> OpenAdmission<CS> {
+    /// Admits the `Open`, releases the frames held for its stream and runs the
+    /// stream. A refused `Open` is answered, so its sender fails at once.
+    async fn admit_and_run(
+        self,
+        held: crate::proxy::fabric_stream::registry::HeldStream,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let admitted = self
+            .gate
+            .admit_held(held)
+            .await;
+        drop(permit);
+        match admitted {
+            Ok(Some(incoming)) => {
+                let sink = Arc::new(crate::proxy::fabric_stream::transport::DidCommFrameSink {
+                    client: self.client,
+                    binding: incoming.binding.clone(),
+                    capabilities: incoming.capabilities.clone(),
+                    max_envelope_bytes: stream_envelope_limit(self.bootstrap_config.as_ref()),
+                });
+                incoming.run(sink).await;
+            }
+            Ok(None) => {}
+            Err(refusal) => {
+                let message = &self.gate.message;
+                warn!(
+                    from = ?message.from_did,
+                    error = %refusal,
+                    code = ?refusal.code,
+                    "Rejecting Fabric Open"
+                );
+                let Ok(_answering) = self
+                    .refusals
+                    .try_acquire_owned()
+                else {
+                    warn!(from = ?message.from_did, "Too many refused Fabric Opens awaiting an answer; leaving this one unanswered");
+                    return;
+                };
+                answer_refused_open(
+                    &self.client,
+                    message,
+                    refusal.code,
+                    self.gate
+                        .gateway_store
+                        .as_deref(),
+                    &self.bootstrap_config,
+                )
+                .await;
+            }
         }
     }
 }
@@ -2693,11 +2725,13 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                         match crate::proxy::fabric_stream::global() {
                             Ok(runtime) => {
                                 let admission = OpenAdmission {
-                                    runtime: Arc::clone(runtime),
-                                    message: received_msg.clone(),
-                                    connection_point: Arc::clone(&connection_point_arc),
-                                    cp_store: cp_store.clone(),
-                                    gateway_store: gateway_store.clone(),
+                                    gate: OpenGate {
+                                        runtime: Arc::clone(runtime),
+                                        message: received_msg.clone(),
+                                        connection_point: Arc::clone(&connection_point_arc),
+                                        cp_store: cp_store.clone(),
+                                        gateway_store: gateway_store.clone(),
+                                    },
                                     client: client.clone(),
                                     bootstrap_config: bootstrap_config.clone(),
                                     refusals: Arc::clone(&pending_open_refusals),
@@ -2707,7 +2741,7 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                     &pending_open_admissions,
                                     &runtime.registry,
                                     &received_msg,
-                                    move |stream_id, permit| admission.admit_and_run(stream_id, permit),
+                                    move |held, permit| admission.admit_and_run(held, permit),
                                 )
                             }
                             Err(error) => Err(error.into()),
@@ -4235,10 +4269,9 @@ mod tests {
             &admissions,
             &runtime.registry,
             &open_from(Some(first)),
-            move |stream_id, permit| async move {
-                assert_eq!(stream_id, first);
+            move |held, permit| async move {
                 waiting.notified().await;
-                drop(permit);
+                drop((held, permit));
             },
         )
         .expect("the reader loop goes on while the Open is admitted");
@@ -4294,9 +4327,9 @@ mod tests {
             &admissions,
             &runtime.registry,
             &open_from(Some(stream_id)),
-            move |_, permit| async move {
+            move |held, permit| async move {
                 waiting.notified().await;
-                drop(permit);
+                drop((held, permit));
             },
         )
         .unwrap();
@@ -4309,6 +4342,247 @@ mod tests {
             assert_eq!(admissions.available_permits(), 1, "a refused Open gives its slot back");
         }
         finish.notify_one();
+    }
+
+    #[tokio::test]
+    async fn an_admission_that_ends_without_releasing_drops_its_held_frames() {
+        let runtime = StreamRuntime::test_runtime();
+        let admissions = Arc::new(Semaphore::new(2));
+        let mut tasks = JoinSet::new();
+        let (aborted, panicked) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        super::start_open_admission(
+            &mut tasks,
+            &admissions,
+            &runtime.registry,
+            &open_from(Some(panicked)),
+            |held, _permit| async move {
+                let _held = held;
+                panic!("admission failed");
+            },
+        )
+        .unwrap();
+        assert!(
+            tasks
+                .join_next()
+                .await
+                .unwrap()
+                .is_err_and(|error| error.is_panic())
+        );
+        assert!(
+            !runtime
+                .registry
+                .was_opened(&panicked),
+            "a panicking admission holds nothing"
+        );
+
+        super::start_open_admission(
+            &mut tasks,
+            &admissions,
+            &runtime.registry,
+            &open_from(Some(aborted)),
+            |held, _permit| async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            },
+        )
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            runtime
+                .registry
+                .was_opened(&aborted)
+        );
+        tasks.shutdown().await;
+        assert!(
+            !runtime
+                .registry
+                .was_opened(&aborted),
+            "an admission aborted with its listener holds nothing"
+        );
+        assert_eq!(admissions.available_permits(), 2);
+    }
+
+    /// A Connection Point store that answers `get` with `record` after
+    /// `delay`, running `on_get` first. Admission reads nothing else.
+    struct StubConnectionPoints {
+        record: Option<crate::gateways::connection_points::types::GatewayConnectionPoint>,
+        delay: std::time::Duration,
+        on_get: Box<dyn Fn() + Send + Sync>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::gateways::connection_points::ConnectionPointStore for StubConnectionPoints {
+        async fn create(
+            &self,
+            _: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            unreachable!("admission only reads its Connection Point")
+        }
+
+        async fn get(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            (self.on_get)();
+            tokio::time::sleep(self.delay).await;
+            Ok(self.record.clone())
+        }
+
+        async fn list_all(
+            &self
+        ) -> anyhow::Result<Vec<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            unreachable!("admission only reads its Connection Point")
+        }
+
+        async fn list_by_gateway(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Vec<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            unreachable!("admission only reads its Connection Point")
+        }
+
+        async fn update(
+            &self,
+            _: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            unreachable!("admission only reads its Connection Point")
+        }
+
+        async fn delete(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            unreachable!("admission only reads its Connection Point")
+        }
+    }
+
+    /// Admits an Open the peer's sender built, holding its stream's frames
+    /// meanwhile, with the Connection Point `connection_points` reads.
+    async fn admit_open(
+        fixture: &crate::proxy::fabric_stream::test_fixture::OpenFixture,
+        gateways: &Arc<crate::gateways::FileSystemGatewayStore>,
+        connection_points: StubConnectionPoints,
+    ) -> (
+        uuid::Uuid,
+        Result<Option<crate::proxy::fabric_stream::IncomingStream>, crate::proxy::fabric_stream::OpenRefusal>,
+    ) {
+        let nonce = uuid::Uuid::new_v4();
+        fixture
+            .runtime
+            .process(&fixture.capability_query(nonce), &MessageType::ForwardStreamQuery);
+        let open = fixture.open(nonce);
+        let stream_id = uuid::Uuid::parse_str(
+            open.message_body["stream_id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let held = fixture
+            .runtime
+            .registry
+            .hold(stream_id, &fixture.peer.did)
+            .unwrap();
+        let gate = super::OpenGate {
+            runtime: Arc::clone(&fixture.runtime),
+            message: open,
+            connection_point: Arc::new(fixture.connection.clone()),
+            cp_store: Some(Arc::new(connection_points)),
+            gateway_store: Some(Arc::clone(gateways)),
+        };
+        (stream_id, gate.admit_held(held).await)
+    }
+
+    #[tokio::test]
+    async fn open_admission_reads_the_current_records_and_refuses_an_open_access_changed_under() {
+        use crate::gateways::GatewayStore;
+        use crate::proxy::fabric_stream::test_fixture::{OpenFixture, in_isolated_child};
+        use std::time::Duration;
+
+        if !in_isolated_child("Open admission").await {
+            return;
+        }
+        let fixture = OpenFixture::new().await;
+        let directory = tempfile::tempdir().unwrap();
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                directory
+                    .path()
+                    .join("gateways"),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        gateways
+            .create(&fixture.peer)
+            .await
+            .unwrap();
+        let current = |record| StubConnectionPoints {
+            record,
+            delay: Duration::ZERO,
+            on_get: Box::new(|| {}),
+        };
+        let registry = &fixture.runtime.registry;
+
+        let (admitted, outcome) = admit_open(&fixture, &gateways, current(Some(fixture.connection.clone()))).await;
+        let incoming = outcome
+            .expect("the records admit the Open")
+            .expect("the hold was kept");
+        assert!(registry.is_running(&admitted));
+        drop(incoming);
+
+        let mut disabled = fixture.connection.clone();
+        disabled.enabled = false;
+        let mut narrowed = fixture.connection.clone();
+        narrowed.exposed_channels = vec!["another-surface".into()];
+        for (record, case) in [
+            (Some(disabled), "a Connection Point disabled since its listener started"),
+            (Some(narrowed), "a Connection Point that stopped exposing the surface"),
+            (None, "a removed Connection Point"),
+        ] {
+            let (stream_id, outcome) = admit_open(&fixture, &gateways, current(record)).await;
+            assert!(outcome.is_err(), "{case}");
+            assert!(!registry.is_running(&stream_id), "{case}");
+            assert!(!registry.was_opened(&stream_id), "{case}: the held frames are dropped");
+        }
+
+        let revoking = Arc::clone(&fixture.runtime);
+        let (stream_id, outcome) = admit_open(
+            &fixture,
+            &gateways,
+            StubConnectionPoints {
+                record: Some(fixture.connection.clone()),
+                delay: Duration::ZERO,
+                on_get: Box::new(move || {
+                    revoking
+                        .registry
+                        .revoke(|_, _| false)
+                }),
+            },
+        )
+        .await;
+        let Err(refusal) = outcome else {
+            panic!("an Open admitted while a revocation ran is refused");
+        };
+        assert_eq!(refusal.to_string(), "Fabric access changed while the Open was admitted");
+        assert!(!registry.is_running(&stream_id), "nothing stays registered");
+
+        let (stream_id, outcome) = admit_open(
+            &fixture,
+            &gateways,
+            StubConnectionPoints {
+                record: Some(fixture.connection.clone()),
+                delay: super::OPEN_ADMISSION_TIMEOUT + Duration::from_secs(1),
+                on_get: Box::new(|| {}),
+            },
+        )
+        .await;
+        let Err(refusal) = outcome else {
+            panic!("an admission past its deadline is refused");
+        };
+        assert_eq!(refusal.to_string(), "Fabric Open admission timed out");
+        assert!(!registry.was_opened(&stream_id), "the held frames are dropped");
     }
 
     use futures::FutureExt;
@@ -4713,5 +4987,17 @@ mod restart_listener_tests {
             .await;
 
         assert_eq!(result.err().as_deref(), Some("Connection point 'cp-1' not found"));
+    }
+
+    #[tokio::test]
+    async fn a_connection_point_whose_listener_was_stopped_is_not_restarted() {
+        let root = tempfile::tempdir().unwrap();
+        let (manager, _issuer_dir) = test_listener_manager(root.path()).await;
+
+        let result = manager
+            .restart_listener_if_current("cp-1", "probed", Duration::from_secs(1))
+            .await;
+
+        assert_eq!(result.err().as_deref(), Some("Connection point 'cp-1' has no running listener; not restarting it"));
     }
 }

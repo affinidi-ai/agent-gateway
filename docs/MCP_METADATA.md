@@ -1357,8 +1357,11 @@ capabilities do not establish caller authorization.
 The listener answers a capability query only from a registered, active peer
 gateway, read from its in-memory gateway store; any other sender's query is
 dropped before it creates an offer, because the offer table is shared by every
-peer. Each peer holds at most its share of the offer table, and the peers of
-one tenant theirs together, so one peer's queries cannot fill it.
+peer. Once the offer table is half full, each peer holds at most its share of
+it, and the peers of one tenant theirs together, so one peer's queries cannot
+fill it (see [how the shares apply](#framed-fabric-limits)). A sending gateway
+has one capability query to a peer in flight at a time: concurrent first
+requests to that peer wait for its answer instead of each sending a query.
 
 The listener admits an Open (the peer lookup and route resolution) off its
 reader loop, at most 16 at a time. Frames that arrive for the stream before its
@@ -1555,10 +1558,10 @@ process.
 | Opens per peer | 50/s, burst 100, per listener | The Open is refused with `capacity_reached` before any lookup; the caller gets `429` |
 | Opens being admitted | 16 at a time per listener, off the listener's reader loop, each for up to 2 s | The Open is refused with `capacity_reached`; the caller gets `429` |
 | Frames held per Open being admitted | 8, from the Open's sender only | The admitted stream is dropped, and its caller waits for the response deadline |
-| Open replay records | 512 per allowed stream (65,536); one peer holds at most an eighth of them and the peers of one tenant half | The Open is refused with `capacity_reached`; the caller gets `429` |
+| Open replay records | 512 per allowed stream (65,536); once half of them are held, one peer holds at most an eighth and the peers of one tenant half | The Open is refused with `capacity_reached`; the caller gets `429` |
 | Capability queries per sender | 10/s, burst 20, per listener | The query is dropped |
-| Capability offers held | 256; one peer holds at most 32 live offers and the peers of one tenant 128 | The query is not answered; the sender's caller gets `502` |
-| Capability probes in flight | 256 on the sending gateway; to one peer at most 32 and to the peers of one tenant 128 | The caller gets `429` with `Retry-After: 5` |
+| Capability offers held | 256; once 128 are held, one peer holds at most 32 live offers and the peers of one tenant 128 | The query is not answered; the sender's caller gets `502` after waiting up to 5 s |
+| Capability probes in flight | 256 on the sending gateway, one at a time to each peer through each Connection Point, shared by concurrent first requests; once 128 are in flight, to one peer at most 32 and to the peers of one tenant 128 | The caller gets `429` with `Retry-After: 5` |
 | Refused Opens being answered | 16 at a time per listener, across all peers, off the listener's reader loop | Further refusals are not answered and are logged at `warn`; the sender waits for its response deadline and its caller gets `504` |
 | `subscriptions/listen` per caller | 16 (the authenticated principal, or the client IP or peer DID when unauthenticated) | `429` |
 | `subscriptions/listen` per surface | 256 across callers | `429` |
@@ -1584,6 +1587,17 @@ slot may stay held for up to an hour, so a slot is unlikely to free within
 5 s, but the sending gateway checks its own caps before it sends an Open, so a
 caller retrying on that interval costs local work only and sends nothing to
 the peer.
+
+**How the shares apply.** The capability offer and probe tables and the Open
+replay table are shared by every peer. Until a table is half full, any peer
+may add to it, so one busy peer is not capped while the table has room. From
+then on one peer may hold an eighth of the table, and the peers of one tenant
+(the tenant owning each peer's Remote gateway record) half of it together. The
+tenant share applies only while other tenants' peers, or peers whose record
+has no tenant, hold entries too, so a gateway whose peers all belong to one
+tenant gives them the whole table, each peer still within its own eighth. A
+peer whose record has no tenant counts against no tenant's share, only its own
+and the table's capacity. These values are fixed and not configurable.
 
 **Cap refusals are logged.** Each registration refused by a full cap is logged
 at `warn` as `Fabric stream cap reached`, with `peer_did`, `surface_id`,

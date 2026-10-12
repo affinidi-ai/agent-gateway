@@ -235,8 +235,8 @@ struct SendEntry {
 }
 
 /// Replay records kept per allowed stream. A record lasts no longer than the
-/// capability offer its `Open` used, so this bounds memory without capping
-/// ordinary traffic.
+/// capability offer its `Open` used, and one peer alone may fill half the
+/// table, so this bounds memory without capping ordinary traffic.
 const OPEN_REPLAY_RECORDS_PER_STREAM: usize = 512;
 
 fn open_replay_cap(limit: ShareLimit) -> &'static str {
@@ -318,6 +318,22 @@ impl ReceiveRegistry {
             .lock()
             .is_ok_and(|held| held.contains_key(stream_id))
             || self.was_accepted(stream_id)
+    }
+
+    /// Whether `stream_id` is registered as a running stream, in either
+    /// direction.
+    #[cfg(test)]
+    pub fn is_running(
+        &self,
+        stream_id: &Uuid,
+    ) -> bool {
+        self.entries
+            .lock()
+            .is_ok_and(|entries| entries.contains_key(stream_id))
+            || self
+                .senders
+                .lock()
+                .is_ok_and(|senders| senders.contains_key(stream_id))
     }
 
     fn was_accepted(
@@ -420,12 +436,14 @@ impl ReceiveRegistry {
 
     /// Holds the frames that arrive for `stream_id` while its `Open` is
     /// admitted off the reader loop, so they reach the stream in order once it
-    /// is registered. Only frames from `peer_did` are held.
+    /// is registered. Only frames from `peer_did` are held. Dropping the
+    /// returned guard without releasing it drops the frames, so an admission
+    /// that is aborted or panics leaves nothing held.
     pub fn hold(
-        &self,
+        self: &Arc<Self>,
         stream_id: Uuid,
         peer_did: &str,
-    ) -> Result<(), RegisterError> {
+    ) -> Result<HeldStream, RegisterError> {
         let mut held = self
             .held
             .lock()
@@ -441,14 +459,18 @@ impl ReceiveRegistry {
                 overflowed: false,
             },
         );
-        Ok(())
+        Ok(HeldStream {
+            registry: Arc::clone(self),
+            stream_id,
+            released: false,
+        })
     }
 
     /// Stops holding `stream_id`'s frames. When its `Open` was admitted, the
     /// held frames are delivered in arrival order, ahead of any frame read
     /// later; otherwise they are dropped. Fails when the sender sent more
     /// frames than it may before admission, or a held frame is refused.
-    pub fn release(
+    fn release(
         &self,
         stream_id: &Uuid,
         admitted: bool,
@@ -939,6 +961,37 @@ impl Drop for SendLease {
     }
 }
 
+/// The frames held for a stream whose `Open` is being admitted (see
+/// [`ReceiveRegistry::hold`]).
+pub(crate) struct HeldStream {
+    registry: Arc<ReceiveRegistry>,
+    stream_id: Uuid,
+    released: bool,
+}
+
+impl HeldStream {
+    /// Ends the hold: an admitted `Open`'s frames are delivered in order, a
+    /// refused one's are dropped.
+    pub fn release(
+        mut self,
+        admitted: bool,
+    ) -> Result<(), String> {
+        self.released = true;
+        self.registry
+            .release(&self.stream_id, admitted)
+    }
+}
+
+impl Drop for HeldStream {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self
+                .registry
+                .release(&self.stream_id, false);
+        }
+    }
+}
+
 pub(crate) struct ReceiveLease {
     registry: Weak<ReceiveRegistry>,
     stream_id: Uuid,
@@ -1393,16 +1446,18 @@ mod tests {
 
     #[tokio::test]
     async fn one_peer_or_tenant_cannot_fill_the_open_replay_table() {
-        let registry = ReceiveRegistry::new(RegistryLimits {
-            max_streams: 1,
-            max_peer_streams: 1,
-            max_surface_streams: 1,
-            max_peer_listens: 1,
-            max_surface_listens: 1,
-        })
-        .unwrap();
+        let replay_table = || {
+            ReceiveRegistry::new(RegistryLimits {
+                max_streams: 1,
+                max_peer_streams: 1,
+                max_surface_streams: 1,
+                max_peer_listens: 1,
+                max_surface_listens: 1,
+            })
+            .unwrap()
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        let open = |peer: &str, tenant: Option<&str>| {
+        let open = |registry: &Arc<ReceiveRegistry>, peer: &str, tenant: Option<&str>| {
             let mut binding = binding();
             binding.peer_did = format!("did:example:{peer}");
             registry
@@ -1420,21 +1475,31 @@ mod tests {
                 .map(drop)
         };
         let full = Err(RegisterError::CapacityReached("Fabric open replay-protection capacity reached"));
-        let peer_share = OPEN_REPLAY_RECORDS_PER_STREAM / 8;
+        let half = OPEN_REPLAY_RECORDS_PER_STREAM / 2;
 
-        for _ in 0..peer_share {
-            assert_eq!(open("alpha", None), Ok(()));
+        let registry = replay_table();
+        for _ in 0..half {
+            assert_eq!(open(&registry, "alpha", None), Ok(()));
         }
-        assert_eq!(open("alpha", None), full, "a peer past its share is told to retry");
-        assert_eq!(open("bravo", None), Ok(()), "another peer is still admitted");
+        assert_eq!(
+            open(&registry, "alpha", None),
+            full,
+            "a peer alone fills at most half the table, then is told to retry"
+        );
+        assert_eq!(open(&registry, "bravo", None), Ok(()), "another peer is still admitted");
 
-        for peer in ["tenant-1", "tenant-2", "tenant-3", "tenant-4"] {
-            for _ in 0..peer_share {
-                assert_eq!(open(peer, Some("tenant")), Ok(()));
-            }
-        }
-        assert_eq!(open("tenant-5", Some("tenant")), full, "the tenant's peers hold at most half");
-        assert_eq!(open("other-1", Some("other")), Ok(()));
+        let registry = replay_table();
+        assert_eq!(open(&registry, "appliance", None), Ok(()));
+        let tenant_held: usize = ["tenant-1", "tenant-2", "tenant-3"]
+            .iter()
+            .map(|peer| {
+                std::iter::repeat_with(|| open(&registry, peer, Some("tenant")))
+                    .take_while(Result::is_ok)
+                    .count()
+            })
+            .sum();
+        assert_eq!(tenant_held, half, "one tenant's peers hold at most half while another peer holds entries");
+        assert_eq!(open(&registry, "other-1", Some("other")), Ok(()));
     }
 
     #[tokio::test]
@@ -1449,7 +1514,7 @@ mod tests {
                 data: encode_chunk(chunk).unwrap(),
             },
         };
-        registry
+        let held = registry
             .hold(id, "did:example:peer")
             .unwrap();
         assert!(registry.was_opened(&id), "an Open being admitted is not answered as refused");
@@ -1474,9 +1539,7 @@ mod tests {
         let (mut receiver, _sender) = registry
             .open(id, binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
             .unwrap();
-        registry
-            .release(&id, true)
-            .unwrap();
+        held.release(true).unwrap();
         for expected in [b"one".as_slice(), b"two".as_slice()] {
             match receiver.next().await {
                 Ok(ReceiveEvent::Data { bytes, .. }) => assert_eq!(bytes.as_ref(), expected),
@@ -1499,13 +1562,11 @@ mod tests {
         };
 
         let refused = Uuid::new_v4();
-        registry
+        let held = registry
             .hold(refused, "did:example:peer")
             .unwrap();
         assert_eq!(registry.deliver(&message(refused), "instance", frame(refused)), Ok(false));
-        registry
-            .release(&refused, false)
-            .unwrap();
+        held.release(false).unwrap();
         assert!(!registry.was_opened(&refused), "a refused Open can be answered");
         assert_eq!(
             registry.deliver(&message(refused), "instance", frame(refused)),
@@ -1514,7 +1575,7 @@ mod tests {
         );
 
         let flooded = Uuid::new_v4();
-        registry
+        let held = registry
             .hold(flooded, "did:example:peer")
             .unwrap();
         for _ in 0..MAX_HELD_FRAMES_PER_OPEN {
@@ -1529,11 +1590,17 @@ mod tests {
         let _leases = registry
             .open(flooded, binding(), MAX_CHUNK_BYTES, MAX_CHUNK_BYTES, deadline)
             .unwrap();
+        assert!(held.release(true).is_err(), "a sender past the held frames is refused");
+
+        let abandoned = Uuid::new_v4();
+        let held = registry
+            .hold(abandoned, "did:example:peer")
+            .unwrap();
+        assert_eq!(registry.deliver(&message(abandoned), "instance", frame(abandoned)), Ok(false));
+        drop(held);
         assert!(
-            registry
-                .release(&flooded, true)
-                .is_err(),
-            "a sender past the held frames is refused"
+            !registry.was_opened(&abandoned),
+            "an admission that ends without releasing its hold leaves nothing held"
         );
     }
 

@@ -1,16 +1,21 @@
 //! Per-peer and per-tenant shares of the tables every Fabric peer uses: the
 //! capability offers and probes and the `Open` replay records.
 //!
-//! One peer may hold an eighth of a table, and the peers of one tenant half of
-//! it together, so neither a single peer nor one tenant's peers can fill a
-//! table and get every other peer refused. A peer whose Remote gateway record
-//! has no tenant counts only against its own share and the table's capacity.
+//! Until a table is half full any peer may add to it, so a single busy peer is
+//! not capped while the table has room. From then on one peer may hold an
+//! eighth of it, and the peers of one tenant half of it together, so neither a
+//! single peer nor one tenant's peers can fill a table and get every other peer
+//! refused. The tenant share applies only while other tenants' peers, or peers
+//! whose Remote gateway record has no tenant, hold entries too. A peer whose
+//! record has no tenant counts only against its own share and the capacity.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
 const PEER_SHARE_DIVISOR: usize = 8;
 const TENANT_SHARE_DIVISOR: usize = 2;
+/// The shares apply once a table holds this fraction of its capacity.
+const SHARED_FROM_DIVISOR: usize = 2;
 
 /// The peer an entry is held for, and the tenant that owns the peer's Remote
 /// gateway record.
@@ -80,6 +85,12 @@ impl<K: Eq + Hash, V> SharedTable<K, V> {
             .map(|(_, value)| value)
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.entries
+            .iter_mut()
+            .map(|(key, (_, value))| (key, value))
+    }
+
     pub fn contains_key(
         &self,
         key: &K,
@@ -87,21 +98,27 @@ impl<K: Eq + Hash, V> SharedTable<K, V> {
         self.entries.contains_key(key)
     }
 
-    /// Whether one more entry for `owner` fits the capacity and its shares.
+    /// Whether one more entry for `owner` fits the capacity and, once the
+    /// table is half full, its shares.
     pub fn admits(
         &self,
         owner: &ShareOwner,
     ) -> Result<(), ShareLimit> {
-        if self.entries.len() >= self.capacity {
+        let held = self.entries.len();
+        if held >= self.capacity {
             return Err(ShareLimit::Total);
+        }
+        if held < share(self.capacity, SHARED_FROM_DIVISOR) {
+            return Ok(());
         }
         if count(&self.per_peer, &owner.peer_did) >= share(self.capacity, PEER_SHARE_DIVISOR) {
             return Err(ShareLimit::Peer);
         }
-        if let Some(tenant_id) = &owner.tenant_id
-            && count(&self.per_tenant, tenant_id) >= share(self.capacity, TENANT_SHARE_DIVISOR)
-        {
-            return Err(ShareLimit::Tenant);
+        if let Some(tenant_id) = &owner.tenant_id {
+            let tenant_held = count(&self.per_tenant, tenant_id);
+            if tenant_held < held && tenant_held >= share(self.capacity, TENANT_SHARE_DIVISOR) {
+                return Err(ShareLimit::Tenant);
+            }
         }
         Ok(())
     }
@@ -211,29 +228,52 @@ mod tests {
     }
 
     #[test]
-    fn a_full_peer_share_refuses_only_that_peer() {
+    fn one_peer_may_fill_half_the_table_and_then_only_other_peers_add() {
         let mut table = SharedTable::new(16);
-        for key in 0..2 {
-            assert_eq!(table.insert(key, owner("alpha", None), ()), Ok(()));
+        for key in 0..8 {
+            assert_eq!(table.insert(key, owner("alpha", None), ()), Ok(()), "entry {key} of a half-empty table");
         }
-        assert_eq!(table.insert(2, owner("alpha", None), ()), Err(ShareLimit::Peer));
-        assert_eq!(table.insert(2, owner("bravo", None), ()), Ok(()));
-        assert_eq!(table.len(), 3);
+        assert_eq!(table.insert(8, owner("alpha", None), ()), Err(ShareLimit::Peer));
+        for (key, peer) in [(8, "bravo"), (9, "bravo")] {
+            assert_eq!(table.insert(key, owner(peer, None), ()), Ok(()));
+        }
+        assert_eq!(table.insert(10, owner("bravo", None), ()), Err(ShareLimit::Peer), "a peer's eighth applies now");
+        assert_eq!(table.insert(10, owner("charlie", None), ()), Ok(()));
+        assert_eq!(table.len(), 11);
     }
 
     #[test]
-    fn a_full_tenant_share_refuses_that_tenants_other_peers_but_not_other_tenants() {
+    fn a_tenant_share_applies_only_while_others_hold_entries() {
         let mut table = SharedTable::new(16);
         let mut key = 0;
-        for peer in ["a1", "a2", "a3", "a4"] {
+        for peer in ["a1", "a2", "a3", "a4", "a5"] {
             for _ in 0..2 {
-                assert_eq!(table.insert(key, owner(peer, Some("tenant-a")), ()), Ok(()));
+                assert_eq!(
+                    table.insert(key, owner(peer, Some("tenant-a")), ()),
+                    Ok(()),
+                    "one tenant's peers alone are held only by their own shares"
+                );
                 key += 1;
             }
         }
-        assert_eq!(table.insert(key, owner("a5", Some("tenant-a")), ()), Err(ShareLimit::Tenant));
         assert_eq!(table.insert(key, owner("b1", Some("tenant-b")), ()), Ok(()));
+        key += 1;
+        assert_eq!(table.insert(key, owner("a6", Some("tenant-a")), ()), Err(ShareLimit::Tenant));
+        assert_eq!(table.insert(key, owner("b2", Some("tenant-b")), ()), Ok(()));
         assert_eq!(table.insert(key + 1, owner("appliance", None), ()), Ok(()));
+        assert_eq!(table.insert(key + 2, owner("a6", Some("tenant-a")), ()), Err(ShareLimit::Tenant));
+    }
+
+    #[test]
+    fn untenanted_peers_count_against_no_tenant_share() {
+        let mut table = SharedTable::new(16);
+        for (key, peer) in ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(table.insert(key, owner(peer, None), ()), Ok(()));
+        }
+        assert!(table.per_tenant.is_empty());
     }
 
     #[test]
@@ -250,7 +290,7 @@ mod tests {
 
     #[test]
     fn removed_and_expired_entries_free_their_owners_share() {
-        let mut table = SharedTable::new(16);
+        let mut table = SharedTable::new(4);
         table
             .insert(0, owner("alpha", Some("t")), 10)
             .unwrap();
