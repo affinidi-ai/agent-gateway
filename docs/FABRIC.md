@@ -240,10 +240,19 @@ Records written before the mode existed have no `exposure_mode`. On boot,
 list (its earlier meaning) and `list` for a record with a non-empty one, so existing peers keep their
 access. Until a record is migrated, it is read with that same earlier meaning, never with more access.
 
+Upgrade every node that shares gateway storage, such as both nodes of an active/standby pair,
+before failing back to a node on an earlier version, and do not pair peers or change exposure
+until every node runs a version with exposure modes. An earlier version ignores `exposure_mode`.
+It reads a record with mode `none` and an empty list as every surface, and drops the mode when
+it saves the record, including a background update, so the peer then reaches every surface on
+the new version too. If a node on an earlier version ran after the upgrade, check each Remote
+record's `exposure_mode` and set it again.
+
 Set the mode with `PUT /v1/gateways/{id}/exposed-surfaces` (`gateways.edit`), body
 `{"exposure_mode": "list", "exposed_channels": ["surface-id"]}`. The list is stored only in `list`
 mode. A body without `exposure_mode` selects `list` for a non-empty list and `none` for an empty
-one, so an empty list never means every surface. The dashboard sets it on the **Publishing** tab of
+one, so an empty list never means every surface. On a gateway that is not Remote, such as the
+self gateway, the request is refused with 400. The dashboard sets it on the **Publishing** tab of
 a remote gateway.
 
 ### Revoking access ends running streams

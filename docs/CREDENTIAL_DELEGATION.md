@@ -41,7 +41,7 @@ Each entry in `AgentSurface.outbound_credentials`
 
 | Field | Options | Default |
 | --- | --- | --- |
-| `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names | `all` |
+| `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names, matched against `params.name` of a `tools/call` on Access Points and Transit Points | `all` |
 | `consent_mode` | `on_demand`, `pre_authorize`, or `elicit` | `on_demand` |
 | `inject_as` | `bearer_header`, `custom_header { name, format }`, or `meta { field }` | `bearer_header` |
 | `scopes` | Scopes to request | The provider's defaults |

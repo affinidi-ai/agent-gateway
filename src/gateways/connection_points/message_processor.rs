@@ -4157,6 +4157,10 @@ async fn process_forward_request_with_mcp_runtime(
             None
         };
         if let Some(classification) = classification {
+        if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body_bytes) {
+            channel_warn!(config_id, "Rejecting fabric MCP request body at admission: {}", refusal.reason());
+            return axum_response_to_forward_result(refusal.into_response()).await;
+        }
         let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(&classification, surface.mcp_legacy_metadata_output);
         if let Err(error) = surface.validate_mcp_metadata_base() {
             channel_warn!(config_id, "Invalid MCP metadata configuration: {}", error);

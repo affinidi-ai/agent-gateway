@@ -100,6 +100,9 @@ pub(crate) enum OutboundPipelineError {
     #[error("Invalid MCP identity presentation")]
     McpIdentityInvalid,
 
+    #[error("MCP request body refused: {}", .0.reason())]
+    McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal),
+
     #[error("{error}")]
     McpMetadata { error: crate::mcp::meta::McpMetadataError, body: Bytes, response: bool },
 
@@ -166,7 +169,10 @@ impl OutboundPipelineError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::McpValidation(error) => error.status,
-            Self::McpIdentityInvalid => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::McpIdentityInvalid | Self::McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal::Batch) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            Self::McpBodyRefused(_) => StatusCode::OK,
             Self::McpMetadata { response, .. } => {
                 if *response {
                     StatusCode::BAD_GATEWAY
@@ -225,6 +231,9 @@ impl IntoResponse for OutboundPipelineError {
         }
         if let Self::McpValidation(error) = self {
             return (*error).into_response();
+        }
+        if let Self::McpBodyRefused(refusal) = self {
+            return refusal.into_response();
         }
         if let Self::UpstreamCapacityReached(id) = self {
             return crate::proxy::fabric_forward::capacity_response(id);
@@ -1755,6 +1764,10 @@ async fn step_extract_protocol_context_with_versions(
                     &transit_upstream_key(ctx),
                 ))
             })?;
+        if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body) {
+            warn!(request_id = %ctx.request_id, reason = refusal.reason(), "Rejecting MCP request body at admission");
+            return Err(OutboundPipelineError::McpBodyRefused(refusal));
+        }
         ctx.surface
             .validate_mcp_metadata_base()
             .map_err(|error| {
@@ -3172,8 +3185,8 @@ async fn step_transit_point_opa_policy(
 /// MCP tool gating firewall hides the named tool. Parity with the
 /// `tools/list` filter applied on the response leg, so a tool the managed
 /// agent can't see it also can't invoke. Only runs for MCP transit points
-/// that have gating installed; a missing tool name or absent gating passes
-/// through. The gate condition is evaluated against the same outbound
+/// that have gating installed; absent gating passes through, while a
+/// `tools/call` whose tool name can't be read is blocked. The gate condition is evaluated against the same outbound
 /// `PolicyInput` the transit-point OPA gate sees, with `mcp.method` pinned to
 /// `tools/call`.
 async fn step_transit_mcp_tool_gating(
@@ -3204,18 +3217,32 @@ async fn step_transit_mcp_tool_gating(
         return Ok(());
     };
 
-    let tool_name = ctx
+    // Fail closed: with gating installed, a `tools/call` whose tool name can't
+    // be read (missing or non-string `params.name`, unparseable body) can't be
+    // checked against the gates, so it must not reach the upstream ungated.
+    let Some(tool_name) = ctx
         .body_bytes
-        .as_ref()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
-        .and_then(|v| {
-            v.get("params")
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
-                .map(str::to_string)
+        .as_deref()
+        .and_then(crate::mcp::tool_analyzer::called_tool_name)
+    else {
+        crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+            scope: crate::observability::PolicyScope::McpTool,
+            allow: false,
+            reason: Some("tools/call without a readable tool name under per-transit-point MCP tool gating"),
+            policy_id: Some("mcp_tool_gating"),
+            surface_id: Some(config_id),
+            trace_id: Some(ctx.request_id.as_str()),
+            http_method: Some(ctx.original_method.as_str()),
+            path: Some(ctx.request_path.as_str()),
+            caller: outbound_caller(ctx).as_ref(),
+            ..Default::default()
         });
-    let Some(tool_name) = tool_name else {
-        return Ok(());
+        warn!(
+            request_id = %ctx.request_id,
+            alias = %alias,
+            "Per-transit-point MCP tool gating blocked tools/call without a readable tool name"
+        );
+        return Err(OutboundPipelineError::TransitMcpToolGated);
     };
 
     // Only build + serialize the outbound context when a gate has an OPA
@@ -3909,7 +3936,10 @@ async fn step_inject_credentials(
         .config_id()
         .unwrap_or("unknown");
 
-    let mcp_tool = ctx.operation.as_deref();
+    let mcp_tool = ctx
+        .body_bytes
+        .as_deref()
+        .and_then(crate::mcp::tool_analyzer::called_tool_name);
 
     let audit_ctx = crate::proxy::credential_delegation::DelegationAuditContext {
         caller: None,
@@ -3923,7 +3953,7 @@ async fn step_inject_credentials(
             .protocol
             .as_ref()
             .map(|p| format!("{:?}", p).to_lowercase()),
-        mcp_tool_name: mcp_tool.map(String::from),
+        mcp_tool_name: mcp_tool.clone(),
         agent_identity_did: match &ctx.resolved_identity {
             ProtectedAgentIdentity::Managed { did, .. } => Some(did.clone()),
             ProtectedAgentIdentity::Anonymous => None,
@@ -3937,7 +3967,7 @@ async fn step_inject_credentials(
         &user_hash,
         agent_did,
         channel_id,
-        mcp_tool,
+        mcp_tool.as_deref(),
         vault_store,
         provider_store,
         secrets_store,
@@ -7103,6 +7133,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transit_tool_gating_denies_gated_tools_call_with_or_without_id() {
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "cfg-tp-gate-call",
+            "name": "tp-gate-call",
+            "description": "",
+            "status": "active",
+            "access_point": {
+                "listen_address": "0.0.0.0:8443",
+                "route": "/surfaces/order",
+                "protocol": "mcp"
+            },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": {
+                "points": [{
+                    "alias": "partner-mcp",
+                    "target_endpoint": "https://partner.example.com/mcp",
+                    "protocol": "mcp",
+                    "mcp_tool_gating": {
+                        "gates": [{
+                            "id": "g1",
+                            "name": "no admin",
+                            "action": { "effect": "deny", "patterns": ["^admin_"] }
+                        }]
+                    }
+                }]
+            }
+        }))
+        .expect("surface json");
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.policy_manager = Some(manager);
+        let surface = Arc::new(surface);
+
+        for (body, denied) in [
+            (json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "admin_reset"}}), true),
+            (json!({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "admin_reset"}}), true),
+            (json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "read_orders"}}), false),
+            (json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}}), true),
+            (json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call"}), true),
+            (json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": 42}}), true),
+            (
+                json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": {"value": "admin_reset"}}}),
+                true,
+            ),
+        ] {
+            let mut ctx = test_pipeline_context();
+            ctx.surface = surface.clone();
+            ctx.virtual_channel = serde_json::from_value(json!({
+                "alias": "partner-mcp",
+                "target_endpoint": "https://partner.example.com/mcp",
+                "protocol": "mcp"
+            }))
+            .expect("transit point json");
+            ctx.operation = Some("tools/call".to_string());
+            ctx.body_bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+
+            let result = step_transit_mcp_tool_gating(&state, &mut ctx).await;
+
+            assert_eq!(matches!(result, Err(OutboundPipelineError::TransitMcpToolGated)), denied, "{body}: {result:?}");
+            assert!(denied || result.is_ok(), "{body}: {result:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn filter_transit_mcp_tools_list_fails_closed_for_unparseable_gated_response() {
         let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
@@ -7160,6 +7258,281 @@ mod tests {
         let unchanged = filter_transit_mcp_tools_list(&state, &ctx, raw_body.clone());
 
         assert_eq!(unchanged, raw_body);
+    }
+
+    #[tokio::test]
+    async fn transit_tool_scoped_binding_applies_only_to_listed_tools() {
+        use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+        use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+        use crate::secrets::SecretsStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let providers = Arc::new(
+            FileSystemCredentialProviderStore::new(
+                directory
+                    .path()
+                    .join("providers"),
+            )
+            .await
+            .unwrap(),
+        );
+        providers
+            .create(
+                serde_json::from_value(json!({
+                    "id": "provider", "name": "Provider", "provider_id": "provider",
+                    "authorization_endpoint": "https://provider.example/authorize",
+                    "client_id_secret_ref": "provider-client-id",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let vault = Arc::new(
+            FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                .await
+                .unwrap(),
+        );
+        vault
+            .store(
+                serde_json::from_value(json!({
+                    "id": "token", "agent_did": "did:web:caller.example", "user_identity_hash": "user-hash",
+                    "credential_provider_id": "provider", "provider_id": "provider",
+                    "access_token": "tool-scoped-credential", "token_type": "bearer", "scopes": [],
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let secrets = crate::secrets::FilesystemSecretsStore::new_async(
+            directory
+                .path()
+                .join("secrets")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        secrets
+            .create(
+                serde_json::from_value(json!({
+                    "name": "Provider client id", "secret_id": "provider-client-id", "value": "client-id"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.credential_provider_store = Some(providers);
+        state.delegation_vault_store = Some(vault.clone());
+        state.secrets_store = Some(Arc::new(secrets));
+        state.gateway_base_url = Some("https://gateway.example".to_string());
+
+        let mut surface = test_surface();
+        surface.outbound_credentials = vec![
+            serde_json::from_value(json!({
+                "credential_provider_id": "provider",
+                "required_for": {"tools": ["get_current_date_time"]}
+            }))
+            .unwrap(),
+        ];
+        let surface = Arc::new(surface);
+        let claims: crate::proxy::transit_token::TransitTokenClaims = serde_json::from_value(json!({
+            "iss": "gateway", "sub": "did:web:caller.example", "surface_id": "surface",
+            "iat": 0, "exp": 0, "jti": "jti", "user_identity_hash": "user-hash"
+        }))
+        .unwrap();
+
+        for (body, expected) in [
+            (
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_current_date_time"}}),
+                Some("Bearer tool-scoped-credential"),
+            ),
+            (json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "other_tool"}}), None),
+            (json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}), None),
+        ] {
+            let mut ctx = test_pipeline_context();
+            ctx.surface = surface.clone();
+            ctx.protocol = Some(ChannelProtocol::Mcp);
+            ctx.operation = body["method"]
+                .as_str()
+                .map(str::to_string);
+            ctx.body_bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+            ctx.transit_token_claims = Some(claims.clone());
+
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .unwrap_or_else(|error| panic!("{body}: {error:?}"));
+
+            assert_eq!(
+                ctx.original_headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                expected,
+                "{body}"
+            );
+        }
+
+        // Modern MCP: the prepared delegation claims every binding on the
+        // surface, so the legacy step never injects a tool-scoped credential.
+        let mut ctx = test_pipeline_context();
+        ctx.surface = surface.clone();
+        ctx.protocol = Some(ChannelProtocol::Mcp);
+        ctx.operation = Some("tools/call".to_string());
+        ctx.body_bytes = Some(Bytes::from(
+            serde_json::to_vec(
+                &json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "get_current_date_time"}}),
+            )
+            .unwrap(),
+        ));
+        ctx.transit_token_claims = Some(claims.clone());
+        ctx.modern_delegation =
+            Some(Box::new(crate::proxy::credential_delegation::modern::PreparedDelegation::handling(
+                crate::mcp::request_validation::ValidatedModernMessage {
+                    protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                    client_capabilities: None,
+                    client_info: None,
+                    method: "tools/call".into(),
+                    id: Some(json!(5)),
+                    kind: crate::mcp::request_validation::McpMessageKind::Request,
+                    params: Some(json!({"name": "get_current_date_time"})),
+                },
+                vec!["provider".to_string()],
+            )));
+
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.original_headers
+                .get("authorization")
+                .is_none()
+        );
+
+        assert!(
+            vault
+                .delete("token")
+                .await
+                .unwrap()
+        );
+        for (tool, consent_required) in [("get_current_date_time", true), ("other_tool", false)] {
+            let mut ctx = test_pipeline_context();
+            ctx.surface = surface.clone();
+            ctx.protocol = Some(ChannelProtocol::Mcp);
+            ctx.body_bytes = Some(Bytes::from(
+                serde_json::to_vec(
+                    &json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": tool}}),
+                )
+                .unwrap(),
+            ));
+            ctx.transit_token_claims = Some(claims.clone());
+
+            let result = step_inject_credentials(&state, &mut ctx).await;
+
+            assert_eq!(
+                matches!(result, Err(OutboundPipelineError::ConsentRequired(_))),
+                consent_required,
+                "{tool}: {result:?}"
+            );
+            assert!(consent_required || result.is_ok(), "{tool}: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transit_tool_call_batches_are_refused_before_tool_level_controls() {
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"content": []}}).to_string(),
+        )
+        .await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "batch-surface", "name": "Batch surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
+                "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr),
+                "mcp_tool_gating": {"gates": [{"id": "g1", "name": "no admin",
+                    "action": {"effect": "deny", "patterns": ["^admin_"]}}]}}]},
+            "outbound_credentials": [{"credential_provider_id": "provider", "required_for": {"tools": ["scoped_tool"]}}]
+        }))
+        .unwrap();
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+        let mut state = state;
+        state.policy_manager = Some(manager);
+
+        // A UTF-8 BOM hides the batch from serde, but a lenient upstream parser
+        // strips it and runs every call, so it is refused as a JSON-RPC parse error.
+        for (tool, bom) in [("admin_reset", false), ("scoped_tool", false), ("admin_reset", true)] {
+            let batch = json!([
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool, "arguments": {}}}
+            ]);
+            let mut body = if bom {
+                b"\xEF\xBB\xBF".to_vec()
+            } else {
+                Vec::new()
+            };
+            body.extend_from_slice(batch.to_string().as_bytes());
+            let request = Request::builder()
+                .method("POST")
+                .uri("/outbound/mcp/partner-a")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+
+            let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                state.clone(),
+                request,
+                crate::mcp::request_validation::McpVersionPolicy::new(
+                    &[crate::mcp::MCP_MODERN_VERSION],
+                    &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+                ),
+            ))
+            .await
+            .unwrap_or_else(|error| error.into_response());
+
+            let status = response.status();
+            let error: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 16384)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if bom {
+                assert_eq!(status, StatusCode::OK, "{tool} bom");
+                assert_eq!(error["error"]["code"], -32700, "{tool} bom: {error}");
+            } else {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{tool}");
+                assert_eq!(
+                    error,
+                    json!({"type": "https://a2a-protocol.org/errors/proxy-error", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
+                    "{tool}"
+                );
+            }
+            assert_eq!(
+                target
+                    .request_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{tool} bom={bom}"
+            );
+        }
     }
 
     // ── detect_protocol_and_operation ───────────────────────────────────────

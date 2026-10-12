@@ -2519,3 +2519,106 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
         assert!(!logs.contains(value), "credential value for {name} was logged:\n{logs}");
     }
 }
+
+#[test]
+fn fabric_tool_call_batches_are_refused_before_tool_level_controls() {
+    if std::env::var_os("ATG_FABRIC_TOOL_CALL_BATCH_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap()
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("ATG_FABRIC_TOOL_CALL_BATCH_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Fabric tool-call batch test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(fabric_tool_call_batch_flow()));
+}
+
+async fn fabric_tool_call_batch_flow() {
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": 2, "result": {"content": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-batch", "name": "fabric-batch",
+        "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": format!("http://{}", target.addr), "mcp_tool_gating": {"gates": [{"id": "g1",
+            "name": "no admin", "action": {"effect": "deny", "patterns": ["^admin_"]}}]}},
+        "outbound_credentials": [{"credential_provider_id": "provider", "required_for": {"tools": ["scoped_tool"]}}]
+    }))
+    .unwrap();
+    store
+        .save(&surface)
+        .await
+        .unwrap();
+    let policies = std::sync::Arc::new(crate::policies::SurfacePolicyManager::new());
+    policies
+        .update_channel_policy(&surface)
+        .await
+        .unwrap();
+    super::init_policy_manager(policies).await;
+
+    let now_secs = super::super::envelope_replay::now_secs();
+    for tool in ["admin_reset", "scoped_tool"] {
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool, "arguments": {}}}
+        ]);
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now_secs + 60),
+            json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": {}, "body": batch}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+
+        let (response, body) = receive(&message).await;
+
+        assert_eq!(response["status"], 422, "{tool}: {response}");
+        assert_eq!(response["headers"]["content-type"], "application/problem+json", "{tool}");
+        assert_eq!(
+            body,
+            json!({"type": "https://a2a-protocol.org/errors/proxy-error", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
+            "{tool}"
+        );
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "{tool}"
+        );
+    }
+}

@@ -51,6 +51,24 @@ pub struct PreparedDelegation {
     payment: Option<ContinuationPayment>,
 }
 
+#[cfg(test)]
+impl PreparedDelegation {
+    /// A prepared delegation with no injections that claims `handled_provider_ids`.
+    pub(crate) fn handling(
+        request: ValidatedModernMessage,
+        handled_provider_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            request,
+            injections: Vec::new(),
+            handled_provider_ids,
+            response_binding: None,
+            claimed: None,
+            payment: None,
+        }
+    }
+}
+
 pub enum ModernDelegationError {
     Continuation(ContinuationError),
     Protocol(Box<McpRequestValidationError>),

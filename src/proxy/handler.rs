@@ -1993,6 +1993,13 @@ async fn proxy_handler_with_mcp_runtime(
                 .into_response());
             }
         };
+        if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body_bytes) {
+            channel_warn!(config_id, "Rejecting MCP request body at admission: {}", refusal.reason());
+            connection_guard
+                .decrement()
+                .await;
+            return Ok(refusal.into_response());
+        }
         let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
             &classification,
             state
@@ -6050,7 +6057,7 @@ async fn proxy_handler_with_mcp_runtime(
         ) {
             let mcp_tool = mcp_context
                 .as_ref()
-                .and_then(|ctx| ctx.tool_name.as_deref());
+                .and_then(crate::surface_context::McpContext::called_tool_name);
 
             // Use the agent DID from request-path identity extraction.
             // Fall back to channel_id as the workload identity when no
@@ -6216,7 +6223,8 @@ async fn proxy_handler_with_mcp_runtime(
                             evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
                             evt.mcp_tool_name = mcp_context
                                 .as_ref()
-                                .and_then(|c| c.tool_name.clone());
+                                .and_then(crate::surface_context::McpContext::called_tool_name)
+                                .map(str::to_string);
                             evt.caller = authenticated_identity
                                 .as_ref()
                                 .map(crate::delegation_vault::audit::build_caller_context);
@@ -6549,7 +6557,8 @@ async fn proxy_handler_with_mcp_runtime(
                     evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
                     evt.mcp_tool_name = mcp_context
                         .as_ref()
-                        .and_then(|c| c.tool_name.clone());
+                        .and_then(crate::surface_context::McpContext::called_tool_name)
+                        .map(str::to_string);
                     evt.vp_jwt = Some(final_vp_jwt.clone());
                     evt.vp_fingerprint = Some(crate::delegation_vault::audit::vp_fingerprint(&final_vp_jwt));
                     evt.trace_id = Some(trace_id.clone());
@@ -13178,8 +13187,8 @@ async fn handle_fabric_request(
                             .into_iter()
                             .collect()
                     };
+                    channel_info!(config_id, "  Header: {}", key);
                     for value_str in values {
-                        channel_info!(config_id, "  Header: {}: {}", key, value_str);
                         response_builder = response_builder.header(key.as_str(), value_str);
                     }
                 }
