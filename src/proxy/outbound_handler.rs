@@ -4657,12 +4657,21 @@ fn compute_outbound_remainder_path(
         .to_string()
 }
 
-/// Check whether the upstream response is an agent card based on the request path and status.
+/// Check whether the upstream response is an agent card: a well-known card, or on
+/// an A2A/AP2 surface an extended card fetched over the HTTP+JSON binding.
 fn is_agent_card_response(
-    request_path: &str,
+    ctx: &OutboundPipelineContext,
     status: reqwest::StatusCode,
 ) -> bool {
-    status.is_success() && crate::proxy::paths::is_well_known_agent_card_path(request_path)
+    status.is_success()
+        && (crate::proxy::paths::is_well_known_agent_card_path(&ctx.request_path)
+            || (matches!(
+                ctx.surface.channel_protocol(),
+                crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
+            ) && crate::proxy::paths::is_rest_extended_agent_card_request(
+                ctx.original_method.as_str(),
+                &ctx.request_path,
+            )))
 }
 
 /// [12] Response Processing — strips headers and optionally rewrites agent card URLs.
@@ -5064,7 +5073,7 @@ fn process_outbound_response_body(
     // through the gateway. `TransitPoint.gateway_url` is declared
     // "computed" but never assigned, so derive it here from the surface
     // + listener config.
-    let body_bytes = if is_agent_card_response(&ctx.request_path, status) {
+    let body_bytes = if is_agent_card_response(ctx, status) {
         let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
             &ctx.surface,
             &ctx.virtual_channel,

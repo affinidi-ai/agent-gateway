@@ -431,7 +431,7 @@ pub fn is_extended_agent_card_method(method: &str) -> bool {
 /// Split a successful extended-card JSON-RPC response into its envelope and the
 /// serialized card from `result`. Returns `None` for error responses, non-object
 /// results and bodies that are not a JSON object, so those pass through unchanged.
-pub fn extended_agent_card_result(body: &[u8]) -> Option<(serde_json::Value, axum::body::Bytes)> {
+fn extended_agent_card_result(body: &[u8]) -> Option<(serde_json::Value, axum::body::Bytes)> {
     let envelope: serde_json::Value = serde_json::from_slice(body).ok()?;
     if envelope
         .get("error")
@@ -446,14 +446,46 @@ pub fn extended_agent_card_result(body: &[u8]) -> Option<(serde_json::Value, axu
     Some((envelope, axum::body::Bytes::from(card_bytes)))
 }
 
-/// Put a processed extended card back into the `result` of the envelope returned
-/// by [`extended_agent_card_result`], keeping every other envelope field.
+/// Whether a JSON-RPC request body calls an extended-card method.
+pub fn requests_extended_agent_card(request_body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(request_body)
+        .ok()
+        .and_then(|request| {
+            request
+                .get("method")?
+                .as_str()
+                .map(is_extended_agent_card_method)
+        })
+        .unwrap_or(false)
+}
+
+/// For a successful response to an extended-card request, return the card from
+/// the JSON-RPC `result` and the envelope to rewrap it into with
+/// [`rewrap_extended_agent_card`]. Any other body is returned unchanged with no envelope.
+pub fn unwrap_extended_agent_card(
+    body: axum::body::Bytes,
+    is_extended_card_response: bool,
+) -> (axum::body::Bytes, Option<serde_json::Value>) {
+    if !is_extended_card_response {
+        return (body, None);
+    }
+    match extended_agent_card_result(&body) {
+        Some((envelope, card)) => (card, Some(envelope)),
+        None => (body, None),
+    }
+}
+
+/// Put a processed card back into the `result` of the envelope from
+/// [`unwrap_extended_agent_card`], keeping every other envelope field. Without an
+/// envelope the body is returned unchanged.
 pub fn rewrap_extended_agent_card(
-    mut envelope: serde_json::Value,
-    card: &[u8],
+    envelope: Option<serde_json::Value>,
+    body: axum::body::Bytes,
 ) -> Result<axum::body::Bytes, anyhow::Error> {
-    let card: serde_json::Value = serde_json::from_slice(card)?;
-    envelope["result"] = card;
+    let Some(mut envelope) = envelope else {
+        return Ok(body);
+    };
+    envelope["result"] = serde_json::from_slice(&body)?;
     Ok(axum::body::Bytes::from(serde_json::to_vec(&envelope)?))
 }
 
@@ -469,7 +501,7 @@ pub fn process_outbound_extended_agent_card(
         return Ok(None);
     };
     let card = process_outbound_agent_card(&card, proxy_endpoint, channel_name)?;
-    rewrap_extended_agent_card(envelope, &card).map(Some)
+    rewrap_extended_agent_card(Some(envelope), card).map(Some)
 }
 
 #[cfg(test)]
@@ -1294,17 +1326,55 @@ mod tests {
     }
 
     #[test]
-    fn rewrap_extended_card_replaces_only_result() {
-        let body = br#"{"jsonrpc":"2.0","id":"x","result":{"url":"https://backend.internal"}}"#;
-        let (envelope, card) = extended_agent_card_result(body).unwrap();
+    fn unwrap_then_rewrap_replaces_only_result() {
+        let body = axum::body::Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":"x","result":{"url":"https://backend.internal"}}"#,
+        );
+        let (card, envelope) = unwrap_extended_agent_card(body, true);
+        assert!(envelope.is_some());
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&card).unwrap(),
             json!({"url": "https://backend.internal"})
         );
-        let out = rewrap_extended_agent_card(envelope, br#"{"url":"https://gw"}"#).unwrap();
+        let out =
+            rewrap_extended_agent_card(envelope, axum::body::Bytes::from_static(br#"{"url":"https://gw"}"#)).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
             json!({"jsonrpc": "2.0", "id": "x", "result": {"url": "https://gw"}})
         );
+    }
+
+    #[test]
+    fn unwrap_leaves_body_when_not_an_extended_card_response() {
+        let card = axum::body::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{"url":"https://backend"}}"#);
+        let (body, envelope) = unwrap_extended_agent_card(card.clone(), false);
+        assert_eq!(body, card);
+        assert!(envelope.is_none());
+
+        let error = axum::body::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32007}}"#);
+        let (body, envelope) = unwrap_extended_agent_card(error.clone(), true);
+        assert_eq!(body, error);
+        assert!(envelope.is_none());
+    }
+
+    #[test]
+    fn rewrap_without_envelope_returns_body_unchanged() {
+        let body = axum::body::Bytes::from_static(b"not json");
+        assert_eq!(rewrap_extended_agent_card(None, body.clone()).unwrap(), body);
+    }
+
+    #[test]
+    fn requests_extended_agent_card_reads_the_jsonrpc_method() {
+        for method in ["GetExtendedAgentCard", "agent/getAuthenticatedExtendedCard"] {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": method}).to_string();
+            assert!(requests_extended_agent_card(body.as_bytes()), "{method}");
+        }
+        let send = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage"}).to_string();
+        assert!(!requests_extended_agent_card(send.as_bytes()));
+        let mcp = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
+        assert!(!requests_extended_agent_card(mcp.as_bytes()));
+        assert!(!requests_extended_agent_card(br#"{"jsonrpc":"2.0","id":1,"method":7}"#));
+        assert!(!requests_extended_agent_card(b""));
+        assert!(!requests_extended_agent_card(b"not json"));
     }
 }

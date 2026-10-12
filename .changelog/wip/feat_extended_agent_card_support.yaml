@@ -8,11 +8,15 @@ changes:
     - timestamp: '2026-10-12T10:00:00.000Z'
       title: Rewrite backend endpoint URLs in extended agent cards
       description: >-
-        Extended agent cards returned as JSON-RPC results of GetExtendedAgentCard and
-        agent/getAuthenticatedExtendedCard now have every endpoint URL rewritten to the gateway on
-        inbound, fabric and outbound paths, and receive the same agent identity treatment as the
-        public card, so authenticated callers no longer learn the backend address and cannot
-        bypass the gateway's policy, egress and trust checks. JSON-RPC errors are forwarded unchanged.
+        Extended agent cards on A2A and AP2 surfaces, returned as JSON-RPC results of
+        GetExtendedAgentCard and agent/getAuthenticatedExtendedCard or fetched over the HTTP+JSON
+        binding (GET extendedAgentCard in 1.0, GET v1/card in 0.3), now have every endpoint URL
+        rewritten to the gateway on inbound, fabric and outbound paths, and receive the same agent
+        identity treatment as the public card on inbound paths, so authenticated callers no longer
+        learn the backend address. Like the public card, extended cards now skip response extension
+        inspection. JSON-RPC errors are forwarded unchanged. The JSON-RPC binding is covered by
+        inbound and outbound component tests; the fabric and HTTP+JSON paths by unit tests of the
+        shared helpers only.
   breaking: []
   internal:
     - timestamp: '2026-10-12T10:30:00.000Z'
@@ -20,3 +24,9 @@ changes:
       description: >-
         Adds is_well_known_agent_card_path in src/proxy/paths.rs and uses it in the inbound,
         fabric and outbound handlers and in is_public_path, replacing duplicated suffix checks.
+    - timestamp: '2026-10-12T11:00:00.000Z'
+      title: Share extended agent card unwrap and rewrap between inbound and fabric
+      description: >-
+        Adds unwrap_extended_agent_card, rewrap_extended_agent_card and requests_extended_agent_card
+        so the inbound and fabric response pipelines use one implementation, and the fabric path only
+        parses the request method on A2A and AP2 surfaces.

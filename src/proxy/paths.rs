@@ -34,6 +34,15 @@ pub fn is_well_known_agent_card_path(path: &str) -> bool {
     path.ends_with("/.well-known/agent-card.json") || path.ends_with("/.well-known/agent.json")
 }
 
+/// Whether a request fetches the extended agent card over the A2A HTTP+JSON
+/// binding: `GET {route}/extendedAgentCard` (1.0) or `GET {route}/v1/card` (0.3).
+pub fn is_rest_extended_agent_card_request(
+    method: &str,
+    path: &str,
+) -> bool {
+    method.eq_ignore_ascii_case("GET") && (path.ends_with("/extendedAgentCard") || path.ends_with("/v1/card"))
+}
+
 /// Whether a request is a public discovery read that bypasses the request
 /// gates: a `GET` or `HEAD` for a public path. A request with another method
 /// whose path only ends like a discovery document, such as an MCP POST to
@@ -131,6 +140,26 @@ mod tests {
             );
         }
         assert!(!is_public_request("GET", "/surface/tools"));
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_matches_get_on_both_eras() {
+        for path in ["/surface/extendedAgentCard", "/surface/v1/card"] {
+            assert!(is_rest_extended_agent_card_request("GET", path), "{path}");
+            assert!(is_rest_extended_agent_card_request("get", path), "{path}");
+            for method in ["POST", "HEAD", "PUT", "DELETE"] {
+                assert!(!is_rest_extended_agent_card_request(method, path), "{method} {path}");
+            }
+        }
+        for path in [
+            "/surface/extendedAgentCard/extra",
+            "/surface/card",
+            "/surface/v1/cards",
+            "/surface/.well-known/agent-card.json",
+            "/surface/rpc",
+        ] {
+            assert!(!is_rest_extended_agent_card_request("GET", path), "{path}");
+        }
     }
 
     #[test]

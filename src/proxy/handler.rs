@@ -7414,6 +7414,13 @@ async fn proxy_handler_with_mcp_runtime(
     }
     .recording_versions(access_point_upstream_key(&state));
     let is_modern_response = modern_request.is_some();
+    let is_rest_extended_card_request =
+        matches!(
+            state
+                .surface
+                .channel_protocol(),
+            crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
+        ) && crate::proxy::paths::is_rest_extended_agent_card_request(method.as_str(), uri.path());
     let process_response = async move |status: StatusCode, response_headers: HeaderMap, response_body: bytes::Bytes| {
         let config_id = state
             .surface
@@ -7438,8 +7445,9 @@ async fn proxy_handler_with_mcp_runtime(
         );
 
         // Determine if this is an agent card response (used by multiple steps below)
-        let is_agent_card_request =
-            crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status.is_success();
+        let is_agent_card_request = (crate::proxy::paths::is_well_known_agent_card_path(uri.path())
+            || is_rest_extended_card_request)
+            && status.is_success();
 
         // ── Step 12: Resolve Protected Agent Identity ───────────────────────────
         // Must happen FIRST, before any injection or rewriting.
@@ -7469,20 +7477,14 @@ async fn proxy_handler_with_mcp_runtime(
 
         // An extended agent card arrives as a JSON-RPC result: run the agent card
         // steps below on the unwrapped card, then rewrap it after the didwebvh step.
-        let extended_card = if status.is_success()
-            && a2a_context
-                .as_ref()
-                .and_then(|c| c.method.as_deref())
-                .is_some_and(crate::a2a::is_extended_agent_card_method)
-        {
-            crate::a2a::extended_agent_card_result(&response_body)
-        } else {
-            None
-        };
-        let (response_body, extended_card_envelope) = match extended_card {
-            Some((envelope, card)) => (card, Some(envelope)),
-            None => (response_body, None),
-        };
+        let (response_body, extended_card_envelope) = crate::a2a::unwrap_extended_agent_card(
+            response_body,
+            status.is_success()
+                && a2a_context
+                    .as_ref()
+                    .and_then(|c| c.method.as_deref())
+                    .is_some_and(crate::a2a::is_extended_agent_card_method),
+        );
         let is_agent_card_request = is_agent_card_request || extended_card_envelope.is_some();
 
         let resolved_identity = if status.is_success() && !response_body.is_empty() {
@@ -7661,13 +7663,11 @@ async fn proxy_handler_with_mcp_runtime(
             response_body
         };
 
-        let response_body = match extended_card_envelope {
-            Some(envelope) => crate::a2a::rewrap_extended_agent_card(envelope, &response_body).map_err(|e| {
+        let response_body =
+            crate::a2a::rewrap_extended_agent_card(extended_card_envelope, response_body).map_err(|e| {
                 error!(channel = channel_name, error = %e, "Failed to rewrap extended agent card");
                 create_error_response(StatusCode::BAD_GATEWAY, "Failed to process extended agent card")
-            })?,
-            None => response_body,
-        };
+            })?;
 
         // Inject custom metadata into MCP initialize responses
         let response_body = if state
@@ -12234,6 +12234,15 @@ async fn handle_fabric_request(
                 });
             }
         });
+    let is_a2a_surface = matches!(
+        state
+            .surface
+            .channel_protocol(),
+        crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
+    );
+    let is_rest_extended_card_request =
+        is_a2a_surface && crate::proxy::paths::is_rest_extended_agent_card_request(method.as_str(), uri.path());
+    let is_extended_card_rpc_request = is_a2a_surface && crate::a2a::requests_extended_agent_card(&original_body_bytes);
     let mut process_response = async move |forward_result: Result<
         Option<crate::gateways::connection_points::messages::ReceivedMessage>,
         String,
@@ -12494,31 +12503,21 @@ async fn handle_fabric_request(
 
                 // An extended agent card arrives as a JSON-RPC result: run the agent card
                 // steps below on the unwrapped card, then rewrap it after the didwebvh step.
-                let extended_card = if (200..300).contains(&status)
-                    && serde_json::from_slice::<serde_json::Value>(&original_body_bytes)
-                        .ok()
-                        .and_then(|request| {
-                            request
-                                .get("method")
-                                .and_then(|m| m.as_str())
-                                .map(crate::a2a::is_extended_agent_card_method)
-                        })
-                        .unwrap_or(false)
-                {
-                    crate::a2a::extended_agent_card_result(response_body.as_bytes())
-                } else {
-                    None
-                };
-                let (response_body, extended_card_envelope) = match extended_card {
-                    Some((envelope, card)) => (String::from_utf8_lossy(&card).into_owned(), Some(envelope)),
-                    None => (response_body, None),
-                };
-                let is_extended_card_response = extended_card_envelope.is_some();
+                let (response_body, extended_card_envelope) =
+                    if is_extended_card_rpc_request && (200..300).contains(&status) {
+                        let (card, envelope) =
+                            crate::a2a::unwrap_extended_agent_card(bytes::Bytes::from(response_body), true);
+                        (String::from_utf8_lossy(&card).into_owned(), envelope)
+                    } else {
+                        (response_body, None)
+                    };
+                let is_extended_card_response = extended_card_envelope.is_some() || is_rest_extended_card_request;
 
                 // ── Step 12: Resolve Protected Agent Identity (fabric path) ─────
                 let is_agent_card_request = (crate::proxy::paths::is_well_known_agent_card_path(uri.path())
-                    && status < 400)
-                    || is_extended_card_response;
+                    || is_rest_extended_card_request)
+                    && status < 400
+                    || extended_card_envelope.is_some();
                 let fabric_response_identity_selector = state
                     .protected_selector
                     .as_ref()
@@ -12722,7 +12721,8 @@ async fn handle_fabric_request(
 
                 let response_body = match extended_card_envelope {
                     Some(envelope) => {
-                        match crate::a2a::rewrap_extended_agent_card(envelope, response_body.as_bytes()) {
+                        match crate::a2a::rewrap_extended_agent_card(Some(envelope), bytes::Bytes::from(response_body))
+                        {
                             Ok(rewrapped) => String::from_utf8_lossy(&rewrapped).into_owned(),
                             Err(e) => {
                                 channel_error!(config_id, "Failed to rewrap extended agent card: {}", e);
