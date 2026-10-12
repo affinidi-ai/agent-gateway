@@ -62,11 +62,17 @@ enum Direction {
     Outbound,
 }
 
-async fn send_through_gateway(
+struct GatewayReply {
+    status: reqwest::StatusCode,
+    body: String,
+    upstream_requests: usize,
+}
+
+async fn send_request_through_gateway(
     direction: Direction,
     upstream_body: String,
-    method: &str,
-) -> serde_json::Value {
+    request_body: String,
+) -> GatewayReply {
     let mock = MockServer::start_with_response(upstream_body).await;
     let h = GatewayHarness::start_with_outbound_mock(mock, |_, gw_config, _| {
         gw_config.surfaces = vec![helpers::build_minimal_outbound_channel()];
@@ -86,14 +92,31 @@ async fn send_through_gateway(
     let resp = reqwest::Client::new()
         .post(url)
         .header("content-type", "application/json")
-        .body(request(method))
+        .body(request_body)
         .send()
         .await
         .expect("request through gateway failed");
-    assert_eq!(resp.status(), 200, "expected 200, got {}", resp.status());
-    resp.json()
-        .await
-        .expect("response is not JSON")
+    GatewayReply {
+        status: resp.status(),
+        body: resp
+            .text()
+            .await
+            .expect("response body unreadable"),
+        upstream_requests: h
+            .mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+    }
+}
+
+async fn send_through_gateway(
+    direction: Direction,
+    upstream_body: String,
+    method: &str,
+) -> serde_json::Value {
+    let reply = send_request_through_gateway(direction, upstream_body, request(method)).await;
+    assert_eq!(reply.status, 200, "expected 200, got {}: {}", reply.status, reply.body);
+    serde_json::from_str(&reply.body).expect("response is not JSON")
 }
 
 fn interface_urls<'a>(
@@ -245,5 +268,39 @@ async fn extended_card_error_response_is_not_rewritten() {
     for direction in [Direction::Inbound, Direction::Outbound] {
         let response = send_through_gateway(direction, error.to_string(), "GetExtendedAgentCard").await;
         assert_eq!(response, error, "JSON-RPC errors must be forwarded unchanged");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_card_response_that_cannot_be_rewritten_is_refused() {
+    let unusable_bodies = [
+        format!("event: message\ndata: {}\n\n", result_envelope(v1_card())),
+        json!({"jsonrpc": "2.0", "id": 1, "result": format!("{BACKEND}/a2a")}).to_string(),
+    ];
+    for body in unusable_bodies {
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let reply = send_request_through_gateway(direction, body.clone(), request("GetExtendedAgentCard")).await;
+            assert_eq!(reply.status, 502, "expected 502, got {}: {}", reply.status, reply.body);
+            assert!(!reply.body.contains(BACKEND), "refusal must not expose the backend: {}", reply.body);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_with_extended_card_request_is_rejected_before_forwarding() {
+    for method in EXTENDED_CARD_METHODS {
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}
+        ])
+        .to_string();
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let reply =
+                send_request_through_gateway(direction, json!([result_envelope(v1_card())]).to_string(), batch.clone())
+                    .await;
+            assert_eq!(reply.status, 400, "expected 400, got {}: {}", reply.status, reply.body);
+            let body: serde_json::Value = serde_json::from_str(&reply.body).expect("rejection is not JSON");
+            assert_eq!(body["error"]["code"], -32600, "{body}");
+            assert_eq!(reply.upstream_requests, 0, "a rejected batch must not reach the upstream");
+        }
     }
 }

@@ -3494,6 +3494,31 @@ fn managed_agent_publishes_v1_card_with_interfaces(
     set_primary_target_response(world, agent_card);
 }
 
+#[given(expr = "managed agent {string} returns a v1.0 extended agent card with multiple interfaces")]
+fn managed_agent_returns_v1_extended_card(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "protocolVersion": "1.0",
+            "name": "test-agent",
+            "version": "1.0.0",
+            "capabilities": { "extensions": [] },
+            "supportedInterfaces": [
+                { "url": "http://managed-agent.local/a2a",  "protocolBinding": "JSONRPC", "protocolVersion": "1.0" },
+                { "url": "http://managed-agent.local/rest", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0" }
+            ]
+        }
+    });
+    set_primary_target_response(world, response);
+}
+
 /// An upstream still publishing a **v0.3** card, used to prove the gateway keeps
 /// serving it at the upstream's own version rather than forcing 1.0 onto it.
 #[given(expr = "managed agent {string} publishes a v0.3 agent card")]

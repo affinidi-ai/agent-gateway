@@ -2785,6 +2785,20 @@ async fn proxy_handler_with_mcp_runtime(
         return Err(create_jsonrpc_error_response(StatusCode::BAD_REQUEST, code, message));
     }
 
+    // An extended agent card inside a JSON-RPC batch response cannot be
+    // rewritten, so such a batch is refused whatever `validate_messages` says.
+    if is_a2a_surface && crate::a2a::is_extended_agent_card_batch(&body_bytes) {
+        channel_warn!(config_id, "Rejected JSON-RPC batch containing an extended agent card request");
+        connection_guard
+            .decrement()
+            .await;
+        return Err(create_jsonrpc_error_response(
+            StatusCode::BAD_REQUEST,
+            -32600,
+            "Invalid Request: extended agent card requests cannot be batched",
+        ));
+    }
+
     // ── A2A request-shape validation ─────────────────────────────────────
     // Beyond the JSON-RPC envelope, check the fields A2A itself requires on a
     // request, under the same `validate_messages` setting. A request that fails
@@ -7482,18 +7496,19 @@ async fn proxy_handler_with_mcp_runtime(
                     .as_ref()
                     .and_then(|c| c.method.as_deref())
                     .is_some_and(crate::a2a::is_extended_agent_card_method),
-        );
+        )
+        .map_err(|e| {
+            error!(channel = channel_name, error = %e, "Extended agent card response cannot be rewritten");
+            create_error_response(StatusCode::BAD_GATEWAY, "Failed to process extended agent card")
+        })?;
         let is_extended_card_response =
             (is_rest_extended_card_request && status.is_success()) || extended_card_envelope.is_some();
         // Determine if this is an agent card response (used by multiple steps below)
         let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
-        let identity_response_kind = if is_extended_card_response {
-            crate::proxy::backend_identity::IdentityResponseKind::ExtendedAgentCard
-        } else if is_agent_card_request {
-            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard
-        } else {
-            crate::proxy::backend_identity::IdentityResponseKind::Message
-        };
+        let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
+            is_extended_card_response,
+            is_agent_card_request,
+        );
 
         let resolved_identity = if status.is_success() && !response_body.is_empty() {
             match crate::proxy::backend_identity::resolve_protected_agent_identity(
@@ -12520,26 +12535,33 @@ async fn handle_fabric_request(
                 // steps below on the unwrapped card, then rewrap it after the didwebvh step.
                 let (response_body, extended_card_envelope) =
                     if is_extended_card_rpc_request && (200..300).contains(&status) {
-                        let (card, envelope) =
-                            crate::a2a::unwrap_extended_agent_card(bytes::Bytes::from(response_body), true);
-                        (String::from_utf8_lossy(&card).into_owned(), envelope)
+                        match crate::a2a::unwrap_extended_agent_card(bytes::Bytes::from(response_body), true) {
+                            Ok((card, envelope)) => (String::from_utf8_lossy(&card).into_owned(), envelope),
+                            Err(e) => {
+                                channel_error!(config_id, "Extended agent card response cannot be rewritten: {}", e);
+                                connection_guard
+                                    .decrement()
+                                    .await;
+                                return Err(create_error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "Failed to process extended agent card",
+                                ));
+                            }
+                        }
                     } else {
                         (response_body, None)
                     };
                 let is_extended_card_response =
-                    extended_card_envelope.is_some() || (is_rest_extended_card_request && status < 400);
+                    extended_card_envelope.is_some() || (is_rest_extended_card_request && (200..300).contains(&status));
                 let is_well_known_card_response =
                     crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
 
                 // ── Step 12: Resolve Protected Agent Identity (fabric path) ─────
                 let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
-                let identity_response_kind = if is_extended_card_response {
-                    crate::proxy::backend_identity::IdentityResponseKind::ExtendedAgentCard
-                } else if is_agent_card_request {
-                    crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard
-                } else {
-                    crate::proxy::backend_identity::IdentityResponseKind::Message
-                };
+                let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
+                    is_extended_card_response,
+                    is_agent_card_request,
+                );
                 let fabric_response_identity_selector = state
                     .protected_selector
                     .as_ref()

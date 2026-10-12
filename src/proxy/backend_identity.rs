@@ -161,6 +161,19 @@ pub enum IdentityResponseKind {
 }
 
 impl IdentityResponseKind {
+    pub fn for_response(
+        is_extended_agent_card: bool,
+        is_agent_card: bool,
+    ) -> Self {
+        if is_extended_agent_card {
+            Self::ExtendedAgentCard
+        } else if is_agent_card {
+            Self::PublicAgentCard
+        } else {
+            Self::Message
+        }
+    }
+
     pub fn is_agent_card(self) -> bool {
         !matches!(self, Self::Message)
     }
@@ -1119,6 +1132,14 @@ mod tests {
                 "{kind:?}: {resolved:?}"
             );
         }
+    }
+
+    #[test]
+    fn identity_response_kind_for_response_prefers_extended_card() {
+        assert_eq!(IdentityResponseKind::for_response(true, true), IdentityResponseKind::ExtendedAgentCard);
+        assert_eq!(IdentityResponseKind::for_response(true, false), IdentityResponseKind::ExtendedAgentCard);
+        assert_eq!(IdentityResponseKind::for_response(false, true), IdentityResponseKind::PublicAgentCard);
+        assert_eq!(IdentityResponseKind::for_response(false, false), IdentityResponseKind::Message);
     }
 
     #[test]

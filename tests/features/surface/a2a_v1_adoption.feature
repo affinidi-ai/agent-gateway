@@ -104,13 +104,22 @@ Feature: A2A v1.0 adoption on an A2A surface
     Then the response status is 200
     And managed agent "bravo" received the request body {"jsonrpc":"2.0","id":1,"method":"tasks/list","params":{}}
 
-  Scenario: The authenticated extended-card method is forwarded to the Target
+  Scenario: The authenticated extended-card method is forwarded and its card rewritten
+    Given managed agent "bravo" returns a v1.0 extended agent card with multiple interfaces
     When the caller sends a request to the surface with body
       """
       {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
       """
     Then the response status is 200
     And managed agent "bravo" received the request body {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
+    And the agent card does not contain managed agent "bravo" endpoint anywhere
+
+  Scenario: An extended-card reply that is not a card is refused
+    When the caller sends a request to the surface with body
+      """
+      {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
+      """
+    Then the response status is 502
 
   # ── Agent-card media type negotiation ─────────────────────────────────────
 

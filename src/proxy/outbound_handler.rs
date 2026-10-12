@@ -103,6 +103,9 @@ pub(crate) enum OutboundPipelineError {
     #[error("MCP request body refused: {}", .0.reason())]
     McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal),
 
+    #[error("Invalid Request: extended agent card requests cannot be batched")]
+    ExtendedAgentCardBatch,
+
     #[error("{error}")]
     McpMetadata { error: crate::mcp::meta::McpMetadataError, body: Bytes, response: bool },
 
@@ -184,7 +187,9 @@ impl OutboundPipelineError {
                 StatusCode::NOT_FOUND
             }
 
-            Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) => StatusCode::BAD_REQUEST,
+            Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) | Self::ExtendedAgentCardBatch => {
+                StatusCode::BAD_REQUEST
+            }
 
             Self::ExtensionValidationFailed(_) | Self::ProtocolMismatch { .. } => StatusCode::UNPROCESSABLE_ENTITY,
 
@@ -234,6 +239,9 @@ impl IntoResponse for OutboundPipelineError {
         }
         if let Self::McpBodyRefused(refusal) = self {
             return refusal.into_response();
+        }
+        if let Self::ExtendedAgentCardBatch = self {
+            return crate::a2a::create_jsonrpc_error_response(StatusCode::BAD_REQUEST, -32600, &self.to_string());
         }
         if let Self::UpstreamCapacityReached(id) = self {
             return crate::proxy::fabric_forward::capacity_response(id);
@@ -1846,6 +1854,15 @@ async fn step_extract_protocol_context_with_versions(
     };
     ctx.protocol = Some(protocol);
     ctx.operation = operation;
+
+    // An extended agent card inside a JSON-RPC batch response cannot be
+    // rewritten, so such a batch is refused on A2A/AP2 surfaces.
+    if matches!(ctx.surface.channel_protocol(), ChannelProtocol::A2a | ChannelProtocol::Ap2)
+        && crate::a2a::is_extended_agent_card_batch(body)
+    {
+        warn!(request_id = %ctx.request_id, "Rejected JSON-RPC batch containing an extended agent card request");
+        return Err(OutboundPipelineError::ExtendedAgentCardBatch);
+    }
 
     // Enforce that the request body actually speaks the protocol this transit
     // point is configured for. A2A/AP2 and MCP have distinct JSON-RPC method
