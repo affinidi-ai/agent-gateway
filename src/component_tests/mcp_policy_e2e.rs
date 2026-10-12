@@ -1147,6 +1147,46 @@ async fn access_point_refuses_tool_call_batches_before_tool_level_controls() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn access_point_refuses_tool_calls_the_gate_cannot_read() {
+    let harness = GatewayHarness::start(|_, gw_config, _| {
+        let mut surface = super::helpers::build_minimal_mcp_surface();
+        surface.target.mcp_tool_gating = Some(
+            serde_json::from_value(json!({
+                "gates": [{"id": "g1", "name": "no admin", "action": {"effect": "deny", "patterns": ["^admin_"]}}]
+            }))
+            .expect("tool gating config"),
+        );
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    // A field the gateway reads, spelled in another case, is refused at
+    // admission: a case-folding upstream would read it as the method or tool.
+    for body in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"Name": "admin_reset"}}),
+        json!({"jsonrpc": "2.0", "id": 2, "Method": "tools/call", "params": {"name": "admin_reset"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "Params": {"name": "admin_reset"}}),
+    ] {
+        let (status, response) = post_json(&harness, &body, None).await;
+        assert_eq!(status, 200, "{body}: {response}");
+        assert_eq!(response["error"]["code"], -32600, "{body}: {response}");
+    }
+    // A `tools/call` with no readable tool name is denied by the gate.
+    for body in [
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": 42}}),
+    ] {
+        let (_, response) = post_json(&harness, &body, None).await;
+        assert!(response["error"].is_object(), "{body}: {response}");
+    }
+    assert_eq!(forwarded(&harness), 0, "no unreadable tool call reaches the target");
+
+    let allowed = json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "read_orders"}});
+    post_json(&harness, &allowed, None).await;
+    assert_eq!(forwarded(&harness), 1, "a readable, allowed tool call is forwarded");
+}
+
 #[test]
 fn access_point_tool_scoped_credentials_apply_only_to_tools_call() {
     if std::env::var_os("ATG_AP_TOOL_SCOPED_CREDENTIALS_CHILD").is_none() {

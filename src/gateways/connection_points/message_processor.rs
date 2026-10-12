@@ -7000,10 +7000,36 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
     let gating = policy_manager
         .compiled_mcp_tool_gating(config_id, variant_alias)
         .filter(|g| !g.is_empty())?;
-    let tool_request = crate::mcp::McpToolRequest::from_json_rpc(body_bytes).ok()?;
-    let tool_name = tool_request
-        .tool_name()?
-        .to_string();
+    // Fail closed: with gating installed, a `tools/call` whose tool name can't
+    // be read can't be checked against the gates, so it must not reach the
+    // Target ungated.
+    let tool_request = crate::mcp::McpToolRequest::from_json_rpc(body_bytes).ok();
+    let Some((tool_request, tool_name)) = tool_request.and_then(|request| {
+        let name = request
+            .tool_name()?
+            .to_string();
+        Some((request, name))
+    }) else {
+        crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+            scope: crate::observability::PolicyScope::McpTool,
+            flow: crate::observability::PolicyFlow::Fabric,
+            allow: false,
+            reason: Some("tools/call without a readable tool name under MCP tool gating"),
+            policy_id: Some("mcp_tool_gating"),
+            surface_id: Some(config_id),
+            http_method: Some(method),
+            path: Some(path),
+            identity: authenticated_identity,
+            actor_did: caller_identity.map(String::as_str),
+            trace_id,
+            ..Default::default()
+        });
+        channel_warn!(config_id, "GW2: MCP tool gating blocked tools/call without a readable tool name");
+        let id = serde_json::from_slice::<Value>(body_bytes)
+            .ok()
+            .and_then(|request| request.get("id").cloned());
+        return Some(mcp_forward_error_response(id, -32001, "Tool is not available"));
+    };
 
     let input_value = if gating.has_policy_conditions() {
         build_fabric_gating_input(

@@ -8155,6 +8155,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_step_extract_protocol_context_refuses_case_variant_fields() {
+        let state = test_outbound_state();
+        for body in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"Name": "admin_reset"}}),
+            json!({"jsonrpc": "2.0", "id": 2, "Method": "tools/call", "params": {"name": "admin_reset"}}),
+        ] {
+            let mut ctx = test_pipeline_context();
+            Arc::make_mut(&mut ctx.surface)
+                .access_point
+                .protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            ctx.request = Some(axum::http::Request::new(axum::body::Body::from(body.to_string())));
+            let result = step_extract_protocol_context(&state, &mut ctx).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(OutboundPipelineError::McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal::AmbiguousKeys))
+                ),
+                "{body}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_step_extract_protocol_context_strips_session_and_resumption_state_from_modern_requests() {
         let state = test_outbound_state();
         let versions = crate::mcp::request_validation::McpVersionPolicy::new(

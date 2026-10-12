@@ -107,9 +107,10 @@ pub enum BodyRefusal {
     /// JSON that is not an object: JSON-RPC `-32600`.
     NotObject,
     /// An object with a duplicate key, or keys that differ only in case, at
-    /// any depth: JSON-RPC `-32600`. An upstream parser that keeps the first
-    /// duplicate, or folds case, would read a different method, tool or
-    /// argument from the one the gateway checked.
+    /// any depth, or a field the gateway reads spelled in another case:
+    /// JSON-RPC `-32600`. An upstream parser that keeps the first duplicate,
+    /// or folds case, would read a different method, tool or argument from
+    /// the one the gateway checked.
     AmbiguousKeys,
 }
 
@@ -162,17 +163,71 @@ impl BodyRefusal {
 /// the last duplicate and some parsers keep the first, and Go's
 /// `encoding/json` matches field names case-insensitively. Policies see all
 /// of `params`, tool arguments and `_meta` included.
+///
+/// A field the gateway reads must also be spelled exactly: a lone `"Method"`
+/// or `params.Name` gives the gateway no method or tool to check, while a
+/// case-folding upstream reads it as `method` or `name`.
 pub fn single_object_refusal(body: &[u8]) -> Option<BodyRefusal> {
-    match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Object(_)) => {}
+    let request = match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(request)) => request,
         Ok(Value::Array(_)) => return Some(BodyRefusal::Batch),
         Ok(_) => return Some(BodyRefusal::NotObject),
         Err(error) => return Some(BodyRefusal::NotJson(error.to_string())),
-    }
-    if serde_json::from_slice::<UniqueKeys>(body).is_err() {
+    };
+    if serde_json::from_slice::<UniqueKeys>(body).is_err() || has_case_variant_field(&request) {
         return Some(BodyRefusal::AmbiguousKeys);
     }
     None
+}
+
+/// JSON-RPC envelope fields the gateway reads.
+const ENVELOPE_FIELDS: &[&str] = &["jsonrpc", "id", "method", "params"];
+
+/// `params` fields the gateway reads on any method.
+const PARAMS_FIELDS: &[&str] = &["_meta"];
+
+/// `params` fields the gateway reads to name what a call targets, with the
+/// methods that carry them. Tool argument keys are not checked: a tool may
+/// legitimately take a `Name` argument.
+const TARGET_PARAMS_FIELDS: &[(&str, &[&str])] =
+    &[("tools/call", &["name", "arguments"]), ("prompts/get", &["name", "arguments"]), ("resources/read", &["uri"])];
+
+/// Whether `request` spells an envelope or `params` field the gateway reads in
+/// a case other than the exact one.
+fn has_case_variant_field(request: &serde_json::Map<String, Value>) -> bool {
+    if has_case_variant_of(request, ENVELOPE_FIELDS) {
+        return true;
+    }
+    let Some(Value::Object(params)) = request.get("params") else {
+        return false;
+    };
+    if has_case_variant_of(params, PARAMS_FIELDS) {
+        return true;
+    }
+    let method = request
+        .get("method")
+        .and_then(Value::as_str);
+    TARGET_PARAMS_FIELDS
+        .iter()
+        .find(|(target_method, _)| method == Some(*target_method))
+        .is_some_and(|(_, fields)| has_case_variant_of(params, fields))
+}
+
+/// Whether `object` has a key that folds to one of `fields` but is not
+/// spelled exactly like it.
+fn has_case_variant_of(
+    object: &serde_json::Map<String, Value>,
+    fields: &[&str],
+) -> bool {
+    object
+        .keys()
+        .filter(|key| !fields.contains(&key.as_str()))
+        .any(|key| {
+            let folded = fold_case(key);
+            fields
+                .iter()
+                .any(|field| folded == *field)
+        })
 }
 
 /// Deserializes any JSON value, failing on an object with two keys that are
@@ -445,6 +500,51 @@ mod tests {
                 br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","_meta":{"progressToken":1,"progresstoken":2}}}"#,
                 Some("duplicate or case-variant JSON keys"),
             ),
+            // A lone field the gateway reads, spelled in another case, is read by a
+            // case-folding upstream but not by the gateway.
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"Name":"admin_reset"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"admin_reset"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","ID":1,"method":"tools/list"}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","Params":{"name":"admin_reset"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","Arguments":{}}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"NAME":"secret"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"Uri":"file:///etc/passwd"}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_Meta":{}}}"#,
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            (
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"param\u{17f}\":{\"name\":\"admin_reset\"}}".as_bytes(),
+                Some("duplicate or case-variant JSON keys"),
+            ),
+            // Tool argument keys and fields of other methods may use any case.
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"Name":"x","URI":"y"}}}"#,
+                None,
+            ),
+            (br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"Name":"x"}}"#, None),
+            (br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","Uri":"x"}}"#, None),
             (br#"{"a":{"k":1},"b":{"k":2},"c":[{"k":1},{"k":2}]}"#, None),
         ] {
             assert_eq!(

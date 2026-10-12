@@ -5436,10 +5436,35 @@ async fn proxy_handler_with_mcp_runtime(
                     .as_deref(),
             )
             .filter(|g| !g.is_empty())
-        && let Some(tool_name) = mcp_context
+    {
+        // Fail closed: a `tools/call` whose tool name can't be read can't be
+        // checked against the gates, so it must not reach the upstream ungated.
+        let Some(tool_name) = mcp_context
             .as_ref()
             .and_then(|m| m.tool_name.as_deref())
-    {
+        else {
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::McpTool,
+                allow: false,
+                reason: Some("tools/call without a readable tool name under MCP tool gating"),
+                policy_id: Some("mcp_tool_gating"),
+                surface_id: Some(config_id_str),
+                trace_id: Some(&trace_id),
+                http_method: Some(method.as_ref()),
+                path: Some(uri.path()),
+                identity: authenticated_identity.as_ref(),
+                actor_did: request_agent_did.as_deref(),
+                ..Default::default()
+            });
+            channel_warn!(config_id_str, "MCP tool gating blocked tools/call without a readable tool name");
+            connection_guard
+                .decrement()
+                .await;
+            return Err(crate::mcp::build_tools_call_policy_denied_response(
+                &body_bytes,
+                Some("Tool is not available"),
+            ));
+        };
         // Only build + serialize the request context when a gate carries an OPA
         // condition; pure-regex gating decides on the tool name alone.
         let input_value = if gating.has_policy_conditions() {
@@ -10611,9 +10636,42 @@ async fn handle_fabric_request(
                     .as_deref(),
             )
             .filter(|g| !g.is_empty())
-        && let Ok(tool_request) = crate::mcp::McpToolRequest::from_json_rpc(&body_bytes)
-        && let Some(tool_name) = tool_request.tool_name()
     {
+        // Fail closed, as on the direct path: an unreadable tool name can't be
+        // checked against the gates.
+        let parsed_request = crate::mcp::McpToolRequest::from_json_rpc(&body_bytes).ok();
+        let Some((tool_request, tool_name)) = parsed_request
+            .as_ref()
+            .and_then(|request| {
+                request
+                    .tool_name()
+                    .map(|name| (request, name))
+            })
+        else {
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::McpTool,
+                allow: false,
+                reason: Some("tools/call without a readable tool name under MCP tool gating"),
+                policy_id: Some("mcp_tool_gating"),
+                surface_id: Some(config_id_str),
+                trace_id: Some(&trace_id),
+                http_method: Some(method.as_ref()),
+                path: Some(uri.path()),
+                identity: authenticated_identity.as_ref(),
+                ..Default::default()
+            });
+            channel_warn!(
+                config_id_str,
+                "MCP tool gating blocked tools/call without a readable tool name (fabric send leg)"
+            );
+            connection_guard
+                .decrement()
+                .await;
+            return Err(crate::mcp::build_tools_call_policy_denied_response(
+                &body_bytes,
+                Some("Tool is not available"),
+            ));
+        };
         let input_value = if gating.has_policy_conditions() {
             fabric_mcp_gate_input(
                 method.as_ref(),
@@ -14585,11 +14643,13 @@ async fn handle_mcp_proxy_request(
     if rpc_method == "tools/call"
         && let Some((gating, input)) = tool_gating.as_ref()
     {
+        // Fail closed: an unreadable tool name can't be checked against the
+        // gates. Checking `""` instead would pass a deny-pattern gate.
         let tool_name = json_request
             .pointer("/params/name")
-            .and_then(|n| n.as_str())
-            .unwrap_or_default();
-        let allowed = gating.is_tool_call_allowed(tool_name, input);
+            .and_then(|n| n.as_str());
+        let allowed = tool_name.is_some_and(|tool_name| gating.is_tool_call_allowed(tool_name, input));
+        let tool_name = tool_name.unwrap_or_default();
         crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
             scope: crate::observability::PolicyScope::McpTool,
             allow: allowed,

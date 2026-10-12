@@ -2621,4 +2621,45 @@ async fn fabric_tool_call_batch_flow() {
             "{tool}"
         );
     }
+
+    // A field the gateway reads, spelled in another case, is refused at
+    // admission: a case-folding Target would read it as the method or tool.
+    // A `tools/call` with no readable tool name is denied by the gate.
+    for (body, code) in [
+        (json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"Name": "admin_reset"}}), -32600),
+        (json!({"jsonrpc": "2.0", "id": 4, "Method": "tools/call", "params": {"name": "admin_reset"}}), -32600),
+        (json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {}}), -32001),
+        (json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": 42}}), -32001),
+    ] {
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now_secs + 60),
+            json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": {}, "body": body}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+
+        let (response, envelope) = receive(&message).await;
+
+        assert_eq!(envelope["error"]["code"], code, "{body}: {response} {envelope}");
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "{body}"
+        );
+    }
 }
