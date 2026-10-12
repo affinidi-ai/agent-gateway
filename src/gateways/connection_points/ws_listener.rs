@@ -3702,225 +3702,239 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
     info!("  Redeemed invitation: {} (ID: {})", connection_point.name, connection_point.id);
 
     info!("✓ Secret validated successfully");
-
-    // The attestation binds the acceptor's gateway DID to the Connection Point
-    // DID it will send from; reject the handshake when it is missing or invalid.
-    let did_cache = manager_weak
-        .as_ref()
-        .and_then(|w| w.upgrade())
-        .map(|m| m.get_did_cache())
-        .ok_or_else(|| "Listener manager not available".to_string())?;
-    let acceptor_issuer_did = match crate::gateways::issuer_attestation::verify_issuer_attestation(
-        issuer_attestation,
-        crate::gateways::issuer_attestation::ExpectedAttestation {
-            sub: acceptor_secure_did,
-            aud: our_temporary_did,
-            nonce: nonce.unwrap_or_default(),
-        },
-        &did_cache,
-    )
-    .await
-    {
-        Ok(issuer_did) => issuer_did,
-        Err(e) => {
-            error!("❌ Issuer attestation rejected for acceptor {}: {}", acceptor_temporary_did, e);
-            if let Err(send_err) = crate::comm::didcomm::gateway::send_connection_rejected(
-                client,
-                our_temporary_did,
-                acceptor_temporary_did,
-                "Invalid issuer attestation",
-            )
-            .await
-            {
-                error!("❌ Failed to send connection-rejected message: {}", send_err);
-            }
-            return Err(format!("Invalid issuer attestation: {e}"));
-        }
-    };
-    info!("✓ Acceptor issuer DID verified: {}", acceptor_issuer_did);
-    info!("");
-
-    // Step 1: Check if gateway already exists for this acceptor
-    info!("🔍 Checking for existing gateway with acceptor's secure DID...");
-    if let Ok(Some(existing_gateway)) = gateway_store
-        .get_by_did(acceptor_secure_did)
-        .await
-    {
-        info!("⚠️  Gateway already exists for acceptor DID {}", acceptor_secure_did);
-        info!("  Gateway ID: {}", existing_gateway.id);
-        info!("  Gateway Status: {:?}", existing_gateway.status);
-
-        // If already awaiting approval or active, don't create duplicate
-        if matches!(
-            existing_gateway.status,
-            crate::gateways::types::GatewayStatus::AwaitingApproval | crate::gateways::types::GatewayStatus::Active
-        ) {
-            info!("  Gateway already exists - not creating duplicate");
-            return Ok(());
-        }
-    }
-    info!("✓ No existing gateway found - proceeding with connection request");
-    info!("");
-
-    // Refuse the inbound connection if the appliance gateway limit is reached.
-    crate::config::enforce_add("connections.gateways")
-        .await
-        .map_err(|e| format!("Inbound gateway connection refused (appliance limit): {}", e.message()))?;
-
-    // Step 2: Create our secure DID for the permanent connection
-    info!("🔑 Creating our secure DID for permanent connection...");
-
-    // Get network_config from manager
-    let network_config = manager_weak
-        .as_ref()
-        .and_then(|w| w.upgrade())
-        .and_then(|m| m.network_config.clone())
-        .ok_or_else(|| "Network config not available in listener manager".to_string())?;
-
-    let secure_cp_id = uuid::Uuid::new_v4().to_string();
-    let (our_secure_did, _secure_secrets, _secure_doc) =
-        crate::gateways::connection_points::handlers::generate_connection_point_identity(
-            &secure_cp_id,
-            &network_config.did.domain,
-            std::path::Path::new(
-                &bootstrap_config
-                    .storage_paths
-                    .connection_points,
-            ),
-            mediator_url,
-            &connection_point.did_method,
-            #[cfg(feature = "didwebvh")]
-            None,
-            #[cfg(feature = "didwebvh")]
-            None,
+    let outcome: Result<(), String> = async {
+        // The attestation binds the acceptor's gateway DID to the Connection Point
+        // DID it will send from; reject the handshake when it is missing or invalid.
+        let did_cache = manager_weak
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|m| m.get_did_cache())
+            .ok_or_else(|| "Listener manager not available".to_string())?;
+        let acceptor_issuer_did = match crate::gateways::issuer_attestation::verify_issuer_attestation(
+            issuer_attestation,
+            crate::gateways::issuer_attestation::ExpectedAttestation {
+                sub: acceptor_secure_did,
+                aud: our_temporary_did,
+                nonce: nonce.unwrap_or_default(),
+            },
+            &did_cache,
         )
         .await
-        .map_err(|e| format!("Failed to generate secure DID: {}", e))?;
-
-    info!("✓ Our secure DID created: {}", our_secure_did);
-
-    // Step 3: Create the gateway record with AwaitingApproval status
-    // Store the acceptor's information so admin can review and approve
-    let gateway_name = format!(
-        "Gateway {}",
-        &acceptor_secure_did[acceptor_secure_did
-            .len()
-            .saturating_sub(12)..]
-    );
-    let mut gateway = Gateway::new_with_creation_type(
-        gateway_name,
-        format!(
-            "Connection request from {}",
-            &acceptor_temporary_did[acceptor_temporary_did
-                .len()
-                .saturating_sub(12)..]
-        ),
-        acceptor_secure_did.to_string(),
-        GatewayType::Remote,
-        crate::gateways::types::GatewayCreationType::System,
-    );
-
-    // Set status to AwaitingApproval - requires human approval
-    gateway.status = crate::gateways::types::GatewayStatus::AwaitingApproval;
-    gateway.issuer_did = Some(acceptor_issuer_did.clone());
-    gateway.issuer_did_source = Some(crate::gateways::types::IssuerDidSource::Handshake);
-
-    gateway_store
-        .create(&gateway)
-        .await
-        .map_err(|e| format!("Failed to store gateway: {}", e))?;
-
-    info!("✓ Gateway {} created with AwaitingApproval status", gateway.id);
-    info!("  Administrator needs to approve this connection request");
-    info!("");
-
-    // Step 4: Store the connection context for later approval
-    // We need to save the acceptor and inviter DIDs and our secure DID for when admin approves
-    info!("💾 Storing connection context for approval...");
-
-    // Create a pending connection record with all the info needed for approval
-    use crate::gateways::pending_connections::{PendingConnection, PendingConnectionState};
-
-    let pending_connection = PendingConnection {
-        gateway_id: gateway.id.clone(),
-        invitation_id: connection_point.id.clone(),
-        our_temporary_did: our_temporary_did.to_string(),
-        our_secure_did: our_secure_did.clone(),
-        their_temporary_did: acceptor_temporary_did.to_string(),
-        their_secure_did: Some(acceptor_secure_did.to_string()),
-        their_issuer_did: Some(acceptor_issuer_did),
-        state: PendingConnectionState::AwaitingApproval,
-        created_at: chrono::Utc::now(),
-    };
-
-    _pending_store
-        .store_approval(&pending_connection)
-        .await
-        .map_err(|e| format!("Failed to store pending connection: {}", e))?;
-
-    info!("✓ Connection context saved - gateway can be approved later");
-    info!("");
-
-    // Step 5: Send notification to administrator
-    info!("📬 Creating notification for administrators...");
-
-    if let Some(notif_store) = notification_store {
-        use crate::integrations::filesystem::NotificationStore;
-        use crate::integrations::types::{Notification, NotificationStatus, NotificationType};
-
-        // For now, create a notification for "system" user (all admins)
-        // In a real system, you'd want to query all administrator users
-        let notification_id = uuid::Uuid::new_v4().to_string();
-        let notification = Notification {
-            id: notification_id,
-            user_id: "system".to_string(), // System-wide notification for admins
-            notification_type: NotificationType::System,
-            title: "New Gateway Connection Request".to_string(),
-            message: format!(
-                "A new gateway connection request requires approval.\n\n\
-                Gateway: {}\n\
-                DID: {}\n\
-                Connection Point: {}\n\n\
-                Please review and approve or reject this connection in the Gateways section.",
-                gateway.name,
-                &acceptor_secure_did[..acceptor_secure_did
-                    .len()
-                    .min(50)],
-                connection_point.name
-            ),
-            metadata: serde_json::json!({
-                "gateway_id": gateway.id,
-                "gateway_did": acceptor_secure_did,
-                "connection_point_id": connection_point.id,
-                "connection_point_name": connection_point.name,
-                "action_required": "approval"
-            }),
-            status: NotificationStatus::New,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+        {
+            Ok(issuer_did) => issuer_did,
+            Err(e) => {
+                error!("❌ Issuer attestation rejected for acceptor {}: {}", acceptor_temporary_did, e);
+                if let Err(send_err) = crate::comm::didcomm::gateway::send_connection_rejected(
+                    client,
+                    our_temporary_did,
+                    acceptor_temporary_did,
+                    "Invalid issuer attestation",
+                )
+                .await
+                {
+                    error!("❌ Failed to send connection-rejected message: {}", send_err);
+                }
+                return Err(format!("Invalid issuer attestation: {e}"));
+            }
         };
+        info!("✓ Acceptor issuer DID verified: {}", acceptor_issuer_did);
+        info!("");
 
-        match notif_store
-            .create(&notification)
+        // Step 1: Check if gateway already exists for this acceptor
+        info!("🔍 Checking for existing gateway with acceptor's secure DID...");
+        if let Ok(Some(existing_gateway)) = gateway_store
+            .get_by_did(acceptor_secure_did)
             .await
         {
-            Ok(_) => {
-                info!("✓ System notification created for administrators");
-                info!("  Notification ID: {}", notification.id);
-                info!("  Gateway: {}", gateway.name);
-            }
-            Err(e) => {
-                error!("❌ Failed to create notification: {}", e);
+            info!("⚠️  Gateway already exists for acceptor DID {}", acceptor_secure_did);
+            info!("  Gateway ID: {}", existing_gateway.id);
+            info!("  Gateway Status: {:?}", existing_gateway.status);
+
+            // If already awaiting approval or active, don't create duplicate
+            if matches!(
+                existing_gateway.status,
+                crate::gateways::types::GatewayStatus::AwaitingApproval | crate::gateways::types::GatewayStatus::Active
+            ) {
+                info!("  Gateway already exists - not creating duplicate");
+                return Ok(());
             }
         }
-    } else {
-        info!("  (Notification store not configured - skipping notification)");
+        info!("✓ No existing gateway found - proceeding with connection request");
+        info!("");
+
+        // Refuse the inbound connection if the appliance gateway limit is reached.
+        crate::config::enforce_add("connections.gateways")
+            .await
+            .map_err(|e| format!("Inbound gateway connection refused (appliance limit): {}", e.message()))?;
+
+        // Step 2: Create our secure DID for the permanent connection
+        info!("🔑 Creating our secure DID for permanent connection...");
+
+        // Get network_config from manager
+        let network_config = manager_weak
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .and_then(|m| m.network_config.clone())
+            .ok_or_else(|| "Network config not available in listener manager".to_string())?;
+
+        let secure_cp_id = uuid::Uuid::new_v4().to_string();
+        let (our_secure_did, _secure_secrets, _secure_doc) =
+            crate::gateways::connection_points::handlers::generate_connection_point_identity(
+                &secure_cp_id,
+                &network_config.did.domain,
+                std::path::Path::new(
+                    &bootstrap_config
+                        .storage_paths
+                        .connection_points,
+                ),
+                mediator_url,
+                &connection_point.did_method,
+                #[cfg(feature = "didwebvh")]
+                None,
+                #[cfg(feature = "didwebvh")]
+                None,
+            )
+            .await
+            .map_err(|e| format!("Failed to generate secure DID: {}", e))?;
+
+        info!("✓ Our secure DID created: {}", our_secure_did);
+
+        // Step 3: Create the gateway record with AwaitingApproval status
+        // Store the acceptor's information so admin can review and approve
+        let gateway_name = format!(
+            "Gateway {}",
+            &acceptor_secure_did[acceptor_secure_did
+                .len()
+                .saturating_sub(12)..]
+        );
+        let mut gateway = Gateway::new_with_creation_type(
+            gateway_name,
+            format!(
+                "Connection request from {}",
+                &acceptor_temporary_did[acceptor_temporary_did
+                    .len()
+                    .saturating_sub(12)..]
+            ),
+            acceptor_secure_did.to_string(),
+            GatewayType::Remote,
+            crate::gateways::types::GatewayCreationType::System,
+        );
+
+        // Set status to AwaitingApproval - requires human approval
+        gateway.status = crate::gateways::types::GatewayStatus::AwaitingApproval;
+        gateway.issuer_did = Some(acceptor_issuer_did.clone());
+        gateway.issuer_did_source = Some(crate::gateways::types::IssuerDidSource::Handshake);
+
+        gateway_store
+            .create(&gateway)
+            .await
+            .map_err(|e| format!("Failed to store gateway: {}", e))?;
+
+        info!("✓ Gateway {} created with AwaitingApproval status", gateway.id);
+        info!("  Administrator needs to approve this connection request");
+        info!("");
+
+        // Step 4: Store the connection context for later approval
+        // We need to save the acceptor and inviter DIDs and our secure DID for when admin approves
+        info!("💾 Storing connection context for approval...");
+
+        // Create a pending connection record with all the info needed for approval
+        use crate::gateways::pending_connections::{PendingConnection, PendingConnectionState};
+
+        let pending_connection = PendingConnection {
+            gateway_id: gateway.id.clone(),
+            invitation_id: connection_point.id.clone(),
+            our_temporary_did: our_temporary_did.to_string(),
+            our_secure_did: our_secure_did.clone(),
+            their_temporary_did: acceptor_temporary_did.to_string(),
+            their_secure_did: Some(acceptor_secure_did.to_string()),
+            their_issuer_did: Some(acceptor_issuer_did),
+            state: PendingConnectionState::AwaitingApproval,
+            created_at: chrono::Utc::now(),
+        };
+
+        if let Err(e) = _pending_store
+            .store_approval(&pending_connection)
+            .await
+        {
+            if let Err(delete_err) = gateway_store
+                .delete(&gateway.id)
+                .await
+            {
+                error!("❌ Failed to remove gateway {} after a failed setup: {}", gateway.id, delete_err);
+            }
+            return Err(format!("Failed to store pending connection: {}", e));
+        }
+
+        info!("✓ Connection context saved - gateway can be approved later");
+        info!("");
+
+        // Step 5: Send notification to administrator
+        info!("📬 Creating notification for administrators...");
+
+        if let Some(notif_store) = notification_store {
+            use crate::integrations::filesystem::NotificationStore;
+            use crate::integrations::types::{Notification, NotificationStatus, NotificationType};
+
+            // For now, create a notification for "system" user (all admins)
+            // In a real system, you'd want to query all administrator users
+            let notification_id = uuid::Uuid::new_v4().to_string();
+            let notification = Notification {
+                id: notification_id,
+                user_id: "system".to_string(), // System-wide notification for admins
+                notification_type: NotificationType::System,
+                title: "New Gateway Connection Request".to_string(),
+                message: format!(
+                    "A new gateway connection request requires approval.\n\n\
+                    Gateway: {}\n\
+                    DID: {}\n\
+                    Connection Point: {}\n\n\
+                    Please review and approve or reject this connection in the Gateways section.",
+                    gateway.name,
+                    &acceptor_secure_did[..acceptor_secure_did
+                        .len()
+                        .min(50)],
+                    connection_point.name
+                ),
+                metadata: serde_json::json!({
+                    "gateway_id": gateway.id,
+                    "gateway_did": acceptor_secure_did,
+                    "connection_point_id": connection_point.id,
+                    "connection_point_name": connection_point.name,
+                    "action_required": "approval"
+                }),
+                status: NotificationStatus::New,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+
+            match notif_store
+                .create(&notification)
+                .await
+            {
+                Ok(_) => {
+                    info!("✓ System notification created for administrators");
+                    info!("  Notification ID: {}", notification.id);
+                    info!("  Gateway: {}", gateway.name);
+                }
+                Err(e) => {
+                    error!("❌ Failed to create notification: {}", e);
+                }
+            }
+        } else {
+            info!("  (Notification store not configured - skipping notification)");
+        }
+
+        info!("");
+        info!("✅ Connection request received and stored - awaiting administrator approval");
+
+        Ok(())
     }
-
-    info!("");
-    info!("✅ Connection request received and stored - awaiting administrator approval");
-
-    Ok(())
+    .await;
+    if outcome.is_err() {
+        super::message_processor::release_invitation(cp_store.as_ref(), &connection_point.id).await;
+    }
+    outcome
 }
 
 /// Spawn a temporary listener for OOB acceptor to receive connection-accepted message

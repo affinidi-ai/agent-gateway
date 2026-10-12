@@ -1055,6 +1055,32 @@ pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
     Ok(invitation)
 }
 
+/// Return a redeemed invitation to unused after the connection-setup it was redeemed for failed
+/// before any gateway record was kept, so the peer can retry with the same invitation.
+pub(crate) async fn release_invitation<CS: ConnectionPointStore + ?Sized>(
+    store: &CS,
+    connection_point_id: &str,
+) {
+    let mut invitation = match store
+        .get(connection_point_id)
+        .await
+    {
+        Ok(Some(invitation)) if invitation.use_count > 0 => invitation,
+        Ok(_) => return,
+        Err(e) => {
+            error!("Failed to load invitation {} to release it: {}", connection_point_id, e);
+            return;
+        }
+    };
+    invitation.use_count -= 1;
+    if let Err(e) = store
+        .update(&invitation)
+        .await
+    {
+        error!("Failed to release invitation {}: {}", connection_point_id, e);
+    }
+}
+
 async fn process_connection_accepted(message: &ReceivedMessage) -> ProcessingResult {
     info!("🎉 Processing connection-accepted (ACCEPTOR receiving final confirmation from INVITER)");
 
@@ -11045,6 +11071,55 @@ mod tests {
                 .await
                 .unwrap_err(),
             InvitationRefusal::Unavailable("invitation has already been used".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_released_invitation_accepts_the_retried_setup() {
+        init_resolver().await;
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+        redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+
+        release_invitation(&store, &connection_point.id).await;
+
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .use_count,
+            0
+        );
+        let retry = process_connection_setup(&proven_setup_msg(temp.path(), &connection_point.id).await).await;
+        assert!(matches!(retry, ProcessingResult::OOBConnectionSetup(_)), "retry was refused: {retry:?}");
+        let redeemed = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+        assert_eq!(redeemed.use_count, 1);
+    }
+
+    #[tokio::test]
+    async fn releasing_an_unused_invitation_leaves_it_unused() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let store = invitation_store(temp.path()).await;
+
+        release_invitation(&store, &connection_point.id).await;
+        release_invitation(&store, "missing-connection-point").await;
+
+        assert_eq!(
+            store
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .use_count,
+            0
         );
     }
 

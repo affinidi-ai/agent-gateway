@@ -116,7 +116,9 @@ its mediator serves, and accepts a `connection-setup` only when all of these hol
 
 The secret is compared in constant time. A successful setup increments the invitation's
 `use_count`, so every later setup on it is refused, even if an administrator rejects the resulting
-request; create a new invitation to pair again. The redeemed Connection Point is kept, because
+request; create a new invitation to pair again. A setup that fails after its secret is accepted
+and before the request is stored, for example on an invalid issuer attestation or at the appliance
+gateway limit, returns the invitation to unused so the peer can retry it. The redeemed Connection Point is kept, because
 approval sends `connection-accepted` from its DID. System Connection Points (`oobresponder`,
 `oobacceptor`, `system`) never accept a `connection-setup`. Invitations created before the gateway
 recorded the message id are refused and must be created again.
