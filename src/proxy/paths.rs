@@ -20,13 +20,18 @@ pub fn is_public_path(path: &str) -> bool {
         .strip_suffix('/')
         .unwrap_or(path);
 
-    path.ends_with("/.well-known/agent-card.json")
-        || path.ends_with("/.well-known/agent.json")
+    is_well_known_agent_card_path(path)
         || path.ends_with("/agent-card.json")
         || path.ends_with("/agent.json")
         || path.ends_with("/.well-known/ucp")
         || path.ends_with("/.well-known/agent-card")
         || path.ends_with("/discovery")
+}
+
+/// Whether `path` requests a well-known agent card (`agent-card.json` or the
+/// legacy `agent.json`).
+pub fn is_well_known_agent_card_path(path: &str) -> bool {
+    path.ends_with("/.well-known/agent-card.json") || path.ends_with("/.well-known/agent.json")
 }
 
 /// Whether a request is a public discovery read that bypasses the request
@@ -126,6 +131,22 @@ mod tests {
             );
         }
         assert!(!is_public_request("GET", "/surface/tools"));
+    }
+
+    #[test]
+    fn well_known_agent_card_path_matches_only_well_known_card_documents() {
+        assert!(is_well_known_agent_card_path("/surface/.well-known/agent-card.json"));
+        assert!(is_well_known_agent_card_path("/.well-known/agent.json"));
+        for path in [
+            "/surface/agent-card.json",
+            "/surface/agent.json",
+            "/surface/.well-known/agent-card",
+            "/surface/.well-known/ucp",
+            "/surface/discovery",
+            "/surface/rpc",
+        ] {
+            assert!(!is_well_known_agent_card_path(path), "{path}");
+        }
     }
 
     #[test]

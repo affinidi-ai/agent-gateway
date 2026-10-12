@@ -1,0 +1,22 @@
+branch: feat/extended_agent_card_support
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-12T10:00:00.000Z'
+      title: Rewrite backend endpoint URLs in extended agent cards
+      description: >-
+        Extended agent cards returned as JSON-RPC results of GetExtendedAgentCard and
+        agent/getAuthenticatedExtendedCard now have every endpoint URL rewritten to the gateway on
+        inbound, fabric and outbound paths, and receive the same agent identity treatment as the
+        public card, so authenticated callers no longer learn the backend address and cannot
+        bypass the gateway's policy, egress and trust checks. JSON-RPC errors are forwarded unchanged.
+  breaking: []
+  internal:
+    - timestamp: '2026-10-12T10:30:00.000Z'
+      title: Share one well-known agent card path check across proxy handlers
+      description: >-
+        Adds is_well_known_agent_card_path in src/proxy/paths.rs and uses it in the inbound,
+        fabric and outbound handlers and in is_public_path, replacing duplicated suffix checks.

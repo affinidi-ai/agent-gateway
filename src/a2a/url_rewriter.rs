@@ -422,6 +422,56 @@ pub fn process_outbound_agent_card(
     Ok(axum::body::Bytes::from(processed))
 }
 
+/// Whether `method` requests the extended agent card, in either A2A era
+/// (`agent/getAuthenticatedExtendedCard` or `GetExtendedAgentCard`).
+pub fn is_extended_agent_card_method(method: &str) -> bool {
+    crate::a2a::canonical_method(method) == "agent/getAuthenticatedExtendedCard"
+}
+
+/// Split a successful extended-card JSON-RPC response into its envelope and the
+/// serialized card from `result`. Returns `None` for error responses, non-object
+/// results and bodies that are not a JSON object, so those pass through unchanged.
+pub fn extended_agent_card_result(body: &[u8]) -> Option<(serde_json::Value, axum::body::Bytes)> {
+    let envelope: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if envelope
+        .get("error")
+        .is_some()
+    {
+        return None;
+    }
+    let card = envelope
+        .get("result")
+        .filter(|r| r.is_object())?;
+    let card_bytes = serde_json::to_vec(card).ok()?;
+    Some((envelope, axum::body::Bytes::from(card_bytes)))
+}
+
+/// Put a processed extended card back into the `result` of the envelope returned
+/// by [`extended_agent_card_result`], keeping every other envelope field.
+pub fn rewrap_extended_agent_card(
+    mut envelope: serde_json::Value,
+    card: &[u8],
+) -> Result<axum::body::Bytes, anyhow::Error> {
+    let card: serde_json::Value = serde_json::from_slice(card)?;
+    envelope["result"] = card;
+    Ok(axum::body::Bytes::from(serde_json::to_vec(&envelope)?))
+}
+
+/// Rewrite the endpoint URLs of an extended card returned as a JSON-RPC result,
+/// for the outbound pipeline. Returns `None` when the body is not a successful
+/// extended-card response.
+pub fn process_outbound_extended_agent_card(
+    body: &[u8],
+    proxy_endpoint: &str,
+    channel_name: &str,
+) -> Result<Option<axum::body::Bytes>, anyhow::Error> {
+    let Some((envelope, card)) = extended_agent_card_result(body) else {
+        return Ok(None);
+    };
+    let card = process_outbound_agent_card(&card, proxy_endpoint, channel_name)?;
+    rewrap_extended_agent_card(envelope, &card).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1168,143 @@ mod tests {
         assert_eq!(
             build_transit_point_proxy_endpoint(&surface, tp, &net),
             "http://localhost:8080/outgoing/agents/a2a/buyer/tp-seller"
+        );
+    }
+
+    // ── extended agent card over JSON-RPC ───────────────────────────────
+
+    fn rewrite_extended_card(envelope: serde_json::Value) -> Option<serde_json::Value> {
+        let body = serde_json::to_vec(&envelope).unwrap();
+        process_outbound_extended_agent_card(&body, PROXY_URL, "test")
+            .unwrap()
+            .map(|b| serde_json::from_slice(&b).unwrap())
+    }
+
+    #[test]
+    fn extended_card_method_matches_both_eras() {
+        assert!(is_extended_agent_card_method("GetExtendedAgentCard"));
+        assert!(is_extended_agent_card_method("agent/getAuthenticatedExtendedCard"));
+        assert!(!is_extended_agent_card_method("SendMessage"));
+        assert!(!is_extended_agent_card_method("message/send"));
+        assert!(!is_extended_agent_card_method("getExtendedAgentCard"));
+    }
+
+    #[test]
+    fn extended_card_v1_interfaces_rewritten_in_order() {
+        let out = rewrite_extended_card(json!({
+            "jsonrpc": "2.0",
+            "id": "req-7",
+            "result": {
+                "name": "Agent",
+                "supportedInterfaces": [
+                    {"url": "https://backend.internal/a2a/v1", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
+                    {"url": "https://backend.internal/a2a/rest", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}
+                ],
+                "supported_interfaces": [
+                    {"url": "https://backend.internal/a2a/grpc", "protocol_binding": "GRPC"}
+                ]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(out["jsonrpc"], "2.0");
+        assert_eq!(out["id"], "req-7");
+        let card = &out["result"];
+        assert_eq!(card["name"], "Agent");
+        let ifaces = card["supportedInterfaces"]
+            .as_array()
+            .unwrap();
+        assert_eq!(ifaces[0]["protocolBinding"], "JSONRPC");
+        assert_eq!(ifaces[1]["protocolBinding"], "HTTP+JSON");
+        assert!(
+            ifaces
+                .iter()
+                .all(|i| i["url"] == PROXY_URL)
+        );
+        assert_eq!(card["supported_interfaces"][0]["url"], PROXY_URL);
+        assert_eq!(card["supported_interfaces"][0]["protocol_binding"], "GRPC");
+    }
+
+    #[test]
+    fn extended_card_v03_fields_rewritten() {
+        let out = rewrite_extended_card(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "name": "Agent",
+                "url": "https://backend.internal/a2a",
+                "preferredTransport": "JSONRPC",
+                "additionalInterfaces": [
+                    {"url": "https://backend.internal/a2a", "transport": "JSONRPC"},
+                    {"url": "https://backend.internal/grpc", "transport": "GRPC"}
+                ],
+                "additional_interfaces": [{"url": "https://backend.internal/rest", "transport": "HTTP+JSON"}]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(out["id"], 1);
+        let card = &out["result"];
+        assert_eq!(card["url"], PROXY_URL);
+        let ifaces = card["additionalInterfaces"]
+            .as_array()
+            .unwrap();
+        assert_eq!(ifaces[0]["transport"], "JSONRPC");
+        assert_eq!(ifaces[1]["transport"], "GRPC");
+        assert!(
+            ifaces
+                .iter()
+                .all(|i| i["url"] == PROXY_URL)
+        );
+        assert_eq!(card["additional_interfaces"][0]["url"], PROXY_URL);
+        assert!(
+            !serde_json::to_string(&out)
+                .unwrap()
+                .contains("backend.internal")
+        );
+    }
+
+    #[test]
+    fn extended_card_error_response_is_untouched() {
+        let envelope = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32007, "message": "Authenticated Extended Card not configured"}
+        });
+        assert!(rewrite_extended_card(envelope).is_none());
+    }
+
+    #[test]
+    fn extended_card_non_object_result_is_untouched() {
+        assert!(
+            rewrite_extended_card(json!({"jsonrpc": "2.0", "id": 1, "result": "https://backend.internal"})).is_none()
+        );
+        assert!(rewrite_extended_card(json!({"jsonrpc": "2.0", "id": 1})).is_none());
+    }
+
+    #[test]
+    fn extended_card_non_json_body_is_untouched() {
+        let sse = b"event: message\ndata: {\"result\":{\"url\":\"https://backend.internal\"}}\n\n";
+        assert!(
+            process_outbound_extended_agent_card(sse, PROXY_URL, "test")
+                .unwrap()
+                .is_none()
+        );
+        assert!(extended_agent_card_result(b"[]").is_none());
+    }
+
+    #[test]
+    fn rewrap_extended_card_replaces_only_result() {
+        let body = br#"{"jsonrpc":"2.0","id":"x","result":{"url":"https://backend.internal"}}"#;
+        let (envelope, card) = extended_agent_card_result(body).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&card).unwrap(),
+            json!({"url": "https://backend.internal"})
+        );
+        let out = rewrap_extended_agent_card(envelope, br#"{"url":"https://gw"}"#).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
+            json!({"jsonrpc": "2.0", "id": "x", "result": {"url": "https://gw"}})
         );
     }
 }

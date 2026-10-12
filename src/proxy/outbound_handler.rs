@@ -4662,8 +4662,7 @@ fn is_agent_card_response(
     request_path: &str,
     status: reqwest::StatusCode,
 ) -> bool {
-    status.is_success()
-        && (request_path.ends_with("/.well-known/agent-card.json") || request_path.ends_with("/.well-known/agent.json"))
+    status.is_success() && crate::proxy::paths::is_well_known_agent_card_path(request_path)
 }
 
 /// [12] Response Processing — strips headers and optionally rewrites agent card URLs.
@@ -5086,6 +5085,37 @@ fn process_outbound_response_body(
                     "Failed to rewrite outbound agent card URLs, returning original"
                 );
                 body_bytes
+            }
+        }
+    } else if status.is_success()
+        && ctx
+            .operation
+            .as_deref()
+            .is_some_and(crate::a2a::is_extended_agent_card_method)
+    {
+        let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
+            &ctx.surface,
+            &ctx.virtual_channel,
+            &state.network_config,
+        );
+        match crate::a2a::url_rewriter::process_outbound_extended_agent_card(
+            &body_bytes,
+            &proxy_endpoint,
+            &ctx.surface.name,
+        ) {
+            Ok(Some(rewritten)) => {
+                info!(
+                    request_id = %ctx.request_id,
+                    "Rewrote outbound extended agent card URLs to outbound virtual channel endpoint"
+                );
+                rewritten
+            }
+            Ok(None) => body_bytes,
+            Err(e) => {
+                warn!(request_id = %ctx.request_id, error = %e, "Failed to rewrite outbound extended agent card URLs");
+                return Err(OutboundPipelineError::ResponseValidationFailed(
+                    "Failed to process extended agent card".to_string(),
+                ));
             }
         }
     } else {

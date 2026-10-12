@@ -292,7 +292,9 @@ URLs are rewritten to the gateway, and, when agent identity is configured, its
 `supportedInterfaces`, `supported_interfaces`, `additionalInterfaces` and `additional_interfaces`,
 in their original order, since in `1.0` order
 encodes preference. An extended card returned as a JSON-RPC result (`GetExtendedAgentCard` /
-`agent/getAuthenticatedExtendedCard`) is forwarded as the agent sent it, without URL rewriting.
+`agent/getAuthenticatedExtendedCard`) gets the same treatment: the card in `result` has its endpoint
+URLs rewritten on inbound, fabric and outbound paths, and on inbound paths the same identity
+treatment when agent identity is configured. JSON-RPC error responses are forwarded unchanged.
 
 A surface's agent card (the synthesized A2A-proxy card or a Managed Agent's rewritten card) is
 served as `application/a2a+json` only when the caller's `A2A-Version` resolves to `1.0` or the

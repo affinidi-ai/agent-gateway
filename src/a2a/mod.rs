@@ -39,7 +39,10 @@ pub use extensions::inject_didwebvh_identity_extension;
 pub use crate::protocols::{
     ExtensionInspectionContext, inspect_message_extensions, is_hop_by_hop_header, should_forward_request_header,
 };
-pub use url_rewriter::{build_target_url, rewrite_agent_card_urls};
+pub use url_rewriter::{
+    build_target_url, extended_agent_card_result, is_extended_agent_card_method, rewrap_extended_agent_card,
+    rewrite_agent_card_urls,
+};
 
 #[cfg(feature = "didwebvh")]
 pub use url_rewriter::inject_didwebvh_identity_into_agent_card;
