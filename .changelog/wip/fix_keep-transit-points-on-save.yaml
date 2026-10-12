@@ -1,0 +1,17 @@
+branch: fix/keep-transit-points-on-save
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-12T10:12:37.000Z'
+      title: Keep Transit Points with credentials when saving a reloaded surface
+      description: >-
+        After a surface was reloaded in the dashboard, saving it from any panel other
+        than its Transit Point's dropped the whole transit block when a Transit Point
+        had credentials, so the gateway lost its Transit Points while the canvas still
+        showed them. The Surface Builder now accepts the credentials in the shape they
+        are loaded in, so every Transit Point on the canvas is saved.
+  removed: []
+  security: []
+  breaking: []
+  internal: []

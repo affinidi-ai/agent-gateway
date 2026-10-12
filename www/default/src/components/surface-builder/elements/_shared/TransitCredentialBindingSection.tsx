@@ -80,6 +80,20 @@ export function transitCredentialsApiToForm(api: any): TransitCredentialsForm | 
   };
 }
 
+/**
+ * Convert a Transit Point node's credentials to the runtime shape. A node
+ * reloaded from a saved surface holds the runtime shape until its panel
+ * normalizes it to form-state, so both shapes are accepted.
+ */
+export function transitCredentialsToApi(value: unknown) {
+  if (!value || typeof value !== 'object') return undefined;
+  const form =
+    'inject_as_type' in value
+      ? (value as TransitCredentialsForm)
+      : transitCredentialsApiToForm(value);
+  return transitCredentialsFormToApi(form);
+}
+
 interface Props {
   value: TransitCredentialsForm | null | undefined;
   onChange: (next: TransitCredentialsForm | null) => void;
