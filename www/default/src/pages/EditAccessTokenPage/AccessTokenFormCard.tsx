@@ -182,7 +182,12 @@ const AccessTokenFormCard: React.FC<AccessTokenFormCardProps> = ({
                 variant="outline-primary"
                 size="md"
                 label="Copy creation link"
-                title="Copy a link that opens this form with the current settings"
+                title={
+                  editor.canSave
+                    ? 'Copy a link that opens this form with the current settings'
+                    : 'Fix the token settings before copying a creation link'
+                }
+                disabled={!editor.canSave}
                 onCopyError={() => showToast('error', 'Could not copy the link.')}
                 data-testid="access-token-copy-permalink-button"
               />

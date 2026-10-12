@@ -167,6 +167,28 @@ describe('EditAccessTokenPage', () => {
     expect(screen.getByTestId('access-token-header-pattern-0')).toHaveValue('tenant-a');
   });
 
+  it('allows copying the creation link only for a valid token configuration', async () => {
+    renderPage();
+    const copy = screen.getByTestId('access-token-copy-permalink-button');
+    expect(copy).toBeDisabled();
+
+    await userEvent.type(screen.getByTestId('access-token-name'), 'Valid token');
+    expect(copy).toBeEnabled();
+
+    await userEvent.click(screen.getByTestId('access-token-never-expires'));
+    fireEvent.change(screen.getByTestId('access-token-expiry-date-time'), {
+      target: { value: toLocalDateTimeInput(new Date(Date.now() - 60 * 60 * 1000)) },
+    });
+    expect(copy).toBeDisabled();
+    await userEvent.click(copy);
+    expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+  });
+
+  it('disables the creation link for preset scopes the operator cannot grant', () => {
+    renderPage('/access-tokens/new?name=Linked&scope=departments.view');
+    expect(screen.getByTestId('access-token-copy-permalink-button')).toBeDisabled();
+  });
+
   it('offers the permalink only while creating', async () => {
     renderPage('/access-tokens/agat_token1');
     await screen.findByTestId('access-token-name');

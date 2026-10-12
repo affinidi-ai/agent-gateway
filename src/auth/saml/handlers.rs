@@ -78,10 +78,15 @@ pub struct SamlLoginQuery {
     pub next: Option<String>,
 }
 
-/// Only the dashboard root and the CLI authorize path (with its query) may be a return target.
-/// Anything else, including off-origin and protocol-relative targets, an encoded slash or
-/// backslash in the path, and characters that could break out of the ACS markup, is rejected.
-/// The query may carry an encoded slash or backslash, since the CLI `state` is opaque.
+/// The dashboard's new access token form. Its query only presets the form, which the signed-in
+/// user still has to submit.
+pub(crate) const ACCESS_TOKEN_NEW_PATH: &str = "/access-tokens/new";
+
+/// Only the dashboard root, the new access token form (with or without its preset query) and the
+/// CLI authorize path (with its query) may be a return target. Anything else, including
+/// off-origin and protocol-relative targets, an encoded slash or backslash in the path, and
+/// characters that could break out of the ACS markup, is rejected. The query may carry an encoded
+/// slash or backslash, since the CLI `state` is opaque.
 pub(crate) fn is_allowed_return_target(target: &str) -> bool {
     let path = target
         .split_once('?')
@@ -99,8 +104,8 @@ pub(crate) fn is_allowed_return_target(target: &str) -> bool {
         return false;
     }
     match target.split_once('?') {
-        None => target == "/",
-        Some((path, query)) => path == CLI_AUTHORIZE_PATH && !query.is_empty(),
+        None => target == "/" || target == ACCESS_TOKEN_NEW_PATH,
+        Some((path, query)) => (path == CLI_AUTHORIZE_PATH && !query.is_empty()) || path == ACCESS_TOKEN_NEW_PATH,
     }
 }
 
@@ -497,6 +502,26 @@ mod tests {
         assert!(is_allowed_return_target("/"));
         assert!(is_allowed_return_target(CLI_TARGET));
         assert!(is_allowed_return_target("/api/auth/cli/authorize?port=52111&state=a%20b&challenge=ch"));
+    }
+
+    #[test]
+    fn return_target_accepts_the_new_access_token_form_with_its_preset_query() {
+        assert!(is_allowed_return_target("/access-tokens/new"));
+        assert!(is_allowed_return_target(
+            "/access-tokens/new?name=CI&scopes=gateways.view%2Csecrets.view&expires_at=2026-12-31T00%3A00%3A00.000Z"
+        ));
+        assert!(is_allowed_return_target(
+            "/access-tokens/new?resource_pattern=TENANT%3A%24%7Baccount%7D%3Agateways%3A.%2A&header=account%3Atenant-a"
+        ));
+    }
+
+    #[test]
+    fn return_target_rejects_other_access_token_paths() {
+        assert!(!is_allowed_return_target("/access-tokens/new/extra?name=x"));
+        assert!(!is_allowed_return_target("/access-tokens/agpat_1?name=x"));
+        assert!(!is_allowed_return_target("/access-tokens/new%2f..%2fsettings?x=1"));
+        assert!(!is_allowed_return_target("//access-tokens/new?name=x"));
+        assert!(!is_allowed_return_target("/access-tokens/new?name=a\"<script>"));
     }
 
     #[test]

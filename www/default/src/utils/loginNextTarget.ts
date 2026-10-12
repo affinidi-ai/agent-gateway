@@ -8,9 +8,10 @@ const MAX_TARGET_LENGTH = 1024;
 
 /**
  * Returns the post-login return target rebuilt from its validated parts, or null. Only the
- * dashboard root and the CLI authorize path with a query are allowed, and the path may not hold an
- * encoded slash or backslash. The query may, since the CLI `state` is opaque. The gateway applies
- * the same rule to the SAML return target.
+ * dashboard root, the new access token form with or without its preset query, and the CLI
+ * authorize path with a query are allowed, and the path may not hold an encoded slash or
+ * backslash. The query may, since the CLI `state` is opaque. The gateway applies the same rule to
+ * the SAML return target.
  */
 export function safeNextTarget(next: string | null, origin: string): string | null {
   if (
@@ -35,6 +36,9 @@ export function safeNextTarget(next: string | null, origin: string): string | nu
   if (resolved.pathname === ROUTES.DASHBOARD && resolved.search === '') {
     return ROUTES.DASHBOARD;
   }
+  if (resolved.pathname === ROUTES.ACCESS_TOKEN_NEW) {
+    return `${resolved.pathname}${resolved.search}`;
+  }
   if (resolved.pathname === CLI_AUTHORIZE_PATH && resolved.search.length > 1) {
     return `${resolved.pathname}${resolved.search}`;
   }
@@ -42,9 +46,19 @@ export function safeNextTarget(next: string | null, origin: string): string | nu
 }
 
 /**
- * The return target for the login page at `location`: its `?next=` when present, or, when the
+ * The query of `search` re-encoded so every value is percent-encoded, including the `*` and `,`
+ * that links commonly carry raw and `safeNextTarget` rejects.
+ */
+function canonicalQuery(search: string): string {
+  const query = new URLSearchParams(search).toString().replace(/\*/g, '%2A');
+  return query ? `?${query}` : '';
+}
+
+/**
+ * The return target for the login page at `location`: its `?next=` when present; when the
  * signed-out user opened the CLI consent page, the CLI authorize path with the consent query, so
- * the CLI login continues after sign-in. Either way the target passes `safeNextTarget`.
+ * the CLI login continues after sign-in; or, when they opened a new access token link, that form
+ * with its preset query. Either way the target passes `safeNextTarget`.
  */
 export function loginNextTarget(
   location: Pick<Location, 'pathname' | 'search' | 'origin'>
@@ -55,6 +69,12 @@ export function loginNextTarget(
   }
   if (location.pathname === ROUTES.CLI_CONSENT) {
     return safeNextTarget(`${CLI_AUTHORIZE_PATH}${location.search}`, location.origin);
+  }
+  if (location.pathname === ROUTES.ACCESS_TOKEN_NEW) {
+    return safeNextTarget(
+      `${ROUTES.ACCESS_TOKEN_NEW}${canonicalQuery(location.search)}`,
+      location.origin
+    );
   }
   return null;
 }

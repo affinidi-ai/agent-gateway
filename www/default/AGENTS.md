@@ -105,11 +105,16 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
   (comma-separated), `expires_at` (ISO 8601; clears **Never**), `resource_pattern`, and
   `header=<name>:<pattern>` (repeatable). The link never saves; the operator still clicks
   Create, and preset scopes they cannot grant render as red unavailable pills. The
-  resource-scope card opens when a pattern or header is preset.
+  resource-scope card opens when a pattern or header is preset. The link survives sign-in:
+  a signed-out visitor sees the login page at that URL, and `loginNextTarget` re-encodes the
+  query and returns to the form after passkey or SAML login (the gateway's SAML return-target
+  allowlist accepts `/access-tokens/new`).
 - In create mode the form footer has a **Copy creation link** button
   (`access-token-copy-permalink-button`) that copies an absolute `/access-tokens/new` URL
   encoding the current name, description, scopes, expiry, resource pattern and headers
-  in the parameters above. It is not shown in edit mode.
+  in the parameters above. It is disabled until the configuration would pass Create's
+  validation (name, scopes, resource pattern, headers, expiry), and it is not shown in edit
+  mode.
 - A successful create replaces the editor with the secret page. The secret is never
   rendered: the field shows a masked placeholder and only **Copy** puts the real value on
   the clipboard.
