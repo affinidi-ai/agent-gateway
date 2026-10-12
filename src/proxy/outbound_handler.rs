@@ -3889,6 +3889,10 @@ async fn step_inject_credentials(
                 .contains(&binding.credential_provider_id)
         });
     }
+    // Tool-scoped bindings never apply on a Transit Point. Bindings carry no
+    // destination, and a partner upstream names its own tools, so matching on
+    // the tool name would hand it a credential scoped to the Target's tools.
+    outbound_creds.retain(|binding| matches!(binding.required_for, crate::config::types::CredentialRequirement::All));
     if outbound_creds.is_empty() {
         return Ok(());
     }
@@ -7272,7 +7276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transit_tool_scoped_binding_applies_only_to_listed_tools() {
+    async fn transit_tool_scoped_binding_never_applies() {
         use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
         use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
         use crate::secrets::SecretsStore;
@@ -7349,20 +7353,36 @@ mod tests {
             }))
             .unwrap(),
         ];
+        let mut all_surface = surface.clone();
+        all_surface.outbound_credentials[0].required_for = crate::config::types::CredentialRequirement::All;
         let surface = Arc::new(surface);
+        let all_surface = Arc::new(all_surface);
         let claims: crate::proxy::transit_token::TransitTokenClaims = serde_json::from_value(json!({
             "iss": "gateway", "sub": "did:web:caller.example", "surface_id": "surface",
             "iat": 0, "exp": 0, "jti": "jti", "user_identity_hash": "user-hash"
         }))
         .unwrap();
 
-        for (body, expected) in [
+        // A partner upstream names its own tools, so a binding scoped to a tool
+        // name is never sent to it, even for a listed tool or a JSON-RPC method.
+        // An `all` binding still is.
+        for (surface, body, expected) in [
             (
+                &surface,
                 json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_current_date_time"}}),
+                None,
+            ),
+            (
+                &surface,
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "other_tool"}}),
+                None,
+            ),
+            (&surface, json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}), None),
+            (
+                &all_surface,
+                json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "get_current_date_time"}}),
                 Some("Bearer tool-scoped-credential"),
             ),
-            (json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "other_tool"}}), None),
-            (json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}), None),
         ] {
             let mut ctx = test_pipeline_context();
             ctx.surface = surface.clone();
@@ -7429,7 +7449,8 @@ mod tests {
                 .await
                 .unwrap()
         );
-        for (tool, consent_required) in [("get_current_date_time", true), ("other_tool", false)] {
+        // With no stored token, a tool-scoped binding asks for no consent either.
+        for tool in ["get_current_date_time", "other_tool"] {
             let mut ctx = test_pipeline_context();
             ctx.surface = surface.clone();
             ctx.protocol = Some(ChannelProtocol::Mcp);
@@ -7443,12 +7464,7 @@ mod tests {
 
             let result = step_inject_credentials(&state, &mut ctx).await;
 
-            assert_eq!(
-                matches!(result, Err(OutboundPipelineError::ConsentRequired(_))),
-                consent_required,
-                "{tool}: {result:?}"
-            );
-            assert!(consent_required || result.is_ok(), "{tool}: {result:?}");
+            assert!(result.is_ok(), "{tool}: {result:?}");
         }
     }
 
