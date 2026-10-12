@@ -150,8 +150,11 @@ regex per tool.
   blocks a denied tool before forwarding
   (`build_tools_call_policy_denied_response`), and a `tools/list` filter on the
   fabric response (already plain JSON — the remote gateway de-SSE'd it) strips
-  denied tools via `CompiledMcpToolGating::filter_tools_list_value`. Both
-  gateways in a G2G chain filter independently and compose.
+  denied tools via `CompiledMcpToolGating::filter_tools_list_value`. Both build
+  their condition input with `fabric_mcp_gate_input`, carrying the caller's
+  `source_auth`, the `mcp` context and the `identity_binding`, so a tool the
+  list shows is one the call gate admits. Both gateways in a G2G chain filter
+  independently and compose.
 - **MCP proxy (`proxy://`) targets** — a surface whose target is a stored MCP
   proxy is answered by `src/proxy/handler.rs::handle_mcp_proxy_request` (the
   gateway *is* the MCP server), which returns before the direct-path gate in

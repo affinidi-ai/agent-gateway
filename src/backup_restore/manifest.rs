@@ -9,6 +9,10 @@ const FORMAT_VERSION: u8 = 2;
 const PRODUCT: &str = "agent-gateway";
 const LEGACY_PRODUCT: &str = "trust-gateway"; // Accept old backups during migration
 
+pub(super) fn is_manifest_path(name: &str) -> bool {
+    name == MANIFEST_PATH || name == LEGACY_MANIFEST_PATH
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupManifest {
     pub format_version: u8,
@@ -67,12 +71,20 @@ pub fn read_optional_backup_manifest(zip_bytes: &[u8]) -> anyhow::Result<Option<
     use std::io::{Cursor, Read};
 
     let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))?;
+    // The current manifest wins over a legacy one: archives taken from storage that kept a
+    // restored legacy manifest file carry both.
+    let manifest_path = if archive
+        .index_for_name(MANIFEST_PATH)
+        .is_some()
+    {
+        MANIFEST_PATH
+    } else {
+        LEGACY_MANIFEST_PATH
+    };
     let mut manifest = None;
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        // Accept both new and legacy manifest paths for backward compatibility
-        let is_manifest = entry.name() == MANIFEST_PATH || entry.name() == LEGACY_MANIFEST_PATH;
-        if !is_manifest {
+        if entry.name() != manifest_path {
             continue;
         }
         if manifest.is_some() {
@@ -263,6 +275,55 @@ mod tests {
     fn manifest_insertion_rejects_duplicate_reserved_entries() {
         let zip = add_backup_manifest(&sample_zip(), "gateway.example.com", false).unwrap();
         assert!(add_backup_manifest(&zip, "gateway.example.com", false).is_err());
+    }
+
+    fn zip_with_manifests(entries: &[(&str, &BackupManifest)]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut zip = ZipWriter::new(cursor);
+        let options: SimpleFileOptions = FileOptions::default();
+        for (path, manifest) in entries {
+            zip.start_file(*path, options)
+                .unwrap();
+            zip.write_all(&serde_json::to_vec(manifest).unwrap())
+                .unwrap();
+        }
+        zip.finish()
+            .unwrap()
+            .into_inner()
+    }
+
+    #[test]
+    fn current_manifest_wins_over_legacy_manifest() {
+        let current = BackupManifest::new("gateway.example.com", false).unwrap();
+        let mut legacy = BackupManifest::new("other.example.com", false).unwrap();
+        legacy.product = LEGACY_PRODUCT.to_string();
+
+        for entries in [
+            [(LEGACY_MANIFEST_PATH, &legacy), (MANIFEST_PATH, &current)],
+            [(MANIFEST_PATH, &current), (LEGACY_MANIFEST_PATH, &legacy)],
+        ] {
+            let zip = zip_with_manifests(&entries);
+            let manifest = validate_backup_manifest(&zip, "gateway.example.com").unwrap();
+            assert_eq!(manifest, current);
+        }
+    }
+
+    #[test]
+    fn invalid_current_manifest_is_not_replaced_by_legacy_manifest() {
+        let mut current = BackupManifest::new("other.example.com", false).unwrap();
+        current.product = "other-product".to_string();
+        let legacy = BackupManifest::new("gateway.example.com", false).unwrap();
+        let zip = zip_with_manifests(&[(LEGACY_MANIFEST_PATH, &legacy), (MANIFEST_PATH, &current)]);
+
+        assert!(validate_backup_manifest(&zip, "gateway.example.com").is_err());
+    }
+
+    #[test]
+    fn manifest_path_matches_only_reserved_names() {
+        assert!(is_manifest_path(MANIFEST_PATH));
+        assert!(is_manifest_path(LEGACY_MANIFEST_PATH));
+        assert!(!is_manifest_path("META-INF/other.json"));
+        assert!(!is_manifest_path("agent-gateway-backup.json"));
     }
 
     #[test]

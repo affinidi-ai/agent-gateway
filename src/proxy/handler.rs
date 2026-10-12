@@ -9691,6 +9691,38 @@ fn modern_fabric_failure_response(
 }
 
 /// Handle requests through the fabric:// protocol by forwarding via gateway
+/// Policy input for MCP tool gating on the fabric leg. The `tools/list`
+/// filter and the `tools/call` gate build it here from the same caller
+/// context, so a tool shown in the list is one the call gate admits.
+#[allow(clippy::too_many_arguments)]
+fn fabric_mcp_gate_input(
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    remote_gateway_did: &str,
+    config_id: &str,
+    surface_name: &str,
+    source_auth: Option<&crate::surface_context::SourceAuthContext>,
+    mcp: crate::surface_context::McpContext,
+    identity_binding: Option<&crate::surface_context::IdentityBindingContext>,
+) -> serde_json::Value {
+    let mut policy_input = crate::surface_context::PolicyInput::new(
+        method,
+        path,
+        crate::surface_context::filter_sensitive_headers(headers),
+        "outbound",
+        None,
+        Some(remote_gateway_did.to_string()),
+        Some(config_id.to_string()),
+        surface_name,
+    );
+    policy_input.source_auth = source_auth.cloned();
+    policy_input.mcp = Some(mcp);
+    policy_input.identity_binding = identity_binding.cloned();
+    policy_input.normalize_caller_did();
+    serde_json::to_value(&policy_input).unwrap_or_default()
+}
+
 async fn handle_fabric_request(
     state: ProxyState,
     channel_name: &str,
@@ -10556,32 +10588,26 @@ async fn handle_fabric_request(
         && let Some(tool_name) = tool_request.tool_name()
     {
         let input_value = if gating.has_policy_conditions() {
-            let mut policy_input = crate::surface_context::PolicyInput::new(
+            fabric_mcp_gate_input(
                 method.as_ref(),
                 uri.path(),
-                crate::surface_context::filter_sensitive_headers(&headers),
-                "outbound",
-                None,
-                Some(remote_gateway_did.clone()),
-                Some(config_id_str.to_string()),
+                &headers,
+                &remote_gateway_did,
+                config_id_str,
                 &state.surface.name,
-            );
-            policy_input.source_auth = source_auth_context.clone();
-            policy_input.mcp = modern_mcp_context
-                .clone()
-                .or_else(|| {
-                    Some(crate::surface_context::McpContext {
+                source_auth_context.as_ref(),
+                modern_mcp_context
+                    .clone()
+                    .unwrap_or_else(|| crate::surface_context::McpContext {
                         method: tool_request.method.clone(),
                         tool_name: Some(tool_name.to_string()),
                         resource_uri: None,
                         prompt_name: None,
                         params: tool_request.params.clone(),
                         ..Default::default()
-                    })
-                });
-            policy_input.identity_binding = identity_binding.clone();
-            policy_input.normalize_caller_did();
-            serde_json::to_value(&policy_input).unwrap_or_default()
+                    }),
+                identity_binding.as_ref(),
+            )
         } else {
             serde_json::Value::Null
         };
@@ -12779,29 +12805,26 @@ async fn handle_fabric_request(
                     match serde_json::from_str::<serde_json::Value>(&response_body) {
                         Ok(mut json) => {
                             let input_value = if gating.has_policy_conditions() {
-                                let mut policy_input = crate::surface_context::PolicyInput::new(
+                                fabric_mcp_gate_input(
                                     method.as_ref(),
                                     uri.path(),
-                                    crate::surface_context::filter_sensitive_headers(&headers),
-                                    "outbound",
-                                    None,
-                                    Some(remote_gateway_did.clone()),
-                                    Some(config_id.to_string()),
+                                    &headers,
+                                    &remote_gateway_did,
+                                    config_id,
                                     &state.surface.name,
-                                );
-                                policy_input.mcp = modern_mcp_context
-                                    .clone()
-                                    .or_else(|| {
-                                        Some(crate::surface_context::McpContext {
+                                    source_auth_context.as_ref(),
+                                    modern_mcp_context
+                                        .clone()
+                                        .unwrap_or_else(|| crate::surface_context::McpContext {
                                             method: "tools/list".to_string(),
                                             tool_name: None,
                                             resource_uri: None,
                                             prompt_name: None,
                                             params: None,
                                             ..Default::default()
-                                        })
-                                    });
-                                serde_json::to_value(&policy_input).unwrap_or_default()
+                                        }),
+                                    identity_binding.as_ref(),
+                                )
                             } else {
                                 serde_json::Value::Null
                             };
@@ -15451,13 +15474,176 @@ mod tests {
     use super::{
         Ap2InboundDecision, CHANNEL_SSE_SESSION_MGR, a2a_proxy_connection_status, agent_card_fabric_forward_path,
         agent_card_response, ap2_experimental_enabled_from_flags, decode_bearer_jwt_claims,
-        evaluate_ap2_inbound_decision, is_forwarded_on_credentialed_card_fetch, modern_fabric_failure_response,
-        normalize_route_for_match, resolve_direct_surface_auth_config, resolve_legacy_mcp_session,
-        route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
+        evaluate_ap2_inbound_decision, fabric_mcp_gate_input, is_forwarded_on_credentialed_card_fetch,
+        modern_fabric_failure_response, normalize_route_for_match, resolve_direct_surface_auth_config,
+        resolve_legacy_mcp_session, route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
     use std::collections::HashMap;
+
+    const READER_CONDITION: &str = r#"
+package surface.policy
+
+default allow = false
+
+allow if {
+    input.source_auth.method == "jwt_bearer"
+    input.source_auth.claims.role == "reader"
+}
+"#;
+
+    /// Deny-by-default gating whose only allow gate grants `read_*` tools to
+    /// callers whose source credential carries `role: reader`.
+    fn caller_scoped_gating() -> crate::policies::CompiledMcpToolGating {
+        use crate::config::agent_surface::{McpToolGate, McpToolGateAction, McpToolGateEffect, McpToolGatingConfig};
+        let config = McpToolGatingConfig {
+            default_effect: McpToolGateEffect::Deny,
+            gates: vec![McpToolGate {
+                id: "readers".to_string(),
+                name: String::new(),
+                description: String::new(),
+                condition_policy_definition_id: Some("reader-only".to_string()),
+                action: McpToolGateAction {
+                    effect: McpToolGateEffect::Allow,
+                    patterns: vec!["^read_".to_string()],
+                },
+            }],
+        };
+        crate::policies::CompiledMcpToolGating::build(&config, |id| {
+            (id == "reader-only").then(|| READER_CONDITION.to_string())
+        })
+    }
+
+    fn caller(role: &str) -> crate::surface_context::SourceAuthContext {
+        crate::surface_context::SourceAuthContext::JwtBearer {
+            subject: "alice".to_string(),
+            claims: serde_json::json!({ "role": role }),
+        }
+    }
+
+    fn fabric_gate_input(
+        source_auth: Option<&crate::surface_context::SourceAuthContext>,
+        mcp_method: &str,
+        tool_name: Option<&str>,
+    ) -> serde_json::Value {
+        fabric_mcp_gate_input(
+            "POST",
+            "/mcp",
+            &HeaderMap::new(),
+            "did:example:peer-gateway",
+            "surface-1",
+            "Surface",
+            source_auth,
+            crate::surface_context::McpContext {
+                method: mcp_method.to_string(),
+                tool_name: tool_name.map(str::to_string),
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
+    fn listed_tools(
+        gating: &crate::policies::CompiledMcpToolGating,
+        input: &serde_json::Value,
+    ) -> Vec<String> {
+        let mut list = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "tools": [{ "name": "read_file" }, { "name": "write_file" }] }
+        });
+        assert_eq!(
+            gating
+                .filter_tools_list_value(&mut list, input)
+                .map(|(before, _)| before),
+            Some(2)
+        );
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                tool["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fabric_tools_list_shows_the_tools_a_caller_scoped_gate_grants() {
+        let gating = caller_scoped_gating();
+        assert!(gating.has_policy_conditions());
+        let reader = caller("reader");
+
+        let list_input = fabric_gate_input(Some(&reader), "tools/list", None);
+        assert_eq!(listed_tools(&gating, &list_input), vec!["read_file".to_string()]);
+
+        let read_call = fabric_gate_input(Some(&reader), "tools/call", Some("read_file"));
+        let write_call = fabric_gate_input(Some(&reader), "tools/call", Some("write_file"));
+        assert!(gating.is_tool_call_allowed("read_file", &read_call));
+        assert!(!gating.is_tool_call_allowed("write_file", &write_call));
+    }
+
+    #[test]
+    fn fabric_tools_list_hides_tools_from_a_caller_the_gate_does_not_grant() {
+        let gating = caller_scoped_gating();
+        let guest = caller("guest");
+
+        assert!(listed_tools(&gating, &fabric_gate_input(Some(&guest), "tools/list", None)).is_empty());
+        assert!(listed_tools(&gating, &fabric_gate_input(None, "tools/list", None)).is_empty());
+        assert!(
+            !gating
+                .is_tool_call_allowed("read_file", &fabric_gate_input(Some(&guest), "tools/call", Some("read_file")))
+        );
+    }
+
+    #[test]
+    fn fabric_gate_input_carries_the_caller_and_identity_binding_without_secret_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret-token"));
+        headers.insert("x-request-id", HeaderValue::from_static("req-1"));
+        let binding = crate::surface_context::IdentityBindingContext::from_verified_parts(
+            "did:example:agent".to_string(),
+            "did:example:issuer-gateway".to_string(),
+            HashMap::new(),
+            Vec::new(),
+            true,
+        );
+        let reader = caller("reader");
+
+        let input = fabric_mcp_gate_input(
+            "POST",
+            "/mcp",
+            &headers,
+            "did:example:peer-gateway",
+            "surface-1",
+            "Surface",
+            Some(&reader),
+            crate::surface_context::McpContext {
+                method: "tools/list".to_string(),
+                ..Default::default()
+            },
+            Some(&binding),
+        );
+
+        assert_eq!(input["source_auth"]["method"], "jwt_bearer");
+        assert_eq!(input["source_auth"]["claims"]["role"], "reader");
+        assert_eq!(input["identity_binding"]["agent"]["did"], "did:example:agent");
+        assert_eq!(input["identity_binding"]["verified"], true);
+        assert_eq!(input["mcp"]["method"], "tools/list");
+        assert_eq!(input["gateway"]["direction"], "outbound");
+        assert_eq!(input["gateway"]["target_id"], "did:example:peer-gateway");
+        assert_eq!(input["channel"]["config_id"], "surface-1");
+        assert_eq!(input["http"]["headers"]["x-request-id"], "req-1");
+        assert!(
+            input["http"]["headers"]
+                .get("authorization")
+                .is_none()
+        );
+    }
 
     #[test]
     fn credentialed_card_fetch_forwards_only_content_negotiation_headers() {
