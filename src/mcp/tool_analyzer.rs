@@ -146,6 +146,91 @@ impl BodyRefusal {
             ),
         }
     }
+
+    /// The refusal of a modern (`2026-07-28`) request: HTTP 400, as for every
+    /// other malformed modern request. The request id is echoed unless it is
+    /// itself one of the ambiguous keys.
+    pub fn into_modern_error(
+        self,
+        body: &[u8],
+    ) -> Box<super::request_validation::McpRequestValidationError> {
+        let (code, message) = match self {
+            Self::NotJson(_) => (super::error_codes::PARSE_ERROR, "Invalid JSON"),
+            Self::Batch | Self::NotObject | Self::AmbiguousKeys => {
+                (super::error_codes::INVALID_REQUEST, "Invalid JSON-RPC request")
+            }
+        };
+        Box::new(super::request_validation::McpRequestValidationError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            id: unambiguous_id(body),
+            code,
+            message: message.to_string(),
+            data: None,
+        })
+    }
+
+    /// The caller's response: the modern refusal for a modern request, else
+    /// [`Self::into_response`].
+    pub fn into_response_for(
+        self,
+        classification: &super::request_validation::McpRequestClassification,
+        body: &[u8],
+    ) -> axum::response::Response {
+        if matches!(classification, super::request_validation::McpRequestClassification::Modern(_)) {
+            (*self.into_modern_error(body)).into_response()
+        } else {
+            self.into_response()
+        }
+    }
+}
+
+/// The top-level `id` of `body`, when exactly one key folds to `id` and it is
+/// spelled exactly. serde keeps the last of duplicate keys, so a duplicated
+/// `id` has no single value to echo.
+fn unambiguous_id(body: &[u8]) -> Option<Value> {
+    let TopLevelIds(mut ids) = serde_json::from_slice(body).ok()?;
+    match (ids.pop(), ids.is_empty()) {
+        (Some((key, id)), true) if key == "id" => Some(id),
+        _ => None,
+    }
+}
+
+/// The top-level keys of a JSON object that fold to `id`, with their values.
+struct TopLevelIds(Vec<(String, Value)>);
+
+impl<'de> Deserialize<'de> for TopLevelIds {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_map(TopLevelIdsVisitor)
+    }
+}
+
+struct TopLevelIdsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for TopLevelIdsVisitor {
+    type Value = TopLevelIds;
+
+    fn expecting(
+        &self,
+        formatter: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        formatter.write_str("a JSON-RPC object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<TopLevelIds, A::Error> {
+        let mut ids = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if fold_case(&key) == "id" {
+                let id = map.next_value::<Value>()?;
+                ids.push((key, id));
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(TopLevelIds(ids))
+    }
 }
 
 /// Why an MCP POST body is refused at admission, or `None` when it is one
@@ -555,6 +640,25 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(body)
             );
+        }
+    }
+
+    #[test]
+    fn modern_refusal_echoes_only_an_unambiguous_id() {
+        for (body, id) in [
+            (&br#"{"jsonrpc":"2.0","id":7,"method":"tools/list","method":"ping"}"#[..], Some(serde_json::json!(7))),
+            (br#"{"jsonrpc":"2.0","id":"a","id":"b","method":"tools/list"}"#, None),
+            (br#"{"jsonrpc":"2.0","ID":"a","method":"tools/list"}"#, None),
+            (br#"{"jsonrpc":"2.0","id":7,"Id":8,"method":"tools/list"}"#, None),
+            (br#"{"jsonrpc":"2.0","method":"tools/list","params":{"id":7,"id":8}}"#, None),
+            (br#"[{"jsonrpc":"2.0","id":7,"method":"tools/list"}]"#, None),
+        ] {
+            let error = single_object_refusal(body)
+                .unwrap()
+                .into_modern_error(body);
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(body));
+            assert_eq!(error.code, super::super::error_codes::INVALID_REQUEST, "{}", String::from_utf8_lossy(body));
+            assert_eq!(error.id, id, "{}", String::from_utf8_lossy(body));
         }
     }
 

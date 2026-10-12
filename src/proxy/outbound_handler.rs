@@ -1777,6 +1777,9 @@ async fn step_extract_protocol_context_with_versions(
             })?;
         if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body) {
             warn!(request_id = %ctx.request_id, reason = refusal.reason(), "Rejecting MCP request body at admission");
+            if matches!(classification, crate::mcp::request_validation::McpRequestClassification::Modern(_)) {
+                return Err(OutboundPipelineError::McpValidation(refusal.into_modern_error(&body)));
+            }
             return Err(OutboundPipelineError::McpBodyRefused(refusal));
         }
         ctx.surface
@@ -7562,6 +7565,91 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn transit_refuses_methods_and_bodies_outside_post() {
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+        )
+        .await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "method-surface", "name": "Method surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
+                "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr)}]}
+        }))
+        .unwrap();
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+        let send = |method: &'static str, body: &'static str| {
+            let state = state.clone();
+            async move {
+                let request = Request::builder()
+                    .method(method)
+                    .uri("/outbound/mcp/partner-a")
+                    .body(axum::body::Body::from(body))
+                    .unwrap();
+                Box::pin(outbound_proxy_handler_with_mcp_versions(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                    state,
+                    request,
+                    crate::mcp::request_validation::McpVersionPolicy::new(
+                        &[crate::mcp::MCP_MODERN_VERSION],
+                        &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+                    ),
+                ))
+                .await
+                .unwrap_or_else(|error| error.into_response())
+            }
+        };
+
+        for (method, body, status) in [
+            ("PUT", "", StatusCode::METHOD_NOT_ALLOWED),
+            ("PATCH", "", StatusCode::METHOD_NOT_ALLOWED),
+            ("FOO", "", StatusCode::METHOD_NOT_ALLOWED),
+            ("GET", "{}", StatusCode::BAD_REQUEST),
+            ("DELETE", "{}", StatusCode::BAD_REQUEST),
+        ] {
+            let response = send(method, body).await;
+            assert_eq!(response.status(), status, "{method}");
+            if status == StatusCode::METHOD_NOT_ALLOWED {
+                assert_eq!(response.headers()["allow"], "POST, GET, DELETE", "{method}");
+            } else {
+                let error: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(error["error"]["code"], crate::mcp::error_codes::INVALID_REQUEST, "{method}");
+            }
+        }
+        assert_eq!(
+            target
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no refused method reaches the upstream"
+        );
+
+        for (forwarded, method) in [(1, "GET"), (2, "DELETE")] {
+            send(method, "").await;
+            assert_eq!(
+                target
+                    .request_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                forwarded,
+                "an unmarked {method} without a body is forwarded"
+            );
+        }
+    }
+
     // ── detect_protocol_and_operation ───────────────────────────────────────
 
     #[test]
@@ -8144,14 +8232,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_step_extract_protocol_context_rejects_every_admission_negative_case() {
-        use crate::mcp::admission_cases::{ALLOWED_ORIGIN, admission_cases, assert_rejected};
+        use crate::mcp::admission_cases::{ALLOWED_ORIGIN, admission_cases, assert_rejected, body_refusal_cases};
 
         let state = test_outbound_state();
         let versions = crate::mcp::request_validation::McpVersionPolicy::new(
             &[crate::mcp::MCP_MODERN_VERSION],
             &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
         );
-        for case in admission_cases() {
+        for case in admission_cases()
+            .into_iter()
+            .chain(body_refusal_cases())
+        {
             let mut ctx = test_pipeline_context();
             Arc::make_mut(&mut ctx.surface)
                 .access_point

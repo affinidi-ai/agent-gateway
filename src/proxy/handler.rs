@@ -2007,7 +2007,7 @@ async fn proxy_handler_with_mcp_runtime(
             connection_guard
                 .decrement()
                 .await;
-            return Ok(refusal.into_response());
+            return Ok(refusal.into_response_for(&classification, &body_bytes));
         }
         let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
             &classification,
@@ -16448,13 +16448,139 @@ allow if {
         }
     }
 
+    /// Methods and bodies outside POST on the three paths the Access Point
+    /// router serves: PUT, PATCH and extension methods get 405 with `Allow`,
+    /// and a body on any other method gets 400, before the Target, the Fabric
+    /// leg or the MCP Proxy is reached. Each refusal releases its connection.
+    /// An unmarked GET without a body still reaches an HTTP Target, and DELETE
+    /// still ends the session at the gateway.
+    async fn access_point_refuses_methods_and_bodies_outside_post(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        const TASK: &str = "router-fixture";
+        let monitor = Arc::new(crate::observability::TaskMonitor::new(None));
+        monitor
+            .register_task(crate::observability::TaskInfo::running(TASK))
+            .await;
+        let state = crate::state::ProxyState {
+            task_monitor: Some(monitor.clone()),
+            ..state.clone()
+        };
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+        )
+        .await;
+        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
+            &[crate::mcp::MCP_MODERN_VERSION],
+            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+        );
+        let surface = |endpoint: String| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "method-cases", "name": "Method cases",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/methods", "protocol": "mcp"},
+                "target": {"endpoint": endpoint}
+            }))
+            .unwrap()
+        };
+        let send = |surface: crate::config::agent_surface::AgentSurface, method: &'static str, body: &'static str| {
+            let router = direct_router_state(&state, surface);
+            async move {
+                let request = axum::http::Request::builder()
+                    .method(method)
+                    .uri("/methods")
+                    .body(axum::body::Body::from(body))
+                    .unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        router,
+                        request,
+                        versions,
+                        None,
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{method} was not answered at admission"))
+            }
+        };
+
+        for (path, endpoint) in [
+            ("direct Access Point", target.url()),
+            ("Fabric send", "fabric://gw/ch".to_string()),
+            ("proxy:// Access Point", "proxy://method-cases".to_string()),
+        ] {
+            for (method, body, status) in [
+                ("PUT", "", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+                ("PATCH", "", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+                ("FOO", "", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+                ("GET", "{}", axum::http::StatusCode::BAD_REQUEST),
+                ("DELETE", "{}", axum::http::StatusCode::BAD_REQUEST),
+            ] {
+                let response = send(surface(endpoint.clone()), method, body).await;
+                assert_eq!(response.status(), status, "{path} {method}");
+                if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+                    assert_eq!(response.headers()["allow"], "POST, GET, DELETE", "{path} {method}");
+                } else {
+                    let error: serde_json::Value = serde_json::from_slice(
+                        &axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(error["error"]["code"], crate::mcp::error_codes::INVALID_REQUEST, "{path} {method}");
+                }
+                assert_eq!(
+                    monitor
+                        .get_task(TASK)
+                        .await
+                        .unwrap()
+                        .active_connections,
+                    0,
+                    "{path} {method}: a refusal releases its connection"
+                );
+            }
+        }
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "no refused method reaches the Target"
+        );
+
+        send(surface(target.url()), "GET", "").await;
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            1,
+            "an unmarked GET without a body is forwarded"
+        );
+        let response = send(surface(target.url()), "DELETE", "").await;
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            monitor
+                .get_task(TASK)
+                .await
+                .unwrap()
+                .active_connections,
+            0,
+            "DELETE releases its connection"
+        );
+    }
+
     /// The shared negative admission cases, and modern GET and
     /// DELETE, on the three paths the Access Point router serves: an HTTP
     /// Target, a `fabric://` Target (Fabric send) and a `proxy://` Target. Each
     /// is rejected by admission, before the Target, the Fabric leg or the MCP
     /// Proxy is reached.
     async fn access_point_admission_rejects_every_negative_case(state: &crate::state::ProxyState) {
-        use crate::mcp::admission_cases::{ALLOWED_ORIGIN, admission_cases, assert_rejected};
+        use crate::mcp::admission_cases::{ALLOWED_ORIGIN, admission_cases, assert_rejected, body_refusal_cases};
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
@@ -16478,7 +16604,10 @@ allow if {
                 "target": {"endpoint": endpoint}
             }))
             .unwrap();
-            for case in admission_cases() {
+            for case in admission_cases()
+                .into_iter()
+                .chain(body_refusal_cases())
+            {
                 let mut request = axum::http::Request::builder()
                     .method("POST")
                     .uri("/negative");
@@ -17451,6 +17580,7 @@ allow if {
         mounted_access_point_uses_the_direct_access_point_policy(&state).await;
         direct_access_point_caps_legacy_initialize(&state).await;
         access_point_admission_rejects_every_negative_case(&state).await;
+        access_point_refuses_methods_and_bodies_outside_post(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;
         direct_access_point_preserves_every_result_field(&state).await;
         direct_access_point_caller_disconnect_cancels_quiet_upstream(&state).await;

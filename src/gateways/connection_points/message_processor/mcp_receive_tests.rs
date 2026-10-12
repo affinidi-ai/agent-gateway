@@ -733,6 +733,57 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(response_body["headers"]["allow"], "POST");
         assert_eq!(response_body["body"], "");
     }
+    // Fabric carries the method as a string: it is uppercased, and one that is
+    // not an HTTP token is an extension method. PUT, PATCH and extension
+    // methods get 405 with `Allow`, and a body on any other method gets 400.
+    let forwarded_before = target
+        .request_count
+        .load(Ordering::SeqCst);
+    for (method, body, status) in [
+        ("PUT", Value::Null, 405),
+        ("put", Value::Null, 405),
+        ("PATCH", Value::Null, 405),
+        ("BAD METHOD", Value::Null, 405),
+        ("GET", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), 400),
+        ("delete", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), 400),
+    ] {
+        let mut message = forward_message(body, json!({}));
+        message.message_body["method"] = json!(method);
+        let ProcessingResult::RequiresResponse { response_body, .. } = process_forward_request(&message).await else {
+            panic!("expected a Fabric method rejection for {method}");
+        };
+        assert_eq!(response_body["status"], status, "{method}: {response_body}");
+        if status == 405 {
+            assert_eq!(response_body["headers"]["allow"], "POST, GET, DELETE", "{method}");
+        } else {
+            let envelope: Value = serde_json::from_str(
+                response_body["body"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(envelope["error"]["code"], -32600, "{method}");
+        }
+    }
+    assert_eq!(
+        target
+            .request_count
+            .load(Ordering::SeqCst),
+        forwarded_before,
+        "no refused method reaches the Target"
+    );
+    for (forwarded, method) in [(1, "GET"), (2, "delete")] {
+        let mut message = forward_message(Value::Null, json!({}));
+        message.message_body["method"] = json!(method);
+        process_forward_request(&message).await;
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            forwarded_before + forwarded,
+            "an unmarked {method} without a body is forwarded"
+        );
+    }
     let mut oversized_origin =
         forward_message(Value::Null, json!({"Origin": format!("https://{}.example", "a".repeat(500))}));
     oversized_origin.message_body["method"] = json!("GET");
@@ -890,13 +941,14 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             }
         );
     }
-    // Includes the capped initialize, the one envelope-replay delivery and the
-    // legacy request whose forwarded Origin is not rechecked.
+    // Includes the capped initialize, the one envelope-replay delivery, the
+    // legacy request whose forwarded Origin is not rechecked, and the unmarked
+    // GET and DELETE without a body.
     assert_eq!(
         target
             .request_count
             .load(Ordering::SeqCst),
-        6
+        8
     );
 }
 
@@ -2628,6 +2680,11 @@ async fn fabric_tool_call_batch_flow() {
     for (body, code) in [
         (json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"Name": "admin_reset"}}), -32600),
         (json!({"jsonrpc": "2.0", "id": 4, "Method": "tools/call", "params": {"name": "admin_reset"}}), -32600),
+        // A string body reaches admission byte for byte, so its duplicate key survives.
+        (
+            json!(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","name":"admin_reset"}}"#),
+            -32600,
+        ),
         (json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {}}), -32001),
         (json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": 42}}), -32001),
     ] {
