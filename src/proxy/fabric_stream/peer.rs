@@ -18,6 +18,9 @@ const MAX_PROBES: usize = 256;
 const MAX_OFFERS: usize = 256;
 const MAX_PEERS: usize = 256;
 const PROBE_TTL: Duration = Duration::from_secs(30);
+/// How long a probe's requests wait for the peer's answer. A query unanswered
+/// by then is taken as lost, so later requests send a new one.
+const PROBE_ANSWER_WINDOW: Duration = Duration::from_secs(5);
 const PEER_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +175,9 @@ impl From<&StreamBinding> for PeerKey {
 struct PendingProbe {
     binding: StreamBinding,
     deadline: Instant,
+    /// The end of the probe's answer window: requests join it and wait for its
+    /// answer only until then.
+    answer_by: Instant,
     /// What the peer disclosed for this probe. Kept for the probe's own
     /// waiters, as a later probe to the same peer may replace the cached
     /// agreement.
@@ -315,7 +321,8 @@ impl PeerCapabilities {
     }
 
     /// Starts negotiating with a peer, or joins the probe to it that is
-    /// waiting for an answer, so concurrent first requests send one query.
+    /// waiting for an answer within its answer window, so concurrent first
+    /// requests send one query.
     /// A new probe takes a slot in the peer's share of the probe table;
     /// `tenant_id` is the tenant owning the peer's record. A full share is
     /// `CapacityReached`, so the caller is told to retry. Each start is ended
@@ -339,7 +346,9 @@ impl PeerCapabilities {
         if let Some((pending, probe)) = state
             .probes
             .iter_mut()
-            .find(|(_, probe)| probe.agreement.is_none() && PeerKey::from(&probe.binding) == key)
+            .find(|(_, probe)| {
+                probe.agreement.is_none() && probe.answer_by > now && PeerKey::from(&probe.binding) == key
+            })
         {
             probe.members = probe
                 .members
@@ -358,6 +367,7 @@ impl PeerCapabilities {
                 PendingProbe {
                     binding,
                     deadline: now + PROBE_TTL,
+                    answer_by: now + PROBE_ANSWER_WINDOW,
                     agreement: None,
                     members: 1,
                 },
@@ -490,6 +500,8 @@ impl PeerCapabilities {
             .map(|agreement| agreement.capabilities)
     }
 
+    /// Waits for the answer to the probe under `nonce` until `deadline` or the
+    /// end of the probe's answer window, whichever comes first.
     pub async fn wait(
         &self,
         binding: &StreamBinding,
@@ -500,7 +512,7 @@ impl PeerCapabilities {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
+            let answer_window_ends = {
                 let state = self
                     .state
                     .lock()
@@ -515,11 +527,15 @@ impl PeerCapabilities {
                 if let Some(agreement) = &probe.agreement {
                     return Ok(agreement.clone());
                 }
-                if probe.deadline <= Instant::now() {
-                    return Err("Fabric capability probe is expired or mismatched".to_string());
+                let window_left = probe
+                    .answer_by
+                    .saturating_duration_since(Instant::now());
+                if window_left.is_zero() {
+                    return Err("Fabric capability probe timed out".to_string());
                 }
-            }
-            tokio::time::timeout_at(deadline, notified)
+                tokio::time::Instant::now() + window_left
+            };
+            tokio::time::timeout_at(deadline.min(answer_window_ends), notified)
                 .await
                 .map_err(|_| "Fabric capability probe timed out")?;
         }
@@ -1132,6 +1148,46 @@ mod tests {
             matches!(peers.begin(binding(), None, now), Ok(ProbeStart::Query(_))),
             "the next request starts a new probe"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_probe_is_joined_and_waited_for_only_within_its_answer_window() {
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let now = Instant::now();
+        let query = peers
+            .begin(binding(), None, now)
+            .unwrap()
+            .into_query();
+        let window_end = now + PROBE_ANSWER_WINDOW;
+        assert_eq!(
+            peers.begin(binding(), None, window_end - Duration::from_millis(1)),
+            Ok(ProbeStart::Joined(query.nonce))
+        );
+        let fresh = peers
+            .begin(binding(), None, window_end)
+            .expect("a request after the answer window starts a new probe")
+            .into_query();
+        assert_ne!(fresh.nonce, query.nonce);
+
+        let peers = PeerCapabilities::new(StreamCapabilities::local(true, true));
+        let started_late = Instant::now()
+            .checked_sub(PROBE_ANSWER_WINDOW - Duration::from_millis(200))
+            .expect("the monotonic clock started more than an answer window ago");
+        let late = peers
+            .begin(binding(), None, started_late)
+            .unwrap()
+            .into_query()
+            .nonce;
+        let waited = Instant::now();
+        let caller_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        assert!(
+            peers
+                .wait(&binding(), late, caller_deadline)
+                .await
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(waited.elapsed() < Duration::from_secs(2), "a request waits no longer than the probe's answer window");
     }
 
     #[tokio::test]

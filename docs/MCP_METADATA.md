@@ -1362,6 +1362,10 @@ it, and the peers of one tenant theirs together, so one peer's queries cannot
 fill it (see [how the shares apply](#framed-fabric-limits)). A sending gateway
 has one capability query to a peer in flight at a time: concurrent first
 requests to that peer wait for its answer instead of each sending a query.
+Requests join a query, and wait for its answer, for at most 5 seconds after the
+first of them starts it. A query unanswered by then is taken as lost, and the
+next request sends a new one. A query that cannot be sent fails the requests
+waiting for it at once.
 
 The listener admits an Open (the peer lookup and route resolution) off its
 reader loop, at most 16 at a time. Frames that arrive for the stream before its
