@@ -44,9 +44,10 @@ identity, and policy sees `input.source_auth` as
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
 such as missing configuration or an internal failure, block the request with `500`
 ([`errors.rs`](../src/source_auth/errors.rs)). Such a request is forwarded without the
-surface's stored target credential, or the A2A proxy's Direct Line secret, on every
-forwarding path: direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric
-send and Fabric receive. A surface that must reject unauthenticated callers therefore
+surface's stored target credential, or the A2A proxy's Direct Line secret, on each inbound
+and Fabric forwarding path: direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets,
+Fabric send and Fabric receive. Transit Point listeners do not authenticate callers, so this
+does not cover them. A surface that must reject unauthenticated callers therefore
 needs a policy that denies them:
 
 ```rego
