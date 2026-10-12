@@ -532,7 +532,7 @@ async fn load_accessible_connection_point<S: ConnectionPointStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get parent gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Connection point not found".to_string()))?;
     if !connection_point_allowed(&connection_point, &gateway, context, scope) {
-        return Err((StatusCode::NOT_FOUND, "Connection point not accessible".to_string()));
+        return Err((StatusCode::NOT_FOUND, "Connection point not found".to_string()));
     }
     if mutation && !connection_point_writable(&connection_point, &gateway, context, scope) {
         return Err((StatusCode::FORBIDDEN, "Connection point not accessible".to_string()));
@@ -2450,13 +2450,22 @@ mod tests {
             tenant_id: "tenant-b".into(),
         }));
         for mutation in [false, true] {
+            let hidden = load(tenant_point.id.clone(), other_tenant.clone(), mutation)
+                .await
+                .err();
             assert_eq!(
-                load(tenant_point.id.clone(), other_tenant.clone(), mutation)
-                    .await
-                    .err()
-                    .map(|(status, _)| status),
+                hidden
+                    .as_ref()
+                    .map(|(status, _)| *status),
                 Some(StatusCode::NOT_FOUND),
                 "another tenant's connection point is hidden (mutation: {mutation})"
+            );
+            assert_eq!(
+                hidden,
+                load("no-such-connection-point".into(), other_tenant.clone(), mutation)
+                    .await
+                    .err(),
+                "a hidden connection point answers exactly like a missing one (mutation: {mutation})"
             );
         }
     }

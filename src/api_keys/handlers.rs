@@ -137,14 +137,10 @@ async fn authorize_agent(
         .await
     {
         Ok(Some(surface)) if surface_allows_api_keys(&surface, context, mutation) => Ok(ParentAuthorization::Existing),
-        Ok(Some(surface)) => {
-            let status = if surface_allows_api_keys(&surface, context, false) {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::NOT_FOUND
-            };
-            Err((status, Json(serde_json::json!({ "error": "Agent not accessible" }))).into_response())
+        Ok(Some(surface)) if surface_allows_api_keys(&surface, context, false) => {
+            Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "Agent not accessible" }))).into_response())
         }
+        Ok(Some(_)) => Err(ApiKeyError::AgentNotFound { agent_id: agent_id.to_string() }.into_response()),
         Ok(None) if allow_orphan_cleanup && access == CallerAccess::Unrestricted => {
             Ok(ParentAuthorization::OrphanCleanup)
         }
@@ -701,6 +697,56 @@ mod tests {
                 .load(Ordering::SeqCst),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn another_tenants_surface_answers_exactly_like_a_missing_surface() {
+        let key_store = Arc::new(CountingKeyStore {
+            creates: AtomicUsize::new(0),
+            deletes: AtomicUsize::new(0),
+            delete_actors: std::sync::Mutex::new(Vec::new()),
+        });
+        let store_with = |surface_id: &str| -> ApiKeySurfaceState {
+            Arc::new(OneSurfaceStore {
+                surface: crate::config::agent_surface::AgentSurface {
+                    surface_id: surface_id.into(),
+                    tenant_id: Some("tenant-b".into()),
+                    ..Default::default()
+                },
+            })
+        };
+        let create = |surface_store: ApiKeySurfaceState| {
+            let key_store = key_store.clone();
+            async move {
+                let response = create_key(
+                    State(key_store),
+                    Extension(surface_store),
+                    Path(AgentPath { agent_id: "surface-b".into() }),
+                    Some(Extension(PatTenantContext {
+                        token_id: "atgat-test".into(),
+                        tenant_id: "tenant-a".into(),
+                    })),
+                    None,
+                    Json(CreateApiKeyRequest {
+                        client_id: "client-a".into(),
+                        labels: None,
+                    }),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, body)
+            }
+        };
+
+        let hidden = create(store_with("surface-b")).await;
+        let missing = create(store_with("surface-other")).await;
+
+        assert_eq!(hidden.0, StatusCode::NOT_FOUND);
+        assert_eq!(hidden, missing);
     }
 
     #[tokio::test]
