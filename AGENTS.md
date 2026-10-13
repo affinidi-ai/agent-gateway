@@ -158,6 +158,25 @@ Do not summarise these here. Update the owning document in the same change as th
 1. compile check: `cargo test --no-run 2>&1 | grep -E "^error\[E|^warning|^\s*-->|Finished"`
 2. module tests: `cargo test --bin agent-gateway "<module name>"`
 
+`make test`, `make ui-test` and the other test targets depend on `config-test`, which prepares
+the certificates and keys the tests need. Run `make config-test` once before invoking `cargo test`
+directly.
+
+`make help` lists every target. The ones used most:
+
+| Task                                                    | Command                                            |
+| ------------------------------------------------------- | -------------------------------------------------- |
+| Fast compile check                                      | `make check`                                       |
+| Build backend and frontend                              | `make dev`                                         |
+| Run locally (builds www + cargo)                        | `make run-debug` (`x=<name>` for a named instance) |
+| All Rust tests                                          | `make test` (`test=<name>` filters)                |
+| Frontend unit tests                                     | `make npm-test`                                    |
+| Playwright UI tests                                     | `make ui-test`                                     |
+| Lint everything (fmt check, Clippy, ESLint, ShellCheck) | `make lint`                                        |
+| Format Rust and frontend                                | `make fmt`                                         |
+| Local CI preflight                                      | `make ci`                                          |
+| MCP conformance                                         | `make mcp-conformance`                             |
+
 ## Before ready for review
 
 1. `cargo clippy --all-targets --all-features` — fix all warnings/errors

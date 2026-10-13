@@ -100,7 +100,25 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 - Create and edit use full-page routes with the same visual pattern:
   `/access-tokens/new` and `/access-tokens/:id`.
-- A successful create replaces the editor with the one-time secret page.
+- `/access-tokens/new` presets the form from its query string so an external link can
+  open a filled-in form: `name`, `description`, `scope` (repeatable) or `scopes`
+  (comma-separated), `expires_at` (ISO 8601; clears **Never**), `resource_pattern`, and
+  `header=<name>:<pattern>` (repeatable). The link never saves; the operator still clicks
+  Create, and preset scopes they cannot grant render as red unavailable pills. The
+  resource-scope card opens when a pattern or header is preset. The link survives sign-in:
+  a signed-out visitor sees the login page at that URL, and `loginNextTarget` re-encodes the
+  query and returns to the form after passkey or SAML login (the gateway's SAML return-target
+  allowlist accepts `/access-tokens/new`).
+- In create mode the form footer has a **Copy creation link** button
+  (`access-token-copy-permalink-button`) that copies an absolute `/access-tokens/new` URL
+  encoding the current name, description, scopes, expiry, resource pattern and headers
+  in the parameters above. It is disabled until the configuration would pass Create's
+  validation (name, scopes, resource pattern, headers, expiry), and it is not shown in edit
+  mode.
+- A successful create replaces the editor with the secret page. The secret isn't rendered:
+  the field shows a masked placeholder and **Copy** puts the real value on the clipboard.
+  If copying fails (clipboard denied, or no clipboard API on a plain-HTTP origin), the
+  field shows the secret, selected on focus, so it can be copied by hand.
 - The right column always shows **About Access Tokens**. Edit mode also shows **Access
   Token Details**, resolving the bound user UUID to a name and email while keeping the
   UUID as a fallback.

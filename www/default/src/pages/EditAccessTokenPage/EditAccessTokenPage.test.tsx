@@ -69,17 +69,139 @@ describe('EditAccessTokenPage', () => {
     (apiClient.revokeAccessToken as jest.Mock).mockResolvedValue(undefined);
   });
 
-  it('creates a token and replaces the full page with its one-time secret', async () => {
+  it('creates a token and offers its secret only through copy', async () => {
     renderPage();
     await userEvent.type(screen.getByTestId('access-token-name'), 'Deploy token');
     await userEvent.click(screen.getByTestId('access-token-form-save-button'));
 
     await waitFor(() => expect(apiClient.createAccessToken).toHaveBeenCalled());
-    expect(await screen.findByTestId('page-access-token-created')).toBeVisible();
-    expect(screen.getByTestId('access-token-secret')).toHaveValue('agpat_once-only');
+    const createdPage = await screen.findByTestId('page-access-token-created');
+    expect(createdPage).toBeVisible();
+    expect(screen.getByTestId('access-token-secret')).not.toHaveValue('agpat_once-only');
+    expect(createdPage.innerHTML).not.toContain('agpat_once-only');
+
+    await userEvent.click(screen.getByTestId('access-token-copy-secret-button'));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('agpat_once-only');
+    expect(screen.getByTestId('access-token-secret')).not.toHaveValue('agpat_once-only');
 
     await userEvent.click(screen.getByTestId('access-token-done-button'));
     expect(screen.getByTestId('location')).toHaveTextContent('/secrets?tab=access-tokens');
+  });
+
+  it('presets the create form from the query string without saving', async () => {
+    const expiry = new Date(Date.now() + 6 * 60 * 60 * 1000);
+    const query = new URLSearchParams([
+      ['name', 'Linked token'],
+      ['description', 'From a link'],
+      ['scopes', 'gateways.view,access_tokens.view'],
+      ['scope', 'gateways.view'],
+      ['expires_at', expiry.toISOString()],
+      ['resource_pattern', 'TENANT:${account}:gateways:.*'],
+      ['header', 'account:tenant-a'],
+    ]);
+    renderPage(`/access-tokens/new?${query.toString()}`);
+
+    expect(screen.getByTestId('access-token-name')).toHaveValue('Linked token');
+    expect(screen.getByTestId('access-token-description')).toHaveValue('From a link');
+    expect(screen.getByTestId('access-token-selected-scope-gateways.view')).toBeVisible();
+    expect(screen.getByTestId('access-token-selected-scope-access_tokens.view')).toBeVisible();
+    expect(screen.getByTestId('access-token-never-expires')).not.toBeChecked();
+    expect(screen.getByTestId('access-token-expiry-date-time')).toHaveValue(
+      toLocalDateTimeInput(expiry)
+    );
+    expect(screen.getByTestId('access-token-resource-pattern')).toHaveValue(
+      'TENANT:${account}:gateways:.*'
+    );
+    expect(screen.getByTestId('access-token-header-name-0')).toHaveValue('account');
+    expect(screen.getByTestId('access-token-header-pattern-0')).toHaveValue('tenant-a');
+    expect(apiClient.createAccessToken).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByTestId('access-token-form-save-button'));
+    await waitFor(() =>
+      expect(apiClient.createAccessToken).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'Linked token',
+          scopes: ['gateways.view', 'access_tokens.view'],
+          resource_pattern: 'TENANT:${account}:gateways:.*',
+          required_headers: [{ name: 'account', pattern: 'tenant-a' }],
+        })
+      )
+    );
+  });
+
+  it('copies a permalink that reopens the form with the same settings', async () => {
+    const view = renderPage();
+    await userEvent.type(screen.getByTestId('access-token-name'), 'Shared token');
+    await userEvent.type(screen.getByTestId('access-token-description'), 'For CI');
+    await userEvent.click(screen.getByTestId('access-token-scope-add-gateways.view'));
+    await userEvent.click(screen.getByTestId('access-token-never-expires'));
+    const localExpiry = toLocalDateTimeInput(new Date(Date.now() + 6 * 60 * 60 * 1000));
+    fireEvent.change(screen.getByTestId('access-token-expiry-date-time'), {
+      target: { value: localExpiry },
+    });
+    await userEvent.click(screen.getByTestId('access-token-resource-scope-toggle'));
+    await userEvent.click(screen.getByTestId('access-token-add-header'));
+    await userEvent.type(screen.getByTestId('access-token-header-name-0'), 'account');
+    fireEvent.change(screen.getByTestId('access-token-header-pattern-0'), {
+      target: { value: 'tenant-a' },
+    });
+    fireEvent.change(screen.getByTestId('access-token-resource-pattern'), {
+      target: { value: 'TENANT:${account}:gateways:.*' },
+    });
+
+    await userEvent.click(screen.getByTestId('access-token-copy-permalink-button'));
+    const link = new URL((navigator.clipboard.writeText as jest.Mock).mock.calls[0][0]);
+    expect(link.origin).toBe(window.location.origin);
+    expect(link.pathname).toBe('/access-tokens/new');
+    expect(apiClient.createAccessToken).not.toHaveBeenCalled();
+
+    view.unmount();
+    renderPage(`${link.pathname}${link.search}`);
+    expect(screen.getByTestId('access-token-name')).toHaveValue('Shared token');
+    expect(screen.getByTestId('access-token-description')).toHaveValue('For CI');
+    expect(screen.getByTestId('access-token-selected-scope-gateways.view')).toBeVisible();
+    expect(screen.getByTestId('access-token-expiry-date-time')).toHaveValue(localExpiry);
+    expect(screen.getByTestId('access-token-resource-pattern')).toHaveValue(
+      'TENANT:${account}:gateways:.*'
+    );
+    expect(screen.getByTestId('access-token-header-name-0')).toHaveValue('account');
+    expect(screen.getByTestId('access-token-header-pattern-0')).toHaveValue('tenant-a');
+  });
+
+  it('allows copying the creation link only for a valid token configuration', async () => {
+    renderPage();
+    const copy = screen.getByTestId('access-token-copy-permalink-button');
+    expect(copy).toBeDisabled();
+
+    await userEvent.type(screen.getByTestId('access-token-name'), 'Valid token');
+    expect(copy).toBeEnabled();
+
+    await userEvent.click(screen.getByTestId('access-token-never-expires'));
+    fireEvent.change(screen.getByTestId('access-token-expiry-date-time'), {
+      target: { value: toLocalDateTimeInput(new Date(Date.now() - 60 * 60 * 1000)) },
+    });
+    expect(copy).toBeDisabled();
+    await userEvent.click(copy);
+    expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+  });
+
+  it('disables the creation link for preset scopes the operator cannot grant', () => {
+    renderPage('/access-tokens/new?name=Linked&scope=departments.view');
+    expect(screen.getByTestId('access-token-copy-permalink-button')).toBeDisabled();
+  });
+
+  it('offers the permalink only while creating', async () => {
+    renderPage('/access-tokens/agat_token1');
+    await screen.findByTestId('access-token-name');
+    expect(screen.queryByTestId('access-token-copy-permalink-button')).not.toBeInTheDocument();
+  });
+
+  it('flags preset scopes the operator cannot grant', async () => {
+    renderPage('/access-tokens/new?name=Linked&scope=departments.view');
+
+    expect(await screen.findByTestId('access-token-unavailable-scopes')).toBeVisible();
+    await userEvent.click(screen.getByTestId('access-token-form-save-button'));
+    expect(apiClient.createAccessToken).not.toHaveBeenCalled();
   });
 
   it('adds and removes permission scopes as pills', async () => {
@@ -187,19 +309,36 @@ describe('EditAccessTokenPage', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
-  it('reports clipboard rejection without claiming success', async () => {
-    (navigator.clipboard.writeText as jest.Mock).mockRejectedValueOnce(new Error('denied'));
+  const createAndCopy = async () => {
     renderPage();
     await userEvent.type(screen.getByTestId('access-token-name'), 'Copy test');
     await userEvent.click(screen.getByTestId('access-token-form-save-button'));
-
     const copy = await screen.findByTestId('access-token-copy-secret-button');
+    expect(screen.getByTestId('access-token-secret')).not.toHaveValue('agpat_once-only');
     await userEvent.click(copy);
+    return copy;
+  };
+
+  it('shows the secret for copying by hand when the clipboard refuses it', async () => {
+    (navigator.clipboard.writeText as jest.Mock).mockRejectedValueOnce(new Error('denied'));
+    const copy = await createAndCopy();
+
     expect(showToast).toHaveBeenCalledWith(
       'error',
-      'Could not copy the token. Select the secret and copy it manually.'
+      'Could not copy the token. It is now shown in the field: select it and copy it by hand.'
     );
+    const secret = screen.getByTestId('access-token-secret');
+    expect(secret).toHaveValue('agpat_once-only');
+    expect(secret).toHaveAttribute('aria-label', 'Token secret');
     expect(copy).toHaveTextContent('Copy');
     expect(copy).not.toHaveTextContent('Copied');
+  });
+
+  it('shows the secret for copying by hand when the page has no clipboard API', async () => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    await createAndCopy();
+
+    expect(showToast).toHaveBeenCalledWith('error', expect.stringContaining('copy it by hand'));
+    expect(screen.getByTestId('access-token-secret')).toHaveValue('agpat_once-only');
   });
 });

@@ -1,5 +1,7 @@
 import { loginNextTarget, safeNextTarget } from './loginNextTarget';
 
+/* eslint-disable no-template-curly-in-string */
+
 const ORIGIN = 'https://gateway.example';
 const CLI_TARGET = '/api/auth/cli/authorize?port=52111&state=st&challenge=ch';
 
@@ -35,6 +37,9 @@ test.each([
   ['a protocol-relative CLI path', '//api/auth/cli/authorize?port=1'],
   ['a dot segment in the CLI path', '/api/auth/../auth/cli/authorize/x?port=1'],
   ['a path outside the allow list', '/settings'],
+  ['a sub path of the access token form', '/access-tokens/new/extra?name=x'],
+  ['an access token edit path', '/access-tokens/agpat_1?name=x'],
+  ['a raw asterisk in the access token query', '/access-tokens/new?resource_pattern=.*'],
   ['the CLI path without a query', '/api/auth/cli/authorize'],
   ['the CLI path with an empty query', '/api/auth/cli/authorize?'],
   ['a sub path of the CLI path', '/api/auth/cli/authorize/extra?port=1'],
@@ -65,6 +70,31 @@ describe('loginNextTarget', () => {
     expect(loginNextTarget(at('/cli-consent', '?port=52111&state=st&challenge=ch'))).toBe(
       CLI_TARGET
     );
+  });
+
+  test('returns to a new access token link with its preset query', () => {
+    const search = new URLSearchParams([
+      ['name', 'CI token'],
+      ['scopes', 'gateways.view,secrets.view'],
+      ['resource_pattern', 'TENANT:${account}:gateways:.*'],
+      ['header', 'account:tenant-a'],
+    ]).toString();
+    const next = loginNextTarget(at('/access-tokens/new', `?${search}`));
+
+    expect(next).not.toBeNull();
+    const url = new URL(next as string, ORIGIN);
+    expect(url.pathname).toBe('/access-tokens/new');
+    expect(url.searchParams.get('name')).toBe('CI token');
+    expect(url.searchParams.get('scopes')).toBe('gateways.view,secrets.view');
+    expect(url.searchParams.get('resource_pattern')).toBe('TENANT:${account}:gateways:.*');
+    expect(url.searchParams.get('header')).toBe('account:tenant-a');
+  });
+
+  test('re-encodes a hand-written access token link', () => {
+    expect(
+      loginNextTarget(at('/access-tokens/new', '?name=CI&scopes=gateways.view,secrets.view'))
+    ).toBe('/access-tokens/new?name=CI&scopes=gateways.view%2Csecrets.view');
+    expect(loginNextTarget(at('/access-tokens/new', ''))).toBe('/access-tokens/new');
   });
 
   test('ignores a consent page without a query and any other page', () => {

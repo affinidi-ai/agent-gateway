@@ -138,7 +138,10 @@ test.describe("Access Tokens tab", () => {
     await page.keyboard.press("Control+s");
 
     await expect(page.getByTestId("access-token-created-view")).toBeVisible();
-    await expect(page.getByTestId("access-token-secret")).toHaveValue(
+    await expect(page.getByTestId("access-token-secret")).not.toHaveValue(
+      "agpat_one_time_secret",
+    );
+    await expect(page.getByTestId("access-token-created-view")).not.toContainText(
       "agpat_one_time_secret",
     );
   });

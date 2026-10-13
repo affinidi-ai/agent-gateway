@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import type { AccessTokenCreated, AccessTokenMeta } from '../../types';
 import { getErrorMessage } from '../../utils/apiError';
@@ -10,16 +10,17 @@ import {
   ACCESS_TOKEN_LIST_ROUTE,
   AccessTokenFormState,
   accessTokenFormFor,
+  accessTokenFormFromQuery,
   accessTokenPayload,
-  newAccessTokenForm,
 } from './editorHelpers';
 
 export function useAccessTokenEditor(id: string | undefined, availableScopes: string[]) {
   const navigate = useNavigate();
+  const { search } = useLocation();
   const isEditMode = Boolean(id);
   const initialNow = useRef(new Date());
   const requestGeneration = useRef(0);
-  const [form, setForm] = useState(() => newAccessTokenForm(initialNow.current));
+  const [form, setForm] = useState(() => accessTokenFormFromQuery(search, initialNow.current));
   const [expiryReference, setExpiryReference] = useState(initialNow.current);
   const [token, setToken] = useState<AccessTokenMeta | null>(null);
   const [created, setCreated] = useState<AccessTokenCreated | null>(null);
@@ -37,7 +38,7 @@ export function useAccessTokenEditor(id: string | undefined, availableScopes: st
     if (!id) {
       const now = new Date();
       setExpiryReference(now);
-      setForm(newAccessTokenForm(now));
+      setForm(accessTokenFormFromQuery(search, now));
       setToken(null);
       setLoading(false);
     } else {
@@ -61,7 +62,7 @@ export function useAccessTokenEditor(id: string | undefined, availableScopes: st
     return () => {
       if (generation === requestGeneration.current) requestGeneration.current += 1;
     };
-  }, [id]);
+  }, [id, search]);
 
   const updateField = <Key extends keyof AccessTokenFormState>(
     key: Key,
