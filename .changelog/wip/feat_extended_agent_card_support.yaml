@@ -14,18 +14,24 @@ changes:
         Extended agent card fetches are forwarded with Accept-Encoding identity in place of the
         caller's value, because the gateway cannot rewrite a compressed card and would otherwise
         answer 502.
+    - timestamp: '2026-10-13T14:00:00.000Z'
+      title: Reject public agent cards that are not JSON objects
+      description: >-
+        A public agent card whose body is valid JSON but not an object is now answered with 502 on
+        inbound paths, as extended cards are, because its endpoint URLs cannot be rewritten.
   fixed: []
   removed: []
   security:
     - timestamp: '2026-10-12T10:00:00.000Z'
-      title: Rewrite backend endpoint URLs in extended agent cards
+      title: Rewrite Target endpoint URLs in extended agent cards
       description: >-
         Extended agent cards on A2A and AP2 surfaces, returned by GetExtendedAgentCard and
         agent/getAuthenticatedExtendedCard or fetched with GET extendedAgentCard (1.0) or GET v1/card
         (0.3), now have their endpoint URLs rewritten to the gateway on inbound, fabric and outbound
         paths and get the same agent identity treatment as the public card, so callers no longer
-        learn the backend address. The HTTP+JSON paths are matched after dot segments and
-        percent-escapes are resolved, ignoring case. An extended-card response the gateway cannot rewrite is
+        learn the Target address. The HTTP+JSON paths are matched ignoring case, after dot segments
+        and percent-escapes are resolved, and also after path parameters and empty segments are
+        dropped as lenient Target routers do; an unparseable path is treated as a card. An extended-card response the gateway cannot rewrite is
         answered with 502, and an extended-card request inside a JSON-RPC batch is rejected with
         -32600.
   breaking: []
@@ -52,4 +58,5 @@ changes:
       title: Pick the identity response kind with one shared helper
       description: >-
         Adds IdentityResponseKind::for_response so the inbound and fabric pipelines choose the
-        identity response kind the same way.
+        identity response kind the same way, taking the extended and well-known card flags
+        separately so they cannot be confused.

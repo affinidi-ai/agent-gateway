@@ -161,19 +161,21 @@ pub enum IdentityResponseKind {
 }
 
 impl IdentityResponseKind {
+    /// Classify a response; an extended card wins when a response is flagged as both.
     pub fn for_response(
         is_extended_agent_card: bool,
-        is_agent_card: bool,
+        is_well_known_agent_card: bool,
     ) -> Self {
         if is_extended_agent_card {
             Self::ExtendedAgentCard
-        } else if is_agent_card {
+        } else if is_well_known_agent_card {
             Self::PublicAgentCard
         } else {
             Self::Message
         }
     }
 
+    /// Whether the response is a public or extended agent card.
     pub fn is_agent_card(self) -> bool {
         !matches!(self, Self::Message)
     }

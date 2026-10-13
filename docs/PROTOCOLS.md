@@ -297,9 +297,11 @@ An extended card gets the same treatment on A2A and AP2 surfaces (on the outboun
 AP2 transit points), whether it is returned as a JSON-RPC result (`GetExtendedAgentCard` /
 `agent/getAuthenticatedExtendedCard`) or fetched over the HTTP+JSON binding
 (`GET {route}/extendedAgentCard` in `1.0`, `GET {route}/v1/card` in `0.3`). The HTTP+JSON paths
-match only directly under the surface route (or the transit point's path), after dot segments
-(including `%2e`) are resolved and percent-escapes decoded, the way the Target will see the path,
-and ignoring ASCII case; a deeper path that only ends the same way is not a card, so a Target whose
+match only directly under the surface route (or the transit point's path), ignoring ASCII case,
+when the path is a card path either as the forwarded URL resolves it (dot segments, including
+`%2e`, resolved and percent-escapes decoded) or as lenient Target routers resolve it (also
+dropping `;` path parameters and empty segments); a path the gateway cannot parse is treated as a
+card. A deeper path that only ends the same way is not a card, so a Target whose
 HTTP+JSON base sits below its target endpoint, or that serves a tenant-scoped
 `/{tenant}/extendedAgentCard`, is not covered. Its endpoint URLs are rewritten on inbound,
 fabric and outbound paths, and on inbound paths it gets the same identity treatment when agent

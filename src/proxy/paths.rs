@@ -38,29 +38,62 @@ pub fn is_well_known_agent_card_path(path: &str) -> bool {
 /// binding: `GET {route}/extendedAgentCard` (1.0) or `GET {route}/v1/card` (0.3).
 /// `route_relative_path` is the request path after the surface route, so a deeper
 /// path that only ends the same way (such as `{route}/payments/v1/card`) does not match.
-/// The path is matched as the Target may see it: dot segments (including `%2e`)
-/// are resolved and percent-escapes decoded first, and the comparison ignores
-/// ASCII case because some Target routers do.
+/// The path matches if any way a Target may see it is a card path: as the
+/// forwarded URL resolves it, or as lenient routers (Tomcat, Spring, JAX-RS) do,
+/// which also drop `;` path parameters and empty segments. Percent-escapes are
+/// decoded and the comparison ignores ASCII case because some Target routers do.
+/// A path that cannot be parsed is treated as a card so the response is still
+/// rewritten.
 pub fn is_rest_extended_agent_card_request(
     method: &str,
     route_relative_path: &str,
 ) -> bool {
-    let normalized = normalize_route_relative_path(route_relative_path);
-    let path = normalized.trim_matches('/');
-    method.eq_ignore_ascii_case("GET")
-        && (path.eq_ignore_ascii_case("extendedAgentCard") || path.eq_ignore_ascii_case("v1/card"))
+    if !method.eq_ignore_ascii_case("GET") {
+        return false;
+    }
+    let Some(resolved) = resolve_as_forwarded(route_relative_path) else {
+        return true;
+    };
+    is_extended_agent_card_route_path(&resolved)
+        || is_extended_agent_card_route_path(&normalize_like_lenient_router(route_relative_path))
+}
+
+fn is_extended_agent_card_route_path(path: &str) -> bool {
+    let path = path.trim_matches('/');
+    path.eq_ignore_ascii_case("extendedAgentCard") || path.eq_ignore_ascii_case("v1/card")
 }
 
 /// Resolve dot segments the way the forwarded URL is resolved before it reaches
-/// the Target, then decode percent-escapes.
-fn normalize_route_relative_path(path: &str) -> String {
-    let resolved = url::Url::parse("http://route.invalid/")
-        .and_then(|base| base.join(path.trim_start_matches('/')))
-        .map(|url| url.path().to_string())
-        .unwrap_or_else(|_| path.to_string());
-    percent_encoding::percent_decode_str(&resolved)
-        .decode_utf8_lossy()
-        .into_owned()
+/// the Target, then decode percent-escapes. The path is appended to an absolute
+/// base so a first segment such as `foo:bar` is never parsed as a URL scheme.
+fn resolve_as_forwarded(path: &str) -> Option<String> {
+    let url = url::Url::parse(&format!("http://route.invalid/{}", path.trim_start_matches('/'))).ok()?;
+    Some(
+        percent_encoding::percent_decode_str(url.path())
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
+}
+
+/// Decode percent-escapes, drop `;` path parameters, empty and `.` segments,
+/// and resolve `..`, treating `\` as a separator.
+fn normalize_like_lenient_router(path: &str) -> String {
+    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in decoded.split(['/', '\\']) {
+        match segment
+            .split(';')
+            .next()
+            .unwrap_or_default()
+        {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    segments.join("/")
 }
 
 /// Whether a request is a public discovery read that bypasses the request
@@ -200,10 +233,28 @@ mod tests {
             "/extendedagentcard",
             "/EXTENDEDAGENTCARD",
             "/V1/Card",
+            "/foo:bar/../extendedAgentCard",
+            "/x/foo:bar/../../v1/card",
+            "/extendedAgentCard;x=1",
+            "/v1;a=b/card",
+            "/v1/card;jsessionid=abc",
+            "/v1//card",
+            "/v1/%2F/card",
+            "/x/..;/extendedAgentCard",
+            "/x/y//../../v1/card",
+            "/v1//../card",
+            "/x\\..\\extendedAgentCard",
         ] {
             assert!(is_rest_extended_agent_card_request("GET", path), "{path}");
         }
-        for path in ["/x/./extendedAgentCard", "/payments/%2e/v1/card", "/x/y/../v1/card"] {
+        for path in [
+            "/x/./extendedAgentCard",
+            "/payments/%2e/v1/card",
+            "/x/y/../v1/card",
+            "/foo:bar/extendedAgentCard",
+            "/payments;x=1/v1/card",
+            "/x//v1/card",
+        ] {
             assert!(!is_rest_extended_agent_card_request("GET", path), "{path}");
         }
     }

@@ -7513,7 +7513,7 @@ async fn proxy_handler_with_mcp_runtime(
         let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
         let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
             is_extended_card_response,
-            is_agent_card_request,
+            is_well_known_card_response,
         );
 
         let resolved_identity = if status.is_success() && !response_body.is_empty() {
@@ -12560,7 +12560,7 @@ async fn handle_fabric_request(
                 let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
                 let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
                     is_extended_card_response,
-                    is_agent_card_request,
+                    is_well_known_card_response,
                 );
                 let fabric_response_identity_selector = state
                     .protected_selector
