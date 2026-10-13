@@ -24,11 +24,23 @@ changes:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Keep delegation audit records when a request ends before its VP is minted
       description: Credential delegation records held back until the request's identity VP was minted were lost when the request returned early, for example with 503 when delegated credentials were unavailable. They are now recorded without a VP on every path.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Send Retry-After when an Access Point rate limit refuses a request
+      description: A request refused with 429 by an Access Point rate limit now carries a Retry-After header; it was never set.
   removed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Remove the unused Pre-Authorize Blocked governance audit event
       description: The audit.pre_authorize_blocked event type is no longer offered for Governance Audit integrations, and the Audit page no longer has a label for it. Nothing in the gateway ever recorded this event, so no audit records are affected.
-  security: []
+  security:
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Deny Fabric requests to a surface with OPA enabled but no compiled policy
+      description: A Fabric request to a surface that has OPA enabled but no compiled policy is now denied, as the direct path already did; it was let through.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Enforce the appliance-wide surface policy on every Fabric request
+      description: The appliance-wide surface policy now runs on every Fabric request; it ran only when the surface had its own compiled policy.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Stop returning OPA engine error text to callers
+      description: When a policy cannot decide, callers get the generic denial and the OPA engine's error detail stays in the gateway log; the error text was returned to the caller.
   breaking:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: ⭐ Record only the audit events each destination selects
@@ -54,7 +66,7 @@ changes:
       description: Produced audit records are appended to journal segment files by a dedicated writer thread that batches them (up to 256 records or 5 ms), syncs them to disk and only then publishes them as durable. On restart the journal continues its sequence and cuts off a partial last line left by a crash. When the journal cannot be written, the writer retries with backoff and keeps up to 10,000 records waiting; beyond that the oldest are discarded and counted in agent_gateway_audit_records_lost_total{reason="journal_write"}. Handing a record to the journal never waits.
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Deliver journalled audit records to each sink from its own cursor
-      description: A dispatcher runs one reader per audit sink. Each reader delivers the durable journal entries addressed to its sink in order, retries a failed delivery with backoff without moving past it, and saves its cursor after each batch so it resumes there after a restart. A new sink reads from the start of the journal, which misses nothing since no record is addressed to a sink before it exists. A removed sink's cursor is parked: it no longer holds back pruning, and a sink that comes back resumes where it stopped. Journal segments every cursor has passed are deleted. The journal's size is reported in agent_gateway_audit_journal_bytes and logged as a warning above 256 MiB; above 1 GiB every sink still in the oldest segment is moved past it so it can be deleted, and the records each skips are counted in agent_gateway_audit_sink_skipped_total{reason="backlog_cap"}.
+      description: A dispatcher runs one reader per audit sink. Each reader delivers the durable journal entries addressed to its sink in order, retries a failed delivery with backoff without moving past it, and saves its cursor after each batch so it resumes there after a restart. A new sink reads from the start of the journal, which misses nothing since no record is addressed to a sink before it exists. A removed sink's cursor is parked, so it no longer holds back pruning, and a sink that comes back resumes where it stopped. Journal segments every cursor has passed are deleted. The journal's size is reported in agent_gateway_audit_journal_bytes and logged as a warning above 256 MiB; above 1 GiB every sink still in the oldest segment is moved past it so it can be deleted, and the records each skips are counted in agent_gateway_audit_sink_skipped_total{reason="backlog_cap"}.
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Let a Governance Audit integration skip records older than a set age
       description: Governance Audit integrations accept audit_drop_after_secs. Records older than that are skipped for the integration instead of delivered, including a record still being retried, and counted in agent_gateway_audit_sink_skipped_total{reason="expired"}. An update that leaves the field out keeps it; null clears it. Without it nothing is skipped.
