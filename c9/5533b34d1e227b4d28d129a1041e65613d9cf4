@@ -1,0 +1,33 @@
+.changelog/wip/token-scoped-permissions.yaml
+  s_09d9fb08a24a2a::t_114f322d37392b 4-7
+.changelog/wip/access-token-rotation.yaml
+  s_09d9fb08a24a2a::t_114f322d37392b 11-16
+.changelog/wip/cli-browser-login.yaml
+  s_09d9fb08a24a2a::t_114f322d37392b 10-13
+.changelog/wip/fix_x402-bind-caller-identity.yaml
+  s_09d9fb08a24a2a::t_114f322d37392b 4-7
+.changelog/wip/access-token-rotation-followups.yaml
+  s_09d9fb08a24a2a::t_114f322d37392b 8-10
+.github/scripts/test_check_docs.py
+  s_09d9fb08a24a2a::t_114f322d37392b 16-21
+.changelog/wip/feat_github_actions.yaml
+  s_09d9fb08a24a2a::t_114f322d37392b 23-28,40-44
+.changelog/wip/feat_human-friendly-metadata.yaml
+  s_09d9fb08a24a2a::t_114f322d37392b 64-76,106,108-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c95533b34d1e227b4d28d129a1041e65613d9cf4",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
