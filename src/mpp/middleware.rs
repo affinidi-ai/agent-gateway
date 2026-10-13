@@ -48,14 +48,19 @@ pub fn should_require_payment(
                 return false;
             }
 
-            let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+            // As for x402: no body (a GET) is not charged; a body the filters cannot
+            // be matched against is charged rather than let through free.
+            if body_bytes.is_empty() {
                 return false;
+            }
+            let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+                return true;
             };
             let Some(method) = json
                 .get("method")
                 .and_then(|m| m.as_str())
             else {
-                return false;
+                return true;
             };
 
             let normalized = crate::x402::middleware::normalize_a2a_method(method);
@@ -547,5 +552,24 @@ mod tests {
         assert!(result.is_err());
         let response = result.unwrap_err();
         assert_eq!(response.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
+    }
+
+    /// As for x402: with A2A method filters configured, a body the filters cannot
+    /// be matched against is charged; a request without a body is not.
+    #[test]
+    fn a2a_method_filters_charge_a_body_without_a_string_method() {
+        let mut config = test_config();
+        config.a2a_method_filters = Some(vec![crate::config::types::A2AMethodFilter {
+            method: "CancelTask".to_string(),
+            message_patterns: vec![],
+        }]);
+        let requires = |body: &[u8]| should_require_payment(&config, &ChannelProtocol::A2a, body, None);
+
+        assert!(requires(br#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t"}}]"#), "a batch");
+        assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":7}"#), "a non-string method");
+        assert!(requires(b"not json"), "a body that is not JSON");
+        assert!(!requires(b""), "no body");
+        assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t"}}"#));
+        assert!(!requires(br#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t"}}"#));
     }
 }
