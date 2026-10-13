@@ -2785,17 +2785,18 @@ async fn proxy_handler_with_mcp_runtime(
         return Err(create_jsonrpc_error_response(StatusCode::BAD_REQUEST, code, message));
     }
 
-    // An extended agent card inside a JSON-RPC batch response cannot be
-    // rewritten, so such a batch is refused whatever `validate_messages` says.
-    if is_a2a_surface && crate::a2a::is_extended_agent_card_batch(&body_bytes) {
-        channel_warn!(config_id, "Rejected JSON-RPC batch containing an extended agent card request");
+    // An extended agent card in a batch response, or in the response to a body
+    // the gateway cannot parse as plain JSON, cannot be rewritten, so such a
+    // request is refused whatever `validate_messages` says.
+    if is_a2a_surface && crate::a2a::is_unrewritable_extended_agent_card_request(&body_bytes) {
+        channel_warn!(config_id, "Rejected an extended agent card request that is not a single JSON-RPC object");
         connection_guard
             .decrement()
             .await;
         return Err(create_jsonrpc_error_response(
             StatusCode::BAD_REQUEST,
             -32600,
-            "Invalid Request: extended agent card requests cannot be batched",
+            "Invalid Request: an extended agent card request must be a single JSON-RPC object",
         ));
     }
 
@@ -7494,7 +7495,7 @@ async fn proxy_handler_with_mcp_runtime(
         )
         .map_err(|e| {
             error!(channel = channel_name, error = %e, "Extended agent card response cannot be rewritten");
-            create_error_response(StatusCode::BAD_GATEWAY, "Failed to process extended agent card")
+            extended_agent_card_refusal()
         })?;
         let is_extended_card_response =
             (is_rest_extended_card_request && status.is_success()) || extended_card_envelope.is_some();
@@ -7607,10 +7608,7 @@ async fn proxy_handler_with_mcp_runtime(
                 }
                 Err(e) if is_extended_card_response => {
                     error!(channel = channel_name, error = %e, "Failed to rewrite extended agent card URLs");
-                    return Err(create_error_response(
-                        StatusCode::BAD_GATEWAY,
-                        "Failed to process extended agent card",
-                    ));
+                    return Err(extended_agent_card_refusal());
                 }
                 Err(e) => {
                     warn!(channel = channel_name, error = %e, "Failed to rewrite agent card URLs, returning original");
@@ -7691,7 +7689,7 @@ async fn proxy_handler_with_mcp_runtime(
         let response_body =
             crate::a2a::rewrap_extended_agent_card(extended_card_envelope, response_body).map_err(|e| {
                 error!(channel = channel_name, error = %e, "Failed to rewrap extended agent card");
-                create_error_response(StatusCode::BAD_GATEWAY, "Failed to process extended agent card")
+                extended_agent_card_refusal()
             })?;
 
         // Inject custom metadata into MCP initialize responses
@@ -12537,10 +12535,7 @@ async fn handle_fabric_request(
                                 connection_guard
                                     .decrement()
                                     .await;
-                                return Err(create_error_response(
-                                    StatusCode::BAD_GATEWAY,
-                                    "Failed to process extended agent card",
-                                ));
+                                return Err(extended_agent_card_refusal());
                             }
                         }
                     } else {
@@ -12680,10 +12675,7 @@ async fn handle_fabric_request(
                             connection_guard
                                 .decrement()
                                 .await;
-                            return Err(create_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "Failed to process extended agent card",
-                            ));
+                            return Err(extended_agent_card_refusal());
                         }
                         Err(e) => {
                             channel_warn!(
@@ -12778,10 +12770,7 @@ async fn handle_fabric_request(
                                 connection_guard
                                     .decrement()
                                     .await;
-                                return Err(create_error_response(
-                                    StatusCode::BAD_GATEWAY,
-                                    "Failed to process extended agent card",
-                                ));
+                                return Err(extended_agent_card_refusal());
                             }
                         }
                     }
@@ -13983,6 +13972,12 @@ fn record_agent_card_gateway_fault(
                 .await;
         });
     }
+}
+
+/// The response for an extended agent card the gateway cannot rewrite: a
+/// generic 502 that never carries the Target's body.
+fn extended_agent_card_refusal() -> Response {
+    create_error_response(StatusCode::BAD_GATEWAY, "Failed to process extended agent card")
 }
 
 async fn fetch_agent_card_from_surface_target(

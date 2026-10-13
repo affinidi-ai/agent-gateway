@@ -477,18 +477,40 @@ pub fn requests_extended_agent_card(request_body: &[u8]) -> bool {
         .is_ok_and(|request| calls_extended_agent_card_method(&request))
 }
 
-/// Whether a JSON-RPC batch request contains a call to an extended-card method.
-/// Such a batch is rejected, because the extended card in its response could not be rewritten.
-pub fn is_extended_agent_card_batch(request_body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(request_body).is_ok_and(|request| {
-        request
+fn calls_extended_agent_card_method_or_batch(request: &serde_json::Value) -> bool {
+    calls_extended_agent_card_method(request)
+        || request
             .as_array()
             .is_some_and(|calls| {
                 calls
                     .iter()
                     .any(calls_extended_agent_card_method)
             })
-    })
+}
+
+/// Whether a request calls an extended-card method in a form whose response the
+/// gateway could not rewrite, so the request must be refused before forwarding:
+/// inside a JSON-RPC batch, or in a body that is not plain JSON (a leading
+/// byte-order mark or trailing bytes) that the Target may still read as an
+/// extended-card call.
+pub fn is_unrewritable_extended_agent_card_request(request_body: &[u8]) -> bool {
+    if let Ok(request) = serde_json::from_slice::<serde_json::Value>(request_body) {
+        return request
+            .as_array()
+            .is_some_and(|calls| {
+                calls
+                    .iter()
+                    .any(calls_extended_agent_card_method)
+            });
+    }
+    let without_bom = request_body
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(request_body);
+    serde_json::Deserializer::from_slice(without_bom)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok)
+        .is_some_and(|first| calls_extended_agent_card_method_or_batch(&first))
 }
 
 /// For a 2xx response to an extended-card request, return the card from the
@@ -1464,20 +1486,37 @@ mod tests {
     }
 
     #[test]
-    fn extended_card_batch_is_detected_for_either_era() {
+    fn extended_card_batch_is_refused_for_either_era() {
         for method in ["GetExtendedAgentCard", "agent/getAuthenticatedExtendedCard"] {
             let batch = json!([
                 {"jsonrpc": "2.0", "id": 1, "method": "SendMessage"},
                 {"jsonrpc": "2.0", "id": 2, "method": method}
             ])
             .to_string();
-            assert!(is_extended_agent_card_batch(batch.as_bytes()), "{method}");
+            assert!(is_unrewritable_extended_agent_card_request(batch.as_bytes()), "{method}");
         }
         let other_batch = json!([{"jsonrpc": "2.0", "id": 1, "method": "SendMessage"}]).to_string();
-        assert!(!is_extended_agent_card_batch(other_batch.as_bytes()));
+        assert!(!is_unrewritable_extended_agent_card_request(other_batch.as_bytes()));
         let single = json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard"}).to_string();
-        assert!(!is_extended_agent_card_batch(single.as_bytes()));
-        assert!(!is_extended_agent_card_batch(b"[]"));
-        assert!(!is_extended_agent_card_batch(b"not json"));
+        assert!(!is_unrewritable_extended_agent_card_request(single.as_bytes()));
+        assert!(!is_unrewritable_extended_agent_card_request(b"[]"));
+        assert!(!is_unrewritable_extended_agent_card_request(b"not json"));
+        assert!(!is_unrewritable_extended_agent_card_request(b""));
+    }
+
+    #[test]
+    fn extended_card_call_in_a_body_that_is_not_plain_json_is_refused() {
+        let call = br#"{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}"#;
+        let with_bom = [&b"\xEF\xBB\xBF"[..], call].concat();
+        let with_trailing_bytes = [call, &b" trailing"[..]].concat();
+        let escaped_method = br#"{"jsonrpc":"2.0","id":1,"method":"Get\u0045xtendedAgentCard"} x"#;
+        let batch_with_bom =
+            [&b"\xEF\xBB\xBF"[..], br#"[{"jsonrpc":"2.0","id":1,"method":"agent/getAuthenticatedExtendedCard"}]"#]
+                .concat();
+        for body in [&with_bom[..], &with_trailing_bytes[..], &escaped_method[..], &batch_with_bom[..]] {
+            assert!(is_unrewritable_extended_agent_card_request(body), "{}", String::from_utf8_lossy(body));
+        }
+        let send_with_bom = [&b"\xEF\xBB\xBF"[..], br#"{"jsonrpc":"2.0","id":1,"method":"SendMessage"}"#].concat();
+        assert!(!is_unrewritable_extended_agent_card_request(&send_with_bom));
     }
 }

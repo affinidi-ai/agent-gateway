@@ -68,29 +68,55 @@ struct GatewayReply {
     upstream_requests: usize,
 }
 
-async fn send_request_through_gateway(
-    direction: Direction,
+async fn start_gateway(
     upstream_body: String,
-    request_body: String,
-) -> GatewayReply {
+    validate_messages: bool,
+) -> GatewayHarness {
     let mock = MockServer::start_with_response(upstream_body).await;
-    let h = GatewayHarness::start_with_outbound_mock(mock, |_, gw_config, _| {
+    GatewayHarness::start_with_outbound_mock(mock, move |_, gw_config, _| {
         gw_config.surfaces = vec![helpers::build_minimal_outbound_channel()];
+        gw_config
+            .a2a
+            .validate_messages = validate_messages;
     })
-    .await;
+    .await
+}
 
-    let url = match direction {
-        Direction::Inbound => h.gateway_url.clone(),
+/// The surface route (inbound) or transit point path (outbound) that request
+/// paths are relative to.
+fn route_url(
+    h: &GatewayHarness,
+    direction: &Direction,
+) -> String {
+    match direction {
+        Direction::Inbound => h
+            .gateway_url
+            .trim_end_matches("/rpc")
+            .to_string(),
         Direction::Outbound => format!(
-            "{}/outbound/smoke/target/rpc",
+            "{}/outbound/smoke/target",
             h.outbound_url
                 .as_ref()
                 .expect("outbound_url must be set")
         ),
-    };
+    }
+}
 
+fn upstream_requests(h: &GatewayHarness) -> usize {
+    h.mock
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+async fn post_to_gateway(
+    direction: Direction,
+    upstream_body: String,
+    request_body: impl Into<reqwest::Body>,
+    validate_messages: bool,
+) -> GatewayReply {
+    let h = start_gateway(upstream_body, validate_messages).await;
     let resp = reqwest::Client::new()
-        .post(url)
+        .post(format!("{}/rpc", route_url(&h, &direction)))
         .header("content-type", "application/json")
         .body(request_body)
         .send()
@@ -102,11 +128,89 @@ async fn send_request_through_gateway(
             .text()
             .await
             .expect("response body unreadable"),
-        upstream_requests: h
-            .mock
-            .request_count
-            .load(std::sync::atomic::Ordering::SeqCst),
+        upstream_requests: upstream_requests(&h),
     }
+}
+
+async fn send_request_through_gateway(
+    direction: Direction,
+    upstream_body: String,
+    request_body: String,
+) -> GatewayReply {
+    post_to_gateway(direction, upstream_body, request_body, true).await
+}
+
+/// Send `GET {route}{path}` over a raw connection, so a non-canonical path such as
+/// `/x/../extendedAgentCard` reaches the gateway exactly as written.
+async fn get_through_gateway(
+    direction: Direction,
+    upstream_body: String,
+    path: &str,
+) -> GatewayReply {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let h = start_gateway(upstream_body, true).await;
+    let route = url::Url::parse(&route_url(&h, &direction)).expect("route url");
+    let authority = format!(
+        "{}:{}",
+        route
+            .host_str()
+            .expect("route host"),
+        route
+            .port_or_known_default()
+            .expect("route port")
+    );
+    let mut stream = tokio::net::TcpStream::connect(&authority)
+        .await
+        .expect("connect to gateway");
+    let request = format!(
+        "GET {}{path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        route.path()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .expect("read response");
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .expect("response head");
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .expect("status code");
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked(body)
+    } else {
+        body.to_string()
+    };
+    GatewayReply {
+        status: reqwest::StatusCode::from_u16(status).expect("valid status"),
+        body,
+        upstream_requests: upstream_requests(&h),
+    }
+}
+
+fn decode_chunked(mut rest: &str) -> String {
+    let mut body = String::new();
+    while let Some((size, after)) = rest.split_once("\r\n") {
+        let size = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        body.push_str(&after[..size]);
+        rest = &after[size + 2..];
+    }
+    body
 }
 
 async fn send_through_gateway(
@@ -303,13 +407,87 @@ async fn batch_with_extended_card_request_is_rejected_before_forwarding() {
         ])
         .to_string();
         for direction in [Direction::Inbound, Direction::Outbound] {
-            let reply =
-                send_request_through_gateway(direction, json!([result_envelope(v1_card())]).to_string(), batch.clone())
-                    .await;
+            let reply = send_request_through_gateway(
+                direction,
+                json!([{"jsonrpc": "2.0", "id": 1, "result": v1_card()}]).to_string(),
+                batch.clone(),
+            )
+            .await;
             assert_eq!(reply.status, 400, "expected 400, got {}: {}", reply.status, reply.body);
             let body: serde_json::Value = serde_json::from_str(&reply.body).expect("rejection is not JSON");
             assert_eq!(body["error"]["code"], -32600, "{body}");
             assert_eq!(reply.upstream_requests, 0, "a rejected batch must not reach the upstream");
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_batch_with_extended_card_request_is_rejected_without_message_validation() {
+    let batch = json!([{"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard", "params": {}}]).to_string();
+    let upstream = json!([{"jsonrpc": "2.0", "id": 1, "result": v1_card()}]).to_string();
+    let reply = post_to_gateway(Direction::Inbound, upstream, batch, false).await;
+    assert_eq!(reply.status, 400, "expected 400, got {}: {}", reply.status, reply.body);
+    let body: serde_json::Value = serde_json::from_str(&reply.body).expect("rejection is not JSON");
+    assert_eq!(body["error"]["code"], -32600, "{body}");
+    assert_eq!(reply.upstream_requests, 0, "a rejected batch must not reach the upstream");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_card_request_that_is_not_plain_json_is_rejected_before_forwarding() {
+    let call = request("GetExtendedAgentCard");
+    let bodies = [[&b"\xEF\xBB\xBF"[..], call.as_bytes()].concat(), [call.as_bytes(), &b" trailing"[..]].concat()];
+    for body in bodies {
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let reply = post_to_gateway(direction, result_envelope(v1_card()), body.clone(), false).await;
+            assert_eq!(reply.status, 400, "expected 400, got {}: {}", reply.status, reply.body);
+            assert_eq!(reply.upstream_requests, 0, "a refused request must not reach the upstream");
+            assert!(!reply.body.contains(BACKEND), "{}", reply.body);
+        }
+    }
+}
+
+// ── HTTP+JSON binding ────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_extended_card_is_rewritten_for_both_eras() {
+    for (path, card) in [("/extendedAgentCard", v1_card()), ("/v1/card", v03_card())] {
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let reply = get_through_gateway(direction, card.to_string(), path).await;
+            assert_eq!(reply.status, 200, "{path}: expected 200, got {}: {}", reply.status, reply.body);
+            assert!(!reply.body.contains(BACKEND), "{path}: card still exposes the backend: {}", reply.body);
+            let rewritten: serde_json::Value = serde_json::from_str(&reply.body).expect("card is not JSON");
+            assert_eq!(rewritten["name"], "extended-agent", "{path}: {rewritten}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_extended_card_reached_through_a_non_canonical_path_is_rewritten() {
+    for path in ["/x/../extendedAgentCard", "/./v1/card", "/x/%2e%2e/extendedAgentCard"] {
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let reply = get_through_gateway(direction, v1_card().to_string(), path).await;
+            assert_eq!(reply.status, 200, "{path}: expected 200, got {}: {}", reply.status, reply.body);
+            assert!(!reply.body.contains(BACKEND), "{path}: card still exposes the backend: {}", reply.body);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_extended_card_that_is_not_an_object_is_refused() {
+    let not_a_card = json!([format!("{BACKEND}/a2a")]).to_string();
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let reply = get_through_gateway(direction, not_a_card.clone(), "/extendedAgentCard").await;
+        assert_eq!(reply.status, 502, "expected 502, got {}: {}", reply.status, reply.body);
+        assert!(!reply.body.contains(BACKEND), "refusal must not expose the backend: {}", reply.body);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_path_ending_like_the_card_path_is_not_treated_as_a_card() {
+    let resource = json!({"url": format!("{BACKEND}/payments")}).to_string();
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let reply = get_through_gateway(direction, resource.clone(), "/payments/v1/card").await;
+        assert_eq!(reply.status, 200, "expected 200, got {}: {}", reply.status, reply.body);
+        assert!(reply.body.contains(BACKEND), "a non-card resource must be forwarded unchanged: {}", reply.body);
     }
 }

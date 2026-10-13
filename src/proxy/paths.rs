@@ -38,12 +38,27 @@ pub fn is_well_known_agent_card_path(path: &str) -> bool {
 /// binding: `GET {route}/extendedAgentCard` (1.0) or `GET {route}/v1/card` (0.3).
 /// `route_relative_path` is the request path after the surface route, so a deeper
 /// path that only ends the same way (such as `{route}/payments/v1/card`) does not match.
+/// The path is matched as the Target will see it: dot segments (including `%2e`)
+/// are resolved and percent-escapes decoded first.
 pub fn is_rest_extended_agent_card_request(
     method: &str,
     route_relative_path: &str,
 ) -> bool {
-    let path = route_relative_path.trim_matches('/');
+    let normalized = normalize_route_relative_path(route_relative_path);
+    let path = normalized.trim_matches('/');
     method.eq_ignore_ascii_case("GET") && (path == "extendedAgentCard" || path == "v1/card")
+}
+
+/// Resolve dot segments the way the forwarded URL is resolved before it reaches
+/// the Target, then decode percent-escapes.
+fn normalize_route_relative_path(path: &str) -> String {
+    let resolved = url::Url::parse("http://route.invalid/")
+        .and_then(|base| base.join(path.trim_start_matches('/')))
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|_| path.to_string());
+    percent_encoding::percent_decode_str(&resolved)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 /// Whether a request is a public discovery read that bypasses the request
@@ -165,6 +180,25 @@ mod tests {
             "/rpc",
             "/",
         ] {
+            assert!(!is_rest_extended_agent_card_request("GET", path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_matches_non_canonical_spellings_of_the_card_path() {
+        for path in [
+            "/./extendedAgentCard",
+            "/x/../v1/card",
+            "/x/%2e%2e/extendedAgentCard",
+            "/%2E/v1/card",
+            "/../extendedAgentCard",
+            "/extended%41gentCard",
+            "/v1%2Fcard",
+            "//extendedAgentCard",
+        ] {
+            assert!(is_rest_extended_agent_card_request("GET", path), "{path}");
+        }
+        for path in ["/x/./extendedAgentCard", "/payments/%2e/v1/card", "/x/y/../v1/card"] {
             assert!(!is_rest_extended_agent_card_request("GET", path), "{path}");
         }
     }

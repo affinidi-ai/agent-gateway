@@ -103,8 +103,8 @@ pub(crate) enum OutboundPipelineError {
     #[error("MCP request body refused: {}", .0.reason())]
     McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal),
 
-    #[error("Invalid Request: extended agent card requests cannot be batched")]
-    ExtendedAgentCardBatch,
+    #[error("Invalid Request: an extended agent card request must be a single JSON-RPC object")]
+    UnrewritableExtendedAgentCardRequest,
 
     #[error("{error}")]
     McpMetadata { error: crate::mcp::meta::McpMetadataError, body: Bytes, response: bool },
@@ -187,9 +187,9 @@ impl OutboundPipelineError {
                 StatusCode::NOT_FOUND
             }
 
-            Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) | Self::ExtendedAgentCardBatch => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::BodyReadFailed(_)
+            | Self::HeaderMetadataMappingFailed(_)
+            | Self::UnrewritableExtendedAgentCardRequest => StatusCode::BAD_REQUEST,
 
             Self::ExtensionValidationFailed(_) | Self::ProtocolMismatch { .. } => StatusCode::UNPROCESSABLE_ENTITY,
 
@@ -240,7 +240,7 @@ impl IntoResponse for OutboundPipelineError {
         if let Self::McpBodyRefused(refusal) = self {
             return refusal.into_response();
         }
-        if let Self::ExtendedAgentCardBatch = self {
+        if let Self::UnrewritableExtendedAgentCardRequest = self {
             return crate::a2a::create_jsonrpc_error_response(StatusCode::BAD_REQUEST, -32600, &self.to_string());
         }
         if let Self::UpstreamCapacityReached(id) = self {
@@ -1855,13 +1855,14 @@ async fn step_extract_protocol_context_with_versions(
     ctx.protocol = Some(protocol);
     ctx.operation = operation;
 
-    // An extended agent card inside a JSON-RPC batch response cannot be
-    // rewritten, so such a batch is refused on A2A/AP2 transit points.
+    // An extended agent card in a batch response, or in the response to a body
+    // the gateway cannot parse as plain JSON, cannot be rewritten, so such a
+    // request is refused on A2A/AP2 transit points.
     if transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
-        && crate::a2a::is_extended_agent_card_batch(body)
+        && crate::a2a::is_unrewritable_extended_agent_card_request(body)
     {
-        warn!(request_id = %ctx.request_id, "Rejected JSON-RPC batch containing an extended agent card request");
-        return Err(OutboundPipelineError::ExtendedAgentCardBatch);
+        warn!(request_id = %ctx.request_id, "Rejected an extended agent card request that is not a single JSON-RPC object");
+        return Err(OutboundPipelineError::UnrewritableExtendedAgentCardRequest);
     }
 
     // Enforce that the request body actually speaks the protocol this transit
@@ -5095,21 +5096,39 @@ fn process_outbound_response_body(
                     .as_deref(),
             ),
         );
-    let body_bytes = if is_agent_card_response(&ctx.request_path, status) || is_rest_extended_card_response {
+    let is_rpc_extended_card_response = status.is_success()
+        && is_a2a_transit
+        && ctx
+            .operation
+            .as_deref()
+            .is_some_and(crate::a2a::is_extended_agent_card_method);
+    let is_extended_card_response = is_rest_extended_card_response || is_rpc_extended_card_response;
+    let body_bytes = if is_agent_card_response(&ctx.request_path, status) || is_extended_card_response {
         let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
             &ctx.surface,
             &ctx.virtual_channel,
             &state.network_config,
         );
-        match crate::a2a::url_rewriter::process_outbound_agent_card(&body_bytes, &proxy_endpoint, &ctx.surface.name) {
-            Ok(rewritten) => {
+        let rewritten = if is_rpc_extended_card_response {
+            crate::a2a::url_rewriter::process_outbound_extended_agent_card(
+                &body_bytes,
+                &proxy_endpoint,
+                &ctx.surface.name,
+            )
+        } else {
+            crate::a2a::url_rewriter::process_outbound_agent_card(&body_bytes, &proxy_endpoint, &ctx.surface.name)
+                .map(Some)
+        };
+        match rewritten {
+            Ok(Some(rewritten)) => {
                 info!(
                     request_id = %ctx.request_id,
                     "Rewrote outbound agent card URLs to outbound virtual channel endpoint"
                 );
                 rewritten
             }
-            Err(e) if is_rest_extended_card_response => {
+            Ok(None) => body_bytes,
+            Err(e) if is_extended_card_response => {
                 warn!(request_id = %ctx.request_id, error = %e, "Failed to rewrite outbound extended agent card URLs");
                 return Err(OutboundPipelineError::ResponseValidationFailed(
                     "Failed to process extended agent card".to_string(),
@@ -5122,38 +5141,6 @@ fn process_outbound_response_body(
                     "Failed to rewrite outbound agent card URLs, returning original"
                 );
                 body_bytes
-            }
-        }
-    } else if status.is_success()
-        && is_a2a_transit
-        && ctx
-            .operation
-            .as_deref()
-            .is_some_and(crate::a2a::is_extended_agent_card_method)
-    {
-        let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
-            &ctx.surface,
-            &ctx.virtual_channel,
-            &state.network_config,
-        );
-        match crate::a2a::url_rewriter::process_outbound_extended_agent_card(
-            &body_bytes,
-            &proxy_endpoint,
-            &ctx.surface.name,
-        ) {
-            Ok(Some(rewritten)) => {
-                info!(
-                    request_id = %ctx.request_id,
-                    "Rewrote outbound extended agent card URLs to outbound virtual channel endpoint"
-                );
-                rewritten
-            }
-            Ok(None) => body_bytes,
-            Err(e) => {
-                warn!(request_id = %ctx.request_id, error = %e, "Failed to rewrite outbound extended agent card URLs");
-                return Err(OutboundPipelineError::ResponseValidationFailed(
-                    "Failed to process extended agent card".to_string(),
-                ));
             }
         }
     } else {

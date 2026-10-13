@@ -3316,53 +3316,6 @@ fn agent_card_first_endpoint_url_points_to_gateway(world: &mut SurfaceWorld) {
     );
 }
 
-#[then("the extended agent card interfaces point to the gateway listen address in their original order")]
-fn extended_agent_card_interfaces_point_to_gateway(world: &mut SurfaceWorld) {
-    let gateway_port = world
-        .infra
-        .as_ref()
-        .expect("scenario infra must be initialised before asserting on the agent card")
-        .gateway_port;
-    let body = get_response_body_value(world);
-    let interfaces = body
-        .pointer("/result/supportedInterfaces")
-        .and_then(|v| v.as_array())
-        .unwrap_or_else(|| panic!("extended agent card must expose result.supportedInterfaces, got: {}", body));
-    let bindings: Vec<&str> = interfaces
-        .iter()
-        .filter_map(|iface| {
-            iface
-                .get("protocolBinding")
-                .and_then(|b| b.as_str())
-        })
-        .collect();
-    assert_eq!(bindings, ["JSONRPC", "GRPC"], "interface order must be preserved, got: {}", body);
-    let needle = format!("localhost:{}", gateway_port);
-    for iface in interfaces {
-        let url = iface
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| panic!("every interface must keep a url, got: {}", body));
-        assert!(
-            url.contains(&needle),
-            "extended agent card interface url should point to the gateway listen address (contains '{}'), got '{}'",
-            needle,
-            url
-        );
-    }
-}
-
-#[then("the response does not contain the managed agent endpoint")]
-fn response_excludes_managed_agent_endpoint(world: &mut SurfaceWorld) {
-    let body = get_response_body_value(world).to_string();
-    assert!(
-        !body.contains(PUBLISHED_MANAGED_AGENT_HOST),
-        "response leaks the managed agent endpoint '{}': {}",
-        PUBLISHED_MANAGED_AGENT_HOST,
-        body
-    );
-}
-
 /// Assert the Target's host appears **nowhere** in the served agent card.
 ///
 /// Stronger than the per-field assertions: it covers nested arrays such as
@@ -3403,6 +3356,39 @@ const PUBLISHED_MANAGED_AGENT_HOST: &str = "managed-agent.local";
 
 #[then(expr = "every interface url in the agent card points to the gateway listen address")]
 fn agent_card_interface_urls_point_to_gateway(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world).clone();
+    assert_interface_urls_point_to_gateway(world, &body);
+}
+
+#[then(expr = "every interface url in the extended agent card points to the gateway listen address")]
+fn extended_agent_card_interface_urls_point_to_gateway(world: &mut SurfaceWorld) {
+    let card = get_response_body_value(world)["result"].clone();
+    assert_interface_urls_point_to_gateway(world, &card);
+}
+
+#[then(expr = "the extended agent card lists its supported interfaces in the order {string}")]
+fn extended_agent_card_interface_order(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let card = &get_response_body_value(world)["result"];
+    let bindings: Vec<&str> = card["supportedInterfaces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("extended agent card must expose supportedInterfaces, got: {card}"))
+        .iter()
+        .filter_map(|interface| interface["protocolBinding"].as_str())
+        .collect();
+    let expected: Vec<&str> = expected
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(bindings, expected, "interface order must be preserved, got: {card}");
+}
+
+fn assert_interface_urls_point_to_gateway(
+    world: &SurfaceWorld,
+    card: &serde_json::Value,
+) {
     let gateway_base = format!(
         "http://localhost:{}/",
         world
@@ -3411,10 +3397,9 @@ fn agent_card_interface_urls_point_to_gateway(world: &mut SurfaceWorld) {
             .expect("scenario infra must be initialised before asserting on the agent card")
             .gateway_port
     );
-    let body = get_response_body_value(world);
     let mut checked = 0;
     for key in ["supportedInterfaces", "additionalInterfaces"] {
-        for interface in body
+        for interface in card
             .get(key)
             .and_then(|v| v.as_array())
             .into_iter()
@@ -3426,12 +3411,12 @@ fn agent_card_interface_urls_point_to_gateway(world: &mut SurfaceWorld) {
                 .unwrap_or_else(|| panic!("every {key} entry must carry a url, got: {interface}"));
             assert!(
                 url.starts_with(&gateway_base),
-                "{key} url should point to the gateway ('{gateway_base}...'), got '{url}' in {body}"
+                "{key} url should point to the gateway ('{gateway_base}...'), got '{url}' in {card}"
             );
             checked += 1;
         }
     }
-    assert!(checked > 0, "agent card must expose at least one interface url, got: {body}");
+    assert!(checked > 0, "agent card must expose at least one interface url, got: {card}");
 }
 
 #[then(expr = "the agent card field {string} does not contain managed agent {string} endpoint")]
