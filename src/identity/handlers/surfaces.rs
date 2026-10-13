@@ -927,7 +927,7 @@ pub async fn create_surface(
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
     normalize_a2a_settings(&mut surface, None).map_err(SurfaceApiError::BadRequest)?;
-    refuse_tenant_validation_off(&surface, None, tenant_context(&context))?;
+    refuse_validation_off_by_scoped_caller(&surface, None, tenant_context(&context), resource_scope(&scope))?;
     validate_mcp_resource_declarations(&state, &surface).await?;
     if let Ok(Some(_)) = store
         .get(&surface.surface_id)
@@ -1128,19 +1128,22 @@ fn normalize_a2a_settings(
 
 /// Only an appliance-wide caller may turn a surface's A2A validation `off`. With
 /// it off, a JSON-RPC batch or a non-string `method` reaches policy and the
-/// payment filters without a method to match, so a tenant-scoped token could
-/// otherwise step around operator-wide method rules. A surface that is already
-/// `off` stays editable.
-fn refuse_tenant_validation_off(
+/// payment filters without a method to match, so a scoped token could otherwise
+/// step around operator-wide method rules. A caller is appliance-wide when its
+/// token has neither a tenant nor a resource scope; each is checked on its own,
+/// rather than relying on today's rule that a resource scope always names a
+/// tenant. A surface that is already `off` stays editable.
+fn refuse_validation_off_by_scoped_caller(
     surface: &AgentSurface,
     stored: Option<&crate::config::agent_surface::A2aAccessPointSettings>,
     context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
 ) -> Result<(), SurfaceApiError> {
     use crate::config::agent_surface::A2aValidation;
     let is_off = |settings: Option<&crate::config::agent_surface::A2aAccessPointSettings>| {
         settings.is_some_and(|settings| settings.validation == A2aValidation::Off)
     };
-    if context.is_some()
+    if (context.is_some() || scope.is_some())
         && is_off(
             surface
                 .access_point
@@ -1321,7 +1324,7 @@ async fn validate_and_save_surface(
             .a2a
             .as_ref()
     });
-    refuse_tenant_validation_off(&surface, stored_a2a, context)?;
+    refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope)?;
     validate_mcp_resource_declarations(state, &surface).await?;
 
     store
@@ -2550,13 +2553,42 @@ mod validation_tests {
         surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
         let envelope = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
 
-        match refuse_tenant_validation_off(&surface, Some(&envelope), Some(&tenant())) {
+        match refuse_validation_off_by_scoped_caller(&surface, Some(&envelope), Some(&tenant()), None) {
             Err(SurfaceApiError::Forbidden(message)) => assert!(message.contains("appliance-wide administrator")),
             other => panic!("expected a 403, got {other:?}"),
         }
         assert!(
-            matches!(refuse_tenant_validation_off(&surface, None, Some(&tenant())), Err(SurfaceApiError::Forbidden(_))),
+            matches!(
+                refuse_validation_off_by_scoped_caller(&surface, None, Some(&tenant()), None),
+                Err(SurfaceApiError::Forbidden(_))
+            ),
             "on create too"
+        );
+    }
+
+    /// A resource scope makes a caller scoped on its own, without relying on the
+    /// token model always pairing it with a tenant.
+    #[test]
+    fn a_resource_scoped_token_cannot_turn_validation_off_with_or_without_a_tenant() {
+        let mut surface = base_surface();
+        surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
+        let envelope = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
+        let scope =
+            PatResourceScope(std::sync::Arc::new(regex::Regex::new(r"\ATENANT:tenant-a:surfaces:.*\z").unwrap()));
+
+        for context in [None, Some(tenant())] {
+            assert!(
+                matches!(
+                    refuse_validation_off_by_scoped_caller(&surface, Some(&envelope), context.as_ref(), Some(&scope)),
+                    Err(SurfaceApiError::Forbidden(_))
+                ),
+                "tenant context: {context:?}"
+            );
+        }
+        let off = a2a_block(&["1.0"], A2aValidation::Off);
+        assert!(
+            refuse_validation_off_by_scoped_caller(&surface, Some(&off), None, Some(&scope)).is_ok(),
+            "a scoped caller may edit a surface that is already off"
         );
     }
 
@@ -2566,15 +2598,15 @@ mod validation_tests {
         surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
         let off = a2a_block(&["1.0"], A2aValidation::Off);
 
-        assert!(refuse_tenant_validation_off(&surface, None, None).is_ok(), "appliance-wide caller");
+        assert!(refuse_validation_off_by_scoped_caller(&surface, None, None, None).is_ok(), "appliance-wide caller");
         assert!(
-            refuse_tenant_validation_off(&surface, Some(&off), Some(&tenant())).is_ok(),
+            refuse_validation_off_by_scoped_caller(&surface, Some(&off), Some(&tenant()), None).is_ok(),
             "a tenant may edit a surface that is already off"
         );
 
         surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Full));
         assert!(
-            refuse_tenant_validation_off(&surface, None, Some(&tenant())).is_ok(),
+            refuse_validation_off_by_scoped_caller(&surface, None, Some(&tenant()), None).is_ok(),
             "a tenant may choose any other level"
         );
     }

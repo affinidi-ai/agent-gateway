@@ -130,6 +130,11 @@ resource pattern answers `404` on read and `403` on write; secrets, certificates
 answer `404` on both. An appliance-wide record the PAT can read answers `403` on those writes. For API keys and
 Connection Points, the parent Agent Surface or Gateway decides which applies.
 
+Some settings are reserved for appliance-wide callers even on records a scoped PAT may write. A
+PAT with a tenant or a resource scope that sets an A2A surface's `access_point.a2a.validation` to
+`"off"` gets `403`, unless the surface was already `"off"`; it may choose any other level. See
+[A2A surface settings](PROTOCOLS.md#a2a-surface-settings).
+
 ### What a tenant PAT may do with global records
 
 | Record kind | Read and reference | Create, update, delete |

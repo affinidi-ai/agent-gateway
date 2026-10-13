@@ -147,8 +147,9 @@ default) or **Envelope + A2A fields**.
 
 - `"off"` lets a JSON-RPC batch, a non-string `method` and a body that is not JSON reach surface
   policy and the agent with no method that rules keyed on `input.a2a.method` could match. Only an
-  appliance-wide caller can set it: a tenant-scoped token that sets `"off"` on a surface that was not
-  already `"off"` is refused with `403`. On such a request, an x402 or MPP payment with A2A method
+  appliance-wide caller can set it: an access token with a tenant or a resource scope that sets
+  `"off"` on a surface that was not already `"off"` is refused with `403`, on create, `PUT`, merge
+  `PATCH` and the variant routes alike. On such a request, an x402 or MPP payment with A2A method
   filters is required rather than skipped, since the filters cannot be matched.
 - The surface API stores the block explicitly on every save of an A2A or AP2 surface, the defaults
   when none is sent. A `PUT` that omits it keeps the stored one, and a JSON merge `PATCH` with

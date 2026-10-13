@@ -2345,3 +2345,183 @@ async fn a2a_settings_survive_adding_policy_and_identity_elements_through_the_ad
 }
 
 const ELEMENTS_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+
+// ── A2A validation off is for appliance-wide callers only ──────────────────
+
+/// Seed an administrator who owns `token`, and a tenant access token scoped to
+/// tenant `tenant-a`'s surfaces, into the gateway's stores before it boots.
+/// Returns a client that sends the token and the tenant header.
+fn seed_tenant_access_token(bootstrap: &crate::config::BootstrapConfig) -> reqwest::Client {
+    let now = chrono::Utc::now();
+    let owner = "tenant-token-owner";
+    let user: crate::auth::storage::UserData = serde_json::from_value(serde_json::json!({
+        "user_id": owner, "username": owner, "passkeys": [], "role": "administrator", "status": "approved",
+        "created_at": now, "updated_at": now
+    }))
+    .unwrap();
+    let passkeys = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .passkeys,
+    );
+    std::fs::create_dir_all(passkeys).unwrap();
+    std::fs::write(passkeys.join(format!("{owner}.json")), serde_json::to_vec(&user).unwrap()).unwrap();
+
+    let (id, secret) = crate::access_tokens::generate_token();
+    let token = crate::access_tokens::AccessToken {
+        id: id.clone(),
+        name: "tenant token".to_string(),
+        description: String::new(),
+        token_hash: crate::access_tokens::store::hash_secret(&secret),
+        user_id: owner.to_string(),
+        scopes: Vec::new(),
+        resource_pattern: Some("TENANT:${x-external-account}:surfaces:.*".to_string()),
+        required_headers: vec![crate::auth_manager::resource_scope::RequiredHeader {
+            name: "x-external-account".to_string(),
+            pattern: "tenant-a".to_string(),
+        }],
+        created_by: owner.to_string(),
+        parent_token_id: None,
+        delegation_depth: 0,
+        created_at: now,
+        last_used_at: None,
+        expires_at: None,
+        revoked_at: None,
+        rotation_generation: 0,
+        rotated_at: None,
+        rotated_by: None,
+    };
+    let tokens = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .secrets,
+    )
+    .parent()
+    .unwrap()
+    .join("access_tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    std::fs::write(tokens.join(format!("{id}.json")), serde_json::to_vec(&token).unwrap()).unwrap();
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
+    authorization.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    headers.insert("x-external-account", reqwest::header::HeaderValue::from_static("tenant-a"));
+    reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap()
+}
+
+/// A tenant access token cannot set an A2A surface's validation to `off`
+/// through the admin API, on create, PUT or merge PATCH, while it can choose
+/// another level; an appliance-wide caller can set `off`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_api() {
+    let mut clients = None;
+    let h = GatewayHarness::start(|_, _, bootstrap| {
+        let admin = helpers::configure_admin_api(bootstrap);
+        clients = Some((admin, seed_tenant_access_token(bootstrap)));
+    })
+    .await;
+    let (admin, tenant) = clients.unwrap();
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let send = |request: reqwest::RequestBuilder| async move {
+        let response = request
+            .send()
+            .await
+            .expect("admin API request");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or(serde_json::json!(null));
+        (status, body)
+    };
+    let surface = |route: &str, validation: &str| {
+        serde_json::json!({
+            "name": route.trim_start_matches('/'), "status": "disabled",
+            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a",
+                             "a2a": {"validation": validation}},
+            "target": {"endpoint": "https://agent.example"}
+        })
+    };
+
+    let (status, body) = send(
+        tenant
+            .post(&collection)
+            .json(&surface("/tenant-off", "off")),
+    )
+    .await;
+    assert_eq!(status, 403, "create with off: {body}");
+    assert!(
+        body.to_string()
+            .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
+        "{body}"
+    );
+
+    let (status, created) = send(
+        tenant
+            .post(&collection)
+            .json(&surface("/tenant-envelope", "envelope")),
+    )
+    .await;
+    assert_eq!(status, 201, "a tenant may create with another level: {created}");
+    let surface_url = format!(
+        "{collection}/{}",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+
+    let mut put_off = created.clone();
+    put_off["access_point"]["a2a"]["validation"] = serde_json::json!("off");
+    let (status, body) = send(
+        tenant
+            .put(&surface_url)
+            .json(&put_off),
+    )
+    .await;
+    assert_eq!(status, 403, "PUT with off: {body}");
+    assert!(
+        body.to_string()
+            .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
+        "{body}"
+    );
+
+    let (status, body) = send(
+        tenant
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&serde_json::json!({"access_point": {"a2a": {"validation": "off"}}})),
+    )
+    .await;
+    assert_eq!(status, 403, "merge PATCH with off: {body}");
+    assert!(
+        body.to_string()
+            .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
+        "{body}"
+    );
+
+    let (status, body) = send(
+        tenant
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&serde_json::json!({"access_point": {"a2a": {"validation": "full"}}})),
+    )
+    .await;
+    assert_eq!(status, 200, "a tenant may choose another level: {body}");
+    assert_eq!(body["access_point"]["a2a"]["validation"], "full");
+
+    let (status, body) = send(
+        admin
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&serde_json::json!({"access_point": {"a2a": {"validation": "off"}}})),
+    )
+    .await;
+    assert_eq!(status, 200, "an appliance-wide caller may set off: {body}");
+    assert_eq!(body["access_point"]["a2a"]["validation"], "off");
+}

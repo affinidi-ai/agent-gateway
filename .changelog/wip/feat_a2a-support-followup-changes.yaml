@@ -14,8 +14,8 @@ changes:
         panel explains why; on such a surface the stored settings configure the variants
         that point the Target at a URL. The
         surface API refuses the block on a surface that is not A2A or AP2, and only an
-        appliance-wide administrator can set validation to off; a tenant-scoped token is
-        refused with 403.
+        appliance-wide administrator can set validation to off; an access token with a
+        tenant or a resource scope is refused with 403.
   changed:
     - timestamp: '2026-10-10T00:00:00.000Z'
       title: Check the A2A request shape against the A2A version of its method
