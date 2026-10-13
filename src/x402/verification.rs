@@ -1698,6 +1698,7 @@ mod tests {
     use super::*;
     use crate::config::types::X402VerificationMode;
     use base64::Engine;
+use uuid::Uuid;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -2058,8 +2059,9 @@ mod tests {
                 .unwrap(),
         );
 
+        let nonce = Uuid::new_v4();
         let (result, payments) = payment_records(verify_payment(
-            &payment_header_for(&configured(), "0x07"),
+            &payment_header_for(&configured(), &nonce.to_string()),
             &config(X402VerificationMode::FabricGateway),
             "Test Channel",
             "channel-1",
