@@ -54,6 +54,29 @@ pub fn assert_header_absent(
     );
 }
 
+/// No header value or body of `requests` contains `secret`.
+pub fn assert_requests_omit_value(
+    requests: &[ReceivedRequest],
+    secret: &str,
+    context: &str,
+) {
+    assert!(!requests.is_empty(), "{context} received no request to inspect");
+    for request in requests {
+        let header = request
+            .headers
+            .iter()
+            .find(|(_, value)| value.contains(secret))
+            .map(|(name, _)| name);
+        assert!(header.is_none(), "{context} carried {secret} in header {header:?}");
+        assert!(
+            !request
+                .raw_body
+                .contains(secret),
+            "{context} carried {secret} in its body"
+        );
+    }
+}
+
 pub fn assert_request_content_type_starts_with(
     request: &ReceivedRequest,
     expected: &str,

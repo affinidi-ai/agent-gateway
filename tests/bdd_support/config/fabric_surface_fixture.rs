@@ -32,6 +32,9 @@ pub struct SurfaceSpec {
     /// The target is a real upstream serving one path, not a harness mock.
     pub external_target: bool,
     pub transit_points: Vec<TransitPointSpec>,
+    /// Credential provider whose delegated credentials the Access Point
+    /// obtains with modern consent. Callers then present MCP access tokens.
+    pub delegated_credentials: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +104,7 @@ impl SurfaceSpec {
             mcp_proxy: None,
             external_target: false,
             transit_points: Vec::new(),
+            delegated_credentials: None,
         }
     }
 }

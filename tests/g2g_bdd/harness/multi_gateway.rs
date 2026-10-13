@@ -20,6 +20,9 @@ use crate::bdd_support::admin_client::{ExternalMediatorBlob, GatewayAdminClient,
 use crate::bdd_support::config;
 use crate::bdd_support::config::ReservedPort;
 use crate::bdd_support::config::fabric_surface_fixture::SurfaceSpec;
+use crate::bdd_support::config::modern_consent::{
+    ModernConsentFixture, oauth_endpoint_allowlist, write_modern_consent_config,
+};
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::mock_server::MockServer;
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
@@ -106,6 +109,8 @@ pub struct GatewayPlan {
     /// Admits only legacy MCP on Fabric streams it receives, as a gateway
     /// whose surfaces do not serve modern MCP does.
     pub legacy_only_fabric_receive: bool,
+    /// Modern MCP consent for the gateway's surfaces with delegated credentials.
+    pub modern_consent: Option<ModernConsentFixture>,
 }
 
 impl GatewayPlan {
@@ -496,6 +501,39 @@ impl MultiGatewayHarness {
         Ok(())
     }
 
+    /// Set whether `gw_index`'s `surface_id` sends its delegated credentials
+    /// to the peer its `fabric://` Target routes to.
+    pub async fn set_fabric_delegated_credentials(
+        &self,
+        gw_index: usize,
+        surface_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let admin = &self.gw(gw_index).admin;
+        let mut surface = admin
+            .get_surface(surface_id)
+            .await
+            .with_context(|| format!("fetch surface {surface_id} on gateway {gw_index}"))?;
+        surface["target"]["fabric_delegated_credentials"] = Value::Bool(enabled);
+        admin
+            .update_surface(surface_id, &surface)
+            .await
+            .with_context(|| {
+                format!("set fabric_delegated_credentials={enabled} on surface {surface_id} gateway {gw_index}")
+            })?;
+        tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
+        Ok(())
+    }
+
+    /// Forget every request the target collaborators have received so far.
+    pub async fn clear_mock_requests(&self) {
+        for node in &self.nodes {
+            for mock in node.mocks.values() {
+                mock.clear_requests().await;
+            }
+        }
+    }
+
     /// Point one Transit Point on `from_gw`'s `surface_id` at `to_gw`'s
     /// `peer_surface_id` over Fabric, then publish the destination surface.
     pub async fn point_transit_point_at_peer(
@@ -807,6 +845,9 @@ async fn spawn_node(
     };
     let temp_dir = create_project_temp_dir(name)?;
     config::fabric_gateway_writer::write_fabric_gateway_config(temp_dir.path(), gateway_port, outbound_port, &surfaces);
+    if let Some(consent) = &plan.modern_consent {
+        write_modern_consent_config(temp_dir.path(), consent);
+    }
 
     let config_path = temp_dir
         .path()
@@ -821,6 +862,9 @@ async fn spawn_node(
     }
     if plan.legacy_only_fabric_receive {
         extra_env.insert("AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY".to_string(), "true".to_string());
+    }
+    if let Some(consent) = &plan.modern_consent {
+        extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoint_allowlist(consent));
     }
     let mut gateway = GatewayProcess::start_g2g_with_env(&config_path, temp_dir.path(), &extra_env);
     gateway = gateway

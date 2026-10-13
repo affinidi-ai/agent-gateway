@@ -413,6 +413,18 @@ The receiving gateway applies its own surface's `outbound_credentials` toward it
 forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
 whose `params.name` it lists, read after admission has refused batches and ambiguous keys.
 
+`make gw-e2e` verifies the Access Point Target case between two gateway binaries
+(`tests/features/g2g/mcp_credential_delegation_over_fabric.feature`). The sending gateway has
+`[mcp.continuations]`, `sts.mcp_issuer` and a credential provider whose consent identity strategy
+trusts a local OpenID provider. The caller holds an MCP access token exchanged at that issuer. With
+the setting on, a modern `tools/call` gets `input_required` with a consent URL, and nothing enters
+the Fabric. After consent, the retry carrying `requestState` reaches the peer's Target with
+`Authorization: Bearer` set to the delegated access token, and neither the refresh token nor the
+caller's own token appears in its headers or body. When the setting is then turned off, the
+caller's stored credential stays on the sending gateway: the same call gets no consent request, and
+the Target receives neither an `Authorization` header nor the access token. The feature does not
+cover Transit Point routes or credential refresh across gateways.
+
 A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 `agent_gateway_a2a_protocol_version_total` metric do not run on either G2G leg. The sending gateway
 skips them for a `fabric://` target, and the receive pipeline above does not run them. So
