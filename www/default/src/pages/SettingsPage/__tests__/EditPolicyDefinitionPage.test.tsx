@@ -67,3 +67,60 @@ describe('EditPolicyDefinitionPage — package/type mismatch', () => {
     expect(screen.getByRole('button', { name: /Create/i })).toBeEnabled();
   });
 });
+
+describe('EditPolicyDefinitionPage — instructions panel', () => {
+  const toggle = () => screen.getByTestId('policy-instructions-toggle');
+  const body = () => screen.getByTestId('policy-instructions-body');
+
+  it('starts collapsed', () => {
+    renderCreateForm();
+    expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+    expect(body()).not.toHaveClass('show');
+  });
+
+  it('expands and collapses when the title is clicked', () => {
+    renderCreateForm();
+
+    fireEvent.click(screen.getByText('Policy Instructions & Examples'));
+    expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+    expect(body()).toHaveClass('show');
+
+    fireEvent.click(screen.getByText('Policy Instructions & Examples'));
+    expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+    expect(body()).not.toHaveClass('show');
+  });
+
+  it('toggles when the header itself is clicked', () => {
+    renderCreateForm();
+    fireEvent.click(toggle());
+    expect(body()).toHaveClass('show');
+  });
+
+  it('flips the arrow to match the state', () => {
+    renderCreateForm();
+    const chevron = () => screen.getByTestId('policy-instructions-chevron');
+    expect(chevron()).toHaveClass('fa-chevron-down');
+
+    fireEvent.click(toggle());
+    expect(chevron()).toHaveClass('fa-chevron-up');
+    expect(chevron()).not.toHaveClass('fa-chevron-down');
+  });
+
+  it('toggles from the keyboard with Enter and Space only', () => {
+    renderCreateForm();
+
+    fireEvent.keyDown(toggle(), { key: 'Enter' });
+    expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+
+    fireEvent.keyDown(toggle(), { key: ' ' });
+    expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+
+    fireEvent.keyDown(toggle(), { key: 'a' });
+    expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('keeps the examples in the DOM for the selected policy type', () => {
+    renderCreateForm();
+    expect(body()).toHaveTextContent('package gateway.policy');
+  });
+});
