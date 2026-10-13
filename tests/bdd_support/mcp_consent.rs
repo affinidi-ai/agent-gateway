@@ -160,14 +160,15 @@ pub async fn exchange_identity_token(
         .with_context(|| format!("token exchange returned no access_token: {body}"))
 }
 
-/// Open the consent URL as the caller's browser: the gateway sends it to the
-/// identity provider, which sends it back to the gateway's callback.
-pub async fn complete_consent(
+/// Open the consent URL as the caller's browser and follow the gateway's
+/// redirect to the identity provider, returning the gateway callback URL the
+/// provider redirects back to, unopened.
+async fn consent_callback_url(
+    client: &Client,
     gateway_port: u16,
     consent: &ConsentRequest,
     provider: &OidcProvider,
-) -> Result<()> {
-    let client = client();
+) -> Result<Url> {
     let connect = client
         .get(gateway_local_url(&consent.url, gateway_port)?)
         .send()
@@ -179,7 +180,68 @@ pub async fn complete_consent(
         .send()
         .await
         .context("open authorization endpoint")?;
-    let callback = gateway_local_url(&redirect_location(&authorized).context("authorization endpoint")?, gateway_port)?;
+    gateway_local_url(&redirect_location(&authorized).context("authorization endpoint")?, gateway_port)
+}
+
+/// Follow the consent URL as [`complete_consent`] does, but open the
+/// gateway's callback with one character of its `state` changed. Returns the
+/// callback's status.
+pub async fn open_consent_callback_with_tampered_state(
+    gateway_port: u16,
+    consent: &ConsentRequest,
+    provider: &OidcProvider,
+) -> Result<reqwest::StatusCode> {
+    let client = client();
+    let mut callback = consent_callback_url(&client, gateway_port, consent, provider).await?;
+    let pairs: Vec<(String, String)> = callback
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    ensure!(
+        pairs
+            .iter()
+            .any(|(name, _)| name == "state"),
+        "consent callback {callback} carries no state"
+    );
+    let mut query = callback.query_pairs_mut();
+    query.clear();
+    for (name, value) in &pairs {
+        if name == "state" {
+            query.append_pair(name, &tamper(value));
+        } else {
+            query.append_pair(name, value);
+        }
+    }
+    drop(query);
+    let response = client
+        .get(callback)
+        .send()
+        .await
+        .context("open consent callback with a tampered state")?;
+    Ok(response.status())
+}
+
+/// `value` with its last character replaced by a different one.
+fn tamper(value: &str) -> String {
+    let mut chars: Vec<char> = value.chars().collect();
+    let last = chars.pop();
+    chars.push(if last == Some('A') {
+        'B'
+    } else {
+        'A'
+    });
+    chars.into_iter().collect()
+}
+
+/// Open the consent URL as the caller's browser: the gateway sends it to the
+/// identity provider, which sends it back to the gateway's callback.
+pub async fn complete_consent(
+    gateway_port: u16,
+    consent: &ConsentRequest,
+    provider: &OidcProvider,
+) -> Result<()> {
+    let client = client();
+    let callback = consent_callback_url(&client, gateway_port, consent, provider).await?;
     let completed = client
         .get(callback)
         .send()

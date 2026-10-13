@@ -239,19 +239,22 @@ impl MultiGatewayHarness {
     /// Number of fabric forward requests received by `gateway_index`, read from
     /// that gateway's own Prometheus counter and summed across destination
     /// surfaces. Returns 0 when the counter is absent (the gateway has never
-    /// received a fabric forward). Harness-owned observation point: it scrapes
-    /// the metrics endpoint rather than parsing `gateway.log`.
+    /// received a fabric forward) and an error when the metrics cannot be
+    /// read, so a failed scrape never reads as "nothing arrived". It counts
+    /// only what this gateway received, not what a peer sent to the mediator.
+    /// Harness-owned observation point: it scrapes the metrics endpoint
+    /// rather than parsing `gateway.log`.
     pub async fn fabric_forward_request_count(
         &self,
         gateway_index: usize,
-    ) -> usize {
+    ) -> Result<usize> {
         let exposition = self
             .gw(gateway_index)
             .admin
             .prometheus_metrics()
             .await
-            .unwrap_or_default();
-        sum_prometheus_counter(&exposition, FABRIC_FORWARD_RECEIVED_METRIC)
+            .with_context(|| format!("read gateway {gateway_index}'s fabric forward counter"))?;
+        Ok(sum_prometheus_counter(&exposition, FABRIC_FORWARD_RECEIVED_METRIC))
     }
 
     /// The `from` gateway's id for the `to` gateway after federation.
@@ -502,7 +505,10 @@ impl MultiGatewayHarness {
     }
 
     /// Set whether `gw_index`'s `surface_id` sends its delegated credentials
-    /// to the peer its `fabric://` Target routes to.
+    /// to the peer its `fabric://` Target routes to. The update returns only
+    /// after the gateway has applied the surface to its running channels, so
+    /// the readback confirms the stored setting rather than waiting on a
+    /// reload; it fails if the API dropped the field.
     pub async fn set_fabric_delegated_credentials(
         &self,
         gw_index: usize,
@@ -521,7 +527,20 @@ impl MultiGatewayHarness {
             .with_context(|| {
                 format!("set fabric_delegated_credentials={enabled} on surface {surface_id} gateway {gw_index}")
             })?;
-        tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
+        let stored = admin
+            .get_surface(surface_id)
+            .await
+            .with_context(|| format!("read back surface {surface_id} on gateway {gw_index}"))?;
+        // The API omits the field when it is false.
+        let stored_enabled = stored["target"]["fabric_delegated_credentials"]
+            .as_bool()
+            .unwrap_or(false);
+        if stored_enabled != enabled {
+            bail!(
+                "surface {surface_id} on gateway {gw_index} reads back fabric_delegated_credentials={}, expected {enabled}",
+                stored["target"]["fabric_delegated_credentials"]
+            );
+        }
         Ok(())
     }
 

@@ -652,7 +652,8 @@ impl G2gWorld {
         {
             let count = harness
                 .fabric_forward_request_count(gateway_index)
-                .await;
+                .await
+                .unwrap_or_else(|error| panic!("{error:#}"));
             self.fabric_forward_baseline
                 .insert(gateway_index, count);
         }

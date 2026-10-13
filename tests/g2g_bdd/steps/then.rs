@@ -21,6 +21,7 @@ use crate::bdd_support::collaborators::{
 };
 use crate::bdd_support::config::modern_consent::PUBLIC_ORIGIN;
 use crate::bdd_support::mcp_consent::ConsentRequest;
+use crate::bdd_support::oidc::OidcProvider;
 use crate::world::G2gWorld;
 
 const FABRIC_GATEWAY_DID_META_KEY: &str = "x-affinidi-fabric-gateway-did";
@@ -193,7 +194,8 @@ pub async fn gateway_did_not_receive_fabric_forward_request(
     let actual = world
         .harness()
         .fabric_forward_request_count(gateway_index)
-        .await;
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
     assert_eq!(
         actual, baseline,
         "gateway {gateway_index} received a fabric forward request after the caller action; caller_status={:?}; caller_body={:?}",
@@ -481,6 +483,18 @@ async fn mcp_response_does_not_ask_for_consent(
     assert_ne!(response["result"]["resultType"], "input_required", "caller '{caller}' was asked for input: {response}");
 }
 
+#[then(expr = "the MCP response still requires input from caller {string}")]
+async fn mcp_response_still_requires_input(
+    world: &mut G2gWorld,
+    caller: String,
+) {
+    let response = response_body(world);
+    assert_eq!(
+        response["result"]["resultType"], "input_required",
+        "caller '{caller}' should still be asked for input: {response}"
+    );
+}
+
 #[then(expr = "MCP server {string} received the delegated access token from OAuth provider {string} as a bearer token")]
 async fn mcp_server_received_delegated_access_token(
     world: &mut G2gWorld,
@@ -513,7 +527,8 @@ async fn mcp_server_did_not_receive_delegated_token(
     let provider = oauth_provider(world, &provider_name);
     let token = match kind.as_str() {
         "access" => provider.access_token(),
-        _ => provider.refresh_token(),
+        "refresh" => provider.refresh_token(),
+        other => unreachable!("the step regex admits only access or refresh tokens, got '{other}'"),
     };
     let (_, _, mock) = mock_for(world, &target_name);
     assert_requests_omit_value(
@@ -538,10 +553,23 @@ async fn mcp_server_did_not_receive_caller_access_token(
     );
 }
 
+#[then(regex = r#"^OAuth provider "([^"]+)" received (\d+) token requests?$"#)]
+async fn oauth_provider_received_token_requests(
+    world: &mut G2gWorld,
+    provider_name: String,
+    expected_count: u64,
+) {
+    let actual = oauth_provider(world, &provider_name).token_request_count();
+    assert_eq!(
+        actual, expected_count,
+        "OAuth provider '{provider_name}' should receive {expected_count} token request(s), got {actual}"
+    );
+}
+
 fn oauth_provider<'a>(
     world: &'a G2gWorld,
     name: &str,
-) -> &'a crate::bdd_support::oidc::OidcProvider {
+) -> &'a OidcProvider {
     world
         .oauth_providers
         .get(name)

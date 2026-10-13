@@ -12,7 +12,7 @@ use crate::bdd_support::config::fabric_surface_fixture::{
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
 use crate::bdd_support::json_rpc::{IdentityBindingProof, build_mcp_echo_response_body, build_target_ok_response};
-use crate::bdd_support::mcp_consent::{ConsentRequest, complete_consent};
+use crate::bdd_support::mcp_consent::{ConsentRequest, complete_consent, open_consent_callback_with_tampered_state};
 use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
 use crate::bdd_support::policies::{
     build_gateway_deny_all_policy, build_gateway_deny_unverified_source_auth_policy, build_mcp_tool_allow_policy,
@@ -985,6 +985,44 @@ async fn surface_no_longer_sends_delegated_credentials_over_fabric(
         .set_fabric_delegated_credentials(gw_index, &surface_id, false)
         .await
         .expect("opt the fabric route out of delegated credentials");
+}
+
+/// The caller signs in at the provider, which redirects back with a valid
+/// code; the gateway must refuse the callback because its `state` was altered.
+#[given(
+    expr = "caller {string} has had a consent callback with a tampered state rejected for OAuth provider {string} at gateway {int}"
+)]
+async fn caller_has_had_tampered_consent_callback_rejected(
+    world: &mut G2gWorld,
+    caller: String,
+    provider_name: String,
+    gw_index: usize,
+) {
+    let (consent, _) = world
+        .consent_request
+        .as_ref()
+        .expect("caller was asked for consent");
+    let provider = world
+        .oauth_providers
+        .get(&provider_name)
+        .unwrap_or_else(|| panic!("unknown OAuth provider '{provider_name}'"));
+    provider
+        .sign_in(&caller)
+        .await;
+    let status = open_consent_callback_with_tampered_state(
+        world
+            .harness()
+            .gw(gw_index)
+            .port,
+        consent,
+        provider,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("caller '{caller}' could not reach the consent callback: {error:#}"));
+    assert!(
+        status.is_client_error(),
+        "the consent callback with a tampered state should be rejected with a 4xx, got {status}"
+    );
 }
 
 #[given(expr = "caller {string} has completed consent for OAuth provider {string} at gateway {int}")]
