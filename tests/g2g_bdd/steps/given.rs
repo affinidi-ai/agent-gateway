@@ -1097,8 +1097,10 @@ async fn surface_no_longer_sends_delegated_credentials_over_fabric(
         .expect("opt the fabric route out of delegated credentials");
 }
 
-/// The caller signs in at the provider, which redirects back with a valid
-/// code; the gateway must refuse the callback because its `state` was altered.
+/// Seeds a consent callback the gateway has already refused: the caller signs
+/// in at the provider, which redirects back with a valid code but an altered
+/// `state`. The refusal is a precondition of the later retry, so a callback
+/// that is not refused fails setup.
 #[given(
     expr = "caller {string} has had a consent callback with a tampered state rejected for OAuth provider {string} at gateway {int}"
 )]

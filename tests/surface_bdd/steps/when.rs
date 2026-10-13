@@ -1369,7 +1369,19 @@ async fn read_audit_log_as_operator(
     record_admin_response(world, response);
 }
 
-pub(crate) async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
+async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
+    record_delegation_audit_trail(world).await;
+    let response = world
+        .delegation_audit_trail
+        .clone()
+        .expect("the delegation audit trail was just recorded");
+    record_admin_response(world, response);
+}
+
+/// Records the delegation audit trail alongside the caller's observations.
+/// Audit events may be written after the gateway answers, so the read is
+/// retried briefly until the trail has events.
+async fn record_delegation_audit_trail(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
 
     let client = world
@@ -1397,7 +1409,7 @@ pub(crate) async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
             .expect("read delegation audit trail through admin API");
     }
 
-    record_admin_response(world, response);
+    world.delegation_audit_trail = Some(response);
 }
 
 #[when("the operator reads the surface through the admin API")]
@@ -2355,6 +2367,14 @@ async fn mcp_tools_call_sent_to_surface_with_args(
 }
 
 #[when(expr = "OAuth provider {string} redirects the caller back with a valid authorization code")]
+async fn oauth_provider_redirects_back_with_valid_code_and_audit_recorded(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    oauth_provider_redirects_back_with_valid_code(world, provider).await;
+    record_delegation_audit_trail(world).await;
+}
+
 pub(crate) async fn oauth_provider_redirects_back_with_valid_code(
     world: &mut SurfaceWorld,
     provider: String,
@@ -2615,24 +2635,28 @@ async fn concurrent_requests_sent_to_surface(
         })
         .collect();
 
+    let mut statuses = Vec::with_capacity(count);
     for handle in handles {
-        handle
-            .await
-            .expect("task panicked");
+        statuses.push(
+            handle
+                .await
+                .expect("task panicked"),
+        );
     }
 
-    // Record the last observation so world state is populated for then steps.
-    let observations = {
-        let infra = world.infra.as_ref().unwrap();
-        read_mock_observation(&infra.mock).await
-    };
-    world.record_primary_observations(observations);
-    // Store a placeholder caller_response so the world is not empty.
-    world.caller_response = Some(RecordedResponse {
-        status: 200,
-        headers: Default::default(),
-        body: serde_json::Value::Null,
-    });
+    record_mock_observation(world).await;
+    // The caller response carries the first status that is not 200, so a
+    // status assertion fails if any concurrent caller was refused.
+    world.caller_response = statuses
+        .iter()
+        .copied()
+        .find(|status| *status != 200)
+        .or_else(|| statuses.first().copied())
+        .map(|status| RecordedResponse {
+            status,
+            headers: Default::default(),
+            body: serde_json::Value::Null,
+        });
 }
 
 fn build_mcp_tool_call_with_valid_identity(tool_name: &str) -> serde_json::Value {
@@ -2806,6 +2830,15 @@ async fn mcp_tool_call_without_identity(
 }
 
 #[when(expr = "caller {string} invokes MCP tool {string} with a valid token")]
+async fn caller_invokes_mcp_tool_with_valid_token_and_audit_recorded(
+    world: &mut SurfaceWorld,
+    caller: String,
+    tool_name: String,
+) {
+    caller_invokes_mcp_tool_with_valid_token(world, caller, tool_name).await;
+    record_delegation_audit_trail(world).await;
+}
+
 pub(crate) async fn caller_invokes_mcp_tool_with_valid_token(
     world: &mut SurfaceWorld,
     caller: String,
@@ -2818,6 +2851,15 @@ pub(crate) async fn caller_invokes_mcp_tool_with_valid_token(
 }
 
 #[when(expr = "caller {string} invokes MCP tool {string} with a valid token and a valid inbound identity payload")]
+async fn caller_invokes_mcp_tool_with_valid_token_and_identity_and_audit_recorded(
+    world: &mut SurfaceWorld,
+    caller: String,
+    tool_name: String,
+) {
+    caller_invokes_mcp_tool_with_valid_token_and_identity(world, caller, tool_name).await;
+    record_delegation_audit_trail(world).await;
+}
+
 pub(crate) async fn caller_invokes_mcp_tool_with_valid_token_and_identity(
     world: &mut SurfaceWorld,
     caller: String,

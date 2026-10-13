@@ -103,6 +103,8 @@ pub struct SurfaceWorld {
     pub created_surface_id: Option<String>,
     pub surface_under_test_id: Option<String>,
     pub admin_response: Option<RecordedResponse>,
+    /// The delegation audit trail as last read through the admin API.
+    pub delegation_audit_trail: Option<RecordedResponse>,
     pub surface_lookup_response: Option<RecordedResponse>,
     pub collected_dids: Vec<String>,
     pub caller_claims: HashMap<String, serde_json::Map<String, serde_json::Value>>,
@@ -157,6 +159,7 @@ impl SurfaceWorld {
             created_surface_id: None,
             surface_under_test_id: None,
             admin_response: None,
+            delegation_audit_trail: None,
             surface_lookup_response: None,
             collected_dids: Vec::new(),
             caller_claims: HashMap::new(),

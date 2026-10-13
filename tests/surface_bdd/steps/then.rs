@@ -2972,26 +2972,21 @@ fn oauth_provider_requests(world: &SurfaceWorld) -> Vec<crate::bdd_support::mock
         .unwrap_or_default()
 }
 
-fn delegation_audit_text(world: &mut SurfaceWorld) -> String {
+fn delegation_audit_text(world: &SurfaceWorld) -> String {
     serde_json::to_string(&read_delegation_audit_events(world)).expect("delegation audit events should serialize")
 }
 
-fn read_delegation_audit_events(world: &mut SurfaceWorld) -> Vec<serde_json::Value> {
-    refresh_delegation_audit_trail(world);
-    get_admin_response(world)
+fn read_delegation_audit_events(world: &SurfaceWorld) -> Vec<serde_json::Value> {
+    let trail = world
+        .delegation_audit_trail
+        .as_ref()
+        .expect("a When must record the delegation audit trail before this Then");
+    trail
         .body
         .get("events")
         .and_then(|events| events.as_array())
         .cloned()
-        .unwrap_or_else(|| {
-            panic!("admin delegation audit response should include events, got {}", get_admin_response(world).body)
-        })
-}
-
-fn refresh_delegation_audit_trail(world: &mut SurfaceWorld) {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(crate::steps::when::read_delegation_audit_trail(world));
-    });
+        .unwrap_or_else(|| panic!("admin delegation audit response should include events, got {}", trail.body))
 }
 
 fn consent_entry<'a>(

@@ -193,10 +193,10 @@ pub async fn gateway_did_not_receive_fabric_forward_request(
         .copied()
         .expect("a When step must record the fabric forward baseline before this Then");
     let actual = world
-        .harness()
-        .fabric_forward_request_count(gateway_index)
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
+        .fabric_forward_after_action
+        .get(&gateway_index)
+        .copied()
+        .expect("a When step must record the fabric forward count after the caller action before this Then");
     assert_eq!(
         actual, baseline,
         "gateway {gateway_index} received a fabric forward request after the caller action; caller_status={:?}; caller_body={:?}",
@@ -384,10 +384,8 @@ pub async fn managed_agent_received_forwarded_request_with_identity_presentation
         .actors
         .expect_target_kind(&target_name, TargetActorKind::ManagedAgent);
     let expected_issuer = world
-        .harness()
         .self_gateway_did(issuer_gw)
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
+        .to_string();
     let messages = forwarded_messages_for(world, &target_name).await;
     assert_eq!(
         messages.len(),
@@ -669,10 +667,8 @@ pub async fn gateway_recorded_peer_gateway_did_as_issuer_did(
 ) {
     assert_eq!(peer_gw, record_of_gw, "the recorded issuer DID is compared with the same peer gateway's own DID");
     let expected = world
-        .harness()
         .self_gateway_did(peer_gw)
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
+        .to_string();
     let record = match world
         .remote_gateway_records
         .get(&gw_index)
@@ -719,11 +715,7 @@ pub async fn reported_issuer_did_equals_peer_gateway_did(
         requested_gw, reporting_gw,
         "the issuer DID was requested from gateway {requested_gw}, not {reporting_gw}"
     );
-    let expected = world
-        .harness()
-        .self_gateway_did(peer_gw)
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
+    let expected = world.self_gateway_did(peer_gw);
     assert_eq!(
         reported, expected,
         "gateway {reporting_gw} reported issuer DID {reported}, expected its gateway DID {expected}"
@@ -1087,15 +1079,7 @@ pub async fn response_includes_fabric_gateway_did_metadata_for_target(
         })
         .expect("fabric gateway DID metadata must be a string or array of strings");
     let (gw_index, _) = world.target(&target_name);
-    let expected_gateway_did = world
-        .harness()
-        .gw(gw_index)
-        .admin
-        .find_self_gateway()
-        .await
-        .unwrap_or_else(|error| panic!("failed to find self gateway for gateway {gw_index}: {error}"))
-        .did
-        .unwrap_or_else(|| panic!("self gateway for gateway {gw_index} must have a DID"));
+    let expected_gateway_did = world.self_gateway_did(gw_index);
 
     assert_eq!(
         gateway_did, expected_gateway_did,

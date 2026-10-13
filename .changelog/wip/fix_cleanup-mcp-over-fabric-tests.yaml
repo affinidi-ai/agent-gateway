@@ -43,8 +43,9 @@ changes:
     - timestamp: '2026-10-13T00:00:00.000Z'
       title: Keep BDD actions in When steps and assertions in Then steps
       description: >-
-        Then steps for streamed progress only check what the When recorded, Given steps report
-        setup failures instead of asserting behaviour, and the Legacy SSE steps record the real
+        Then steps for streamed progress, Fabric forward counts, gateway DIDs and the delegation
+        audit trail only check what the When recorded, Given steps report setup failures instead
+        of asserting behaviour, and the Legacy SSE and concurrent-request steps record the real
         response status. MCP protocol versions in the BDD fixtures use a typed McpVersion, step
         wording for MCP tool listing matches across the surface and g2g suites, and Scenario
         Outlines cover the Legacy SSE and Streamable HTTP proxy scenarios.
@@ -55,6 +56,11 @@ changes:
         completion and cancellation tracking have support tests. The conformance upstream shim
         exports its reframing helpers, has node:test tests (npm test), and make mcp-conformance
         runs them before starting the shim.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Remove the uncalled one-shot Legacy SSE round-trip helper
+      description: >-
+        legacy_sse_roundtrip and its event-size helper had no callers; Legacy SSE upstreams are
+        reached through the persistent UpstreamSseSession.
     - timestamp: '2026-10-13T00:00:00.000Z'
       title: Remove the conformance harness --legacy-binary option
       description: >-

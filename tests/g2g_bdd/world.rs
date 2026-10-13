@@ -291,6 +291,11 @@ pub struct G2gWorld {
     pub concurrent_requests: Vec<Value>,
     pub concurrent_responses: Vec<ConcurrentResponse>,
     pub fabric_forward_baseline: HashMap<usize, usize>,
+    /// Fabric forward requests each gateway had received once the caller's
+    /// action completed, keyed by gateway index.
+    pub fabric_forward_after_action: HashMap<usize, usize>,
+    /// Each gateway's Self gateway DID, read once the topology has started.
+    pub self_gateway_dids: HashMap<usize, String>,
     /// Ping outcomes keyed by `(from_gw, to_gw)`.
     pub ping_results: HashMap<(usize, usize), bool>,
     /// Remote gateway records the operator read, keyed by the gateway they
@@ -348,6 +353,8 @@ impl G2gWorld {
             concurrent_requests: Vec::new(),
             concurrent_responses: Vec::new(),
             fabric_forward_baseline: HashMap::new(),
+            fabric_forward_after_action: HashMap::new(),
+            self_gateway_dids: HashMap::new(),
             ping_results: HashMap::new(),
             remote_gateway_records: HashMap::new(),
             issuer_request_result: None,
@@ -487,7 +494,28 @@ impl G2gWorld {
                 .expect("opt the fabric route into delegated credentials");
         }
 
+        for gw_index in 1..=count {
+            let did = harness
+                .self_gateway_did(gw_index)
+                .await
+                .unwrap_or_else(|error| panic!("setup failed: {error:#}"));
+            self.self_gateway_dids
+                .insert(gw_index, did);
+        }
+
         self.harness = Some(harness);
+    }
+
+    /// The Self gateway DID of gateway `gw_index`, recorded when the topology started.
+    pub fn self_gateway_did(
+        &self,
+        gw_index: usize,
+    ) -> &str {
+        self.self_gateway_dids
+            .get(&gw_index)
+            .unwrap_or_else(|| {
+                panic!("no Self gateway DID recorded for gateway {gw_index}; the topology must start first")
+            })
     }
 
     async fn exchange_caller_identity_tokens(
@@ -673,11 +701,25 @@ impl G2gWorld {
     }
 
     pub async fn remember_fabric_forward_baseline(&mut self) {
-        let Some(harness) = self.harness.as_ref() else {
-            return;
-        };
-        self.fabric_forward_baseline
+        self.fabric_forward_after_action
             .clear();
+        self.fabric_forward_baseline = self
+            .read_fabric_forward_counts()
+            .await;
+    }
+
+    /// Record each gateway's fabric forward count once the caller's action has completed.
+    pub async fn remember_fabric_forward_after_action(&mut self) {
+        self.fabric_forward_after_action = self
+            .read_fabric_forward_counts()
+            .await;
+    }
+
+    async fn read_fabric_forward_counts(&self) -> HashMap<usize, usize> {
+        let Some(harness) = self.harness.as_ref() else {
+            return HashMap::new();
+        };
+        let mut counts = HashMap::new();
         for gateway_index in 1..=self
             .topology
             .gateway_count
@@ -687,9 +729,9 @@ impl G2gWorld {
                 .fabric_forward_request_count(gateway_index)
                 .await
                 .unwrap_or_else(|error| panic!("{error:#}"));
-            self.fabric_forward_baseline
-                .insert(gateway_index, count);
+            counts.insert(gateway_index, count);
         }
+        counts
     }
 
     pub fn expects_allow_only_denial(
