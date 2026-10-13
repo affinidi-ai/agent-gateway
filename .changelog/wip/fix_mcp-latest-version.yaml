@@ -21,16 +21,14 @@ changes:
         the sending gateway is not refused with `403` by its peer. Header and body limits still
         apply, with the forwarded Origin counted toward the header budget, and framed streams
         still check Origin on receive.
-    - timestamp: '2026-10-07T09:00:00.000Z'
-      title: Restrict the Fabric Origin-check bypass to the receive path
-      description: >-
-        The Origin-check bypass is now limited to the buffered Fabric receive path, so regular
-        HTTP policy handling continues to enforce configured origin allowlists.
     - timestamp: '2026-10-07T02:15:14.000Z'
       title: Document modern MCP admission and rollback behavior
       description: >-
         The documentation now describes modern MCP admission on every endpoint, the retired
-        protocol setting, and the steps required before downgrading to an older release.
+        protocol setting, and the steps required before downgrading to an older release. The
+        rollback steps PATCH `{"mcp_http": null}` onto every surface, even when GET shows
+        neither field, and verify the stored records rather than GET, because GET hides a
+        retired `mcp_protocol_mode` that only a save removes and that older releases reject.
   fixed: []
   removed: []
   security: []
