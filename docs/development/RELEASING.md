@@ -94,6 +94,27 @@ finishes the release.
 The release app must be allowed to create tags: add it as a bypass actor on the `tags_managed`
 ruleset.
 
+## Container image
+
+[`docker.yml`](../../.github/workflows/docker.yml) builds the `Dockerfile` and publishes it to the
+GitHub Container Registry as `ghcr.io/affinidi-ai/agent-gateway`. Nothing is pushed to any other
+registry.
+
+- **Pull requests** that touch the `Dockerfile`, the Rust or dashboard sources, `Cargo.toml`,
+  `Cargo.lock`, or `scripts/ci/` build the `linux/amd64` image and boot-probe it
+  (`scripts/ci/boot-probe.sh` runs the entrypoint with `--help` and requires a clean exit). Nothing
+  is pushed.
+- **A `v*` tag**, created by "Publish release", builds `linux/amd64` and `linux/arm64` natively and
+  pushes each by digest. Each pushed image is pulled back and boot-probed. Then a `publish` job
+  merges the digests into one multi-arch manifest (`scripts/ci/publish-manifest.sh`) tagged
+  `X.Y.Z`, `X.Y` and, for a release that is not a pre-release, `latest`, and attests the manifest's
+  build provenance. Verify an image with
+  `gh attestation verify oci://ghcr.io/affinidi-ai/agent-gateway:X.Y.Z --repo affinidi-ai/agent-gateway`.
+
+The build uses no layer cache, so each run compiles from scratch. The first publish creates the
+package; set its visibility to public in the organization's package settings if GitHub does not
+inherit it from the repository.
+
 ## Changelog fragments
 
 See [Changelog fragments in `AGENTS.md`](../../AGENTS.md#changelog-fragments) for how to write
