@@ -26,5 +26,5 @@ changes:
       title: Test that every permissions key is an accepted access token scope
       description: A unit test checks that each key the permissions endpoint returns, which the token form offers as a scope, exists in the RBAC permission map that token creation validates against, so an alias like departments.* cannot reappear.
     - timestamp: "2026-10-12T00:00:00.000Z"
-      title: Add CLAUDE.md that imports AGENTS.md and lists common make targets
-      description: Claude Code loads CLAUDE.md, so it imports the canonical AGENTS.md and adds a short command table from the Makefile.
+      title: List the most used make targets in AGENTS.md
+      description: The Commands to run section now lists the everyday make targets and notes that config-test prepares the certificates and keys the tests need, so every agent tool sees them in the canonical AGENTS.md instead of a separate per-tool file.
