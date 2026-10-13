@@ -1,0 +1,26 @@
+.changelog/wip/initial-release.yaml
+  s_09d9fb08a24a2a::t_e5d65c0fd0b41c 1-59
+.github/scripts/test_changelog.py
+  s_09d9fb08a24a2a::t_6234714c7294f8 139
+  s_09d9fb08a24a2a::t_9741cf8c114272 121,128-130,138,142-162
+.github/scripts/changelog.py
+  s_09d9fb08a24a2a::t_9741cf8c114272 18,186-194,201-211,213-214,217
+docs/development/RELEASING.md
+  s_09d9fb08a24a2a::t_4351a7e6428faa 32-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7cc1b2838f0808489932bb996953d404a015ca65",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
