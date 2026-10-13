@@ -1,21 +1,13 @@
-//! Forwards every governance audit record the VP Audit Log persists to the
-//! active, appliance-global integrations in the `audit` category.
-//!
-//! The audit writer hands each appended record to [`forward`]. A dispatcher
-//! task fans the record out to one bounded queue per subscribed integration, so
-//! a slow or unreachable sink never stalls the audit writer or the other sinks.
-//! A full queue drops the record for that sink (the VP Audit Log still holds
-//! it) and counts it as `agent_gateway_audit_forward_total{result="dropped", integration_id}`.
+//! The Governance Audit integration category: which integrations receive
+//! audit records, the template variables a record offers, and publishing one
+//! rendered record. Delivery order, retries and selection live in
+//! [`crate::audit`].
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use futures::future::BoxFuture;
-use tokio::sync::mpsc::{self, error::TrySendError};
-use tracing::{debug, warn};
 
+use crate::audit::catalog::AUDIT_EVENTS;
 use crate::delegation_vault::audit::{
     AuditCallerContext, DelegationAuditAction, DelegationAuditEvent, action_category,
 };
@@ -24,57 +16,21 @@ use crate::storage::Integration;
 /// Integration category whose integrations receive governance audit records.
 pub const AUDIT_CATEGORY: &str = "audit";
 
-const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Every audit record category, as `(category, name, description)`. Its event
-/// type is `audit.<category>`.
-const AUDIT_EVENT_CATEGORIES: &[(&str, &str, &str)] = &[
-    (
-        "policy_decision",
-        "Policy Decision",
-        "A gateway, surface, MCP-tool or response OPA policy allowed or denied a request",
-    ),
-    ("trust_check", "Trust Check", "A TRQP trust-check outcome for the caller or target leg"),
-    ("trace_terminated", "Trace Terminated", "A surface terminated the end-to-end trace at its egress"),
-    (
-        "vp_injected",
-        "VP Injected",
-        "A signed identity Verifiable Presentation was injected into a proxied request or response",
-    ),
-    ("token_injected", "Token Injected", "A delegated credential from the vault was injected on the caller's behalf"),
-    ("token_refreshed", "Token Refreshed", "An expired delegated credential was refreshed and injected"),
-    ("refresh_failed", "Refresh Failed", "A delegated credential could not be refreshed, so consent is required again"),
-    ("consent_granted", "Consent Granted", "A user completed the OAuth consent flow and a delegation token was stored"),
-    ("consent_required", "Consent Required", "The caller was asked to grant consent before the request could proceed"),
-    ("token_revoked", "Token Revoked", "A delegation token was revoked through the management API"),
-    ("user_tokens_revoked", "User Tokens Revoked", "Every delegation token for a user was revoked"),
-    ("token_not_found", "Token Not Found", "A delegation token lookup found no match"),
-    ("elicitation_sent", "Elicitation Sent", "An MCP elicitation request was sent to the client"),
-    ("elicitation_accepted", "Elicitation Accepted", "The client accepted an MCP elicitation"),
-    ("elicitation_declined", "Elicitation Declined", "The client declined an MCP elicitation"),
-    ("elicitation_cancelled", "Elicitation Cancelled", "The client cancelled an MCP elicitation"),
-    ("elicitation_timed_out", "Elicitation Timed Out", "The client did not answer an MCP elicitation in time"),
-    (
-        "pre_authorize_blocked",
-        "Pre-Authorize Blocked",
-        "Pre-authorization blocked a session because a required credential was missing",
-    ),
-    ("payment", "Payment Event", "An x402 or MPP payment lifecycle event (challenge, verification, settlement)"),
-];
-
 /// The `audit` integration category offered in the integration configuration.
+/// Each event type is `audit.<category>`.
 pub fn audit_integration_category() -> crate::config::IntegrationCategory {
     crate::config::IntegrationCategory {
         enum_value: AUDIT_CATEGORY.to_string(),
         name: "Governance Audit".to_string(),
         description: "Forwards every record written to the VP Audit Log: policy decisions, trust checks, VP injections, credential delegation and payment events. Requires the audit.view permission.".to_string(),
         metadata: serde_json::json!({
-            "event_types": AUDIT_EVENT_CATEGORIES
+            "event_types": AUDIT_EVENTS
                 .iter()
-                .map(|(category, name, description)| serde_json::json!({
-                    "event_type": format!("{}.{}", AUDIT_CATEGORY, category),
-                    "name": name,
-                    "description": description,
+                .map(|event| serde_json::json!({
+                    "event_type": format!("{}.{}", AUDIT_CATEGORY, event.category),
+                    "name": event.name,
+                    "description": event.description,
+                    "group": event.group,
                 }))
                 .collect::<Vec<_>>(),
         }),
@@ -91,7 +47,7 @@ pub fn is_audit_integration(integration: &Integration) -> bool {
 
 /// Audit records carry appliance-wide evidence, so only active integrations
 /// without a tenant owner receive them, whatever their type.
-fn receives_audit_records(integration: &Integration) -> bool {
+pub(crate) fn receives_audit_records(integration: &Integration) -> bool {
     is_audit_integration(integration)
         && integration.status == "active"
         && integration
@@ -197,7 +153,7 @@ fn principal(caller: &AuditCallerContext) -> String {
 }
 
 /// One audit record, rendered once and shared by every subscribed integration.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AuditDelivery {
     subject: String,
     message: String,
@@ -205,7 +161,19 @@ pub(crate) struct AuditDelivery {
 }
 
 impl AuditDelivery {
-    fn from_event(event: &DelegationAuditEvent) -> Self {
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn variables(&self) -> &HashMap<String, String> {
+        &self.variables
+    }
+
+    pub(crate) fn from_event(event: &DelegationAuditEvent) -> Self {
         let event_type = audit_event_type(event);
         Self {
             subject: format!("Governance Audit: {}", event_type),
@@ -215,263 +183,45 @@ impl AuditDelivery {
     }
 }
 
-type LoadSubscribers = Arc<dyn Fn() -> BoxFuture<'static, Option<HashSet<String>>> + Send + Sync>;
-type Deliver = Arc<dyn Fn(String, Arc<AuditDelivery>) -> BoxFuture<'static, ()> + Send + Sync>;
-
-struct DispatcherConfig {
-    intake_capacity: usize,
-    queue_capacity: usize,
-    refresh_interval: Duration,
-    stale: Arc<AtomicBool>,
-    load_subscribers: LoadSubscribers,
-    deliver: Deliver,
-}
-
-fn production_stale_flag() -> &'static Arc<AtomicBool> {
-    static STALE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    STALE.get_or_init(|| Arc::new(AtomicBool::new(true)))
-}
-
-fn production_intake() -> &'static mpsc::Sender<DelegationAuditEvent> {
-    static INTAKE: OnceLock<mpsc::Sender<DelegationAuditEvent>> = OnceLock::new();
-    INTAKE.get_or_init(|| {
-        spawn_dispatcher(DispatcherConfig {
-            intake_capacity: 4096,
-            queue_capacity: 1024,
-            refresh_interval: Duration::from_secs(30),
-            stale: production_stale_flag().clone(),
-            load_subscribers: Arc::new(|| Box::pin(load_subscribers_from_storage())),
-            deliver: Arc::new(|integration_id, delivery| Box::pin(deliver_to_integration(integration_id, delivery))),
-        })
-    })
-}
-
-/// Queue a persisted audit record for every audit integration. Never blocks.
-pub fn forward(event: DelegationAuditEvent) {
-    static INTAKE_FULL: WarnThrottle = WarnThrottle::new();
-    static INTAKE_CLOSED: WarnThrottle = WarnThrottle::new();
-
-    match production_intake().try_send(event) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            crate::metrics::backends::prometheus::track_audit_forward("dropped", None);
-            if let Some(dropped) = INTAKE_FULL.record() {
-                warn!(
-                    dropped,
-                    "Audit forwarding intake queue is full; audit records were not forwarded to integrations"
-                );
-            }
-        }
-        Err(TrySendError::Closed(_)) => {
-            crate::metrics::backends::prometheus::track_audit_forward("dropped", None);
-            if let Some(dropped) = INTAKE_CLOSED.record() {
-                warn!(
-                    dropped,
-                    "Audit forwarding dispatcher has stopped; audit records were not forwarded to integrations"
-                );
-            }
-        }
-    }
-}
-
-/// Make the dispatcher reload its subscriber list before the next record.
-pub fn invalidate_subscribers() {
-    production_stale_flag().store(true, Ordering::Release);
-}
-
-/// Rate-limits a repeating WARN to one per [`DROP_WARN_INTERVAL`]. `record`
-/// counts an occurrence and, when a WARN may be logged, returns how many
-/// occurrences it stands for.
-struct WarnThrottle {
-    pending: AtomicU64,
-    last: std::sync::Mutex<Option<Instant>>,
-}
-
-impl WarnThrottle {
-    const fn new() -> Self {
-        Self {
-            pending: AtomicU64::new(0),
-            last: std::sync::Mutex::new(None),
-        }
-    }
-
-    fn record(&self) -> Option<u64> {
-        self.pending
-            .fetch_add(1, Ordering::Relaxed);
-        let Ok(mut last) = self.last.try_lock() else {
-            return None;
-        };
-        if last.is_some_and(|at| at.elapsed() < DROP_WARN_INTERVAL) {
-            return None;
-        }
-        *last = Some(Instant::now());
-        Some(
-            self.pending
-                .swap(0, Ordering::Relaxed),
-        )
-    }
-}
-
-async fn load_subscribers_from_storage() -> Option<HashSet<String>> {
-    let storage = crate::storage::get_integration_storage()?;
-    match storage.list().await {
-        Ok(integrations) => Some(
-            integrations
-                .into_iter()
-                .filter(receives_audit_records)
-                .map(|integration| integration.id)
-                .collect(),
-        ),
-        Err(e) => {
-            warn!(error = %e, "Failed to list integrations for audit forwarding");
-            None
-        }
-    }
-}
-
-async fn deliver_to_integration(
+/// Publishes one rendered record to a Governance Audit integration. An
+/// integration that no longer receives audit records is skipped. Counted in
+/// `agent_gateway_audit_forward_total`.
+pub(crate) fn publish_audit_delivery(
     integration_id: String,
-    delivery: Arc<AuditDelivery>,
-) {
+    delivery: AuditDelivery,
+) -> BoxFuture<'static, anyhow::Result<()>> {
     use crate::integrations::integration_service::{load_integration, publish_to_integration};
     use crate::metrics::backends::prometheus::track_audit_forward;
-    static DELIVERY_FAILED: WarnThrottle = WarnThrottle::new();
 
-    let result = match load_integration(&integration_id).await {
-        Ok(integration) if receives_audit_records(&integration) => {
-            publish_to_integration(&integration, &delivery.subject, &delivery.message, &delivery.variables)
-                .await
-                .map_err(|e| e.to_string())
+    Box::pin(async move {
+        let integration = load_integration(&integration_id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if !receives_audit_records(&integration) {
+            return Ok(());
         }
-        Ok(_) => {
-            track_audit_forward("dropped", Some(&integration_id));
-            return;
-        }
-        Err(e) => Err(e.to_string()),
-    };
-    match result {
-        Ok(()) => track_audit_forward("delivered", Some(&integration_id)),
-        Err(error) => {
-            track_audit_forward("failed", Some(&integration_id));
-            if let Some(failures) = DELIVERY_FAILED.record() {
-                warn!(
-                    integration_id = %integration_id,
-                    event_type = delivery.variables.get("EVENT_TYPE").map(String::as_str).unwrap_or_default(),
-                    error = %error,
-                    failures,
-                    "Failed to forward audit records to integrations"
-                );
+        match publish_to_integration(&integration, delivery.subject(), delivery.message(), delivery.variables()).await {
+            Ok(()) => {
+                track_audit_forward("delivered", Some(&integration_id));
+                Ok(())
+            }
+            Err(e) => {
+                track_audit_forward("failed", Some(&integration_id));
+                Err(anyhow::anyhow!(e.to_string()))
             }
         }
-    }
-}
-
-fn spawn_dispatcher(config: DispatcherConfig) -> mpsc::Sender<DelegationAuditEvent> {
-    let (tx, rx) = mpsc::channel(config.intake_capacity);
-    tokio::spawn(run_dispatcher(rx, config));
-    tx
-}
-
-async fn run_dispatcher(
-    mut intake: mpsc::Receiver<DelegationAuditEvent>,
-    config: DispatcherConfig,
-) {
-    let mut subscribers: HashSet<String> = HashSet::new();
-    let mut loaded_at: Option<Instant> = None;
-    let mut workers: HashMap<String, Worker> = HashMap::new();
-    let mut dropped: u64 = 0;
-    let mut last_drop_warn: Option<Instant> = None;
-
-    while let Some(event) = intake.recv().await {
-        let expired = loaded_at.is_none_or(|at| at.elapsed() >= config.refresh_interval);
-        if config
-            .stale
-            .swap(false, Ordering::AcqRel)
-            || expired
-        {
-            if let Some(current) = (config.load_subscribers)().await {
-                subscribers = current;
-                workers.retain(|id, worker| {
-                    let subscribed = subscribers.contains(id);
-                    if !subscribed {
-                        worker
-                            .retired
-                            .store(true, Ordering::Release);
-                    }
-                    subscribed
-                });
-            }
-            loaded_at = Some(Instant::now());
-        }
-        if subscribers.is_empty() {
-            continue;
-        }
-
-        let delivery = Arc::new(AuditDelivery::from_event(&event));
-        for integration_id in &subscribers {
-            let new_worker = || spawn_worker(integration_id.clone(), config.queue_capacity, config.deliver.clone());
-            let worker = workers
-                .entry(integration_id.clone())
-                .or_insert_with(&new_worker);
-            match worker
-                .queue
-                .try_send(delivery.clone())
-            {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    crate::metrics::backends::prometheus::track_audit_forward("dropped", Some(integration_id));
-                    dropped += 1;
-                }
-                Err(TrySendError::Closed(pending)) => {
-                    *worker = new_worker();
-                    let _ = worker.queue.try_send(pending);
-                }
-            }
-        }
-
-        if dropped > 0 && last_drop_warn.is_none_or(|at| at.elapsed() >= DROP_WARN_INTERVAL) {
-            warn!(dropped, "Audit integration queues are full; audit records were not forwarded");
-            dropped = 0;
-            last_drop_warn = Some(Instant::now());
-        }
-    }
-    debug!("Audit forwarding dispatcher stopped");
-}
-
-/// One destination's queue. A worker retired because its integration stopped
-/// receiving audit records discards what is still queued, counted as
-/// `dropped`, instead of delivering it or logging a failure per record.
-struct Worker {
-    queue: mpsc::Sender<Arc<AuditDelivery>>,
-    retired: Arc<AtomicBool>,
-}
-
-fn spawn_worker(
-    integration_id: String,
-    capacity: usize,
-    deliver: Deliver,
-) -> Worker {
-    let (queue, mut rx) = mpsc::channel::<Arc<AuditDelivery>>(capacity);
-    let retired = Arc::new(AtomicBool::new(false));
-    let worker_retired = retired.clone();
-    tokio::spawn(async move {
-        while let Some(delivery) = rx.recv().await {
-            if worker_retired.load(Ordering::Acquire) {
-                crate::metrics::backends::prometheus::track_audit_forward("dropped", Some(&integration_id));
-                continue;
-            }
-            deliver(integration_id.clone(), delivery).await;
-        }
-    });
-    Worker { queue, retired }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::events::{
+        AuthScheme, DelegationFailureReason, IdentityBindingFailure, RateLimitScope, RejectionReason, RejectionStage,
+        RequestFailureOutcome, TargetKind,
+    };
     use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, PaymentStage, audit_event};
-    use std::sync::Mutex;
-    use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
+    use std::collections::HashSet;
 
     fn integration(
         category: Option<&str>,
@@ -507,6 +257,7 @@ mod tests {
                 http_path: Some("/a2a".to_string()),
                 policy_version: Some(3),
                 policy_content_hash: Some("sha256:abc".to_string()),
+                removed_tools: None,
             },
             None,
             None,
@@ -722,11 +473,18 @@ mod tests {
             | DelegationAuditAction::ElicitationDeclined
             | DelegationAuditAction::ElicitationCancelled
             | DelegationAuditAction::ElicitationTimedOut
-            | DelegationAuditAction::PreAuthorizeBlocked
             | DelegationAuditAction::PolicyDecision { .. }
             | DelegationAuditAction::TrustCheck { .. }
             | DelegationAuditAction::TraceTerminated { .. }
-            | DelegationAuditAction::PaymentEvent(_) => {}
+            | DelegationAuditAction::PaymentEvent(_)
+            | DelegationAuditAction::AuthFailed { .. }
+            | DelegationAuditAction::RateLimited { .. }
+            | DelegationAuditAction::RequestRejected { .. }
+            | DelegationAuditAction::IdentityBindingFailed { .. }
+            | DelegationAuditAction::IdentityBindingVerified { .. }
+            | DelegationAuditAction::DelegationFailed { .. }
+            | DelegationAuditAction::RequestFailed { .. }
+            | DelegationAuditAction::RequestCompleted { .. } => {}
         }
     }
 
@@ -746,7 +504,6 @@ mod tests {
             DelegationAuditAction::ElicitationDeclined,
             DelegationAuditAction::ElicitationCancelled,
             DelegationAuditAction::ElicitationTimedOut,
-            DelegationAuditAction::PreAuthorizeBlocked,
             policy_decision("allow").event,
             DelegationAuditAction::TrustCheck {
                 leg: "caller".to_string(),
@@ -774,6 +531,51 @@ mod tests {
                 payment_surface_id: None,
                 remote_status: None,
             })),
+            DelegationAuditAction::AuthFailed {
+                scheme: AuthScheme::Jwt,
+                reason: "expired".to_string(),
+                blocking: true,
+                client_ip: None,
+            },
+            DelegationAuditAction::RateLimited {
+                scope: RateLimitScope::Surface,
+                retry_after_ms: None,
+            },
+            DelegationAuditAction::RequestRejected {
+                stage: RejectionStage::Routing,
+                reason: RejectionReason::NoRoute,
+                http_status: 404,
+            },
+            DelegationAuditAction::IdentityBindingFailed {
+                outcome: IdentityBindingFailure::Absent,
+                agent_did: None,
+                issuer_gateway: None,
+                error_detail: None,
+            },
+            DelegationAuditAction::IdentityBindingVerified {
+                agent_did: "did:web:agent.example".to_string(),
+                issuer_gateway: None,
+                assurance: None,
+            },
+            DelegationAuditAction::DelegationFailed {
+                reason: DelegationFailureReason::CredentialsUnavailable,
+                provider_id: None,
+            },
+            DelegationAuditAction::RequestFailed {
+                outcome: RequestFailureOutcome::UpstreamError,
+                target_kind: TargetKind::Http,
+                upstream_status: Some(502),
+                latency_ms: 10,
+            },
+            DelegationAuditAction::RequestCompleted {
+                target_kind: TargetKind::Http,
+                upstream_status: 200,
+                latency_ms: 10,
+                request_bytes: 0,
+                response_bytes: 0,
+                ucp_op: None,
+                variant_alias: None,
+            },
         ]
     }
 
@@ -815,6 +617,28 @@ mod tests {
     }
 
     #[test]
+    fn audit_category_lists_the_group_of_each_event_type() {
+        let category = audit_integration_category();
+        let events = category.metadata["event_types"]
+            .as_array()
+            .unwrap();
+        let group_of = |event_type: &str| {
+            events
+                .iter()
+                .find(|event| event["event_type"] == event_type)
+                .and_then(|event| event["group"].as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(group_of("audit.policy_decision").as_deref(), Some("policies"));
+        assert_eq!(group_of("audit.token_injected").as_deref(), Some("delegation"));
+        assert!(
+            events
+                .iter()
+                .all(|event| event["group"].is_string())
+        );
+    }
+
+    #[test]
     fn example_gateway_config_carries_the_built_in_audit_category() {
         let example: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -840,248 +664,5 @@ mod tests {
                 .iter()
                 .any(|category| category.enum_value == AUDIT_CATEGORY)
         );
-    }
-
-    struct Harness {
-        intake: mpsc::Sender<DelegationAuditEvent>,
-        subscribers: Arc<Mutex<Option<HashSet<String>>>>,
-        stale: Arc<AtomicBool>,
-        delivered: UnboundedReceiver<(String, String)>,
-    }
-
-    impl Harness {
-        fn new(
-            queue_capacity: usize,
-            subscribers: &[&str],
-            gate: Option<(&str, Arc<Semaphore>, mpsc::UnboundedSender<()>)>,
-        ) -> Self {
-            let subscribers = Arc::new(Mutex::new(Some(
-                subscribers
-                    .iter()
-                    .map(|id| id.to_string())
-                    .collect(),
-            )));
-            let stale = Arc::new(AtomicBool::new(false));
-            let (delivered_tx, delivered) = mpsc::unbounded_channel();
-            let gate = gate.map(|(id, permits, started)| (id.to_string(), permits, started));
-            let source = subscribers.clone();
-            let intake = spawn_dispatcher(DispatcherConfig {
-                intake_capacity: 64,
-                queue_capacity,
-                refresh_interval: Duration::from_secs(3600),
-                stale: stale.clone(),
-                load_subscribers: Arc::new(move || {
-                    let current = source.lock().unwrap().clone();
-                    Box::pin(async move { current })
-                }),
-                deliver: Arc::new(move |integration_id, delivery| {
-                    let delivered_tx = delivered_tx.clone();
-                    let gate = gate.clone();
-                    Box::pin(async move {
-                        if let Some((gated_id, permits, started)) = gate
-                            && gated_id == integration_id
-                        {
-                            let _ = started.send(());
-                            permits
-                                .acquire()
-                                .await
-                                .unwrap()
-                                .forget();
-                        }
-                        let trace_id = delivery.variables["AUDIT_TRACE_ID"].clone();
-                        let _ = delivered_tx.send((integration_id, trace_id));
-                    })
-                }),
-            });
-            Self {
-                intake,
-                subscribers,
-                stale,
-                delivered,
-            }
-        }
-
-        async fn send(
-            &self,
-            trace_id: &str,
-        ) {
-            self.intake
-                .send(vp_injected(trace_id))
-                .await
-                .unwrap();
-        }
-
-        fn set_subscribers(
-            &self,
-            subscribers: Option<&[&str]>,
-        ) {
-            *self
-                .subscribers
-                .lock()
-                .unwrap() = subscribers.map(|ids| {
-                ids.iter()
-                    .map(|id| id.to_string())
-                    .collect()
-            });
-            self.stale
-                .store(true, Ordering::Release);
-        }
-
-        async fn next(&mut self) -> (String, String) {
-            tokio::time::timeout(Duration::from_secs(5), self.delivered.recv())
-                .await
-                .expect("a delivery arrives")
-                .expect("the dispatcher is running")
-        }
-
-        async fn collect(
-            &mut self,
-            count: usize,
-        ) -> HashMap<String, Vec<String>> {
-            let mut by_integration: HashMap<String, Vec<String>> = HashMap::new();
-            for _ in 0..count {
-                let (integration_id, trace_id) = self.next().await;
-                by_integration
-                    .entry(integration_id)
-                    .or_default()
-                    .push(trace_id);
-            }
-            by_integration
-        }
-
-        async fn assert_quiet(&mut self) {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(200), self.delivered.recv())
-                    .await
-                    .is_err(),
-                "no further deliveries are expected"
-            );
-        }
-    }
-
-    fn traces(ids: &[&str]) -> Vec<String> {
-        ids.iter()
-            .map(|id| id.to_string())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn dispatcher_forwards_every_record_to_every_subscriber_in_order() {
-        let mut harness = Harness::new(16, &["kafka", "webhook"], None);
-        for trace_id in ["t1", "t2", "t3"] {
-            harness.send(trace_id).await;
-        }
-
-        let delivered = harness.collect(6).await;
-        assert_eq!(delivered["kafka"], traces(&["t1", "t2", "t3"]));
-        assert_eq!(delivered["webhook"], traces(&["t1", "t2", "t3"]));
-        harness.assert_quiet().await;
-    }
-
-    #[tokio::test]
-    async fn dispatcher_forwards_nothing_without_subscribers() {
-        let mut harness = Harness::new(16, &[], None);
-        harness
-            .send("unsubscribed")
-            .await;
-        harness.assert_quiet().await;
-
-        harness.set_subscribers(Some(&["kafka"]));
-        harness
-            .send("subscribed")
-            .await;
-        assert_eq!(harness.next().await, ("kafka".to_string(), "subscribed".to_string()));
-        harness.assert_quiet().await;
-    }
-
-    #[tokio::test]
-    async fn dispatcher_follows_subscriber_changes() {
-        let mut harness = Harness::new(16, &["kafka", "webhook"], None);
-        harness.send("t1").await;
-        let first = harness.collect(2).await;
-        assert_eq!(first["kafka"], traces(&["t1"]));
-        assert_eq!(first["webhook"], traces(&["t1"]));
-
-        harness.set_subscribers(Some(&["kafka", "slack"]));
-        harness.send("t2").await;
-        let second = harness.collect(2).await;
-        assert_eq!(second["kafka"], traces(&["t2"]));
-        assert_eq!(second["slack"], traces(&["t2"]));
-        assert!(!second.contains_key("webhook"), "a removed subscriber stops receiving records");
-        harness.assert_quiet().await;
-    }
-
-    #[tokio::test]
-    async fn dispatcher_keeps_subscribers_when_reload_fails() {
-        let mut harness = Harness::new(16, &["kafka"], None);
-        harness.send("t1").await;
-        assert_eq!(harness.next().await.1, "t1");
-
-        harness.set_subscribers(None);
-        harness.send("t2").await;
-        assert_eq!(harness.next().await, ("kafka".to_string(), "t2".to_string()));
-    }
-
-    #[tokio::test]
-    async fn slow_subscriber_drops_overflow_without_delaying_others() {
-        let permits = Arc::new(Semaphore::new(0));
-        let (started_tx, mut started) = mpsc::unbounded_channel();
-        let mut harness = Harness::new(2, &["fast", "slow"], Some(("slow", permits.clone(), started_tx)));
-
-        harness.send("t1").await;
-        tokio::time::timeout(Duration::from_secs(5), started.recv())
-            .await
-            .expect("the slow sink starts delivering t1")
-            .unwrap();
-        assert_eq!(harness.next().await, ("fast".to_string(), "t1".to_string()));
-        for trace_id in ["t2", "t3", "t4", "t5", "t6"] {
-            harness.send(trace_id).await;
-            assert_eq!(
-                harness.next().await,
-                ("fast".to_string(), trace_id.to_string()),
-                "a blocked sink never delays the others"
-            );
-        }
-
-        permits.add_permits(16);
-        let slow = harness.collect(3).await;
-        assert_eq!(slow["slow"], traces(&["t1", "t2", "t3"]), "the in-flight record plus a full queue survive");
-        harness.assert_quiet().await;
-    }
-
-    #[tokio::test]
-    async fn a_retired_subscriber_discards_its_queue_instead_of_delivering_it() {
-        let permits = Arc::new(Semaphore::new(0));
-        let (started_tx, mut started) = mpsc::unbounded_channel();
-        let mut harness = Harness::new(4, &["retired", "witness"], Some(("retired", permits.clone(), started_tx)));
-
-        harness.send("t1").await;
-        tokio::time::timeout(Duration::from_secs(5), started.recv())
-            .await
-            .expect("the sink starts delivering t1")
-            .unwrap();
-        harness.send("t2").await;
-        harness.send("t3").await;
-        let witnessed = harness.collect(3).await;
-        assert_eq!(witnessed["witness"], traces(&["t1", "t2", "t3"]), "t2 and t3 are queued for both sinks");
-
-        harness.set_subscribers(Some(&["witness"]));
-        harness.send("t4").await;
-        assert_eq!(harness.next().await, ("witness".to_string(), "t4".to_string()));
-
-        permits.add_permits(16);
-        assert_eq!(harness.next().await, ("retired".to_string(), "t1".to_string()), "the in-flight record completes");
-        harness.assert_quiet().await;
-    }
-
-    #[test]
-    fn warn_throttle_logs_once_per_interval_and_counts_what_it_held_back() {
-        let throttle = WarnThrottle::new();
-        assert_eq!(throttle.record(), Some(1), "the first occurrence is logged");
-        assert_eq!(throttle.record(), None);
-        assert_eq!(throttle.record(), None);
-
-        *throttle.last.lock().unwrap() = Instant::now().checked_sub(DROP_WARN_INTERVAL);
-        assert_eq!(throttle.record(), Some(3), "the next WARN reports the held-back occurrences");
     }
 }

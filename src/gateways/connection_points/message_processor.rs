@@ -2436,14 +2436,21 @@ async fn evaluate_gateway_policy_for_fabric(
             }
             Err(e) => {
                 info!(channel = config_id, "[GW-POLICY] GW2: gateway-level policy evaluation error (denying): {}", e);
-                return Err(ProcessingResult::RequiresResponse {
-                    response_type: MessageType::ForwardResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "status": 403,
-                        "body": r#"{"error":"Forbidden","message":"Request blocked by gateway policy"}"#,
-                        "error": "Request blocked by gateway policy",
-                    }),
-                });
+                return Err(fabric_gateway_policy_error(crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Gateway,
+                    flow: crate::observability::PolicyFlow::Fabric,
+                    policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
+                    policy_definition_id: gw_policy_def_id.as_deref(),
+                    policy_name: Some(gw_policy_name.as_str()),
+                    surface_id: surface.config_id(),
+                    http_method: Some(method),
+                    path: Some(path),
+                    identity: authenticated_identity,
+                    gateway_did: Some(&self_gateway_id),
+                    policy_version: gw_policy_version,
+                    policy_content_hash: gw_policy_hash.as_deref(),
+                    ..Default::default()
+                }));
             }
         }
     } else {
@@ -2458,6 +2465,43 @@ async fn evaluate_gateway_policy_for_fabric(
     }
 
     Ok(())
+}
+
+/// The surface-plane policies a Fabric request must pass, as on the direct path.
+#[derive(Debug, PartialEq)]
+struct FabricSurfacePolicies {
+    /// The appliance-wide surface policy, enforced on every request whatever
+    /// the surface's own OPA configuration and path.
+    global: bool,
+    /// The surface's own policy: `None` when it does not apply (OPA off, or a
+    /// public discovery request), otherwise whether a compiled policy can run.
+    surface: Option<Result<(), crate::observability::PolicyEvaluationError>>,
+}
+
+impl FabricSurfacePolicies {
+    fn any(&self) -> bool {
+        self.global || self.surface.is_some()
+    }
+}
+
+fn fabric_surface_policies(
+    surface_opa_enabled: bool,
+    public_request: bool,
+    has_global_surface_policy: bool,
+    policy_manager: Option<&crate::policies::SurfacePolicyManager>,
+    config_id: &str,
+    variant_alias: Option<&str>,
+) -> FabricSurfacePolicies {
+    use crate::observability::PolicyEvaluationError;
+    let surface = (surface_opa_enabled && !public_request).then(|| match policy_manager {
+        None => Err(PolicyEvaluationError::NoPolicyManager),
+        Some(pm) if pm.has_policy_for_variant(config_id, variant_alias) => Ok(()),
+        Some(_) => Err(PolicyEvaluationError::PolicyNotCompiled),
+    });
+    FabricSurfacePolicies {
+        global: has_global_surface_policy,
+        surface,
+    }
 }
 
 /// Injects custom metadata and trust registry extensions into the request body,
@@ -2756,11 +2800,20 @@ async fn enrich_and_evaluate_surface_policies(
         }
     }
 
-    let has_compiled_policy = GLOBAL_POLICY_MANAGER
-        .get()
-        .is_some_and(|pm| pm.has_policy_for_variant(config_id, variant_alias));
-    channel_info!(config_id, "GW2: opa_enabled={} has_compiled_policy={}", surface.opa_enabled(), has_compiled_policy);
-    if surface.opa_enabled() && !is_agent_card_request && has_compiled_policy {
+    let policies = fabric_surface_policies(
+        surface.opa_enabled(),
+        is_agent_card_request,
+        GLOBAL_APPLIANCE_POLICY_MANAGER
+            .get()
+            .is_some_and(|pm| pm.has_global(crate::policies::global_policy::PLANE_AGENT_SURFACE)),
+        GLOBAL_POLICY_MANAGER
+            .get()
+            .map(Arc::as_ref),
+        config_id,
+        variant_alias,
+    );
+    channel_info!(config_id, "GW2: opa_enabled={} surface policies={:?}", surface.opa_enabled(), policies);
+    if policies.any() {
         channel_info!(config_id, "GW2: Starting surface-level OPA policy evaluation");
 
         let body_json: Option<serde_json::Value> = serde_json::from_slice(&body_bytes).ok();
@@ -2897,30 +2950,25 @@ async fn enrich_and_evaluate_surface_policies(
                     &surface.channel_protocol(),
                 )
             {
-                let mut evt = crate::delegation_vault::audit::audit_event(
-                    crate::delegation_vault::audit::DelegationAuditAction::VpInjected,
-                    None,
-                    None,
-                    None,
-                    surface.config_id(),
-                );
-                evt.agent_identity_did = Some(binding.agent_did.clone());
-                evt.channel_name = Some(surface.name.clone());
-                evt.target_endpoint = Some(
-                    surface
-                        .target
-                        .endpoint
-                        .clone(),
-                );
-                evt.protocol = Some(format!("{:?}", surface.channel_protocol()).to_lowercase());
-                evt.vp_fingerprint = Some(crate::delegation_vault::audit::vp_fingerprint(&vp_jwt));
-                evt.vp_jwt = Some(vp_jwt);
-                evt.via_fabric = true;
                 // Same trace id as this request's policy decisions so the Audit
                 // "This request" filter + correlation work.
-                evt.trace_id = crate::observability::policy_audit::current_span_trace_id();
-                evt.detail = Some("request_path_fabric_received".to_string());
-                crate::delegation_vault::audit::audit(evt);
+                let trace_id = crate::observability::policy_audit::current_span_trace_id();
+                crate::delegation_vault::audit::submit(crate::delegation_vault::audit::vp_injected_event(
+                    crate::delegation_vault::audit::VpInjection {
+                        agent_did: Some(binding.agent_did.as_str()),
+                        user_hash: None,
+                        surface_id: surface.config_id(),
+                        channel_name: &surface.name,
+                        target_endpoint: &surface.target.endpoint,
+                        protocol: &format!("{:?}", surface.channel_protocol()).to_lowercase(),
+                        mcp_tool_name: None,
+                        vp_jwt: &vp_jwt,
+                        trace_id: trace_id.as_deref(),
+                        detail: "request_path_fabric_received".to_string(),
+                        caller: None,
+                        via_fabric: true,
+                    },
+                ));
             }
             match binding_result {
                 Ok(binding) => binding,
@@ -2983,8 +3031,8 @@ async fn enrich_and_evaluate_surface_policies(
         // Appliance-wide (global) surface policy — enforced deny-overrides ahead
         // of the per-surface policy, evaluated on every fabric request
         // regardless of the surface's own OPA configuration.
-        if let Some(global_pm) = GLOBAL_APPLIANCE_POLICY_MANAGER.get()
-            && global_pm.has_global(crate::policies::global_policy::PLANE_AGENT_SURFACE)
+        if policies.global
+            && let Some(global_pm) = GLOBAL_APPLIANCE_POLICY_MANAGER.get()
         {
             let gd = global_pm.evaluate_global(crate::policies::global_policy::PLANE_AGENT_SURFACE, &input_value);
             let global_policy_name = gd.policy_name.as_deref();
@@ -3014,7 +3062,31 @@ async fn enrich_and_evaluate_surface_policies(
             }
         }
 
-        if let Some(policy_manager) = GLOBAL_POLICY_MANAGER.get() {
+        // OPA is enabled for the surface but its policy cannot run: deny, as
+        // the direct path does, rather than letting the request through.
+        if let Some(Err(error)) = policies.surface {
+            channel_warn!(config_id, "GW2: OPA is enabled but no compiled policy can run — denying request");
+            return Err(fabric_surface_policy_error(
+                &body_bytes,
+                error,
+                crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Surface,
+                    flow: crate::observability::PolicyFlow::Fabric,
+                    policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                    policy_definition_id: surface.opa_policy_definition_id(),
+                    surface_id: Some(config_id),
+                    http_method: Some(method),
+                    path: Some(path),
+                    identity: authenticated_identity,
+                    actor_did: caller_identity.map(String::as_str),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        if policies.surface == Some(Ok(()))
+            && let Some(policy_manager) = GLOBAL_POLICY_MANAGER.get()
+        {
             let channel_opa_def_id = surface.opa_policy_definition_id();
             let (channel_opa_name, channel_opa_version, channel_opa_hash) = policy_manager
                 .resolve_policy_decision_evidence(channel_opa_def_id)
@@ -3065,29 +3137,26 @@ async fn enrich_and_evaluate_surface_policies(
                     });
                 }
                 Err(e) => {
-                    let reason = format!("Policy evaluation error: {e}");
                     channel_warn!(config_id, "GW2: Surface-level OPA policy evaluation error (denying request): {}", e);
-                    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
-                        scope: crate::observability::PolicyScope::Surface,
-                        flow: crate::observability::PolicyFlow::Fabric,
-                        allow: false,
-                        reason: Some(reason.as_str()),
-                        policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
-                        policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
-                        surface_id: Some(config_id),
-                        http_method: Some(method),
-                        path: Some(path),
-                        identity: authenticated_identity,
-                        actor_did: caller_identity.map(String::as_str),
-                        policy_version: channel_opa_version,
-                        policy_content_hash: channel_opa_hash.as_deref(),
-                        ..Default::default()
-                    });
-                    return Err(ProcessingResult::RequiresResponse {
-                        response_type: MessageType::ForwardResponse.to_string(),
-                        response_body: build_surface_policy_denied_forward_body(&body_bytes, Some(reason.as_str())),
-                    });
+                    return Err(fabric_surface_policy_error(
+                        &body_bytes,
+                        crate::observability::PolicyEvaluationError::EvaluationError,
+                        crate::observability::PolicyDecisionEvent {
+                            scope: crate::observability::PolicyScope::Surface,
+                            flow: crate::observability::PolicyFlow::Fabric,
+                            policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                            policy_definition_id: channel_opa_def_id,
+                            policy_name: Some(channel_opa_name.as_str()),
+                            surface_id: Some(config_id),
+                            http_method: Some(method),
+                            path: Some(path),
+                            identity: authenticated_identity,
+                            actor_did: caller_identity.map(String::as_str),
+                            policy_version: channel_opa_version,
+                            policy_content_hash: channel_opa_hash.as_deref(),
+                            ..Default::default()
+                        },
+                    ));
                 }
             }
         }
@@ -3957,6 +4026,21 @@ async fn process_forward_request_with_mcp_runtime(
     // Caller-attributable failures are non-blocking: the outcome is handed to the
     // policy layer via `source_auth_context` below. Only server-side failures
     // (setup/config resolution, internal errors) still block here (now 500).
+    let audit_trace_id = message
+        .message_body
+        .get("otel_context")
+        .and_then(|ctx| ctx.get("trace_id"))
+        .and_then(|value| value.as_str())
+        .or_else(|| (!trace_id_field.is_empty()).then_some(trace_id_field));
+    // The caller connected to the sending gateway, so its address is not known here.
+    let audit_facts = crate::audit::request_events::RequestFacts {
+        surface_id: config_id,
+        channel_name: &surface.name,
+        trace_id: audit_trace_id,
+        via_fabric: true,
+    };
+    let token_refused = |error| crate::audit::request_events::resource_token_failed(&audit_facts, error, None);
+
     let mut source_auth_failure: Option<crate::surface_context::SourceAuthContext> = None;
     let mut resource_authorization = None;
     let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> =
@@ -3965,14 +4049,19 @@ async fn process_forward_request_with_mcp_runtime(
 
             let authorization = match authorization.for_variant(variant_alias) {
                 Ok(authorization) => authorization,
-                Err(_) => return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Unavailable)).await,
+                Err(_) => {
+                    token_refused(ResourceTokenError::Unavailable);
+                    return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Unavailable)).await;
+                }
             };
             let Some(network) = GLOBAL_MCP_AUTH_NETWORK.get() else {
+                token_refused(ResourceTokenError::Unavailable);
                 return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Unavailable)).await;
             };
             let Some((profile, issuer, middleware)) = network.sts.mcp_issuer.as_ref()
                 .zip(GLOBAL_VC_ISSUER.get()).zip(get_source_auth_middleware())
                 .map(|((profile, issuer), middleware)| (profile, issuer, middleware)) else {
+                token_refused(ResourceTokenError::Unavailable);
                 return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Unavailable)).await;
             };
             let origins = network.map_url_to_port(&surface.access_point.listen_address)
@@ -3987,17 +4076,24 @@ async fn process_forward_request_with_mcp_runtime(
                 || authorization.validate_endpoint(&origins, &expected_path).is_err()
                 || profile.validate_network(network).is_err()
             {
+                token_refused(ResourceTokenError::Unavailable);
                 return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Unavailable)).await;
             }
             let auth_headers = match stream_request.as_ref().map(|request| Ok(request.headers.clone())).unwrap_or_else(|| {
                 crate::proxy::fabric_stream::wire::headers_from_json(headers.clone().map(Value::Object).as_ref())
             }) {
                 Ok(headers) => headers,
-                Err(_) => return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Invalid)).await,
+                Err(_) => {
+                    token_refused(ResourceTokenError::Invalid);
+                    return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Invalid)).await;
+                }
             };
             let identity = match authorization.authenticate(&auth_headers, profile, issuer, middleware.jwks_client()).await {
                 Ok(identity) => identity,
-                Err(error) => return axum_response_to_forward_result(authorization.challenge(error)).await,
+                Err(error) => {
+                    token_refused(error);
+                    return axum_response_to_forward_result(authorization.challenge(error)).await;
+                }
             };
             if let Some(headers) = headers.as_mut() {
                 headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
@@ -4043,6 +4139,13 @@ async fn process_forward_request_with_mcp_runtime(
                         // Setup/config-resolution failure is a server-side
                         // problem, not a caller decision — keep blocking.
                         channel_warn!(config_id, "GW2: Source authentication setup failed (reason={}) — blocking", e);
+                        crate::audit::request_events::auth_failed(
+                            &audit_facts,
+                            crate::audit::request_events::source_auth_scheme(auth_config),
+                            "setup_failed",
+                            true,
+                            None,
+                        );
                         let deny = crate::source_auth::errors::deny_response(
                             &surface.access_point.protocol,
                             auth_config,
@@ -4060,6 +4163,13 @@ async fn process_forward_request_with_mcp_runtime(
                     // policy layer and continue with no asserted caller identity.
                     Err(e) if e.is_caller_attributable() => {
                         channel_warn!(config_id, "GW2: Source authentication failed (reason={}) — deferring to policy", e);
+                        crate::audit::request_events::auth_failed(
+                            &audit_facts,
+                            crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                            crate::audit::request_events::source_auth_reason(&e),
+                            false,
+                            None,
+                        );
                         source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                             attempted_method: resolved_auth_config.method_tag().to_string(),
                             reason: e.to_string(),
@@ -4069,6 +4179,13 @@ async fn process_forward_request_with_mcp_runtime(
                     // Server-side failure — keep blocking (500).
                     Err(e) => {
                         channel_warn!(config_id, "GW2: Source authentication error (reason={}) — blocking", e);
+                        crate::audit::request_events::auth_failed(
+                            &audit_facts,
+                            crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                            crate::audit::request_events::source_auth_reason(&e),
+                            true,
+                            None,
+                        );
                         let deny = crate::source_auth::errors::deny_response(
                             &surface.access_point.protocol,
                             &resolved_auth_config,
@@ -4417,13 +4534,6 @@ async fn process_forward_request_with_mcp_runtime(
             GLOBAL_VC_ISSUER.get(),
         ))
         .await;
-
-    let audit_trace_id = message
-        .message_body
-        .get("otel_context")
-        .and_then(|ctx| ctx.get("trace_id"))
-        .and_then(|value| value.as_str())
-        .or_else(|| (!trace_id_field.is_empty()).then_some(trace_id_field));
 
     if let Some(result) = evaluate_mcp_tool_policies_for_fabric(
         &surface,
@@ -6498,26 +6608,26 @@ async fn process_forward_request_with_mcp_runtime(
                                         // mirroring the GW1 injection sites in `proxy/handler.rs`.
                                         // Without this the GW2 backend-agent VP is injected but
                                         // never audited (the response leg of the fabric flow).
-                                        if let Some(vp_jwt) = vp_jwt
-                                            && crate::delegation_vault::audit::identity_binding_vp_audit_enabled() {
-                                            let mut evt = crate::delegation_vault::audit::audit_event(
-                                                crate::delegation_vault::audit::DelegationAuditAction::VpInjected,
-                                                None,
-                                                None,
-                                                None,
-                                                resolved_surface.config_id(),
-                                            );
-                                            evt.agent_identity_did = Some(agent_did.to_string());
-                                            evt.channel_name = Some(resolved_surface.name.clone());
-                                            evt.target_endpoint = Some(resolved_surface.target.endpoint.clone());
-                                            evt.protocol = Some(format!("{:?}", surface_protocol).to_lowercase());
-                                            evt.vp_jwt = Some(vp_jwt.clone());
-                                            evt.via_fabric = true;
+                                        if let Some(vp_jwt) = vp_jwt {
                                             // Same trace id as this request's policy decisions so
                                             // the Audit "This request" filter + correlation work.
-                                            evt.trace_id = crate::observability::policy_audit::current_span_trace_id();
-                                            evt.detail = Some("response_path_fabric_backend_agent".to_string());
-                                            crate::delegation_vault::audit::audit(evt);
+                                            crate::delegation_vault::audit::emit("vp_injected", || {
+                                                let trace_id = crate::observability::policy_audit::current_span_trace_id();
+                                                crate::delegation_vault::audit::vp_injected_event(crate::delegation_vault::audit::VpInjection {
+                                                    agent_did: Some(agent_did),
+                                                    user_hash: None,
+                                                    surface_id: resolved_surface.config_id(),
+                                                    channel_name: &resolved_surface.name,
+                                                    target_endpoint: &resolved_surface.target.endpoint,
+                                                    protocol: &format!("{:?}", surface_protocol).to_lowercase(),
+                                                    mcp_tool_name: None,
+                                                    vp_jwt: &vp_jwt,
+                                                    trace_id: trace_id.as_deref(),
+                                                    detail: "response_path_fabric_backend_agent".to_string(),
+                                                    caller: None,
+                                                    via_fabric: true,
+                                                })
+                                            });
                                         }
                                     }
                                     Err(e) => {
@@ -6772,21 +6882,33 @@ async fn evaluate_mcp_tool_policies_for_fabric(
         return None;
     }
 
+    let error_event = || crate::observability::PolicyDecisionEvent {
+        scope: crate::observability::PolicyScope::McpTool,
+        flow: crate::observability::PolicyFlow::Fabric,
+        surface_id: Some(config_id),
+        http_method: Some(method),
+        path: Some(path),
+        identity: authenticated_identity,
+        actor_did: caller_identity.map(String::as_str),
+        trace_id,
+        ..Default::default()
+    };
+
     let Some(policy_manager) = GLOBAL_POLICY_MANAGER.get() else {
         channel_error!(config_id, "GW2: MCP tool policies configured but policy manager is not initialized");
-        return Some(mcp_forward_error_response(
+        return Some(fabric_mcp_tool_policy_error(
             Some(tool_request.id.clone()),
-            crate::mcp::error_codes::INTERNAL_ERROR,
-            "Internal error: policy evaluation failed",
+            crate::observability::PolicyEvaluationError::NoPolicyManager,
+            error_event(),
         ));
     };
 
     let Some(store) = policy_manager.policy_definition_store() else {
         channel_error!(config_id, "GW2: MCP tool policies configured but no policy definition store is available");
-        return Some(mcp_forward_error_response(
+        return Some(fabric_mcp_tool_policy_error(
             Some(tool_request.id.clone()),
-            crate::mcp::error_codes::INTERNAL_ERROR,
-            "Internal error: policy evaluation failed",
+            crate::observability::PolicyEvaluationError::NoPolicyManager,
+            error_event(),
         ));
     };
 
@@ -6848,32 +6970,46 @@ async fn evaluate_mcp_tool_policies_for_fabric(
         let policy_id = &entry.policy_definition_id;
         let Some(definition) = store.get(policy_id).await else {
             channel_error!(config_id, "GW2: MCP tool policy references unknown policy definition: {}", policy_id);
-            return Some(mcp_forward_error_response(
+            return Some(fabric_mcp_tool_policy_error(
                 Some(tool_request.id.clone()),
-                crate::mcp::error_codes::INTERNAL_ERROR,
-                "Internal error: policy evaluation failed",
+                crate::observability::PolicyEvaluationError::PolicyNotCompiled,
+                crate::observability::PolicyDecisionEvent {
+                    policy_id: Some(policy_id.as_str()),
+                    policy_definition_id: Some(policy_id.as_str()),
+                    ..error_event()
+                },
             ));
         };
         if !definition.enabled {
             continue;
         }
+        let definition_event = || crate::observability::PolicyDecisionEvent {
+            policy_id: Some(policy_id.as_str()),
+            policy_definition_id: Some(policy_id.as_str()),
+            policy_name: Some(definition.name.as_str()),
+            policy_version: definition.version,
+            policy_content_hash: definition
+                .content_hash
+                .as_deref(),
+            ..error_event()
+        };
         let engine = crate::policies::OpaEngine::new();
         if let Err(error) = engine.load_policy(policy_id, &definition.policy) {
             channel_error!(config_id, "GW2: Failed to load MCP tool policy {}: {}", policy_id, error);
-            return Some(mcp_forward_error_response(
+            return Some(fabric_mcp_tool_policy_error(
                 Some(tool_request.id.clone()),
-                crate::mcp::error_codes::INTERNAL_ERROR,
-                "Internal error: policy evaluation failed",
+                crate::observability::PolicyEvaluationError::PolicyNotCompiled,
+                definition_event(),
             ));
         }
         let decision = match engine.evaluate_mcp_tool_policy(&context) {
             Ok(decision) => decision,
             Err(error) => {
                 channel_error!(config_id, "GW2: Failed to evaluate MCP tool policy {}: {}", policy_id, error);
-                return Some(mcp_forward_error_response(
+                return Some(fabric_mcp_tool_policy_error(
                     Some(tool_request.id.clone()),
-                    crate::mcp::error_codes::INTERNAL_ERROR,
-                    "Internal error: policy evaluation failed",
+                    crate::observability::PolicyEvaluationError::EvaluationError,
+                    definition_event(),
                 ));
             }
         };
@@ -7089,6 +7225,7 @@ fn filter_mcp_tools_list_for_fabric(
             return Some(crate::mcp::fail_closed_tools_list(request_body, context));
         }
     };
+    let actor_did = from_did.clone();
     let input_value = if gating.has_policy_conditions() {
         build_fabric_gating_input(
             surface,
@@ -7112,20 +7249,84 @@ fn filter_mcp_tools_list_for_fabric(
     } else {
         Value::Null
     };
-    let (before, after) = gating.filter_tools_list_value(&mut json, &input_value)?;
+    let filtered = gating.filter_tools_list_value(&mut json, &input_value)?;
     // A caller-scoped gate makes the list authorization-dependent even when it
     // removes nothing, so the modern result must not stay publicly cacheable.
     let privatize = context.requires_private_result_cache();
-    if after == before && !privatize {
+    if !filtered.removed_any() && !privatize {
         return None;
     }
     if privatize {
         crate::mcp::meta::protect_enriched_result_cache(&mut json, context);
     }
-    if after < before {
-        channel_info!(config_id, "GW2: MCP tool gating filtered tools/list before={} after={}", before, after);
+    if filtered.removed_any() {
+        channel_info!(
+            config_id,
+            "GW2: MCP tool gating filtered tools/list before={} after={}",
+            filtered.listed.len(),
+            filtered.kept.len()
+        );
+        crate::observability::policy_audit::record_tools_list_filtering(
+            &filtered.listed,
+            &filtered.kept,
+            crate::observability::PolicyDecisionEvent {
+                surface_id: Some(config_id),
+                http_method: Some(method),
+                path: Some(path),
+                actor_did: actor_did.as_deref(),
+                ..Default::default()
+            },
+        );
     }
     serde_json::to_string(&json).ok()
+}
+
+/// The gateway policy could not decide: record the `error` decision and
+/// block. The engine's error text is logged by the caller, never sent back.
+fn fabric_gateway_policy_error(event: crate::observability::PolicyDecisionEvent<'_>) -> ProcessingResult {
+    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+        error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+        ..event
+    });
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::ForwardResponse.to_string(),
+        response_body: serde_json::json!({
+            "status": 403,
+            "body": r#"{"error":"Forbidden","message":"Request blocked by gateway policy"}"#,
+            "error": "Request blocked by gateway policy",
+        }),
+    }
+}
+
+/// The surface policy could not run or decide: record the `error` decision
+/// and send the generic denial. Any engine error text is logged by the caller.
+fn fabric_surface_policy_error(
+    body_bytes: &[u8],
+    error: crate::observability::PolicyEvaluationError,
+    event: crate::observability::PolicyDecisionEvent<'_>,
+) -> ProcessingResult {
+    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+        error: Some(error),
+        ..event
+    });
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::ForwardResponse.to_string(),
+        response_body: build_surface_policy_denied_forward_body(body_bytes, None),
+    }
+}
+
+/// An MCP tool policy could not run or decide: record the `error` decision
+/// and answer the `tools/call` with a generic internal error.
+fn fabric_mcp_tool_policy_error(
+    id: Option<serde_json::Value>,
+    error: crate::observability::PolicyEvaluationError,
+    event: crate::observability::PolicyDecisionEvent<'_>,
+) -> ProcessingResult {
+    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+        error: Some(error),
+        ..event
+    });
+    mcp_forward_error_response(id, crate::mcp::error_codes::INTERNAL_ERROR, "Internal error: policy evaluation failed")
 }
 
 fn mcp_forward_error_response(
@@ -8940,6 +9141,167 @@ mod tests {
     use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
+
+    /// Run `f` under a policy-decision collector and return what it recorded.
+    async fn collect_policy_decisions<T>(
+        f: impl FnOnce() -> T
+    ) -> (T, Vec<crate::observability::policy_audit::PolicyDecisionSummary>) {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), async { f() })
+            .await;
+        let decisions = collector
+            .lock()
+            .unwrap()
+            .clone();
+        (out, decisions)
+    }
+
+    fn forward_response_body(result: &ProcessingResult) -> String {
+        match result {
+            ProcessingResult::RequiresResponse { response_body, .. } => response_body.to_string(),
+            _ => panic!("expected a forward response"),
+        }
+    }
+
+    fn assert_error_decision(
+        decisions: &[crate::observability::policy_audit::PolicyDecisionSummary],
+        scope: &str,
+        reason: &str,
+    ) {
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].scope, scope);
+        assert_eq!(decisions[0].decision, "error");
+        assert_eq!(
+            decisions[0]
+                .deny_reason
+                .as_deref(),
+            Some(reason)
+        );
+    }
+
+    #[tokio::test]
+    async fn fabric_gateway_policy_error_records_error_and_blocks_generically() {
+        let (result, decisions) = collect_policy_decisions(|| {
+            fabric_gateway_policy_error(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::Gateway,
+                ..Default::default()
+            })
+        })
+        .await;
+        assert_error_decision(&decisions, "gateway", "evaluation_error");
+        assert!(forward_response_body(&result).contains("Request blocked by gateway policy"));
+    }
+
+    #[tokio::test]
+    async fn fabric_surface_policy_error_records_error_without_engine_detail() {
+        let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"message/send"}"#);
+        let (result, decisions) = collect_policy_decisions(|| {
+            fabric_surface_policy_error(
+                &body,
+                crate::observability::PolicyEvaluationError::EvaluationError,
+                crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Surface,
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
+        assert_error_decision(&decisions, "surface", "evaluation_error");
+        let response = forward_response_body(&result);
+        assert!(response.contains("Agent trust policy denied the request"));
+        assert!(!response.contains("evaluation error"), "no engine detail for the caller: {response}");
+    }
+
+    #[tokio::test]
+    async fn fabric_surface_policy_error_records_why_the_policy_could_not_run() {
+        let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"message/send"}"#);
+        let (_, decisions) = collect_policy_decisions(|| {
+            fabric_surface_policy_error(
+                &body,
+                crate::observability::PolicyEvaluationError::PolicyNotCompiled,
+                crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Surface,
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
+        assert_error_decision(&decisions, "surface", "policy_not_compiled");
+    }
+
+    fn manager_with_surface_policy(config_id: &str) -> crate::policies::SurfacePolicyManager {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text(config_id, "package surface.policy\n\ndefault allow := true\n")
+            .unwrap();
+        manager
+    }
+
+    #[test]
+    fn appliance_surface_policy_applies_without_surface_opa() {
+        let policies = fabric_surface_policies(false, false, true, None, "surf-1", None);
+        assert_eq!(policies, FabricSurfacePolicies { global: true, surface: None });
+        assert!(policies.any());
+    }
+
+    #[test]
+    fn appliance_surface_policy_applies_to_public_requests() {
+        let manager = manager_with_surface_policy("surf-1");
+        let policies = fabric_surface_policies(true, true, true, Some(&manager), "surf-1", None);
+        assert_eq!(policies, FabricSurfacePolicies { global: true, surface: None });
+    }
+
+    #[test]
+    fn nothing_applies_without_surface_opa_or_appliance_policy() {
+        assert!(!fabric_surface_policies(false, false, false, None, "surf-1", None).any());
+    }
+
+    #[test]
+    fn surface_opa_without_policy_manager_cannot_run() {
+        assert_eq!(
+            fabric_surface_policies(true, false, false, None, "surf-1", None).surface,
+            Some(Err(crate::observability::PolicyEvaluationError::NoPolicyManager))
+        );
+    }
+
+    #[test]
+    fn surface_opa_without_compiled_policy_cannot_run() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        assert_eq!(
+            fabric_surface_policies(true, false, false, Some(&manager), "surf-1", None).surface,
+            Some(Err(crate::observability::PolicyEvaluationError::PolicyNotCompiled))
+        );
+    }
+
+    #[test]
+    fn surface_opa_with_compiled_policy_runs() {
+        let manager = manager_with_surface_policy("surf-1");
+        assert_eq!(fabric_surface_policies(true, false, false, Some(&manager), "surf-1", None).surface, Some(Ok(())));
+    }
+
+    #[test]
+    fn surface_opa_skips_public_requests() {
+        assert_eq!(fabric_surface_policies(true, true, false, None, "surf-1", None).surface, None);
+    }
+
+    #[tokio::test]
+    async fn fabric_mcp_tool_policy_error_records_the_reason_it_could_not_decide() {
+        let (result, decisions) = collect_policy_decisions(|| {
+            fabric_mcp_tool_policy_error(
+                Some(serde_json::json!(7)),
+                crate::observability::PolicyEvaluationError::PolicyNotCompiled,
+                crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::McpTool,
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
+        assert_error_decision(&decisions, "mcp_tool", "policy_not_compiled");
+        assert!(forward_response_body(&result).contains("Internal error: policy evaluation failed"));
+    }
 
     #[test]
     fn fabric_mcp_headers_preserve_case_insensitive_duplicates() {

@@ -352,6 +352,49 @@ lazy_static! {
         counter
     };
 
+    /// Governance audit records the system itself lost, by reason. `journal_write` means
+    /// the records could not be written to the audit journal and were discarded once the
+    /// in-memory backlog was full.
+    pub static ref AUDIT_RECORDS_LOST: IntCounterVec = {
+        let opts = Opts::new(
+            names::AUDIT_RECORDS_LOST_TOTAL,
+            "Governance audit records the gateway lost before any sink received them (reason = journal_write)",
+        );
+        let counter = IntCounterVec::new(opts, &["reason"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// Governance audit records produced and handed to the journal, by event.
+    pub static ref AUDIT_RECORDS_PRODUCED: IntCounterVec = {
+        let opts = Opts::new(
+            names::AUDIT_RECORDS_PRODUCED_TOTAL,
+            "Governance audit records produced and handed to the journal (event = audit event name)",
+        );
+        let counter = IntCounterVec::new(opts, &["event"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// Size of the governance audit journal on disk, in bytes.
+    pub static ref AUDIT_JOURNAL_BYTES: IntGauge = {
+        let opts = Opts::new(names::AUDIT_JOURNAL_BYTES, "Size of the governance audit journal on disk, in bytes");
+        let gauge = IntGauge::with_opts(opts).unwrap();
+        REGISTRY.register(Box::new(gauge.clone())).unwrap();
+        gauge
+    };
+
+    /// Governance audit records a sink skipped, by sink and reason.
+    pub static ref AUDIT_SINK_SKIPPED: IntCounterVec = {
+        let opts = Opts::new(
+            names::AUDIT_SINK_SKIPPED_TOTAL,
+            "Governance audit records a sink skipped (reason = backlog_cap|expired; sink = audit_log or the integration id)",
+        );
+        let counter = IntCounterVec::new(opts, &["sink", "reason"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// Consent epoch reads that failed, each closing every MCP subscription on the vault.
     pub static ref MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE: IntCounter = {
         let opts = Opts::new(
@@ -702,6 +745,35 @@ pub fn track_audit_forward(
     AUDIT_FORWARD
         .with_label_values(&[result, integration_id.unwrap_or_default()])
         .inc();
+}
+
+pub fn track_audit_records_lost(
+    reason: &str,
+    count: u64,
+) {
+    AUDIT_RECORDS_LOST
+        .with_label_values(&[reason])
+        .inc_by(count);
+}
+
+pub fn track_audit_record_produced(event: &str) {
+    AUDIT_RECORDS_PRODUCED
+        .with_label_values(&[event])
+        .inc();
+}
+
+pub fn set_audit_journal_bytes(bytes: u64) {
+    AUDIT_JOURNAL_BYTES.set(i64::try_from(bytes).unwrap_or(i64::MAX));
+}
+
+pub fn track_audit_sink_skipped(
+    sink: &str,
+    reason: &str,
+    count: u64,
+) {
+    AUDIT_SINK_SKIPPED
+        .with_label_values(&[sink, reason])
+        .inc_by(count);
 }
 
 /// Track a failed consent epoch read that closed every MCP subscription on

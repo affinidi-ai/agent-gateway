@@ -137,22 +137,42 @@ match, or Terms the token owner has not accepted.
 
 ## Governance audit forwarding
 
-Every record the VP Audit Log appends to `delegation-audit.jsonl` is also handed to the
-Governance Audit integrations: integrations in the `audit` category. Forwarding happens in the
-audit writer after the append succeeds, so an integration receives exactly the records the log
-holds, including the signed VP stamped on each record of a proxied request. A record counts as
-appended once the write is flushed; a record the log could not append or flush is not
-forwarded.
+Governance audit records go to **sinks**: the VP Audit Log (`delegation-audit.jsonl`, read by
+`/v1/audit`) and each Governance Audit integration (category `audit`). Every sink selects the
+audit events it wants, and the selections are independent: an integration can receive an event
+the VP Audit Log does not keep, and the reverse. Nothing is selected on a fresh install, and a
+record nobody selects is never built.
+
+**Selection.** The VP Audit Log keeps the events in the settings field `audit_events` while
+`audit_enabled` is on (Settings › VP Audit); turning it off pauses the log without losing the
+selection. Each Governance Audit integration receives the events in its own `audit_events` list;
+an empty list receives nothing. Both take event names from the audit event catalog
+(`src/audit/catalog.rs`), for example `policy_decision`, `auth_failed`, `token_injected`; an
+unknown name is rejected (400). An integration update that leaves `audit_events` out keeps the
+integration's current list. The catalog is also listed in the category's
+`metadata.event_types` as `audit.<event>` with the event's `group`.
+
+**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
+Reasons are fixed codes; no record carries a credential, token or validator message.
+
+- `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
+  `mtls` or `mcp_resource_token`. `reason` is `missing_credential`, `invalid_credential`,
+  `insufficient_scope`, `config_not_found`, `internal`, `setup_failed` or `unavailable` (no MCP
+  resource authorization context). `blocking` is false when the failure was handed to policy
+  (`input.source_auth.method == "failed"`) instead of refusing the request. `client_ip` is the
+  resolved client address (forwarded headers only from `client_ip.trusted_proxies`); absent on
+  the fabric path, where the caller connected to the sending gateway.
+- `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
+  rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
+  stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
+  when there is one; the surface limit also sends it as `Retry-After` in whole seconds.
 
 **Recipients.** Every integration with category `audit`, status `active` and no tenant owner,
 whatever its type. Every record is one delivery, so Email and Slack send one message per record;
 Stream (Kafka, Kinesis, Pulsar or Redis Streams) and Webhook suit busy appliances. The records
 hold administrator-only evidence: the caller's email and name, request details and the signed VP
 leave the appliance with each record, so point audit integrations only at destinations cleared
-for that data. There is no per-integration event filter: each recipient gets every record, and
-`EVENT_TYPE` (`audit.<category>`) lets the consumer filter. The offered event types are listed
-in the category's `metadata.event_types`, one per audit record category (`audit.policy_decision`,
-`audit.trust_check`, `audit.vp_injected`, `audit.payment`, …).
+for that data.
 
 **Access.** The records carry administrator-only evidence (caller context and VP JWTs), so
 Governance Audit integrations share the `audit.view` permission of `/v1/audit`, on top of the
@@ -174,20 +194,43 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   user, identity, surface, x402, MPP) refuses one, so values those triggers carry, some of them
   caller-supplied, never reach the audit stream.
 
-**Delivery.** `forward` never blocks the writer. A dispatcher task keeps the recipient list,
-reloaded once it is 30 seconds old (so manual `_storage/` edits are picked up) and straight
-after any integration is saved or deleted through the API, and gives each recipient its own
-bounded queue (1024 records) drained by its own task. A slow
-or unreachable destination therefore delays only itself; records arrive at each destination in
-the order the log wrote them. Each delivery re-checks that the integration is still a recipient
-and uses the integration retry policy, which retries only transient failures (connect, timeout
-or send errors, HTTP 429 and 5xx) and fails a 4xx at once. When a queue (or the 4096-record
-intake) is full the record is skipped for that destination; when a recipient stops receiving
-records, what is still queued for it is discarded. Outcomes are counted in
-`agent_gateway_audit_forward_total{result="delivered"|"failed"|"dropped", integration_id}`
-(`integration_id` is empty for an intake drop), and drops and delivery failures are each
-logged at most every 10 seconds with the number held back. Delivery is best-effort: the VP
-Audit Log remains the source of truth, and forwarding is not replayed after a restart.
+**Delivery.** No record is lost by the gateway except in the counted cases below.
+
+- *Producing.* The producer (`src/audit/producer.rs`) is the only place a record is finalised.
+  It checks the selections first (one atomic read), gives the record an `event_id` (UUID v4),
+  addresses it to the sinks that select its event at that moment, and hands it to the journal
+  without waiting. Records a proxied request produces while credential delegation runs are held
+  until the request's identity VP is minted, then stamped with it; any still held when the
+  request ends, on any path, are submitted without a VP.
+- *Journal.* Every record is appended to the journal (`{log_directory}/journal/`, segment
+  files named by their first sequence number) by a dedicated thread that writes in batches of up
+  to 256 records or 5 ms and syncs each batch to disk before any sink may read it. A crash can
+  lose at most the last unsynced batch. If the journal cannot be written the writer retries with
+  backoff while holding up to 10,000 records in memory; beyond that the oldest are discarded and
+  counted in `agent_gateway_audit_records_lost_total{reason="journal_write"}`.
+- *Dispatch.* Each sink has its own reader and cursor (`journal/cursors.json`). A reader
+  delivers the records addressed to its sink in journal order and saves its cursor after each
+  batch, so it resumes there after a restart; a slow or unreachable destination only delays
+  itself. A failed delivery is retried with backoff (1 s up to 5 min) and holds back the records
+  after it; the integration retry policy still applies inside each attempt. Delivery is
+  at-least-once: a record may be delivered again after a restart, so receivers should
+  deduplicate on `event_id`. The VP Audit Log does this itself for the records at the end of
+  its file.
+- *Sinks coming and going.* A new sink reads from the start of the journal; no record is
+  addressed to a sink before it exists, so it misses nothing. A removed or disabled sink's cursor
+  is parked, and the sink resumes from it if it comes back.
+- *Backlog.* Journal segments every active cursor has passed are deleted. The journal size is
+  reported in `agent_gateway_audit_journal_bytes` and logged as a warning above 256 MiB. Above
+  1 GiB, every sink still in the oldest segment is moved past it so the segment can be deleted;
+  the records each one skips are counted in
+  `agent_gateway_audit_sink_skipped_total{sink, reason="backlog_cap"}`.
+- *Drop policy.* A Governance Audit integration may set `audit_drop_after_secs`: records older
+  than that are skipped for it, including one still being retried, and counted with
+  `reason="expired"`. Without it nothing is skipped.
+
+Records produced are counted in `agent_gateway_audit_records_produced_total{event}`;
+integration deliveries in
+`agent_gateway_audit_forward_total{result="delivered"|"failed", integration_id}`.
 
 **Payload.** Audit templates may use `EVENT_TYPE`, `TIMESTAMP` (the record's own timestamp),
 `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
@@ -225,7 +268,7 @@ publishers still open a client per record.
 **Configuration.** `config/examples/gateway.example.json` carries the canonical `audit`
 category entry. A `gateway.json` that lacks it, such as one created before the category
 existed, is given the built-in entry at load with a WARN, so an upgrade offers Governance Audit
-without an edit; an operator's own `audit` entry is kept. The records forwarded are those the VP
-Audit Log writes, so VP Auditing and the audit categories enabled in Settings › Security also
-decide what is forwarded.
-See `src/integrations/audit_integration_triggers.rs`.
+without an edit; an operator's own `audit` entry is kept. Settings saved with the older
+`audit_categories` booleans are read as the events `policy_decision`, `trust_check` and
+`vp_injected`; nothing else is selected on upgrade, and existing Governance Audit integrations
+start with no events. See `src/audit/` and `src/integrations/audit_integration_triggers.rs`.

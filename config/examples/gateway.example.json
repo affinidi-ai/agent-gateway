@@ -889,97 +889,158 @@
             {
               "event_type": "audit.policy_decision",
               "name": "Policy Decision",
-              "description": "A gateway, surface, MCP-tool or response OPA policy allowed or denied a request"
+              "description": "A gateway, surface, MCP-tool or response OPA policy allowed or denied a request",
+              "group": "policies"
             },
             {
               "event_type": "audit.trust_check",
               "name": "Trust Check",
-              "description": "A TRQP trust-check outcome for the caller or target leg"
+              "description": "A TRQP trust-check outcome for the caller or target leg",
+              "group": "trust"
             },
             {
               "event_type": "audit.trace_terminated",
               "name": "Trace Terminated",
-              "description": "A surface terminated the end-to-end trace at its egress"
+              "description": "A surface terminated the end-to-end trace at its egress",
+              "group": "trace"
             },
             {
               "event_type": "audit.vp_injected",
               "name": "VP Injected",
-              "description": "A signed identity Verifiable Presentation was injected into a proxied request or response"
+              "description": "A signed identity Verifiable Presentation was injected into a proxied request or response",
+              "group": "identity"
             },
             {
               "event_type": "audit.token_injected",
               "name": "Token Injected",
-              "description": "A delegated credential from the vault was injected on the caller's behalf"
+              "description": "A delegated credential from the vault was injected on the caller's behalf",
+              "group": "delegation"
             },
             {
               "event_type": "audit.token_refreshed",
               "name": "Token Refreshed",
-              "description": "An expired delegated credential was refreshed and injected"
+              "description": "An expired delegated credential was refreshed and injected",
+              "group": "delegation"
             },
             {
               "event_type": "audit.refresh_failed",
               "name": "Refresh Failed",
-              "description": "A delegated credential could not be refreshed, so consent is required again"
+              "description": "A delegated credential could not be refreshed, so consent is required again",
+              "group": "delegation"
             },
             {
               "event_type": "audit.consent_granted",
               "name": "Consent Granted",
-              "description": "A user completed the OAuth consent flow and a delegation token was stored"
+              "description": "A user completed the OAuth consent flow and a delegation token was stored",
+              "group": "delegation"
             },
             {
               "event_type": "audit.consent_required",
               "name": "Consent Required",
-              "description": "The caller was asked to grant consent before the request could proceed"
+              "description": "The caller was asked to grant consent before the request could proceed",
+              "group": "delegation"
             },
             {
               "event_type": "audit.token_revoked",
               "name": "Token Revoked",
-              "description": "A delegation token was revoked through the management API"
+              "description": "A delegation token was revoked through the management API",
+              "group": "delegation"
             },
             {
               "event_type": "audit.user_tokens_revoked",
               "name": "User Tokens Revoked",
-              "description": "Every delegation token for a user was revoked"
+              "description": "Every delegation token for a user was revoked",
+              "group": "delegation"
             },
             {
               "event_type": "audit.token_not_found",
               "name": "Token Not Found",
-              "description": "A delegation token lookup found no match"
+              "description": "A delegation token lookup found no match",
+              "group": "delegation"
             },
             {
               "event_type": "audit.elicitation_sent",
               "name": "Elicitation Sent",
-              "description": "An MCP elicitation request was sent to the client"
+              "description": "An MCP elicitation request was sent to the client",
+              "group": "delegation"
             },
             {
               "event_type": "audit.elicitation_accepted",
               "name": "Elicitation Accepted",
-              "description": "The client accepted an MCP elicitation"
+              "description": "The client accepted an MCP elicitation",
+              "group": "delegation"
             },
             {
               "event_type": "audit.elicitation_declined",
               "name": "Elicitation Declined",
-              "description": "The client declined an MCP elicitation"
+              "description": "The client declined an MCP elicitation",
+              "group": "delegation"
             },
             {
               "event_type": "audit.elicitation_cancelled",
               "name": "Elicitation Cancelled",
-              "description": "The client cancelled an MCP elicitation"
+              "description": "The client cancelled an MCP elicitation",
+              "group": "delegation"
             },
             {
               "event_type": "audit.elicitation_timed_out",
               "name": "Elicitation Timed Out",
-              "description": "The client did not answer an MCP elicitation in time"
-            },
-            {
-              "event_type": "audit.pre_authorize_blocked",
-              "name": "Pre-Authorize Blocked",
-              "description": "Pre-authorization blocked a session because a required credential was missing"
+              "description": "The client did not answer an MCP elicitation in time",
+              "group": "delegation"
             },
             {
               "event_type": "audit.payment",
               "name": "Payment Event",
-              "description": "An x402 or MPP payment lifecycle event (challenge, verification, settlement)"
+              "description": "An x402 or MPP payment lifecycle event (challenge, verification, settlement)",
+              "group": "payments"
+            },
+            {
+              "event_type": "audit.auth_failed",
+              "name": "Authentication Failed",
+              "description": "A caller's JWT, API key, DID Auth session, mTLS certificate or MCP resource token was not accepted",
+              "group": "auth"
+            },
+            {
+              "event_type": "audit.identity_binding_failed",
+              "name": "Identity Binding Failed",
+              "description": "A request's identity binding Verifiable Presentation was missing or could not be verified",
+              "group": "identity"
+            },
+            {
+              "event_type": "audit.identity_binding_verified",
+              "name": "Identity Binding Verified",
+              "description": "A request's identity binding Verifiable Presentation was verified",
+              "group": "identity"
+            },
+            {
+              "event_type": "audit.delegation_failed",
+              "name": "Delegation Failed",
+              "description": "A delegated credential could not be resolved, stored or used for the caller",
+              "group": "delegation"
+            },
+            {
+              "event_type": "audit.rate_limited",
+              "name": "Rate Limited",
+              "description": "A request was refused because a surface rate limit, SSE session cap or Fabric stream capacity was reached",
+              "group": "requests"
+            },
+            {
+              "event_type": "audit.request_rejected",
+              "name": "Request Rejected",
+              "description": "A request was refused at routing, admission or forwarding before it reached the target",
+              "group": "requests"
+            },
+            {
+              "event_type": "audit.request_failed",
+              "name": "Request Failed",
+              "description": "A forwarded request failed upstream, timed out, or failed in the gateway",
+              "group": "requests"
+            },
+            {
+              "event_type": "audit.request_completed",
+              "name": "Request Completed",
+              "description": "A request was forwarded and its response returned to the caller",
+              "group": "requests"
             }
           ]
         }

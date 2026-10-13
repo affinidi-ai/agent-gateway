@@ -10,7 +10,7 @@ jest.mock('../../../utils/toaster', () => ({
 
 const BASE_SETTINGS = {
   audit_enabled: false,
-  audit_categories: { policies: false, trust_checks: false, identity: false },
+  audit_events: [],
 } as unknown as Settings;
 
 describe('VpAuditTab', () => {
@@ -19,33 +19,63 @@ describe('VpAuditTab', () => {
 
     expect(screen.getByTestId('vp-audit-enabled-toggle')).toBeInTheDocument();
     expect(screen.getByTestId('vp-audit-save-button')).toBeInTheDocument();
-    // Category toggles are hidden until auditing is enabled.
-    expect(screen.queryByTestId('vp-audit-category-policies')).not.toBeInTheDocument();
+    // Event toggles are hidden until auditing is enabled.
+    expect(screen.queryByTestId('vp-audit-event-policy_decision')).not.toBeInTheDocument();
   });
 
-  it('reveals the category toggles once auditing is enabled', () => {
+  it('reveals the event toggles once auditing is enabled', () => {
     render(<VpAuditTab settings={BASE_SETTINGS} updateSettings={jest.fn()} />);
 
     fireEvent.click(screen.getByTestId('vp-audit-enabled-toggle'));
 
-    expect(screen.getByTestId('vp-audit-category-policies')).toBeInTheDocument();
-    expect(screen.getByTestId('vp-audit-category-trust_checks')).toBeInTheDocument();
-    expect(screen.getByTestId('vp-audit-category-identity')).toBeInTheDocument();
+    expect(screen.getByTestId('vp-audit-event-policy_decision')).toBeInTheDocument();
+    expect(screen.getByTestId('vp-audit-event-trust_check')).toBeInTheDocument();
+    expect(screen.getByTestId('vp-audit-event-vp_injected')).toBeInTheDocument();
   });
 
-  it('saves the enabled flag and selected categories', async () => {
+  it('checks the events stored in the settings', () => {
+    const settings = {
+      audit_enabled: true,
+      audit_events: ['trust_check'],
+    } as unknown as Settings;
+    render(<VpAuditTab settings={settings} updateSettings={jest.fn()} />);
+
+    expect(screen.getByTestId('vp-audit-event-trust_check')).toBeChecked();
+    expect(screen.getByTestId('vp-audit-event-policy_decision')).not.toBeChecked();
+  });
+
+  it('saves the enabled flag and the selected events', async () => {
     const updateSettings = jest.fn().mockResolvedValue(undefined);
     render(<VpAuditTab settings={BASE_SETTINGS} updateSettings={updateSettings} />);
 
     fireEvent.click(screen.getByTestId('vp-audit-enabled-toggle'));
-    fireEvent.click(screen.getByTestId('vp-audit-category-policies'));
-    fireEvent.click(screen.getByTestId('vp-audit-category-trust_checks'));
+    fireEvent.click(screen.getByTestId('vp-audit-event-policy_decision'));
+    fireEvent.click(screen.getByTestId('vp-audit-event-trust_check'));
     fireEvent.click(screen.getByTestId('vp-audit-save-button'));
 
     await waitFor(() =>
       expect(updateSettings).toHaveBeenCalledWith({
         audit_enabled: true,
-        audit_categories: { policies: true, trust_checks: true, identity: false },
+        audit_events: ['policy_decision', 'trust_check'],
+      })
+    );
+  });
+
+  it('keeps stored events the tab does not show when saving', async () => {
+    const updateSettings = jest.fn().mockResolvedValue(undefined);
+    const settings = {
+      audit_enabled: true,
+      audit_events: ['auth_failed', 'policy_decision'],
+    } as unknown as Settings;
+    render(<VpAuditTab settings={settings} updateSettings={updateSettings} />);
+
+    fireEvent.click(screen.getByTestId('vp-audit-event-policy_decision'));
+    fireEvent.click(screen.getByTestId('vp-audit-save-button'));
+
+    await waitFor(() =>
+      expect(updateSettings).toHaveBeenCalledWith({
+        audit_enabled: true,
+        audit_events: ['auth_failed'],
       })
     );
   });

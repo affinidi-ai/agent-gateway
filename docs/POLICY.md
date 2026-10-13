@@ -69,7 +69,7 @@ The impact endpoint does not count those surfaces either.
 
 Every OPA decision made by a stored policy definition records the definition's name and
 the enforced `policy_version` and `content_hash` in the audit event, and, when the
-`policies` audit category is enabled, in the JSONL `PolicyDecision` and the signed
+`policy_decision` audit event is selected, in the JSONL `PolicyDecision` and the signed
 `PolicyDecisionSummary`. That covers gateway, appliance-wide, surface, access-point
 inbound, Transit Point, and response policies, and a denying MCP tool policy, on the
 direct, MCP-proxy, outbound, and fabric paths.
@@ -83,7 +83,9 @@ authenticated source identity, or on a Transit Point the caller the transit toke
 the request had neither.
 
 Enforcement is **fail-closed** on both planes. An enabled but broken policy denies, and a
-gateway set is evicted wholesale if any member fails to resolve or compile.
+gateway set is evicted wholesale if any member fails to resolve or compile. A surface with
+OPA enabled but no compiled policy (or no policy engine) denies its requests on the direct
+and fabric paths alike, recorded as decision `error`.
 
 Change-control endpoints: `GET /v1/policy-definitions[/{id}[/versions|/impact]]`,
 `POST /v1/policy-definitions/{id}/simulate` (dry-run), `GET`/`PUT
@@ -103,8 +105,9 @@ In `src/policies/global_policy.rs`: a policy can be assigned to a whole plane vi
 each object's own OPA config. `GlobalPolicyManager` compiles one engine per
 assignment per plane and evaluates the set **deny-overrides ahead of the
 per-object policy** at the inbound PEPs (fabric gateway + fabric surface in
-`message_processor`; direct-inbound gateway + surface in `proxy/handler` — the
-surface global runs even when the surface's own OPA is disabled). Each
+`message_processor`; direct-inbound gateway + surface in `proxy/handler` — on both
+paths the surface global runs on every request, even when the surface's own OPA is
+disabled or the path is a public discovery endpoint). Each
 `GlobalAssignment` supports `monitor_only` (evaluated + audited with version/hash,
 never blocking) for safe rollout; the set is **fail-closed** (a broken-to-compile
 or missing enforced member denies that plane, monitor-only exempt) and recompiles
@@ -138,6 +141,11 @@ Element validation is in
 
 The two caps are separate constants that happen to share a value today, because `id` is
 addressable from policy while `name` is only a label. Counts are code points, not bytes.
+
+When an audit sink selects `trust_check`, each element's outcome is recorded with the
+surface id, the request's trace id and the authenticated caller (on the Access Point, Fabric
+and MCP-proxy paths), so a trust check can be tied to the request and principal that
+triggered it.
 
 ## Failed caller authentication
 
@@ -398,6 +406,23 @@ Every OPA evaluation emits a structured `tracing` event via
 `caller_*`, `http_method`, `http_path`, `trace_id`, `policy_version`,
 `policy_content_hash`. See `src/observability/policy_audit.rs`.
 
-When the `policies` audit category is enabled, the decision is also written to the VP Audit
+`policy_decision` is `allow`, `deny`, or `error`. `error` means the policy could not decide
+and the request was denied (fail closed); `deny_reason` is then `evaluation_error` (the Rego
+raised an error), `no_policy_manager` (no policy engine is available) or
+`policy_not_compiled` (OPA is enabled for the surface but no compiled policy is loaded). These
+are recorded on the gateway, access-point inbound, surface and MCP tool policies on the direct,
+Fabric and MCP-proxy paths, on the transit-point gateway, surface and per-transit-point policies,
+and on response policies, and logged at `WARN`. The engine's error text stays in that log line;
+it is not put in the audit record or the response to the caller.
+
+Response policies record every outcome: `allow` when the response is passed on, `deny` when it is
+blocked, and `error` when the policy could not decide.
+
+MCP tool gating that takes tools out of a `tools/list` response is recorded as one decision with
+scope `mcp_tool_list` and decision `allow` (the list itself was served). `removed_tools` lists the
+tool names the caller did not see. Nothing is recorded when the gate keeps every tool. This
+applies on the direct, Fabric and MCP-proxy paths.
+
+When the `policy_decision` audit event is selected, the decision is also written to the VP Audit
 Log, and from there forwarded to any Governance Audit integrations (any type). See
 [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).

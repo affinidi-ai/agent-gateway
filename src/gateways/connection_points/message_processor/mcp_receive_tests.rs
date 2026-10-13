@@ -799,15 +799,30 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     let before = target
         .request_count
         .load(Ordering::SeqCst);
-    let denied = process_forward_request(&forward_message(
+    let (denied, audit) = crate::audit::producer::capture(process_forward_request(&forward_message(
         json!({"jsonrpc": "2.0", "id": "protected", "method": "tools/list"}),
         json!({"Authorization": "Bearer cannot-establish-receiver-authority"}),
-    ))
+    )))
     .await;
     let ProcessingResult::RequiresResponse { response_body, .. } = denied else {
         panic!("protected Fabric request must fail closed without resource authorization context");
     };
     assert_eq!(response_body["status"], 503);
+    assert!(
+        audit
+            .iter()
+            .any(|event| event.via_fabric
+                && matches!(
+                    &event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::AuthFailed {
+                        scheme: crate::audit::events::AuthScheme::McpResourceToken,
+                        reason,
+                        blocking: true,
+                        client_ip: None,
+                    } if reason == "unavailable"
+                )),
+        "the refused resource token is audited: {audit:?}"
+    );
     assert_eq!(
         target
             .request_count

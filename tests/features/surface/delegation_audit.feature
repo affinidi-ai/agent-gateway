@@ -8,6 +8,7 @@ Feature: Delegation audit log
     And the surface requires "JWT Bearer" source authentication
     And the surface has an explicit inbound identity slot for MCP
     And the surface requires delegated credentials from OAuth provider "calendar"
+    And the VP Audit Log keeps every audit event
 
   Scenario: Operator sees a complete consent-to-use sequence in delegation audit
     Given caller "alice" has been asked to complete OAuth consent for provider "calendar"

@@ -328,11 +328,7 @@ class APIClient {
       prometheus_auth_enabled: backendSettings.prometheus_auth_enabled || false,
       prometheus_auth_username: backendSettings.prometheus_auth_username || '',
       audit_enabled: backendSettings.audit_enabled || false,
-      audit_categories: backendSettings.audit_categories || {
-        policies: false,
-        trust_checks: false,
-        identity: false,
-      },
+      audit_events: backendSettings.audit_events || [],
       appliance_id: backendSettings.appliance_id || '',
       expose_user_identity_downstream: backendSettings.expose_user_identity_downstream || false,
     };
@@ -402,8 +398,8 @@ class APIClient {
       backendSettings.audit_enabled = settings.audit_enabled;
     }
 
-    if (settings.audit_categories !== undefined) {
-      backendSettings.audit_categories = settings.audit_categories;
+    if (settings.audit_events !== undefined) {
+      backendSettings.audit_events = settings.audit_events;
     }
 
     if (settings.appliance_id !== undefined) {
@@ -450,11 +446,7 @@ class APIClient {
         prometheus_auth_enabled: backendSettings.prometheus_auth_enabled || false,
         prometheus_auth_username: backendSettings.prometheus_auth_username || '',
         audit_enabled: backendSettings.audit_enabled || false,
-        audit_categories: backendSettings.audit_categories || {
-          policies: false,
-          trust_checks: false,
-          identity: false,
-        },
+        audit_events: backendSettings.audit_events || [],
         appliance_id: backendSettings.appliance_id || '',
         expose_user_identity_downstream: backendSettings.expose_user_identity_downstream || false,
       };

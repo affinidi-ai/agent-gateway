@@ -1409,7 +1409,11 @@ fn hold_connection_for_body(
 
 /// Refuses a new SSE session because the session cap is reached, releasing the
 /// request's connection.
-fn sse_session_limit_response(connection_guard: ConnectionGuard) -> axum::response::Response {
+fn sse_session_limit_response(
+    connection_guard: ConnectionGuard,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+) -> axum::response::Response {
+    crate::audit::request_events::rate_limited(facts, crate::audit::events::RateLimitScope::SseSessions, None);
     connection_guard.release();
     (StatusCode::TOO_MANY_REQUESTS, "Too many active SSE sessions").into_response()
 }
@@ -1663,6 +1667,18 @@ async fn proxy_handler_with_mcp_runtime(
         .transpose()
         .map_err(|_| create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP resource authorization"))?;
     let mut source_auth_failure: Option<crate::surface_context::SourceAuthContext> = None;
+    let audit_facts = crate::audit::request_events::RequestFacts {
+        surface_id: config_id,
+        channel_name: &channel_name,
+        trace_id: Some(&trace_id),
+        via_fabric: false,
+    };
+    // The resolved client address (trusted proxies only), else the TCP peer.
+    let client_ip = Some(
+        req.extensions()
+            .get::<crate::source_auth::client_ip::ClientIp>()
+            .map_or(addr.ip(), |client| client.0),
+    );
     let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
         &resource_authorization
     {
@@ -1679,7 +1695,9 @@ async fn proxy_handler_with_mcp_runtime(
             )
             .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
         else {
-            return Ok(authorization.challenge(crate::mcp::resource_server::ResourceTokenError::Unavailable));
+            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
+            crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+            return Ok(authorization.challenge(error));
         };
         let public_origins = state
             .network_config
@@ -1729,14 +1747,19 @@ async fn proxy_handler_with_mcp_runtime(
                 .validate_network(&state.network_config)
                 .is_err()
         {
-            return Ok(authorization.challenge(crate::mcp::resource_server::ResourceTokenError::Unavailable));
+            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
+            crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+            return Ok(authorization.challenge(error));
         }
         match authorization
             .authenticate(&headers, profile, issuer, middleware.jwks_client())
             .await
         {
             Ok(identity) => Some(identity),
-            Err(error) => return Ok(authorization.challenge(error)),
+            Err(error) => {
+                crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+                return Ok(authorization.challenge(error));
+            }
         }
     } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
         && let (Some(auth_config), Some(sa_middleware)) = (state.surface.source_auth(), &state.source_auth_middleware)
@@ -1753,6 +1776,13 @@ async fn proxy_handler_with_mcp_runtime(
                 // Setup/config-resolution failure is a server-side problem,
                 // not a caller decision — keep blocking.
                 channel_warn!(config_id, "Source authentication setup failed (reason={}) — blocking", e);
+                crate::audit::request_events::auth_failed(
+                    &audit_facts,
+                    crate::audit::request_events::source_auth_scheme(auth_config),
+                    "setup_failed",
+                    true,
+                    client_ip,
+                );
                 connection_guard
                     .decrement()
                     .await;
@@ -1779,6 +1809,13 @@ async fn proxy_handler_with_mcp_runtime(
             // asserted caller identity — do not block here.
             Err(e) if e.is_caller_attributable() => {
                 channel_warn!(config_id, "Source authentication failed (reason={}) — deferring to policy", e);
+                crate::audit::request_events::auth_failed(
+                    &audit_facts,
+                    crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                    crate::audit::request_events::source_auth_reason(&e),
+                    false,
+                    client_ip,
+                );
                 source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
                     attempted_method: resolved_auth_config
                         .method_tag()
@@ -1791,6 +1828,13 @@ async fn proxy_handler_with_mcp_runtime(
             // blocking (500).
             Err(e) => {
                 channel_warn!(config_id, "Source authentication error (reason={}) — blocking", e);
+                crate::audit::request_events::auth_failed(
+                    &audit_facts,
+                    crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                    crate::audit::request_events::source_auth_reason(&e),
+                    true,
+                    client_ip,
+                );
                 connection_guard
                     .decrement()
                     .await;
@@ -1839,6 +1883,18 @@ async fn proxy_handler_with_mcp_runtime(
             }
             Err(e) => {
                 warn!(channel = channel_name, error = %e, "Rate limit exceeded");
+                let retry_after = match &e {
+                    crate::policies::RateLimitError::Exceeded { retry_after } => Some(*retry_after),
+                    crate::policies::RateLimitError::InvalidConfig(_) => None,
+                };
+                crate::audit::request_events::rate_limited(
+                    &audit_facts,
+                    crate::audit::events::RateLimitScope::Surface,
+                    retry_after,
+                );
+                // Whole seconds, rounded up so a caller never retries early.
+                let retry_after_header = retry_after
+                    .map(|wait| axum::http::HeaderValue::from(wait.as_secs() + u64::from(wait.subsec_nanos() > 0)));
 
                 // For MCP protocol, return JSON-RPC error with HTTP 429 status
                 if state
@@ -1862,13 +1918,10 @@ async fn proxy_handler_with_mcp_runtime(
                     let mut response = axum::response::Json(error_response).into_response();
                     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
 
-                    // Add Retry-After header
-                    if let Ok(retry_secs) = e.to_string().parse::<u64>() {
-                        response.headers_mut().insert(
-                            axum::http::header::RETRY_AFTER,
-                            axum::http::HeaderValue::from_str(&retry_secs.to_string())
-                                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
-                        );
+                    if let Some(value) = retry_after_header {
+                        response
+                            .headers_mut()
+                            .insert(axum::http::header::RETRY_AFTER, value);
                     }
 
                     connection_guard
@@ -1879,13 +1932,10 @@ async fn proxy_handler_with_mcp_runtime(
                     // For A2A protocol, return HTTP 429 Too Many Requests
                     let mut response = create_error_response(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded");
 
-                    // Add Retry-After header (extract seconds from error string)
-                    if let Ok(retry_secs) = e.to_string().parse::<u64>() {
-                        response.headers_mut().insert(
-                            axum::http::header::RETRY_AFTER,
-                            axum::http::HeaderValue::from_str(&retry_secs.to_string())
-                                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
-                        );
+                    if let Some(value) = retry_after_header {
+                        response
+                            .headers_mut()
+                            .insert(axum::http::header::RETRY_AFTER, value);
                     }
 
                     connection_guard
@@ -2586,6 +2636,22 @@ async fn proxy_handler_with_mcp_runtime(
             }
             Err(e) => {
                 channel_warn!(config_id, "Gateway policy evaluation error (denying request): {}", e);
+                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Gateway,
+                    error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                    policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
+                    policy_definition_id: gw_policy_def_id.as_deref(),
+                    policy_name: Some(gw_policy_name.as_str()),
+                    surface_id: state.surface.config_id(),
+                    trace_id: Some(&trace_id),
+                    http_method: Some(method.as_ref()),
+                    path: Some(uri.path()),
+                    identity: authenticated_identity.as_ref(),
+                    gateway_did: Some(&self_gateway_id),
+                    policy_version: gw_policy_version,
+                    policy_content_hash: gw_policy_hash.as_deref(),
+                    ..Default::default()
+                });
                 connection_guard
                     .decrement()
                     .await;
@@ -3138,7 +3204,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .create_session()
                 .await
             else {
-                return Ok(sse_session_limit_response(connection_guard));
+                return Ok(sse_session_limit_response(connection_guard, &audit_facts));
             };
 
             // The `endpoint` event must advertise a path the client can POST to
@@ -3386,7 +3452,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .content_hash
                             .as_deref(),
                         policy_definition_id: outcome.policy_id.as_deref(),
-                        surface_id: Some(channel_name.as_str()),
+                        surface_id: Some(config_id),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -3417,6 +3483,16 @@ async fn proxy_handler_with_mcp_runtime(
                 }
                 Err(e) => {
                     error!(channel = channel_name, error = %e, "Failed to evaluate MCP tool policy before fabric forwarding");
+                    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                        scope: crate::observability::PolicyScope::McpTool,
+                        error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                        surface_id: Some(config_id),
+                        trace_id: Some(&trace_id),
+                        http_method: Some(method.as_ref()),
+                        path: Some(uri.path()),
+                        identity: authenticated_identity.as_ref(),
+                        ..Default::default()
+                    });
                     let request_id = serde_json::from_slice::<serde_json::Value>(&body_bytes)
                         .ok()
                         .and_then(|json| json.get("id").cloned());
@@ -3721,7 +3797,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .await
                     {
                         Some(rx) => rx,
-                        None => return Ok(sse_session_limit_response(connection_guard)),
+                        None => return Ok(sse_session_limit_response(connection_guard, &audit_facts)),
                     };
                     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
                 }
@@ -3808,7 +3884,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .create_session()
                 .await
             else {
-                return Ok(sse_session_limit_response(connection_guard));
+                return Ok(sse_session_limit_response(connection_guard, &audit_facts));
             };
 
             // The `endpoint` event must advertise a path the client can POST to
@@ -4163,7 +4239,7 @@ async fn proxy_handler_with_mcp_runtime(
                     crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
                         scope: crate::observability::PolicyScope::McpTool,
                         allow: true,
-                        surface_id: Some(channel_name.as_str()),
+                        surface_id: Some(config_id),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -4187,7 +4263,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .content_hash
                             .as_deref(),
                         policy_definition_id: outcome.policy_id.as_deref(),
-                        surface_id: Some(channel_name.as_str()),
+                        surface_id: Some(config_id),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -4250,6 +4326,16 @@ async fn proxy_handler_with_mcp_runtime(
                 }
                 Err(e) => {
                     error!(channel = channel_name, error = %e, "Failed to evaluate MCP tool policy");
+                    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                        scope: crate::observability::PolicyScope::McpTool,
+                        error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                        surface_id: Some(config_id),
+                        trace_id: Some(&trace_id),
+                        http_method: Some(method.as_ref()),
+                        path: Some(uri.path()),
+                        identity: authenticated_identity.as_ref(),
+                        ..Default::default()
+                    });
 
                     // Return JSON-RPC error response
                     let request_id = serde_json::from_slice::<serde_json::Value>(&body_bytes)
@@ -4766,9 +4852,7 @@ async fn proxy_handler_with_mcp_runtime(
     // VP after the deferred mint below. When workload-binding attestation is
     // explicitly configured, that VP carries `workloadBinding.delegationAction`;
     // otherwise it stays in the legacy `identityFields` shape.
-    let deferred_audit_queue: std::sync::Arc<
-        std::sync::Mutex<Vec<crate::delegation_vault::audit::DelegationAuditEvent>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let deferred_audit = crate::audit::producer::DeferredAudit::new(crate::audit::producer::producer());
 
     // Note: outbound request body VP injection is deferred to after credential
     // delegation resolves (see "deferred request VP injection" below) so an
@@ -4930,14 +5014,19 @@ async fn proxy_handler_with_mcp_runtime(
             probe_input.payment = payment_context.clone();
             probe_input.identity_binding = identity_binding.clone();
             probe_input.normalize_caller_did();
-            trust_check_results = crate::trust_registry_verification::run_caller_trust_check(
-                state
-                    .surface
-                    .surface_id
-                    .as_str(),
-                caller_elements,
-                &probe_input,
-                &client,
+            trust_check_results = crate::audit::context::with_caller(
+                authenticated_identity
+                    .as_ref()
+                    .map(crate::delegation_vault::audit::build_caller_context),
+                crate::trust_registry_verification::run_caller_trust_check(
+                    state
+                        .surface
+                        .surface_id
+                        .as_str(),
+                    caller_elements,
+                    &probe_input,
+                    &client,
+                ),
             )
             .await;
         }
@@ -4997,15 +5086,20 @@ async fn proxy_handler_with_mcp_runtime(
                     probe_input.payment = payment_context.clone();
                     probe_input.identity_binding = identity_binding.clone();
                     let probe_value = serde_json::to_value(&probe_input).unwrap_or_default();
-                    if let Some(target_results) = crate::trust_registry_verification::run_trust_check_stage(
-                        state
-                            .surface
-                            .surface_id
-                            .as_str(),
-                        crate::trust_registry_verification::TrustCheckLeg::Target,
-                        target_elements,
-                        &probe_value,
-                        &crate::trust_registry_verification::TrqpListenerClient::new(manager),
+                    if let Some(target_results) = crate::audit::context::with_caller(
+                        authenticated_identity
+                            .as_ref()
+                            .map(crate::delegation_vault::audit::build_caller_context),
+                        crate::trust_registry_verification::run_trust_check_stage(
+                            state
+                                .surface
+                                .surface_id
+                                .as_str(),
+                            crate::trust_registry_verification::TrustCheckLeg::Target,
+                            target_elements,
+                            &probe_value,
+                            &crate::trust_registry_verification::TrqpListenerClient::new(manager),
+                        ),
                     )
                     .await
                     {
@@ -5020,16 +5114,23 @@ async fn proxy_handler_with_mcp_runtime(
                 let mut merged = trust_check_results
                     .take()
                     .unwrap_or_default();
-                merged.target = target_elements
-                    .iter()
-                    .map(|elem| {
-                        crate::trust_registry_verification::synthesize_failure(
-                            elem,
+                merged.target = crate::audit::context::with_caller(
+                    authenticated_identity
+                        .as_ref()
+                        .map(crate::delegation_vault::audit::build_caller_context),
+                    async {
+                        crate::trust_registry_verification::synthesize_unavailable_target(
+                            state
+                                .surface
+                                .surface_id
+                                .as_str(),
+                            target_elements,
                             crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE,
-                            "A2A proxy target agent card could not be synthesized".to_string(),
+                            "A2A proxy target agent card could not be synthesized",
                         )
-                    })
-                    .collect();
+                    },
+                )
+                .await;
                 trust_check_results = Some(merged);
             }
         }
@@ -5071,11 +5172,27 @@ async fn proxy_handler_with_mcp_runtime(
         policy_input.trust_check_results = trust_check_results.clone();
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
 
+        let inbound_policy_def_id = state
+            .surface
+            .inbound_opa_policy_definition_id();
         let Some(policy_manager) = state.policy_manager.as_ref() else {
             channel_warn!(
                 config_id_str,
                 "Access-point inbound OPA policy is configured but policy manager is not available — denying request"
             );
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::Surface,
+                error: Some(crate::observability::PolicyEvaluationError::NoPolicyManager),
+                policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                policy_definition_id: inbound_policy_def_id,
+                surface_id: Some(config_id_str),
+                trace_id: Some(&trace_id),
+                http_method: Some(method.as_ref()),
+                path: Some(uri.path()),
+                identity: authenticated_identity.as_ref(),
+                actor_did: request_agent_did.as_deref(),
+                ..Default::default()
+            });
             connection_guard
                 .decrement()
                 .await;
@@ -5087,9 +5204,6 @@ async fn proxy_handler_with_mcp_runtime(
                 ))
                 .unwrap());
         };
-        let inbound_policy_def_id = state
-            .surface
-            .inbound_opa_policy_definition_id();
         let (inbound_policy_name, inbound_policy_version, inbound_policy_hash) = policy_manager
             .resolve_policy_decision_evidence(inbound_policy_def_id)
             .await;
@@ -5159,6 +5273,22 @@ async fn proxy_handler_with_mcp_runtime(
                     "Access-point inbound OPA policy evaluation error (denying request): {}",
                     e
                 );
+                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Surface,
+                    error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                    policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                    policy_definition_id: inbound_policy_def_id,
+                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_version: inbound_policy_version,
+                    policy_content_hash: inbound_policy_hash.as_deref(),
+                    surface_id: Some(config_id_str),
+                    trace_id: Some(&trace_id),
+                    http_method: Some(method.as_ref()),
+                    path: Some(uri.path()),
+                    identity: authenticated_identity.as_ref(),
+                    actor_did: request_agent_did.as_deref(),
+                    ..Default::default()
+                });
                 connection_guard
                     .decrement()
                     .await;
@@ -5291,6 +5421,25 @@ async fn proxy_handler_with_mcp_runtime(
             })
         else {
             channel_warn!(config_id_str, "OPA is enabled but no compiled policy found for channel — denying request");
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::Surface,
+                error: Some(if state.policy_manager.is_some() {
+                    crate::observability::PolicyEvaluationError::PolicyNotCompiled
+                } else {
+                    crate::observability::PolicyEvaluationError::NoPolicyManager
+                }),
+                policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                policy_definition_id: state
+                    .surface
+                    .opa_policy_definition_id(),
+                surface_id: Some(config_id_str),
+                trace_id: Some(&trace_id),
+                http_method: Some(method.as_ref()),
+                path: Some(uri.path()),
+                identity: authenticated_identity.as_ref(),
+                actor_did: request_agent_did.as_deref(),
+                ..Default::default()
+            });
             connection_guard
                 .decrement()
                 .await;
@@ -5376,6 +5525,22 @@ async fn proxy_handler_with_mcp_runtime(
             }
             Err(e) => {
                 channel_warn!(config_id_str, "Surface-level OPA policy evaluation error (denying request): {}", e);
+                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Surface,
+                    error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                    policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                    policy_definition_id: channel_opa_def_id,
+                    policy_name: Some(channel_opa_name.as_str()),
+                    surface_id: Some(config_id_str),
+                    trace_id: Some(&trace_id),
+                    http_method: Some(method.as_ref()),
+                    path: Some(uri.path()),
+                    identity: authenticated_identity.as_ref(),
+                    actor_did: request_agent_did.as_deref(),
+                    policy_version: channel_opa_version,
+                    policy_content_hash: channel_opa_hash.as_deref(),
+                    ..Default::default()
+                });
                 connection_guard
                     .decrement()
                     .await;
@@ -6098,24 +6263,21 @@ async fn proxy_handler_with_mcp_runtime(
                 mcp_session_id: validated_mcp_session_id.clone(),
             };
 
-            let delegation_results = crate::delegation_vault::audit::AUDIT_DEFER_QUEUE
-                .scope(
-                    deferred_audit_queue.clone(),
-                    crate::proxy::credential_delegation::resolve_delegation_credentials(
-                        &outbound_credentials,
-                        user_hash,
-                        agent_did_for_vault,
-                        config_id,
-                        mcp_tool,
-                        vault_store,
-                        provider_store,
-                        secrets_store,
-                        base_url,
-                        false, // via_fabric = false (direct HTTP path)
-                        Some(&delegation_audit_ctx),
-                        delegation_consent_principal.as_deref(),
-                    ),
-                )
+            let delegation_results = deferred_audit
+                .scope(crate::proxy::credential_delegation::resolve_delegation_credentials(
+                    &outbound_credentials,
+                    user_hash,
+                    agent_did_for_vault,
+                    config_id,
+                    mcp_tool,
+                    vault_store,
+                    provider_store,
+                    secrets_store,
+                    base_url,
+                    false, // via_fabric = false (direct HTTP path)
+                    Some(&delegation_audit_ctx),
+                    delegation_consent_principal.as_deref(),
+                ))
                 .await;
 
             // Compute the delegation-action summary for the workload-binding VP.
@@ -6191,45 +6353,37 @@ async fn proxy_handler_with_mcp_runtime(
                         .await
                     {
                         Ok(jwt) => {
-                            // Drain the deferred queue and stamp every
-                            // per-binding event with the consent_required VP.
-                            {
-                                let pending = match deferred_audit_queue.lock() {
-                                    Ok(mut g) => std::mem::take(&mut *g),
-                                    Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-                                };
-                                for mut evt in pending {
-                                    evt.vp_jwt = Some(jwt.clone());
-                                    crate::delegation_vault::audit::audit(evt);
-                                }
-                            }
+                            // Stamp every deferred per-binding event with the
+                            // consent_required VP.
+                            deferred_audit.flush_with_vp(&jwt);
 
-                            let mut evt = crate::delegation_vault::audit::audit_event(
-                                crate::delegation_vault::audit::DelegationAuditAction::ConsentRequired,
-                                Some(agent_did_for_vault),
-                                Some(user_hash),
-                                None,
-                                Some(config_id),
-                            );
-                            evt.channel_name = Some(channel_name.to_string());
-                            evt.agent_identity_did = request_agent_did.clone();
-                            evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
-                            evt.mcp_tool_name = mcp_context
-                                .as_ref()
-                                .and_then(|c| c.tool_name.clone());
-                            evt.caller = authenticated_identity
-                                .as_ref()
-                                .map(crate::delegation_vault::audit::build_caller_context);
-                            evt.vp_jwt = Some(jwt);
+                            crate::delegation_vault::audit::emit("consent_required", || {
+                                let mut evt = crate::delegation_vault::audit::audit_event(
+                                    crate::delegation_vault::audit::DelegationAuditAction::ConsentRequired,
+                                    Some(agent_did_for_vault),
+                                    Some(user_hash),
+                                    None,
+                                    Some(config_id),
+                                );
+                                evt.channel_name = Some(channel_name.to_string());
+                                evt.agent_identity_did = request_agent_did.clone();
+                                evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
+                                evt.mcp_tool_name = mcp_context
+                                    .as_ref()
+                                    .and_then(|c| c.tool_name.clone());
+                                evt.caller = authenticated_identity
+                                    .as_ref()
+                                    .map(crate::delegation_vault::audit::build_caller_context);
+                                evt.vp_jwt = Some(jwt);
 
-                            // Surface provider info for single-provider cases
-                            // so the dashboard renders something useful in
-                            // the provider column instead of a dash. For
-                            // multi-provider rejections we leave provider_id
-                            // unset and rely on the VP's `delegationAction`
-                            // array (rendered in the row detail panel) to
-                            // show the per-binding outcomes.
-                            let consent_providers: Vec<&crate::proxy::credential_delegation::DelegationResolution> =
+                                // Surface provider info for single-provider cases
+                                // so the dashboard renders something useful in
+                                // the provider column instead of a dash. For
+                                // multi-provider rejections we leave provider_id
+                                // unset and rely on the VP's `delegationAction`
+                                // array (rendered in the row detail panel) to
+                                // show the per-binding outcomes.
+                                let consent_providers: Vec<&crate::proxy::credential_delegation::DelegationResolution> =
                                 delegation_results
                                     .iter()
                                     .filter(|r| {
@@ -6239,19 +6393,21 @@ async fn proxy_handler_with_mcp_runtime(
                                         )
                                     })
                                     .collect();
-                            if let [only] = consent_providers.as_slice() {
-                                evt.provider_id = Some(
-                                    only.action
-                                        .provider_id
-                                        .clone(),
-                                );
-                                evt.provider_name = only
-                                    .action
-                                    .provider_name
-                                    .clone();
-                            }
-                            evt.detail = Some(format!("consent_required summary; providers={}", consent_entries.len()));
-                            crate::delegation_vault::audit::audit(evt);
+                                if let [only] = consent_providers.as_slice() {
+                                    evt.provider_id = Some(
+                                        only.action
+                                            .provider_id
+                                            .clone(),
+                                    );
+                                    evt.provider_name = only
+                                        .action
+                                        .provider_name
+                                        .clone();
+                                }
+                                evt.detail =
+                                    Some(format!("consent_required summary; providers={}", consent_entries.len()));
+                                evt
+                            });
                         }
                         Err(e) => {
                             warn!(
@@ -6272,19 +6428,10 @@ async fn proxy_handler_with_mcp_runtime(
                     );
                 }
 
-                // Flush any per-binding events that were still queued because
-                // the consent_required VP could not be minted (or no identity
-                // selector). They have no VP attached but at least preserve
-                // the audit trail.
-                {
-                    let pending = match deferred_audit_queue.lock() {
-                        Ok(mut g) => std::mem::take(&mut *g),
-                        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-                    };
-                    for evt in pending {
-                        crate::delegation_vault::audit::audit(evt);
-                    }
-                }
+                // Submit any per-binding events still deferred because the
+                // consent_required VP could not be minted (or no identity
+                // selector), without a VP.
+                deferred_audit.flush();
 
                 let body = serde_json::json!({
                     "type": "https://affinidi.com/atg/errors/consent-required",
@@ -6508,61 +6655,47 @@ async fn proxy_handler_with_mcp_runtime(
                     }
                 }
 
-                // 2. drain the deferred audit queue and re-stamp every
-                //    per-binding event with the canonical VP so each row in
-                //    the audit log carries the same signed identity binding as
-                //    the request-level event.
-                {
-                    let pending = match deferred_audit_queue.lock() {
-                        Ok(mut g) => std::mem::take(&mut *g),
-                        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-                    };
-                    for mut evt in pending {
-                        evt.vp_jwt = Some(final_vp_jwt.clone());
-                        crate::delegation_vault::audit::audit(evt);
-                    }
-                }
+                // 2. stamp every deferred per-binding event with the
+                //    canonical VP so each record carries the same signed
+                //    identity binding as the request-level event.
+                deferred_audit.flush_with_vp(&final_vp_jwt);
 
                 // 3. audit the request-path VP injection itself
-                if crate::delegation_vault::audit::identity_binding_vp_audit_enabled() {
-                    let mut evt = crate::delegation_vault::audit::audit_event(
-                        crate::delegation_vault::audit::DelegationAuditAction::VpInjected,
-                        request_agent_did.as_deref(),
-                        request_user_hash.as_deref(),
-                        None,
-                        Some(
+                crate::delegation_vault::audit::emit("vp_injected", || {
+                    crate::delegation_vault::audit::vp_injected_event(crate::delegation_vault::audit::VpInjection {
+                        agent_did: request_agent_did.as_deref(),
+                        user_hash: request_user_hash.as_deref(),
+                        surface_id: Some(
                             state
                                 .surface
                                 .surface_id
                                 .as_str(),
                         ),
-                    );
-                    evt.agent_identity_did = request_agent_did.clone();
-                    evt.channel_name = Some(channel_name.clone());
-                    evt.target_endpoint = Some(
-                        state
-                            .surface
-                            .target
-                            .endpoint
-                            .clone(),
-                    );
-                    evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
-                    evt.mcp_tool_name = mcp_context
-                        .as_ref()
-                        .and_then(|c| c.tool_name.clone());
-                    evt.vp_jwt = Some(final_vp_jwt.clone());
-                    evt.vp_fingerprint = Some(crate::delegation_vault::audit::vp_fingerprint(&final_vp_jwt));
-                    evt.trace_id = Some(trace_id.clone());
-                    evt.detail = Some(if egress_trace_id != trace_id {
-                        format!("request_path; downstream_trace_id={egress_trace_id}")
-                    } else {
-                        "request_path".to_string()
-                    });
-                    evt.caller = authenticated_identity
-                        .as_ref()
-                        .map(crate::delegation_vault::audit::build_caller_context);
-                    crate::delegation_vault::audit::audit(evt);
-                }
+                        channel_name: &channel_name,
+                        target_endpoint: &state.surface.target.endpoint,
+                        protocol: &format!(
+                            "{:?}",
+                            state
+                                .surface
+                                .channel_protocol()
+                        )
+                        .to_lowercase(),
+                        mcp_tool_name: mcp_context
+                            .as_ref()
+                            .and_then(|c| c.tool_name.as_deref()),
+                        vp_jwt: &final_vp_jwt,
+                        trace_id: Some(&trace_id),
+                        detail: if egress_trace_id != trace_id {
+                            format!("request_path; downstream_trace_id={egress_trace_id}")
+                        } else {
+                            "request_path".to_string()
+                        },
+                        caller: authenticated_identity
+                            .as_ref()
+                            .map(crate::delegation_vault::audit::build_caller_context),
+                        via_fabric: false,
+                    })
+                });
             }
             Err(e) => {
                 warn!(
@@ -6570,27 +6703,14 @@ async fn proxy_handler_with_mcp_runtime(
                     error = %e,
                     "Failed to mint deferred request-path identity VP"
                 );
-                // Flush any queued per-binding events without a VP so we
-                // don't lose audit trail on VP minting failure.
-                let pending = match deferred_audit_queue.lock() {
-                    Ok(mut g) => std::mem::take(&mut *g),
-                    Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-                };
-                for evt in pending {
-                    crate::delegation_vault::audit::audit(evt);
-                }
+                // Submit the deferred per-binding events without a VP.
+                deferred_audit.flush();
             }
         }
     } else {
-        // No identity selector / resolved identity — flush any queued events
-        // unchanged so we don't silently drop audit rows.
-        let pending = match deferred_audit_queue.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        };
-        for evt in pending {
-            crate::delegation_vault::audit::audit(evt);
-        }
+        // No identity selector / resolved identity: submit the deferred
+        // events unchanged.
+        deferred_audit.flush();
     }
 
     debug!("🟢 OUTBOUND REQUEST: trace_id={} target={}", trace_id, target_url);
@@ -7659,6 +7779,7 @@ async fn proxy_handler_with_mcp_runtime(
                         template.normalize_caller_did();
 
                         // Filter tools based on policy
+                        let listed_names = tool_names.clone();
                         let filtered_names = policy_manager.filter_mcp_tools_for_variant(
                             config_id,
                             state
@@ -7744,6 +7865,28 @@ async fn proxy_handler_with_mcp_runtime(
                                 );
                             }
                         }
+
+                        let kept_names: Vec<String> = tools_array_mut
+                            .iter()
+                            .filter_map(|t| {
+                                t.get("name")
+                                    .and_then(|n| n.as_str())
+                                    .map(str::to_string)
+                            })
+                            .collect();
+                        crate::observability::policy_audit::record_tools_list_filtering(
+                            &listed_names,
+                            &kept_names,
+                            crate::observability::PolicyDecisionEvent {
+                                surface_id: Some(config_id),
+                                trace_id: Some(&trace_id),
+                                http_method: Some(method.as_ref()),
+                                path: Some(uri.path()),
+                                identity: authenticated_identity.as_ref(),
+                                actor_did: request_agent_did.as_deref(),
+                                ..Default::default()
+                            },
+                        );
                     }
                 }
 
@@ -7893,37 +8036,37 @@ async fn proxy_handler_with_mcp_runtime(
                         Ok(None) => response_body,
                         Ok(Some((modified_bytes, vp_jwt))) => {
                             info!(channel = channel_name, did = %did, "Identity credential VP injected into outbound response");
-                            if crate::delegation_vault::audit::identity_binding_vp_audit_enabled() {
-                                let mut evt = crate::delegation_vault::audit::audit_event(
-                                    crate::delegation_vault::audit::DelegationAuditAction::VpInjected,
-                                    None,
-                                    request_user_hash.as_deref(),
-                                    None,
-                                    Some(
-                                        state
-                                            .surface
-                                            .surface_id
-                                            .as_str(),
-                                    ),
-                                );
-                                evt.agent_identity_did = Some(did.clone());
-                                evt.channel_name = Some(channel_name.clone());
-                                evt.target_endpoint = Some(
-                                    state
-                                        .surface
-                                        .target
-                                        .endpoint
-                                        .clone(),
-                                );
-                                evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
-                                evt.vp_jwt = Some(vp_jwt);
-                                evt.trace_id = Some(trace_id.clone());
-                                evt.detail = Some("response_path".to_string());
-                                evt.caller = authenticated_identity
-                                    .as_ref()
-                                    .map(crate::delegation_vault::audit::build_caller_context);
-                                crate::delegation_vault::audit::audit(evt);
-                            }
+                            crate::delegation_vault::audit::emit("vp_injected", || {
+                                crate::delegation_vault::audit::vp_injected_event(
+                                    crate::delegation_vault::audit::VpInjection {
+                                        agent_did: Some(did.as_str()),
+                                        user_hash: request_user_hash.as_deref(),
+                                        surface_id: Some(
+                                            state
+                                                .surface
+                                                .surface_id
+                                                .as_str(),
+                                        ),
+                                        channel_name: &channel_name,
+                                        target_endpoint: &state.surface.target.endpoint,
+                                        protocol: &format!(
+                                            "{:?}",
+                                            state
+                                                .surface
+                                                .channel_protocol()
+                                        )
+                                        .to_lowercase(),
+                                        mcp_tool_name: None,
+                                        vp_jwt: &vp_jwt,
+                                        trace_id: Some(&trace_id),
+                                        detail: "response_path".to_string(),
+                                        caller: authenticated_identity
+                                            .as_ref()
+                                            .map(crate::delegation_vault::audit::build_caller_context),
+                                        via_fabric: false,
+                                    },
+                                )
+                            });
                             modified_bytes
                         }
                         Err(e) => {
@@ -8116,6 +8259,7 @@ async fn proxy_handler_with_mcp_runtime(
                     scope: crate::observability::PolicyScope::Response,
                     allow: false,
                     reason: decision.reason.as_deref(),
+                    error: decision.error,
                     policy_id: Some(response_policy_id),
                     policy_definition_id: Some(response_policy_id),
                     policy_name: response_policy
@@ -8125,7 +8269,7 @@ async fn proxy_handler_with_mcp_runtime(
                     policy_content_hash: response_policy
                         .content_hash
                         .as_deref(),
-                    surface_id: Some(channel_name.as_str()),
+                    surface_id: Some(config_id),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -8154,7 +8298,7 @@ async fn proxy_handler_with_mcp_runtime(
                 policy_content_hash: response_policy
                     .content_hash
                     .as_deref(),
-                surface_id: Some(channel_name.as_str()),
+                surface_id: Some(config_id),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -8186,40 +8330,40 @@ async fn proxy_handler_with_mcp_runtime(
         )
         .await?;
 
-        // Emit delegation audit event if a VP was injected
-        if let Some(ref vp_jwt) = injected_vp_jwt
-            && crate::delegation_vault::audit::identity_binding_vp_audit_enabled()
-        {
-            let mut evt = crate::delegation_vault::audit::audit_event(
-                crate::delegation_vault::audit::DelegationAuditAction::VpInjected,
-                None,
-                request_user_hash.as_deref(),
-                None,
-                Some(
-                    state
-                        .surface
-                        .surface_id
-                        .as_str(),
-                ),
-            );
-            evt.agent_identity_did = match &resolved_identity {
-                ProtectedAgentIdentity::Managed { did, .. } => Some(did.clone()),
-                ProtectedAgentIdentity::Anonymous => None,
-            };
-            evt.channel_name = Some(channel_name.clone());
-            evt.target_endpoint = Some(
-                state
-                    .surface
-                    .target
-                    .endpoint
-                    .clone(),
-            );
-            evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
-            evt.vp_jwt = Some(vp_jwt.clone());
-            evt.caller = authenticated_identity
-                .as_ref()
-                .map(crate::delegation_vault::audit::build_caller_context);
-            crate::delegation_vault::audit::audit(evt);
+        // Audit the backend agent VP injected into the response
+        if let Some(ref vp_jwt) = injected_vp_jwt {
+            crate::delegation_vault::audit::emit("vp_injected", || {
+                crate::delegation_vault::audit::vp_injected_event(crate::delegation_vault::audit::VpInjection {
+                    agent_did: match &resolved_identity {
+                        ProtectedAgentIdentity::Managed { did, .. } => Some(did.as_str()),
+                        ProtectedAgentIdentity::Anonymous => None,
+                    },
+                    user_hash: request_user_hash.as_deref(),
+                    surface_id: Some(
+                        state
+                            .surface
+                            .surface_id
+                            .as_str(),
+                    ),
+                    channel_name: &channel_name,
+                    target_endpoint: &state.surface.target.endpoint,
+                    protocol: &format!(
+                        "{:?}",
+                        state
+                            .surface
+                            .channel_protocol()
+                    )
+                    .to_lowercase(),
+                    mcp_tool_name: None,
+                    vp_jwt,
+                    trace_id: Some(&trace_id),
+                    detail: "backend_response".to_string(),
+                    caller: authenticated_identity
+                        .as_ref()
+                        .map(crate::delegation_vault::audit::build_caller_context),
+                    via_fabric: false,
+                })
+            });
         }
 
         // Trust Recorder — writes TrAdmin records to configured TRs on the
@@ -9676,12 +9820,18 @@ async fn resolve_configured_caller_identity(
 fn modern_fabric_failure_response(
     error: crate::proxy::fabric_forward::FabricForwardError,
     id: Option<serde_json::Value>,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
 ) -> Response {
     let status = match error {
         crate::proxy::fabric_forward::FabricForwardError::RemoteLegacyOnly => {
             return crate::mcp::request_validation::McpRequestValidationError::legacy_only(id).into_response();
         }
         crate::proxy::fabric_forward::FabricForwardError::CapacityReached => {
+            crate::audit::request_events::rate_limited(
+                facts,
+                crate::audit::events::RateLimitScope::FabricCapacity,
+                Some(std::time::Duration::from_secs(crate::proxy::fabric_forward::CAPACITY_RETRY_AFTER_SECS)),
+            );
             return crate::proxy::fabric_forward::capacity_response(id);
         }
         crate::proxy::fabric_forward::FabricForwardError::NoResponse(_) => StatusCode::GATEWAY_TIMEOUT,
@@ -10202,11 +10352,27 @@ async fn handle_fabric_request(
             .as_ref()
             .map(|r| r.did.clone());
 
+        let inbound_policy_def_id = state
+            .surface
+            .inbound_opa_policy_definition_id();
         let Some(policy_manager) = state.policy_manager.as_ref() else {
             channel_warn!(
                 config_id_str,
                 "Access-point inbound OPA policy is configured but policy manager is not available — denying request"
             );
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::Surface,
+                error: Some(crate::observability::PolicyEvaluationError::NoPolicyManager),
+                policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                policy_definition_id: inbound_policy_def_id,
+                surface_id: Some(config_id_str),
+                trace_id: Some(&trace_id),
+                http_method: Some(method.as_ref()),
+                path: Some(uri.path()),
+                identity: authenticated_identity.as_ref(),
+                actor_did: request_agent_did.as_deref(),
+                ..Default::default()
+            });
             connection_guard
                 .decrement()
                 .await;
@@ -10218,9 +10384,6 @@ async fn handle_fabric_request(
                 ))
                 .unwrap());
         };
-        let inbound_policy_def_id = state
-            .surface
-            .inbound_opa_policy_definition_id();
         let (inbound_policy_name, inbound_policy_version, inbound_policy_hash) = policy_manager
             .resolve_policy_decision_evidence(inbound_policy_def_id)
             .await;
@@ -10290,6 +10453,22 @@ async fn handle_fabric_request(
                     "Fabric access-point inbound OPA policy evaluation error (denying request): {}",
                     e
                 );
+                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Surface,
+                    error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                    policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                    policy_definition_id: inbound_policy_def_id,
+                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_version: inbound_policy_version,
+                    policy_content_hash: inbound_policy_hash.as_deref(),
+                    surface_id: Some(config_id_str),
+                    trace_id: Some(&trace_id),
+                    http_method: Some(method.as_ref()),
+                    path: Some(uri.path()),
+                    identity: authenticated_identity.as_ref(),
+                    actor_did: request_agent_did.as_deref(),
+                    ..Default::default()
+                });
                 connection_guard
                     .decrement()
                     .await;
@@ -10438,15 +10617,20 @@ async fn handle_fabric_request(
             {
                 let client = crate::trust_registry_verification::TrqpListenerClient::new(manager);
                 let probe_input = serde_json::to_value(&policy_input).unwrap_or_default();
-                policy_input.trust_check_results = crate::trust_registry_verification::run_trust_check_stage(
-                    state
-                        .surface
-                        .surface_id
-                        .as_str(),
-                    crate::trust_registry_verification::TrustCheckLeg::Target,
-                    target_elements,
-                    &probe_input,
-                    &client,
+                policy_input.trust_check_results = crate::audit::context::with_caller(
+                    authenticated_identity
+                        .as_ref()
+                        .map(crate::delegation_vault::audit::build_caller_context),
+                    crate::trust_registry_verification::run_trust_check_stage(
+                        state
+                            .surface
+                            .surface_id
+                            .as_str(),
+                        crate::trust_registry_verification::TrustCheckLeg::Target,
+                        target_elements,
+                        &probe_input,
+                        &client,
+                    ),
                 )
                 .await;
             }
@@ -10516,6 +10700,21 @@ async fn handle_fabric_request(
                 }
                 Err(e) => {
                     channel_warn!(config_id_str, "Surface-level OPA policy evaluation error (denying request): {}", e);
+                    crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                        scope: crate::observability::PolicyScope::Surface,
+                        error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                        policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                        policy_definition_id: channel_opa_def_id,
+                        policy_name: Some(channel_opa_name.as_str()),
+                        surface_id: Some(config_id_str),
+                        trace_id: Some(&trace_id),
+                        http_method: Some(method.as_ref()),
+                        path: Some(uri.path()),
+                        identity: authenticated_identity.as_ref(),
+                        policy_version: channel_opa_version,
+                        policy_content_hash: channel_opa_hash.as_deref(),
+                        ..Default::default()
+                    });
                     connection_guard
                         .decrement()
                         .await;
@@ -11196,48 +11395,41 @@ async fn handle_fabric_request(
                 body_bytes = modified;
                 channel_info!(config_id, "Identity binding VP injected into fabric forward request");
 
-                // Emit delegation audit event for VP injection
-                if crate::delegation_vault::audit::identity_binding_vp_audit_enabled() {
-                    let mut evt = crate::delegation_vault::audit::audit_event(
-                        crate::delegation_vault::audit::DelegationAuditAction::VpInjected,
-                        None,
-                        request_user_hash.as_deref(),
-                        None,
-                        Some(
+                // Own trace id (not the egress one on the wire) groups this record
+                // with this gateway's policy decisions; when the trace was
+                // terminated the detail names the downstream trace so the
+                // operator can bridge to it locally.
+                crate::delegation_vault::audit::emit("vp_injected", || {
+                    crate::delegation_vault::audit::vp_injected_event(crate::delegation_vault::audit::VpInjection {
+                        agent_did: Some(result.did.as_str()),
+                        user_hash: request_user_hash.as_deref(),
+                        surface_id: Some(
                             state
                                 .surface
                                 .surface_id
                                 .as_str(),
                         ),
-                    );
-                    evt.agent_identity_did = Some(result.did.clone());
-                    evt.channel_name = Some(channel_name.to_string());
-                    evt.target_endpoint = Some(
-                        state
-                            .surface
-                            .target
-                            .endpoint
-                            .clone(),
-                    );
-                    evt.protocol = Some(format!("{:?}", state.surface.channel_protocol()).to_lowercase());
-                    evt.vp_jwt = Some(vp_jwt.clone());
-                    // Own trace id (not the egress one on the wire): groups this
-                    // injection event with this gateway's policy decisions under one
-                    // `trace_id` so the Audit "This request" filter appears (mirrors
-                    // the direct path). The VP the caller receives still carries the
-                    // egress trace id downstream.
-                    evt.trace_id = Some(trace_id.clone());
-                    // When the trace was terminated, record the downstream (egress)
-                    // trace in this gateway's own audit so the operator can bridge to
-                    // the isolated downstream trace — it stays local (the remote
-                    // gateway never sees the incoming trace).
-                    evt.detail = Some(if egress_trace_id != trace_id {
-                        format!("request_path_fabric; downstream_trace_id={egress_trace_id}")
-                    } else {
-                        "request_path_fabric".to_string()
-                    });
-                    crate::delegation_vault::audit::audit(evt);
-                }
+                        channel_name,
+                        target_endpoint: &state.surface.target.endpoint,
+                        protocol: &format!(
+                            "{:?}",
+                            state
+                                .surface
+                                .channel_protocol()
+                        )
+                        .to_lowercase(),
+                        mcp_tool_name: None,
+                        vp_jwt,
+                        trace_id: Some(&trace_id),
+                        detail: if egress_trace_id != trace_id {
+                            format!("request_path_fabric; downstream_trace_id={egress_trace_id}")
+                        } else {
+                            "request_path_fabric".to_string()
+                        },
+                        caller: None,
+                        via_fabric: true,
+                    })
+                });
             }
             Err(e) => {
                 channel_warn!(
@@ -11602,6 +11794,12 @@ async fn handle_fabric_request(
                 modern_request
                     .as_ref()
                     .and_then(|request| request.id.clone()),
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: config_id,
+                    channel_name,
+                    trace_id: Some(&trace_id),
+                    via_fabric: false,
+                },
             )
         })?;
         (Some(response), Ok(None))
@@ -12806,15 +13004,27 @@ async fn handle_fabric_request(
                                 serde_json::Value::Null
                             };
                             match gating.filter_tools_list_value(&mut json, &input_value) {
-                                Some((before, after)) => {
-                                    if after < before {
+                                Some(filtered) => {
+                                    if filtered.removed_any() {
                                         channel_info!(
                                             config_id,
                                             "MCP tool gating filtered tools/list before={} after={} (fabric response leg)",
-                                            before,
-                                            after
+                                            filtered.listed.len(),
+                                            filtered.kept.len()
                                         );
                                     }
+                                    crate::observability::policy_audit::record_tools_list_filtering(
+                                        &filtered.listed,
+                                        &filtered.kept,
+                                        crate::observability::PolicyDecisionEvent {
+                                            surface_id: Some(config_id),
+                                            trace_id: Some(&trace_id),
+                                            http_method: Some(method.as_ref()),
+                                            path: Some(uri.path()),
+                                            identity: authenticated_identity.as_ref(),
+                                            ..Default::default()
+                                        },
+                                    );
                                     // A caller-scoped gate makes the list
                                     // authorization-dependent even when it removes nothing.
                                     let privatize = mcp_metadata_context.requires_private_result_cache();
@@ -12824,7 +13034,7 @@ async fn handle_fabric_request(
                                             mcp_metadata_context,
                                         );
                                     }
-                                    match (after < before || privatize)
+                                    match (filtered.removed_any() || privatize)
                                         .then(|| serde_json::to_string(&json).ok())
                                         .flatten()
                                     {
@@ -14166,14 +14376,17 @@ async fn evaluate_mcp_proxy_opa_policies(
                 .clone()
         {
             let client = crate::trust_registry_verification::TrqpListenerClient::new(manager);
-            policy_input.trust_check_results = crate::trust_registry_verification::run_caller_trust_check(
-                state
-                    .surface
-                    .surface_id
-                    .as_str(),
-                caller_elements,
-                &policy_input,
-                &client,
+            policy_input.trust_check_results = crate::audit::context::with_caller(
+                authenticated_identity.map(crate::delegation_vault::audit::build_caller_context),
+                crate::trust_registry_verification::run_caller_trust_check(
+                    state
+                        .surface
+                        .surface_id
+                        .as_str(),
+                    caller_elements,
+                    &policy_input,
+                    &client,
+                ),
             )
             .await;
         }
@@ -14187,16 +14400,28 @@ async fn evaluate_mcp_proxy_opa_policies(
         .inbound_opa_enabled()
         && let Some(config_id_str) = state.surface.config_id()
     {
+        let inbound_policy_def_id = state
+            .surface
+            .inbound_opa_policy_definition_id();
         let Some(policy_manager) = state.policy_manager.as_ref() else {
             channel_warn!(
                 config_id_str,
                 "Access-point inbound OPA policy is configured but policy manager is not available — denying request"
             );
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::Surface,
+                error: Some(crate::observability::PolicyEvaluationError::NoPolicyManager),
+                policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                policy_definition_id: inbound_policy_def_id,
+                surface_id: Some(config_id_str),
+                trace_id: Some(trace_id),
+                http_method: Some(method),
+                path: Some(uri.path()),
+                identity: authenticated_identity,
+                ..Default::default()
+            });
             return Err(mcp_proxy_deny_response(body_bytes, None, "Agent trust policy denied the request"));
         };
-        let inbound_policy_def_id = state
-            .surface
-            .inbound_opa_policy_definition_id();
         let (inbound_policy_name, inbound_policy_version, inbound_policy_hash) = policy_manager
             .resolve_policy_decision_evidence(inbound_policy_def_id)
             .await;
@@ -14253,6 +14478,21 @@ async fn evaluate_mcp_proxy_opa_policies(
                     "Access-point inbound OPA policy evaluation error (denying request): {}",
                     e
                 );
+                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Surface,
+                    error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                    policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                    policy_definition_id: inbound_policy_def_id,
+                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_version: inbound_policy_version,
+                    policy_content_hash: inbound_policy_hash.as_deref(),
+                    surface_id: Some(config_id_str),
+                    trace_id: Some(trace_id),
+                    http_method: Some(method),
+                    path: Some(uri.path()),
+                    identity: authenticated_identity,
+                    ..Default::default()
+                });
                 return Err(mcp_proxy_deny_response(
                     body_bytes,
                     Some("policy evaluation error"),
@@ -14279,6 +14519,24 @@ async fn evaluate_mcp_proxy_opa_policies(
             })
         else {
             channel_warn!(config_id_str, "OPA is enabled but no compiled policy found for channel — denying request");
+            crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                scope: crate::observability::PolicyScope::Surface,
+                error: Some(if state.policy_manager.is_some() {
+                    crate::observability::PolicyEvaluationError::PolicyNotCompiled
+                } else {
+                    crate::observability::PolicyEvaluationError::NoPolicyManager
+                }),
+                policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                policy_definition_id: state
+                    .surface
+                    .opa_policy_definition_id(),
+                surface_id: Some(config_id_str),
+                trace_id: Some(trace_id),
+                http_method: Some(method),
+                path: Some(uri.path()),
+                identity: authenticated_identity,
+                ..Default::default()
+            });
             return Err(mcp_proxy_deny_response(
                 body_bytes,
                 Some("no policy is loaded for this channel"),
@@ -14340,6 +14598,21 @@ async fn evaluate_mcp_proxy_opa_policies(
             }
             Err(e) => {
                 channel_warn!(config_id_str, "Surface-level OPA policy evaluation error (denying request): {}", e);
+                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::Surface,
+                    error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                    policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
+                    policy_definition_id: channel_opa_def_id,
+                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_version: channel_opa_version,
+                    policy_content_hash: channel_opa_hash.as_deref(),
+                    surface_id: Some(config_id_str),
+                    trace_id: Some(trace_id),
+                    http_method: Some(method),
+                    path: Some(uri.path()),
+                    identity: authenticated_identity,
+                    ..Default::default()
+                });
                 return Err(mcp_proxy_deny_response(
                     body_bytes,
                     Some("policy evaluation error"),
@@ -14370,6 +14643,11 @@ async fn handle_mcp_proxy_request(
     mcp_context: Option<&crate::surface_context::McpContext>,
 ) -> Result<Response, Response> {
     use crate::mcp_proxies::filesystem::McpProxyStore;
+
+    let config_id = state
+        .surface
+        .surface_id
+        .as_str();
 
     let store = state
         .mcp_proxy_store
@@ -14454,7 +14732,7 @@ async fn handle_mcp_proxy_request(
                 crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
                     scope: crate::observability::PolicyScope::McpTool,
                     allow: true,
-                    surface_id: Some(channel_name),
+                    surface_id: Some(config_id),
                     trace_id: Some(&trace_id),
                     path: Some(uri.path()),
                     identity: authenticated_identity,
@@ -14477,7 +14755,7 @@ async fn handle_mcp_proxy_request(
                         .policy
                         .content_hash
                         .as_deref(),
-                    surface_id: Some(channel_name),
+                    surface_id: Some(config_id),
                     trace_id: Some(&trace_id),
                     path: Some(uri.path()),
                     identity: authenticated_identity,
@@ -14501,6 +14779,15 @@ async fn handle_mcp_proxy_request(
             }
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to evaluate MCP tool policy");
+                crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
+                    scope: crate::observability::PolicyScope::McpTool,
+                    error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
+                    surface_id: Some(config_id),
+                    trace_id: Some(&trace_id),
+                    path: Some(uri.path()),
+                    identity: authenticated_identity,
+                    ..Default::default()
+                });
                 return Err(crate::mcp::errors::create_mcp_error_response(
                     json_request
                         .get("id")
@@ -14539,7 +14826,7 @@ async fn handle_mcp_proxy_request(
                 Some("blocked by MCP tool gating")
             },
             policy_id: Some("mcp_tool_gating"),
-            surface_id: Some(channel_name),
+            surface_id: Some(config_id),
             trace_id: Some(&trace_id),
             http_method: Some("POST"),
             path: Some(uri.path()),
@@ -14551,12 +14838,6 @@ async fn handle_mcp_proxy_request(
             return Err(crate::mcp::build_tools_call_policy_denied_response(body_bytes, Some("Tool is not available")));
         }
     }
-
-    // Get config_id for payload capture
-    let config_id = state
-        .surface
-        .config_id()
-        .unwrap_or("unknown");
 
     // Resolve target auth header if configured on the channel
     let target_auth_header = if let Some(target_auth) = state.surface.target_auth() {
@@ -14609,10 +14890,27 @@ async fn handle_mcp_proxy_request(
 
             if rpc_method == "tools/list"
                 && let Some((gating, input)) = tool_gating.as_ref()
-                && let Some((before, after)) = gating.filter_tools_list_value(&mut response_json, input)
-                && after < before
+                && let Some(filtered) = gating.filter_tools_list_value(&mut response_json, input)
+                && filtered.removed_any()
             {
-                info!(channel = channel_name, before, after, "MCP tool gating filtered tools/list on MCP proxy");
+                info!(
+                    channel = channel_name,
+                    before = filtered.listed.len(),
+                    after = filtered.kept.len(),
+                    "MCP tool gating filtered tools/list on MCP proxy"
+                );
+                crate::observability::policy_audit::record_tools_list_filtering(
+                    &filtered.listed,
+                    &filtered.kept,
+                    crate::observability::PolicyDecisionEvent {
+                        surface_id: Some(config_id),
+                        trace_id: Some(&trace_id),
+                        http_method: Some(method.as_str()),
+                        path: Some(uri.path()),
+                        identity: authenticated_identity,
+                        ..Default::default()
+                    },
+                );
             }
 
             // ── Response OPA policy ────────────────────────────────────────
@@ -14666,6 +14964,7 @@ async fn handle_mcp_proxy_request(
                         scope: crate::observability::PolicyScope::Response,
                         allow: false,
                         reason: decision.reason.as_deref(),
+                        error: decision.error,
                         policy_id: Some(response_policy_id),
                         policy_definition_id: Some(response_policy_id),
                         policy_name: response_policy
@@ -14675,7 +14974,7 @@ async fn handle_mcp_proxy_request(
                         policy_content_hash: response_policy
                             .content_hash
                             .as_deref(),
-                        surface_id: Some(channel_name),
+                        surface_id: Some(config_id),
                         trace_id: Some(&trace_id),
                         http_method: Some("POST"),
                         path: Some(uri.path()),
@@ -14704,7 +15003,7 @@ async fn handle_mcp_proxy_request(
                     policy_content_hash: response_policy
                         .content_hash
                         .as_deref(),
-                    surface_id: Some(channel_name),
+                    surface_id: Some(config_id),
                     trace_id: Some(&trace_id),
                     http_method: Some("POST"),
                     path: Some(uri.path()),
@@ -16447,12 +16746,32 @@ mod tests {
             .increment_connections("limited")
             .await;
 
-        let response = super::sse_session_limit_response(super::ConnectionGuard::new(
-            Some(monitor.clone()),
-            Some("limited".into()),
-        ));
+        let (response, audit) = crate::audit::producer::capture(async {
+            super::sse_session_limit_response(
+                super::ConnectionGuard::new(Some(monitor.clone()), Some("limited".into())),
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: "surf-1",
+                    channel_name: "Alpha",
+                    trace_id: None,
+                    via_fabric: false,
+                },
+            )
+        })
+        .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            audit
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
+                        scope: crate::audit::events::RateLimitScope::SseSessions,
+                        retry_after_ms: None,
+                    }
+                )),
+            "the refused SSE session is audited: {audit:?}"
+        );
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
@@ -18696,9 +19015,33 @@ mod tests {
     async fn access_point_answers_a_full_fabric_stream_cap_with_a_retryable_429() {
         use crate::proxy::fabric_forward::FabricForwardError;
 
-        let response =
-            modern_fabric_failure_response(FabricForwardError::CapacityReached, Some(serde_json::json!("call-1")));
+        let facts = crate::audit::request_events::RequestFacts {
+            surface_id: "surf-1",
+            channel_name: "Alpha",
+            trace_id: None,
+            via_fabric: false,
+        };
+        let (response, audit) = crate::audit::producer::capture(async {
+            modern_fabric_failure_response(
+                FabricForwardError::CapacityReached,
+                Some(serde_json::json!("call-1")),
+                &facts,
+            )
+        })
+        .await;
         assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            audit
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
+                        scope: crate::audit::events::RateLimitScope::FabricCapacity,
+                        retry_after_ms: Some(5000),
+                    }
+                )),
+            "the full Fabric stream cap is audited: {audit:?}"
+        );
         assert_eq!(
             response
                 .headers()
@@ -18719,8 +19062,12 @@ mod tests {
             (FabricForwardError::StreamingUnavailable, axum::http::StatusCode::BAD_GATEWAY),
             (FabricForwardError::NoResponse("gw".into()), axum::http::StatusCode::GATEWAY_TIMEOUT),
         ] {
-            let response = modern_fabric_failure_response(error, Some(serde_json::json!("call-1")));
+            let (response, audit) = crate::audit::producer::capture(async {
+                modern_fabric_failure_response(error, Some(serde_json::json!("call-1")), &facts)
+            })
+            .await;
             assert_eq!(response.status(), status);
+            assert!(audit.is_empty(), "only a full stream cap is rate limiting: {audit:?}");
             assert!(
                 response
                     .headers()

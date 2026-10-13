@@ -54,6 +54,19 @@ pub(crate) async fn record_replacement_mock_observation(world: &mut SurfaceWorld
 }
 
 pub(crate) async fn ensure_gateway_running(world: &mut SurfaceWorld) {
+    start_gateway_if_needed(world).await;
+}
+
+/// Whether a scenario gateway has been started, on either setup path.
+pub(crate) fn gateway_is_running(world: &SurfaceWorld) -> bool {
+    world.infra.is_some()
+        || !world
+            .runtimes
+            .gateway_instances
+            .is_empty()
+}
+
+async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     let need_gateway_setup_with_actors = world
         .actors
         .gateway_instances()
@@ -1153,7 +1166,7 @@ async fn send_raw_request_and_record(
     record_replacement_mock_observation(world).await;
 }
 
-async fn send_request_and_record(
+pub(crate) async fn send_request_and_record(
     world: &mut SurfaceWorld,
     headers: Vec<(String, String)>,
 ) {
@@ -3104,6 +3117,15 @@ async fn start_gateways(world: &mut SurfaceWorld) {
                 .as_ref()
                 .unwrap_or_else(|| panic!("target '{}' fixture must be present", key))
                 .clone()
+        })
+        .map(|mut fixture| {
+            if world
+                .surface_config
+                .audit_log_keeps_every_event
+            {
+                fixture.settings = Some(crate::bdd_support::admin_client::audit_log_keeping_every_event());
+            }
+            fixture
         })
         .collect::<Vec<_>>();
     let fixtures_to_start = fixtures

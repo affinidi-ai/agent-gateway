@@ -61,6 +61,14 @@ pub mod prom {
 
     // Governance audit records forwarded to audit integrations.
     pub const AUDIT_FORWARD_TOTAL: &str = "agent_gateway_audit_forward_total";
+    // Governance audit records lost before any sink received them.
+    pub const AUDIT_RECORDS_LOST_TOTAL: &str = "agent_gateway_audit_records_lost_total";
+    // Governance audit records produced and handed to the journal.
+    pub const AUDIT_RECORDS_PRODUCED_TOTAL: &str = "agent_gateway_audit_records_produced_total";
+    // Size of the governance audit journal on disk.
+    pub const AUDIT_JOURNAL_BYTES: &str = "agent_gateway_audit_journal_bytes";
+    // Governance audit records a sink skipped (backlog cap or its own drop policy).
+    pub const AUDIT_SINK_SKIPPED_TOTAL: &str = "agent_gateway_audit_sink_skipped_total";
 
     // Consent epoch reads that failed, each closing every MCP subscription on the vault.
     pub const MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE_TOTAL: &str = "agent_gateway_mcp_subscription_epoch_unavailable_total";

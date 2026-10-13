@@ -106,14 +106,18 @@ pub(crate) enum OutboundPipelineError {
     #[error("Request blocked by gateway policy")]
     GatewayPolicyDenied,
 
-    #[error("Request blocked by gateway policy: {0}")]
-    GatewayPolicyError(String),
+    /// The gateway policy could not decide. Why is logged and audited, never
+    /// shown to the caller.
+    #[error("Request blocked by gateway policy")]
+    GatewayPolicyError(crate::observability::PolicyEvaluationError),
 
     #[error("Request blocked by surface policy")]
     SurfacePolicyDenied,
 
-    #[error("Request blocked by surface policy: {0}")]
-    SurfacePolicyError(String),
+    /// The surface or transit-point policy could not decide. Why is logged
+    /// and audited, never shown to the caller.
+    #[error("Request blocked by surface policy")]
+    SurfacePolicyError(crate::observability::PolicyEvaluationError),
 
     #[error("Target authentication credentials unavailable")]
     TargetAuthUnavailable,
@@ -2619,7 +2623,7 @@ async fn step_trust_check(
     }
 
     if ctx.target_agent_card_unavailable {
-        let synthesized = synthesize_target_unavailable_results(
+        let synthesized = crate::trust_registry_verification::synthesize_unavailable_target(
             ctx.surface
                 .surface_id
                 .as_str(),
@@ -2650,7 +2654,7 @@ async fn step_trust_check(
         .target_identity_failure
         .clone()
     {
-        let synthesized = synthesize_target_unavailable_results(
+        let synthesized = crate::trust_registry_verification::synthesize_unavailable_target(
             ctx.surface
                 .surface_id
                 .as_str(),
@@ -2727,49 +2731,6 @@ async fn step_trust_check(
     Ok(())
 }
 
-/// Build the per-element target-leg `TrustCheckResult` list for the
-/// whole-surface `AGENT_CARD_UNAVAILABLE` path (card fetch itself
-/// failed) and emit the matching audit events. The
-/// `TRUST_REGISTRY_METADATA_UNAVAILABLE` path is per-element and lives
-/// in [`crate::trust_registry_verification::metadata_gate`], driven
-/// automatically by [`run_trust_check_stage`].
-fn synthesize_target_unavailable_results(
-    surface_id: &str,
-    elements: &[crate::trust_registry_verification::TrustCheckElement],
-    error_code: &'static str,
-    error_detail: &'static str,
-) -> Vec<crate::trust_registry_verification::TrustCheckResult> {
-    elements
-        .iter()
-        .map(|elem| {
-            let result =
-                crate::trust_registry_verification::synthesize_failure(elem, error_code, error_detail.to_string());
-            crate::observability::trust_check_audit::record_trust_check(
-                crate::observability::trust_check_audit::TrustCheckAuditEvent {
-                    surface_id,
-                    leg: crate::trust_registry_verification::TrustCheckLeg::Target,
-                    element_id: elem.id.as_str(),
-                    element_name: elem.name.as_deref(),
-                    // Match the wire shape: the two "unavailable" codes
-                    // omit authority_id / entity_id since the raw
-                    // template strings would be noise on those paths.
-                    authority_id: None,
-                    entity_id: None,
-                    trust_registry_id: elem
-                        .trust_registry_id
-                        .as_str(),
-                    query_type: elem.query_type,
-                    ok: false,
-                    error_code: Some(error_code),
-                    error_detail: Some(error_detail),
-                    latency_ms: 0,
-                },
-            );
-            result
-        })
-        .collect()
-}
-
 /// The protected agent's DID for outbound policy-audit attribution, or `None`
 /// when no managed identity was resolved.
 fn outbound_actor_did(ctx: &OutboundPipelineContext) -> Option<&str> {
@@ -2812,10 +2773,28 @@ impl OutboundPolicyAudit<'_> {
         allow: bool,
         reason: Option<&str>,
     ) {
+        self.record_event(allow, reason, None);
+    }
+
+    /// Emit the `error` decision for a policy that could not decide.
+    fn record_error(
+        &self,
+        error: crate::observability::PolicyEvaluationError,
+    ) {
+        self.record_event(false, None, Some(error));
+    }
+
+    fn record_event(
+        &self,
+        allow: bool,
+        reason: Option<&str>,
+        error: Option<crate::observability::PolicyEvaluationError>,
+    ) {
         crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
             scope: self.scope,
             allow,
             reason,
+            error,
             policy_id: Some(self.policy_id),
             policy_definition_id: self.policy_definition_id,
             policy_name: self.policy_name,
@@ -2908,13 +2887,41 @@ async fn step_gateway_opa_policy(
             return Err(OutboundPipelineError::GatewayPolicyDenied);
         }
         Err(e) => {
-            audit.record(false, Some(e.as_str()));
+            let error = crate::observability::PolicyEvaluationError::EvaluationError;
+            audit.record_error(error);
             warn!(request_id = %ctx.request_id, error = %e, "Gateway OPA evaluation error (denying)");
-            return Err(OutboundPipelineError::GatewayPolicyError(e.to_string()));
+            return Err(OutboundPipelineError::GatewayPolicyError(error));
         }
     }
 
     Ok(())
+}
+
+/// Record the `error` decision for a configured surface or transit-point
+/// policy that cannot run, and return the fail-closed pipeline error.
+fn record_surface_policy_unavailable(
+    ctx: &OutboundPipelineContext,
+    policy_definition_id: Option<&str>,
+    error: crate::observability::PolicyEvaluationError,
+) -> OutboundPipelineError {
+    let caller = outbound_caller(ctx);
+    OutboundPolicyAudit {
+        scope: crate::observability::PolicyScope::Surface,
+        policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
+        policy_definition_id,
+        policy_name: None,
+        surface_id: ctx.surface.config_id(),
+        http_method: ctx.original_method.as_str(),
+        path: ctx.request_path.as_str(),
+        actor_did: outbound_actor_did(ctx),
+        gateway_did: None,
+        trace_id: &ctx.request_id,
+        policy_version: None,
+        policy_content_hash: None,
+        caller: caller.as_ref(),
+    }
+    .record_error(error);
+    OutboundPipelineError::SurfacePolicyError(error)
 }
 
 /// [10] Surface-Level OPA Policy — evaluates the per-surface outbound Rego policy.
@@ -2936,8 +2943,12 @@ async fn step_surface_opa_policy(
             request_id = %ctx.request_id,
             "[OPA-INPUT] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
         );
-        return Err(OutboundPipelineError::SurfacePolicyError(
-            "Outbound OPA policy configured but policy manager not available".to_string(),
+        return Err(record_surface_policy_unavailable(
+            ctx,
+            ctx.outbound_shared
+                .opa_policy_definition_id
+                .as_deref(),
+            crate::observability::PolicyEvaluationError::NoPolicyManager,
         ));
     };
 
@@ -2955,8 +2966,12 @@ async fn step_surface_opa_policy(
             config_id = %config_id,
             "Outbound OPA policy is configured but engine not found (compilation may have failed); denying"
         );
-        return Err(OutboundPipelineError::SurfacePolicyError(
-            "Outbound OPA policy configured but not compiled".to_string(),
+        return Err(record_surface_policy_unavailable(
+            ctx,
+            ctx.outbound_shared
+                .opa_policy_definition_id
+                .as_deref(),
+            crate::observability::PolicyEvaluationError::PolicyNotCompiled,
         ));
     }
 
@@ -3007,9 +3022,10 @@ async fn step_surface_opa_policy(
             return Err(OutboundPipelineError::SurfacePolicyDenied);
         }
         Err(e) => {
-            audit.record(false, Some(e.as_str()));
+            let error = crate::observability::PolicyEvaluationError::EvaluationError;
+            audit.record_error(error);
             warn!(request_id = %ctx.request_id, error = %e, "Channel OPA evaluation error (denying)");
-            return Err(OutboundPipelineError::SurfacePolicyError(e.to_string()));
+            return Err(OutboundPipelineError::SurfacePolicyError(error));
         }
     }
 
@@ -3086,8 +3102,10 @@ async fn step_transit_point_opa_policy(
             alias = %ctx.virtual_channel.alias,
             "Per-transit-point OPA policy configured but SurfacePolicyManager not available; denying"
         );
-        return Err(OutboundPipelineError::SurfacePolicyError(
-            "Transit point OPA policy configured but policy manager not available".to_string(),
+        return Err(record_surface_policy_unavailable(
+            ctx,
+            Some(tp_def_id.as_str()),
+            crate::observability::PolicyEvaluationError::NoPolicyManager,
         ));
     };
 
@@ -3103,8 +3121,10 @@ async fn step_transit_point_opa_policy(
             alias = %ctx.virtual_channel.alias,
             "Per-transit-point OPA policy configured but engine not found; denying"
         );
-        return Err(OutboundPipelineError::SurfacePolicyError(
-            "Transit point OPA policy configured but not compiled".to_string(),
+        return Err(record_surface_policy_unavailable(
+            ctx,
+            Some(tp_def_id.as_str()),
+            crate::observability::PolicyEvaluationError::PolicyNotCompiled,
         ));
     }
 
@@ -3152,14 +3172,15 @@ async fn step_transit_point_opa_policy(
             return Err(OutboundPipelineError::SurfacePolicyDenied);
         }
         Err(e) => {
-            audit.record(false, Some(e.as_str()));
+            let error = crate::observability::PolicyEvaluationError::EvaluationError;
+            audit.record_error(error);
             warn!(
                 request_id = %ctx.request_id,
                 alias = %ctx.virtual_channel.alias,
                 error = %e,
                 "Per-transit-point OPA evaluation error (denying)"
             );
-            return Err(OutboundPipelineError::SurfacePolicyError(e.to_string()));
+            return Err(OutboundPipelineError::SurfacePolicyError(error));
         }
     }
 
@@ -3406,7 +3427,10 @@ fn step_transit_point_response_policy(
         caller: caller.as_ref(),
     };
     if !decision.allow {
-        audit.record(false, decision.reason.as_deref());
+        match decision.error {
+            Some(error) => audit.record_error(error),
+            None => audit.record(false, decision.reason.as_deref()),
+        }
         warn!(
             request_id = %ctx.request_id,
             alias = %ctx.virtual_channel.alias,
@@ -3713,34 +3737,29 @@ async fn step_inject_trusted_identity(
     // recorded on this (producing) gateway, mirroring the direct/`fabric://`
     // injection sites in `proxy::handler`. The receiving gateway separately
     // audits the same VP on extraction.
-    if let Some(vp_jwt) = injected_vp_jwt
-        && crate::delegation_vault::audit::identity_binding_vp_audit_enabled()
-    {
-        let mut evt = crate::delegation_vault::audit::audit_event(
-            crate::delegation_vault::audit::DelegationAuditAction::VpInjected,
-            None,
-            None,
-            None,
-            Some(
-                ctx.surface
-                    .surface_id
-                    .as_str(),
-            ),
-        );
-        evt.agent_identity_did = Some(did.clone());
-        evt.channel_name = Some(channel_name.to_string());
-        evt.target_endpoint = Some(
-            ctx.virtual_channel
-                .target_endpoint
-                .clone(),
-        );
-        evt.protocol = Some(format!("{:?}", protocol).to_lowercase());
-        evt.via_fabric = true;
-        evt.vp_fingerprint = Some(crate::delegation_vault::audit::vp_fingerprint(&vp_jwt));
-        evt.vp_jwt = Some(vp_jwt);
-        evt.trace_id = Some(ctx.request_id.clone());
-        evt.detail = Some("transit_point".to_string());
-        crate::delegation_vault::audit::audit(evt);
+    if let Some(vp_jwt) = injected_vp_jwt {
+        crate::delegation_vault::audit::emit("vp_injected", || {
+            crate::delegation_vault::audit::vp_injected_event(crate::delegation_vault::audit::VpInjection {
+                agent_did: Some(did.as_str()),
+                user_hash: None,
+                surface_id: Some(
+                    ctx.surface
+                        .surface_id
+                        .as_str(),
+                ),
+                channel_name,
+                target_endpoint: &ctx
+                    .virtual_channel
+                    .target_endpoint,
+                protocol: &format!("{:?}", protocol).to_lowercase(),
+                mcp_tool_name: None,
+                vp_jwt: &vp_jwt,
+                trace_id: Some(&ctx.request_id),
+                detail: "transit_point".to_string(),
+                caller: None,
+                via_fabric: true,
+            })
+        });
     }
 
     Ok(())
@@ -5364,6 +5383,44 @@ mod tests {
             decisions[0]
                 .caller_did
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_policy_audit_records_an_evaluation_error_as_error() {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        use std::sync::Mutex;
+
+        let collector = Arc::new(Mutex::new(Vec::new()));
+        POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), async {
+                OutboundPolicyAudit {
+                    scope: crate::observability::PolicyScope::Response,
+                    policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
+                    policy_definition_id: Some("def-resp-1"),
+                    policy_name: None,
+                    surface_id: Some("surf-2"),
+                    http_method: "POST",
+                    path: "/a2a",
+                    actor_did: None,
+                    gateway_did: None,
+                    trace_id: "req-3",
+                    policy_version: None,
+                    policy_content_hash: None,
+                    caller: None,
+                }
+                .record_error(crate::observability::PolicyEvaluationError::EvaluationError);
+            })
+            .await;
+
+        let decisions = collector.lock().unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "error");
+        assert_eq!(
+            decisions[0]
+                .deny_reason
+                .as_deref(),
+            Some("evaluation_error")
         );
     }
 
@@ -9366,6 +9423,83 @@ mod tests {
             .opa_policy_definition_id = None;
         let result = step_surface_opa_policy(&state, &mut ctx).await;
         assert!(result.is_ok());
+    }
+
+    /// Run `step_surface_opa_policy` with a policy definition configured and
+    /// return the pipeline result plus the recorded decisions.
+    async fn surface_opa_outcome(
+        manager: Option<Arc<crate::policies::SurfacePolicyManager>>
+    ) -> (Result<(), OutboundPipelineError>, Vec<crate::observability::policy_audit::PolicyDecisionSummary>) {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        use std::sync::Mutex;
+
+        let mut state = test_outbound_state();
+        state.policy_manager = manager;
+        let mut ctx = test_pipeline_context();
+        ctx.outbound_shared
+            .opa_policy_definition_id = Some("def-out-1".to_string());
+        let collector = Arc::new(Mutex::new(Vec::new()));
+        let result = POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), step_surface_opa_policy(&state, &mut ctx))
+            .await;
+        let decisions = collector
+            .lock()
+            .unwrap()
+            .clone();
+        (result, decisions)
+    }
+
+    fn assert_error_decision(
+        result: Result<(), OutboundPipelineError>,
+        decisions: &[crate::observability::policy_audit::PolicyDecisionSummary],
+        expected: crate::observability::PolicyEvaluationError,
+    ) {
+        let err = result.expect_err("a policy that could not decide fails closed");
+        assert!(
+            matches!(err, OutboundPipelineError::SurfacePolicyError(e) if e == expected),
+            "expected SurfacePolicyError({expected:?}), got {err:?}"
+        );
+        assert_eq!(err.to_string(), "Request blocked by surface policy", "no engine detail for the caller");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "error");
+        assert_eq!(
+            decisions[0]
+                .deny_reason
+                .as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_opa_without_policy_manager_records_an_error_decision() {
+        let (result, decisions) = surface_opa_outcome(None).await;
+        assert_error_decision(result, &decisions, crate::observability::PolicyEvaluationError::NoPolicyManager);
+    }
+
+    #[tokio::test]
+    async fn surface_opa_without_compiled_policy_records_an_error_decision() {
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        let (result, decisions) = surface_opa_outcome(Some(manager)).await;
+        assert_error_decision(result, &decisions, crate::observability::PolicyEvaluationError::PolicyNotCompiled);
+    }
+
+    #[tokio::test]
+    async fn surface_opa_evaluation_error_records_an_error_decision() {
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        let config_id = test_pipeline_context()
+            .surface
+            .config_id()
+            .unwrap_or("unknown")
+            .to_string();
+        // Compiles, but `allow` gets two values for every input.
+        manager
+            .load_policy_text(
+                &format!("outbound:{config_id}"),
+                "package surface.policy\n\nallow := true if {\n    true\n}\n\nallow := false if {\n    true\n}\n",
+            )
+            .unwrap();
+        let (result, decisions) = surface_opa_outcome(Some(manager)).await;
+        assert_error_decision(result, &decisions, crate::observability::PolicyEvaluationError::EvaluationError);
     }
 
     // ── step_record_metrics ────────────────────────────────────────────────

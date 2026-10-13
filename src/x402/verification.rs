@@ -33,7 +33,13 @@ pub async fn verify_payment(
         Ok(d) => d,
         Err(e) => {
             channel_warn!(channel_id, "Failed to decode payment header error={}", e);
-            return Err("Invalid payment signature encoding".to_string());
+            return Err(unreadable_payment(
+                payment_header,
+                existing_correlation_id,
+                channel_id,
+                channel_name,
+                "Invalid payment signature encoding",
+            ));
         }
     };
     // Parse payment payload
@@ -41,7 +47,13 @@ pub async fn verify_payment(
         Ok(p) => p,
         Err(e) => {
             channel_warn!(channel_id, "Failed to parse payment payload error={}", e);
-            return Err("Invalid payment signature format".to_string());
+            return Err(unreadable_payment(
+                payment_header,
+                existing_correlation_id,
+                channel_id,
+                channel_name,
+                "Invalid payment signature format",
+            ));
         }
     };
 
@@ -50,13 +62,7 @@ pub async fn verify_payment(
     let correlation_id = existing_correlation_id.unwrap_or_else(|| {
         payload
             .tx_hash()
-            .unwrap_or_else(|| {
-                // Fallback to SHA256 of payment signature if tx_hash not available
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                hasher.update(payment_header.as_bytes());
-                format!("{:x}", hasher.finalize())
-            })
+            .unwrap_or_else(|| payment_header_digest(payment_header))
     });
 
     channel_debug!(
@@ -138,48 +144,27 @@ pub async fn verify_payment(
             // Gateway-to-gateway DIDComm verification via facilitator service
             channel_info!(channel_id, "Gateway verification mode - initiating DIDComm verification");
 
-            // Resolve facilitator gateway DID using listener_manager (same pattern as fabric:// forwarding)
-            let facilitator_did = if let Some(gateway_id) = &config.facilitator_gateway_id {
-                channel_debug!(channel_id, "Resolving facilitator gateway DID from ID: {}", gateway_id);
+            // A facilitator that cannot be resolved fails verification like
+            // any other error, so the transaction is marked failed.
+            match resolve_facilitator_did(config, listener_manager.as_ref(), channel_id).await {
+                Err(e) => Err(e),
+                Ok(facilitator_did) => {
+                    channel_info!(channel_id, "Resolved facilitator gateway DID: {}", facilitator_did);
 
-                // Get listener_manager to resolve gateway DID (same as fabric:// forwarding)
-                let listener_mgr = listener_manager
-                    .as_ref()
-                    .ok_or_else(|| {
-                        channel_error!(channel_id, "Listener manager not available for gateway DID resolution");
-                        "Gateway verification requires listener manager to resolve gateway DID".to_string()
-                    })?;
-
-                // Resolve gateway DID (same method as handle_fabric_request uses)
-                listener_mgr
-                    .get_gateway_did(gateway_id)
+                    // Send verification request via gateway facilitator service
+                    // This now waits synchronously for the DIDComm response (like fabric:// forwarding)
+                    crate::x402::verify_via_facilitator_gateway(
+                        &facilitator_did,
+                        payment_header,
+                        &requirement,
+                        channel_id.to_string(),
+                        format!("/resource/{}", channel_name), // TODO: get actual resource path
+                    )
                     .await
-                    .ok_or_else(|| {
-                        channel_error!(channel_id, "Facilitator gateway '{}' not found or not connected", gateway_id);
-                        format!(
-                            "Facilitator gateway '{}' not found. Ensure the gateway is connected via DIDComm.",
-                            gateway_id
-                        )
-                    })?
-            } else {
-                channel_error!(channel_id, "Fabric gateway mode requires facilitator_gateway_id configuration");
-                return Err("No facilitator gateway configured for fabric gateway verification mode".to_string());
-            };
-
-            channel_info!(channel_id, "Resolved facilitator gateway DID: {}", facilitator_did);
-
-            // Send verification request via gateway facilitator service
-            // This now waits synchronously for the DIDComm response (like fabric:// forwarding)
-            crate::x402::verify_via_facilitator_gateway(
-                &facilitator_did,
-                payment_header,
-                &requirement,
-                channel_id.to_string(),
-                format!("/resource/{}", channel_name), // TODO: get actual resource path
-            )
-            .await
-            .inspect(|()| channel_info!(channel_id, "Payment verified successfully via gateway facilitator"))
-            .inspect_err(|e| channel_warn!(channel_id, "Gateway facilitator verification failed: {}", e))
+                    .inspect(|()| channel_info!(channel_id, "Payment verified successfully via gateway facilitator"))
+                    .inspect_err(|e| channel_warn!(channel_id, "Gateway facilitator verification failed: {}", e))
+                }
+            }
         }
         X402VerificationMode::Signature => {
             // Signature-based verification (EIP-3009 / Permit2)
@@ -220,6 +205,74 @@ pub async fn verify_payment(
         }
         Err(e) => Err(fail_verification(&transaction_store, &correlation_id, channel_id, &payload, e).await),
     }
+}
+
+/// Resolve the facilitator gateway's DID for fabric gateway verification,
+/// using the listener manager the same way fabric:// forwarding does.
+async fn resolve_facilitator_did(
+    config: &X402Config,
+    listener_manager: Option<&Arc<ConnectionPointListenerManager>>,
+    channel_id: &str,
+) -> Result<String, String> {
+    let Some(gateway_id) = &config.facilitator_gateway_id else {
+        channel_error!(channel_id, "Fabric gateway mode requires facilitator_gateway_id configuration");
+        return Err("No facilitator gateway configured for fabric gateway verification mode".to_string());
+    };
+    channel_debug!(channel_id, "Resolving facilitator gateway DID from ID: {}", gateway_id);
+
+    let Some(listener_mgr) = listener_manager else {
+        channel_error!(channel_id, "Listener manager not available for gateway DID resolution");
+        return Err("Gateway verification requires listener manager to resolve gateway DID".to_string());
+    };
+
+    listener_mgr
+        .get_gateway_did(gateway_id)
+        .await
+        .ok_or_else(|| {
+            channel_error!(channel_id, "Facilitator gateway '{}' not found or not connected", gateway_id);
+            format!("Facilitator gateway '{}' not found. Ensure the gateway is connected via DIDComm.", gateway_id)
+        })
+}
+
+/// SHA-256 of the payment header: the correlation id when the payload carries
+/// no transaction hash, or cannot be read at all.
+fn payment_header_digest(payment_header: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(payment_header.as_bytes()))
+}
+
+/// A payment header that cannot be decoded or parsed has no transaction to
+/// fail, so record the failed `payment` event directly; returns `error`.
+fn unreadable_payment(
+    payment_header: &str,
+    existing_correlation_id: Option<String>,
+    channel_id: &str,
+    channel_name: &str,
+    error: &str,
+) -> String {
+    use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, PaymentStage, record_payment_event};
+    record_payment_event(
+        PaymentEventDetails {
+            rail: PaymentRail::X402,
+            stage: PaymentStage::Failed,
+            transaction_id: existing_correlation_id.unwrap_or_else(|| payment_header_digest(payment_header)),
+            amount: None,
+            currency: None,
+            method: None,
+            payer: None,
+            error: Some(error.to_string()),
+            delegated: false,
+            payment_gateway_id: None,
+            payment_surface_id: None,
+            remote_status: None,
+        },
+        Some(channel_id),
+        Some(channel_name),
+        None,
+        false,
+        None,
+    );
+    error.to_string()
 }
 
 /// Resolve which of the surface's issued payment requirements a caller's `accepted` refers to.
@@ -1919,6 +1972,119 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// The `payment` records captured while running `future`, as
+    /// (stage, transaction id, error).
+    async fn payment_records<F: std::future::Future>(
+        future: F
+    ) -> (F::Output, Vec<(crate::delegation_vault::audit::PaymentStage, String, Option<String>)>) {
+        let (output, events) = crate::audit::producer::capture(future).await;
+        let payments = events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::PaymentEvent(details) => {
+                    Some((details.stage, details.transaction_id, details.error))
+                }
+                _ => None,
+            })
+            .collect();
+        (output, payments)
+    }
+
+    fn header_digest(header: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(header.as_bytes()))
+    }
+
+    #[tokio::test]
+    async fn undecodable_payment_header_is_recorded_as_failed() {
+        let header = "%%% not base64 %%%";
+        let (result, payments) = payment_records(verify_payment(
+            header,
+            &config(X402VerificationMode::Mock),
+            "Test Channel",
+            "channel-1",
+            "/test",
+            None,
+            None,
+            None,
+        ))
+        .await;
+
+        assert_eq!(result.unwrap_err(), "Invalid payment signature encoding");
+        assert_eq!(
+            payments,
+            vec![(
+                crate::delegation_vault::audit::PaymentStage::Failed,
+                header_digest(header),
+                Some("Invalid payment signature encoding".to_string())
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn unparsable_payment_payload_is_recorded_as_failed() {
+        let header = base64::engine::general_purpose::STANDARD.encode(b"not a payment payload");
+        let (result, payments) = payment_records(verify_payment(
+            &header,
+            &config(X402VerificationMode::Mock),
+            "Test Channel",
+            "channel-1",
+            "/test",
+            None,
+            None,
+            None,
+        ))
+        .await;
+
+        assert_eq!(result.unwrap_err(), "Invalid payment signature format");
+        assert_eq!(
+            payments,
+            vec![(
+                crate::delegation_vault::audit::PaymentStage::Failed,
+                header_digest(&header),
+                Some("Invalid payment signature format".to_string())
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn fabric_gateway_without_facilitator_fails_the_transaction() {
+        let temp_dir = tempdir().unwrap();
+        let store = Arc::new(
+            TransactionStore::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+
+        let (result, payments) = payment_records(verify_payment(
+            &payment_header_for(&configured(), "0x07"),
+            &config(X402VerificationMode::FabricGateway),
+            "Test Channel",
+            "channel-1",
+            "/test",
+            None,
+            Some(Arc::clone(&store)),
+            None,
+        ))
+        .await;
+
+        assert!(result.is_err());
+        let transactions = store.list_all().await;
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(
+            transactions[0]
+                .verification
+                .status,
+            crate::x402::transaction_store::VerificationStatus::Failed
+        );
+        assert!(
+            payments
+                .iter()
+                .any(|(stage, _, _)| *stage == crate::delegation_vault::audit::PaymentStage::Failed),
+            "expected a failed payment record, got {payments:?}"
+        );
     }
 
     #[tokio::test]

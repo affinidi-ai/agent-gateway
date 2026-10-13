@@ -2306,6 +2306,7 @@ pub async fn run_axum_proxy(
             // Initialize global integration storage
             crate::storage::init_integration_storage(storage_arc.clone()).await;
             info!("✓ Global integration storage initialized");
+            crate::audit::sources::rebuild_sinks().await;
 
             if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
                 spawn_x402_cleanup_worker(txn_store);

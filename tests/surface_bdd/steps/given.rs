@@ -88,7 +88,7 @@ fn remember_named_surface_under_test_id(
         .record_surface_id(surface_name, &surface_id);
 }
 
-fn tracked_surface_id(
+pub(crate) fn tracked_surface_id(
     world: &SurfaceWorld,
     surface_name: &str,
 ) -> String {
@@ -254,6 +254,27 @@ allow if {{
     world
         .surface_config
         .request_policy = Some(RequestPolicyFixture::new(policy_id, "BDD caller-context request policy", rego));
+}
+
+#[given("the surface has a request policy that fails to evaluate")]
+fn surface_has_request_policy_that_fails_to_evaluate(world: &mut SurfaceWorld) {
+    let policy_id = format!("bdd-failing-policy-{}", uuid::Uuid::new_v4());
+    // Compiles, but the two rules give `allow` two values for every input,
+    // which is an evaluation error rather than a decision.
+    let rego = r#"package surface.policy
+
+allow := true if {
+    true
+}
+
+allow := false if {
+    true
+}
+"#
+    .to_string();
+    world
+        .surface_config
+        .request_policy = Some(RequestPolicyFixture::new(policy_id, "BDD failing request policy", rego));
 }
 
 #[given(expr = "the surface has a policy denying callers whose source authentication failed")]
@@ -2139,7 +2160,7 @@ async fn vp_audit_log_contains_policy_decision(world: &mut SurfaceWorld) {
     mcp_server_returns_tool_result(world, "bravo".to_string());
     surface_requires_source_auth(world, "JWT Bearer".to_string());
     mcp_surface_has_allow_all_request_policy(world);
-    enable_policy_audit_category(world).await;
+    enable_every_audit_event(world).await;
     crate::steps::when::caller_invokes_mcp_tool_with_valid_token(
         world,
         "alice".to_string(),
@@ -2149,32 +2170,28 @@ async fn vp_audit_log_contains_policy_decision(world: &mut SurfaceWorld) {
     wait_for_audit_events(world, "/v1/audit?limit=100").await;
 }
 
-async fn enable_policy_audit_category(world: &mut SurfaceWorld) {
+pub(crate) async fn enable_every_audit_event(world: &mut SurfaceWorld) {
     crate::steps::when::ensure_admin_session(world).await;
-    let client = world
+    world
         .admin_client
         .as_ref()
-        .expect("admin client must exist");
-    client
-        .send_recorded_json(
-            reqwest::Method::POST,
-            "/v1/settings",
-            Some(&serde_json::json!({
-                "audit_enabled": true,
-                "audit_categories": {
-                    "policies": true,
-                    "trust_checks": true,
-                    "identity": true
-                }
-            })),
-        )
+        .expect("admin client must exist")
+        .enable_every_audit_event()
         .await
-        .expect("enable audit categories through admin API");
+        .unwrap_or_else(|error| panic!("the VP Audit Log must keep every audit event: {error:#}"));
 }
 
-#[given("trust check audit is enabled")]
-async fn trust_check_audit_is_enabled(world: &mut SurfaceWorld) {
-    enable_policy_audit_category(world).await;
+/// A gateway that has not started yet keeps every audit event from its
+/// stored settings; a running one is switched over through the Admin API.
+#[given("the VP Audit Log keeps every audit event")]
+async fn vp_audit_log_keeps_every_audit_event(world: &mut SurfaceWorld) {
+    if crate::steps::when::gateway_is_running(world) {
+        enable_every_audit_event(world).await;
+    } else {
+        world
+            .surface_config
+            .audit_log_keeps_every_event = true;
+    }
 }
 
 #[given(
@@ -2199,6 +2216,7 @@ async fn credential_delegation_audit_log_contains_token_injection_for_caller(
         ]),
     );
 
+    enable_every_audit_event(world).await;
     caller_has_started_oauth_consent(world, caller.clone(), "calendar".to_string()).await;
     oauth_provider_ready_to_exchange_code(world, "calendar".to_string()).await;
     caller_has_completed_oauth_consent(world, caller.clone(), "calendar".to_string()).await;
@@ -2223,6 +2241,7 @@ async fn api_key_delegated_credential_was_injected(
         "x-target-api-key".to_string(),
     );
 
+    enable_every_audit_event(world).await;
     caller_has_invoked_mcp_tool_with_valid_token_and_identity(world, caller, "lookup_place".to_string()).await;
     wait_for_audit_events(world, "/v1/delegation-audit?page_size=100").await;
 }
@@ -2619,6 +2638,37 @@ fn surface_injects_delegated_credentials_into_meta(
     delegation_config_mut(world).inject_as = DelegatedCredentialInjection::Meta { field };
 }
 
+#[given(expr = "the surface admits {int} request(s) per minute")]
+fn surface_admits_requests_per_minute(
+    world: &mut SurfaceWorld,
+    requests: u32,
+) {
+    world
+        .surface_config
+        .rate_limit_per_minute = Some(requests);
+}
+
+#[given("the surface rate limit is reached")]
+async fn surface_rate_limit_is_reached(world: &mut SurfaceWorld) {
+    let admitted = world
+        .surface_config
+        .rate_limit_per_minute
+        .expect("the surface rate limit must be configured before it can be reached");
+    for request in 1..=admitted {
+        crate::steps::when::send_request_and_record(world, vec![]).await;
+        let response = world
+            .caller_response
+            .as_ref()
+            .expect("the admitted request has a response");
+        assert!(
+            (200..300).contains(&response.status),
+            "expected admitted request {request} of {admitted} to succeed, got status {} with body {}",
+            response.status,
+            response.body
+        );
+    }
+}
+
 #[given(expr = "the surface accepts JWT audience {string}")]
 fn surface_accepts_jwt_audience(
     world: &mut SurfaceWorld,
@@ -2921,6 +2971,7 @@ fn a_gateway(
         policy_opa_entry: None,
         terms_enabled: false,
         affinidi_terms_url: None,
+        settings: None,
         identity_route_key: "api".to_string(),
         bootstrap_surfaces: vec![],
         agent_surfaces: HashMap::new(),
@@ -2975,6 +3026,7 @@ fn a_gateway_with_outbound_listener(
         policy_opa_entry: None,
         terms_enabled: false,
         affinidi_terms_url: None,
+        settings: None,
         identity_route_key: "api".to_string(),
         bootstrap_surfaces: vec![],
         agent_surfaces: HashMap::new(),

@@ -129,6 +129,43 @@ fn ensure_audit_integration_is_global(
     Ok(())
 }
 
+/// Audit events are selected only by Governance Audit integrations, and only
+/// from the audit event catalog.
+fn validate_audit_events(
+    category: Option<&str>,
+    events: &[String],
+) -> Result<(), (StatusCode, String)> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    if category != Some(AUDIT_CATEGORY) {
+        return Err((StatusCode::BAD_REQUEST, "Only Governance Audit integrations select audit events".to_string()));
+    }
+    if let Some(unknown) = events
+        .iter()
+        .find(|event| crate::audit::catalog::event_bit(event).is_none())
+    {
+        return Err((StatusCode::BAD_REQUEST, format!("Unknown audit event: {unknown:?}")));
+    }
+    Ok(())
+}
+
+/// A drop policy belongs only to Governance Audit integrations and must be a
+/// positive number of seconds.
+fn validate_audit_drop_after(
+    category: Option<&str>,
+    seconds: Option<u64>,
+) -> Result<(), (StatusCode, String)> {
+    match seconds {
+        None => Ok(()),
+        Some(_) if category != Some(AUDIT_CATEGORY) => {
+            Err((StatusCode::BAD_REQUEST, "Only Governance Audit integrations have an audit drop policy".to_string()))
+        }
+        Some(0) => Err((StatusCode::BAD_REQUEST, "audit_drop_after_secs must be at least 1".to_string())),
+        Some(_) => Ok(()),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateIntegrationRequest {
     #[serde(default)]
@@ -142,6 +179,10 @@ pub struct CreateIntegrationRequest {
     pub configuration: JsonValue,
     pub content: JsonValue,
     pub status: String,
+    #[serde(default)]
+    pub audit_events: Vec<String>,
+    #[serde(default)]
+    pub audit_drop_after_secs: Option<u64>,
 }
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
@@ -185,6 +226,21 @@ pub struct UpdateIntegrationRequest {
     pub configuration: JsonValue,
     pub content: JsonValue,
     pub status: String,
+    /// Omitted keeps an audit integration's current events.
+    #[serde(default)]
+    pub audit_events: Option<Vec<String>>,
+    /// Omitted keeps an audit integration's current drop policy; `null` clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub audit_drop_after_secs: Option<Option<u64>>,
+}
+
+/// Distinguishes a field sent as `null` (`Some(None)`) from one left out (`None`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// List all integrations
@@ -262,6 +318,8 @@ pub async fn create_notifier(
     req.tenant_id = tenant_for_create(req.tenant_id.take(), pat.is_some(), tenant_context(&context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     ensure_audit_integration_is_global(req.category.as_deref(), req.tenant_id.as_deref())?;
+    validate_audit_events(req.category.as_deref(), &req.audit_events)?;
+    validate_audit_drop_after(req.category.as_deref(), req.audit_drop_after_secs)?;
     // Validate name
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Integration name is required".to_string()));
@@ -334,6 +392,8 @@ pub async fn create_notifier(
         req.category,
     );
     integration.tenant_id = req.tenant_id;
+    integration.audit_events = req.audit_events;
+    integration.audit_drop_after_secs = req.audit_drop_after_secs;
     if !integration_allowed(&integration, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".into()));
     }
@@ -435,6 +495,18 @@ pub async fn update_notifier(
             .await?;
     }
     ensure_audit_integration_is_global(req.category.as_deref(), existing.tenant_id.as_deref())?;
+    let audit_events = match req.audit_events {
+        Some(events) => events,
+        None if req.category.as_deref() == Some(AUDIT_CATEGORY) => existing.audit_events,
+        None => Vec::new(),
+    };
+    validate_audit_events(req.category.as_deref(), &audit_events)?;
+    let audit_drop_after_secs = match req.audit_drop_after_secs {
+        Some(seconds) => seconds,
+        None if req.category.as_deref() == Some(AUDIT_CATEGORY) => existing.audit_drop_after_secs,
+        None => None,
+    };
+    validate_audit_drop_after(req.category.as_deref(), audit_drop_after_secs)?;
 
     // Create updated integration
     let now = chrono::Utc::now().to_rfc3339();
@@ -448,6 +520,8 @@ pub async fn update_notifier(
         configuration: req.configuration,
         content: req.content,
         status: req.status,
+        audit_events,
+        audit_drop_after_secs,
         created_at: existing.created_at,
         updated_at: now,
     };
@@ -744,6 +818,27 @@ mod tests {
             existing: &Integration,
             category: &str,
         ) -> StatusCode {
+            self.update_with(user_id, existing, category, None)
+                .await
+        }
+
+        async fn update_events(
+            &self,
+            user_id: &str,
+            existing: &Integration,
+            events: &[&str],
+        ) -> StatusCode {
+            self.update_with(user_id, existing, AUDIT_CATEGORY, Some(events))
+                .await
+        }
+
+        async fn update_with(
+            &self,
+            user_id: &str,
+            existing: &Integration,
+            category: &str,
+            events: Option<&[&str]>,
+        ) -> StatusCode {
             match update_notifier(
                 Extension(self.integrations.clone()),
                 Extension(self.config.clone()),
@@ -763,6 +858,13 @@ mod tests {
                     configuration: existing.configuration.clone(),
                     content: serde_json::json!({"type": "${EVENT_TYPE}"}),
                     status: "active".to_string(),
+                    audit_events: events.map(|events| {
+                        events
+                            .iter()
+                            .map(|event| event.to_string())
+                            .collect()
+                    }),
+                    audit_drop_after_secs: None,
                 }),
             )
             .await
@@ -830,6 +932,8 @@ mod tests {
             configuration: serde_json::json!({"platform": "kafka", "topic": "audit", "brokers": "127.0.0.1:1"}),
             content: serde_json::json!({"type": "${EVENT_TYPE}", "record": "${AUDIT_RECORD}"}),
             status: "active".to_string(),
+            audit_events: Vec::new(),
+            audit_drop_after_secs: None,
         }
     }
 
@@ -844,6 +948,191 @@ mod tests {
         assert_eq!(created.category.as_deref(), Some("audit"));
         assert_eq!(created.tenant_id, None);
         assert_eq!(f.stored().await.len(), 1);
+    }
+
+    fn selecting(
+        mut request: CreateIntegrationRequest,
+        events: &[&str],
+    ) -> CreateIntegrationRequest {
+        request.audit_events = events
+            .iter()
+            .map(|event| event.to_string())
+            .collect();
+        request
+    }
+
+    #[tokio::test]
+    async fn audit_integration_keeps_the_events_it_selects() {
+        let f = fixture().await;
+        let created = f
+            .create(
+                Some(ADMIN),
+                None,
+                f.guard(),
+                selecting(request("audit", None), &["policy_decision", "auth_failed"]),
+            )
+            .await
+            .unwrap();
+
+        let selected = vec!["policy_decision".to_string(), "auth_failed".to_string()];
+        assert_eq!(created.audit_events, selected);
+        assert_eq!(f.stored().await[0].audit_events, selected);
+    }
+
+    #[tokio::test]
+    async fn audit_integration_rejects_an_unknown_event() {
+        let f = fixture().await;
+        let status = f
+            .create(
+                Some(ADMIN),
+                None,
+                f.guard(),
+                selecting(request("audit", None), &["policy_decision", "no_such_event"]),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(f.stored().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_audit_integrations_select_audit_events() {
+        let f = fixture().await;
+        let mut general = selecting(request("general", None), &["policy_decision"]);
+        general.content = serde_json::json!({"type": "${EVENT_TYPE}"});
+        let status = f
+            .create(Some(ADMIN), None, f.guard(), general)
+            .await
+            .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(f.stored().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn updating_an_audit_integration_replaces_its_events() {
+        let f = fixture().await;
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), selecting(request("audit", None), &["policy_decision"]))
+            .await
+            .unwrap();
+
+        let status = f
+            .update_events(ADMIN, &created, &["trust_check"])
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(f.stored().await[0].audit_events, vec!["trust_check".to_string()]);
+
+        let status = f
+            .update_events(ADMIN, &created, &["no_such_event"])
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(f.stored().await[0].audit_events, vec!["trust_check".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn updating_without_events_keeps_an_audit_integrations_events() {
+        let f = fixture().await;
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), selecting(request("audit", None), &["policy_decision"]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.update(ADMIN, &created, AUDIT_CATEGORY)
+                .await,
+            StatusCode::OK
+        );
+        assert_eq!(f.stored().await[0].audit_events, vec!["policy_decision".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn moving_out_of_the_audit_category_clears_the_events() {
+        let f = fixture().await;
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), selecting(request("audit", None), &["policy_decision"]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.update(ADMIN, &created, "general")
+                .await,
+            StatusCode::OK
+        );
+        assert!(
+            f.stored().await[0]
+                .audit_events
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_integration_keeps_its_drop_policy() {
+        let f = fixture().await;
+        let mut audit = request("audit", None);
+        audit.audit_drop_after_secs = Some(3600);
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), audit)
+            .await
+            .unwrap();
+        assert_eq!(created.audit_drop_after_secs, Some(3600));
+        assert_eq!(f.stored().await[0].audit_drop_after_secs, Some(3600));
+    }
+
+    #[tokio::test]
+    async fn a_drop_policy_must_be_positive_and_only_on_audit_integrations() {
+        let f = fixture().await;
+        let mut zero = request("audit", None);
+        zero.audit_drop_after_secs = Some(0);
+        assert_eq!(
+            f.create(Some(ADMIN), None, f.guard(), zero)
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut general = request("general", None);
+        general.content = serde_json::json!({"type": "${EVENT_TYPE}"});
+        general.audit_drop_after_secs = Some(60);
+        assert_eq!(
+            f.create(Some(ADMIN), None, f.guard(), general)
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(f.stored().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_update_keeps_the_drop_policy_unless_it_names_one() {
+        let f = fixture().await;
+        let mut audit = request("audit", None);
+        audit.audit_drop_after_secs = Some(3600);
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), audit)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.update(ADMIN, &created, AUDIT_CATEGORY)
+                .await,
+            StatusCode::OK
+        );
+        assert_eq!(f.stored().await[0].audit_drop_after_secs, Some(3600));
+
+        let cleared: UpdateIntegrationRequest = serde_json::from_value(serde_json::json!({
+            "name": "audit stream",
+            "description": "",
+            "type": "stream",
+            "category": "audit",
+            "configuration": created.configuration,
+            "content": {"type": "${EVENT_TYPE}"},
+            "status": "active",
+            "audit_drop_after_secs": null,
+        }))
+        .unwrap();
+        assert_eq!(cleared.audit_drop_after_secs, Some(None));
     }
 
     #[tokio::test]

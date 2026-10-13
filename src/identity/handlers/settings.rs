@@ -110,7 +110,7 @@ pub struct UpdateSettingsRequest {
     /// Plaintext password — hashed with bcrypt before storing.
     pub prometheus_auth_password: Option<String>,
     pub audit_enabled: Option<bool>,
-    pub audit_categories: Option<crate::storage::settings_store::AuditCategories>,
+    pub audit_events: Option<Vec<String>>,
     /// Id that fills `${APPLIANCE_ID}`; empty leaves the variable unfilled.
     pub appliance_id: Option<String>,
 }
@@ -202,8 +202,8 @@ pub async fn update_settings(
     if let Some(v) = req.audit_enabled {
         settings.audit_enabled = v;
     }
-    if let Some(v) = req.audit_categories {
-        settings.audit_categories = v;
+    if let Some(v) = req.audit_events {
+        settings.audit_events = v;
     }
     if let Some(appliance_id) = req.appliance_id {
         settings.appliance_id = appliance_id
@@ -223,6 +223,7 @@ pub async fn update_settings(
         .save()
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save settings: {}", e)))?;
+    crate::audit::sources::rebuild_sinks().await;
 
     info!(
         "Settings updated: badge_threshold={} minutes, metrics_retention={} minutes, task_activity_window={} seconds, connections_window={} minutes, latency_window={} minutes, temp_channel_ttl={} seconds",
@@ -269,6 +270,7 @@ pub async fn reset_settings(
         .save()
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save settings: {}", e)))?;
+    crate::audit::sources::rebuild_sinks().await;
 
     info!("Settings reset to defaults");
 

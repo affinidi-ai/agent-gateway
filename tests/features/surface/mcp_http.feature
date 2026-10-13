@@ -136,10 +136,12 @@ Feature: HTTP MCP surface forwarding
 
   Scenario: MCP tool policy denies an unlisted tool before reaching the MCP server
     Given the MCP surface enforces a tool policy allowing only tool "get_news"
+    And the VP Audit Log keeps every audit event
     When the caller invokes MCP tool "delete_everything"
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32000
     And MCP server "bravo" was not called
+    And the VP Audit Log's MCP tool policy decisions name the surface by its id
 
   Scenario: MCP tool policy forwards an allowed tool to the MCP server
     Given the MCP surface enforces a tool policy allowing only tool "get_news"

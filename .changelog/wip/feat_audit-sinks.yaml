@@ -1,0 +1,69 @@
+branch: feat/audit-sinks
+changes:
+  added:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Give every VP injection audit record the same fields
+      description: vp_injected records from every injection point (request path, response path, backend agent response, Fabric forward and receive, Transit Point) now carry the trace id, a detail naming the injection point, the VP fingerprint and the caller when known. The backend agent response record, which had no trace id or detail, now reads backend_response, and the Fabric forward record is marked as sent over Fabric.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Record the surface, trace and caller on trust check audit records
+      description: trust_check audit records now carry the surface id, the request's trace id and the authenticated caller on the Access Point, Fabric and MCP-proxy paths, so each outcome can be tied to the request and principal that triggered it.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Give every governance audit record a unique event_id
+      description: Each record written to the VP Audit Log and sent to Governance Audit integrations now carries event_id, a UUID v4. Receivers can use it to recognise a record delivered more than once. Records stored before this change have no event_id and still read.
+  changed:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Store VP Audit selections as audit event names
+      description: Settings › VP Audit now saves the selected audit events as audit_events, a list of event names such as policy_decision, instead of the audit_categories booleans. The settings API takes and returns audit_events and rejects names that are not audit events. Settings saved with audit_categories are read as the matching events (policies as policy_decision, trust_checks as trust_check, identity as vp_injected), so existing selections are kept.
+  fixed:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Audit requests denied because a policy could not decide
+      description: When a gateway, access-point inbound, surface or MCP tool policy raised an evaluation error, had no policy engine, or was enabled without a compiled policy, the request was denied without a policy decision record. These denials are now recorded with decision error and deny_reason evaluation_error, no_policy_manager or policy_not_compiled, on the direct, Fabric and MCP-proxy paths.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Audit trust checks failed because an A2A proxy target's agent card is unavailable
+      description: When an A2A proxy target's agent card could not be synthesized, its target-leg trust checks failed with AGENT_CARD_UNAVAILABLE without a trust_check audit record or metric. They are now recorded like the same failure on the outbound path.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Keep delegation audit records when a request ends before its VP is minted
+      description: Credential delegation records held back until the request's identity VP was minted were lost when the request returned early, for example with 503 when delegated credentials were unavailable. They are now recorded without a VP on every path.
+  removed:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Remove the unused Pre-Authorize Blocked governance audit event
+      description: The audit.pre_authorize_blocked event type is no longer offered for Governance Audit integrations, and the Audit page no longer has a label for it. Nothing in the gateway ever recorded this event, so no audit records are affected.
+  security: []
+  breaking:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: ⭐ Record only the audit events each destination selects
+      description: The VP Audit Log and each Governance Audit integration now record only the audit events selected for them, and nothing is selected by default. After upgrade, the VP Audit Log keeps policy decisions, trust checks and VP injections only if they were enabled before; credential delegation, payment and trace-termination records, which were always written, stop until selected in Settings › VP Audit. Existing Governance Audit integrations receive nothing until events are listed in their audit_events.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Deliver governance audit records at least once from a durable journal
+      description: Audit records are journalled to disk before any destination receives them, and each destination reads the journal from its own position, so a slow or unreachable integration falls behind instead of losing records, and delivery resumes after a restart. A record may be delivered more than once; deduplicate on event_id. Integrations no longer depend on the VP Audit Log keeping a record. The journal lives in the audit log directory under journal/. A record no destination selects is not built at all, so unselected events cost nothing, including the signed VP a consent-granted record may carry.
+  internal:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Move the governance audit event catalog into its own module with groups
+      description: The list of governance audit events now lives in the audit module and gives each event a group (policies, trust, identity, trace, delegation, payments). The Governance Audit integration category lists the group with each event type, so the dashboard can show events grouped.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Define the authentication, identity binding and request audit event types
+      description: Adds the auth_failed, rate_limited, request_rejected, identity_binding_failed, identity_binding_verified, delegation_failed, request_failed and request_completed audit records and lists them in the catalog under the auth, identity, delegation and requests groups. Nothing produces them yet.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Add the audit sink registry
+      description: Each audit destination (the VP Audit Log and each Governance Audit integration) is a sink with its own set of selected events. The registry keeps, per event, the sinks that selected it, and the union of all selections as an atomic so the request path can check whether any sink wants an event without taking a lock.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Let each Governance Audit integration store the audit events it selects
+      description: Integrations carry audit_events, a list of audit event names, accepted only on Governance Audit integrations and only with names from the audit event catalog. An update that omits the field keeps an audit integration's current events. The sink registry is rebuilt at startup and whenever settings or integrations change.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Add the durable audit journal
+      description: Produced audit records are appended to journal segment files by a dedicated writer thread that batches them (up to 256 records or 5 ms), syncs them to disk and only then publishes them as durable. On restart the journal continues its sequence and cuts off a partial last line left by a crash. When the journal cannot be written, the writer retries with backoff and keeps up to 10,000 records waiting; beyond that the oldest are discarded and counted in agent_gateway_audit_records_lost_total{reason="journal_write"}. Handing a record to the journal never waits.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Deliver journalled audit records to each sink from its own cursor
+      description: A dispatcher runs one reader per audit sink. Each reader delivers the durable journal entries addressed to its sink in order, retries a failed delivery with backoff without moving past it, and saves its cursor after each batch so it resumes there after a restart. A new sink reads from the start of the journal, which misses nothing since no record is addressed to a sink before it exists. A removed sink's cursor is parked: it no longer holds back pruning, and a sink that comes back resumes where it stopped. Journal segments every cursor has passed are deleted. The journal's size is reported in agent_gateway_audit_journal_bytes and logged as a warning above 256 MiB; above 1 GiB every sink still in the oldest segment is moved past it so it can be deleted, and the records each skips are counted in agent_gateway_audit_sink_skipped_total{reason="backlog_cap"}.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Let a Governance Audit integration skip records older than a set age
+      description: Governance Audit integrations accept audit_drop_after_secs. Records older than that are skipped for the integration instead of delivered, including a record still being retried, and counted in agent_gateway_audit_sink_skipped_total{reason="expired"}. An update that leaves the field out keeps it; null clears it. Without it nothing is skipped.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Add the VP Audit Log sink
+      description: The VP Audit Log becomes a sink that appends delivered records to delegation-audit.jsonl in the existing format and syncs the file once per batch before the dispatcher saves its cursor; a failed sync makes the batch be read again. It remembers the event ids at the end of the log and those it has written, so a record delivered again is not written twice.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Add the Governance Audit integration sink
+      description: Each Governance Audit integration becomes a sink that renders a record exactly as before and publishes it; a failed publish is reported so the dispatcher retries instead of dropping it. The current forwarder shares the same publish step.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Add the audit producer and the deferred-audit guard
+      description: The producer is the one place an audit record is finalised. It builds a record only when a sink selects its event, decides the recipients from the current sinks, gives it an event id and hands it to the journal without waiting, counting it in agent_gateway_audit_records_produced_total. The deferred-audit guard holds records until the request's identity VP is known and stamps them with it; whatever it still holds when dropped is submitted without a VP, so no return path loses them.

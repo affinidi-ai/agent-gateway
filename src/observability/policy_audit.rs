@@ -105,16 +105,11 @@ tokio::task_local! {
 /// Snapshot the current decisions as a JSON array for embedding in a VP.
 /// Returns `None` when the collector is empty or inactive.
 ///
-/// Also returns `None` when the operator has not enabled the `policies` VP
-/// audit category (Settings › Security): disabling policy-decision auditing
-/// stops the signed `policyDecisions` from being embedded in minted VPs, so the
-/// switch governs *all* policy-decision evidence recording, not just the JSONL
-/// audit log.
+/// Also returns `None` when no audit sink selects `policy_decision`: the
+/// signed `policyDecisions` are embedded in minted VPs only while policy
+/// decisions are being audited.
 pub fn current_policy_decisions() -> Option<serde_json::Value> {
-    let policies_audit_enabled = crate::storage::settings_store::global_settings()
-        .map(|s| s.audit_category_enabled("policies"))
-        .unwrap_or(false);
-    if !policies_audit_enabled {
+    if !crate::audit::producer::producer().wants("policy_decision") {
         return None;
     }
     POLICY_DECISION_COLLECTOR
@@ -181,6 +176,8 @@ pub enum PolicyScope {
     McpTool,
     /// Response-leg policy (outbound payload to the caller).
     Response,
+    /// Filtering of an MCP `tools/list` response by tool policy and gating.
+    McpToolList,
 }
 
 impl PolicyScope {
@@ -191,6 +188,7 @@ impl PolicyScope {
             PolicyScope::Surface => "surface",
             PolicyScope::McpTool => "mcp_tool",
             PolicyScope::Response => "response",
+            PolicyScope::McpToolList => "mcp_tool_list",
         }
     }
 }
@@ -245,6 +243,25 @@ fn decision_caller(event: &PolicyDecisionEvent<'_>) -> Option<crate::delegation_
         .or_else(|| event.caller.cloned())
 }
 
+/// Why a policy could not reach a decision. The request is denied (fail
+/// closed) and the decision is recorded as `error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyEvaluationError {
+    EvaluationError,
+    NoPolicyManager,
+    PolicyNotCompiled,
+}
+
+impl PolicyEvaluationError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EvaluationError => "evaluation_error",
+            Self::NoPolicyManager => "no_policy_manager",
+            Self::PolicyNotCompiled => "policy_not_compiled",
+        }
+    }
+}
+
 /// A single policy decision to be recorded. Optional fields are tolerated so
 /// the same shape works at every evaluation point regardless of how much
 /// context has been resolved by the time the decision is made (e.g. the
@@ -255,6 +272,10 @@ pub struct PolicyDecisionEvent<'a> {
     pub scope: PolicyScope,
     /// `true` = allowed, `false` = denied.
     pub allow: bool,
+    /// Set when the policy could not decide; the request was denied.
+    pub error: Option<PolicyEvaluationError>,
+    /// Tools a `tools/list` filter removed (scope `McpToolList`).
+    pub removed_tools: Option<&'a [String]>,
     /// Human-readable deny reason, when the policy supplied one.
     pub reason: Option<&'a str>,
     /// Policy/definition identifier — for gateway/surface scopes this is the
@@ -301,6 +322,30 @@ pub struct PolicyDecisionEvent<'a> {
 /// Denials are logged at `WARN` (reaching the OTEL log exporter); allows at
 /// `DEBUG`. The event is emitted within the active request span, so it is
 /// correlated to the distributed trace automatically.
+/// Records which tools a `tools/list` filter took out of the catalog: an
+/// `allow` decision with scope `McpToolList` naming the removed tools. Nothing
+/// is recorded when no tool was removed. `context` carries the request fields.
+pub fn record_tools_list_filtering(
+    listed: &[String],
+    kept: &[String],
+    context: PolicyDecisionEvent<'_>,
+) {
+    let removed: Vec<String> = listed
+        .iter()
+        .filter(|tool| !kept.contains(tool))
+        .cloned()
+        .collect();
+    if removed.is_empty() {
+        return;
+    }
+    record_policy_decision(PolicyDecisionEvent {
+        scope: PolicyScope::McpToolList,
+        allow: true,
+        removed_tools: Some(&removed),
+        ..context
+    });
+}
+
 pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     let (auth_method, principal, did_from_identity) = match event.identity {
         Some(id) => caller_fields(id),
@@ -313,15 +358,18 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
         .or(did_from_identity)
         .unwrap_or_default();
 
-    let decision = if event.allow {
-        "allow"
-    } else {
-        "deny"
+    let allowed = event.allow && event.error.is_none();
+    let decision = match (event.error, allowed) {
+        (Some(_), _) => "error",
+        (None, true) => "allow",
+        (None, false) => "deny",
     };
     let scope = event.scope.as_str();
     let flow = event.flow.as_str();
     let reason = event
-        .reason
+        .error
+        .map(PolicyEvaluationError::as_str)
+        .or(event.reason)
         .unwrap_or_default();
     let policy_id = event
         .policy_id
@@ -357,7 +405,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
         .policy_content_hash
         .unwrap_or_default();
 
-    if event.allow {
+    if allowed {
         tracing::debug!(
             target: "policy_audit",
             policy_scope = scope,
@@ -399,30 +447,21 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             trace_id = trace_id,
             policy_version = policy_version_str.as_str(),
             policy_content_hash = policy_content_hash,
-            "policy decision: deny"
+            "policy decision: {decision}"
         );
     }
 
-    // Whether operators enabled recording of policy-decision evidence. This
-    // single switch gates BOTH the JSONL VP audit log entry and the signed
-    // `policyDecisions` embedded in the minted VP, so disabling the category in
-    // Settings › Security stops all policy-decision evidence recording (not just
-    // the JSONL log). The structured `policy_audit` tracing events above are
-    // always emitted for operational observability and are unaffected.
-    let policies_audit_enabled = crate::storage::settings_store::global_settings()
-        .map(|s| s.audit_category_enabled("policies"))
-        .unwrap_or(false);
-
-    // Write to VP audit log when the policies category is enabled.
-    if policies_audit_enabled {
-        let is_allow = event.allow;
+    // A record is built only when an audit sink selects `policy_decision`; the
+    // same selection decides whether the signed `policyDecisions` are embedded
+    // in minted VPs. The `policy_audit` tracing events above are always emitted.
+    if crate::audit::producer::producer().wants("policy_decision") {
         crate::delegation_vault::audit::audit_policy_decision(
             scope,
-            is_allow,
+            decision,
             policy_id,
             event.policy_name,
             event.policy_definition_id,
-            if is_allow {
+            if allowed {
                 None
             } else {
                 Some(reason)
@@ -452,6 +491,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             event.policy_version,
             event.policy_content_hash,
             decision_caller(&event),
+            event.removed_tools,
         );
     }
 
@@ -460,21 +500,8 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     // request. The collector is always populated; whether these decisions are
     // actually embedded into a minted VP is gated at the embedding site by the
     // same `policies` audit category.
-    let is_allow = event.allow;
-    let deny_reason_val = if is_allow {
-        None
-    } else {
-        event
-            .reason
-            .map(str::to_string)
-    };
-    let decision_str = if is_allow {
-        "allow"
-    } else {
-        "deny"
-    };
-    let id =
-        compute_decision_id(scope, policy_id, decision_str, deny_reason_val.as_deref(), resolved_trace_id.as_deref());
+    let deny_reason_val = (!allowed && !reason.is_empty()).then(|| reason.to_string());
+    let id = compute_decision_id(scope, policy_id, decision, deny_reason_val.as_deref(), resolved_trace_id.as_deref());
     // Use the operator-assigned definition name when available; fall back to the Rego package name.
     let policy_name_val = event
         .policy_name
@@ -495,7 +522,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             .policy_definition_id
             .filter(|d| !d.is_empty())
             .map(str::to_string),
-        decision: decision_str,
+        decision,
         deny_reason: deny_reason_val,
         surface_id: if surface_id.is_empty() {
             None
@@ -780,6 +807,8 @@ mod tests {
                 policy_version: Some(3),
                 policy_content_hash: Some("sha256:abc123"),
                 caller: None,
+                error: None,
+                removed_tools: None,
             });
         });
 
@@ -805,6 +834,133 @@ mod tests {
         assert_eq!(field(ev, "gateway_did"), Some("did:web:gw1"));
         assert_eq!(field(ev, "policy_version"), Some("3"));
         assert_eq!(field(ev, "policy_content_hash"), Some("sha256:abc123"));
+    }
+
+    #[tokio::test]
+    async fn a_policy_that_could_not_decide_is_recorded_as_an_error() {
+        for (error, reason) in [
+            (PolicyEvaluationError::EvaluationError, "evaluation_error"),
+            (PolicyEvaluationError::NoPolicyManager, "no_policy_manager"),
+            (PolicyEvaluationError::PolicyNotCompiled, "policy_not_compiled"),
+        ] {
+            let ((), events) = crate::audit::producer::capture(async {
+                record_policy_decision(PolicyDecisionEvent {
+                    scope: PolicyScope::Surface,
+                    error: Some(error),
+                    policy_id: Some("surface.policy"),
+                    surface_id: Some("surface-a"),
+                    ..Default::default()
+                });
+            })
+            .await;
+
+            assert_eq!(events.len(), 1, "{reason}");
+            match &events[0].event {
+                crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                    decision, deny_reason, ..
+                } => {
+                    assert_eq!(decision, "error");
+                    assert_eq!(deny_reason.as_deref(), Some(reason));
+                }
+                other => panic!("expected a policy decision, got {other:?}"),
+            }
+        }
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tools_removed_from_a_tools_list_are_recorded() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_tools_list_filtering(
+                &names(&["search", "delete_repo", "read_file", "drop_table"]),
+                &names(&["search", "read_file"]),
+                PolicyDecisionEvent {
+                    surface_id: Some("surface-a"),
+                    trace_id: Some("trace-1"),
+                    ..Default::default()
+                },
+            );
+        })
+        .await;
+
+        assert_eq!(events.len(), 1);
+        match &events[0].event {
+            crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                scope,
+                decision,
+                removed_tools,
+                surface_id,
+                ..
+            } => {
+                assert_eq!(scope, "mcp_tool_list");
+                assert_eq!(decision, "allow");
+                assert_eq!(removed_tools.as_deref(), Some(names(&["delete_repo", "drop_table"]).as_slice()));
+                assert_eq!(surface_id.as_deref(), Some("surface-a"));
+            }
+            other => panic!("expected a policy decision, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tools_list_with_nothing_removed_is_not_recorded() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_tools_list_filtering(&names(&["search"]), &names(&["search"]), PolicyDecisionEvent::default());
+        })
+        .await;
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_decision_without_removed_tools_omits_the_field() {
+        let event = crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+            scope: "surface".to_string(),
+            flow: "access_point".to_string(),
+            policy_id: "surface.policy".to_string(),
+            policy_name: None,
+            policy_definition_id: None,
+            decision: "allow".to_string(),
+            deny_reason: None,
+            surface_id: None,
+            caller_did: None,
+            http_method: None,
+            http_path: None,
+            policy_version: None,
+            policy_content_hash: None,
+            removed_tools: None,
+        };
+        let stored = serde_json::to_value(event).unwrap();
+        assert!(
+            stored["policy_decision"]
+                .get("removed_tools")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_error_decision_is_logged_at_warn() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer { events: events.clone() });
+        tracing::subscriber::with_default(subscriber, || {
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Gateway,
+                error: Some(PolicyEvaluationError::PolicyNotCompiled),
+                ..Default::default()
+            });
+        });
+        let captured = events.lock().unwrap();
+        let ev = captured
+            .iter()
+            .find(|e| field(e, "policy_scope") == Some("gateway"))
+            .expect("policy decision event not captured");
+        assert_eq!(ev.level, "WARN");
+        assert_eq!(field(ev, "policy_decision"), Some("error"));
+        assert_eq!(field(ev, "deny_reason"), Some("policy_not_compiled"));
     }
 
     #[test]

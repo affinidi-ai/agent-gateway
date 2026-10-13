@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Deny fabric requests to a surface that has OPA enabled but no compiled policy, as the direct path already did; they were let through.
+- Enforce the appliance-wide surface policy on every fabric request; it ran only when the surface had its own compiled policy.
+- Stop returning OPA engine error text to callers when a policy cannot decide; callers get the generic denial and the detail stays in the gateway log.
+
+### Fixed
+
+- Send `Retry-After` when an Access Point rate limit refuses a request with 429; it was never set.
+
 ## [1.0.0]
 
 ### Added

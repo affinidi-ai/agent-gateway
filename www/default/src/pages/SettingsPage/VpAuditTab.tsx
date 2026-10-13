@@ -10,11 +10,7 @@ interface VpAuditTabProps {
 
 const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => {
   const [auditEnabled, setAuditEnabled] = useState(settings?.audit_enabled ?? false);
-  const [categories, setCategories] = useState({
-    policies: settings?.audit_categories?.policies ?? false,
-    trust_checks: settings?.audit_categories?.trust_checks ?? false,
-    identity: settings?.audit_categories?.identity ?? false,
-  });
+  const [events, setEvents] = useState<string[]>(settings?.audit_events ?? []);
   const [isSaving, setIsSaving] = useState(false);
   const initialized = useRef(false);
 
@@ -24,12 +20,15 @@ const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => 
     if (initialized.current || settings === null) return;
     initialized.current = true;
     setAuditEnabled(settings.audit_enabled ?? false);
-    setCategories({
-      policies: settings.audit_categories?.policies ?? false,
-      trust_checks: settings.audit_categories?.trust_checks ?? false,
-      identity: settings.audit_categories?.identity ?? false,
-    });
+    setEvents(settings.audit_events ?? []);
   }, [settings]);
+
+  const toggleEvent = (event: string, selected: boolean) =>
+    setEvents(prev =>
+      selected
+        ? [...prev.filter(name => name !== event), event]
+        : prev.filter(name => name !== event)
+    );
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -38,7 +37,7 @@ const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => 
     try {
       await updateSettings({
         audit_enabled: auditEnabled,
-        audit_categories: categories,
+        audit_events: events,
       });
       showToast('success', 'VP Audit settings saved!');
     } catch (error) {
@@ -91,9 +90,9 @@ const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => 
                   type="checkbox"
                   className="custom-control-input"
                   id="cat_policies"
-                  data-testid="vp-audit-category-policies"
-                  checked={categories.policies}
-                  onChange={e => setCategories(prev => ({ ...prev, policies: e.target.checked }))}
+                  data-testid="vp-audit-event-policy_decision"
+                  checked={events.includes('policy_decision')}
+                  onChange={e => toggleEvent('policy_decision', e.target.checked)}
                 />
                 <label className="custom-control-label" htmlFor="cat_policies">
                   Policy Decisions
@@ -112,11 +111,9 @@ const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => 
                   type="checkbox"
                   className="custom-control-input"
                   id="cat_trust_checks"
-                  data-testid="vp-audit-category-trust_checks"
-                  checked={categories.trust_checks}
-                  onChange={e =>
-                    setCategories(prev => ({ ...prev, trust_checks: e.target.checked }))
-                  }
+                  data-testid="vp-audit-event-trust_check"
+                  checked={events.includes('trust_check')}
+                  onChange={e => toggleEvent('trust_check', e.target.checked)}
                 />
                 <label className="custom-control-label" htmlFor="cat_trust_checks">
                   Trust Checks
@@ -135,9 +132,9 @@ const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => 
                   type="checkbox"
                   className="custom-control-input"
                   id="cat_identity"
-                  data-testid="vp-audit-category-identity"
-                  checked={categories.identity}
-                  onChange={e => setCategories(prev => ({ ...prev, identity: e.target.checked }))}
+                  data-testid="vp-audit-event-vp_injected"
+                  checked={events.includes('vp_injected')}
+                  onChange={e => toggleEvent('vp_injected', e.target.checked)}
                 />
                 <label className="custom-control-label" htmlFor="cat_identity">
                   Identity Bindings
