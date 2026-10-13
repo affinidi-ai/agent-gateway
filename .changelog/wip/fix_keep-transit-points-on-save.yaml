@@ -18,9 +18,12 @@ changes:
       description: >-
         Saving a surface from the dashboard dropped an empty list of retryable status
         codes, so the gateway fell back to its default codes and retried calls on 5xx
-        that the operator had limited to transport errors. Zeros for retry attempts,
+        that the operator had limited to connection errors. Zeros for retry attempts,
         the circuit-breaker failure threshold and its timeout were saved as 3, 5 and
-        30. The dashboard now keeps these values as stored.
+        30. The dashboard now keeps these values as stored. An empty list shows as a
+        new Retry on connection errors only switch, an empty codes field still means
+        the gateway default, and input that is not a list of HTTP status codes blocks
+        Save instead of being saved as an empty list.
     - timestamp: '2026-10-12T11:55:15.000Z'
       title: Stop the dashboard restoring Networking settings removed through the API
       description: >-
@@ -53,6 +56,8 @@ changes:
       title: Test Networking values and stale canvas data across load and save
       description: >-
         Adds dashboard tests that an empty status-code list and stored zeros survive a
-        load and save, that Networking removed through the API is not restored from the
-        canvas data for the Target and for a Transit Point, that Networking moved between
-        them stays where the API put it, and that its layout is still restored.
+        load and save, that the status-code field tells the gateway default, connection
+        errors only and invalid input apart, that Networking removed through the API is
+        not restored from the canvas data for the Target and for a Transit Point, that
+        Networking moved between them stays where the API put it, and that its layout is
+        still restored.

@@ -7,6 +7,7 @@ import {
 import { nodesFromSurface } from '../../nodesFromSurface';
 
 const incomplete = (c: any) => networkingDefinition.incompleteReason!(c);
+const validate = (c: any) => networkingDefinition.validate!(c);
 
 describe('networking configFromPayload', () => {
   it('is registered on the definition', () => {
@@ -124,15 +125,54 @@ describe('networkingConfigFromWire edge cases', () => {
     expect(endpointRule.check(flat)).toBe(false);
   });
 
-  it('keeps an empty list of retryable status codes through a load and save', () => {
+  it('loads an empty list of retryable status codes as connection errors only', () => {
     const wire = { retry: { max_attempts: 2, retryable_status_codes: [] } };
     const flat = networkingConfigFromWire(wire);
-    expect(flat).toEqual({ retry_enabled: true, retry_max: '2', retry_status_codes: '' });
+    expect(flat).toEqual({
+      retry_enabled: true,
+      retry_max: '2',
+      retry_connection_errors_only: true,
+    });
     expect(networkingConfigToWire(flat)).toEqual(wire);
   });
 
-  it('leaves the status codes to the gateway default when they were never set', () => {
-    expect(networkingConfigToWire({ retry_enabled: true })).toEqual({ retry: { max_attempts: 3 } });
+  it('saves connection errors only as an empty list whatever the field holds', () => {
+    expect(
+      networkingConfigToWire({
+        retry_enabled: true,
+        retry_connection_errors_only: true,
+        retry_status_codes: '502',
+      })
+    ).toEqual({ retry: { max_attempts: 3, retryable_status_codes: [] } });
+  });
+
+  it('leaves the status codes to the gateway default when the field is unset or empty', () => {
+    for (const retry_status_codes of [undefined, '', ' , ']) {
+      expect(networkingConfigToWire({ retry_enabled: true, retry_status_codes })).toEqual({
+        retry: { max_attempts: 3 },
+      });
+    }
+  });
+
+  it('flags status codes that are not HTTP status codes', () => {
+    for (const retry_status_codes of ['abc', '502,abc', '5000', '99', '502x', '600']) {
+      expect(validate({ retry_enabled: true, retry_status_codes })).toEqual([
+        {
+          field: 'retry_status_codes',
+          message: 'Enter HTTP status codes separated by commas, e.g. 502,503,504',
+        },
+      ]);
+    }
+  });
+
+  it('accepts status codes, an empty field, connection errors only and disabled retry', () => {
+    expect(validate({ retry_enabled: true, retry_status_codes: '408, 502,503' })).toEqual([]);
+    expect(validate({ retry_enabled: true, retry_status_codes: '' })).toEqual([]);
+    expect(validate({ retry_enabled: true })).toEqual([]);
+    expect(
+      validate({ retry_enabled: true, retry_connection_errors_only: true, retry_status_codes: 'x' })
+    ).toEqual([]);
+    expect(validate({ retry_enabled: false, retry_status_codes: 'x' })).toEqual([]);
   });
 
   it('keeps stored zeros through a load and save', () => {

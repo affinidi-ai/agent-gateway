@@ -10,6 +10,15 @@ function intOr(v: unknown, fallback: number): number {
   return Number.isNaN(n) ? fallback : n;
 }
 
+/** Panel status codes as numbers; null when any entry is not an HTTP status code. */
+function parseStatusCodes(v: unknown): number[] | null {
+  const entries = String(v ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  return entries.every(e => /^[1-5]\d\d$/.test(e)) ? entries.map(e => parseInt(e, 10)) : null;
+}
+
 /**
  * Convert the panel's flat config shape into the wire-format
  * NetworkingConfig object. Returns `undefined` when no sub-feature is
@@ -27,6 +36,9 @@ export function networkingConfigToWire(c: any): Record<string, any> | undefined 
     };
   }
   if (c.retry_enabled) {
+    // Connection errors only saves an explicit empty list. An empty field
+    // leaves the codes to the gateway default.
+    const codes = c.retry_connection_errors_only ? [] : parseStatusCodes(c.retry_status_codes);
     out.retry = {
       max_attempts: intOr(c.retry_max, 3),
       ...(c.retry_initial_backoff_ms
@@ -36,15 +48,8 @@ export function networkingConfigToWire(c: any): Record<string, any> | undefined 
       ...(c.retry_backoff_multiplier
         ? { backoff_multiplier: parseFloat(c.retry_backoff_multiplier) }
         : {}),
-      // An empty field keeps an explicit empty list (retry on transport
-      // errors only); only a field that was never set uses the server default.
-      ...(c.retry_status_codes !== undefined && c.retry_status_codes !== null
-        ? {
-            retryable_status_codes: String(c.retry_status_codes)
-              .split(',')
-              .map((s: string) => parseInt(s.trim(), 10))
-              .filter((n: number) => !Number.isNaN(n)),
-          }
+      ...(codes && (codes.length > 0 || c.retry_connection_errors_only)
+        ? { retryable_status_codes: codes }
         : {}),
     };
   }
@@ -101,7 +106,8 @@ export function networkingConfigFromWire(wire: unknown): Record<string, any> {
     put('retry_max_backoff_ms', r.max_backoff_ms);
     put('retry_backoff_multiplier', r.backoff_multiplier);
     if (Array.isArray(r.retryable_status_codes)) {
-      out.retry_status_codes = r.retryable_status_codes.join(',');
+      if (r.retryable_status_codes.length === 0) out.retry_connection_errors_only = true;
+      else out.retry_status_codes = r.retryable_status_codes.join(',');
     }
   }
   const cb = w.circuit_breaker;
@@ -183,6 +189,17 @@ export const networkingDefinition: NodeDefinition = {
     !(c.timeout_secs || c.retry_enabled || c.circuit_breaker_enabled || c.mirror_enabled)
       ? 'At least one networking option must be configured'
       : null,
+  validate: c =>
+    c.retry_enabled &&
+    !c.retry_connection_errors_only &&
+    parseStatusCodes(c.retry_status_codes) === null
+      ? [
+          {
+            field: 'retry_status_codes',
+            message: 'Enter HTTP status codes separated by commas, e.g. 502,503,504',
+          },
+        ]
+      : [],
   featureDependencies: [
     {
       description: 'Mirror percentage must be between 0 and 100',
