@@ -223,9 +223,7 @@ including the agent identity extension, need no change.
 Two gaps remain. With `[a2a] validate_messages` off, a JSON-RPC batch or a non-string `method`
 reaches policy with neither `input.a2a.method` nor `input.a2a.method_canonical`, so no rule keyed on
 the method sees it; keep validation on, which refuses both with `-32600`. On a `fabric://` surface
-the request is never validated, so the same applies whatever the setting. A body that is not valid
-JSON is refused with `-32700` on every A2A and AP2 surface regardless (see the extended agent card
-rules below).
+the request is never validated, so the same applies whatever the setting.
 
 The allow-list and message-shape patterns are pinned against the policy engine by the tests in
 [`src/surface_context/mod.rs`](../src/surface_context/mod.rs).
@@ -318,14 +316,15 @@ empty HTTP+JSON body, a card or `result` that is not a JSON object, and both `re
 A public card that cannot be rewritten is answered with `502` on the direct inbound path and
 forwarded as received on fabric and outbound paths.
 
-On A2A and AP2 surfaces and transit points, two kinds of request are rejected before they are
-forwarded, whatever `validate_messages` is set to and for `fabric://` targets too. A non-empty body
-that is not valid JSON is rejected with `-32700`, because a lenient Target parser may still read it
-as an extended-card call the gateway cannot detect (for example a body with `NaN`, a lone surrogate
-escape, a leading byte-order mark or trailing bytes). A JSON-RPC batch that contains an
-extended-card call is rejected with `-32600`, because a card inside a batch response cannot be
+A JSON-RPC batch that contains an extended-card call is rejected with `-32600` before it is
+forwarded, whatever `validate_messages` is set to, because a card inside a batch response cannot be
 rewritten. A compressed card cannot be rewritten either, so an extended-card fetch is forwarded with
 `Accept-Encoding: identity` in place of the caller's value.
+
+Extended cards are detected the same way as the public card: from the request's JSON-RPC method or
+path. A request the gateway cannot recognise, such as a body it cannot parse (when
+`validate_messages` is off, on `fabric://` targets and on outbound transit points) or a card path
+it does not match, is forwarded like any other request and its response is not rewritten.
 
 An extended card is always fetched by a caller, so with `from_jwt_claim` managed identity it needs
 the caller's validated JWT claims like any other response; without them the request fails with

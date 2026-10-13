@@ -3512,7 +3512,7 @@ fn managed_agent_publishes_v1_extended_card(
 
 /// A reply to the extended-card method whose `result` is not a card: a bare
 /// backend URL the gateway cannot rewrite.
-#[given(expr = "managed agent {string} answers the extended-card method with a non-card result")]
+#[given(expr = "managed agent {string} publishes a non-card extended-card result")]
 fn managed_agent_answers_extended_card_with_non_card(
     world: &mut SurfaceWorld,
     agent_name: String,

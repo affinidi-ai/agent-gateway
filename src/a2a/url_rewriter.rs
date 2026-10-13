@@ -477,68 +477,23 @@ pub fn requests_extended_agent_card(request_body: &[u8]) -> bool {
         .is_ok_and(|request| calls_extended_agent_card_method(&request))
 }
 
-fn batch_calls_extended_agent_card(request: &serde_json::Value) -> bool {
-    request
-        .as_array()
-        .is_some_and(|calls| {
-            calls
-                .iter()
-                .any(calls_extended_agent_card_method)
-        })
-}
+/// The JSON-RPC error message for a refused extended-card batch.
+pub const EXTENDED_AGENT_CARD_BATCH_REFUSAL: &str =
+    "Invalid Request: an extended agent card request must be a single JSON-RPC object";
 
-/// Why an A2A request body is refused before forwarding, whatever
-/// `validate_messages` says: the gateway could not tell whether it asks for an
-/// extended agent card, or could not rewrite the card in its response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnforwardableA2aRequest {
-    /// A non-empty body that is not valid JSON. A lenient Target parser may still
-    /// read it as an extended-card call the gateway cannot detect.
-    NotJson,
-    /// A JSON-RPC batch containing an extended-card call; a card inside a batch
-    /// response cannot be rewritten.
-    ExtendedAgentCardBatch,
-}
-
-impl UnforwardableA2aRequest {
-    pub fn jsonrpc_code(self) -> i32 {
-        match self {
-            Self::NotJson => -32700,
-            Self::ExtendedAgentCardBatch => -32600,
-        }
-    }
-
-    pub fn message(self) -> &'static str {
-        match self {
-            Self::NotJson => "Parse error: the request body is not valid JSON",
-            Self::ExtendedAgentCardBatch => {
-                "Invalid Request: an extended agent card request must be a single JSON-RPC object"
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for UnforwardableA2aRequest {
-    fn fmt(
-        &self,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
-        f.write_str(self.message())
-    }
-}
-
-/// Classify an A2A request body that must not be forwarded. An empty body (such
-/// as a `GET`) is always forwardable.
-pub fn unforwardable_a2a_request(request_body: &[u8]) -> Option<UnforwardableA2aRequest> {
-    if request_body.is_empty() {
-        return None;
-    }
-    match serde_json::from_slice::<serde_json::Value>(request_body) {
-        Err(_) => Some(UnforwardableA2aRequest::NotJson),
-        Ok(request) => {
-            batch_calls_extended_agent_card(&request).then_some(UnforwardableA2aRequest::ExtendedAgentCardBatch)
-        }
-    }
+/// Whether a JSON-RPC batch request contains a call to an extended-card method.
+/// Such a batch is refused with `-32600`, because a card inside a batch response
+/// cannot be rewritten.
+pub fn is_extended_agent_card_batch(request_body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(request_body).is_ok_and(|request| {
+        request
+            .as_array()
+            .is_some_and(|calls| {
+                calls
+                    .iter()
+                    .any(calls_extended_agent_card_method)
+            })
+    })
 }
 
 /// For a 2xx response to an extended-card request, return the card from the
@@ -1514,63 +1469,21 @@ mod tests {
     }
 
     #[test]
-    fn extended_card_batch_is_refused_for_either_era() {
+    fn extended_card_batch_is_detected_for_either_era() {
         for method in ["GetExtendedAgentCard", "agent/getAuthenticatedExtendedCard"] {
             let batch = json!([
                 {"jsonrpc": "2.0", "id": 1, "method": "SendMessage"},
                 {"jsonrpc": "2.0", "id": 2, "method": method}
             ])
             .to_string();
-            assert_eq!(
-                unforwardable_a2a_request(batch.as_bytes()),
-                Some(UnforwardableA2aRequest::ExtendedAgentCardBatch),
-                "{method}"
-            );
+            assert!(is_extended_agent_card_batch(batch.as_bytes()), "{method}");
         }
         let other_batch = json!([{"jsonrpc": "2.0", "id": 1, "method": "SendMessage"}]).to_string();
-        assert_eq!(unforwardable_a2a_request(other_batch.as_bytes()), None);
+        assert!(!is_extended_agent_card_batch(other_batch.as_bytes()));
         let single = json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard"}).to_string();
-        assert_eq!(unforwardable_a2a_request(single.as_bytes()), None);
-        assert_eq!(unforwardable_a2a_request(b"[]"), None);
-        assert_eq!(unforwardable_a2a_request(b""), None);
-        assert_eq!(unforwardable_a2a_request(br#"{"hello":"world"}"#), None);
-    }
-
-    #[test]
-    fn body_that_is_not_valid_json_is_refused() {
-        let call = br#"{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}"#;
-        let bodies: [Vec<u8>; 7] = [
-            [&b"\xEF\xBB\xBF"[..], call].concat(),
-            [call, &b" trailing"[..]].concat(),
-            br#"{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","x":NaN}"#.to_vec(),
-            br#"{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","x":"\ud800"}"#.to_vec(),
-            format!("{}1{}", "[".repeat(200), "]".repeat(200)).into_bytes(),
-            b"not json".to_vec(),
-            b"   ".to_vec(),
-        ];
-        for body in bodies {
-            assert_eq!(
-                unforwardable_a2a_request(&body),
-                Some(UnforwardableA2aRequest::NotJson),
-                "{}",
-                String::from_utf8_lossy(&body)
-            );
-        }
-    }
-
-    #[test]
-    fn unforwardable_request_maps_to_jsonrpc_errors() {
-        assert_eq!(UnforwardableA2aRequest::NotJson.jsonrpc_code(), -32700);
-        assert_eq!(UnforwardableA2aRequest::ExtendedAgentCardBatch.jsonrpc_code(), -32600);
-        assert!(
-            UnforwardableA2aRequest::NotJson
-                .to_string()
-                .starts_with("Parse error")
-        );
-        assert!(
-            UnforwardableA2aRequest::ExtendedAgentCardBatch
-                .to_string()
-                .starts_with("Invalid Request")
-        );
+        assert!(!is_extended_agent_card_batch(single.as_bytes()));
+        assert!(!is_extended_agent_card_batch(b"[]"));
+        assert!(!is_extended_agent_card_batch(b""));
+        assert!(!is_extended_agent_card_batch(b"not json"));
     }
 }

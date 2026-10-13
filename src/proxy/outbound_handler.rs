@@ -103,8 +103,8 @@ pub(crate) enum OutboundPipelineError {
     #[error("MCP request body refused: {}", .0.reason())]
     McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal),
 
-    #[error("{0}")]
-    UnforwardableA2aRequest(crate::a2a::UnforwardableA2aRequest),
+    #[error("{}", crate::a2a::EXTENDED_AGENT_CARD_BATCH_REFUSAL)]
+    ExtendedAgentCardBatch,
 
     #[error("Failed to process extended agent card")]
     UnrewritableExtendedAgentCardResponse,
@@ -190,7 +190,7 @@ impl OutboundPipelineError {
                 StatusCode::NOT_FOUND
             }
 
-            Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) | Self::UnforwardableA2aRequest(_) => {
+            Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) | Self::ExtendedAgentCardBatch => {
                 StatusCode::BAD_REQUEST
             }
 
@@ -244,12 +244,8 @@ impl IntoResponse for OutboundPipelineError {
         if let Self::McpBodyRefused(refusal) = self {
             return refusal.into_response();
         }
-        if let Self::UnforwardableA2aRequest(refusal) = self {
-            return crate::a2a::create_jsonrpc_error_response(
-                StatusCode::BAD_REQUEST,
-                refusal.jsonrpc_code(),
-                refusal.message(),
-            );
+        if let Self::ExtendedAgentCardBatch = self {
+            return crate::a2a::create_jsonrpc_error_response(StatusCode::BAD_REQUEST, -32600, &self.to_string());
         }
         if let Self::UpstreamCapacityReached(id) = self {
             return crate::proxy::fabric_forward::capacity_response(id);
@@ -1865,14 +1861,13 @@ async fn step_extract_protocol_context_with_versions(
     ctx.protocol = Some(protocol);
     ctx.operation = operation;
 
-    // A body the gateway cannot parse may still be an extended-card call a lenient
-    // Target reads, and a card inside a batch response cannot be rewritten, so
-    // both are refused on A2A/AP2 transit points.
+    // An extended agent card inside a JSON-RPC batch response cannot be
+    // rewritten, so such a batch is refused on A2A/AP2 transit points.
     if transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
-        && let Some(refusal) = crate::a2a::unforwardable_a2a_request(body)
+        && crate::a2a::is_extended_agent_card_batch(body)
     {
-        warn!(request_id = %ctx.request_id, reason = %refusal, "Rejected A2A request before forwarding");
-        return Err(OutboundPipelineError::UnforwardableA2aRequest(refusal));
+        warn!(request_id = %ctx.request_id, "Rejected JSON-RPC batch containing an extended agent card request");
+        return Err(OutboundPipelineError::ExtendedAgentCardBatch);
     }
 
     // Enforce that the request body actually speaks the protocol this transit

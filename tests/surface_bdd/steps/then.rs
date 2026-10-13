@@ -3351,6 +3351,14 @@ fn agent_card_excludes_managed_agent_endpoint_anywhere(
     }
 }
 
+#[then(expr = "the response does not contain managed agent {string} endpoint")]
+fn response_excludes_managed_agent_endpoint(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    agent_card_excludes_managed_agent_endpoint_anywhere(world, agent_name);
+}
+
 /// Host the managed-agent card fixtures publish as their own endpoint.
 const PUBLISHED_MANAGED_AGENT_HOST: &str = "managed-agent.local";
 

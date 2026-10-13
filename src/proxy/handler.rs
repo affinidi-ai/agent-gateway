@@ -2798,15 +2798,18 @@ async fn proxy_handler_with_mcp_runtime(
         return Err(create_jsonrpc_error_response(StatusCode::BAD_REQUEST, code, message));
     }
 
-    // A body the gateway cannot parse may still be an extended-card call a lenient
-    // Target reads, and a card inside a batch response cannot be rewritten, so
-    // both are refused whatever `validate_messages` says, fabric targets included.
-    if is_a2a_surface && let Some(refusal) = crate::a2a::unforwardable_a2a_request(&body_bytes) {
-        channel_warn!(config_id, "Rejected A2A request before forwarding: {}", refusal);
+    // An extended agent card inside a JSON-RPC batch response cannot be
+    // rewritten, so such a batch is refused whatever `validate_messages` says.
+    if is_a2a_surface && crate::a2a::is_extended_agent_card_batch(&body_bytes) {
+        channel_warn!(config_id, "Rejected JSON-RPC batch containing an extended agent card request");
         connection_guard
             .decrement()
             .await;
-        return Err(create_jsonrpc_error_response(StatusCode::BAD_REQUEST, refusal.jsonrpc_code(), refusal.message()));
+        return Err(create_jsonrpc_error_response(
+            StatusCode::BAD_REQUEST,
+            -32600,
+            crate::a2a::EXTENDED_AGENT_CARD_BATCH_REFUSAL,
+        ));
     }
 
     // ── A2A request-shape validation ─────────────────────────────────────

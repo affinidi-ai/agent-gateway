@@ -117,14 +117,14 @@ Feature: A2A v1.0 adoption on an A2A surface
     And the agent card does not contain managed agent "bravo" endpoint anywhere
 
   Scenario: An extended-card reply that is not a card is refused
-    Given managed agent "bravo" answers the extended-card method with a non-card result
+    Given managed agent "bravo" publishes a non-card extended-card result
     When the caller sends a request to the surface with body
       """
       {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
       """
     Then the response status is 502
     And managed agent "bravo" received the request body {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
-    And the agent card does not contain managed agent "bravo" endpoint anywhere
+    And the response does not contain managed agent "bravo" endpoint
 
   # ── Agent-card media type negotiation ─────────────────────────────────────
 

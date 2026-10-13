@@ -9,13 +9,6 @@ changes:
         card and skip response extension inspection, so response validation rules no longer apply to
         GetExtendedAgentCard and agent/getAuthenticatedExtendedCard responses.
     - timestamp: '2026-10-13T12:00:00.000Z'
-      title: Refuse A2A request bodies that are not valid JSON
-      description: >-
-        On A2A and AP2 surfaces and transit points, a non-empty request body that is not valid JSON
-        is now rejected with -32700 before forwarding, even with validate_messages off and for
-        fabric targets, because a lenient Target could read it as an extended agent card request the
-        gateway cannot detect.
-    - timestamp: '2026-10-13T12:00:00.000Z'
       title: Request uncompressed extended agent cards from the Target
       description: >-
         Extended agent card fetches are forwarded with Accept-Encoding identity in place of the
