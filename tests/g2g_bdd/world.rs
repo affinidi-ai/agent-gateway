@@ -290,10 +290,10 @@ pub struct G2gWorld {
     pub response_elapsed: Option<std::time::Duration>,
     pub concurrent_requests: Vec<Value>,
     pub concurrent_responses: Vec<ConcurrentResponse>,
-    pub fabric_forward_baseline: HashMap<usize, usize>,
-    /// Fabric forward requests each gateway had received once the caller's
-    /// action completed, keyed by gateway index.
-    pub fabric_forward_after_action: HashMap<usize, usize>,
+    /// Fabric forward requests each gateway had received before the caller's
+    /// action, keyed by gateway index; a failed read is kept for the Then that
+    /// needs it, so scenarios that never check forwards are unaffected.
+    pub fabric_forward_baseline: HashMap<usize, Result<usize, String>>,
     /// Each gateway's Self gateway DID, read once the topology has started.
     pub self_gateway_dids: HashMap<usize, String>,
     /// Ping outcomes keyed by `(from_gw, to_gw)`.
@@ -353,7 +353,6 @@ impl G2gWorld {
             concurrent_requests: Vec::new(),
             concurrent_responses: Vec::new(),
             fabric_forward_baseline: HashMap::new(),
-            fabric_forward_after_action: HashMap::new(),
             self_gateway_dids: HashMap::new(),
             ping_results: HashMap::new(),
             remote_gateway_records: HashMap::new(),
@@ -701,23 +700,10 @@ impl G2gWorld {
     }
 
     pub async fn remember_fabric_forward_baseline(&mut self) {
-        self.fabric_forward_after_action
-            .clear();
-        self.fabric_forward_baseline = self
-            .read_fabric_forward_counts()
-            .await;
-    }
-
-    /// Record each gateway's fabric forward count once the caller's action has completed.
-    pub async fn remember_fabric_forward_after_action(&mut self) {
-        self.fabric_forward_after_action = self
-            .read_fabric_forward_counts()
-            .await;
-    }
-
-    async fn read_fabric_forward_counts(&self) -> HashMap<usize, usize> {
         let Some(harness) = self.harness.as_ref() else {
-            return HashMap::new();
+            self.fabric_forward_baseline
+                .clear();
+            return;
         };
         let mut counts = HashMap::new();
         for gateway_index in 1..=self
@@ -728,10 +714,10 @@ impl G2gWorld {
             let count = harness
                 .fabric_forward_request_count(gateway_index)
                 .await
-                .unwrap_or_else(|error| panic!("{error:#}"));
+                .map_err(|error| format!("{error:#}"));
             counts.insert(gateway_index, count);
         }
-        counts
+        self.fabric_forward_baseline = counts;
     }
 
     pub fn expects_allow_only_denial(

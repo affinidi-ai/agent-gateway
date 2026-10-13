@@ -1379,8 +1379,9 @@ async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
 }
 
 /// Records the delegation audit trail alongside the caller's observations.
-/// Audit events may be written after the gateway answers, so the read is
-/// retried briefly until the trail has events.
+/// Audit events may be written after the gateway answers, and earlier steps
+/// may already have written some, so the read is retried briefly until the
+/// trail has events and two reads in a row agree on how many.
 async fn record_delegation_audit_trail(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
 
@@ -1388,25 +1389,29 @@ async fn record_delegation_audit_trail(world: &mut SurfaceWorld) {
         .admin_client
         .as_ref()
         .expect("admin client must exist");
+    let event_count = |response: &RecordedResponse| {
+        response
+            .body
+            .get("events")
+            .and_then(|events| events.as_array())
+            .map_or(0, Vec::len)
+    };
     let mut response = client
         .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/delegation-audit?page_size=100", None)
         .await
         .expect("read delegation audit trail through admin API");
 
     for _ in 0..10 {
-        let has_events = response
-            .body
-            .get("events")
-            .and_then(|events| events.as_array())
-            .is_some_and(|events| !events.is_empty());
-        if has_events {
-            break;
-        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        response = client
+        let next = client
             .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/delegation-audit?page_size=100", None)
             .await
             .expect("read delegation audit trail through admin API");
+        let settled = event_count(&next) > 0 && event_count(&next) == event_count(&response);
+        response = next;
+        if settled {
+            break;
+        }
     }
 
     world.delegation_audit_trail = Some(response);

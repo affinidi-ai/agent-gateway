@@ -2066,7 +2066,7 @@ async fn proxy_handler_with_mcp_runtime(
                 return Ok(error.into_response(&body_bytes, StatusCode::BAD_REQUEST));
             }
         };
-        body_bytes = policy.cap_legacy_initialize(body_bytes, &classification, config_id);
+        body_bytes = policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
         let binding = crate::protocols::extensions::verify_mcp_metadata_identity(
             &body_bytes,
             state.vc_issuer.as_ref(),

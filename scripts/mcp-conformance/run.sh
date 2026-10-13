@@ -81,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --binary) option_value "$1" "${2:-}"; BINARY="$2"; shift ;;
         --only) option_value "$1" "${2:-}"; ONLY="$2"; shift ;;
         -h|--help) usage; exit 0 ;;
+        --legacy-binary) echo "--legacy-binary was removed: --binary now runs both the modern and legacy phases" >&2; exit 2 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
     shift

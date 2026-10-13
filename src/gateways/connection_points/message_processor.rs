@@ -4280,7 +4280,7 @@ async fn process_forward_request_with_mcp_runtime(
             Ok(body) => body,
             Err(error) => return axum_response_to_forward_result(error.into_response(&body_bytes, axum::http::StatusCode::BAD_REQUEST)).await,
         };
-        body_bytes = http_policy.cap_legacy_initialize(body_bytes, &classification, config_id);
+        body_bytes = http_policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
         mcp_verified_binding = match crate::protocols::extensions::verify_mcp_metadata_identity(
             &body_bytes, GLOBAL_VC_ISSUER.get(), config_id, Some(&peer_issuers),
         ).await {

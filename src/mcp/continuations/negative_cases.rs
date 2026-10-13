@@ -35,11 +35,15 @@ pub(crate) fn continuation_runtime(
     })
 }
 
-/// `state` with its last byte changed, so its seal no longer verifies.
+/// `state` with one alphanumeric byte near its middle changed, so it still
+/// decodes but its seal no longer verifies. The last character is avoided: its
+/// trailing bits may be dropped by the decoder, leaving the sealed bytes intact.
 pub(crate) fn tamper(state: &str) -> String {
     let mut bytes = state.as_bytes().to_vec();
-    let last = bytes.len() - 1;
-    bytes[last] = if bytes[last] == b'A' {
+    let index = (bytes.len() / 2..bytes.len() - 1)
+        .find(|&index| bytes[index].is_ascii_alphanumeric())
+        .expect("a continuation state has alphanumeric characters to tamper with");
+    bytes[index] = if bytes[index] == b'A' {
         b'B'
     } else {
         b'A'

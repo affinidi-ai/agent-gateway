@@ -294,8 +294,9 @@ pub(crate) async fn consume_sse_response(
 
     let request_id = single_request_id(request);
     let mut chunks = crate::proxy::upstream_body::BoundedChunks::new(upstream_response, limits)?;
-    // `chunks` already caps the whole stream, and so every event in it.
-    let mut events = SseEventBuffer::new(usize::MAX);
+    // `chunks` already caps the whole stream; the same cap on each event keeps
+    // the buffer bounded on its own.
+    let mut events = SseEventBuffer::new(limits.max_bytes());
     let mut last: Option<String> = None;
     loop {
         let (chunk, ended) = match chunks.next().await {

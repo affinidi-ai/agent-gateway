@@ -71,9 +71,6 @@ pub(crate) async fn send_a2a_request_through_transit_point(
     world.response_status = Some(response.status);
     world.response_content_type = response.content_type;
     world.response_body = Some(response.body);
-    world
-        .remember_fabric_forward_after_action()
-        .await;
 }
 
 #[when(
@@ -529,9 +526,6 @@ pub async fn mcp_list_tools_twice_over_legacy_sse(
         .into_iter()
         .map(|request| (request, replies.next()))
         .collect();
-    world
-        .remember_fabric_forward_after_action()
-        .await;
 }
 
 #[when(regex = r#"^the caller sends an MCP initialize request to gateway (\d+) surface "([^"]+)"$"#)]
@@ -671,9 +665,6 @@ pub async fn concurrent_mcp_echo_calls_sent_to_surface(
         .expect("concurrent MCP calls should complete before timeout");
 
     world.concurrent_responses = responses;
-    world
-        .remember_fabric_forward_after_action()
-        .await;
 }
 
 async fn send_concurrent_rpc(
@@ -743,9 +734,6 @@ pub(crate) async fn send_rpc(
     world.response_status = Some(response.status);
     world.response_content_type = response.content_type;
     world.response_body = Some(response.body);
-    world
-        .remember_fabric_forward_after_action()
-        .await;
 }
 
 async fn send_raw_rpc_body(
@@ -804,9 +792,6 @@ async fn send_raw_string(
     world.response_status = Some(status);
     world.response_content_type = content_type;
     world.response_body = Some(body);
-    world
-        .remember_fabric_forward_after_action()
-        .await;
 }
 
 fn conformance_setting(name: &str) -> String {

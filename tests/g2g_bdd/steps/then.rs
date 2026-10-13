@@ -190,18 +190,28 @@ pub async fn gateway_did_not_receive_fabric_forward_request(
     let baseline = world
         .fabric_forward_baseline
         .get(&gateway_index)
-        .copied()
-        .expect("a When step must record the fabric forward baseline before this Then");
-    let actual = world
-        .fabric_forward_after_action
-        .get(&gateway_index)
-        .copied()
-        .expect("a When step must record the fabric forward count after the caller action before this Then");
-    assert_eq!(
-        actual, baseline,
-        "gateway {gateway_index} received a fabric forward request after the caller action; caller_status={:?}; caller_body={:?}",
-        world.response_status, world.response_body
-    );
+        .cloned()
+        .expect("a When step must record the fabric forward baseline before this Then")
+        .unwrap_or_else(|error| panic!("reading gateway {gateway_index}'s fabric forward baseline failed: {error}"));
+    // Keep watching briefly so a forward that lands after the caller's
+    // response is still caught.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let actual = world
+            .harness()
+            .fabric_forward_request_count(gateway_index)
+            .await
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        assert_eq!(
+            actual, baseline,
+            "gateway {gateway_index} received a fabric forward request after the caller action; caller_status={:?}; caller_body={:?}",
+            world.response_status, world.response_body
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[then(regex = r#"^MCP server "([^"]+)" received (\d+) forwarded MCP requests$"#)]

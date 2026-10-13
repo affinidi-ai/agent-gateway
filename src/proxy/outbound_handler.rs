@@ -1800,10 +1800,12 @@ async fn step_extract_protocol_context_with_versions(
                 response: false,
             }
         })?;
-        ctx.body_bytes = Some(
-            tracing::info_span!("transit_initialize_cap", request_id = %ctx.request_id)
-                .in_scope(|| policy.cap_legacy_initialize(normalized, &classification, &ctx.surface.surface_id)),
-        );
+        ctx.body_bytes = Some(policy.cap_legacy_initialize(
+            normalized,
+            &classification,
+            &ctx.surface.surface_id,
+            Some(&ctx.request_id),
+        ));
         crate::protocols::extensions::verify_mcp_metadata_identity(
             &body,
             state.vc_issuer.as_ref(),
