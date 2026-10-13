@@ -107,6 +107,41 @@ already processed: `connection-setup` after it proves control of its `channel_di
 invitation, `connection-accepted` once its sender and `channel_did` are present; both verify their
 issuer attestation afterwards. A pairing message without `expires_time` is remembered for one hour.
 
+An invitation pairs one gateway. The inviting gateway records the id of the invitation message
+its mediator serves, and accepts a `connection-setup` only when all of these hold:
+
+- it arrives on a User Connection Point that has a secret, is enabled and has not expired;
+- the Connection Point has not already been redeemed;
+- the setup's `pthid` names that invitation message.
+
+The secret is compared in constant time. A successful setup increments the invitation's
+`use_count`, so every later setup on it is refused, even if an administrator rejects the resulting
+request; create a new invitation to pair again. A setup that fails after its secret is accepted
+and before the request is stored, for example on an invalid issuer attestation or at the appliance
+gateway limit, returns the invitation to unused so the peer can retry it. The redeemed Connection Point is kept, because
+approval sends `connection-accepted` from its DID. System Connection Points (`oobresponder`,
+`oobacceptor`, `system`) never accept a `connection-setup`. Invitations created before the gateway
+recorded the message id are refused and must be created again.
+
+The handshake always runs on the inviter's mediator. The acceptor's permanent connection point uses
+the inviter's mediator too, unless `connect-via-oob` names one of the acceptor's own mediators in
+`acceptor_mediator_id`. The field is refused with `400` unless the experimental `mediator_federation`
+feature flag is on (it is off by default). That mediator must be within the caller's tenant and token
+scope, referenceable by the new gateway's tenant (as for connection points), Active, and registered
+(`our_did` / `our_secrets`), otherwise the request fails with `400`
+before any outbound call. If the pending connection is lost before `connection-accepted` arrives, the
+acceptor recovers its mediator from the temporary connection point. If that is the temporary
+connection point's own (the inviter's) mediator, recovery proceeds; otherwise it refuses to finish
+unless the acceptor mediator record recorded at accept time is still Active with that DID. The
+acceptor's permanent connection point stores that record id as its `mediator_id`, so finalize,
+recovery and its listener read that record by id, never a mediator found by DID. See [per-gateway mediators](PER_GATEWAY_MEDIATOR_FEDERATION.md).
+
+`pack_and_send_message` chooses each send's route from the recipient's DID: when its
+`DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
+in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
+directly. The route does not depend on the feature flag. Fabric stream frames and the x402
+facilitator always send directly.
+
 ## Peer issuer DIDs
 
 A gateway sends fabric envelopes from a per-pairing Connection Point DID but signs the identity
@@ -238,12 +273,22 @@ applies on top of every mode.
 Records written before the mode existed have no `exposure_mode`. On boot,
 [`migrate_exposure_modes`](../src/gateways/filesystem.rs) persists `all` for a record with an empty
 list (its earlier meaning) and `list` for a record with a non-empty one, so existing peers keep their
-access. Until a record is migrated, it is read with that same earlier meaning, never with more access.
+access. On this version, until a record is migrated, it is read with that same earlier meaning,
+never with more access.
+
+Upgrade every node that shares gateway storage, such as both nodes of an active/standby pair,
+before failing back to a node on an earlier version, and do not pair peers or change exposure
+until every node runs a version with exposure modes. An earlier version ignores `exposure_mode`.
+It reads a record with mode `none` and an empty list as every surface, and drops the mode when
+it saves the record, including a background update, so the peer then reaches every surface on
+the new version too. If a node on an earlier version ran after the upgrade, check each Remote
+record's `exposure_mode` and set it again.
 
 Set the mode with `PUT /v1/gateways/{id}/exposed-surfaces` (`gateways.edit`), body
 `{"exposure_mode": "list", "exposed_channels": ["surface-id"]}`. The list is stored only in `list`
 mode. A body without `exposure_mode` selects `list` for a non-empty list and `none` for an empty
-one, so an empty list never means every surface. The dashboard sets it on the **Publishing** tab of
+one, so an empty list never means every surface. On a gateway that is not Remote, such as the
+self gateway, the request is refused with 400. The dashboard sets it on the **Publishing** tab of
 a remote gateway.
 
 ### Revoking access ends running streams
@@ -348,16 +393,62 @@ the paired sending gateway's check, as it trusts that peer for every other forwa
 
 ### Delegated credentials over Fabric
 
-A sending surface with `outbound_credentials` keeps its delegated tokens to itself for legacy
-traffic. For a modern (`2026-07-28`) MCP request, the sending gateway applies the
-caller's delegated credential after stripping the caller's own token, the same way it would for a
-local Target, and sends it to the peer inside the authcrypt framed stream: the access token only,
-injected as the binding's `inject_as` says (a header or a `_meta` field), never the refresh token.
-The receiving gateway, and its Target, can therefore use that access token until it expires.
-Any modern MCP caller on a `fabric://` route with `outbound_credentials` triggers this, with no
-per-route opt-in or opt-out, so routes that predate this behaviour start sharing tokens on upgrade.
-Pair only with peers you would trust with those tokens, and remove `outbound_credentials` from a
-`fabric://` route whose peer must not receive them. See [Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
+A sending surface's `outbound_credentials` reach a `fabric://` peer only when the route to that
+peer opts in with `fabric_delegated_credentials: true`: on the Target for Access Point traffic, or
+on the Transit Point for agent-initiated traffic. The setting is off by default, including on
+surfaces saved before it existed, and no migration turns it on. With it off, the sending gateway
+still strips the caller's own token and sends the peer no delegated credential, whatever the
+request's protocol or MCP revision.
+
+With it on, the access token crosses as it would to a local destination, injected as the
+binding's `inject_as` says (a header or a `_meta` field); the refresh token never crosses. On the
+Target, only modern (`2026-07-28`) MCP requests carry it: the sending gateway strips the caller's
+own token, applies the delegated credential, and sends it inside the authcrypt framed stream.
+Legacy MCP and A2A Access Point requests never carry it. On a Transit Point the setting applies to
+every protocol: modern MCP requests, legacy MCP `_meta` injection, and header injection on any
+request, including A2A. The receiving gateway, and its Target, can use that access token until it
+expires. When the receiving gateway forwards the request to its Target it logs the name of each
+forwarded header, never its value, so a delegated credential stays out of the logs whatever header
+carries it.
+
+The setting applies to one route only. Another `fabric://` Target or Transit Point on the same
+gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without
+`outbound_credentials` uses only its own `transit_credentials`, never another Transit Point's. A
+Target variant can override the setting, a variant's `transit.points` override sets it for that
+variant's Transit Points, and a variant with `complete: true` that omits the Target override turns
+it off. A legacy request whose Transit Point variant fails to resolve carries no delegated
+credential.
+
+When the setting keeps bindings from a peer, the sending gateway logs `Delegated credentials
+withheld from Fabric peer` at debug level under the `credential_delegation` target, with
+`surface_id`, `route` (the Target endpoint or Transit Point alias) and
+`reason = "fabric_delegated_credentials=false"`. It never logs credential values. Turn it on only
+for peers you would trust with those tokens. In the dashboard it is the **Send delegated
+credentials over Fabric** switch on the Managed Agent or Transit Point panel, shown for a
+`fabric://` route on a surface with credential bindings. See
+[Credential delegation](CREDENTIAL_DELEGATION.md#across-fabric).
+
+The receiving gateway applies its own surface's `outbound_credentials` toward its Target. Since it
+forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
+whose `params.name` it lists, read after admission has refused batches and ambiguous keys.
+
+`make gw-e2e` verifies the Access Point Target case between two gateway binaries
+(`tests/features/g2g/mcp_credential_delegation_over_fabric.feature`). The sending gateway has
+`[mcp.continuations]`, `sts.mcp_issuer` and a credential provider whose consent identity strategy
+trusts a local OpenID provider. The caller holds an MCP access token exchanged at that issuer. With
+the setting on, a modern `tools/call` gets `input_required` with a consent URL, and the peer
+gateway's received Fabric forward counter does not move. After consent, the retry carrying `requestState` reaches the peer's Target with
+`Authorization: Bearer` set to the delegated access token, and neither the refresh token nor the
+caller's own token appears in its URL, headers or body. A consent callback whose `state` was
+altered is rejected before the gateway calls the provider's token endpoint; a retry with the
+consent request state then still gets `input_required` and reaches nothing, and a new tool call
+gets a new consent URL that completes normally. When the setting is
+turned off after consent, the caller's stored credential does not reach the peer's Target: the
+same call gets no consent request, and the Target receives neither an `Authorization` header, the
+access token nor the caller's token. With the setting off and nothing stored, the call likewise
+gets no consent request and the provider's token endpoint is never called. These checks observe
+the peer's Target only; they do not inspect the Fabric message the receiving gateway gets. The
+feature does not cover Transit Point routes or credential refresh across gateways.
 
 A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 `agent_gateway_a2a_protocol_version_total` metric do not run on either G2G leg. The sending gateway

@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::secrets::SecretsStore;
 use crate::tenancy::{
-    PatTenantContext, ResourceKind, can_access, can_reference, scope_allows_resource, tenant_for_create,
+    PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
 };
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
@@ -451,6 +451,10 @@ pub async fn update_provider(
             &existing.id,
         )
     {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
+            .into_response();
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "credential provider is outside this token's permitted scope" })),
@@ -594,6 +598,10 @@ pub async fn delete_provider(
             &existing.id,
         )
     {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
+            .into_response();
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "credential provider is outside this token's permitted scope" })),
@@ -828,6 +836,144 @@ mod consent_strategy_tests {
             validate_consent_strategy(&state, &provider, &None, &None)
                 .await
                 .is_ok()
+        );
+    }
+
+    async fn state_with_provider(
+        directory: &tempfile::TempDir,
+        tenant_id: Option<&str>,
+    ) -> CredentialProviderState {
+        let state = CredentialProviderState {
+            store: Arc::new(
+                super::super::storage::FileSystemCredentialProviderStore::new(
+                    directory
+                        .path()
+                        .join("providers"),
+                )
+                .await
+                .unwrap(),
+            ),
+            secrets_store: Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+            identity_strategies: None,
+            oauth_callback_route: "/oauth/callback".into(),
+        };
+        let provider: CredentialProvider = serde_json::from_value(json!({
+            "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(provider)
+            .await
+            .unwrap();
+        state
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn rename() -> Json<UpdateCredentialProviderRequest> {
+        Json(serde_json::from_value(json!({ "name": "Tenant provider" })).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_token_cannot_update_or_delete_an_appliance_wide_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, None).await;
+
+        let read = get_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+
+        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
+            .await
+            .into_response();
+        assert_eq!(update.status(), StatusCode::FORBIDDEN);
+
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(delete.status(), StatusCode::FORBIDDEN);
+
+        let after = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("appliance-wide provider must survive");
+        assert_eq!(after.name, "Operator provider");
+        assert_eq!(after.tenant_id, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_tenants_provider_is_not_found_on_update_or_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, Some("tenant-b")).await;
+
+        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
+            .await
+            .into_response();
+        assert_eq!(update.status(), StatusCode::NOT_FOUND);
+
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(delete.status(), StatusCode::NOT_FOUND);
+
+        let after = state
+            .store
+            .get("provider")
+            .await
+            .unwrap()
+            .expect("another tenant's provider must survive");
+        assert_eq!(after.name, "Operator provider");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_token_can_update_and_delete_its_own_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with_provider(&directory, Some("tenant-a")).await;
+
+        let update = update_provider(State(state.clone()), Path("provider".into()), tenant_a(), None, rename())
+            .await
+            .into_response();
+        assert_eq!(update.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .map(|provider| provider.name),
+            Some("Tenant provider".to_string())
+        );
+
+        let delete = delete_provider(State(state.clone()), Path("provider".into()), tenant_a(), None)
+            .await
+            .into_response();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .store
+                .get("provider")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

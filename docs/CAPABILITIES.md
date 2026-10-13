@@ -420,7 +420,8 @@ privileged ports. The challenge is a 43 character S256 value, and the verifier i
 characters as defined in RFC 7636. The consent page and its API must be served from the same
 origin: the consent request is accepted only when `Sec-Fetch-Site` is `same-origin`, or when
 `Origin` equals `Host` for clients that do not send it. The user must also be approved. After
-sign-in, the browser returns only to the dashboard root or the CLI authorize path. For SAML the
+sign-in, the browser returns only to the dashboard root, the CLI authorize path, or the new
+access token form (`/access-tokens/new`) with its preset query, which only fills in the form. For SAML the
 gateway keeps that return target for five minutes and sends only a one-time 32 character key as
 `RelayState`, within the 80 byte limit of the HTTP-Redirect binding. The assertion consumer
 service uses the key once and checks the target again; an unknown, expired or reused key lands

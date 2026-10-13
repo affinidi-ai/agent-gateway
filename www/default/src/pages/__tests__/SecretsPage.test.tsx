@@ -57,10 +57,26 @@ const mockCertificates = [
   },
 ];
 
+const mockSecrets = [
+  {
+    id: 'secret-1',
+    name: 'Gateway Secret',
+    secret_id: 'gateway-secret',
+    description: 'A test secret',
+    secret_type: 'General',
+    tags: [],
+    created_at: '2026-07-01T10:00:00Z',
+    updated_at: '2026-07-03T12:30:00',
+  },
+];
+
 function mockFetchByUrl() {
   (apiClient.fetch as jest.Mock).mockImplementation((url: string) => {
     if (url.startsWith('/api/v1/certificates/')) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve(mockCertificates) });
+    }
+    if (url.startsWith('/api/v1/secrets')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(mockSecrets) });
     }
     // secrets and everything else
     return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
@@ -111,5 +127,23 @@ describe('SecretsPage certificate kind deep-link', () => {
 
     const filter = screen.getByLabelText('Kind:') as HTMLSelectElement;
     expect(filter.value).toBe('all');
+  });
+});
+
+describe('SecretsPage secret timestamps', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockFetchByUrl();
+  });
+
+  it('displays the last updated date in the secret list', async () => {
+    renderAt('/secrets?tab=secrets');
+
+    await waitFor(() => {
+      expect(screen.getByText('Gateway Secret')).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('Updated')).toBeInTheDocument();
+    expect(screen.getByText('July 3, 2026')).toBeInTheDocument();
   });
 });

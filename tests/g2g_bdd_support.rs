@@ -415,6 +415,196 @@ fn tail_file_returns_last_lines_in_original_order() {
     assert_eq!(tail, "two\nthree");
 }
 
+fn read_json(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {path:?}: {error}")))
+        .expect("parse JSON")
+}
+
+#[test]
+fn modern_consent_config_makes_the_access_point_a_resource_server_with_delegated_credentials() {
+    use bdd_support::config::modern_consent::{
+        ModernConsentFixture, PUBLIC_ORIGIN, mcp_issuer, oauth_endpoint_allowlist, write_modern_consent_config,
+    };
+
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let mut surface = SurfaceSpec::new("charlie", "/charlie", "mcp", "fabric://pending/pending");
+    surface.delegated_credentials = Some("calendar".to_string());
+    let fixture = ModernConsentFixture {
+        provider_id: "calendar".to_string(),
+        authorization_endpoint: "https://127.0.0.1:32010/authorize".to_string(),
+        token_endpoint: "http://127.0.0.1:32010/token".to_string(),
+        identity_issuer: "https://identity.example/".to_string(),
+        identity_client_id: "idp-client".to_string(),
+        identity_client_secret: "idp-secret".to_string(),
+        identity_jwk: serde_json::json!({"kty": "OKP", "crv": "Ed25519", "x": "x"}),
+        route: "/charlie".to_string(),
+    };
+
+    write_fabric_gateway_config(temp_dir.path(), 32007, None, &[surface]);
+    write_modern_consent_config(temp_dir.path(), &fixture);
+
+    let storage = temp_dir
+        .path()
+        .join("_storage");
+    let surface = read_json(&storage.join("agent_surfaces/charlie.json"));
+    assert_eq!(surface["mcp_http"]["authorization"]["resource"], "https://gateway.example/charlie");
+    assert_eq!(surface["mcp_http"]["authorization"]["scopes"], serde_json::json!(["read"]));
+    assert_eq!(surface["outbound_credentials"][0]["credential_provider_id"], "calendar");
+    assert_eq!(surface["identity_slots"]["inbound"]["type"], "static");
+
+    let network = read_json(
+        &temp_dir
+            .path()
+            .join("gateway.json"),
+    );
+    assert_eq!(network["sts"]["mcp_issuer"]["issuer"], mcp_issuer());
+    assert_eq!(network["listeners"][0]["external_urls"][1], PUBLIC_ORIGIN);
+    let toml = std::fs::read_to_string(
+        temp_dir
+            .path()
+            .join("config.toml"),
+    )
+    .expect("config.toml");
+    assert!(toml.contains("[mcp.continuations]"), "{toml}");
+
+    let client = read_json(&storage.join("sts_clients/bdd-mcp-client.json"));
+    assert_eq!(client["allowed_audiences"], serde_json::json!(["https://gateway.example/charlie"]));
+    assert_eq!(client["allowed_subject_audiences"], serde_json::json!(["idp-client"]));
+    let provider = read_json(&storage.join("credential_providers/calendar.json"));
+    assert_eq!(provider["resource"], "https://calendar.example/api");
+    assert_eq!(provider["consent_identity_strategy_id"], "bdd-consent-identity");
+    let strategy = read_json(&storage.join("jwt_verification_strategies/bdd-consent-identity.json"));
+    assert_eq!(strategy["expected_issuer"], "https://identity.example/");
+    assert_eq!(strategy["jwks_source"]["type"], "static");
+    assert_eq!(oauth_endpoint_allowlist(&fixture), "https://127.0.0.1:32010/authorize,http://127.0.0.1:32010/token");
+}
+
+#[test]
+fn oidc_provider_issues_tokens_only_for_a_matching_pkce_verifier() {
+    use base64::Engine as _;
+    use bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
+    use sha2::Digest as _;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async {
+        let provider = OidcProvider::start().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+        let verifier = "v".repeat(43);
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(&verifier));
+        let authorize = |nonce: &str| {
+            let mut url = provider
+                .local_url(&url::Url::parse(&provider.authorization_endpoint()).unwrap())
+                .unwrap();
+            url.query_pairs_mut()
+                .append_pair("response_type", "code")
+                .append_pair("client_id", OIDC_CLIENT_ID)
+                .append_pair("redirect_uri", "https://gateway.example/callback")
+                .append_pair("state", "opaque-state")
+                .append_pair("nonce", nonce)
+                .append_pair("code_challenge", &challenge)
+                .append_pair("code_challenge_method", "S256");
+            client.get(url).send()
+        };
+        let code_of = |response: reqwest::Response| {
+            assert_eq!(response.status(), 302);
+            let location = url::Url::parse(
+                response.headers()["location"]
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(location.path(), "/callback");
+            let params: std::collections::HashMap<_, _> = location
+                .query_pairs()
+                .into_owned()
+                .collect();
+            assert_eq!(params["state"], "opaque-state");
+            assert_eq!(params["iss"], OIDC_ISSUER);
+            params["code"].clone()
+        };
+        let exchange = |code: String, code_verifier: String| {
+            client
+                .post(provider.token_endpoint())
+                .form(&[
+                    ("grant_type", "authorization_code"),
+                    ("code", &code),
+                    ("redirect_uri", "https://gateway.example/callback"),
+                    ("client_id", OIDC_CLIENT_ID),
+                    ("client_secret", OIDC_CLIENT_SECRET),
+                    ("code_verifier", &code_verifier),
+                ])
+                .send()
+        };
+
+        assert_eq!(
+            authorize("first")
+                .await
+                .unwrap()
+                .status(),
+            401,
+            "nobody is signed in yet"
+        );
+        provider
+            .sign_in("alice")
+            .await;
+        let wrong = exchange(
+            code_of(
+                authorize("first")
+                    .await
+                    .unwrap(),
+            ),
+            "w".repeat(43),
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrong.status(), 400);
+
+        let issued: serde_json::Value = exchange(
+            code_of(
+                authorize("second")
+                    .await
+                    .unwrap(),
+            ),
+            verifier.clone(),
+        )
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(issued["access_token"], provider.access_token());
+        assert_eq!(issued["refresh_token"], provider.refresh_token());
+        let claims = issued["id_token"]
+            .as_str()
+            .and_then(|token| token.split('.').nth(1))
+            .map(|payload| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .unwrap()
+            })
+            .map(|payload| serde_json::from_slice::<serde_json::Value>(&payload).unwrap())
+            .expect("ID token claims");
+        assert_eq!(claims["iss"], OIDC_ISSUER);
+        assert_eq!(claims["sub"], "alice");
+        assert_eq!(claims["aud"], OIDC_CLIENT_ID);
+        assert_eq!(claims["nonce"], "second");
+        assert_eq!(provider.token_request_count(), 2);
+        assert!(
+            provider
+                .local_url(&url::Url::parse("https://127.0.0.1:1/elsewhere").unwrap())
+                .is_err(),
+            "only the provider's authorization endpoint maps to it"
+        );
+    });
+}
+
 // -----------------------------------------------------------------------------
 // Gateway restart support (needs the Docker mediator, like the g2g_bdd runner).
 // -----------------------------------------------------------------------------
@@ -436,7 +626,7 @@ mod restart_support {
             .build()
             .expect("tokio runtime");
         rt.block_on(async {
-            let mut harness = MultiGatewayHarness::spawn(vec![GatewayPlan::new()])
+            let mut harness = MultiGatewayHarness::spawn(vec![GatewayPlan::new()], vec![None])
                 .await
                 .expect("spawn one gateway");
             let before = harness

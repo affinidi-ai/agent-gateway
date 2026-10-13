@@ -146,3 +146,18 @@ Feature: Routing through a proxy:// MCP target
     Then the response status is 200
     And REST API "bravo" received "GET /weather/Paris"
     And the MCP tool result matches REST API "bravo" response
+
+  Scenario: A caller whose source authentication failed does not get the target credential on a proxy:// MCP target
+    Given the surface requires "API Key" source authentication
+    And the surface injects target authentication from secret "bdd-target-api-key" with value "bdd-target-secret" as header "x-target-api-key"
+    When the caller invokes the MCP tool "get_weather" for city "Paris"
+    Then the response status is 200
+    And REST API "bravo" received "GET /weather/Paris"
+    And REST API "bravo" did not receive header "x-target-api-key"
+
+  Scenario: An authenticated caller gets the target credential on a proxy:// MCP target
+    Given the surface requires "API Key" source authentication
+    And the surface injects target authentication from secret "bdd-target-api-key" with value "bdd-target-secret" as header "x-target-api-key"
+    When the caller invokes the MCP tool "get_weather" for city "Paris" with a valid API key
+    Then the response status is 200
+    And REST API "bravo" received header "x-target-api-key" with value "bdd-target-secret"

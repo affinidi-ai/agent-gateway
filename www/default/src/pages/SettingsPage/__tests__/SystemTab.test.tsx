@@ -81,3 +81,28 @@ describe('SystemTab feature flags', () => {
     }
   });
 });
+
+describe('SystemTab restore from backup', () => {
+  it('tells the operator legacy .tgwbak backups are still supported', () => {
+    renderTab();
+
+    expect(screen.getByTestId('restore-legacy-format-note')).toHaveTextContent(
+      'Legacy .tgwbak backups are still supported.'
+    );
+    expect(screen.getByTestId('restore-file-input')).toHaveAttribute('accept', '.agbak,.tgwbak');
+  });
+
+  it('names both backup extensions when the selected file is not a backup', () => {
+    renderTab();
+    const { showToast } = jest.requireMock('../../../utils/toaster');
+
+    fireEvent.change(screen.getByTestId('restore-file-input'), {
+      target: { files: [new File(['x'], 'backup.zip')] },
+    });
+
+    expect(showToast).toHaveBeenCalledWith(
+      'error',
+      'Please select a .agbak or legacy .tgwbak backup file'
+    );
+  });
+});

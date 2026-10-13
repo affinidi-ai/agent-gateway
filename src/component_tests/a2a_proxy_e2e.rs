@@ -830,3 +830,116 @@ async fn a2a_proxy_accepts_a_message_a_managed_agent_would_refuse() {
         .expect("JSON response");
     assert!(body.get("error").is_none(), "expected the proxy to serve the request, got {body}");
 }
+
+const SOURCE_API_KEY_SECRET_ID: &str = "a2a-proxy-source-key";
+const SOURCE_API_KEY: &str = "valid-caller-key";
+
+async fn start_a2a_proxy_harness_requiring_caller_auth(fake_direct_line: &FakeDirectLine) -> GatewayHarness {
+    let direct_line_base_url = fake_direct_line
+        .base_url
+        .clone();
+    GatewayHarness::start(move |temp_dir, gw_config, _| {
+        let mut surface = helpers::build_minimal_channel();
+        surface.target.endpoint = format!("a2a-proxy://{PROXY_ID}");
+        surface
+            .access_point
+            .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+            methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+                extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
+                    field: "x-api-key".to_string(),
+                },
+                secret_id: SOURCE_API_KEY_SECRET_ID.to_string(),
+            })],
+        });
+        let mut surface_json = serde_json::to_value(surface).expect("surface JSON");
+        surface_json["target"]["a2a_proxy_id"] = json!(PROXY_ID);
+        gw_config.surfaces = vec![serde_json::from_value(surface_json).expect("A2A proxy surface")];
+
+        write_a2a_proxy_fixtures(temp_dir, &direct_line_base_url, "active", true, 5, 100, 3);
+        let now = chrono::Utc::now().to_rfc3339();
+        std::fs::write(
+            temp_dir
+                .join("secrets")
+                .join("secret-2.json"),
+            json!({
+                "id": "secret-2",
+                "name": "Caller API key",
+                "secret_id": SOURCE_API_KEY_SECRET_ID,
+                "description": null,
+                "value": SOURCE_API_KEY,
+                "secret_type": "ApiKey",
+                "tags": [],
+                "created_at": now,
+                "updated_at": now
+            })
+            .to_string(),
+        )
+        .expect("write caller API key fixture");
+    })
+    .await
+}
+
+async fn send_a2a_text(
+    h: &GatewayHarness,
+    api_key: &str,
+) -> Value {
+    let response = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("x-api-key", api_key)
+        .json(&a2a_text_request(vec![json!({ "kind": "text", "text": "Hello, worker!" })]))
+        .send()
+        .await
+        .expect("send request through gateway");
+    assert_eq!(response.status(), 200);
+    response
+        .json()
+        .await
+        .expect("A2A proxy response JSON")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_proxy_withholds_the_direct_line_credential_from_a_caller_whose_source_auth_failed() {
+    let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
+    let h = start_a2a_proxy_harness_requiring_caller_auth(&fake_direct_line).await;
+
+    let body = send_a2a_text(&h, "wrong-key").await;
+
+    assert_eq!(body["result"]["parts"][0]["text"], "Hello from Copilot", "unexpected response {body}");
+    let requests = fake_direct_line.requests();
+    assert_eq!(requests.len(), 3, "create conversation, post activity, poll activities");
+    for request in &requests {
+        assert!(
+            !request
+                .headers
+                .contains_key("authorization"),
+            "{} {} carried the Direct Line credential",
+            request.method,
+            request.path
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_proxy_sends_the_direct_line_credential_for_an_authenticated_caller() {
+    let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
+    let h = start_a2a_proxy_harness_requiring_caller_auth(&fake_direct_line).await;
+
+    let body = send_a2a_text(&h, SOURCE_API_KEY).await;
+
+    assert_eq!(body["result"]["parts"][0]["text"], "Hello from Copilot", "unexpected response {body}");
+    let requests = fake_direct_line.requests();
+    assert_eq!(requests.len(), 3, "create conversation, post activity, poll activities");
+    for request in &requests {
+        assert_eq!(
+            request
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer test-direct-line-secret"),
+            "{} {}",
+            request.method,
+            request.path
+        );
+    }
+}

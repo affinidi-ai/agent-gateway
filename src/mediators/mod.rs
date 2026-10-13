@@ -1,3 +1,4 @@
+pub mod federation;
 pub mod filesystem;
 pub mod handlers;
 pub mod store;

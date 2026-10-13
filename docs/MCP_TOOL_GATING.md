@@ -33,6 +33,17 @@ select validation, and duplicate version headers are rejected. Decode `Mcp-Name`
 only when both Base64 sentinel markers are present, using checked extraction so
 overlapping markers return `HeaderMismatch` rather than panicking.
 
+Admit only one JSON-RPC object per POST, before tool gating or tool-scoped
+credentials read it (`single_object_refusal`). Refuse a batch, a body that is not
+JSON or not an object, any object with two keys that are equal or differ only in
+case at any depth, and a lone case variant of a field the gateway reads
+(`method`, `params.name` of a `tools/call`, and the rest listed in
+[`MCP_METADATA.md`](MCP_METADATA.md#http-endpoint-admission)). Otherwise an upstream
+parser that keeps the first duplicate, folds case, or strips a UTF-8 BOM could run
+a different method or tool from the one the gates checked. Only POST may carry a
+body: PUT, PATCH and extension methods return `405`, and a body on any other
+method returns `400`.
+
 Validate every supplied `Mcp-Name` before version rejection, including methods
 without a mirrored name source. Well-formed extra headers are tolerated;
 malformed values return HTTP `400` / `HeaderMismatch` (`-32020`). Modern
@@ -58,9 +69,11 @@ inherited from the surface-wide target gate.
   **fails closed toward denial** — effect-aware: a `Deny` gate stays **active**
   (keep hiding), an `Allow` gate is forced **inactive** (never grant on an
   unknowable condition), so a broken/missing condition can never silently widen
-  an allow-list. Evaluated against the same `PolicyInput` the surface OPA gate and
-  the tools/list filter see, so a gate that hides a tool from the list decides
-  identically on a call.
+  an allow-list. Evaluated against a `PolicyInput` built from the request's
+  caller context. On each path the tools/list filter and the tools/call gate
+  share that input, so a gate that hides a tool from the list decides
+  identically on a call. The fields a condition can read differ by path; see
+  [Enforcement points](#enforcement-points).
 - **Action** — `effect: allow | deny` plus a regex `patterns` list over tool
   names (empty/whitespace patterns ignored; RegexSet-compiled once).
 - **Default** — `default_effect: allow | deny` (top-level on
@@ -95,6 +108,13 @@ tools/list filter) on **both** the `tools/list` response (hiding tools) and
 `tools/call` requests (blocking invocation), so a hidden tool is uncallable.
 Gates evaluate their condition **once per request**, then apply the precompiled
 regex per tool.
+
+Every gate fails closed on a `tools/call` whose tool name it cannot read (no
+`params.name`, or one that is not a string): the direct Access Point, the
+`fabric://` send leg, the `proxy://` MCP proxy path, Fabric receive and each
+Transit Point deny it and record a deny decision, rather than checking an empty
+name that a deny-pattern gate would pass. A surface or Transit Point without
+gating is unaffected.
 
 - **SSE / Streamable-HTTP note**: when the upstream MCP server answers
   `tools/list` with `text/event-stream` (SSE), `src/proxy/handler.rs` buffers
@@ -150,8 +170,14 @@ regex per tool.
   blocks a denied tool before forwarding
   (`build_tools_call_policy_denied_response`), and a `tools/list` filter on the
   fabric response (already plain JSON — the remote gateway de-SSE'd it) strips
-  denied tools via `CompiledMcpToolGating::filter_tools_list_value`. Both
-  gateways in a G2G chain filter independently and compose.
+  denied tools via `CompiledMcpToolGating::filter_tools_list_value`. Both build
+  their condition input with `fabric_mcp_gate_input`, carrying the caller's
+  `source_auth`, `extension_identity` (promoted to `agent.did`), `payment`, the
+  `mcp` context and the `identity_binding`, so a tool the list shows is one the
+  call gate admits. The input has no trust-registry `agent` fields and no
+  `trust_check_results`; a condition that reads them is undefined, which leaves
+  a `Deny` gate inactive, so write such conditions so an absent field fails
+  toward denial. Both gateways in a G2G chain filter independently and compose.
 - **MCP proxy (`proxy://`) targets** — a surface whose target is a stored MCP
   proxy is answered by `src/proxy/handler.rs::handle_mcp_proxy_request` (the
   gateway *is* the MCP server), which returns before the direct-path gate in

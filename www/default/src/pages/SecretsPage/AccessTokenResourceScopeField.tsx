@@ -23,7 +23,7 @@ const AccessTokenResourceScopeField: React.FC<AccessTokenResourceScopeFieldProps
   disabled = false,
   showValidation = false,
 }) => {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(() => Boolean(pattern) || headers.length > 0);
   const inference = inferTenantSelection(pattern);
   const inferenceText =
     inference.mode === 'tenant'

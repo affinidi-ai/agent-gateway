@@ -15,6 +15,8 @@ use crate::bdd_support::json_rpc::{
     build_mcp_request_without_method_body, build_mcp_tool_call_body, build_modern_mcp_list_tools_body,
     modern_mcp_request_headers,
 };
+use crate::bdd_support::mcp_consent::build_consent_capable_tool_call_body;
+use crate::bdd_support::mediator::Mediator as _;
 use crate::world::{ConcurrentResponse, ConformanceRun, G2gWorld};
 
 const CONCURRENT_MCP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -111,6 +113,37 @@ pub async fn a2a_request_sent_to_surface(
     send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &[]).await;
 }
 
+#[when(expr = "the caller fetches the agent card from gateway {int} surface {string}")]
+pub async fn agent_card_fetched_from_surface(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    world.start().await;
+    let (_gw, surface_id) = world.surface(&surface_name);
+    let port = world
+        .harness()
+        .gw(gw_index)
+        .port;
+    let response = Client::new()
+        .get(format!("http://127.0.0.1:{port}/{surface_id}/.well-known/agent-card.json"))
+        .send()
+        .await
+        .expect("caller request must succeed at the transport layer");
+
+    let status = response.status().as_u16();
+    let content_type = collect_headers(response.headers())
+        .get("content-type")
+        .cloned();
+    let raw = response
+        .text()
+        .await
+        .unwrap_or_default();
+    world.response_body = Some(parse_json_or_sse_body(&raw, content_type.as_deref()));
+    world.response_status = Some(status);
+    world.response_content_type = content_type;
+}
+
 /// Send a Fabric A2A request carrying a specific JSON-RPC method name.
 ///
 /// Proves a v1.0 method survives the DIDComm hop between gateways unchanged: the
@@ -164,6 +197,81 @@ pub async fn modern_mcp_list_tools_sent_to_surface(
     let body = build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), &protocol_version, true);
     let headers = modern_mcp_request_headers(&protocol_version, "tools/list");
     send_rpc(world, gw_index, &surface_name, body, &headers).await;
+}
+
+/// The caller presents its MCP access token and accepts URL-mode
+/// elicitation, as a client able to complete consent does.
+pub(crate) async fn caller_invokes_modern_mcp_tool(
+    world: &mut G2gWorld,
+    caller: &str,
+    tool: &str,
+    gw_index: usize,
+    surface_name: &str,
+    protocol_version: &str,
+) {
+    world.start().await;
+    let body = build_consent_capable_tool_call_body(serde_json::json!("modern-mcp-tool-call"), tool, protocol_version);
+    send_caller_tool_call(world, caller, tool, gw_index, surface_name, body).await;
+}
+
+async fn send_caller_tool_call(
+    world: &mut G2gWorld,
+    caller: &str,
+    tool: &str,
+    gw_index: usize,
+    surface_name: &str,
+    body: Value,
+) {
+    let protocol_version = body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+        .as_str()
+        .expect("modern request declares its protocol version")
+        .to_string();
+    let mut headers = modern_mcp_request_headers(&protocol_version, "tools/call");
+    headers.push(("Mcp-Name".to_string(), tool.to_string()));
+    headers.push(("authorization".to_string(), format!("Bearer {}", world.caller_access_token(caller))));
+    send_rpc(world, gw_index, surface_name, body, &headers).await;
+}
+
+#[when(
+    expr = "caller {string} invokes MCP tool {string} through gateway {int} surface {string} using protocol version {string}"
+)]
+async fn caller_invokes_modern_mcp_tool_through_surface(
+    world: &mut G2gWorld,
+    caller: String,
+    tool: String,
+    gw_index: usize,
+    surface_name: String,
+    protocol_version: String,
+) {
+    caller_invokes_modern_mcp_tool(world, &caller, &tool, gw_index, &surface_name, &protocol_version).await;
+}
+
+#[when(
+    expr = "caller {string} retries MCP tool {string} through gateway {int} surface {string} with the consent request state"
+)]
+async fn caller_retries_mcp_tool_with_consent_state(
+    world: &mut G2gWorld,
+    caller: String,
+    tool: String,
+    gw_index: usize,
+    surface_name: String,
+) {
+    caller_retries_mcp_tool(world, &caller, &tool, gw_index, &surface_name).await;
+}
+
+pub(crate) async fn caller_retries_mcp_tool(
+    world: &mut G2gWorld,
+    caller: &str,
+    tool: &str,
+    gw_index: usize,
+    surface_name: &str,
+) {
+    let (consent, original) = world
+        .consent_request
+        .clone()
+        .expect("caller was asked for consent");
+    assert_eq!(original["params"]["name"], tool, "the retry must repeat the tool call that needed consent");
+    send_caller_tool_call(world, caller, tool, gw_index, surface_name, consent.retry_body(&original)).await;
 }
 
 #[when(
@@ -254,6 +362,63 @@ pub async fn gateway_pings_gateway(
     world
         .ping_results
         .insert((from_gw, to_gw), success);
+}
+
+async fn accept_pending_oob(
+    world: &mut G2gWorld,
+    gateway: usize,
+    acceptor_mediator_id: Option<&str>,
+) {
+    let oob_url = world
+        .pending_oob_url
+        .clone()
+        .expect("no pending OOB invitation published for this scenario");
+    let did_method = world
+        .harness()
+        .mediator()
+        .did_method()
+        .to_string();
+    let admin = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .clone();
+    let response = admin
+        .connect_via_oob_recorded(
+            &oob_url,
+            "g2g-bdd-negative-secret",
+            "negative-path acceptor view",
+            "negative-path acceptor view",
+            &did_method,
+            acceptor_mediator_id,
+        )
+        .await
+        .expect("connect-via-oob request should complete at the transport layer");
+    world.response_status = Some(response.status);
+    world.response_body = Some(response.body);
+}
+
+#[when(regex = r#"^gateway (\d+) accepts the invitation using mediator "([^"]+)"$"#)]
+pub async fn gateway_accepts_invitation_using_mediator(
+    world: &mut G2gWorld,
+    gateway: usize,
+    mediator_name: String,
+) {
+    let mediator_id = world
+        .named_mediators
+        .get(&mediator_name)
+        .unwrap_or_else(|| panic!("mediator '{mediator_name}' not declared"))
+        .clone();
+    accept_pending_oob(world, gateway, Some(mediator_id.as_str())).await;
+}
+
+#[when(regex = r"^gateway (\d+) accepts the invitation using an unknown mediator id$")]
+pub async fn gateway_accepts_invitation_using_unknown_mediator(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    let unknown_id = uuid::Uuid::new_v4().to_string();
+    accept_pending_oob(world, gateway, Some(unknown_id.as_str())).await;
 }
 
 #[when(regex = r#"^the caller asks gateway (\d+) surface "([^"]+)" for available MCP tools with a valid API key$"#)]

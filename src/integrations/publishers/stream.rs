@@ -107,44 +107,6 @@ impl IntegrationPublisher for StreamPublisher {
             .await
     }
 
-    async fn test(
-        &self,
-        config: &Value,
-        content: &Value,
-        variables: &HashMap<String, String>,
-    ) -> Result<String> {
-        let platform = config
-            .get("platform")
-            .and_then(|v| v.as_str())
-            .unwrap_or("kafka");
-
-        let topic = config
-            .get("topic")
-            .and_then(|v| v.as_str())
-            .context("Stream topic/stream name is required")?;
-
-        // Build test event
-        let event = if !content.is_null() && content.is_object() {
-            substitute_variables_in_json(content, None, variables)
-        } else {
-            serde_json::json!({
-                "test": true,
-                "message": "This is a test stream event",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            })
-        };
-
-        // Get the stream publisher from the registry
-        let publisher = STREAM_PUBLISHER_REGISTRY
-            .get(platform)
-            .ok_or_else(|| anyhow::anyhow!("Unsupported streaming platform: {}", platform))?;
-
-        // Use the publisher to test the connection
-        publisher
-            .test_connection(topic, &event, config)
-            .await
-    }
-
     async fn publish_batch(
         &self,
         integration: &Integration,

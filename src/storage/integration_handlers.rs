@@ -8,7 +8,9 @@ use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::config::GatewayConfig;
 use crate::integrations::audit_integration_triggers::{AUDIT_CATEGORY, is_audit_integration};
 use crate::storage::{Integration, IntegrationStorage};
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+};
 
 /// The authenticated caller of an integration route. Governance audit
 /// integrations receive administrator-only audit evidence, so only a caller
@@ -197,12 +199,32 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
-fn integration_allowed(
+pub(crate) fn integration_allowed(
     integration: &Integration,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,
 ) -> bool {
     can_access(
+        integration
+            .tenant_id
+            .as_deref(),
+        tenant_context(context),
+    ) && scope_allows_resource(
+        resource_scope(scope),
+        tenant_context(context),
+        ResourceKind::Integrations,
+        &integration.id,
+    )
+}
+
+/// May this caller change or delete the integration? Requires [`can_mutate`]
+/// ownership and a resource scope that matches the integration id.
+pub(crate) fn integration_writable(
+    integration: &Integration,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> bool {
+    can_mutate(
         integration
             .tenant_id
             .as_deref(),
@@ -394,7 +416,7 @@ pub async fn create_notifier(
     integration.tenant_id = req.tenant_id;
     integration.audit_events = req.audit_events;
     integration.audit_drop_after_secs = req.audit_drop_after_secs;
-    if !integration_allowed(&integration, &context, &scope) {
+    if !integration_writable(&integration, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".into()));
     }
 
@@ -487,6 +509,9 @@ pub async fn update_notifier(
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "Integration not found".to_string()))?;
     if !integration_allowed(&existing, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Integration not found".to_string()));
+    }
+    if !integration_writable(&existing, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".into()));
     }
     if is_audit_integration(&existing) || req.category.as_deref() == Some(AUDIT_CATEGORY) {
@@ -552,6 +577,9 @@ pub async fn delete_notifier(
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "Integration not found".to_string()))?;
     if !integration_allowed(&integration, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Integration not found".to_string()));
+    }
+    if !integration_writable(&integration, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".into()));
     }
     if is_audit_integration(&integration) {
@@ -1678,5 +1706,245 @@ mod tests {
             let (status, _) = call(f.router(None), ADMIN, method, uri, body).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
         }
+    }
+
+    #[test]
+    fn a_tenant_may_read_an_appliance_wide_integration_but_not_change_it() {
+        let tenant = Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+        let mut record = Integration::new(
+            "integration".into(),
+            String::new(),
+            "stream".to_string(),
+            serde_json::json!({"platform": "kafka", "topic": "audit", "brokers": "127.0.0.1:1"}),
+            serde_json::json!({}),
+            "active".to_string(),
+            None,
+        );
+        record.tenant_id = None;
+        assert!(integration_allowed(&record, &tenant, &None));
+        assert!(!integration_writable(&record, &tenant, &None));
+        assert!(integration_writable(&record, &None, &None));
+
+        record.tenant_id = Some("tenant-a".into());
+        assert!(integration_writable(&record, &tenant, &None));
+
+        record.tenant_id = Some("tenant-b".into());
+        assert!(!integration_writable(&record, &tenant, &None));
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    async fn seed_general(
+        f: &Fixture,
+        tenant_id: Option<&str>,
+    ) -> Integration {
+        let mut integration = Integration::new(
+            "Operator stream".to_string(),
+            String::new(),
+            "stream".to_string(),
+            serde_json::json!({"platform": "kafka", "topic": "events", "brokers": "127.0.0.1:1"}),
+            serde_json::json!({"type": "${EVENT_TYPE}"}),
+            "disabled".to_string(),
+            Some("general".to_string()),
+        );
+        integration.tenant_id = tenant_id.map(str::to_string);
+        f.integrations
+            .save(&integration)
+            .await
+            .unwrap();
+        integration
+    }
+
+    async fn update_as_tenant_a(
+        f: &Fixture,
+        existing: &Integration,
+    ) -> StatusCode {
+        match update_notifier(
+            Extension(f.integrations.clone()),
+            Extension(f.config.clone()),
+            Path(existing.id.clone()),
+            tenant_a(),
+            None,
+            f.guard(),
+            caller(Some(OPERATOR)),
+            None,
+            Json(UpdateIntegrationRequest {
+                name: "Tenant stream".to_string(),
+                description: String::new(),
+                integration_type: existing
+                    .integration_type
+                    .clone(),
+                category: Some("general".to_string()),
+                configuration: existing.configuration.clone(),
+                content: existing.content.clone(),
+                status: existing.status.clone(),
+                audit_events: None,
+                audit_drop_after_secs: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => StatusCode::OK,
+            Err((status, _)) => status,
+        }
+    }
+
+    async fn delete_as_tenant_a(
+        f: &Fixture,
+        id: &str,
+    ) -> StatusCode {
+        match delete_notifier(
+            Extension(f.integrations.clone()),
+            Extension(f.bootstrap()),
+            Path(id.to_string()),
+            tenant_a(),
+            None,
+            f.guard(),
+            caller(Some(OPERATOR)),
+            None,
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err((status, _)) => status,
+        }
+    }
+
+    async fn trigger_as_tenant_a(
+        f: &Fixture,
+        id: &str,
+    ) -> StatusCode {
+        use crate::storage::integration_trigger_handlers::{TriggerNotifierRequest, trigger_integration_handler};
+        use axum::response::IntoResponse;
+
+        match trigger_integration_handler(
+            Extension(f.integrations.clone()),
+            Path(id.to_string()),
+            tenant_a(),
+            None,
+            f.guard(),
+            caller(Some(OPERATOR)),
+            None,
+            Json(TriggerNotifierRequest {
+                subject: "subject".to_string(),
+                message: "message".to_string(),
+                variables: Default::default(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response
+                .into_response()
+                .status(),
+            Err((status, _)) => status,
+        }
+    }
+
+    async fn trigger_several_as_tenant_a(
+        f: &Fixture,
+        id: &str,
+    ) -> StatusCode {
+        use crate::storage::integration_trigger_handlers::{
+            TriggerNotifiersRequest, trigger_multiple_notifiers_handler,
+        };
+        use axum::response::IntoResponse;
+
+        match trigger_multiple_notifiers_handler(
+            Extension(f.integrations.clone()),
+            tenant_a(),
+            None,
+            f.guard(),
+            caller(Some(OPERATOR)),
+            None,
+            Json(TriggerNotifiersRequest {
+                integration_ids: vec![id.to_string()],
+                subject: "subject".to_string(),
+                message: "message".to_string(),
+                variables: Default::default(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response
+                .into_response()
+                .status(),
+            Err((status, _)) => status,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_update_delete_or_trigger_an_appliance_wide_integration() {
+        let f = fixture().await;
+        let integration = seed_general(&f, None).await;
+
+        let read = get_notifier(
+            Extension(f.integrations.clone()),
+            Path(integration.id.clone()),
+            tenant_a(),
+            None,
+            f.guard(),
+            caller(Some(OPERATOR)),
+            None,
+        )
+        .await
+        .map(|Json(read)| read.name);
+        assert_eq!(read.ok().as_deref(), Some("Operator stream"));
+
+        assert_eq!(update_as_tenant_a(&f, &integration).await, StatusCode::FORBIDDEN);
+        assert_eq!(delete_as_tenant_a(&f, &integration.id).await, StatusCode::FORBIDDEN);
+        assert_eq!(trigger_as_tenant_a(&f, &integration.id).await, StatusCode::FORBIDDEN);
+        assert_eq!(trigger_several_as_tenant_a(&f, &integration.id).await, StatusCode::FORBIDDEN);
+
+        let stored = f.stored().await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "Operator stream");
+        assert_eq!(stored[0].updated_at, integration.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_integration_is_not_found_on_update_delete_or_trigger() {
+        let f = fixture().await;
+        let integration = seed_general(&f, Some("tenant-b")).await;
+
+        assert_eq!(update_as_tenant_a(&f, &integration).await, StatusCode::NOT_FOUND);
+        assert_eq!(delete_as_tenant_a(&f, &integration.id).await, StatusCode::NOT_FOUND);
+        assert_eq!(trigger_as_tenant_a(&f, &integration.id).await, StatusCode::NOT_FOUND);
+        assert_eq!(trigger_several_as_tenant_a(&f, &integration.id).await, StatusCode::NOT_FOUND);
+
+        let stored = f.stored().await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "Operator stream");
+        assert_eq!(stored[0].updated_at, integration.updated_at);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_trigger_and_delete_its_own_integration() {
+        let f = fixture().await;
+        let integration = seed_general(&f, Some("tenant-a")).await;
+
+        assert_eq!(update_as_tenant_a(&f, &integration).await, StatusCode::OK);
+        assert_eq!(
+            f.stored()
+                .await
+                .into_iter()
+                .map(|stored| stored.name)
+                .collect::<Vec<_>>(),
+            vec!["Tenant stream".to_string()]
+        );
+        assert_eq!(
+            trigger_as_tenant_a(&f, &integration.id).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a tenant passes the access check on its own integration and reaches the publish step"
+        );
+        assert_eq!(delete_as_tenant_a(&f, &integration.id).await, StatusCode::NO_CONTENT);
+        assert!(f.stored().await.is_empty());
     }
 }

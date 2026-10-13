@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::egress::{EgressError, EgressPolicy, guarded_send_inner};
+use crate::proxy::handler::CallerAssertion;
 
 use super::types::{A2aProxy, A2aProxyBackend, A2aProxyStatus, CopilotDirectLineBackend, DirectLineCredentialMode};
 
@@ -37,6 +38,7 @@ pub async fn handle_a2a_proxy_request(
     body_bytes: &[u8],
     secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
     channel_name: &str,
+    caller: CallerAssertion,
 ) -> Response {
     let allow_local = allow_local_a2a_dial();
     let request = match serde_json::from_slice::<Value>(body_bytes) {
@@ -89,7 +91,7 @@ pub async fn handle_a2a_proxy_request(
                 operation = "message/send",
                 "A2A proxy dispatch started"
             );
-            match send_via_direct_line(proxy, backend, &text, secrets_store, channel_name, allow_local).await {
+            match send_via_direct_line(proxy, backend, &text, secrets_store, channel_name, caller, allow_local).await {
                 Ok(parts) => {
                     info!(
                         channel = channel_name,
@@ -188,15 +190,17 @@ fn allow_local_a2a_dial() -> bool {
 async fn guarded_direct_line_dial(
     method: Method,
     url: String,
-    bearer: &str,
+    bearer: Option<&str>,
     json_body: Option<Value>,
     timeout: Duration,
     allow_local: bool,
 ) -> Result<reqwest::Response, A2aProxyRuntimeError> {
     let mut headers = HeaderMap::new();
-    let auth = HeaderValue::from_str(&format!("Bearer {bearer}"))
-        .map_err(|e| A2aProxyRuntimeError::Internal(format!("invalid credential header: {e}")))?;
-    headers.insert(AUTHORIZATION, auth);
+    if let Some(bearer) = bearer {
+        let auth = HeaderValue::from_str(&format!("Bearer {bearer}"))
+            .map_err(|e| A2aProxyRuntimeError::Internal(format!("invalid credential header: {e}")))?;
+        headers.insert(AUTHORIZATION, auth);
+    }
     let body = match json_body {
         Some(value) => {
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -271,9 +275,12 @@ async fn send_via_direct_line(
     text: &str,
     secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
     channel_name: &str,
+    caller: CallerAssertion,
     allow_local: bool,
 ) -> Result<Vec<String>, A2aProxyRuntimeError> {
-    let credential = resolve_direct_line_credential(proxy, backend, secrets_store, channel_name, allow_local).await?;
+    let credential =
+        resolve_direct_line_credential(proxy, backend, secrets_store, channel_name, caller, allow_local).await?;
+    let credential = credential.as_deref();
     let base_url = backend
         .base_url
         .trim_end_matches('/');
@@ -285,7 +292,7 @@ async fn send_via_direct_line(
     let conversation: Value = guarded_direct_line_dial(
         Method::POST,
         format!("{base_url}/conversations"),
-        &credential,
+        credential,
         Some(serde_json::json!({})),
         dial_timeout,
         allow_local,
@@ -307,7 +314,7 @@ async fn send_via_direct_line(
     guarded_direct_line_dial(
         Method::POST,
         format!("{base_url}/conversations/{conversation_id}/activities"),
-        &credential,
+        credential,
         Some(serde_json::json!({
             "type": "message",
             "from": { "id": "agent-gateway" },
@@ -337,7 +344,7 @@ async fn send_via_direct_line(
             format!("{base_url}/conversations/{conversation_id}/activities")
         };
         let activities: Value =
-            guarded_direct_line_dial(Method::GET, poll_url, &credential, None, dial_timeout, allow_local)
+            guarded_direct_line_dial(Method::GET, poll_url, credential, None, dial_timeout, allow_local)
                 .await?
                 .error_for_status()
                 .map_err(|e| A2aProxyRuntimeError::TargetUnavailable(format!("Direct Line activity poll failed: {e}")))?
@@ -368,8 +375,13 @@ async fn resolve_direct_line_credential(
     backend: &CopilotDirectLineBackend,
     secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
     channel_name: &str,
+    caller: CallerAssertion,
     allow_local: bool,
-) -> Result<String, A2aProxyRuntimeError> {
+) -> Result<Option<String>, A2aProxyRuntimeError> {
+    if !caller.permits_target_credential() {
+        warn!(channel = channel_name, proxy_id = %proxy.id, "Refusing to attach the Direct Line credential: the caller was not authenticated");
+        return Ok(None);
+    }
     let store =
         secrets_store.ok_or_else(|| A2aProxyRuntimeError::Internal("Secrets store is not configured".to_string()))?;
     let secret = store
@@ -381,7 +393,7 @@ async fn resolve_direct_line_credential(
     match backend.credential_mode {
         DirectLineCredentialMode::Secret => {
             info!(channel = channel_name, proxy_id = %proxy.id, credential_mode = "secret", "Using configured Direct Line credential for A2A proxy request");
-            Ok(secret.value)
+            Ok(Some(secret.value))
         }
         DirectLineCredentialMode::GenerateToken => {
             let base_url = backend
@@ -392,7 +404,7 @@ async fn resolve_direct_line_credential(
             let response: Value = guarded_direct_line_dial(
                 Method::POST,
                 format!("{base_url}/tokens/generate"),
-                &secret.value,
+                Some(&secret.value),
                 None,
                 Duration::from_secs(backend.timeout_secs.into()),
                 allow_local,
@@ -411,7 +423,7 @@ async fn resolve_direct_line_credential(
                     A2aProxyRuntimeError::Internal("Direct Line token response omitted token".to_string())
                 })?;
             info!(channel = channel_name, proxy_id = %proxy.id, credential_mode = "generate_token", operation = "tokens.generate", result = "ok", duration_ms = token_started.elapsed().as_millis(), "Direct Line token generated for A2A proxy request");
-            Ok(token)
+            Ok(Some(token))
         }
     }
 }
@@ -616,7 +628,7 @@ mod tests {
         let result = guarded_direct_line_dial(
             Method::POST,
             format!("http://{addr}/v3/directline/conversations"),
-            "super-secret-credential",
+            Some("super-secret-credential"),
             Some(serde_json::json!({})),
             Duration::from_secs(2),
             false,
@@ -678,7 +690,7 @@ mod tests {
         let result = guarded_direct_line_dial(
             Method::POST,
             format!("http://{addr}/v3/directline/conversations"),
-            "super-secret-credential",
+            Some("super-secret-credential"),
             Some(serde_json::json!({})),
             Duration::from_secs(2),
             true,
@@ -713,5 +725,85 @@ mod tests {
         });
 
         assert_eq!(collect_bot_texts(&activities), vec!["hi".to_string()]);
+    }
+
+    fn direct_line_proxy() -> (A2aProxy, CopilotDirectLineBackend) {
+        let proxy: A2aProxy = serde_json::from_value(serde_json::json!({
+            "id": "worker",
+            "name": "worker",
+            "backend": { "kind": "copilot_direct_line", "secret_id": "direct-line-secret" },
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let A2aProxyBackend::CopilotDirectLine(backend) = proxy.backend.clone();
+        (proxy, backend)
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_caller_gets_no_direct_line_credential() {
+        let (proxy, backend) = direct_line_proxy();
+
+        let credential =
+            resolve_direct_line_credential(&proxy, &backend, None, "alpha", CallerAssertion::Unauthenticated, false)
+                .await
+                .unwrap();
+
+        assert_eq!(credential, None);
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_caller_resolves_the_direct_line_credential() {
+        let (proxy, backend) = direct_line_proxy();
+
+        let result =
+            resolve_direct_line_credential(&proxy, &backend, None, "alpha", CallerAssertion::Authenticated, false)
+                .await;
+
+        assert!(
+            matches!(&result, Err(A2aProxyRuntimeError::Internal(message)) if message.contains("Secrets store")),
+            "an authenticated caller must look up the stored credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dial_without_a_credential_sends_no_authorization_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener
+                .accept()
+                .await
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock
+                .read(&mut buf)
+                .await
+                .unwrap_or(0);
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await;
+            String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+        });
+
+        let result = guarded_direct_line_dial(
+            Method::POST,
+            format!("http://{addr}/v3/directline/conversations"),
+            None,
+            Some(serde_json::json!({})),
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+
+        assert!(result.is_ok(), "dial should reach the local server, got {result:?}");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("post /v3/directline/conversations"), "unexpected request: {request}");
+        assert!(!request.contains("authorization:"), "no credential may be sent: {request}");
     }
 }

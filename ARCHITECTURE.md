@@ -62,7 +62,9 @@ the stores, listeners, and middleware.
 5. Seed built-in surface templates from the configured templates directory.
 6. Start trust registry listeners.
 7. Create the connection point manager for fabric peers, and pre-warm the DID cache.
-8. Build the management and dashboard routers, and hand them to the surface task manager.
+8. Build the source authentication middleware, then the management and dashboard routers,
+   and hand them to the surface task manager. Startup aborts if the JWT verification
+   strategy store cannot be opened.
 9. Bind listeners and start each surface.
 10. Mark the process ready, at which point `/api/v1/health` returns 200.
 
@@ -299,6 +301,7 @@ Breaking one of these is a correctness bug, not a style question.
 | DNS is resolved once per forward, and the request is pinned to that address with redirects disabled. | A host could rebind to an internal or metadata address between vetting and connect. |
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
+| A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
 
@@ -369,7 +372,7 @@ from.
 | Module | Owns | Document |
 | --- | --- | --- |
 | [`gateways/`](src/gateways/) | Remote gateway records, pairing, connection points, issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md) |
-| [`mediators/`](src/mediators/) | DIDComm mediator connections | [`FABRIC.md`](docs/FABRIC.md) |
+| [`mediators/`](src/mediators/) | DIDComm mediator connections | [`FABRIC.md`](docs/FABRIC.md), [`PER_GATEWAY_MEDIATOR_FEDERATION.md`](docs/PER_GATEWAY_MEDIATOR_FEDERATION.md) |
 
 ### Management plane
 

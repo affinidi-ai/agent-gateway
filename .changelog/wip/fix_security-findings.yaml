@@ -1,0 +1,51 @@
+branch: fix/security-findings
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-09T00:00:05.000Z'
+      title: Refuse secret updates and deletes when the secret cannot be loaded
+      description: Updating or deleting a secret now returns 404 when it does not exist and 500 when it cannot be read, before any write. Previously the ownership check was skipped when the lookup failed, and a missing secret returned 400.
+  removed: []
+  security:
+    - timestamp: '2026-10-09T00:00:00.000Z'
+      title: ⭐ Withhold target credentials from callers whose source auth failed
+      description: A caller whose source authentication failed is now forwarded without the stored target credential on `proxy://` MCP Targets, Fabric send, Fabric receive (direct and MCP proxy Targets) and the `a2a-proxy://` Direct Line secret, as the direct inbound path already did. Previously these paths decided from the request path alone or assumed the caller was authenticated, so an anonymous caller on a surface without a denying policy reached the backend with the operator's credential. Agent-card fetches between gateways still carry the receiving gateway's credential.
+    - timestamp: '2026-10-09T00:00:03.000Z'
+      title: ⭐ Refuse tenant token writes to appliance-wide management records
+      description: A tenant access token can still read records that belong to no tenant, but now gets 403 when it updates, deletes or otherwise changes them in JWT verification strategies, secrets, STS clients, mediators, credential providers, certificates, trust authorities, issuers, trust registries, surface templates and integrations (including triggering an appliance-wide integration), and on the appliance Gateway's Connection Points, which tenant tokens can therefore no longer create. Previously these write paths used the read rule, so a tenant could, for example, replace a global JWT strategy's keys. Tenant automations that edited untenanted records need an appliance-wide token, or an operator can assign the record with `PUT /v1/tenant-ownership/...`.
+    - timestamp: '2026-10-10T00:00:00.000Z'
+      title: Refuse to start when source authentication cannot initialise
+      description: A gateway in Active or Standby mode now exits at startup if the JWT verification strategy store cannot be opened, instead of running with source authentication silently disabled and attaching target credentials for every caller. A Fabric message that reaches a surface with caller authentication before source authentication is ready, or a direct request on a surface whose source authentication is missing, now gets 500. A fresh install is unaffected, because the store directory is created on first start.
+    - timestamp: '2026-10-10T00:00:02.000Z'
+      title: Stop logging integration credentials and webhook URLs
+      description: The integration test endpoint no longer logs the submitted configuration or content, and Slack, webhook and Redis Streams publishers no longer log webhook URLs, Redis connection strings or URLs inside HTTP errors, which can carry passwords and bearer tokens.
+    - timestamp: '2026-10-10T00:00:03.000Z'
+      title: Accept one connection setup per gateway invitation, and only that one
+      description: A gateway invitation now accepts a connection setup only on a User Connection Point with a secret, only when the setup's parent thread id names the invitation message the mediator served, and only once. Previously the parent thread id was ignored, a leaked invitation URL and secret could be redeemed repeatedly until it expired, and system Connection Points with an empty secret accepted setups, each one creating an approval request, an admin notification and integration calls. The secret is now compared in constant time, and a setup that fails after its secret is accepted, such as at the appliance gateway limit, leaves the invitation unused so the peer can retry.
+    - timestamp: '2026-10-10T00:00:05.000Z'
+      title: Answer 404 for records a tenant token cannot see on every write
+      description: Updating, deleting or otherwise changing another tenant's record now returns the same 404, with the same body, as a missing record across all management stores, Gateways, Connection Points, Agent Surfaces, policies and API keys, so a tenant token cannot tell that an id exists in another tenant. Secrets, certificates and API keys outside the token's resource pattern answer the same way. A record the token can see but not change, such as an appliance-wide one, still returns 403. Previously these writes returned 403 for another tenant's record.
+    - timestamp: '2026-10-10T00:00:06.000Z'
+      title: Publish the Docker Compose ports on loopback only
+      description: docker-compose.yml now publishes the HTTPS (8443) and HTTP (8080) listeners on 127.0.0.1 instead of every host interface, so a local gateway is not reachable from the network before its first administrator registers. Remove the 127.0.0.1 prefix to expose it deliberately.
+  breaking:
+    - timestamp: '2026-10-09T00:00:01.000Z'
+      title: Stop sending target credentials for failed callers over MCP proxy and Fabric
+      description: Backends behind `proxy://` MCP, `a2a-proxy://` or Fabric surfaces with source authentication now receive requests from failed callers without the target credential, and will usually reject them. Two Fabric gateways that both require source authentication on the same header now reach the backend without the target credential, because the sending gateway strips that header; require caller authentication on one side of the hop or use a different header on each side (see docs/POLICY.md).
+    - timestamp: '2026-10-09T00:00:07.000Z'
+      title: Refuse tenant token edits to records that belong to no tenant
+      description: Tenant automations that updated, deleted or triggered appliance-wide records, including records created before tenant stamping, now get 403, and tenant tokens can no longer create Connection Points. Use an appliance-wide token, or have an operator assign the record with `PUT /v1/tenant-ownership/...`.
+    - timestamp: '2026-10-10T00:00:04.000Z'
+      title: Pair one gateway per invitation and recreate invitations made before upgrade
+      description: Each gateway invitation now pairs a single gateway; create a new invitation for every peer, including after rejecting a request. Invitations created before this release recorded a different invitation message id and are refused, so create them again.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Stop starting when the JWT verification strategy store cannot be opened
+      description: A gateway in Active or Standby mode now exits at startup if its JWT verification strategy store cannot be opened, even when no surface uses caller authentication. Before upgrading, check that the gateway user can create and read the `jwt_verification_strategies` directory next to the secrets storage directory.
+    - timestamp: '2026-10-12T00:00:01.000Z'
+      title: Publish Docker Compose ports on 127.0.0.1 instead of every interface
+      description: A gateway started with docker-compose.yml is no longer reachable from other hosts on ports 8443 and 8080. Remove the 127.0.0.1 prefix in docker-compose.yml to expose it deliberately.
+  internal:
+    - timestamp: '2026-10-12T00:00:02.000Z'
+      title: Keep secret-named values out of two test assertions and helpers
+      description: A Direct Line credential test no longer prints its result in the assertion message, and the A2A proxy component-test harness that requires caller authentication is renamed, so code scanning no longer reports test-only values as logged or sent in cleartext.

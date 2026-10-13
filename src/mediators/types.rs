@@ -98,6 +98,9 @@ pub struct MediatorResponse {
     pub did_document: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub our_did: Option<String>,
+    /// Whether the gateway has an identity on this mediator (`our_did` and
+    /// `our_secrets` both set), without exposing the secrets.
+    pub registered: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -113,10 +116,11 @@ impl From<Mediator> for MediatorResponse {
             status,
             did_document,
             our_did,
-            our_secrets: _,
+            our_secrets,
             created_at,
             updated_at,
         } = mediator;
+        let registered = our_did.is_some() && our_secrets.is_some();
         Self {
             id,
             tenant_id,
@@ -126,6 +130,7 @@ impl From<Mediator> for MediatorResponse {
             status,
             did_document,
             our_did,
+            registered,
             created_at,
             updated_at,
         }
@@ -177,6 +182,22 @@ mod tests {
         assert!(!serialized.contains("our_secrets"));
         assert!(!serialized.contains("privateKeyJwk"));
         assert!(!serialized.contains("PRIVATE_KEY_MATERIAL"));
+    }
+
+    #[test]
+    fn response_reports_registration_without_the_secrets() {
+        assert_eq!(
+            serde_json::to_value(MediatorResponse::from(mediator_with_secrets())).unwrap()["registered"],
+            json!(true)
+        );
+
+        let mut did_only = mediator_with_secrets();
+        did_only.our_secrets = None;
+        assert!(!MediatorResponse::from(did_only).registered);
+
+        let mut secrets_only = mediator_with_secrets();
+        secrets_only.our_did = None;
+        assert!(!MediatorResponse::from(secrets_only).registered);
     }
 
     #[test]

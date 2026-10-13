@@ -25,8 +25,8 @@ pub use crate::proxy::SurfaceTaskManager;
 /// Builds the middleware from the secrets store, API key validator, DID Auth session
 /// store, and JWT strategy store.
 ///
-/// Returns `None` (with a warning) if the JWT verification strategy store cannot be
-/// created; the gateway continues to start but source authentication will be unavailable.
+/// Fails when the JWT verification strategy store cannot be opened, so the gateway
+/// refuses to start rather than serving surfaces without source authentication.
 async fn init_source_auth_middleware(
     secrets_storage_path: &str,
     secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>>,
@@ -34,48 +34,44 @@ async fn init_source_auth_middleware(
     api_key_validator: Option<Arc<dyn crate::api_keys::ApiKeyValidator>>,
     didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
     cert_store: Option<Arc<dyn crate::certificates::CertificateStore>>,
-) -> Option<Arc<crate::source_auth::SourceAuthMiddleware>> {
+) -> anyhow::Result<Arc<crate::source_auth::SourceAuthMiddleware>> {
     let storage_path = PathBuf::from(secrets_storage_path)
         .parent()
         .map(|p| p.join("jwt_verification_strategies"))
         .unwrap_or_else(|| PathBuf::from("_storage/jwt_verification_strategies"));
 
-    match crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(storage_path.clone()).await {
-        Ok(store) => {
-            info!("Source auth: JWT verification strategy store initialised at {}", storage_path.display());
-            let store_arc: Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage> = Arc::new(store);
-            {
-                let s = store_arc.clone();
-                crate::config::register_counter("credentials.jwt", move || {
-                    let s = s.clone();
-                    async move {
-                        s.list()
-                            .await
-                            .map(|v| v.len())
-                            .unwrap_or(0)
-                    }
-                });
+    let store = crate::jwt_bearer::FileSystemJwtVerificationStrategyStore::new(storage_path.clone())
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to initialise source authentication: JWT verification strategy store at {} is unavailable",
+                storage_path.display()
+            )
+        })?;
+    info!("Source auth: JWT verification strategy store initialised at {}", storage_path.display());
+    let store_arc: Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage> = Arc::new(store);
+    {
+        let s = store_arc.clone();
+        crate::config::register_counter("credentials.jwt", move || {
+            let s = s.clone();
+            async move {
+                s.list()
+                    .await
+                    .map(|v| v.len())
+                    .unwrap_or(0)
             }
-            let jwks_client = Arc::new(crate::jwt_bearer::JwksClient::new());
-            Some(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
-                didauth_session_store,
-                store_arc,
-                jwks_client,
-                secrets_store,
-                secrets_cache,
-                api_key_validator,
-                cert_store,
-            )))
-        }
-        Err(e) => {
-            warn!(
-                "Failed to initialise source auth middleware (JWT strategy store at {}): {}",
-                storage_path.display(),
-                e
-            );
-            None
-        }
+        });
     }
+    let jwks_client = Arc::new(crate::jwt_bearer::JwksClient::new());
+    Ok(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        didauth_session_store,
+        store_arc,
+        jwks_client,
+        secrets_store,
+        secrets_cache,
+        api_key_validator,
+        cert_store,
+    )))
 }
 
 /// Register live entity counters for appliance resource-limit enforcement.
@@ -3156,20 +3152,17 @@ pub async fn run_axum_proxy(
             didauth_session_store.clone(),
             Some(certificates_store.clone()),
         )
-        .await;
+        .await?;
         identity_state.certificate_store = Some(certificates_store.clone());
-        identity_state.jwt_verification_strategy_store = source_auth_middleware
-            .as_ref()
-            .map(|middleware| middleware.provider_store());
+        identity_state.jwt_verification_strategy_store = Some(source_auth_middleware.provider_store());
 
         // Register with the GW2 message processor (global singleton).
-        if let Some(ref sa_mw) = source_auth_middleware {
-            crate::gateways::connection_points::message_processor::init_mcp_auth_network(Arc::new(
-                network_config.clone(),
-            ));
-            crate::gateways::connection_points::message_processor::init_source_auth_middleware(sa_mw.clone()).await;
-            info!("Source auth middleware registered with GW2 message processor");
-        }
+        crate::gateways::connection_points::message_processor::init_mcp_auth_network(Arc::new(network_config.clone()));
+        crate::gateways::connection_points::message_processor::init_source_auth_middleware(
+            source_auth_middleware.clone(),
+        )
+        .await;
+        info!("Source auth middleware registered with GW2 message processor");
 
         // Resolve inbound client-cert mTLS material once (CA cert DERs) so the
         // listener can build a WebPkiClientVerifier. Shared across inbound
@@ -3250,13 +3243,9 @@ pub async fn run_axum_proxy(
             pending_connection_store.clone(),
             integration_storage,
             // Re-use the same store that backs the middleware so hot-reloads are consistent.
-            source_auth_middleware
-                .as_ref()
-                .map(|mw| mw.provider_store()),
+            Some(source_auth_middleware.provider_store()),
             // Pass the JwksClient so the validate-jwks-uri endpoint can probe URIs.
-            source_auth_middleware
-                .as_ref()
-                .map(|mw| mw.jwks_client()),
+            Some(source_auth_middleware.jwks_client()),
             issuer_store.clone(),
             authority_store.clone(),
             // Build the x402 admin router here so it sits inside the identity
@@ -3327,9 +3316,7 @@ pub async fn run_axum_proxy(
                     .oauth_callback_route
                     .clone(),
                 vault_rbac_guard.clone(),
-                source_auth_middleware
-                    .as_ref()
-                    .map(|middleware| middleware.provider_store()),
+                Some(source_auth_middleware.provider_store()),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {
@@ -3362,7 +3349,6 @@ pub async fn run_axum_proxy(
             let mut dv_oauth_router =
                 crate::delegation_vault::router::create_delegation_vault_oauth_router(dv_state.clone());
             if let Some(runtime) = crate::mcp::continuations::config::global()
-                && let Some(middleware) = source_auth_middleware.as_ref()
                 && network_config
                     .sts
                     .mcp_issuer
@@ -3372,8 +3358,10 @@ pub async fn run_axum_proxy(
                     crate::delegation_vault::modern_consent::ModernConsentState {
                         vault: dv_state,
                         network: Arc::new(network_config.clone()),
-                        identity_strategies: middleware.provider_store(),
-                        verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(middleware.jwks_client())),
+                        identity_strategies: source_auth_middleware.provider_store(),
+                        verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(
+                            source_auth_middleware.jwks_client(),
+                        )),
                         continuations: runtime.service.clone(),
                         provider_http: crate::http_client::external().map_err(|error| anyhow::anyhow!(error))?,
                     },
@@ -3543,7 +3531,7 @@ pub async fn run_axum_proxy(
 
         // Store unified source auth middleware in channel_manager
         channel_manager
-            .set_source_auth_middleware(source_auth_middleware.clone())
+            .set_source_auth_middleware(Some(source_auth_middleware.clone()))
             .await;
 
         channel_manager
@@ -3743,9 +3731,7 @@ pub async fn run_axum_proxy(
                     .clone();
                 let direct_client_auth_clone = direct_client_auth.clone();
                 let listener_mgr_slot_for_outbound = listener_manager_slot.clone();
-                let consent_strategies = source_auth_middleware
-                    .as_ref()
-                    .map(|middleware| middleware.provider_store());
+                let consent_strategies = Some(source_auth_middleware.provider_store());
 
                 info!("Starting outbound port listener on port {} for {} channel(s)", port, outbound_channels.len());
 
@@ -3895,7 +3881,7 @@ pub async fn run_axum_proxy(
             let gateway_policy_mgr_clone = Some(gateway_policy_manager.clone());
 
             // Clone source_auth_middleware for this port
-            let source_auth_middleware_for_port = source_auth_middleware.clone();
+            let source_auth_middleware_for_port = Some(source_auth_middleware.clone());
             let direct_client_auth_for_port = direct_client_auth.clone();
             let resolved_surface_cache_for_port = resolved_surface_cache.clone();
 
@@ -4525,5 +4511,60 @@ mod tests {
         let connection_points = vec![cp(ConnectionPointType::OobAcceptor), cp(ConnectionPointType::System)];
 
         assert_eq!(count_user_connection_points(connection_points), 0);
+    }
+
+    async fn init_source_auth_under(storage_root: &std::path::Path) -> anyhow::Result<()> {
+        let secrets_path = storage_root.join("secrets");
+        super::init_source_auth_middleware(
+            secrets_path
+                .to_str()
+                .expect("utf-8 temp path"),
+            None,
+            std::sync::Arc::new(dashmap::DashMap::new()),
+            None,
+            std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn source_auth_initialises_when_the_strategy_store_opens() {
+        let storage_root = tempfile::tempdir().expect("temp dir");
+
+        init_source_auth_under(storage_root.path())
+            .await
+            .expect("source auth should initialise");
+
+        assert!(
+            storage_root
+                .path()
+                .join("jwt_verification_strategies")
+                .is_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_auth_initialisation_fails_when_the_strategy_store_cannot_open() {
+        let storage_root = tempfile::tempdir().expect("temp dir");
+        let strategies_path = storage_root
+            .path()
+            .join("jwt_verification_strategies");
+        std::fs::write(&strategies_path, b"not a directory").expect("write blocking file");
+
+        let error = match init_source_auth_under(storage_root.path()).await {
+            Err(error) => error,
+            Ok(()) => panic!("source auth must not initialise without its strategy store"),
+        };
+
+        assert!(
+            error.to_string().contains(
+                &strategies_path
+                    .display()
+                    .to_string()
+            ),
+            "error should name the storage path: {error:#}"
+        );
     }
 }

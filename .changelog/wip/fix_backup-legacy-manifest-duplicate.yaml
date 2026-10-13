@@ -1,0 +1,25 @@
+branch: fix/backup-legacy-manifest-duplicate
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Show that the restore page still accepts legacy .tgwbak backups
+      description: >-
+        Settings → System → Restore from Backup now states that legacy .tgwbak backups are still
+        supported, and the wrong-file error names both .agbak and .tgwbak, matching what the file
+        picker and the gateway already accept.
+  fixed:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Fix storage backups failing restore with duplicate manifest entries
+      description: >-
+        Backups taken from storage that contained a legacy backup manifest file under META-INF
+        carried two manifests and failed to restore with
+        "backup contains duplicate manifest entries". Restoring a backup whose manifest uses the
+        legacy name could leave that file in storage. Backups now skip stray manifest files and
+        log that they can be deleted, restores never write either manifest name into storage
+        (including dot-segment variants of the name), and an archive carrying both manifests is
+        validated against the current one, so backups already taken this way restore again.
+  removed: []
+  security: []
+  breaking: []
+  internal: []

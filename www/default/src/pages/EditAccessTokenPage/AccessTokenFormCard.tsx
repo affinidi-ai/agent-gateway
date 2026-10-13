@@ -6,6 +6,7 @@ import { DeleteButton } from '../../components/shared/DeleteButton';
 import { showToast } from '../../utils/toaster';
 import AccessTokenResourceScopeField from '../SecretsPage/AccessTokenResourceScopeField';
 import AccessTokenScopesField from '../SecretsPage/AccessTokenScopesField';
+import { ACCESS_TOKEN_NEW_ROUTE, accessTokenFormQuery } from './editorHelpers';
 import type { AccessTokenEditor } from './useAccessTokenEditor';
 
 interface AccessTokenFormCardProps {
@@ -175,6 +176,21 @@ const AccessTokenFormCard: React.FC<AccessTokenFormCardProps> = ({
               >
                 Revoke token
               </DeleteButton>
+            ) : !editor.isEditMode ? (
+              <CopyButton
+                text={`${window.location.origin}${ACCESS_TOKEN_NEW_ROUTE}${accessTokenFormQuery(editor.form)}`}
+                variant="outline-primary"
+                size="md"
+                label="Copy creation link"
+                title={
+                  editor.canSave
+                    ? 'Copy a link that opens this form with the current settings'
+                    : 'Fix the token settings before copying a creation link'
+                }
+                disabled={!editor.canSave}
+                onCopyError={() => showToast('error', 'Could not copy the link.')}
+                data-testid="access-token-copy-permalink-button"
+              />
             ) : (
               <span />
             )}

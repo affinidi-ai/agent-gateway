@@ -30,6 +30,8 @@ pub struct EndpointHttpPolicy {
     origins: Option<OriginPolicy>,
     limits: HttpLimits,
     versions: McpVersionPolicy<'static>,
+    /// The `Allow` header of a 405: the methods this endpoint admits.
+    allowed_methods: &'static str,
 }
 
 impl EndpointHttpPolicy {
@@ -38,7 +40,12 @@ impl EndpointHttpPolicy {
         public_endpoints: &[String],
         path: super::request_validation::McpPathKind,
     ) -> Result<Self, String> {
-        Self::with_versions(config, public_endpoints, super::request_validation::runtime_policy_for(path))
+        let mut policy =
+            Self::with_versions(config, public_endpoints, super::request_validation::runtime_policy_for(path))?;
+        if path == super::request_validation::McpPathKind::OwnedProxy {
+            policy.allowed_methods = OWNED_PROXY_ALLOWED_METHODS;
+        }
+        Ok(policy)
     }
 
     pub(crate) fn with_versions(
@@ -52,6 +59,7 @@ impl EndpointHttpPolicy {
             origins: Some(OriginPolicy::new(public_endpoints, &config.allowed_origins)?),
             limits: config.into(),
             versions,
+            allowed_methods: MCP_ALLOWED_METHODS,
         })
     }
 
@@ -103,7 +111,11 @@ impl EndpointHttpPolicy {
         method: &axum::http::Method,
         headers: &HeaderMap,
     ) -> Option<axum::response::Response> {
-        if !matches!(*method, axum::http::Method::GET | axum::http::Method::DELETE) {
+        use axum::http::Method;
+        if !matches!(*method, Method::POST | Method::GET | Method::DELETE | Method::HEAD | Method::OPTIONS) {
+            return Some(method_not_allowed(self.allowed_methods));
+        }
+        if !matches!(*method, Method::GET | Method::DELETE) {
             return None;
         }
         let mut versions = headers
@@ -122,12 +134,18 @@ impl EndpointHttpPolicy {
         if version != super::MCP_MODERN_VERSION {
             return None;
         }
-        let mut response = axum::response::Response::new(axum::body::Body::empty());
-        *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-        response
-            .headers_mut()
-            .insert(header::ALLOW, axum::http::HeaderValue::from_static("POST"));
-        Some(response)
+        Some(method_not_allowed("POST"))
+    }
+
+    /// Refuses a body on any method but POST: only a POST body passes the
+    /// JSON-RPC admission and batch refusal, so no other method may carry one
+    /// upstream.
+    pub fn non_post_body_response(
+        &self,
+        method: &axum::http::Method,
+        body: &[u8],
+    ) -> Option<axum::response::Response> {
+        (*method != axum::http::Method::POST && !body.is_empty()).then(|| NON_POST_BODY.into_response(None))
     }
 
     pub fn body_read_error(
@@ -198,6 +216,26 @@ const BODY_TOO_LARGE: HttpAdmissionError = HttpAdmissionError {
     status: StatusCode::PAYLOAD_TOO_LARGE,
     message: "MCP request body exceeds the configured limit",
 };
+
+const NON_POST_BODY: HttpAdmissionError = HttpAdmissionError {
+    status: StatusCode::BAD_REQUEST,
+    message: "Only MCP POST requests may carry a body",
+};
+/// Methods the gateway's MCP endpoints admit: POST, GET and DELETE for the
+/// transport, and HEAD and OPTIONS, which pass admission without a body.
+const MCP_ALLOWED_METHODS: &str = "POST, GET, DELETE, HEAD, OPTIONS";
+/// Methods a standalone MCP Proxy serves: its router routes POST, GET (and so
+/// HEAD) and DELETE, and it refuses DELETE.
+pub const OWNED_PROXY_ALLOWED_METHODS: &str = "POST, GET, HEAD";
+
+fn method_not_allowed(allow: &'static str) -> axum::response::Response {
+    let mut response = axum::response::Response::new(axum::body::Body::empty());
+    *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    response
+        .headers_mut()
+        .insert(header::ALLOW, axum::http::HeaderValue::from_static(allow));
+    response
+}
 
 pub fn strip_protocol_session_headers(headers: &mut HeaderMap) {
     headers.remove("mcp-session-id");
@@ -639,6 +677,71 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn methods_outside_mcp_are_refused_with_or_without_a_version_header() {
+        let policy =
+            EndpointHttpPolicy::new(None, &[], crate::mcp::request_validation::McpPathKind::DirectAccessPoint).unwrap();
+        for method in [
+            axum::http::Method::PUT,
+            axum::http::Method::PATCH,
+            axum::http::Method::TRACE,
+            axum::http::Method::CONNECT,
+            axum::http::Method::from_bytes(b"PROPFIND").unwrap(),
+        ] {
+            for headers in [HeaderMap::new(), modern_headers()] {
+                let response = policy
+                    .non_post_response(&method, &headers)
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+                assert_eq!(response.headers()[header::ALLOW], "POST, GET, DELETE, HEAD, OPTIONS");
+            }
+        }
+        for method in [axum::http::Method::HEAD, axum::http::Method::OPTIONS] {
+            assert!(
+                policy
+                    .non_post_response(&method, &HeaderMap::new())
+                    .is_none()
+            );
+        }
+        // A standalone MCP Proxy refuses DELETE, so it doesn't advertise it.
+        let owned =
+            EndpointHttpPolicy::new(None, &[], crate::mcp::request_validation::McpPathKind::OwnedProxy).unwrap();
+        let response = owned
+            .non_post_response(&axum::http::Method::PUT, &HeaderMap::new())
+            .unwrap();
+        assert_eq!(response.headers()[header::ALLOW], OWNED_PROXY_ALLOWED_METHODS);
+        assert!(!OWNED_PROXY_ALLOWED_METHODS.contains("DELETE"));
+    }
+
+    #[test]
+    fn only_post_may_carry_a_body() {
+        let policy =
+            EndpointHttpPolicy::new(None, &[], crate::mcp::request_validation::McpPathKind::DirectAccessPoint).unwrap();
+        let batch = br#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"admin_reset"}}]"#;
+        for method in
+            [axum::http::Method::GET, axum::http::Method::DELETE, axum::http::Method::HEAD, axum::http::Method::OPTIONS]
+        {
+            assert_eq!(
+                policy
+                    .non_post_body_response(&method, batch)
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST,
+                "{method}"
+            );
+            assert!(
+                policy
+                    .non_post_body_response(&method, b"")
+                    .is_none()
+            );
+        }
+        assert!(
+            policy
+                .non_post_body_response(&axum::http::Method::POST, batch)
+                .is_none()
         );
     }
 

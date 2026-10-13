@@ -67,11 +67,6 @@ pub async fn get_permissions_optional(
         ("issuers.view", Feature::IssuersView),
         ("issuers.edit", Feature::IssuersEdit),
         ("issuers.delete", Feature::IssuersDelete),
-        // Legacy aliases — emit both canonical and legacy keys so dashboards
-        // still checking the pre-rename permission names continue to work.
-        ("departments.view", Feature::IssuersView),
-        ("departments.edit", Feature::IssuersEdit),
-        ("departments.delete", Feature::IssuersDelete),
         ("authorities.view", Feature::AuthoritiesView),
         ("authorities.edit", Feature::AuthoritiesEdit),
         ("authorities.delete", Feature::AuthoritiesDelete),
@@ -195,11 +190,6 @@ pub async fn get_permissions(
         ("issuers.view", Feature::IssuersView),
         ("issuers.edit", Feature::IssuersEdit),
         ("issuers.delete", Feature::IssuersDelete),
-        // Legacy aliases — emit both canonical and legacy keys so dashboards
-        // still checking the pre-rename permission names continue to work.
-        ("departments.view", Feature::IssuersView),
-        ("departments.edit", Feature::IssuersEdit),
-        ("departments.delete", Feature::IssuersDelete),
         ("authorities.view", Feature::AuthoritiesView),
         ("authorities.edit", Feature::AuthoritiesEdit),
         ("authorities.delete", Feature::AuthoritiesDelete),
@@ -227,7 +217,6 @@ pub async fn get_permissions(
 
     let mut permissions = serde_json::Map::new();
     for (name, feature) in features {
-        // Match on the canonical feature name so aliases like `departments.view` follow `issuers.view`.
         let granted = rbac_config.has_permission(&user_data.role, &feature) && pat_scope_allows(pat.as_ref(), &feature);
         permissions.insert(name.to_string(), serde_json::Value::Bool(granted));
     }
@@ -450,8 +439,35 @@ mod tests {
         assert_eq!(perms["secrets.edit"], serde_json::Value::Bool(false));
         assert_eq!(perms["gateways.view"], serde_json::Value::Bool(false));
         assert_eq!(perms["issuers.view"], serde_json::Value::Bool(true));
-        assert_eq!(perms["departments.view"], serde_json::Value::Bool(true));
-        assert_eq!(perms["departments.edit"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn every_permissions_key_is_an_access_token_scope_the_rbac_config_accepts() {
+        let perms = permissions_for_token(UserRole::Administrator, None).await;
+        let rbac = RbacConfig::default();
+        let unknown: Vec<&String> = perms
+            .as_object()
+            .expect("permissions object")
+            .keys()
+            .filter(|key| {
+                !rbac
+                    .permissions
+                    .contains_key(*key)
+            })
+            .collect();
+        assert!(unknown.is_empty(), "permissions keys rejected as access-token scopes: {unknown:?}");
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_omits_legacy_department_keys() {
+        let perms = permissions_for_token(UserRole::Administrator, None).await;
+        let keys = perms
+            .as_object()
+            .expect("permissions object");
+        assert!(keys.contains_key("issuers.view"));
+        assert!(!keys.contains_key("departments.view"));
+        assert!(!keys.contains_key("departments.edit"));
+        assert!(!keys.contains_key("departments.delete"));
     }
 
     #[tokio::test]

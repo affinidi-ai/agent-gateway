@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use crate::mediators::handlers::mediator_allowed;
 use crate::mediators::utils::fetch_mediator_did_from_url;
 use crate::mediators::utils::set_acl_to_allow_everything_and_more;
 use crate::messages::MessageType;
@@ -377,6 +378,9 @@ pub async fn update_gateway<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
@@ -424,6 +428,9 @@ pub async fn update_gateway_exposed_surfaces<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
@@ -520,6 +527,9 @@ pub async fn update_gateway_policy<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
@@ -670,6 +680,9 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
     }
@@ -1002,11 +1015,19 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            update(owned.id.clone(), tenant)
+            update(owned.id.clone(), tenant.clone())
                 .await
                 .is_ok(),
             "a tenant manages its own gateway"
         );
+        let other_tenant = Some(Extension(PatTenantContext {
+            token_id: "agat_other".into(),
+            tenant_id: "tenant-b".into(),
+        }));
+        let err = update(owned.id.clone(), other_tenant)
+            .await
+            .expect_err("another tenant's gateway is out of reach");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert!(
             update(appliance.id.clone(), None)
                 .await
@@ -1338,6 +1359,141 @@ mod tests {
         assert_eq!(response.message, "Gateway ping timed out - no response received");
         assert_eq!(response.round_trip_ms, None);
     }
+
+    fn acceptor_mediator(tenant: &str) -> crate::mediators::types::Mediator {
+        let mut mediator = crate::mediators::types::Mediator::new(
+            "Acceptor mediator".into(),
+            String::new(),
+            "did:example:acceptor-mediator".into(),
+            None,
+        );
+        mediator.id = "mediator-a".into();
+        mediator.tenant_id = Some(tenant.into());
+        mediator.status = crate::mediators::types::MediatorStatus::Active;
+        mediator.our_did = Some("did:example:our-identity".into());
+        mediator.our_secrets = Some(serde_json::json!([]));
+        mediator
+    }
+
+    fn tenant_a_caller() -> (Option<Extension<PatTenantContext>>, Option<Extension<PatResourceScope>>) {
+        let context = PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        };
+        let scope = PatResourceScope(std::sync::Arc::new(
+            regex::Regex::new(r"\ATENANT:tenant-a:mediators:mediator-a\z").unwrap(),
+        ));
+        (Some(Extension(context)), Some(Extension(scope)))
+    }
+
+    #[test]
+    fn acceptor_mediator_id_is_refused_while_mediator_federation_is_off() {
+        let error = check_acceptor_mediator_allowed_by_flag(true, false).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.1, "acceptor_mediator_id requires the mediator_federation feature flag");
+
+        assert!(check_acceptor_mediator_allowed_by_flag(true, true).is_ok());
+        assert!(check_acceptor_mediator_allowed_by_flag(false, false).is_ok());
+    }
+
+    #[test]
+    fn acceptor_mediator_in_scope_active_and_registered_is_accepted() {
+        let (context, scope) = tenant_a_caller();
+        let mediator = check_acceptor_mediator(
+            "mediator-a",
+            Some(acceptor_mediator("tenant-a")),
+            Some("tenant-a"),
+            &context,
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(mediator.id, "mediator-a");
+        assert_eq!(mediator.did, "did:example:acceptor-mediator");
+    }
+
+    #[test]
+    fn acceptor_mediator_outside_caller_tenant_is_indistinguishable_from_unknown() {
+        let (context, scope) = tenant_a_caller();
+        let out_of_scope = check_acceptor_mediator(
+            "mediator-a",
+            Some(acceptor_mediator("tenant-b")),
+            Some("tenant-a"),
+            &context,
+            &scope,
+        )
+        .unwrap_err();
+        let unknown = check_acceptor_mediator("mediator-a", None, Some("tenant-a"), &context, &scope).unwrap_err();
+
+        assert_eq!(out_of_scope, (StatusCode::BAD_REQUEST, "Mediator not found: mediator-a".to_string()));
+        assert_eq!(out_of_scope, unknown);
+    }
+
+    #[test]
+    fn acceptor_mediator_outside_token_resource_scope_is_rejected_as_unknown() {
+        let (context, _) = tenant_a_caller();
+        let other_resource_only = Some(Extension(PatResourceScope(std::sync::Arc::new(
+            regex::Regex::new(r"\ATENANT:tenant-a:mediators:mediator-b\z").unwrap(),
+        ))));
+
+        let error = check_acceptor_mediator(
+            "mediator-a",
+            Some(acceptor_mediator("tenant-a")),
+            Some("tenant-a"),
+            &context,
+            &other_resource_only,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, (StatusCode::BAD_REQUEST, "Mediator not found: mediator-a".to_string()));
+    }
+
+    #[test]
+    fn acceptor_mediator_disabled_or_unregistered_gets_one_generic_message() {
+        let (context, scope) = tenant_a_caller();
+        let mut disabled = acceptor_mediator("tenant-a");
+        disabled.status = crate::mediators::types::MediatorStatus::Disabled;
+        let mut unregistered = acceptor_mediator("tenant-a");
+        unregistered.our_did = None;
+        unregistered.our_secrets = None;
+
+        let expected = (StatusCode::BAD_REQUEST, "Selected mediator is unavailable".to_string());
+        assert_eq!(
+            check_acceptor_mediator("mediator-a", Some(disabled), Some("tenant-a"), &context, &scope).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            check_acceptor_mediator("mediator-a", Some(unregistered), Some("tenant-a"), &context, &scope).unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn an_appliance_caller_cannot_home_a_tenant_gateway_on_another_tenants_mediator() {
+        let error =
+            check_acceptor_mediator("mediator-a", Some(acceptor_mediator("tenant-a")), Some("tenant-b"), &None, &None)
+                .unwrap_err();
+
+        assert_eq!(error, (StatusCode::BAD_REQUEST, "Mediator not found: mediator-a".to_string()));
+    }
+
+    #[test]
+    fn a_global_gateway_cannot_use_a_tenant_mediator() {
+        let error =
+            check_acceptor_mediator("mediator-a", Some(acceptor_mediator("tenant-a")), None, &None, &None).unwrap_err();
+
+        assert_eq!(error, (StatusCode::BAD_REQUEST, "Mediator not found: mediator-a".to_string()));
+    }
+
+    #[test]
+    fn a_tenant_gateway_may_use_a_global_mediator() {
+        let (context, _) = tenant_a_caller();
+        let mut global = acceptor_mediator("tenant-a");
+        global.tenant_id = None;
+
+        let mediator = check_acceptor_mediator("mediator-a", Some(global), Some("tenant-a"), &context, &None).unwrap();
+
+        assert_eq!(mediator.tenant_id, None);
+    }
 }
 
 /// Request body for connecting to a gateway via OOB
@@ -1351,6 +1507,94 @@ pub struct ConnectViaOOBRequest {
     pub description: String,
     #[serde(default)]
     pub did_method: Option<crate::gateways::connection_points::types::ConnectionPointDidMethod>,
+    /// Mediator (by id) to home the acceptor's permanent connection point on.
+    /// Omitted, the acceptor uses the inviter's mediator.
+    #[serde(default)]
+    pub acceptor_mediator_id: Option<String>,
+}
+
+/// Refuses `acceptor_mediator_id` while the `mediator_federation` flag is off.
+fn check_acceptor_mediator_allowed_by_flag(
+    acceptor_mediator_requested: bool,
+    federation_enabled: bool,
+) -> Result<(), (StatusCode, String)> {
+    if acceptor_mediator_requested && !federation_enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "acceptor_mediator_id requires the {} feature flag",
+                crate::mediators::federation::FLAG_MEDIATOR_FEDERATION
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Looks up and validates the acceptor mediator, returning its DID and the
+/// endpoint the permanent connection point advertises.
+async fn resolve_acceptor_mediator<M: crate::mediators::MediatorStore>(
+    mediator_store: &M,
+    mediator_id: &str,
+    gateway_tenant_id: Option<&str>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<(String, String), (StatusCode, String)> {
+    let mediator = mediator_store
+        .get(mediator_id)
+        .await
+        .map_err(|e| {
+            error!(mediator_id, error = %e, "Failed to look up acceptor mediator");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to look up mediator".to_string())
+        })?;
+    let mediator = check_acceptor_mediator(mediator_id, mediator, gateway_tenant_id, context, scope)?;
+    let endpoint = crate::gateways::connection_points::handlers::resolve_mediator_endpoint(
+        &mediator.did,
+        mediator.did_document.as_ref(),
+    )
+    .map_err(|e| {
+        warn!(mediator_id, error = %e, "Acceptor mediator endpoint could not be resolved");
+        (StatusCode::BAD_REQUEST, ACCEPTOR_MEDIATOR_UNAVAILABLE.to_string())
+    })?;
+    Ok((mediator.did, endpoint))
+}
+
+const ACCEPTOR_MEDIATOR_UNAVAILABLE: &str = "Selected mediator is unavailable";
+
+/// Validates the mediator named by `ConnectViaOOBRequest::acceptor_mediator_id`.
+///
+/// An unknown mediator, one outside the caller's tenant or resource scope, and
+/// one the gateway's tenant may not reference (a tenant gateway may use its own
+/// tenant's mediators or global ones, a global gateway only global ones) get the
+/// same `400`, so a scoped caller cannot learn that the mediator exists. An
+/// in-scope mediator that is not Active or not registered (`our_did` /
+/// `our_secrets`) gets one generic message; the detail is logged server-side.
+fn check_acceptor_mediator(
+    mediator_id: &str,
+    mediator: Option<crate::mediators::types::Mediator>,
+    gateway_tenant_id: Option<&str>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<crate::mediators::types::Mediator, (StatusCode, String)> {
+    let not_found = || (StatusCode::BAD_REQUEST, format!("Mediator not found: {}", mediator_id));
+    let mediator = mediator.ok_or_else(not_found)?;
+    if !mediator_allowed(&mediator, context, scope) || !can_reference(gateway_tenant_id, mediator.tenant_id.as_deref())
+    {
+        return Err(not_found());
+    }
+    if mediator.status != crate::mediators::types::MediatorStatus::Active
+        || mediator.our_did.is_none()
+        || mediator.our_secrets.is_none()
+    {
+        warn!(
+            "Rejecting acceptor_mediator_id '{}': mediator '{}' unavailable (status={:?}, registered={})",
+            mediator_id,
+            mediator.name,
+            mediator.status,
+            mediator.our_did.is_some() && mediator.our_secrets.is_some()
+        );
+        return Err((StatusCode::BAD_REQUEST, ACCEPTOR_MEDIATOR_UNAVAILABLE.to_string()));
+    }
+    Ok(mediator)
 }
 
 /// Response for connecting to a gateway via OOB
@@ -1395,14 +1639,30 @@ pub async fn connect_via_oob<
     ) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
     }
+    check_acceptor_mediator_allowed_by_flag(
+        req.acceptor_mediator_id
+            .is_some(),
+        crate::mediators::federation::mediator_federation_enabled(),
+    )?;
+    let acceptor_mediator = match req
+        .acceptor_mediator_id
+        .as_deref()
+    {
+        Some(mediator_id) => Some(
+            resolve_acceptor_mediator(mediator_store.as_ref(), mediator_id, req.tenant_id.as_deref(), &context, &scope)
+                .await?,
+        ),
+        None => None,
+    };
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("🔗 Starting OOB connection flow (ACCEPTOR role)");
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("  OOB URL: {}", req.oob_url);
     info!("  Gateway Name: {}", req.name);
     info!("  Gateway Description: {}", req.description);
-    info!("  IMPORTANT: ACCEPTOR does not need a mediator configured");
-    info!("  Messages will be sent to inviter's mediator (from OOB URL)");
+    info!("  IMPORTANT: The handshake always uses the inviter's mediator (from OOB URL)");
+    info!("  The permanent connection uses the acceptor's own mediator when acceptor_mediator_id is set,");
+    info!("  otherwise it falls back to the inviter's mediator (shared mediator mode)");
     info!("");
 
     // Enforce the appliance gateway limit before starting the OOB handshake.
@@ -1478,7 +1738,7 @@ pub async fn connect_via_oob<
             (StatusCode::BAD_REQUEST, "Invalid OOB URL format".to_string())
         })?
         .to_string();
-    info!("  Mediator endpoint: {}", their_mediator_endpoint);
+    debug!("  Mediator endpoint: {}", their_mediator_endpoint);
 
     // Convert mediator endpoint to DID (replace / with : for did:web format)
     // https://fabric-mediator-1.example.com/mediator/v1 -> did:web:fabric-mediator-1.example.com:mediator:v1:.well-known
@@ -1489,7 +1749,7 @@ pub async fn connect_via_oob<
             (StatusCode::BAD_REQUEST, format!("Failed to fetch inviter's mediator DID from URL: {}", e))
         })?;
 
-    info!("✓ Inviter's mediator DID: {}", their_mediator_did);
+    debug!("✓ Inviter's mediator DID: {}", their_mediator_did);
 
     let their_mediator_did_document = match mediator_store
         .list_all()
@@ -1520,6 +1780,22 @@ pub async fn connect_via_oob<
         );
     }
 
+    info!("");
+
+    // Step 4.5: The permanent connection point is homed on the acceptor
+    // mediator when one was selected, otherwise on the inviter's mediator. The
+    // handshake (Steps 5, 9-11) always uses the inviter's mediator.
+    info!("🔍 Step 4.5: Choosing the mediator for the permanent connection...");
+    let (acceptor_mediator_did, acceptor_mediator_endpoint) = match acceptor_mediator {
+        Some((did, endpoint)) => {
+            debug!("  Using acceptor's own mediator: {} ({})", did, endpoint);
+            (did, endpoint)
+        }
+        None => {
+            info!("  No acceptor mediator selected - using the inviter's mediator (shared mediator mode)");
+            (their_mediator_did.clone(), their_mediator_endpoint.clone())
+        }
+    };
     info!("");
 
     // Step 5: Create TWO DIDs for proper OOB flow
@@ -1579,6 +1855,7 @@ pub async fn connect_via_oob<
     // Step 6: Create secure DID #2 (permanent connection)
     info!("🔑 Step 6: Creating secure DID for permanent connection...");
     info!("  DID #2: Secure (permanent) - used for actual connection after handshake");
+    debug!("  Homed on mediator: {}", acceptor_mediator_did);
 
     let secure_cp_id = uuid::Uuid::new_v4().to_string();
     info!("  Secure CP ID: {}", secure_cp_id);
@@ -1593,7 +1870,7 @@ pub async fn connect_via_oob<
                     .storage_paths
                     .connection_points,
             ),
-            &their_mediator_endpoint,
+            &acceptor_mediator_endpoint,
             did_method,
             #[cfg(feature = "didwebvh")]
             log_storage.clone(),
@@ -1611,7 +1888,9 @@ pub async fn connect_via_oob<
 
     // Step 7: Store pending connection state (so we can complete handshake when connection-accepted arrives)
     info!("💾 Step 7: Storing pending connection state...");
-    // Note: We store the inviter's mediator DID (not ours, since we don't have one on ACCEPTOR side)
+    // Note: mediator_did is the mediator the permanent secure DID is homed on -
+    // the acceptor's own mediator when acceptor_mediator_id was set (Step 4.5),
+    // otherwise the inviter's mediator (shared-mediator fallback).
     let pending_connection = crate::gateways::PendingOOBConnection {
         id: invitation_message.id.clone(),
         invitation_id: invitation_message.id.clone(),
@@ -1620,14 +1899,17 @@ pub async fn connect_via_oob<
         their_temporary_did: inviter_temporary_did.clone(),
         their_secure_did: None, // Will be set when we receive connection-accepted
         their_issuer_did: None,
-        mediator_did: their_mediator_did.clone(), // Store inviter's mediator
-        connection_point_id: String::new(),       // No connection point needed for OOB
+        mediator_did: acceptor_mediator_did.clone(), // Mediator the permanent secure DID is homed on
+        connection_point_id: String::new(),          // No connection point needed for OOB
         role: crate::gateways::ConnectionRole::Acceptor,
         state: crate::gateways::ConnectionState::WaitingForResponse,
         created_at: chrono::Utc::now(),
         expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
         secure_cp_id: Some(secure_cp_id.clone()),
         temporary_cp_id: Some(temp_cp_id.clone()),
+        mediator_record_id: req
+            .acceptor_mediator_id
+            .clone(),
     };
 
     info!("  Pending connection details:");
@@ -1635,7 +1917,7 @@ pub async fn connect_via_oob<
     info!("    Our temporary DID: {}", pending_connection.our_temporary_did);
     info!("    Our secure DID: {}", pending_connection.our_secure_did);
     info!("    Their temporary DID: {}", pending_connection.their_temporary_did);
-    info!("    Mediator DID: {}", pending_connection.mediator_did);
+    debug!("    Mediator DID: {}", pending_connection.mediator_did);
     info!("    Role: {:?}", pending_connection.role);
     info!("    State: {:?}", pending_connection.state);
 
@@ -1763,7 +2045,7 @@ pub async fn connect_via_oob<
         .await
         .map_err(|e| {
             error!("❌ Failed to send connection-setup: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send connection-setup: {}", e))
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send connection-setup".to_string())
         })?;
 
     info!("✓ Connection-setup sent successfully to inviter's mediator");
@@ -1827,6 +2109,8 @@ pub async fn connect_via_oob<
             "pending_gateway_id": pending_gateway.id,
             "secure_cp_id": secure_cp_id,
             "secure_did": secure_did,
+            "secure_mediator_did": acceptor_mediator_did,
+            "secure_mediator_id": req.acceptor_mediator_id,
         }),
         None,
         super::connection_points::types::ConnectionPointType::System, // Temporary system CP
@@ -1898,6 +2182,9 @@ pub async fn request_gateway_issuer<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
     }
@@ -1941,6 +2228,9 @@ async fn load_remote_gateway_for_issuers<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_allowed(&gateway, context, scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !gateway_writable(&gateway, context, scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
     }
@@ -2176,7 +2466,8 @@ async fn recover_ping_after_timeout(
         .pack_and_send_message(&retry_message, &gateway.did, &gateway_listener.gateway_did)
         .await
     {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send retry ping message: {}", e)));
+        error!(gateway_id = %gateway.id, error = %e, "Failed to send retry ping message");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to send retry ping message".to_string()));
     }
 
     let retry_response = gateway_listener
@@ -2234,7 +2525,7 @@ pub async fn ping_gateway<S: GatewayStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
     if !gateway_allowed(&gateway, &context, &scope) {
-        return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
     }
 
     info!("[{request_id}] Gateway found: {} (DID: {})", gateway.name, gateway.did);
@@ -2339,7 +2630,10 @@ pub async fn ping_gateway<S: GatewayStore>(
         .client
         .pack_and_send_message(&ping_message, &gateway.did, &gateway_listener.gateway_did)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send ping message: {}", e)))?;
+        .map_err(|e| {
+            error!("[{request_id}] Failed to send ping message to gateway {}: {}", gateway.id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send ping message".to_string())
+        })?;
 
     info!("[{request_id}] 🟢 Ping sent, waiting for pong via WebSocket...");
 
@@ -2570,7 +2864,8 @@ async fn discover_gateway_surfaces<S: GatewayStore>(
         .pack_and_send_message(&get_channels_message, &gateway.did, &gateway_listener.gateway_did)
         .await
         .map_err(|e| {
-            DiscoveryFailure::hard(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send get-channels: {e}"))
+            error!(gateway_id = %gateway.id, error = %e, "Failed to send get-channels");
+            DiscoveryFailure::hard(StatusCode::INTERNAL_SERVER_ERROR, "Failed to send get-channels".to_string())
         })?;
 
     // Wait for get-channels-response via WebSocket (5s timeout).

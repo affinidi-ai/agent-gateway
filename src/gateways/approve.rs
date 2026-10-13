@@ -30,6 +30,9 @@ async fn load_pending_gateway<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !crate::gateways::handlers::gateway_allowed(&gateway, context, scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !crate::gateways::handlers::gateway_writable(&gateway, context, scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
     }
@@ -181,17 +184,16 @@ pub async fn approve_gateway<
         // We need to send the gateway CP DID in the connection-accepted message
         info!("📝 Creating connection points for gateway communication...");
 
-        // IMPORTANT: Use the SAME mediator as the OOB connection point (already retrieved above)
-        // Both sides of the connection MUST use the same mediator for the handshake to work!
+        // The inviter's permanent connection point uses its OOB connection point's
+        // mediator. The acceptor's may be on another mediator.
         let gw_mediator_did = mediator_did.clone();
         let gw_mediator_id = connection_point
             .mediator_id
             .clone();
 
-        // Extract mediator URL from DID
-        use crate::gateways::connection_points::handlers::extract_mediator_url;
-        let gw_mediator_url = extract_mediator_url(&gw_mediator_did)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to extract mediator URL: {}", e)))?;
+        use crate::gateways::connection_points::handlers::resolve_mediator_endpoint;
+        let gw_mediator_url = resolve_mediator_endpoint(&gw_mediator_did, mediator.did_document.as_ref())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resolve mediator URL: {}", e)))?;
 
         info!("  Using mediator from OOB connection point: {}", gw_mediator_did);
 
@@ -444,7 +446,7 @@ mod tests {
                 .await
                 .expect_err("another tenant's peer is out of reach")
                 .0,
-            StatusCode::FORBIDDEN
+            StatusCode::NOT_FOUND
         );
         assert!(
             load_pending_gateway(&store, "appliance-peer", &None, &None)

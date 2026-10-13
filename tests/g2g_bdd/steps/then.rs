@@ -16,8 +16,12 @@ use crate::bdd_support::assertions::{
 };
 use crate::bdd_support::collaborators::{
     assert_header_absent, assert_header_value, assert_json_request_body, assert_no_requests,
-    assert_request_content_type_starts_with, assert_request_count, assert_unique_json_rpc_request_ids,
+    assert_request_content_type_starts_with, assert_request_count, assert_requests_omit_value,
+    assert_unique_json_rpc_request_ids,
 };
+use crate::bdd_support::config::modern_consent::PUBLIC_ORIGIN;
+use crate::bdd_support::mcp_consent::ConsentRequest;
+use crate::bdd_support::oidc::OidcProvider;
 use crate::world::G2gWorld;
 
 const FABRIC_GATEWAY_DID_META_KEY: &str = "x-affinidi-fabric-gateway-did";
@@ -190,7 +194,8 @@ pub async fn gateway_did_not_receive_fabric_forward_request(
     let actual = world
         .harness()
         .fabric_forward_request_count(gateway_index)
-        .await;
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
     assert_eq!(
         actual, baseline,
         "gateway {gateway_index} received a fabric forward request after the caller action; caller_status={:?}; caller_body={:?}",
@@ -481,6 +486,149 @@ pub async fn actor_did_not_receive_header(
     assert_header_absent(&last.headers, &header, &format!("forwarded request for target collaborator '{target_name}'"));
 }
 
+#[then(expr = "the MCP response asks caller {string} for consent to OAuth provider {string} at gateway {int}")]
+async fn mcp_response_asks_for_consent(
+    world: &mut G2gWorld,
+    caller: String,
+    provider: String,
+    gw_index: usize,
+) {
+    let response = response_body(world);
+    let consent = ConsentRequest::from_response(response)
+        .unwrap_or_else(|| panic!("caller '{caller}' was not asked for consent: {response}"));
+    assert!(
+        world
+            .topology
+            .plans
+            .get(&gw_index)
+            .is_some_and(|plan| plan.modern_consent.is_some()),
+        "gateway {gw_index} does not serve consent on {PUBLIC_ORIGIN}"
+    );
+    assert_eq!(
+        consent
+            .url
+            .origin()
+            .ascii_serialization(),
+        PUBLIC_ORIGIN,
+        "consent URL {} is not on gateway {gw_index}",
+        consent.url
+    );
+    assert_eq!(
+        consent.url.path(),
+        format!("/mcp-consent/connect/{provider}"),
+        "consent URL {} does not connect OAuth provider '{provider}'",
+        consent.url
+    );
+}
+
+#[then(expr = "the MCP response does not ask caller {string} for consent")]
+async fn mcp_response_does_not_ask_for_consent(
+    world: &mut G2gWorld,
+    caller: String,
+) {
+    let response = response_body(world);
+    assert!(
+        response
+            .get("result")
+            .is_some(),
+        "caller '{caller}' did not receive an MCP result: {response}"
+    );
+    assert_ne!(response["result"]["resultType"], "input_required", "caller '{caller}' was asked for input: {response}");
+}
+
+#[then(expr = "the MCP response still requires input from caller {string}")]
+async fn mcp_response_still_requires_input(
+    world: &mut G2gWorld,
+    caller: String,
+) {
+    let response = response_body(world);
+    assert_eq!(
+        response["result"]["resultType"], "input_required",
+        "caller '{caller}' should still be asked for input: {response}"
+    );
+}
+
+#[then(expr = "MCP server {string} received the delegated access token from OAuth provider {string} as a bearer token")]
+async fn mcp_server_received_delegated_access_token(
+    world: &mut G2gWorld,
+    target_name: String,
+    provider: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&target_name, TargetActorKind::McpServer);
+    let access_token = oauth_provider(world, &provider).access_token();
+    let request = last_request_for(world, &target_name).await;
+    assert_header_value(
+        &request.headers,
+        "authorization",
+        &format!("Bearer {access_token}"),
+        &format!("MCP server '{target_name}'"),
+    );
+}
+
+#[then(
+    regex = r#"^MCP server "([^"]+)" did not receive the delegated (access|refresh) token from OAuth provider "([^"]+)"$"#
+)]
+async fn mcp_server_did_not_receive_delegated_token(
+    world: &mut G2gWorld,
+    target_name: String,
+    kind: String,
+    provider_name: String,
+) {
+    let provider = oauth_provider(world, &provider_name);
+    let token = match kind.as_str() {
+        "access" => provider.access_token(),
+        "refresh" => provider.refresh_token(),
+        other => unreachable!("the step regex admits only access or refresh tokens, got '{other}'"),
+    };
+    let (_, _, mock) = mock_for(world, &target_name);
+    assert_requests_omit_value(
+        &mock.requests().await,
+        token,
+        &format!("MCP server '{target_name}' ({kind} token from '{provider_name}')"),
+    );
+}
+
+#[then(expr = "MCP server {string} did not receive the MCP access token of caller {string}")]
+async fn mcp_server_did_not_receive_caller_access_token(
+    world: &mut G2gWorld,
+    target_name: String,
+    caller: String,
+) {
+    let token = world.caller_access_token(&caller);
+    let (_, _, mock) = mock_for(world, &target_name);
+    assert_requests_omit_value(
+        &mock.requests().await,
+        token,
+        &format!("MCP server '{target_name}' (MCP access token of caller '{caller}')"),
+    );
+}
+
+#[then(regex = r#"^OAuth provider "([^"]+)" received (\d+) token requests?$"#)]
+async fn oauth_provider_received_token_requests(
+    world: &mut G2gWorld,
+    provider_name: String,
+    expected_count: u64,
+) {
+    let actual = oauth_provider(world, &provider_name).token_request_count();
+    assert_eq!(
+        actual, expected_count,
+        "OAuth provider '{provider_name}' should receive {expected_count} token request(s), got {actual}"
+    );
+}
+
+fn oauth_provider<'a>(
+    world: &'a G2gWorld,
+    name: &str,
+) -> &'a OidcProvider {
+    world
+        .oauth_providers
+        .get(name)
+        .unwrap_or_else(|| panic!("unknown OAuth provider '{name}'"))
+}
+
 async fn last_request_for(
     world: &G2gWorld,
     target_name: &str,
@@ -748,6 +896,22 @@ pub async fn response_status_is(
         "unexpected response status; body={:?}; content_type={:?}",
         world.response_body, world.response_content_type
     );
+}
+
+#[then(expr = "the response says {string}")]
+pub async fn response_says(
+    world: &mut G2gWorld,
+    expected: String,
+) {
+    let body = world
+        .response_body
+        .as_ref()
+        .expect("a When must record the response body before this Then");
+    let text = match body {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    assert!(text.contains(&expected), "response body {text:?} does not contain {expected:?}");
 }
 
 #[then(regex = r"^all (\d+) responses have status (\d+)$")]
@@ -1021,4 +1185,140 @@ fn expected_response_for_request(
         expected_object.insert("id".to_string(), request_id.clone());
     }
     expected
+}
+
+#[then(regex = r"^gateway (\d+) and gateway (\d+) see each other as Active$")]
+pub async fn gateways_see_each_other_as_active(
+    world: &mut G2gWorld,
+    first: usize,
+    second: usize,
+) {
+    for (viewer, peer) in [(first, second), (second, first)] {
+        let remote = only_remote_gateway(world, viewer, peer).await;
+        assert_eq!(
+            remote.status,
+            crate::bdd_support::admin_client::GatewayStatus::Active,
+            "gateway {viewer}'s record of gateway {peer}"
+        );
+    }
+}
+
+#[then(regex = r#"^gateway (\d+) reaches gateway (\d+) through mediator "([^"]+)"$"#)]
+pub async fn gateway_reaches_gateway_through_mediator(
+    world: &mut G2gWorld,
+    viewer: usize,
+    peer: usize,
+    mediator_alias: String,
+) {
+    let owner = world
+        .topology
+        .gateway_mediator_alias
+        .iter()
+        .find(|(_, alias)| **alias == mediator_alias)
+        .map(|(gateway, _)| *gateway)
+        .unwrap_or_else(|| panic!("no gateway uses mediator '{mediator_alias}'"));
+    let expected = mediator_authority(
+        world
+            .harness()
+            .mediator_of(owner),
+    );
+    let remote = only_remote_gateway(world, viewer, peer).await;
+    let peer_did = remote
+        .did
+        .unwrap_or_else(|| panic!("gateway {viewer}'s record of gateway {peer} has no DID"));
+    let service_uri = peer_did_service_uri(&peer_did);
+
+    assert_eq!(
+        endpoint_authority(&service_uri),
+        expected,
+        "gateway {peer}'s DID {peer_did} should name mediator '{mediator_alias}'"
+    );
+}
+
+async fn only_remote_gateway(
+    world: &G2gWorld,
+    viewer: usize,
+    peer: usize,
+) -> crate::bdd_support::admin_client::GatewayRecord {
+    let mut remotes = world
+        .harness()
+        .gw(viewer)
+        .admin
+        .remote_gateways()
+        .await
+        .expect("list remote gateways");
+    assert_eq!(remotes.len(), 1, "gateway {viewer} should know only gateway {peer}");
+    remotes.remove(0)
+}
+
+fn mediator_authority(mediator: &dyn crate::bdd_support::mediator::Mediator) -> (String, u16) {
+    let uri = mediator
+        .did_document()
+        .and_then(|doc| {
+            doc.get("service")?
+                .as_array()
+                .cloned()
+        })
+        .into_iter()
+        .flatten()
+        .find_map(|service| {
+            let endpoints = service.get("serviceEndpoint")?;
+            let candidates: Vec<Value> = match endpoints {
+                Value::Array(entries) => entries.clone(),
+                other => vec![other.clone()],
+            };
+            candidates
+                .into_iter()
+                .find_map(|endpoint| {
+                    let uri = match &endpoint {
+                        Value::String(uri) => uri.clone(),
+                        other => other
+                            .get("uri")?
+                            .as_str()?
+                            .to_string(),
+                    };
+                    uri.starts_with("http")
+                        .then_some(uri)
+                })
+        })
+        .unwrap_or_else(|| panic!("mediator {} has no HTTP endpoint in its DID document", mediator.did()));
+    endpoint_authority(&uri)
+}
+
+fn endpoint_authority(uri: &str) -> (String, u16) {
+    let url = url::Url::parse(uri).unwrap_or_else(|e| panic!("invalid endpoint {uri}: {e}"));
+    (
+        url.host_str()
+            .expect("endpoint host")
+            .to_ascii_lowercase(),
+        url.port_or_known_default()
+            .expect("endpoint port"),
+    )
+}
+
+/// The `DIDCommMessaging` service URI encoded in a `did:peer:2` DID.
+fn peer_did_service_uri(did: &str) -> String {
+    let encoded = did
+        .strip_prefix("did:peer:2.")
+        .unwrap_or_else(|| panic!("{did} is not a did:peer:2 DID; run with FABRIC_BDD_DID_METHOD=peer"))
+        .split('.')
+        .find_map(|element| element.strip_prefix('S'))
+        .unwrap_or_else(|| panic!("{did} has no service"));
+    let service: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.trim_end_matches('='))
+            .expect("decode did:peer service"),
+    )
+    .expect("parse did:peer service");
+    let endpoint = service
+        .get("s")
+        .expect("did:peer service endpoint");
+    match endpoint {
+        Value::String(uri) => uri.clone(),
+        other => other
+            .get("uri")
+            .and_then(Value::as_str)
+            .expect("did:peer service uri")
+            .to_string(),
+    }
 }

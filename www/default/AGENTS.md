@@ -83,6 +83,20 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 - Payment setup dependency alerts stay hidden until the first Save attempt. Invalid
   payment configuration remains blocked on Save, while embedded safety warnings stay
   visible.
+- **Send delegated credentials over Fabric** is one shared section
+  (`_shared/FabricDelegatedCredentialsSection.tsx`) used by the Managed Agent and Transit
+  Point panels. It writes `fabric_delegated_credentials` and appears only when that route
+  is `fabric://` and the surface has credential bindings (a Credential Delegation row, or
+  the Transit Point's own `transit_credentials`). It defaults to off. When on, an
+  always-visible warning names the receiving gateway. Test ids:
+  `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
+  `-warning`. There is no surface-wide switch.
+- **Networking** retryable status codes: an empty field means the gateway default and
+  saves no `retryable_status_codes`, and its placeholder says so. The **Retry on
+  connection errors only** switch saves an empty list and disables the field. A field
+  that isn't a comma-separated list of HTTP status codes (100 to 599) blocks Save. Test
+  ids: `networking-retry-status-codes-input` and
+  `networking-retry-connection-errors-only-switch`.
 
 ## Access Tokens page
 
@@ -92,7 +106,25 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 - Create and edit use full-page routes with the same visual pattern:
   `/access-tokens/new` and `/access-tokens/:id`.
-- A successful create replaces the editor with the one-time secret page.
+- `/access-tokens/new` presets the form from its query string so an external link can
+  open a filled-in form: `name`, `description`, `scope` (repeatable) or `scopes`
+  (comma-separated), `expires_at` (ISO 8601; clears **Never**), `resource_pattern`, and
+  `header=<name>:<pattern>` (repeatable). The link never saves; the operator still clicks
+  Create, and preset scopes they cannot grant render as red unavailable pills. The
+  resource-scope card opens when a pattern or header is preset. The link survives sign-in:
+  a signed-out visitor sees the login page at that URL, and `loginNextTarget` re-encodes the
+  query and returns to the form after passkey or SAML login (the gateway's SAML return-target
+  allowlist accepts `/access-tokens/new`).
+- In create mode the form footer has a **Copy creation link** button
+  (`access-token-copy-permalink-button`) that copies an absolute `/access-tokens/new` URL
+  encoding the current name, description, scopes, expiry, resource pattern and headers
+  in the parameters above. It is disabled until the configuration would pass Create's
+  validation (name, scopes, resource pattern, headers, expiry), and it is not shown in edit
+  mode.
+- A successful create replaces the editor with the secret page. The secret isn't rendered:
+  the field shows a masked placeholder and **Copy** puts the real value on the clipboard.
+  If copying fails (clipboard denied, or no clipboard API on a plain-HTTP origin), the
+  field shows the secret, selected on focus, so it can be copied by hand.
 - The right column always shows **About Access Tokens**. Edit mode also shows **Access
   Token Details**, resolving the bound user UUID to a name and email while keeping the
   UUID as a fallback.
@@ -256,6 +288,19 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
   on, the gateway's rule. On, surfaces accept A2A 1.0 and 0.3 and generated agent cards list
   both. Off, they serve 1.0 only, and a 0.3 or version-less call gets an
   unsupported-version error.
+- `mediator_federation` is default off and experimental. On, the Connect via OOB wizard's
+  details step (`gateway-add-via-oob/EnterDetailsStep.tsx`) shows a mediator picker
+  (`wizard-oob-acceptor-mediator`) that lists only mediators with `status === 'active'` and
+  `registered` true, and sends the choice as `acceptor_mediator_id`; the default option
+  sends nothing. When the list is empty it shows `wizard-oob-acceptor-mediator-empty`, and
+  when `/mediators` fails, `wizard-oob-acceptor-mediator-load-error`.
+
+## Restore from backup
+
+Settings → **System** → **Restore from Backup** (`SettingsPage/SystemTab.tsx`) accepts
+`.agbak` and legacy `.tgwbak` files. The legacy support is stated on the page
+(`data-testid="restore-legacy-format-note"`), and the wrong-file toast names both extensions.
+The hidden file input is `data-testid="restore-file-input"`.
 
 ## Schema capture and A2A versions
 

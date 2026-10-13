@@ -400,6 +400,32 @@ fn named_rest_api_received(
     );
 }
 
+#[then(expr = "REST API {string} received header {string} with value {string}")]
+fn named_rest_api_received_header(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+    header_name: String,
+    expected_value: String,
+) {
+    let request = get_observed_request_for_actor(world, &actor_name, TargetActorKind::RestApi);
+    assert_collaborator_header_value(
+        &request.headers,
+        &header_name,
+        &expected_value,
+        &format!("REST API '{}'", actor_name),
+    );
+}
+
+#[then(expr = "REST API {string} did not receive header {string}")]
+fn named_rest_api_did_not_receive_header(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+    header_name: String,
+) {
+    let request = get_observed_request_for_actor(world, &actor_name, TargetActorKind::RestApi);
+    assert_collaborator_header_absent(&request.headers, &header_name, &format!("REST API '{}'", actor_name));
+}
+
 #[then(expr = "managed agent {string} received a forwarded request")]
 fn named_managed_agent_received_a_forwarded_request(
     world: &mut SurfaceWorld,

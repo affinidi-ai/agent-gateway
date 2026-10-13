@@ -74,6 +74,11 @@ Frontend work spans two concerns:
 
 For frontend work under `www/default/` (the current dashboard shipped to users), use the scoped frontend instructions at [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+The Surface Builder's **Send delegated credentials over Fabric** switch is per route
+(Managed Agent or Transit Point), off by default, and shown only for a `fabric://` route on
+a surface with credential bindings; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
@@ -127,6 +132,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | MCP metadata contract and the tool-gating firewall                             | [`docs/MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md)                 |
 | MCP 2026-07-28, modern admission, `mcp_http`, Resource Server, conformance     | [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md)                       |
 | Fabric, peer issuer DIDs, envelope replay                                      | [`docs/FABRIC.md`](docs/FABRIC.md)                                   |
+| Per-gateway mediators, send routing, mediator relay setup                      | [`docs/PER_GATEWAY_MEDIATOR_FEDERATION.md`](docs/PER_GATEWAY_MEDIATOR_FEDERATION.md) |
 | Token exchange and ID-JAG                                                      | [`docs/STS.md`](docs/STS.md)                                         |
 | Management tokens and tenant ownership                                         | [`docs/ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md)                     |
 | Management RBAC                                                                | [`docs/RBAC.md`](docs/RBAC.md)                                       |
@@ -152,6 +158,25 @@ Do not summarise these here. Update the owning document in the same change as th
 
 1. compile check: `cargo test --no-run 2>&1 | grep -E "^error\[E|^warning|^\s*-->|Finished"`
 2. module tests: `cargo test --bin agent-gateway "<module name>"`
+
+`make test`, `make ui-test` and the other test targets depend on `config-test`, which prepares
+the certificates and keys the tests need. Run `make config-test` once before invoking `cargo test`
+directly.
+
+`make help` lists every target. The ones used most:
+
+| Task                                                    | Command                                            |
+| ------------------------------------------------------- | -------------------------------------------------- |
+| Fast compile check                                      | `make check`                                       |
+| Build backend and frontend                              | `make dev`                                         |
+| Run locally (builds www + cargo)                        | `make run-debug` (`x=<name>` for a named instance) |
+| All Rust tests                                          | `make test` (`test=<name>` filters)                |
+| Frontend unit tests                                     | `make npm-test`                                    |
+| Playwright UI tests                                     | `make ui-test`                                     |
+| Lint everything (fmt check, Clippy, ESLint, ShellCheck) | `make lint`                                        |
+| Format Rust and frontend                                | `make fmt`                                         |
+| Local CI preflight                                      | `make ci`                                          |
+| MCP conformance                                         | `make mcp-conformance`                             |
 
 ## Before ready for review
 

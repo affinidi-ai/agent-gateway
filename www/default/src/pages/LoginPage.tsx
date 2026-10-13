@@ -126,7 +126,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
           const authCheck = await apiClient.fetch('/api/auth/check');
           if (authCheck.ok) {
             await authCheck.json();
-            window.location.href = ROUTES.DASHBOARD;
+            window.location.href = loginNextTarget(window.location) ?? ROUTES.DASHBOARD;
             return;
           }
         } catch {

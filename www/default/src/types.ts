@@ -747,6 +747,12 @@ export interface FeatureFlags {
   agent_pay_delegation?: boolean;
   /** Accept A2A protocol version 0.3 alongside 1.0. Absent means enabled. */
   a2a_legacy_compatibility?: boolean;
+  /** Experimental per-gateway mediator choice. Default off (treated as `false`
+   *  when undefined); set explicitly to `true` to enable. When on, the Connect
+   *  via OOB wizard shows the mediator picker and the API accepts
+   *  `acceptor_mediator_id`. Requests between gateways on different mediators
+   *  are not relayed yet. */
+  mediator_federation?: boolean;
   /** Whether Terms enforcement and management are enabled by the appliance. */
   terms?: boolean;
 }

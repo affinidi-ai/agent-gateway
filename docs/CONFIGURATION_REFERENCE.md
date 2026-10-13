@@ -360,7 +360,7 @@ A manual edit is picked up as described in
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). See
 [`FABRIC.md`](FABRIC.md#peer-exposure).
 
-
+## Related
 
 - [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md): what a reload does and does not re-read.
 - [`config/examples/README.md`](../config/examples/README.md): the example files and their roles.

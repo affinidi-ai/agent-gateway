@@ -4,6 +4,21 @@ import type { NodeDefinition } from '../types';
 import NetworkingPanel from './NetworkingPanel';
 import { DOCS_URL } from '../../../../config/docs';
 
+/** Parse a panel number, falling back only when the field is empty or not a number. */
+function intOr(v: unknown, fallback: number): number {
+  const n = parseInt(String(v ?? ''), 10);
+  return Number.isNaN(n) ? fallback : n;
+}
+
+/** Panel status codes as numbers; null when any entry is not an HTTP status code. */
+function parseStatusCodes(v: unknown): number[] | null {
+  const entries = String(v ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  return entries.every(e => /^[1-5]\d\d$/.test(e)) ? entries.map(e => parseInt(e, 10)) : null;
+}
+
 /**
  * Convert the panel's flat config shape into the wire-format
  * NetworkingConfig object. Returns `undefined` when no sub-feature is
@@ -21,8 +36,11 @@ export function networkingConfigToWire(c: any): Record<string, any> | undefined 
     };
   }
   if (c.retry_enabled) {
+    // Connection errors only saves an explicit empty list. An empty field
+    // leaves the codes to the gateway default.
+    const codes = c.retry_connection_errors_only ? [] : parseStatusCodes(c.retry_status_codes);
     out.retry = {
-      max_attempts: parseInt(c.retry_max, 10) || 3,
+      max_attempts: intOr(c.retry_max, 3),
       ...(c.retry_initial_backoff_ms
         ? { initial_backoff_ms: parseInt(c.retry_initial_backoff_ms, 10) }
         : {}),
@@ -30,20 +48,15 @@ export function networkingConfigToWire(c: any): Record<string, any> | undefined 
       ...(c.retry_backoff_multiplier
         ? { backoff_multiplier: parseFloat(c.retry_backoff_multiplier) }
         : {}),
-      ...(c.retry_status_codes
-        ? {
-            retryable_status_codes: String(c.retry_status_codes)
-              .split(',')
-              .map((s: string) => parseInt(s.trim(), 10))
-              .filter((n: number) => !Number.isNaN(n)),
-          }
+      ...(codes && (codes.length > 0 || c.retry_connection_errors_only)
+        ? { retryable_status_codes: codes }
         : {}),
     };
   }
   if (c.circuit_breaker_enabled) {
     out.circuit_breaker = {
-      failure_threshold: parseInt(c.cb_threshold, 10) || 5,
-      timeout_secs: parseInt(c.cb_recovery_secs, 10) || 30,
+      failure_threshold: intOr(c.cb_threshold, 5),
+      timeout_secs: intOr(c.cb_recovery_secs, 30),
       ...(c.cb_success_threshold
         ? { success_threshold: parseInt(c.cb_success_threshold, 10) }
         : {}),
@@ -62,6 +75,59 @@ export function networkingConfigToWire(c: any): Record<string, any> | undefined 
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Inverse of `networkingConfigToWire`: convert the wire-format
+ * NetworkingConfig (`target.networking` or `transit.points[].networking`)
+ * back into the panel's flat config. Numeric fields become strings (the
+ * panel inputs are text). Missing blocks stay absent, so the sub-feature
+ * is off and no default is invented for a value that was never set.
+ */
+export function networkingConfigFromWire(wire: unknown): Record<string, any> {
+  const out: Record<string, any> = {};
+  if (!wire || typeof wire !== 'object') return out;
+  const w = wire as Record<string, any>;
+  const has = (v: unknown) => v !== undefined && v !== null;
+  const put = (key: string, v: unknown) => {
+    if (has(v)) out[key] = String(v);
+  };
+  const t = w.timeout;
+  if (t && typeof t === 'object') {
+    put('timeout_secs', t.request_secs);
+    put('connect_timeout_secs', t.connect_secs);
+    put('idle_timeout_secs', t.idle_secs);
+  }
+  const r = w.retry;
+  if (r && typeof r === 'object') {
+    out.retry_enabled = true;
+    put('retry_max', r.max_attempts);
+    put('retry_initial_backoff_ms', r.initial_backoff_ms);
+    put('retry_max_backoff_ms', r.max_backoff_ms);
+    put('retry_backoff_multiplier', r.backoff_multiplier);
+    if (Array.isArray(r.retryable_status_codes)) {
+      if (r.retryable_status_codes.length === 0) out.retry_connection_errors_only = true;
+      else out.retry_status_codes = r.retryable_status_codes.join(',');
+    }
+  }
+  const cb = w.circuit_breaker;
+  if (cb && typeof cb === 'object') {
+    out.circuit_breaker_enabled = true;
+    put('cb_threshold', cb.failure_threshold);
+    put('cb_recovery_secs', cb.timeout_secs);
+    put('cb_success_threshold', cb.success_threshold);
+    put('cb_window_secs', cb.window_secs);
+  }
+  const m = w.mirror;
+  if (m && typeof m === 'object') {
+    out.mirror_enabled = true;
+    out.mirror_endpoint = has(m.endpoint) ? String(m.endpoint) : '';
+    put('mirror_percentage', m.percentage);
+    // Inverse of the wait_for_response mapping in networkingConfigToWire.
+    if (has(m.wait_for_response)) out.mirror_async = !m.wait_for_response;
+    put('mirror_timeout_secs', m.timeout_secs);
+  }
+  return out;
 }
 
 export const networkingDefinition: NodeDefinition = {
@@ -123,6 +189,17 @@ export const networkingDefinition: NodeDefinition = {
     !(c.timeout_secs || c.retry_enabled || c.circuit_breaker_enabled || c.mirror_enabled)
       ? 'At least one networking option must be configured'
       : null,
+  validate: c =>
+    c.retry_enabled &&
+    !c.retry_connection_errors_only &&
+    parseStatusCodes(c.retry_status_codes) === null
+      ? [
+          {
+            field: 'retry_status_codes',
+            message: 'Enter HTTP status codes separated by commas, e.g. 502,503,504',
+          },
+        ]
+      : [],
   featureDependencies: [
     {
       description: 'Mirror percentage must be between 0 and 100',
@@ -144,6 +221,8 @@ export const networkingDefinition: NodeDefinition = {
   ],
   ConfigPanel: NetworkingPanel,
   payloadPath: 'target.networking',
+  configFromPayload: slice => networkingConfigFromWire(slice),
+  payloadOwnsConfig: true,
   // Pre-fill sensible defaults for every numeric option so toggling
   // a sub-feature on (retry / circuit breaker / mirror) gives a working
   // configuration immediately, with no empty fields to interpret.
@@ -173,10 +252,10 @@ export const networkingDefinition: NodeDefinition = {
   buildPayload: ctx => {
     // Per-TP networking nodes are folded into `transit.points[]` by the
     // TP factory (it owns the entire transit.points slice), so they
-    // must NOT contribute to `target.networking`. We additionally
-    // require the node's ancestor chain to reach the `target` node so
-    // an inbound networking blob (parented to access-point/policy)
-    // doesn't accidentally clobber the target-side configuration.
+    // must NOT contribute to `target.networking`. A node on the Access
+    // Point to Target edge writes `target.networking`, whether it sits
+    // below the Target (as dropped) or among the Target's ancestors
+    // (after a reload re-chains request middleware ahead of it).
     const reachesTarget = (n: any): boolean => {
       let cur: any = n;
       const seen = new Set<string>();
@@ -190,7 +269,16 @@ export const networkingDefinition: NodeDefinition = {
       }
       return false;
     };
-    const node = ctx.nodesOfType('networking').find(reachesTarget);
+    const targetAncestors = new Set<string>();
+    let cur = ctx.firstNodeOfType('target');
+    while (cur?.parentId && !targetAncestors.has(cur.parentId)) {
+      const parentId: string = cur.parentId;
+      targetAncestors.add(parentId);
+      cur = ctx.allNodes.find(p => p.id === parentId);
+    }
+    const node = ctx
+      .nodesOfType('networking')
+      .find(n => targetAncestors.has(n.id) || reachesTarget(n));
     const out = networkingConfigToWire(node?.config);
     if (!out) return undefined;
     return [{ path: 'target.networking', value: out }];

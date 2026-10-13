@@ -1,12 +1,27 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { apiClient } from '../../api';
 import { AppButton } from '../shared/AppButton';
+import { useApp } from '../../context/AppContext';
+
+interface Mediator {
+  id: string;
+  name: string;
+  registered?: boolean;
+  status: 'active' | 'disabled';
+}
 
 interface EnterDetailsStepProps {
-  onNext: (name: string, description: string, didMethod: string) => void;
+  onNext: (
+    name: string,
+    description: string,
+    didMethod: string,
+    acceptorMediatorId: string
+  ) => void;
   onCancel: () => void;
   initialName?: string;
   initialDescription?: string;
   initialDidMethod?: string;
+  initialAcceptorMediatorId?: string;
 }
 
 const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
@@ -15,11 +30,33 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
   initialName = '',
   initialDescription = '',
   initialDidMethod = 'web',
+  initialAcceptorMediatorId = '',
 }) => {
   const [name, setName] = useState(initialName);
   const [description, setDescription] = useState(initialDescription);
   const [didMethod, setDidMethod] = useState(initialDidMethod);
+  const [acceptorMediatorId, setAcceptorMediatorId] = useState(initialAcceptorMediatorId);
+  const [mediators, setMediators] = useState<Mediator[]>([]);
+  const [mediatorsLoadFailed, setMediatorsLoadFailed] = useState(false);
   const [error, setError] = useState('');
+  const { state } = useApp();
+  const mediatorFederationEnabled = state.settings?.feature_flags?.mediator_federation === true;
+
+  useEffect(() => {
+    if (!mediatorFederationEnabled) return;
+    apiClient
+      .get('/mediators')
+      .then(response => {
+        setMediators(Array.isArray(response.data) ? response.data : []);
+        setMediatorsLoadFailed(false);
+      })
+      .catch(() => {
+        setMediators([]);
+        setMediatorsLoadFailed(true);
+      });
+  }, [mediatorFederationEnabled]);
+
+  const registeredMediators = mediators.filter(m => m.registered && m.status === 'active');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,7 +66,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
       return;
     }
 
-    onNext(name.trim(), description.trim(), didMethod);
+    onNext(name.trim(), description.trim(), didMethod, acceptorMediatorId);
   };
 
   return (
@@ -106,6 +143,48 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
               The DID method used to generate the identity for this connection.
             </small>
           </div>
+
+          {mediatorFederationEnabled && (
+            <div className="mb-3">
+              <label htmlFor="acceptorMediatorId">Mediator for this connection (Optional)</label>
+              <select
+                className="form-select"
+                id="acceptorMediatorId"
+                data-testid="wizard-oob-acceptor-mediator"
+                value={acceptorMediatorId}
+                onChange={e => setAcceptorMediatorId(e.target.value)}
+              >
+                <option value="">Use the inviter's mediator (default)</option>
+                {registeredMediators.map(m => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
+              {mediatorsLoadFailed ? (
+                <small
+                  className="form-text text-danger d-block"
+                  data-testid="wizard-oob-acceptor-mediator-load-error"
+                >
+                  Your mediators could not be loaded, so only the inviter's mediator is offered.
+                </small>
+              ) : (
+                registeredMediators.length === 0 && (
+                  <small
+                    className="form-text text-muted d-block"
+                    data-testid="wizard-oob-acceptor-mediator-empty"
+                  >
+                    You have no active, registered mediator to select.
+                  </small>
+                )
+              )}
+              <small className="form-text text-muted d-block">
+                By default the permanent connection is homed on the inviter's mediator. Selecting
+                one of your own active, registered mediators homes it there instead. Experimental:
+                requests between gateways on different mediators are not relayed yet.
+              </small>
+            </div>
+          )}
 
           <div className="d-flex justify-content-between">
             <AppButton

@@ -7,7 +7,7 @@
 //! `surface_bdd` (config accrues in Givens, the gateway starts in the When)
 //! while supporting the multi-gateway fabric topology.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use cucumber::World;
 use serde_json::Value;
@@ -19,6 +19,8 @@ use crate::bdd_support::json_rpc::{
     IdentityBindingProof, build_a2a_request_body, build_mcp_list_tools_body, build_mcp_tool_call_body,
     build_modern_mcp_list_tools_body, modern_mcp_request_headers,
 };
+use crate::bdd_support::mcp_consent::{ConsentRequest, exchange_identity_token};
+use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::policies::build_gateway_source_did_allow_policy;
 use crate::harness::multi_gateway::{FabricRouteReadyProbe, GatewayPlan, MultiGatewayHarness};
 
@@ -45,6 +47,15 @@ pub struct TransitPointFabricLink {
     pub to_surface: String,
 }
 
+/// A caller holding an MCP access token from `gw_index` for its identity at
+/// the identity provider `provider`.
+#[derive(Debug, Clone)]
+pub struct McpCaller {
+    pub name: String,
+    pub gw_index: usize,
+    pub provider: String,
+}
+
 #[derive(Debug, Default)]
 pub struct TopologyBuilder {
     pub gateway_count: usize,
@@ -52,6 +63,14 @@ pub struct TopologyBuilder {
     pub fabric_links: Vec<FabricLink>,
     pub transit_point_fabric_links: Vec<TransitPointFabricLink>,
     pub gateway_policies: HashMap<usize, String>,
+    /// gw_index -> the own mediator alias declared by `gateway N uses
+    /// mediator "M"`. Gateways with no entry share one default mediator;
+    /// gateways naming distinct aliases each get their own independent
+    /// `ScenarioDockerMediator`.
+    pub gateway_mediator_alias: HashMap<usize, String>,
+    /// Gateways that turn on the `mediator_federation` feature flag after boot,
+    /// before any pairing.
+    pub mediator_federation_gateways: HashSet<usize>,
     /// gw_index -> the only peer gw_index it accepts fabric calls from. The
     /// rego is authored after federation (it needs the peer's DID), so this is
     /// kept separate from the static `gateway_policies`.
@@ -62,6 +81,10 @@ pub struct TopologyBuilder {
     /// requests carrying `origin_gw`'s origin. Applied after boot, when the
     /// gateway ports are known.
     pub mcp_origin_grants: Vec<(usize, String, usize)>,
+    pub mcp_callers: Vec<McpCaller>,
+    /// `(gw_index, surface_id)` whose `fabric://` Target receives delegated
+    /// credentials. Applied once the fabric routes are ready.
+    pub fabric_delegated_credentials: Vec<(usize, String)>,
 }
 
 impl TopologyBuilder {
@@ -285,6 +308,19 @@ pub struct G2gWorld {
     /// Requests sent over one Legacy SSE session, each with the SSE reply
     /// that answered it.
     pub legacy_sse_exchange: Vec<(Value, Value)>,
+    /// Mediator record ids created for negative-path mediator-selection
+    /// scenarios, keyed by the Gherkin-facing mediator label (e.g. `"M1"`).
+    pub named_mediators: HashMap<String, String>,
+    /// OOB invitation URL published by a `... has published an OOB
+    /// invitation for gateway ...` step, awaiting a manual accept attempt.
+    pub pending_oob_url: Option<String>,
+    /// Identity providers that are also OAuth credential providers, by name.
+    pub oauth_providers: HashMap<String, OidcProvider>,
+    /// MCP access tokens callers obtained by token exchange, by caller.
+    pub caller_access_tokens: HashMap<String, String>,
+    /// The last consent request a gateway answered a caller with, and the
+    /// request it answered.
+    pub consent_request: Option<(ConsentRequest, Value)>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +356,11 @@ impl G2gWorld {
             obtained_identity_proofs: HashMap::new(),
             conformance_run: None,
             legacy_sse_exchange: Vec::new(),
+            named_mediators: HashMap::new(),
+            pending_oob_url: None,
+            oauth_providers: HashMap::new(),
+            caller_access_tokens: HashMap::new(),
+            consent_request: None,
         }
     }
 
@@ -343,10 +384,29 @@ impl G2gWorld {
                     .unwrap_or_else(GatewayPlan::new)
             })
             .collect();
+        let mediator_aliases: Vec<Option<String>> = (1..=count)
+            .map(|i| {
+                self.topology
+                    .gateway_mediator_alias
+                    .get(&i)
+                    .cloned()
+            })
+            .collect();
 
-        let mut harness = MultiGatewayHarness::spawn(plans)
+        let mut harness = MultiGatewayHarness::spawn(plans, mediator_aliases)
             .await
             .expect("spawn multi-gateway harness");
+        for gw_index in &self
+            .topology
+            .mediator_federation_gateways
+        {
+            harness
+                .gw(*gw_index)
+                .admin
+                .set_feature_flags(&[("mediator_federation", true)])
+                .await
+                .expect("enable mediator federation");
+        }
         let federation_pairs = self
             .topology
             .federation_pairs(count);
@@ -387,6 +447,9 @@ impl G2gWorld {
                 .expect("wire Transit Point fabric link");
         }
 
+        self.exchange_caller_identity_tokens(&harness)
+            .await;
+
         self.wait_for_fabric_routes(&harness, FabricRouteProbeStage::BeforeBlockingPolicies)
             .await;
 
@@ -416,7 +479,75 @@ impl G2gWorld {
         self.wait_for_fabric_routes(&harness, FabricRouteProbeStage::AfterPolicies)
             .await;
 
+        for (gw_index, surface_id) in &self
+            .topology
+            .fabric_delegated_credentials
+        {
+            harness
+                .set_fabric_delegated_credentials(*gw_index, surface_id, true)
+                .await
+                .expect("opt the fabric route into delegated credentials");
+        }
+
         self.harness = Some(harness);
+    }
+
+    async fn exchange_caller_identity_tokens(
+        &mut self,
+        harness: &MultiGatewayHarness,
+    ) {
+        for caller in &self.topology.mcp_callers {
+            let route = self.consent_route(caller.gw_index);
+            let identity_token = self
+                .oauth_providers
+                .get(&caller.provider)
+                .unwrap_or_else(|| panic!("unknown identity provider '{}'", caller.provider))
+                .identity_token(&caller.name);
+            let token = exchange_identity_token(
+                harness
+                    .gw(caller.gw_index)
+                    .port,
+                &identity_token,
+                &route,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("caller '{}' token exchange failed: {error:#}", caller.name));
+            self.caller_access_tokens
+                .insert(caller.name.clone(), token);
+        }
+    }
+
+    /// The route of the one surface on `gw_index` whose callers present MCP
+    /// access tokens.
+    fn consent_route(
+        &self,
+        gw_index: usize,
+    ) -> String {
+        let mut surfaces = self
+            .topology
+            .plans
+            .get(&gw_index)
+            .into_iter()
+            .flat_map(|plan| plan.surfaces.iter())
+            .filter(|surface| {
+                surface
+                    .delegated_credentials
+                    .is_some()
+            });
+        let surface = surfaces
+            .next()
+            .unwrap_or_else(|| panic!("gateway {gw_index} has no surface with delegated credentials"));
+        assert!(surfaces.next().is_none(), "gateway {gw_index} has more than one surface with delegated credentials");
+        surface.route.clone()
+    }
+
+    pub fn caller_access_token(
+        &self,
+        caller: &str,
+    ) -> &str {
+        self.caller_access_tokens
+            .get(caller)
+            .unwrap_or_else(|| panic!("caller '{caller}' holds no MCP access token"))
     }
 
     async fn wait_for_fabric_routes(
@@ -425,7 +556,23 @@ impl G2gWorld {
         stage: FabricRouteProbeStage,
     ) {
         for link in &self.topology.fabric_links {
-            if let Some(probe) = fabric_route_probe(&self.topology, link, stage) {
+            if let Some(mut probe) = fabric_route_probe(&self.topology, link, stage) {
+                if self
+                    .surface_spec(link.from_gw, &link.from_surface)
+                    .delegated_credentials
+                    .is_some()
+                {
+                    let token = self
+                        .topology
+                        .mcp_callers
+                        .iter()
+                        .find(|caller| caller.gw_index == link.from_gw)
+                        .map(|caller| self.caller_access_token(&caller.name))
+                        .unwrap_or_else(|| panic!("no caller holds an MCP access token for gateway {}", link.from_gw));
+                    probe
+                        .extra_headers
+                        .push(("authorization".to_string(), format!("Bearer {token}")));
+                }
                 harness
                     .wait_for_fabric_route_ready(&probe)
                     .await
@@ -540,7 +687,8 @@ impl G2gWorld {
         {
             let count = harness
                 .fabric_forward_request_count(gateway_index)
-                .await;
+                .await
+                .unwrap_or_else(|error| panic!("{error:#}"));
             self.fabric_forward_baseline
                 .insert(gateway_index, count);
         }

@@ -1071,3 +1071,215 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
         assert_eq!(response.status(), 422);
     }
 }
+
+fn tool_scoped_binding(tool: &str) -> crate::config::types::OutboundCredentialBinding {
+    serde_json::from_value(json!({"credential_provider_id": "provider", "required_for": {"tools": [tool]}}))
+        .expect("tool-scoped binding")
+}
+
+async fn post_json(
+    harness: &GatewayHarness,
+    body: &serde_json::Value,
+    api_key: Option<&str>,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let mut request = reqwest::Client::new()
+        .post(&harness.gateway_url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(api_key) = api_key {
+        request = request.header("x-api-key", api_key);
+    }
+    let response = request
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("POST to the Access Point failed");
+    let status = response.status();
+    (
+        status,
+        response
+            .json()
+            .await
+            .unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn forwarded(harness: &GatewayHarness) -> usize {
+    harness
+        .mock
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_point_refuses_tool_call_batches_before_tool_level_controls() {
+    let harness = GatewayHarness::start(|_, gw_config, _| {
+        let mut surface = super::helpers::build_minimal_mcp_surface();
+        surface.target.mcp_tool_gating = Some(
+            serde_json::from_value(json!({
+                "gates": [{"id": "g1", "name": "no admin", "action": {"effect": "deny", "patterns": ["^admin_"]}}]
+            }))
+            .expect("tool gating config"),
+        );
+        surface.outbound_credentials = vec![tool_scoped_binding("scoped_tool")];
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    for tool in ["admin_reset", "scoped_tool"] {
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool, "arguments": {}}}
+        ]);
+        let (status, body) = post_json(&harness, &batch, None).await;
+        assert_eq!(status, 422, "{tool}: {body}");
+        assert_eq!(
+            body,
+            json!({
+                "type": "https://a2a-protocol.org/errors/proxy-error",
+                "title": "Unprocessable Entity",
+                "status": 422,
+                "detail": "JSON-RPC batches are not supported"
+            }),
+            "{tool}"
+        );
+        assert_eq!(forwarded(&harness), 0, "{tool}: a batch never reaches the target");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_point_refuses_tool_calls_the_gate_cannot_read() {
+    let harness = GatewayHarness::start(|_, gw_config, _| {
+        let mut surface = super::helpers::build_minimal_mcp_surface();
+        surface.target.mcp_tool_gating = Some(
+            serde_json::from_value(json!({
+                "gates": [{"id": "g1", "name": "no admin", "action": {"effect": "deny", "patterns": ["^admin_"]}}]
+            }))
+            .expect("tool gating config"),
+        );
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    // A field the gateway reads, spelled in another case, is refused at
+    // admission: a case-folding upstream would read it as the method or tool.
+    for body in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"Name": "admin_reset"}}),
+        json!({"jsonrpc": "2.0", "id": 2, "Method": "tools/call", "params": {"name": "admin_reset"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "Params": {"name": "admin_reset"}}),
+    ] {
+        let (status, response) = post_json(&harness, &body, None).await;
+        assert_eq!(status, 200, "{body}: {response}");
+        assert_eq!(response["error"]["code"], -32600, "{body}: {response}");
+    }
+    // A `tools/call` with no readable tool name is denied by the gate.
+    for body in [
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": 42}}),
+    ] {
+        let (_, response) = post_json(&harness, &body, None).await;
+        assert!(response["error"].is_object(), "{body}: {response}");
+    }
+    assert_eq!(forwarded(&harness), 0, "no unreadable tool call reaches the target");
+
+    let allowed = json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "read_orders"}});
+    post_json(&harness, &allowed, None).await;
+    assert_eq!(forwarded(&harness), 1, "a readable, allowed tool call is forwarded");
+}
+
+#[test]
+fn access_point_tool_scoped_credentials_apply_only_to_tools_call() {
+    if std::env::var_os("ATG_AP_TOOL_SCOPED_CREDENTIALS_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap()
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("ATG_AP_TOOL_SCOPED_CREDENTIALS_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Access Point credential test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(access_point_tool_scoped_credentials_flow()));
+}
+
+/// The credential delegation stores are process-global, so this gateway runs
+/// in its own process to resolve against its own provider store.
+async fn access_point_tool_scoped_credentials_flow() {
+    let harness = GatewayHarness::start(|_, gw_config, bootstrap| {
+        use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+        use crate::secrets::SecretsStore;
+
+        let secrets_path = bootstrap
+            .storage_paths
+            .secrets
+            .clone();
+        let providers_path = bootstrap
+            .storage_paths
+            .credential_providers
+            .clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let secrets = crate::secrets::FilesystemSecretsStore::new(&secrets_path).expect("secrets store");
+                for (secret_id, value) in [("ap-source-key", "valid"), ("provider-client-id", "client-id")] {
+                    secrets
+                        .create(
+                            serde_json::from_value(json!({"name": secret_id, "secret_id": secret_id, "value": value}))
+                                .expect("secret request"),
+                        )
+                        .await
+                        .expect("create secret");
+                }
+                FileSystemCredentialProviderStore::new(providers_path.into())
+                    .await
+                    .expect("provider store")
+                    .create(
+                        serde_json::from_value(json!({
+                            "id": "provider", "name": "Provider", "provider_id": "provider",
+                            "authorization_endpoint": "https://provider.example/authorize",
+                            "client_id_secret_ref": "provider-client-id",
+                            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                        }))
+                        .expect("provider"),
+                    )
+                    .await
+                    .expect("create provider");
+            })
+        });
+        let mut surface = super::helpers::build_minimal_mcp_surface();
+        surface
+            .access_point
+            .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+            methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+                extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
+                    field: "x-api-key".to_string(),
+                },
+                secret_id: "ap-source-key".to_string(),
+            })],
+        });
+        surface.outbound_credentials = vec![tool_scoped_binding("echo")];
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    let prompt = json!({"jsonrpc": "2.0", "id": 1, "method": "prompts/get", "params": {"name": "echo"}});
+    let (status, body) = post_json(&harness, &prompt, Some("valid")).await;
+    assert_eq!(status, 200, "a prompt named like a listed tool needs no tool credential: {body}");
+    assert_eq!(forwarded(&harness), 1);
+
+    let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "echo", "arguments": {}}});
+    let (status, body) = post_json(&harness, &call, Some("valid")).await;
+    assert_eq!(status, 401, "a call to a listed tool needs its credential: {body}");
+    assert_eq!(forwarded(&harness), 1, "a call awaiting consent never reaches the target");
+}
