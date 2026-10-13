@@ -1,16 +1,26 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Settings } from '../../types';
+import { AuditEventCatalogEntry, Settings } from '../../types';
+import { apiClient } from '../../api';
 import { showToast } from '../../utils/toaster';
 import FieldHelp from '../../components/shared/FieldHelp';
+import AuditEventPicker from '../../components/integrations/AuditEventPicker';
 
 interface VpAuditTabProps {
   settings: Settings | null;
   updateSettings: (settings: Partial<Settings>) => Promise<void>;
+  /** Loads the selectable audit events; the API by default. */
+  loadCatalog?: () => Promise<AuditEventCatalogEntry[]>;
 }
 
-const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => {
+const VpAuditTab: React.FC<VpAuditTabProps> = ({
+  settings,
+  updateSettings,
+  loadCatalog = () => apiClient.getAuditEventCatalog(),
+}) => {
   const [auditEnabled, setAuditEnabled] = useState(settings?.audit_enabled ?? false);
   const [events, setEvents] = useState<string[]>(settings?.audit_events ?? []);
+  const [catalog, setCatalog] = useState<AuditEventCatalogEntry[]>([]);
+  const [catalogError, setCatalogError] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const initialized = useRef(false);
 
@@ -23,12 +33,21 @@ const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => 
     setEvents(settings.audit_events ?? []);
   }, [settings]);
 
-  const toggleEvent = (event: string, selected: boolean) =>
-    setEvents(prev =>
-      selected
-        ? [...prev.filter(name => name !== event), event]
-        : prev.filter(name => name !== event)
-    );
+  useEffect(() => {
+    let active = true;
+    loadCatalog()
+      .then(entries => {
+        if (active) setCatalog(entries);
+      })
+      .catch(() => {
+        if (active) setCatalogError(true);
+      });
+    return () => {
+      active = false;
+    };
+    // Load once; the catalog does not change while the page is open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -60,9 +79,13 @@ const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => 
           Record VP evidence of gateway authorisation decisions for compliance auditing.{' '}
           <FieldHelp testId="field-help-vp-audit-intro" ariaLabel="About VP Auditing">
             A VP (Verifiable Presentation) is a cryptographically signed record. Enabling this keeps
-            one for every decision below, so you can prove after the fact what the gateway allowed
-            or denied and why.
+            one for every event selected below, so you can prove after the fact what the gateway
+            allowed or denied and why.
           </FieldHelp>
+        </p>
+        <p className="text-muted mb-3" data-testid="vp-audit-scope-note">
+          These settings control the VP Audit Log only. Governance Audit integrations choose their
+          own events, whether or not the log keeps them.
         </p>
         <form onSubmit={handleSave}>
           <div className="mb-3">
@@ -83,73 +106,20 @@ const VpAuditTab: React.FC<VpAuditTabProps> = ({ settings, updateSettings }) => 
 
           {auditEnabled && (
             <div className="mb-3 pl-3">
-              <h6 className="mb-2 font-weight-bold">Audit Categories</h6>
-
-              <div className="custom-control custom-checkbox mb-2">
-                <input
-                  type="checkbox"
-                  className="custom-control-input"
-                  id="cat_policies"
-                  data-testid="vp-audit-event-policy_decision"
-                  checked={events.includes('policy_decision')}
-                  onChange={e => toggleEvent('policy_decision', e.target.checked)}
+              <h6 className="mb-2 font-weight-bold">Events to keep</h6>
+              {catalogError ? (
+                <p className="text-danger" data-testid="vp-audit-catalog-error">
+                  The list of audit events could not be loaded. Reload the page to try again.
+                </p>
+              ) : (
+                <AuditEventPicker
+                  testIdPrefix="vp-audit"
+                  catalog={catalog}
+                  selected={events}
+                  onChange={setEvents}
+                  disabled={isSaving}
                 />
-                <label className="custom-control-label" htmlFor="cat_policies">
-                  Policy Decisions
-                  <small className="d-block text-muted">
-                    OPA allow/deny events{' '}
-                    <FieldHelp testId="field-help-vp-audit-policies" ariaLabel="About OPA">
-                      OPA (Open Policy Agent) is the engine that evaluates this gateway's Gateway
-                      and Agent Surface policies.
-                    </FieldHelp>
-                  </small>
-                </label>
-              </div>
-
-              <div className="custom-control custom-checkbox mb-2">
-                <input
-                  type="checkbox"
-                  className="custom-control-input"
-                  id="cat_trust_checks"
-                  data-testid="vp-audit-event-trust_check"
-                  checked={events.includes('trust_check')}
-                  onChange={e => toggleEvent('trust_check', e.target.checked)}
-                />
-                <label className="custom-control-label" htmlFor="cat_trust_checks">
-                  Trust Checks
-                  <small className="d-block text-muted">
-                    TRQP query outcomes{' '}
-                    <FieldHelp testId="field-help-vp-audit-trust-checks" ariaLabel="About TRQP">
-                      TRQP (Trust Registry Query Protocol) is how this gateway asks a connected
-                      Trust Registry whether a caller or target agent is recognised.
-                    </FieldHelp>
-                  </small>
-                </label>
-              </div>
-
-              <div className="custom-control custom-checkbox mb-2">
-                <input
-                  type="checkbox"
-                  className="custom-control-input"
-                  id="cat_identity"
-                  data-testid="vp-audit-event-vp_injected"
-                  checked={events.includes('vp_injected')}
-                  onChange={e => toggleEvent('vp_injected', e.target.checked)}
-                />
-                <label className="custom-control-label" htmlFor="cat_identity">
-                  Identity Bindings
-                  <small className="d-block text-muted">
-                    Managed identity VP injections{' '}
-                    <FieldHelp
-                      testId="field-help-vp-audit-identity"
-                      ariaLabel="About managed identity VP injections"
-                    >
-                      A managed identity is a DID this gateway maintains on an agent's behalf. This
-                      records each time its credential (VP) is attached to an outbound request.
-                    </FieldHelp>
-                  </small>
-                </label>
-              </div>
+              )}
             </div>
           )}
 

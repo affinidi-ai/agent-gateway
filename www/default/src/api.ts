@@ -1,6 +1,7 @@
 import {
   AccessTokenCreated,
   AccessTokenMeta,
+  AuditEventCatalogEntry,
   Authority,
   CliLoginRequest,
   CreateAccessTokenRequest,
@@ -332,6 +333,11 @@ class APIClient {
       appliance_id: backendSettings.appliance_id || '',
       expose_user_identity_downstream: backendSettings.expose_user_identity_downstream || false,
     };
+  }
+
+  /** The audit events a sink can select, in display order. */
+  async getAuditEventCatalog(): Promise<AuditEventCatalogEntry[]> {
+    return this.request<AuditEventCatalogEntry[]>('/settings/audit-events');
   }
 
   async updateSettings(settings: Partial<Settings>): Promise<void> {

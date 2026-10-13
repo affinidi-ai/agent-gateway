@@ -770,6 +770,16 @@ export interface Settings {
   appliance_id?: string; // Fills ${APPLIANCE_ID}; empty leaves it unfilled
 }
 
+/** One selectable audit event, from `GET /v1/settings/audit-events`. */
+export interface AuditEventCatalogEntry {
+  /** Name stored in `audit_events`. */
+  event: string;
+  label: string;
+  description: string;
+  group: string;
+  group_label: string;
+}
+
 /** Per-user settings overrides (display preferences only) */
 export interface UserSettingsOverrides {
   refresh_interval_seconds?: number;
