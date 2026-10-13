@@ -43,6 +43,16 @@ changes:
         callable over Fabric while the same gate blocked them on a direct target, and
         an Allow gate hid every tool it grants. The input now carries both, as on the
         direct path.
+    - timestamp: '2026-10-13T10:08:01.000Z'
+      title: Keep Transit Point credentials on their own upstream after API changes
+      description: >-
+        After a Transit Point was removed through the API, the next dashboard save gave
+        its credential and its elements to the Transit Point that took its place on the
+        canvas, and saved that Transit Point twice. A credential or a Fabric delegated
+        credentials switch removed through the API also came back from the canvas layout
+        data. The dashboard now matches each Transit Point to its canvas node by its id,
+        does not restore a Transit Point the stored surface no longer has, and takes
+        every stored Transit Point field only from the stored surface.
   breaking: []
   internal:
     - timestamp: '2026-10-12T11:55:15.000Z'
@@ -61,3 +71,12 @@ changes:
         not restored from the canvas data for the Target and for a Transit Point, that
         Networking moved between them stays where the API put it, and that its layout is
         still restored.
+    - timestamp: '2026-10-13T10:08:01.000Z'
+      title: Test Transit Points removed, added or changed through the API
+      description: >-
+        Adds dashboard tests that a removed Transit Point's credential, elements and
+        settings do not move to another Transit Point, that a credential and the Fabric
+        delegated credentials switch removed through the API stay removed, and that the
+        remaining Transit Point keeps its node and layout. Adds agent_card_path,
+        extension_inspection and require_transit_token to the dashboard's list of stored
+        Transit Point fields, to match the gateway.

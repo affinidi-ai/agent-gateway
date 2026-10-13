@@ -228,3 +228,130 @@ describe('saving a reloaded surface with a Transit Point', () => {
     expect(resaved.transit.points[0].transit_credentials).toBeUndefined();
   });
 });
+
+describe('Transit Points changed through the API after a dashboard save', () => {
+  const cred = {
+    credential_provider_id: 'prov-1',
+    scopes: ['repo'],
+    consent_mode: 'on_demand',
+    inject_as: { type: 'bearer_header' },
+  };
+
+  const tp = (n: number, config: Record<string, any> = {}) => ({
+    id: `transit-point-a2a-${n}`,
+    type: 'transit-point-a2a',
+    label: '',
+    configured: true,
+    config: {
+      id: `tp-${n}`,
+      name: `tp-${n}`,
+      target_endpoint: `https://tp${n}.example`,
+      ...config,
+    },
+    parentId: 'ap',
+    position: { x: 100 * n, y: 50 },
+  });
+
+  /** Save from the dashboard, apply an API change, then reload and save again. */
+  function resaveAfter(nodes: any[], change: (stored: any) => void): any {
+    const stored = registry.buildPayload(makeCtx(nodes));
+    stored.canvas = buildCanvasBlob(nodes as any);
+    change(stored);
+    return registry.buildPayload(makeCtx(nodesFromSurface(stored)));
+  }
+
+  const points = (payload: any) =>
+    (payload.transit?.points ?? []).map((p: any) => [
+      p.id,
+      p.target_endpoint,
+      p.transit_credentials?.credential_provider_id ?? null,
+    ]);
+
+  const shapes = [
+    ['form-state', transitCredentialsApiToForm(cred)],
+    ['stored', cred],
+  ] as const;
+
+  for (const [shape, value] of shapes) {
+    it(`does not give a removed Transit Point's credential to another one (${shape} shape)`, () => {
+      const resaved = resaveAfter(
+        [...baseNodes, tp(1, { transit_credentials: value }), tp(2)],
+        stored => stored.transit.points.splice(0, 1)
+      );
+
+      expect(points(resaved)).toEqual([['tp-2', 'https://tp2.example', null]]);
+    });
+
+    it(`does not restore a credential removed through the API (${shape} shape)`, () => {
+      const resaved = resaveAfter([...baseNodes, tp(1, { transit_credentials: value })], stored => {
+        delete stored.transit.points[0].transit_credentials;
+      });
+
+      expect(points(resaved)).toEqual([['tp-1', 'https://tp1.example', null]]);
+    });
+  }
+
+  it("does not give a removed Transit Point's settings to one added through the API", () => {
+    const resaved = resaveAfter([...baseNodes, tp(1, { transit_credentials: cred })], stored => {
+      stored.transit.points = [
+        { id: 'tp-3', name: 'tp-3', target_endpoint: 'https://tp3.example', protocol: 'a2a' },
+      ];
+    });
+
+    expect(points(resaved)).toEqual([['tp-3', 'https://tp3.example', null]]);
+  });
+
+  it("does not attach a removed Transit Point's elements to another one", () => {
+    const rateLimit = {
+      id: 'rate-limit-transit-point-a2a-1',
+      type: 'rate-limit',
+      label: '',
+      configured: true,
+      config: { requests: '5', window_secs: '60' },
+      parentId: 'transit-point-a2a-1',
+    };
+    const resaved = resaveAfter([...baseNodes, tp(1), rateLimit, tp(2)], stored => {
+      expect(stored.transit.points[0].rate_limit).toEqual({ requests: 5, window_secs: 60 });
+      stored.transit.points.splice(0, 1);
+    });
+
+    expect(points(resaved)).toEqual([['tp-2', 'https://tp2.example', null]]);
+    expect(resaved.transit.points[0].rate_limit).toBeUndefined();
+    expect(resaved.access_point?.rate_limit).toBeUndefined();
+  });
+
+  it('does not turn the Fabric credential switch back on after the API turned it off', () => {
+    const fabric = 'fabric://peer-gateway/upstream';
+    const resaved = resaveAfter(
+      [
+        ...baseNodes,
+        tp(1, {
+          target_endpoint: fabric,
+          transit_credentials: cred,
+          fabric_delegated_credentials: true,
+        }),
+      ],
+      stored => {
+        expect(stored.transit.points[0].fabric_delegated_credentials).toBe(true);
+        delete stored.transit.points[0].fabric_delegated_credentials;
+      }
+    );
+
+    expect(resaved.transit.points[0].target_endpoint).toBe(fabric);
+    expect(resaved.transit.points[0].fabric_delegated_credentials).toBeUndefined();
+  });
+
+  it('keeps the remaining Transit Point on its own node and layout', () => {
+    const nodes = [...baseNodes, tp(1), tp(2)];
+    const stored = registry.buildPayload(makeCtx(nodes));
+    stored.canvas = buildCanvasBlob(nodes as any);
+    stored.transit.points.splice(0, 1);
+
+    const reloaded = registry.nodesFromPayload(stored);
+    const tps = reloaded.filter(n => registry.isTransitPointType(n.type));
+
+    expect(tps.map(n => [n.id, n.config?.id, n.position])).toEqual([
+      ['transit-point-a2a-2', 'tp-2', { x: 200, y: 50 }],
+    ]);
+  });
+});
