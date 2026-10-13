@@ -40,8 +40,8 @@ pub use crate::protocols::{
     ExtensionInspectionContext, inspect_message_extensions, is_hop_by_hop_header, should_forward_request_header,
 };
 pub use url_rewriter::{
-    build_target_url, is_extended_agent_card_method, is_unrewritable_extended_agent_card_request,
-    requests_extended_agent_card, rewrap_extended_agent_card, rewrite_agent_card_urls, unwrap_extended_agent_card,
+    UnforwardableA2aRequest, build_target_url, is_extended_agent_card_method, requests_extended_agent_card,
+    rewrap_extended_agent_card, rewrite_agent_card_urls, unforwardable_a2a_request, unwrap_extended_agent_card,
 };
 
 #[cfg(feature = "didwebvh")]

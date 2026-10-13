@@ -223,7 +223,9 @@ including the agent identity extension, need no change.
 Two gaps remain. With `[a2a] validate_messages` off, a JSON-RPC batch or a non-string `method`
 reaches policy with neither `input.a2a.method` nor `input.a2a.method_canonical`, so no rule keyed on
 the method sees it; keep validation on, which refuses both with `-32600`. On a `fabric://` surface
-the request is never validated, so the same applies whatever the setting.
+the request is never validated, so the same applies whatever the setting. A body that is not valid
+JSON is refused with `-32700` on every A2A and AP2 surface regardless (see the extended agent card
+rules below).
 
 The allow-list and message-shape patterns are pinned against the policy engine by the tests in
 [`src/surface_context/mod.rs`](../src/surface_context/mod.rs).
@@ -298,8 +300,10 @@ AP2 transit points), whether it is returned as a JSON-RPC result (`GetExtendedAg
 `agent/getAuthenticatedExtendedCard`) or fetched over the HTTP+JSON binding
 (`GET {route}/extendedAgentCard` in `1.0`, `GET {route}/v1/card` in `0.3`). The HTTP+JSON paths
 match only directly under the surface route (or the transit point's path), after dot segments
-(including `%2e`) are resolved and percent-escapes decoded, the way the Target will see the path; a
-deeper path that only ends the same way is not a card. Its endpoint URLs are rewritten on inbound,
+(including `%2e`) are resolved and percent-escapes decoded, the way the Target will see the path,
+and ignoring ASCII case; a deeper path that only ends the same way is not a card, so a Target whose
+HTTP+JSON base sits below its target endpoint, or that serves a tenant-scoped
+`/{tenant}/extendedAgentCard`, is not covered. Its endpoint URLs are rewritten on inbound,
 fabric and outbound paths, and on inbound paths it gets the same identity treatment when agent
 identity is configured. On inbound and fabric paths it skips response extension inspection, like
 the public card, so response validation rules do not apply to it; outbound transit points still
@@ -314,11 +318,14 @@ empty HTTP+JSON body, a card or `result` that is not a JSON object, and both `re
 A public card that cannot be rewritten is answered with `502` on the direct inbound path and
 forwarded as received on fabric and outbound paths.
 
-A request whose extended card the gateway could not rewrite is rejected with `-32600` before it is
-forwarded, whatever `validate_messages` is set to: a JSON-RPC batch that contains an extended-card
-call, or an extended-card call in a body that is not plain JSON (for example with a leading
-byte-order mark or trailing bytes). A compressed response cannot be rewritten either, so an extended
-card from a Target that compresses its replies is answered with `502`.
+On A2A and AP2 surfaces and transit points, two kinds of request are rejected before they are
+forwarded, whatever `validate_messages` is set to and for `fabric://` targets too. A non-empty body
+that is not valid JSON is rejected with `-32700`, because a lenient Target parser may still read it
+as an extended-card call the gateway cannot detect (for example a body with `NaN`, a lone surrogate
+escape, a leading byte-order mark or trailing bytes). A JSON-RPC batch that contains an
+extended-card call is rejected with `-32600`, because a card inside a batch response cannot be
+rewritten. A compressed card cannot be rewritten either, so an extended-card fetch is forwarded with
+`Accept-Encoding: identity` in place of the caller's value.
 
 An extended card is always fetched by a caller, so with `from_jwt_claim` managed identity it needs
 the caller's validated JWT claims like any other response; without them the request fails with

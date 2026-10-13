@@ -433,16 +433,102 @@ async fn inbound_batch_with_extended_card_request_is_rejected_without_message_va
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn extended_card_request_that_is_not_plain_json_is_rejected_before_forwarding() {
+async fn request_body_that_is_not_valid_json_is_rejected_before_forwarding() {
     let call = request("GetExtendedAgentCard");
-    let bodies = [[&b"\xEF\xBB\xBF"[..], call.as_bytes()].concat(), [call.as_bytes(), &b" trailing"[..]].concat()];
+    let bodies = [
+        [&b"\xEF\xBB\xBF"[..], call.as_bytes()].concat(),
+        [call.as_bytes(), &b" trailing"[..]].concat(),
+        br#"{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{},"x":NaN}"#.to_vec(),
+    ];
     for body in bodies {
         for direction in [Direction::Inbound, Direction::Outbound] {
             let reply = post_to_gateway(direction, result_envelope(v1_card()), body.clone(), false).await;
             assert_eq!(reply.status, 400, "expected 400, got {}: {}", reply.status, reply.body);
+            let refusal: serde_json::Value = serde_json::from_str(&reply.body).expect("refusal is not JSON");
+            assert_eq!(refusal["error"]["code"], -32700, "{refusal}");
             assert_eq!(reply.upstream_requests, 0, "a refused request must not reach the upstream");
-            assert!(!reply.body.contains(BACKEND), "{}", reply.body);
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_body_that_is_not_valid_json_is_rejected_for_a_fabric_target() {
+    let mock = MockServer::start_with_response(result_envelope(v1_card())).await;
+    let h = GatewayHarness::start_with_outbound_mock(mock, |_, gw_config, _| {
+        let mut surface = helpers::build_minimal_outbound_channel();
+        surface.target.endpoint = "fabric://unknown/ch".to_string();
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{},"x":NaN}"#)
+        .send()
+        .await
+        .expect("request through gateway failed");
+    assert_eq!(resp.status(), 400);
+    let refusal: serde_json::Value = resp
+        .json()
+        .await
+        .expect("refusal is not JSON");
+    assert_eq!(refusal["error"]["code"], -32700, "{refusal}");
+}
+
+async fn upstream_accept_encoding(
+    direction: Direction,
+    upstream_body: String,
+    send: impl FnOnce(reqwest::Client, String) -> reqwest::RequestBuilder,
+) -> Option<String> {
+    let h = start_gateway(upstream_body, true).await;
+    let resp = send(reqwest::Client::new(), route_url(&h, &direction))
+        .header("accept-encoding", "gzip, br")
+        .send()
+        .await
+        .expect("request through gateway failed");
+    assert!(resp.status().is_success(), "expected success, got {}", resp.status());
+    h.mock
+        .last_request_rx
+        .borrow()
+        .as_ref()
+        .expect("upstream received the request")
+        .headers
+        .get("accept-encoding")
+        .cloned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_card_fetches_ask_the_upstream_for_an_uncompressed_card() {
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let rpc = upstream_accept_encoding(direction, result_envelope(v1_card()), |client, route| {
+            client
+                .post(format!("{route}/rpc"))
+                .header("content-type", "application/json")
+                .body(request("GetExtendedAgentCard"))
+        })
+        .await;
+        assert_eq!(rpc.as_deref(), Some("identity"));
+    }
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let rest = upstream_accept_encoding(direction, v1_card().to_string(), |client, route| {
+            client.get(format!("{route}/extendedAgentCard"))
+        })
+        .await;
+        assert_eq!(rest.as_deref(), Some("identity"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_requests_keep_the_callers_accept_encoding() {
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let forwarded = upstream_accept_encoding(direction, result_envelope(v1_card()), |client, route| {
+            client
+                .post(format!("{route}/rpc"))
+                .header("content-type", "application/json")
+                .body(request("SendMessage"))
+        })
+        .await;
+        assert_eq!(forwarded.as_deref(), Some("gzip, br"));
     }
 }
 

@@ -2704,6 +2704,19 @@ async fn proxy_handler_with_mcp_runtime(
             .protocol,
         crate::config::agent_surface::SurfaceProtocol::A2a | crate::config::agent_surface::SurfaceProtocol::Ap2
     );
+    let is_rest_extended_card_request =
+        is_a2a_surface && crate::proxy::paths::is_rest_extended_agent_card_request(method.as_str(), uri.path());
+    // A compressed extended card cannot be rewritten, so the Target is asked for
+    // an uncompressed one. The same headers are forwarded to fabric targets.
+    if is_rest_extended_card_request
+        || (is_a2a_surface
+            && a2a_context
+                .as_ref()
+                .and_then(|context| context.method.as_deref())
+                .is_some_and(crate::a2a::is_extended_agent_card_method))
+    {
+        headers.insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
+    }
     let is_a2a_proxy_target = is_a2a_surface
         && state
             .surface
@@ -2785,19 +2798,15 @@ async fn proxy_handler_with_mcp_runtime(
         return Err(create_jsonrpc_error_response(StatusCode::BAD_REQUEST, code, message));
     }
 
-    // An extended agent card in a batch response, or in the response to a body
-    // the gateway cannot parse as plain JSON, cannot be rewritten, so such a
-    // request is refused whatever `validate_messages` says.
-    if is_a2a_surface && crate::a2a::is_unrewritable_extended_agent_card_request(&body_bytes) {
-        channel_warn!(config_id, "Rejected an extended agent card request that is not a single JSON-RPC object");
+    // A body the gateway cannot parse may still be an extended-card call a lenient
+    // Target reads, and a card inside a batch response cannot be rewritten, so
+    // both are refused whatever `validate_messages` says, fabric targets included.
+    if is_a2a_surface && let Some(refusal) = crate::a2a::unforwardable_a2a_request(&body_bytes) {
+        channel_warn!(config_id, "Rejected A2A request before forwarding: {}", refusal);
         connection_guard
             .decrement()
             .await;
-        return Err(create_jsonrpc_error_response(
-            StatusCode::BAD_REQUEST,
-            -32600,
-            "Invalid Request: an extended agent card request must be a single JSON-RPC object",
-        ));
+        return Err(create_jsonrpc_error_response(StatusCode::BAD_REQUEST, refusal.jsonrpc_code(), refusal.message()));
     }
 
     // ── A2A request-shape validation ─────────────────────────────────────
@@ -7429,8 +7438,6 @@ async fn proxy_handler_with_mcp_runtime(
     }
     .recording_versions(access_point_upstream_key(&state));
     let is_modern_response = modern_request.is_some();
-    let is_rest_extended_card_request =
-        is_a2a_surface && crate::proxy::paths::is_rest_extended_agent_card_request(method.as_str(), uri.path());
     let process_response = async move |status: StatusCode, response_headers: HeaderMap, response_body: bytes::Bytes| {
         let config_id = state
             .surface
@@ -13231,10 +13238,10 @@ async fn handle_fabric_request(
                 // Skip validation for agent card requests (they're JSON config, not A2A messages)
                 let _inspect_span =
                     tracing::info_span!("fabric.inspect_response", otel.name = "Inspect Response Extensions");
-                let is_agent_card_request =
+                let skips_extension_inspection =
                     crate::proxy::paths::is_well_known_agent_card_path(uri.path()) || is_extended_card_response;
 
-                if is_agent_card_request {
+                if skips_extension_inspection {
                     debug!(
                         channel = channel_name,
                         "Skipping extension validation for agent card request in fabric path"
@@ -13251,7 +13258,7 @@ async fn handle_fabric_request(
                         && state
                             .identity_rules_engine
                             .is_some()
-                        && !is_agent_card_request
+                        && !skips_extension_inspection
                     {
                         // Dispatch to protocol-specific validator
                         let validation_result = if matches!(

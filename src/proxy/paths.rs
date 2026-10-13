@@ -38,15 +38,17 @@ pub fn is_well_known_agent_card_path(path: &str) -> bool {
 /// binding: `GET {route}/extendedAgentCard` (1.0) or `GET {route}/v1/card` (0.3).
 /// `route_relative_path` is the request path after the surface route, so a deeper
 /// path that only ends the same way (such as `{route}/payments/v1/card`) does not match.
-/// The path is matched as the Target will see it: dot segments (including `%2e`)
-/// are resolved and percent-escapes decoded first.
+/// The path is matched as the Target may see it: dot segments (including `%2e`)
+/// are resolved and percent-escapes decoded first, and the comparison ignores
+/// ASCII case because some Target routers do.
 pub fn is_rest_extended_agent_card_request(
     method: &str,
     route_relative_path: &str,
 ) -> bool {
     let normalized = normalize_route_relative_path(route_relative_path);
     let path = normalized.trim_matches('/');
-    method.eq_ignore_ascii_case("GET") && (path == "extendedAgentCard" || path == "v1/card")
+    method.eq_ignore_ascii_case("GET")
+        && (path.eq_ignore_ascii_case("extendedAgentCard") || path.eq_ignore_ascii_case("v1/card"))
 }
 
 /// Resolve dot segments the way the forwarded URL is resolved before it reaches
@@ -195,6 +197,9 @@ mod tests {
             "/extended%41gentCard",
             "/v1%2Fcard",
             "//extendedAgentCard",
+            "/extendedagentcard",
+            "/EXTENDEDAGENTCARD",
+            "/V1/Card",
         ] {
             assert!(is_rest_extended_agent_card_request("GET", path), "{path}");
         }
