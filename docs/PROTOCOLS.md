@@ -296,25 +296,40 @@ encodes preference.
 An extended card gets the same treatment on A2A and AP2 surfaces (on the outbound path, A2A and
 AP2 transit points), whether it is returned as a JSON-RPC result (`GetExtendedAgentCard` /
 `agent/getAuthenticatedExtendedCard`) or fetched over the HTTP+JSON binding
-(`GET {route}/extendedAgentCard` in `1.0`, `GET {route}/v1/card` in `0.3`). The HTTP+JSON paths
-match only directly under the surface route (or the transit point's path), ignoring ASCII case,
-when the path is a card path either as the forwarded URL resolves it (dot segments, including
-`%2e`, resolved and percent-escapes decoded) or as lenient Target routers resolve it (also
-dropping `;` path parameters and empty segments); a path the gateway cannot parse is treated as a
-card. A deeper path that only ends the same way is not a card, so a Target whose
-HTTP+JSON base sits below its target endpoint, or that serves a tenant-scoped
-`/{tenant}/extendedAgentCard`, is not covered. Its endpoint URLs are rewritten on inbound,
+(`{route}/extendedAgentCard` in `1.0`, `{route}/v1/card` in `0.3`). JSON-RPC method names match
+exactly as the A2A specification spells them. The HTTP+JSON path is checked as the Target sees it:
+appended to the base path of the target endpoint (or the transit point's destination), resolved
+the way the forwarded URL is resolved (dot segments, including `%2e`, and percent-escapes), and
+also the way lenient Target routers resolve it (dropping `;` path parameters and empty segments,
+and treating `\` as a separator), ignoring ASCII case. `extendedAgentCard` matches as the last
+segment at any depth, so a tenant-scoped `{route}/{tenant}/extendedAgentCard` is a card; `v1/card`
+matches only directly under the base path, so a deeper path such as `{route}/payments/v1/card` is
+not a card. A root-level `{route}/v1/card` is a card on every A2A and AP2 surface, including one
+whose Target serves its own `/v1/card` resource. A path that climbs out of the base path, or that
+the gateway cannot parse, is treated as a card. Every method except `HEAD` and `OPTIONS` is
+checked, because a Target may honour a method override header. A Target whose HTTP+JSON base sits
+below its target endpoint is not covered. Its endpoint URLs are rewritten on inbound,
 fabric and outbound paths, and on inbound paths it gets the same identity treatment when agent
-identity is configured. On inbound and fabric paths it skips response extension inspection, like
+identity is configured, with one difference: an `agent-identity-credential/v1` extension already on
+an extended card stands in for the agent's identity only when it arrives over Fabric from a peer
+gateway. A direct Target must present `agent-identity/v1`, and any credential extension it sends is
+replaced by the one the gateway issues. When managed identity is on, an extended card with no
+`capabilities.extensions` array is answered with `502`. No identity VP is signed for an agent card
+response, public or extended. On inbound and fabric paths it skips response extension inspection, like
 the public card, so response validation rules do not apply to it; outbound transit points still
 validate response extensions on both kinds of card.
 
 For the JSON-RPC binding, error responses and empty bodies are forwarded unchanged; a JSON-RPC error
 is an object `error` with no `result`, and a `null` member counts as absent, so `"error": null` next
-to a card still has the card rewritten. The URL rewrite fails closed for an extended card: a
-successful response that is neither a JSON-RPC error (on the JSON-RPC binding) nor a card the
-gateway can rewrite is answered with `502` rather than forwarded. That covers an SSE stream, an
-empty HTTP+JSON body, a card or `result` that is not a JSON object, and both `result` and `error`.
+to a card still has the card rewritten. A card `result` is rewritten whatever the HTTP status. The
+URL rewrite fails closed for an extended card: a successful response that is neither a JSON-RPC
+error (on the JSON-RPC binding) nor a card the gateway can rewrite is answered with `502` rather
+than forwarded. That covers an SSE stream, an empty HTTP+JSON body, a card or `result` that is not
+a JSON object, both `result` and `error`, and a card with no endpoint field (`url`, `endpoint`,
+`endpoints`, `supportedInterfaces` or `additionalInterfaces`) to rewrite, such as a wrapped card.
+On the JSON-RPC binding the refusal is a JSON-RPC `-32603` error that echoes the request `id`; on
+the HTTP+JSON binding it is a problem response. A non-success response that carries no card
+`result` is forwarded unchanged.
 A public card that cannot be rewritten is answered with `502` on the direct inbound path and
 forwarded as received on fabric and outbound paths.
 
@@ -324,9 +339,19 @@ rewritten. A compressed card cannot be rewritten either, so an extended-card fet
 `Accept-Encoding: identity` in place of the caller's value.
 
 Extended cards are detected the same way as the public card: from the request's JSON-RPC method or
-path. A request the gateway cannot recognise, such as a body it cannot parse (when
-`validate_messages` is off, on `fabric://` targets and on outbound transit points) or a card path
-it does not match, is forwarded like any other request and its response is not rewritten.
+path. Some requests are not recognised, and are forwarded like any other request with their
+response not rewritten. These are accepted limits:
+
+- a body the gateway cannot parse but the Target can, such as JSON with a UTF-8 byte order mark,
+  when `validate_messages` is off, on `fabric://` targets and on outbound transit points;
+- a JSON-RPC body with duplicate `method` keys, sent to a Target that keeps the first key where the
+  gateway keeps the last;
+- a JSON-RPC method name in another letter case, sent to a Target that matches method names
+  case-insensitively;
+- an HTTP+JSON base path below the target endpoint.
+
+A Fabric caller's extended card is rewritten by the caller-side gateway only once that gateway
+runs a version that recognises extended cards.
 
 An extended card is always fetched by a caller, so with `from_jwt_claim` managed identity it needs
 the caller's validated JWT claims like any other response; without them the request fails with

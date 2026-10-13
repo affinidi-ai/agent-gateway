@@ -106,8 +106,8 @@ pub(crate) enum OutboundPipelineError {
     #[error("{}", crate::a2a::EXTENDED_AGENT_CARD_BATCH_REFUSAL)]
     ExtendedAgentCardBatch,
 
-    #[error("Failed to process extended agent card")]
-    UnrewritableExtendedAgentCardResponse,
+    #[error("{}", crate::a2a::url_rewriter::EXTENDED_AGENT_CARD_REFUSAL)]
+    UnrewritableExtendedAgentCardResponse { rpc_request_id: Option<serde_json::Value> },
 
     #[error("{error}")]
     McpMetadata { error: crate::mcp::meta::McpMetadataError, body: Bytes, response: bool },
@@ -221,7 +221,7 @@ impl OutboundPipelineError {
             | Self::UpstreamConnectionFailed(_)
             | Self::UpstreamResponseReadFailed
             | Self::ResponseValidationFailed(_)
-            | Self::UnrewritableExtendedAgentCardResponse => StatusCode::BAD_GATEWAY,
+            | Self::UnrewritableExtendedAgentCardResponse { .. } => StatusCode::BAD_GATEWAY,
 
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
 
@@ -243,6 +243,9 @@ impl IntoResponse for OutboundPipelineError {
         }
         if let Self::McpBodyRefused(refusal) = self {
             return refusal.into_response();
+        }
+        if let Self::UnrewritableExtendedAgentCardResponse { rpc_request_id } = self {
+            return crate::a2a::url_rewriter::extended_agent_card_refusal(rpc_request_id.as_ref());
         }
         if let Self::ExtendedAgentCardBatch = self {
             return crate::a2a::create_jsonrpc_error_response(StatusCode::BAD_REQUEST, -32600, &self.to_string());
@@ -4686,6 +4689,8 @@ fn is_rest_extended_card_request(ctx: &OutboundPipelineContext) -> bool {
     transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
         && crate::proxy::paths::is_rest_extended_agent_card_request(
             ctx.original_method.as_str(),
+            &ctx.virtual_channel
+                .target_endpoint,
             &compute_outbound_remainder_path(
                 &ctx.request_path,
                 &ctx.surface.access_point.route,
@@ -5124,7 +5129,7 @@ fn process_outbound_response_body(
     // "computed" but never assigned, so derive it here from the surface
     // + listener config.
     let is_rest_extended_card_response = status.is_success() && is_rest_extended_card_request(ctx);
-    let is_rpc_extended_card_response = status.is_success() && is_rpc_extended_card_request(ctx);
+    let is_rpc_extended_card_response = is_rpc_extended_card_request(ctx);
     let is_extended_card_response = is_rest_extended_card_response || is_rpc_extended_card_response;
     let body_bytes = if is_agent_card_response(&ctx.request_path, status) || is_extended_card_response {
         let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
@@ -5137,9 +5142,15 @@ fn process_outbound_response_body(
                 &body_bytes,
                 &proxy_endpoint,
                 &ctx.surface.name,
+                status,
             )
         } else {
-            crate::a2a::url_rewriter::process_outbound_agent_card(&body_bytes, &proxy_endpoint, &ctx.surface.name)
+            let kind = if is_extended_card_response {
+                crate::a2a::AgentCardKind::Extended
+            } else {
+                crate::a2a::AgentCardKind::Public
+            };
+            crate::a2a::url_rewriter::process_outbound_agent_card(&body_bytes, &proxy_endpoint, &ctx.surface.name, kind)
                 .map(Some)
         };
         match rewritten {
@@ -5153,7 +5164,14 @@ fn process_outbound_response_body(
             Ok(None) => body_bytes,
             Err(e) if is_extended_card_response => {
                 warn!(request_id = %ctx.request_id, error = %e, "Failed to rewrite outbound extended agent card URLs");
-                return Err(OutboundPipelineError::UnrewritableExtendedAgentCardResponse);
+                return Err(OutboundPipelineError::UnrewritableExtendedAgentCardResponse {
+                    rpc_request_id: is_rpc_extended_card_response.then(|| {
+                        ctx.body_bytes
+                            .as_deref()
+                            .and_then(crate::a2a::url_rewriter::extended_agent_card_request_id)
+                            .unwrap_or(serde_json::Value::Null)
+                    }),
+                });
             }
             Err(e) => {
                 warn!(

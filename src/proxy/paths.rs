@@ -35,51 +35,81 @@ pub fn is_well_known_agent_card_path(path: &str) -> bool {
 }
 
 /// Whether a request fetches the extended agent card over the A2A HTTP+JSON
-/// binding: `GET {route}/extendedAgentCard` (1.0) or `GET {route}/v1/card` (0.3).
-/// `route_relative_path` is the request path after the surface route, so a deeper
-/// path that only ends the same way (such as `{route}/payments/v1/card`) does not match.
-/// The path matches if any way a Target may see it is a card path: as the
-/// forwarded URL resolves it, or as lenient routers (Tomcat, Spring, JAX-RS) do,
-/// which also drop `;` path parameters and empty segments. Percent-escapes are
-/// decoded and the comparison ignores ASCII case because some Target routers do.
-/// A path that cannot be parsed is treated as a card so the response is still
-/// rewritten.
+/// binding: `{route}/extendedAgentCard` (1.0, also tenant-scoped as
+/// `{route}/{tenant}/extendedAgentCard`) or `{route}/v1/card` (0.3).
+///
+/// The path is checked as the Target sees it: appended to the base path of
+/// `target_endpoint`, resolved the way the forwarded URL is resolved, and also
+/// the way lenient routers (Tomcat, Spring, JAX-RS) resolve it, which decode
+/// `%2e`, drop `;` path parameters and empty segments, and treat `\` as a
+/// separator. Matching ignores ASCII case. A path that climbs out of the base
+/// path or cannot be parsed is treated as a card so the response is still
+/// rewritten. Every method except `HEAD` and `OPTIONS` is checked, because a
+/// Target may honour a method override header.
 pub fn is_rest_extended_agent_card_request(
     method: &str,
-    route_relative_path: &str,
+    target_endpoint: &str,
+    request_path: &str,
 ) -> bool {
-    if !method.eq_ignore_ascii_case("GET") {
+    if method.eq_ignore_ascii_case("HEAD") || method.eq_ignore_ascii_case("OPTIONS") {
         return false;
     }
-    let Some(resolved) = resolve_as_forwarded(route_relative_path) else {
+    let base_path = target_base_path(target_endpoint);
+    let joined = format!("{}/{}", base_path.trim_end_matches('/'), request_path.trim_start_matches('/'));
+    let Ok(forwarded) = url::Url::parse(&format!("http://route.invalid{joined}")) else {
         return true;
     };
-    is_extended_agent_card_route_path(&resolved)
-        || is_extended_agent_card_route_path(&normalize_like_lenient_router(route_relative_path))
+    let base_segments = lenient_router_segments(&base_path);
+    let resolved = percent_decode_lossy(forwarded.path());
+    [lenient_router_segments(&resolved), lenient_router_segments(&joined)]
+        .iter()
+        .any(|segments| match strip_base_segments(segments, &base_segments) {
+            Some(route_relative) => is_extended_agent_card_segments(route_relative),
+            None => true,
+        })
 }
 
-fn is_extended_agent_card_route_path(path: &str) -> bool {
-    let path = path.trim_matches('/');
-    path.eq_ignore_ascii_case("extendedAgentCard") || path.eq_ignore_ascii_case("v1/card")
+/// The path of an `http(s)` Target endpoint; other schemes, such as `fabric://`,
+/// forward the request path unchanged.
+fn target_base_path(target_endpoint: &str) -> String {
+    url::Url::parse(target_endpoint)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| "/".to_string())
 }
 
-/// Resolve dot segments the way the forwarded URL is resolved before it reaches
-/// the Target, then decode percent-escapes. The path is appended to an absolute
-/// base so a first segment such as `foo:bar` is never parsed as a URL scheme.
-fn resolve_as_forwarded(path: &str) -> Option<String> {
-    let url = url::Url::parse(&format!("http://route.invalid/{}", path.trim_start_matches('/'))).ok()?;
-    Some(
-        percent_encoding::percent_decode_str(url.path())
-            .decode_utf8_lossy()
-            .into_owned(),
-    )
+fn strip_base_segments<'a>(
+    segments: &'a [String],
+    base_segments: &[String],
+) -> Option<&'a [String]> {
+    if segments.len() < base_segments.len() {
+        return None;
+    }
+    let (base, rest) = segments.split_at(base_segments.len());
+    base.iter()
+        .zip(base_segments)
+        .all(|(segment, base_segment)| segment.eq_ignore_ascii_case(base_segment))
+        .then_some(rest)
+}
+
+fn is_extended_agent_card_segments(segments: &[String]) -> bool {
+    match segments {
+        [.., last] if last.eq_ignore_ascii_case("extendedAgentCard") => true,
+        [version, card] => version.eq_ignore_ascii_case("v1") && card.eq_ignore_ascii_case("card"),
+        _ => false,
+    }
+}
+
+fn percent_decode_lossy(path: &str) -> String {
+    String::from_utf8_lossy(&urlencoding::decode_binary(path.as_bytes())).into_owned()
 }
 
 /// Decode percent-escapes, drop `;` path parameters, empty and `.` segments,
 /// and resolve `..`, treating `\` as a separator.
-fn normalize_like_lenient_router(path: &str) -> String {
-    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
-    let mut segments: Vec<&str> = Vec::new();
+fn lenient_router_segments(path: &str) -> Vec<String> {
+    let decoded = percent_decode_lossy(path);
+    let mut segments: Vec<String> = Vec::new();
     for segment in decoded.split(['/', '\\']) {
         match segment
             .split(';')
@@ -90,10 +120,10 @@ fn normalize_like_lenient_router(path: &str) -> String {
             ".." => {
                 segments.pop();
             }
-            segment => segments.push(segment),
+            segment => segments.push(segment.to_string()),
         }
     }
-    segments.join("/")
+    segments
 }
 
 /// Whether a request is a public discovery read that bypasses the request
@@ -195,28 +225,48 @@ mod tests {
         assert!(!is_public_request("GET", "/surface/tools"));
     }
 
+    const ROOT_TARGET: &str = "http://target.example";
+    const BASE_TARGET: &str = "http://target.example/base/";
+
+    fn is_card(path: &str) -> bool {
+        is_rest_extended_agent_card_request("GET", ROOT_TARGET, path)
+    }
+
     #[test]
-    fn rest_extended_agent_card_request_matches_get_on_both_eras() {
+    fn rest_extended_agent_card_request_matches_both_eras_for_any_method_but_head_and_options() {
         for path in ["/extendedAgentCard", "/v1/card", "/extendedAgentCard/", "v1/card", "extendedAgentCard"] {
-            assert!(is_rest_extended_agent_card_request("GET", path), "{path}");
-            assert!(is_rest_extended_agent_card_request("get", path), "{path}");
-            for method in ["POST", "HEAD", "PUT", "DELETE"] {
-                assert!(!is_rest_extended_agent_card_request(method, path), "{method} {path}");
+            for method in ["GET", "get", "POST", "PUT", "DELETE"] {
+                assert!(is_rest_extended_agent_card_request(method, ROOT_TARGET, path), "{method} {path}");
+            }
+            for method in ["HEAD", "OPTIONS", "options"] {
+                assert!(!is_rest_extended_agent_card_request(method, ROOT_TARGET, path), "{method} {path}");
             }
         }
         for path in [
             "/extendedAgentCard/extra",
             "/foo/v1/card",
             "/payments/v1/card",
-            "/foo/extendedAgentCard",
             "/card",
             "/v1/cards",
             "/.well-known/agent-card.json",
             "/rpc",
             "/",
         ] {
-            assert!(!is_rest_extended_agent_card_request("GET", path), "{path}");
+            assert!(!is_card(path), "{path}");
         }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_matches_tenant_scoped_extended_card_paths() {
+        for path in [
+            "/acme/extendedAgentCard",
+            "/a/b/extendedAgentCard/",
+            "/x/./extendedAgentCard",
+            "/foo:bar/extendedAgentCard",
+        ] {
+            assert!(is_card(path), "{path}");
+        }
+        assert!(!is_card("/acme/v1/card"));
     }
 
     #[test]
@@ -245,18 +295,42 @@ mod tests {
             "/v1//../card",
             "/x\\..\\extendedAgentCard",
         ] {
-            assert!(is_rest_extended_agent_card_request("GET", path), "{path}");
+            assert!(is_card(path), "{path}");
         }
+        for path in ["/payments/%2e/v1/card", "/x/y/../v1/card", "/payments;x=1/v1/card", "/x//v1/card"] {
+            assert!(!is_card(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_resolves_against_the_target_base_path() {
+        for path in ["/v1/card", "/extendedAgentCard", "/x/../v1/card"] {
+            assert!(is_rest_extended_agent_card_request("GET", BASE_TARGET, path), "{path}");
+        }
+        for path in ["/rpc", "/", "/v1/cards", "/x/v1/card"] {
+            assert!(!is_rest_extended_agent_card_request("GET", BASE_TARGET, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_treats_a_climb_out_of_the_target_base_as_a_card() {
         for path in [
-            "/x/./extendedAgentCard",
-            "/payments/%2e/v1/card",
-            "/x/y/../v1/card",
-            "/foo:bar/extendedAgentCard",
-            "/payments;x=1/v1/card",
-            "/x//v1/card",
+            "/../base/extendedAgentCard",
+            "/%2e%2e/base/extendedAgentCard",
+            "/../base/./extendedAgentCard",
+            "/x/../../base/v1/card",
+            "/..;/base/v1/card",
+            "/../other/rpc",
         ] {
-            assert!(!is_rest_extended_agent_card_request("GET", path), "{path}");
+            assert!(is_rest_extended_agent_card_request("GET", BASE_TARGET, path), "{path}");
         }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_ignores_the_base_of_non_http_targets() {
+        assert!(is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/v1/card"));
+        assert!(!is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/surface/rpc"));
+        assert!(!is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/../rpc"));
     }
 
     #[test]

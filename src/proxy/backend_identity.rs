@@ -179,6 +179,17 @@ impl IdentityResponseKind {
     pub fn is_agent_card(self) -> bool {
         !matches!(self, Self::Message)
     }
+
+    /// Whether an `agent-identity-credential/v1` extension already on the card
+    /// can stand in for the agent's identity. An extended card only trusts one
+    /// that arrives over Fabric from a peer gateway; a direct Target must present
+    /// `agent-identity/v1` and have the gateway issue the credential.
+    pub fn trusts_upstream_identity_credential(
+        self,
+        target_endpoint: &str,
+    ) -> bool {
+        self != Self::ExtendedAgentCard || target_endpoint.starts_with("fabric://")
+    }
 }
 
 /// Resolve the protected agent's identity from a response.
@@ -601,6 +612,8 @@ pub async fn resolve_agent_identity_for_slot(
         }
         crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2 => {
             if is_agent_card {
+                let trusts_upstream_credential =
+                    response_kind.trusts_upstream_identity_credential(&surface.target.endpoint);
                 // Short-circuit: when the card already carries an
                 // `agent-identity-credential/v1` extension (injected by an
                 // upstream gateway that has already resolved and DID-hashed the
@@ -622,7 +635,7 @@ pub async fn resolve_agent_identity_for_slot(
                     })
                     .cloned();
 
-                if let Some(ext) = cred_ext {
+                if let Some(ext) = cred_ext.filter(|_| trusts_upstream_credential) {
                     let params = ext.get("params");
                     let did = params
                         .and_then(|p| p.get("did"))
@@ -1149,6 +1162,72 @@ mod tests {
         assert!(!IdentityResponseKind::Message.is_agent_card());
         assert!(IdentityResponseKind::PublicAgentCard.is_agent_card());
         assert!(IdentityResponseKind::ExtendedAgentCard.is_agent_card());
+    }
+
+    fn self_asserted_credential_card() -> Vec<u8> {
+        let did = "did:key:z6MkSelfAsserted";
+        let vp = json!({"holder": did, "verifiableCredential": {"credentialSubject": {"id": did}}});
+        serde_json::to_vec(&json!({
+            "name": "agent",
+            "capabilities": {"extensions": [{
+                "uri": crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+                "params": {"did": did, "verifiablePresentation": vp.to_string()}
+            }]}
+        }))
+        .unwrap()
+    }
+
+    fn payload_extraction_surface(target_endpoint: &str) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
+        surface.target.endpoint = target_endpoint.to_string();
+        surface
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                meta_field: "agentIdentity".to_string(),
+                ..Default::default()
+            },
+        ));
+        surface
+    }
+
+    async fn resolve_card(
+        target_endpoint: &str,
+        kind: IdentityResponseKind,
+    ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
+        resolve_protected_agent_identity(
+            &self_asserted_credential_card(),
+            &payload_extraction_surface(target_endpoint),
+            None,
+            None,
+            "test",
+            kind,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_target_cannot_assert_its_own_did_on_an_extended_card() {
+        let resolved = resolve_card("https://agent.example", IdentityResponseKind::ExtendedAgentCard).await;
+        assert!(matches!(resolved, Err(IdentityResolutionError::IdentityExtensionMissing(_))), "{resolved:?}");
+    }
+
+    #[tokio::test]
+    async fn fabric_extended_card_keeps_the_peer_gateway_credential() {
+        let resolved = resolve_card("fabric://peer/surface", IdentityResponseKind::ExtendedAgentCard).await;
+        assert!(
+            matches!(&resolved, Ok(ProtectedAgentIdentity::Managed { did, .. }) if did == "did:key:z6MkSelfAsserted"),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_fabric_extended_card_or_a_public_card_trusts_an_upstream_identity_credential() {
+        assert!(IdentityResponseKind::PublicAgentCard.trusts_upstream_identity_credential("https://agent.example"));
+        assert!(IdentityResponseKind::ExtendedAgentCard.trusts_upstream_identity_credential("fabric://peer/surface"));
+        assert!(!IdentityResponseKind::ExtendedAgentCard.trusts_upstream_identity_credential("https://agent.example"));
     }
 
     // ── extract_a2a_identity_from_message ────────────────────────────────

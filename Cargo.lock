@@ -715,7 +715,6 @@ dependencies = [
  "p256 0.13.2",
  "parking_lot",
  "pem 3.0.6",
- "percent-encoding",
  "prometheus",
  "pulsar",
  "quick-xml 0.39.4",
