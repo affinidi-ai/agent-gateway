@@ -334,6 +334,15 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     if world.terms_enabled {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
+    // The A2A proxy dial refuses loopback targets unless the gateway's
+    // dev/test hatch is on; the non-A2A managed agent is a loopback mock.
+    if world
+        .surface_config
+        .a2a_proxy_target
+        .is_some()
+    {
+        gateway_env.insert("AG_ALLOW_LOCAL_A2A_PROXY".to_string(), "true".to_string());
+    }
     let mut gateway = GatewayProcess::start_surface_with_env(&config_path, temp_dir.path(), &gateway_env);
     gateway = gateway
         .with_port(gateway_port)
@@ -990,7 +999,7 @@ async fn operator_attempts_create_a2a_surface_with_header_metadata_mapping(
     create_surface(world, payload).await;
 }
 
-#[when(expr = "the caller sends an A2A message/send request to surface {string} with text {string}")]
+#[when(expr = "the caller sends an A2A message\\/send request to surface {string} with text {string}")]
 async fn caller_sends_a2a_message_send_with_text(
     world: &mut SurfaceWorld,
     surface_name: String,
@@ -1007,7 +1016,9 @@ async fn caller_sends_a2a_message_send_with_text(
     send_a2a_proxy_request_and_record(world, body, Vec::new()).await;
 }
 
-#[when(expr = "the caller sends an A2A message/send request to surface {string} with text parts {string} and {string}")]
+#[when(
+    expr = "the caller sends an A2A message\\/send request to surface {string} with text parts {string} and {string}"
+)]
 async fn caller_sends_a2a_message_send_with_text_parts(
     world: &mut SurfaceWorld,
     surface_name: String,
@@ -1028,7 +1039,7 @@ async fn caller_sends_a2a_message_send_with_text_parts(
     send_a2a_proxy_request_and_record(world, body, Vec::new()).await;
 }
 
-#[when(expr = "the caller sends an A2A message/send request to surface {string} with a non-text part")]
+#[when(expr = "the caller sends an A2A message\\/send request to surface {string} with a non-text part")]
 async fn caller_sends_a2a_message_send_with_non_text_part(
     world: &mut SurfaceWorld,
     surface_name: String,
@@ -1083,7 +1094,7 @@ async fn caller_sends_a2a_method_to_surface(
 }
 
 #[when(
-    expr = "the caller sends an A2A message/send request to surface {string} with text {string} and header {string} set to {string}"
+    expr = "the caller sends an A2A message\\/send request to surface {string} with text {string} and header {string} set to {string}"
 )]
 async fn caller_sends_a2a_message_send_with_text_and_header(
     world: &mut SurfaceWorld,

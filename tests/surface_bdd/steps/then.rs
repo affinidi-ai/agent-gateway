@@ -221,6 +221,9 @@ fn named_non_a2a_managed_agent_received_text(
     agent_name: String,
     expected_text: String,
 ) {
+    // Gherkin strings are not unescaped, so `\n` in the step text stands for a
+    // line break between text parts.
+    let expected_text = expected_text.replace("\\n", "\n");
     let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
     let requests = get_observed_target_requests(target, &agent_name);
     let activity_post = direct_line_activity_post(requests, &agent_name);
