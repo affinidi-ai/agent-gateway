@@ -119,6 +119,41 @@ pub fn mcp_refusal_reason(
     }
 }
 
+/// An identity-binding VP verified and a trust anchor vouches for its issuer.
+pub fn identity_binding_verified(
+    facts: &RequestFacts<'_>,
+    agent_did: &str,
+    issuer_gateway: Option<&str>,
+    assurance: Option<&str>,
+) {
+    emit("identity_binding_verified", || {
+        facts.record(DelegationAuditAction::IdentityBindingVerified {
+            agent_did: agent_did.to_string(),
+            issuer_gateway: issuer_gateway.map(str::to_string),
+            assurance: assurance.map(str::to_string),
+        })
+    })
+}
+
+/// The identity check did not produce a binding to rely on. `error_detail` is
+/// a short diagnostic and never carries signed VP material.
+pub fn identity_binding_failed(
+    facts: &RequestFacts<'_>,
+    outcome: crate::audit::events::IdentityBindingFailure,
+    agent_did: Option<&str>,
+    issuer_gateway: Option<&str>,
+    error_detail: Option<&str>,
+) {
+    emit("identity_binding_failed", || {
+        facts.record(DelegationAuditAction::IdentityBindingFailed {
+            outcome,
+            agent_did: agent_did.map(str::to_string),
+            issuer_gateway: issuer_gateway.map(str::to_string),
+            error_detail: error_detail.map(str::to_string),
+        })
+    })
+}
+
 /// An MCP transport refusal, recorded from the validation error the caller receives.
 pub fn mcp_request_rejected(
     facts: &RequestFacts<'_>,

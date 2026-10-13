@@ -48,8 +48,12 @@ pub enum RejectionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityBindingFailure {
+    /// The request carried no identity binding VP.
     Absent,
+    /// The VP failed verification.
     Invalid,
+    /// The VP verified, but no trust anchor vouches for its issuer.
+    Untrusted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1790,7 +1790,12 @@ async fn step_extract_protocol_context_with_versions(
         crate::protocols::extensions::verify_mcp_metadata_identity(
             &body,
             state.vc_issuer.as_ref(),
-            &ctx.surface.surface_id,
+            &crate::audit::request_events::RequestFacts {
+                surface_id: &ctx.surface.surface_id,
+                channel_name: &ctx.surface.name,
+                trace_id: Some(&ctx.request_id),
+                via_fabric: false,
+            },
             None,
         )
         .await

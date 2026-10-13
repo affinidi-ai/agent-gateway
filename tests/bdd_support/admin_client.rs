@@ -588,6 +588,23 @@ impl GatewayAdminClient {
             .await
     }
 
+    /// Turn the VP Audit Log on and keep every audit event on this gateway.
+    pub async fn enable_every_audit_event(&self) -> Result<()> {
+        self.client
+            .enable_every_audit_event()
+            .await
+    }
+
+    /// See [`AdminApiClient::wait_for_audit_event`].
+    pub async fn wait_for_audit_event(
+        &self,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Result<(bool, Vec<Value>)> {
+        self.client
+            .wait_for_audit_event(matches)
+            .await
+    }
+
     pub async fn create_mediator(
         &self,
         name: &str,

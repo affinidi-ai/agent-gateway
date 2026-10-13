@@ -2935,7 +2935,17 @@ async fn enrich_and_evaluate_surface_policies(
                 Some(peer_issuers),
             )
             .await;
-            crate::observability::identity_binding_audit::audit_extraction(&surface.surface_id, None, &binding_result);
+            let binding_trace_id = crate::observability::policy_audit::current_span_trace_id();
+            crate::observability::identity_binding_audit::audit_extraction(
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: config_id,
+                    channel_name: &surface.name,
+                    trace_id: binding_trace_id.as_deref(),
+                    via_fabric: true,
+                },
+                None,
+                &binding_result,
+            );
             // When an inbound identity-binding VP verified, also record it in the
             // delegation audit log so the *received* VP (carrying any
             // workloadBinding) surfaces as a `vp_injected` event on the Audit
@@ -4344,7 +4354,7 @@ async fn process_forward_request_with_mcp_runtime(
             body_bytes = capped.body;
         }
         mcp_verified_binding = match crate::protocols::extensions::verify_mcp_metadata_identity(
-            &body_bytes, GLOBAL_VC_ISSUER.get(), config_id, Some(&peer_issuers),
+            &body_bytes, GLOBAL_VC_ISSUER.get(), &audit_facts, Some(&peer_issuers),
         ).await {
             Ok(binding) => binding,
             Err(error) => {

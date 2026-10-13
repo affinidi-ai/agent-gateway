@@ -183,6 +183,17 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a misconfigured default variant, a failed egress check task) are not recorded.
+- `identity_binding_verified` and `identity_binding_failed`: the outcome of checking the identity
+  presentation (identity binding VP) a request carries, recorded wherever the gateway checks one:
+  A2A requests on the direct path, MCP requests at admission, Transit Point MCP requests, and, on
+  the fabric receive path, when a surface policy relies on the presentation. These record that a
+  received presentation was checked; `vp_injected` records the gateway creating one.
+  - `identity_binding_verified`: the presentation verified and a trust anchor vouches for its
+    issuer. Carries `agent_did`, `issuer_gateway` and the caller-context `assurance`.
+  - `identity_binding_failed`: `outcome` is `absent` (no presentation was sent), `invalid` (it
+    failed verification, including an issuer the receiving connection does not trust) or
+    `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).
+    `error_detail` is a short diagnostic and never carries the presentation itself.
 
 **Recipients.** Every integration with category `audit`, status `active` and no tenant owner,
 whatever its type. Every record is one delivery, so Email and Slack send one message per record;

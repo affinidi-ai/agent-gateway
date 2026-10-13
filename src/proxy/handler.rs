@@ -2194,7 +2194,7 @@ async fn proxy_handler_with_mcp_runtime(
         let binding = crate::protocols::extensions::verify_mcp_metadata_identity(
             &body_bytes,
             state.vc_issuer.as_ref(),
-            config_id,
+            &audit_facts,
             None,
         )
         .await
@@ -4924,7 +4924,7 @@ async fn proxy_handler_with_mcp_runtime(
             None,
         )
         .await;
-        crate::observability::identity_binding_audit::audit_extraction(&state.surface.surface_id, None, &result);
+        crate::observability::identity_binding_audit::audit_extraction(&audit_facts, None, &result);
         result
     };
     let identity_binding = match binding_result {
@@ -10172,7 +10172,16 @@ async fn handle_fabric_request(
             None,
         )
         .await;
-        crate::observability::identity_binding_audit::audit_extraction(&state.surface.surface_id, None, &result);
+        crate::observability::identity_binding_audit::audit_extraction(
+            &crate::audit::request_events::RequestFacts {
+                surface_id: config_id,
+                channel_name,
+                trace_id: Some(&trace_id),
+                via_fabric: false,
+            },
+            None,
+            &result,
+        );
         result
     };
     let identity_binding = match binding_result {
