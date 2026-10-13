@@ -16,8 +16,12 @@ use crate::bdd_support::assertions::{
 };
 use crate::bdd_support::collaborators::{
     assert_header_absent, assert_header_value, assert_json_request_body, assert_no_requests,
-    assert_request_content_type_starts_with, assert_request_count, assert_unique_json_rpc_request_ids,
+    assert_request_content_type_starts_with, assert_request_count, assert_requests_omit_value,
+    assert_unique_json_rpc_request_ids,
 };
+use crate::bdd_support::config::modern_consent::PUBLIC_ORIGIN;
+use crate::bdd_support::mcp_consent::ConsentRequest;
+use crate::bdd_support::oidc::OidcProvider;
 use crate::world::G2gWorld;
 
 const FABRIC_GATEWAY_DID_META_KEY: &str = "x-affinidi-fabric-gateway-did";
@@ -190,7 +194,8 @@ pub async fn gateway_did_not_receive_fabric_forward_request(
     let actual = world
         .harness()
         .fabric_forward_request_count(gateway_index)
-        .await;
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
     assert_eq!(
         actual, baseline,
         "gateway {gateway_index} received a fabric forward request after the caller action; caller_status={:?}; caller_body={:?}",
@@ -426,6 +431,149 @@ pub async fn actor_did_not_receive_header(
         .expect_target_kind(&target_name, TargetActorKind::from_gherkin_label(&actor_kind));
     let last = last_request_for(world, &target_name).await;
     assert_header_absent(&last.headers, &header, &format!("forwarded request for target collaborator '{target_name}'"));
+}
+
+#[then(expr = "the MCP response asks caller {string} for consent to OAuth provider {string} at gateway {int}")]
+async fn mcp_response_asks_for_consent(
+    world: &mut G2gWorld,
+    caller: String,
+    provider: String,
+    gw_index: usize,
+) {
+    let response = response_body(world);
+    let consent = ConsentRequest::from_response(response)
+        .unwrap_or_else(|| panic!("caller '{caller}' was not asked for consent: {response}"));
+    assert!(
+        world
+            .topology
+            .plans
+            .get(&gw_index)
+            .is_some_and(|plan| plan.modern_consent.is_some()),
+        "gateway {gw_index} does not serve consent on {PUBLIC_ORIGIN}"
+    );
+    assert_eq!(
+        consent
+            .url
+            .origin()
+            .ascii_serialization(),
+        PUBLIC_ORIGIN,
+        "consent URL {} is not on gateway {gw_index}",
+        consent.url
+    );
+    assert_eq!(
+        consent.url.path(),
+        format!("/mcp-consent/connect/{provider}"),
+        "consent URL {} does not connect OAuth provider '{provider}'",
+        consent.url
+    );
+}
+
+#[then(expr = "the MCP response does not ask caller {string} for consent")]
+async fn mcp_response_does_not_ask_for_consent(
+    world: &mut G2gWorld,
+    caller: String,
+) {
+    let response = response_body(world);
+    assert!(
+        response
+            .get("result")
+            .is_some(),
+        "caller '{caller}' did not receive an MCP result: {response}"
+    );
+    assert_ne!(response["result"]["resultType"], "input_required", "caller '{caller}' was asked for input: {response}");
+}
+
+#[then(expr = "the MCP response still requires input from caller {string}")]
+async fn mcp_response_still_requires_input(
+    world: &mut G2gWorld,
+    caller: String,
+) {
+    let response = response_body(world);
+    assert_eq!(
+        response["result"]["resultType"], "input_required",
+        "caller '{caller}' should still be asked for input: {response}"
+    );
+}
+
+#[then(expr = "MCP server {string} received the delegated access token from OAuth provider {string} as a bearer token")]
+async fn mcp_server_received_delegated_access_token(
+    world: &mut G2gWorld,
+    target_name: String,
+    provider: String,
+) {
+    world
+        .topology
+        .actors
+        .expect_target_kind(&target_name, TargetActorKind::McpServer);
+    let access_token = oauth_provider(world, &provider).access_token();
+    let request = last_request_for(world, &target_name).await;
+    assert_header_value(
+        &request.headers,
+        "authorization",
+        &format!("Bearer {access_token}"),
+        &format!("MCP server '{target_name}'"),
+    );
+}
+
+#[then(
+    regex = r#"^MCP server "([^"]+)" did not receive the delegated (access|refresh) token from OAuth provider "([^"]+)"$"#
+)]
+async fn mcp_server_did_not_receive_delegated_token(
+    world: &mut G2gWorld,
+    target_name: String,
+    kind: String,
+    provider_name: String,
+) {
+    let provider = oauth_provider(world, &provider_name);
+    let token = match kind.as_str() {
+        "access" => provider.access_token(),
+        "refresh" => provider.refresh_token(),
+        other => unreachable!("the step regex admits only access or refresh tokens, got '{other}'"),
+    };
+    let (_, _, mock) = mock_for(world, &target_name);
+    assert_requests_omit_value(
+        &mock.requests().await,
+        token,
+        &format!("MCP server '{target_name}' ({kind} token from '{provider_name}')"),
+    );
+}
+
+#[then(expr = "MCP server {string} did not receive the MCP access token of caller {string}")]
+async fn mcp_server_did_not_receive_caller_access_token(
+    world: &mut G2gWorld,
+    target_name: String,
+    caller: String,
+) {
+    let token = world.caller_access_token(&caller);
+    let (_, _, mock) = mock_for(world, &target_name);
+    assert_requests_omit_value(
+        &mock.requests().await,
+        token,
+        &format!("MCP server '{target_name}' (MCP access token of caller '{caller}')"),
+    );
+}
+
+#[then(regex = r#"^OAuth provider "([^"]+)" received (\d+) token requests?$"#)]
+async fn oauth_provider_received_token_requests(
+    world: &mut G2gWorld,
+    provider_name: String,
+    expected_count: u64,
+) {
+    let actual = oauth_provider(world, &provider_name).token_request_count();
+    assert_eq!(
+        actual, expected_count,
+        "OAuth provider '{provider_name}' should receive {expected_count} token request(s), got {actual}"
+    );
+}
+
+fn oauth_provider<'a>(
+    world: &'a G2gWorld,
+    name: &str,
+) -> &'a OidcProvider {
+    world
+        .oauth_providers
+        .get(name)
+        .unwrap_or_else(|| panic!("unknown OAuth provider '{name}'"))
 }
 
 async fn last_request_for(

@@ -745,7 +745,9 @@ service for gateway-originated consent (MRTR), which needs both
 request to an endpoint that has `outbound_credentials` while
 `[mcp.continuations]` is not configured fails with HTTP `503`, JSON-RPC
 `-32603` ("MCP credential service unavailable"); there is no legacy consent
-fallback. Full cross-gateway delivery and callback conformance is not verified.
+fallback. Two-gateway delivery from a sending Access Point is verified under
+`make gw-e2e` (see [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric));
+callback conformance with real providers is not verified.
 The separate modern
 consent connect/callback routes reuse the existing Credential Provider and JWT
 verification strategy stores to verify provider-issued OIDC identity tokens.
@@ -912,8 +914,10 @@ distinct from the receiver's `fabric` role. Prepared credentials are added
 after source-token stripping; they must authorize the receiving resource,
 never reuse the ingress bearer. The sender wraps a remote `input_required`
 response with its own state when local consent is configured, preserving the
-remote state as opaque data. Sender-side wiring and receipt preservation still
-require full two-gateway and managed-mediator conformance.
+remote state as opaque data. `make gw-e2e` verifies sender-side consent and
+delivery of the delegated access token between two gateway binaries over the
+harness-managed Docker mediator; wrapping a remote `input_required` round still requires
+two-gateway conformance.
 
 `claim_delegation` leaves pending consent pending even when an ordinary vault
 record matches the agent/user/provider and scopes. Only a verified callback
@@ -1081,8 +1085,11 @@ existing legacy behavior. Releases without these fields ignore `resource` and
 provider. In-process callback-route tests use a real isolated token endpoint
 and signed ID tokens, covering same-user success, wrong-user rejection,
 configuration changes, provider denial, PKCE and single-use exchange.
-Full cross-gateway and routed callback integration, distributed coverage, and
-provider/redirect conformance remain required.
+The `make gw-e2e` scenarios in
+`tests/features/g2g/mcp_credential_delegation_over_fabric.feature` drive the
+routed connect and callback routes of a real gateway binary against a local
+OpenID provider. Distributed coverage and conformance with real providers and
+redirects remain required.
 
 Startup-only `[mcp.continuations]` settings in the bootstrap TOML explicitly
 select a deployment namespace, TTL, active key, key ring and storage backend.
@@ -1870,7 +1877,7 @@ The direct modern branch uses shared `proxy::credential_delegation::modern` prep
 
 Fabric receive prepares modern consent after its own resource authorization, verified agent-presentation admission and policy gates, before payment and Target dispatch. Continuations additionally bind the authenticated sending peer; ingress-audience tokens do not authorize the receiver. An isolated signed-identity receiver test covers pending consent, delegated credential delivery, JSON/SSE upstream continuation restoration, cross-peer rejection and single-use concurrent retries. This does not establish encrypted-frame or managed-mediator conformance.
 
-The sending Access Point uses a distinct `FabricSend` continuation role bound to the selected remote peer; when its Target sets `fabric_delegated_credentials`, modern consent precedes mirroring, payment and remote dispatch, with delegated credentials applied after caller-token stripping; otherwise the caller's token is stripped and no delegated credential is sent (see [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). Modern-provenance vault credentials use durable, version- and revocation-bound refresh claims across filesystem instances, including when a legacy request reaches the same credential. Provider refresh calls are bounded, resource-scoped and cannot widen scopes; publication rejects concurrent replacement/revocation. Ambiguous refreshes never automatically reuse the rotating token. Remote-filesystem, crash-durability, payment-retry and full two-gateway consent conformance are not verified.
+The sending Access Point uses a distinct `FabricSend` continuation role bound to the selected remote peer; when its Target sets `fabric_delegated_credentials`, modern consent precedes mirroring, payment and remote dispatch, with delegated credentials applied after caller-token stripping; otherwise the caller's token is stripped and no delegated credential is sent (see [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). Modern-provenance vault credentials use durable, version- and revocation-bound refresh claims across filesystem instances, including when a legacy request reaches the same credential. Provider refresh calls are bounded, resource-scoped and cannot widen scopes; publication rejects concurrent replacement/revocation. Ambiguous refreshes never automatically reuse the rotating token. The `make gw-e2e` feature `tests/features/g2g/mcp_credential_delegation_over_fabric.feature` covers two-gateway consent on a sending Access Point: consent before the peer gateway receives a Fabric forward, the access token at the peer's Target after consent, rejection of a consent callback with an altered `state` before any token exchange (a retry afterwards still gets `input_required` and reaches nothing; a new tool call can still complete consent), and, once the Target opts out again, no consent request and neither an `Authorization` header, the stored access token nor the caller's token at the peer's Target. A separate scenario shows that a Target with the setting off and no stored credential also gets no consent request, so "no consent request" does not depend on consent already being stored. These checks observe the peer's Target, not the Fabric message itself. Remote-filesystem, crash-durability, payment-retry, Transit Point Fabric consent and refresh across gateways are not verified.
 
 Modern credential preparation owns all configured bindings, including tool-filtered skips, on every modern method. Only `tools/call`, `prompts/get` and `resources/read` may initiate or resume gateway consent; other methods reuse verified credentials or fail authorization without legacy elicitation. API-key and client-credentials providers resolve through the prepared injection path, fail closed on missing credentials, and require no browser identity strategy. Modern machine grants use bounded no-redirect requests, the configured resource and exact scopes, and a provider-configuration-bound cache distinct from legacy machine tokens. Service-only bindings preserve opaque upstream continuation state.
 

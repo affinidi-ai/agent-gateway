@@ -964,6 +964,9 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         .save(&guarded)
         .await
         .unwrap();
+    let before = target
+        .request_count
+        .load(Ordering::SeqCst);
     let unauthenticated = forward_message(
         json!({"jsonrpc": "2.0", "id": "unauthenticated", "method": "tools/list"}),
         json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION}),
@@ -974,7 +977,8 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         target
             .request_count
             .load(Ordering::SeqCst),
-        6
+        before,
+        "a request blocked by source auth must not reach the Target"
     );
 }
 

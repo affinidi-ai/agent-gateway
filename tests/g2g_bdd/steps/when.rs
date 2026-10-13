@@ -15,6 +15,7 @@ use crate::bdd_support::json_rpc::{
     build_mcp_request_without_method_body, build_mcp_tool_call_body, build_modern_mcp_list_tools_body,
     modern_mcp_request_headers,
 };
+use crate::bdd_support::mcp_consent::build_consent_capable_tool_call_body;
 use crate::world::{ConcurrentResponse, ConformanceRun, G2gWorld};
 
 const CONCURRENT_MCP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -195,6 +196,81 @@ pub async fn modern_mcp_list_tools_sent_to_surface(
     let body = build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), &protocol_version, true);
     let headers = modern_mcp_request_headers(&protocol_version, "tools/list");
     send_rpc(world, gw_index, &surface_name, body, &headers).await;
+}
+
+/// The caller presents its MCP access token and accepts URL-mode
+/// elicitation, as a client able to complete consent does.
+pub(crate) async fn caller_invokes_modern_mcp_tool(
+    world: &mut G2gWorld,
+    caller: &str,
+    tool: &str,
+    gw_index: usize,
+    surface_name: &str,
+    protocol_version: &str,
+) {
+    world.start().await;
+    let body = build_consent_capable_tool_call_body(serde_json::json!("modern-mcp-tool-call"), tool, protocol_version);
+    send_caller_tool_call(world, caller, tool, gw_index, surface_name, body).await;
+}
+
+async fn send_caller_tool_call(
+    world: &mut G2gWorld,
+    caller: &str,
+    tool: &str,
+    gw_index: usize,
+    surface_name: &str,
+    body: Value,
+) {
+    let protocol_version = body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+        .as_str()
+        .expect("modern request declares its protocol version")
+        .to_string();
+    let mut headers = modern_mcp_request_headers(&protocol_version, "tools/call");
+    headers.push(("Mcp-Name".to_string(), tool.to_string()));
+    headers.push(("authorization".to_string(), format!("Bearer {}", world.caller_access_token(caller))));
+    send_rpc(world, gw_index, surface_name, body, &headers).await;
+}
+
+#[when(
+    expr = "caller {string} invokes MCP tool {string} through gateway {int} surface {string} using protocol version {string}"
+)]
+async fn caller_invokes_modern_mcp_tool_through_surface(
+    world: &mut G2gWorld,
+    caller: String,
+    tool: String,
+    gw_index: usize,
+    surface_name: String,
+    protocol_version: String,
+) {
+    caller_invokes_modern_mcp_tool(world, &caller, &tool, gw_index, &surface_name, &protocol_version).await;
+}
+
+#[when(
+    expr = "caller {string} retries MCP tool {string} through gateway {int} surface {string} with the consent request state"
+)]
+async fn caller_retries_mcp_tool_with_consent_state(
+    world: &mut G2gWorld,
+    caller: String,
+    tool: String,
+    gw_index: usize,
+    surface_name: String,
+) {
+    caller_retries_mcp_tool(world, &caller, &tool, gw_index, &surface_name).await;
+}
+
+pub(crate) async fn caller_retries_mcp_tool(
+    world: &mut G2gWorld,
+    caller: &str,
+    tool: &str,
+    gw_index: usize,
+    surface_name: &str,
+) {
+    let (consent, original) = world
+        .consent_request
+        .clone()
+        .expect("caller was asked for consent");
+    assert_eq!(original["params"]["name"], tool, "the retry must repeat the tool call that needed consent");
+    send_caller_tool_call(world, caller, tool, gw_index, surface_name, consent.retry_body(&original)).await;
 }
 
 #[when(

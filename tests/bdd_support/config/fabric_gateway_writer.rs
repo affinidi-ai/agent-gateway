@@ -16,6 +16,7 @@ use crate::bdd_support::config::config_tree::{
 };
 use crate::bdd_support::config::fabric_surface_fixture::{SourceAuthSpec, SurfaceSpec};
 use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
+use crate::bdd_support::config::modern_consent;
 use crate::bdd_support::config::policy_definitions::{
     PolicyDefinitionFixtureKind, inbound_policy_definition_id, policy_definition_id as kinded_policy_definition_id,
 };
@@ -161,7 +162,22 @@ fn build_surface_fixture(
         // An MCP endpoint checks Origin, so it accepts the gateway's own
         // origin under both loopback names callers use.
         let loopback = listen_address.replacen("localhost", "127.0.0.1", 1);
-        fixture = fixture.with_mcp_http(serde_json::json!({ "allowed_origins": [listen_address, loopback] }));
+        let mut mcp_http = serde_json::json!({ "allowed_origins": [listen_address, loopback] });
+        if surface
+            .delegated_credentials
+            .is_some()
+        {
+            mcp_http["authorization"] = modern_consent::access_point_authorization(&surface.route);
+        }
+        fixture = fixture.with_mcp_http(mcp_http);
+    }
+    if let Some(provider_id) = &surface.delegated_credentials {
+        fixture = fixture
+            .with_outbound_credential(modern_consent::outbound_credential(provider_id))
+            .with_identity_slot(
+                "inbound",
+                serde_json::json!({ "type": "static", "did": modern_consent::CALLER_AGENT_DID }),
+            );
     }
     if let Some(target_auth) = &surface.target_auth {
         fixture = fixture.with_target_auth(static_secret_target_auth_json(
