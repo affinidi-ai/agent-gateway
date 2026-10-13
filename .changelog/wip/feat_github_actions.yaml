@@ -20,6 +20,12 @@ changes:
         A changes-detection job filters touched paths; test, coverage, surface-bdd, g2g-bdd and
         smoke now only run for Rust changes, and the frontend job only for www/default changes,
         on pull requests (pushes to main always run everything).
+    - timestamp: '2026-10-13T00:00:00Z'
+      title: Harden release assets and changelog validation
+      description: >-
+        Release binaries now include a target-specific name and SHA256 checksum, receive a
+        build-provenance attestation, and omit automatic PR-title notes. Markdown anchor checks
+        ignore fenced code, and changelog guidance documents timestamps and no-op fragments.
   removed:
     - timestamp: '2026-10-08T00:00:00.000Z'
       title: Remove the unused version-bump check script
@@ -31,6 +37,11 @@ changes:
     - timestamp: '2026-10-07T00:00:00.000Z'
       title: Pin GitHub Actions and reusable workflows
       description: Pin CI dependencies to immutable commits and scope checks to read-only repository access.
+    - timestamp: '2026-10-13T00:00:00Z'
+      title: Verify release PRs before publishing and protect release tokens
+      description: >-
+        Publishing now verifies that the triggering commit belongs to a release pull request,
+        disables persisted checkout credentials, and uses explicit token headers for release pushes.
   fixed:
     - timestamp: '2026-10-07T00:00:00.000Z'
       title: Pull G2G BDD images from workflow version variables

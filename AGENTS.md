@@ -43,14 +43,18 @@ Every change needs a fragment under `.changelog/wip/<branch>.yaml`. The filename
 branch: <current-git-branch>
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-01-01T00:00:00Z'
+      title: Describe the user-visible change
+      description: Explain what changed and why.
   fixed: []
   removed: []
   security: []
   breaking: []
 ```
 - Put each entry under the public category that best describes the change: `added` / `changed` / `fixed` / `removed` / `security` / `breaking`.
-- Put each entry under the public category that best describes the change: `added` / `changed` / `fixed` / `removed` / `security` / `breaking`.
+- If a change has no public release effect, leave all category lists empty.
+- Every non-empty entry requires an RFC 3339 `timestamp`, a `title`, and a `description`.
 - `title` is a changelog-ready imperative sentence, 80 characters or less; important entries may keep a leading `⭐` (counted within the 80).
 - `description` says what changed and why — never `Change description`.
 - One entry per logical change. Append to the existing branch fragment if one already exists, and commit it alongside the code change.

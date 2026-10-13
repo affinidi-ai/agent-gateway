@@ -47,7 +47,9 @@ from the merge commit's message, so an unrelated merge cannot publish). It then:
 3. Tags that commit `vX.Y.Z` and pushes the tag. Re-running the job after a partial failure does
    not fail on "tag already exists": it skips re-tagging if the tag already points at the same
    commit, and only errors if it points somewhere else.
-4. Creates the GitHub Release from the reviewed `CHANGELOG.md` section, attaching the binary.
+4. Creates the GitHub Release from the reviewed `CHANGELOG.md` section, attaching the
+   `agent-gateway-linux-x86_64` binary and its SHA256 checksum. GitHub's generated PR-title
+   notes are disabled, and the binary receives a build-provenance attestation.
 
 ## Changelog fragments
 

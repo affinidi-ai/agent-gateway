@@ -136,11 +136,15 @@ jobs:
         run: python3 .github/scripts/changelog.py check
 
       - name: Require a changelog fragment change on pull requests
-        if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && !startsWith(github.head_ref, 'release/')
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]' && (!startsWith(github.head_ref, 'release/') || github.event.pull_request.user.type != 'Bot')
         env:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
         run: |
+          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -Fxq "CHANGELOG.md"; then
+            echo "::error::Ordinary pull requests must update changelog fragments, not CHANGELOG.md directly."
+            exit 1
+          fi
           fragment=".changelog/wip/${HEAD_REF//\//_}.yaml"
           if ! git diff --name-status --find-renames --diff-filter=AMR \
             "origin/${BASE_REF}...HEAD" | awk -F '\t' -v expected="${fragment}" '

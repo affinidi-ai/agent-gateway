@@ -13,6 +13,12 @@ class AnchorsTests(unittest.TestCase):
             path.write_text("# Getting Started!\n\n## Getting Started!\n", encoding="utf-8")
             self.assertEqual(check_docs.anchors(path), {"getting-started", "getting-started-1"})
 
+    def test_ignores_headings_inside_fenced_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "doc.md"
+            path.write_text("```sh\n# Not a heading\n```\n# Real heading\n", encoding="utf-8")
+            self.assertEqual(check_docs.anchors(path), {"real-heading"})
+
 
 class ValidateLinksTests(unittest.TestCase):
     def test_ignores_external_and_mailto_links(self) -> None:

@@ -24,9 +24,10 @@ management endpoint, see
 **Every change requires a changelog fragment — never edit [`CHANGELOG.md`](CHANGELOG.md) directly**
 (CI generates it on release). Create or append to `.changelog/wip/<branch>.yaml`, where the filename
 is the current branch with every `/` replaced by `_` (read `.git/HEAD` for the branch name). Each
-entry needs a `title` (imperative, 80 characters or less) and a `description`. User-visible work goes
+entry needs an RFC 3339 `timestamp`, a `title` (imperative, 80 characters or less), and a `description`. User-visible work goes
 under `added` / `changed` / `fixed` / `removed` / `security` / `breaking`; tests, docs, CI, and
-refactors go under the public category that best describes their user-visible effect.
+refactors go under the public category that best describes their user-visible effect. If a change
+has no public release effect, leave all category lists empty.
 
 ## Code Quality Expectations
 

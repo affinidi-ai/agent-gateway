@@ -28,7 +28,21 @@ def markdown_files() -> list[Path]:
 def anchors(path: Path) -> set[str]:
     found = set()
     counts: dict[str, int] = {}
-    for heading in HEADING.findall(path.read_text(encoding="utf-8")):
+    visible_lines = []
+    fence: str | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token[0]
+            elif token[0] == fence:
+                fence = None
+            continue
+        if fence is None:
+            visible_lines.append(line)
+
+    for heading in HEADING.findall("\n".join(visible_lines)):
         slug = heading.strip().lower()
         slug = re.sub(r"[^\w\- ]", "", slug, flags=re.UNICODE)
         slug = re.sub(r"\s+", "-", slug)

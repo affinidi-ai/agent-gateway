@@ -1,7 +1,10 @@
 branch: token-scoped-permissions
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Document token-scoped permissions
+      description: Updates the RBAC guide with personal access token scope behavior for permissions and JWT verification strategy routes.
   fixed:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Limit /api/v1/permissions for access tokens to the token's own scopes
@@ -12,7 +15,3 @@ changes:
       title: Enforce access-token scopes on the JWT verification strategy routes
       description: The /api/v1/jwt-verification-strategies routes (list, get, create, update, delete and validate-jwks-uri) now also require the matching jwt_verification_strategies feature in a scoped personal access token's scopes, instead of checking only the owner's role. Session logins and tokens without feature scopes are unchanged.
   breaking: []
-  internal:
-    - timestamp: '2026-10-06T00:00:00.000Z'
-      title: Add tests and docs for token-scoped permissions
-      description: Cover session logins, scoped tokens, unrestricted tokens, the cache headers and the unauthenticated 401, cover scoped tokens on the JWT verification strategy routes, and document the behavior in the RBAC guide.
