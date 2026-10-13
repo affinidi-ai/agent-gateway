@@ -883,7 +883,7 @@
       {
         "enum_value": "audit",
         "name": "Governance Audit",
-        "description": "Forwards every record written to the VP Audit Log: policy decisions, trust checks, VP injections, credential delegation and payment events. Requires the audit.view permission.",
+        "description": "Sends the audit events you select, such as policy decisions, refused requests, trust checks, credential delegation and payment events, whether or not the VP Audit Log keeps them. Requires the audit.view permission.",
         "metadata": {
           "event_types": [
             {

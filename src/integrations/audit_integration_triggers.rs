@@ -22,7 +22,7 @@ pub fn audit_integration_category() -> crate::config::IntegrationCategory {
     crate::config::IntegrationCategory {
         enum_value: AUDIT_CATEGORY.to_string(),
         name: "Governance Audit".to_string(),
-        description: "Forwards every record written to the VP Audit Log: policy decisions, trust checks, VP injections, credential delegation and payment events. Requires the audit.view permission.".to_string(),
+        description: "Sends the audit events you select, such as policy decisions, refused requests, trust checks, credential delegation and payment events, whether or not the VP Audit Log keeps them. Requires the audit.view permission.".to_string(),
         metadata: serde_json::json!({
             "event_types": AUDIT_EVENTS
                 .iter()
