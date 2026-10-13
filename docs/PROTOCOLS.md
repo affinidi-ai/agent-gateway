@@ -306,14 +306,17 @@ segment at any depth, so a tenant-scoped `{route}/{tenant}/extendedAgentCard` is
 matches only directly under the base path, so a deeper path such as `{route}/payments/v1/card` is
 not a card. A root-level `{route}/v1/card` is a card on every A2A and AP2 surface, including one
 whose Target serves its own `/v1/card` resource. A path that climbs out of the base path, or that
-the gateway cannot parse, is treated as a card. Every method except `HEAD` and `OPTIONS` is
+the gateway cannot parse, is treated as a card. So is a path whose `..` segments climb above the
+root, which covers a `fabric://` target, where the peer gateway's Target base path is not known. Every method except `HEAD` and `OPTIONS` is
 checked, because a Target may honour a method override header. A Target whose HTTP+JSON base sits
 below its target endpoint is not covered. Its endpoint URLs are rewritten on inbound,
 fabric and outbound paths, and on inbound paths it gets the same identity treatment when agent
 identity is configured, with one difference: an `agent-identity-credential/v1` extension already on
-an extended card stands in for the agent's identity only when it arrives over Fabric from a peer
-gateway. A direct Target must present `agent-identity/v1`, and any credential extension it sends is
-replaced by the one the gateway issues. When managed identity is on, an extended card with no
+an extended card never stands in for the agent's identity, even over Fabric, because a peer gateway
+does not issue one on an extended card, so it can only come from a Target. The Target must present
+`agent-identity/v1`. When agent identity is configured, every credential extension on an extended
+card is removed and only the one the gateway issues is added, so none survives for an anonymous
+identity. When managed identity is on, an extended card with no
 `capabilities.extensions` array is answered with `502`. No identity VP is signed for an agent card
 response, public or extended. On inbound and fabric paths it skips response extension inspection, like
 the public card, so response validation rules do not apply to it; outbound transit points still

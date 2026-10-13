@@ -43,8 +43,9 @@ pub fn is_well_known_agent_card_path(path: &str) -> bool {
 /// the way lenient routers (Tomcat, Spring, JAX-RS) resolve it, which decode
 /// `%2e`, drop `;` path parameters and empty segments, and treat `\` as a
 /// separator. Matching ignores ASCII case. A path that climbs out of the base
-/// path or cannot be parsed is treated as a card so the response is still
-/// rewritten. Every method except `HEAD` and `OPTIONS` is checked, because a
+/// path, climbs above the root (which covers a peer gateway's unknown base path
+/// on `fabric://` targets), or cannot be parsed is treated as a card so the
+/// response is still rewritten. Every method except `HEAD` and `OPTIONS` is checked, because a
 /// Target may honour a method override header.
 pub fn is_rest_extended_agent_card_request(
     method: &str,
@@ -59,13 +60,18 @@ pub fn is_rest_extended_agent_card_request(
     let Ok(forwarded) = url::Url::parse(&format!("http://route.invalid{joined}")) else {
         return true;
     };
-    let base_segments = lenient_router_segments(&base_path);
+    let base_segments = lenient_router_segments(&base_path).unwrap_or_default();
     let resolved = percent_decode_lossy(forwarded.path());
     [lenient_router_segments(&resolved), lenient_router_segments(&joined)]
         .iter()
-        .any(|segments| match strip_base_segments(segments, &base_segments) {
-            Some(route_relative) => is_extended_agent_card_segments(route_relative),
-            None => true,
+        .any(|segments| {
+            match segments
+                .as_deref()
+                .and_then(|segments| strip_base_segments(segments, &base_segments))
+            {
+                Some(route_relative) => is_extended_agent_card_segments(route_relative),
+                None => true,
+            }
         })
 }
 
@@ -106,8 +112,9 @@ fn percent_decode_lossy(path: &str) -> String {
 }
 
 /// Decode percent-escapes, drop `;` path parameters, empty and `.` segments,
-/// and resolve `..`, treating `\` as a separator.
-fn lenient_router_segments(path: &str) -> Vec<String> {
+/// and resolve `..`, treating `\` as a separator. `None` when a `..` climbs
+/// above the root.
+fn lenient_router_segments(path: &str) -> Option<Vec<String>> {
     let decoded = percent_decode_lossy(path);
     let mut segments: Vec<String> = Vec::new();
     for segment in decoded.split(['/', '\\']) {
@@ -118,12 +125,12 @@ fn lenient_router_segments(path: &str) -> Vec<String> {
         {
             "" | "." => {}
             ".." => {
-                segments.pop();
+                segments.pop()?;
             }
             segment => segments.push(segment.to_string()),
         }
     }
-    segments
+    Some(segments)
 }
 
 /// Whether a request is a public discovery read that bypasses the request
@@ -330,7 +337,23 @@ mod tests {
     fn rest_extended_agent_card_request_ignores_the_base_of_non_http_targets() {
         assert!(is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/v1/card"));
         assert!(!is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/surface/rpc"));
-        assert!(!is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/../rpc"));
+        assert!(!is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/x/../rpc"));
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_treats_a_climb_above_the_root_as_a_card() {
+        for target in ["fabric://peer/surface", ROOT_TARGET, BASE_TARGET] {
+            for path in [
+                "/../base/v1/card",
+                "/x/../../base/v1/card",
+                "/%2e%2e/base/v1/card",
+                "/..;/base/v1/card",
+                "/..\\base\\v1\\card",
+                "/../rpc",
+            ] {
+                assert!(is_rest_extended_agent_card_request("GET", target, path), "{target} {path}");
+            }
+        }
     }
 
     #[test]

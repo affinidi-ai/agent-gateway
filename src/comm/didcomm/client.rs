@@ -203,6 +203,10 @@ impl DIDCommClient {
         to_did: &str,
         from_did: &str,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if test_send_hook::intercept(message, to_did) {
+            return Ok(());
+        }
         let packed = self
             .atm
             .pack_encrypted(message, to_did, Some(from_did), Some(from_did))
@@ -492,6 +496,43 @@ fn endpoint_uri(endpoint: &serde_json::Value) -> Option<String> {
             .iter()
             .find_map(endpoint_uri),
         _ => None,
+    }
+}
+
+/// Test-only stand-in for a peer gateway: a send to a DID with an installed
+/// hook is handed to the hook instead of being packed and sent, so a test can
+/// answer it, for example by completing the Fabric response waiter.
+#[cfg(test)]
+pub(crate) mod test_send_hook {
+    use super::DIDCommMessage;
+
+    type Hook = Box<dyn Fn(&DIDCommMessage) + Send + Sync>;
+
+    fn hooks() -> &'static dashmap::DashMap<String, Hook> {
+        static HOOKS: std::sync::OnceLock<dashmap::DashMap<String, Hook>> = std::sync::OnceLock::new();
+        HOOKS.get_or_init(dashmap::DashMap::new)
+    }
+
+    /// Hand every send to `to_did` to `hook` until [`uninstall`] is called.
+    pub(crate) fn install(
+        to_did: &str,
+        hook: impl Fn(&DIDCommMessage) + Send + Sync + 'static,
+    ) {
+        hooks().insert(to_did.to_string(), Box::new(hook));
+    }
+
+    pub(crate) fn uninstall(to_did: &str) {
+        hooks().remove(to_did);
+    }
+
+    pub(super) fn intercept(
+        message: &DIDCommMessage,
+        to_did: &str,
+    ) -> bool {
+        hooks()
+            .get(to_did)
+            .map(|hook| hook(message))
+            .is_some()
     }
 }
 

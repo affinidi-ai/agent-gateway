@@ -82,6 +82,27 @@ async fn start_gateway(
     .await
 }
 
+/// Start a gateway whose Target and transit point destination sit under `/base`
+/// on the mock.
+async fn start_gateway_with_target_base(upstream_body: String) -> GatewayHarness {
+    let mock = MockServer::start_with_response(upstream_body).await;
+    let endpoint = format!("{}/base", mock.url());
+    GatewayHarness::start_with_outbound_mock(mock, move |_, gw_config, _| {
+        let mut surface = helpers::build_minimal_outbound_channel();
+        surface.target.endpoint = endpoint.clone();
+        for point in &mut surface
+            .transit
+            .as_mut()
+            .expect("transit config")
+            .points
+        {
+            point.target_endpoint = endpoint.clone();
+        }
+        gw_config.surfaces = vec![surface];
+    })
+    .await
+}
+
 /// The surface route (inbound) or transit point path (outbound) that request
 /// paths are relative to.
 fn route_url(
@@ -147,10 +168,18 @@ async fn get_through_gateway(
     upstream_body: String,
     path: &str,
 ) -> GatewayReply {
+    let h = start_gateway(upstream_body, true).await;
+    get_raw(&h, &direction, path).await
+}
+
+async fn get_raw(
+    h: &GatewayHarness,
+    direction: &Direction,
+    path: &str,
+) -> GatewayReply {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let h = start_gateway(upstream_body, true).await;
-    let route = url::Url::parse(&route_url(&h, &direction)).expect("route url");
+    let route = url::Url::parse(&route_url(h, direction)).expect("route url");
     let authority = format!(
         "{}:{}",
         route
@@ -196,7 +225,7 @@ async fn get_through_gateway(
     GatewayReply {
         status: reqwest::StatusCode::from_u16(status).expect("valid status"),
         body,
-        upstream_requests: upstream_requests(&h),
+        upstream_requests: upstream_requests(h),
     }
 }
 
@@ -390,11 +419,16 @@ async fn extended_card_response_that_cannot_be_rewritten_is_refused() {
         format!("event: message\ndata: {}\n\n", result_envelope(v1_card())),
         json!({"jsonrpc": "2.0", "id": 1, "result": format!("{BACKEND}/a2a")}).to_string(),
     ];
+    let call = json!({"jsonrpc": "2.0", "id": "card-1", "method": "GetExtendedAgentCard", "params": {}}).to_string();
     for body in unusable_bodies {
         for direction in [Direction::Inbound, Direction::Outbound] {
-            let reply = send_request_through_gateway(direction, body.clone(), request("GetExtendedAgentCard")).await;
+            let reply = send_request_through_gateway(direction, body.clone(), call.clone()).await;
             assert_eq!(reply.status, 502, "expected 502, got {}: {}", reply.status, reply.body);
             assert!(!reply.body.contains(BACKEND), "refusal must not expose the backend: {}", reply.body);
+            let refusal: serde_json::Value = serde_json::from_str(&reply.body).expect("refusal is not JSON");
+            assert_eq!(refusal["jsonrpc"], "2.0", "{refusal}");
+            assert_eq!(refusal["id"], "card-1", "{refusal}");
+            assert_eq!(refusal["error"]["code"], -32603, "{refusal}");
         }
     }
 }
@@ -532,5 +566,30 @@ async fn nested_path_ending_like_the_card_path_is_not_treated_as_a_card() {
         let reply = get_through_gateway(direction, resource.clone(), "/payments/v1/card").await;
         assert_eq!(reply.status, 200, "expected 200, got {}: {}", reply.status, reply.body);
         assert!(reply.body.contains(BACKEND), "a non-card resource must be forwarded unchanged: {}", reply.body);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_extended_card_reached_by_climbing_out_of_the_target_base_is_rewritten() {
+    for (path, card, forwarded) in [
+        ("/../base/extendedAgentCard", v1_card(), "/base/extendedAgentCard"),
+        ("/%2e%2e/base/extendedAgentCard", v1_card(), "/base/extendedAgentCard"),
+        ("/..;/base/v1/card", v03_card(), "/base/..;/base/v1/card"),
+    ] {
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let h = start_gateway_with_target_base(card.to_string()).await;
+            let reply = get_raw(&h, &direction, path).await;
+            assert_eq!(reply.status, 200, "{path}: expected 200, got {}: {}", reply.status, reply.body);
+            assert!(!reply.body.contains(BACKEND), "{path}: card still exposes the backend: {}", reply.body);
+            let upstream_path = h
+                .mock
+                .last_request_rx
+                .borrow()
+                .as_ref()
+                .expect("upstream received the request")
+                .path
+                .clone();
+            assert_eq!(upstream_path, forwarded, "{path}: the Target saw a different path");
+        }
     }
 }

@@ -181,14 +181,11 @@ impl IdentityResponseKind {
     }
 
     /// Whether an `agent-identity-credential/v1` extension already on the card
-    /// can stand in for the agent's identity. An extended card only trusts one
-    /// that arrives over Fabric from a peer gateway; a direct Target must present
-    /// `agent-identity/v1` and have the gateway issue the credential.
-    pub fn trusts_upstream_identity_credential(
-        self,
-        target_endpoint: &str,
-    ) -> bool {
-        self != Self::ExtendedAgentCard || target_endpoint.starts_with("fabric://")
+    /// can stand in for the agent's identity. Only a public card trusts one: a
+    /// peer gateway never issues a credential on an extended card, so one there
+    /// was written by a Target, directly or behind a Fabric peer.
+    pub fn trusts_upstream_identity_credential(self) -> bool {
+        self != Self::ExtendedAgentCard
     }
 }
 
@@ -612,8 +609,7 @@ pub async fn resolve_agent_identity_for_slot(
         }
         crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2 => {
             if is_agent_card {
-                let trusts_upstream_credential =
-                    response_kind.trusts_upstream_identity_credential(&surface.target.endpoint);
+                let trusts_upstream_credential = response_kind.trusts_upstream_identity_credential();
                 // Short-circuit: when the card already carries an
                 // `agent-identity-credential/v1` extension (injected by an
                 // upstream gateway that has already resolved and DID-hashed the
@@ -646,8 +642,9 @@ pub async fn resolve_agent_identity_for_slot(
                         // an attacker who controls the agent card's HTTP layer could set
                         // an arbitrary DID in params while the signed VP content remains
                         // unrelated, bypassing identity checks. The VP signature itself
-                        // is not re-verified here (that happens when GW2 issues it), but
-                        // the structural consistency check prevents trivial DID injection.
+                        // is not re-verified here, so the shortcut is skipped for extended
+                        // cards, on which a peer gateway never issues a credential; the
+                        // structural consistency check prevents trivial DID injection.
                         let vp_parsed = params
                             .and_then(|p| p.get("verifiablePresentation"))
                             .and_then(|v| v.as_str())
@@ -1209,14 +1206,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_target_cannot_assert_its_own_did_on_an_extended_card() {
-        let resolved = resolve_card("https://agent.example", IdentityResponseKind::ExtendedAgentCard).await;
-        assert!(matches!(resolved, Err(IdentityResolutionError::IdentityExtensionMissing(_))), "{resolved:?}");
+    async fn extended_card_never_trusts_a_credential_its_sender_put_there() {
+        for target in ["https://agent.example", "fabric://peer/surface"] {
+            let resolved = resolve_card(target, IdentityResponseKind::ExtendedAgentCard).await;
+            assert!(
+                matches!(resolved, Err(IdentityResolutionError::IdentityExtensionMissing(_))),
+                "{target}: {resolved:?}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn fabric_extended_card_keeps_the_peer_gateway_credential() {
-        let resolved = resolve_card("fabric://peer/surface", IdentityResponseKind::ExtendedAgentCard).await;
+    async fn public_card_keeps_an_upstream_gateway_credential() {
+        let resolved = resolve_card("fabric://peer/surface", IdentityResponseKind::PublicAgentCard).await;
         assert!(
             matches!(&resolved, Ok(ProtectedAgentIdentity::Managed { did, .. }) if did == "did:key:z6MkSelfAsserted"),
             "{resolved:?}"
@@ -1224,10 +1226,9 @@ mod tests {
     }
 
     #[test]
-    fn only_a_fabric_extended_card_or_a_public_card_trusts_an_upstream_identity_credential() {
-        assert!(IdentityResponseKind::PublicAgentCard.trusts_upstream_identity_credential("https://agent.example"));
-        assert!(IdentityResponseKind::ExtendedAgentCard.trusts_upstream_identity_credential("fabric://peer/surface"));
-        assert!(!IdentityResponseKind::ExtendedAgentCard.trusts_upstream_identity_credential("https://agent.example"));
+    fn only_a_public_card_trusts_an_upstream_identity_credential() {
+        assert!(IdentityResponseKind::PublicAgentCard.trusts_upstream_identity_credential());
+        assert!(!IdentityResponseKind::ExtendedAgentCard.trusts_upstream_identity_credential());
     }
 
     // ── extract_a2a_identity_from_message ────────────────────────────────

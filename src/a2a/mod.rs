@@ -29,7 +29,7 @@ pub use errors::{
 
 pub use extensions::{
     inject_credential_into_agent_card, inject_custom_metadata_extension, inject_header_metadata_extension,
-    inject_identity_credential_into_response, upsert_credential_into_agent_card,
+    inject_identity_credential_into_response, replace_credential_in_agent_card, upsert_credential_into_agent_card,
 };
 
 #[cfg(feature = "didwebvh")]

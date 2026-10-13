@@ -7652,7 +7652,6 @@ async fn proxy_handler_with_mcp_runtime(
                     &vc_issuer,
                     &channel_name,
                     identity_response_kind,
-                    &state.surface.target.endpoint,
                 )
                 .await
                 .map_err(|e| {
@@ -12753,7 +12752,6 @@ async fn handle_fabric_request(
                             &vc_issuer,
                             channel_name,
                             identity_response_kind,
-                            &state.surface.target.endpoint,
                         )
                         .await
                         {
@@ -14016,23 +14014,20 @@ fn record_agent_card_gateway_fault(
     }
 }
 
-/// The response for an extended agent card the gateway cannot rewrite: a
-/// generic 502 that never carries the Target's body.
-/// Put the gateway-issued identity credential on an agent card. A card that may
-/// keep an upstream credential gets one only in place of `agent-identity/v1`;
-/// otherwise any credential the Target sent is replaced.
+/// Put the gateway-issued identity credential on an agent card. A public card
+/// keeps a credential an upstream gateway already put there; an extended card
+/// has every credential its sender put there removed and gets the gateway's own.
 async fn put_identity_credential_into_agent_card(
     card: &mut serde_json::Value,
     resolved_identity: &crate::proxy::backend_identity::ProtectedAgentIdentity,
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     response_kind: crate::proxy::backend_identity::IdentityResponseKind,
-    target_endpoint: &str,
 ) -> anyhow::Result<()> {
-    if response_kind.trusts_upstream_identity_credential(target_endpoint) {
+    if response_kind.trusts_upstream_identity_credential() {
         crate::a2a::inject_credential_into_agent_card(card, resolved_identity, vc_issuer, channel_name).await
     } else {
-        crate::a2a::upsert_credential_into_agent_card(card, resolved_identity, vc_issuer, channel_name).await
+        crate::a2a::replace_credential_in_agent_card(card, resolved_identity, vc_issuer, channel_name).await
     }
 }
 
@@ -19670,5 +19665,244 @@ allow if {
                     .is_none()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fabric_extended_card_tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    const TARGET_URL: &str = "https://backend.internal/a2a";
+
+    struct FabricPeer {
+        state: crate::state::ProxyState,
+        peer_did: String,
+        _root: tempfile::TempDir,
+        _issuer_dir: tempfile::TempDir,
+    }
+
+    impl Drop for FabricPeer {
+        fn drop(&mut self) {
+            crate::comm::didcomm::client::test_send_hook::uninstall(&self.peer_did);
+        }
+    }
+
+    /// A gateway whose A2A surface targets a Fabric peer that answers every
+    /// ForwardRequest with `status` and `body`.
+    async fn fabric_peer_answering(
+        status: u16,
+        body: serde_json::Value,
+    ) -> FabricPeer {
+        let root = tempfile::tempdir().unwrap();
+        let peer_did = format!("did:example:peer-{}", uuid::Uuid::new_v4());
+        let peer = crate::gateways::types::Gateway::new(
+            "Peer".into(),
+            String::new(),
+            peer_did.clone(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                root.path().join("gateways"),
+                Some("did:web:gateway.example".into()),
+            )
+            .await
+            .unwrap(),
+        );
+        crate::gateways::GatewayStore::create(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+        let (manager, issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root.path()).await;
+        let manager = manager.with_gateway_store(gateways);
+        let mut listener = crate::gateways::test_helpers::test_listener("fabric-extended-card").await;
+        listener.gateway_id = peer.id.clone();
+        manager
+            .register_test_listener(listener)
+            .await;
+
+        let responder_did = peer_did.clone();
+        let reply_body = body.to_string();
+        crate::comm::didcomm::client::test_send_hook::install(&peer_did, move |request| {
+            let reply = crate::gateways::connection_points::messages::ReceivedMessage::new(
+                "cp-1".into(),
+                "peer".into(),
+                crate::messages::MessageType::ForwardResponse
+                    .as_str()
+                    .into(),
+                uuid::Uuid::new_v4().to_string(),
+                Some(request.id.clone()),
+                Some(responder_did.clone()),
+                vec!["did:example:connection-point".into()],
+                None,
+                None,
+                json!({"status": status, "headers": {"content-type": "application/json"}, "body": reply_body}),
+                crate::gateways::connection_points::messages::MessageMetadata {
+                    encrypted: true,
+                    authenticated: true,
+                    from_key: None,
+                    extra: json!({}),
+                },
+            );
+            assert!(crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply));
+        });
+
+        let surface = serde_json::from_value(json!({
+            "surface_id": "fabric-a2a", "name": "Fabric A2A",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": format!("fabric://{}/remote-surface", peer.id)}
+        }))
+        .unwrap();
+        let network = serde_json::from_value(json!({
+            "did": {"domain": "gateway.example"},
+            "webauthn": {"rp_id": "gateway.example", "external_origin": "https://gateway.example"},
+            "integration": {"types": [], "categories": []},
+            "listeners": [{"id": "in", "name": "in", "bind_address": "127.0.0.1", "port": 8080,
+                "protocol": "http", "external_urls": ["https://gateway.example"]}],
+            "routes": {"identity": {"type": "identity_api", "prefix": "/api"}}
+        }))
+        .unwrap();
+        let config = serde_json::from_value(json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [], "categories": []}
+        }))
+        .unwrap();
+        let state = crate::state::ProxyState {
+            config: Arc::new(config),
+            network_config: Arc::new(network),
+            client: reqwest::Client::new(),
+            metrics_store: None,
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_monitor: None,
+            task_id: None,
+            ws_state: None,
+            listener_manager: Arc::new(tokio::sync::RwLock::new(Some(Arc::new(manager)))),
+            secrets_store: None,
+            certificates_store: None,
+            vc_issuer: None,
+            policy_manager: None,
+            gateway_policy_manager: None,
+            didauth_session_store: Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            transaction_store: None,
+            mpp_transaction_store: None,
+            trust_registry_listener_manager: None,
+            source_auth_middleware: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_identity_store: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_log_manager: None,
+            credential_provider_store: None,
+            delegation_vault_store: None,
+            gateway_base_url: Some("https://gateway.example".into()),
+            transit_token_issuer: None,
+            mcp_proxy_store: None,
+            a2a_proxy_store: None,
+            active_variant_alias: None,
+            active_variant_id: None,
+            variant_resolution_error: None,
+            surface: Arc::new(surface),
+        };
+        FabricPeer {
+            state,
+            peer_did,
+            _root: root,
+            _issuer_dir: issuer_dir,
+        }
+    }
+
+    async fn get_extended_card(peer: &FabricPeer) -> (axum::http::StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("https://gateway.example/a2a")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": "card-1", "method": "GetExtendedAgentCard", "params": {}}).to_string(),
+            ))
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::pin(super::proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                peer.state.clone(),
+                request,
+                crate::mcp::request_validation::McpVersionPolicy::new(
+                    &[crate::mcp::MCP_MODERN_VERSION],
+                    &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+                ),
+                None,
+            )),
+        )
+        .await
+        .expect("the Fabric leg answers")
+        .unwrap_or_else(|response| response);
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("{status}: {}", String::from_utf8_lossy(&bytes)));
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn extended_card_from_a_fabric_peer_is_rewritten() {
+        let card = json!({"name": "agent", "supportedInterfaces": [{"url": TARGET_URL, "protocolBinding": "JSONRPC"}]});
+        let peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "card-1", "result": card})).await;
+
+        let (status, body) = get_extended_card(&peer).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["id"], "card-1", "{body}");
+        let url = body["result"]["supportedInterfaces"][0]["url"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(url.starts_with("https://gateway.example"), "{body}");
+        assert!(
+            !body
+                .to_string()
+                .contains("backend.internal"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrewritable_extended_card_from_a_fabric_peer_is_refused_with_a_jsonrpc_error() {
+        for result in [json!(TARGET_URL), json!({"agentCard": {"supportedInterfaces": [{"url": TARGET_URL}]}})] {
+            let peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "card-1", "result": result})).await;
+
+            let (status, body) = get_extended_card(&peer).await;
+
+            assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+            assert_eq!(body["jsonrpc"], "2.0", "{body}");
+            assert_eq!(body["id"], "card-1", "{body}");
+            assert_eq!(body["error"]["code"], -32603, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("backend.internal"),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_card_from_a_fabric_peer_on_an_error_status_is_still_rewritten() {
+        let card = json!({"name": "agent", "url": TARGET_URL});
+        let peer = fabric_peer_answering(500, json!({"jsonrpc": "2.0", "id": "card-1", "result": card})).await;
+
+        let (_, body) = get_extended_card(&peer).await;
+
+        let url = body["result"]["url"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(url.starts_with("https://gateway.example"), "{body}");
     }
 }

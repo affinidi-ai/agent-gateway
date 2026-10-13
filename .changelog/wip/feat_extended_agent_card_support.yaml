@@ -37,19 +37,21 @@ changes:
         on inbound, fabric and outbound paths and get the same agent identity treatment as the public
         card, so callers no longer learn the Target address from requests the gateway recognises.
         The HTTP+JSON path is resolved against the Target's base path both as the forwarded URL is and
-        as lenient Target routers do, and a path that climbs out of the base or cannot be parsed is
-        treated as a card. An extended-card response the gateway cannot rewrite, including one with no
+        as lenient Target routers do, and a path that climbs out of the base or above the root (which
+        covers fabric targets, whose peer base path is unknown) or cannot be parsed is treated as a
+        card. An extended-card response the gateway cannot rewrite, including one with no
         endpoint field, is answered with 502 (a JSON-RPC -32603 error echoing the request id on the
         JSON-RPC binding), and an extended-card request inside a JSON-RPC batch is rejected with
         -32600. Requests the gateway cannot parse or recognise, listed in docs/PROTOCOLS.md, are
         forwarded unrewritten, and a Fabric caller is covered only once its own gateway is upgraded.
     - timestamp: '2026-10-13T15:00:00.000Z'
-      title: Trust identity credentials on extended cards only from Fabric peers
+      title: Never trust an identity credential already on an extended agent card
       description: >-
-        An agent-identity-credential/v1 extension already on an extended card now stands in for the
-        agent identity only when the card arrives over Fabric. A direct Target must present
-        agent-identity/v1, and any credential extension it sends is replaced by the gateway's own, so
-        it cannot assert a DID of its choosing.
+        An agent-identity-credential/v1 extension already on an extended card no longer stands in for
+        the agent identity, directly or over Fabric, because a peer gateway never issues one there.
+        The Target must present agent-identity/v1, and when agent identity is configured every
+        credential extension on the card is removed before the gateway adds its own, so a Target
+        cannot assert a DID of its choosing.
   breaking: []
   internal:
     - timestamp: '2026-10-12T10:30:00.000Z'
@@ -71,6 +73,13 @@ changes:
         from separate extended and well-known card flags, so the anonymous short-circuit for
         from_jwt_claim applies to public cards only and the inbound and fabric pipelines classify
         responses the same way.
+    - timestamp: '2026-10-13T17:00:00.000Z'
+      title: Test the Fabric extended card path with a scripted peer gateway
+      description: >-
+        Adds a test-only send hook to the DIDComm client so handler tests can answer a Fabric
+        ForwardRequest, and uses it to cover rewrite, refusal and error-status handling of extended
+        cards on the Fabric caller path, plus component tests for Target base path climbs and the
+        JSON-RPC refusal body.
     - timestamp: '2026-10-13T15:10:00.000Z'
       title: Pass the agent card kind to the card URL rewriters
       description: >-
