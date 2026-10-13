@@ -23,21 +23,8 @@ concurrency:
 
 jobs:
   audit:
-    # The reusable workflow's job needs issues: write to annotate RustSec issues;
-    # the workflow-level permissions block above caps every job at contents: read
-    # unless overridden here.
-    permissions:
-      contents: read
-      issues: write
-    uses: affinidi/pipeline-rust/.github/workflows/audit.yaml@beb4367431eec87376121b50d1f0a295aa203fe5 # main 2026-10-01
-    with:
-      auditIgnore: ''
-
-  audit-diagnostics:
-    name: Audit diagnostics
+    name: Audit Rust dependencies
     runs-on: ubuntu-latest
-    needs: audit
-    if: always() && needs.audit.result == 'failure'
     permissions:
       contents: read
     steps:
@@ -51,26 +38,26 @@ jobs:
       - name: Install cargo-audit
         run: cargo +stable install cargo-audit --version 0.22.0 --no-default-features --locked
 
-      - name: Print advisory details
+      - name: Audit dependencies and print advisory details
         run: |
           set +e
           cargo audit --json > audit.json
           audit_status=$?
           set -e
           if ! jq empty audit.json >/dev/null 2>&1; then
-            echo "::warning::cargo audit diagnostics did not produce valid JSON"
-            exit 0
+            echo "::error::cargo audit did not produce valid JSON"
+            exit "${audit_status}"
           fi
           count="$(jq '.vulnerabilities.count // 0' audit.json)"
           {
-            echo "### Cargo audit diagnostics"
+            echo "### Cargo audit"
             echo
-            echo "Found ${count} vulnerability entries. The primary audit job remains authoritative."
+            echo "Found ${count} vulnerability entries."
             echo
             jq -r '.vulnerabilities.list[]? | "- **\(.advisory.id)**: \(.package.name) \(.package.version) — \(.advisory.title) — \(.advisory.url)"' audit.json
           } >> "${GITHUB_STEP_SUMMARY}"
           jq -r '.vulnerabilities.list[]? | "::error title=\(.advisory.id)::\(.package.name) \(.package.version): \(.advisory.title) — \(.advisory.url)"' audit.json
-          exit 0
+          exit "${audit_status}"
 
   cargo-deny:
     uses: affinidi/pipeline-rust/.github/workflows/cargo-deny.yaml@beb4367431eec87376121b50d1f0a295aa203fe5 # main 2026-10-01

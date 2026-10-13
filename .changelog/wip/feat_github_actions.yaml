@@ -69,5 +69,5 @@ changes:
         releases the current version as-is when it has no matching tag yet, and only bumps once
         that version has been published.
     - timestamp: '2026-10-13T00:00:00Z'
-      title: Explain RustSec findings when the audit job fails
-      description: Add a failure-only audit diagnostics job that prints advisory IDs, affected packages, versions, and remediation URLs without masking the primary audit failure.
+      title: Explain RustSec findings in the audit job
+      description: The local audit job now prints advisory IDs, affected packages, versions, and remediation URLs while preserving cargo-audit's failing exit status.
