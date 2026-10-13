@@ -1,0 +1,22 @@
+.github/workflows/ci.yml
+  s_09d9fb08a24a2a::t_1636c2585c728a 41-43,47-48,51,55-56,58,75,234-236,494
+.github/workflows/checks.yml
+  s_09d9fb08a24a2a::t_3ec4f7a1a36297 86-88
+  s_09d9fb08a24a2a::t_1636c2585c728a 47-49,53-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fe70127012363fa7cd2d1cf3bd744a20960e3149",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
