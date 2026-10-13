@@ -350,7 +350,12 @@ pub enum DelegationAuditAction {
     RequestRejected {
         stage: RejectionStage,
         reason: RejectionReason,
+        /// The HTTP status the caller received. Legacy MCP refuses a malformed
+        /// request with 200 and a JSON-RPC error, so read it with `rpc_error_code`.
         http_status: u16,
+        /// The JSON-RPC error code the caller received, when the refusal was one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rpc_error_code: Option<i64>,
     },
     IdentityBindingFailed {
         outcome: IdentityBindingFailure,
@@ -1698,6 +1703,7 @@ mod tests {
                     stage: RejectionStage::Admission,
                     reason: RejectionReason::BodyTooLarge,
                     http_status: 413,
+                    rpc_error_code: Some(-32600),
                 },
                 "request_rejected",
             ),
@@ -1772,10 +1778,17 @@ mod tests {
             stage: RejectionStage::Admission,
             reason: RejectionReason::ConsentIdentityRequired,
             http_status: 403,
+            rpc_error_code: None,
         })
         .unwrap();
         assert_eq!(stored["request_rejected"]["stage"], "admission");
         assert_eq!(stored["request_rejected"]["reason"], "consent_identity_required");
+        assert!(
+            stored["request_rejected"]
+                .get("rpc_error_code")
+                .is_none(),
+            "an absent JSON-RPC code is left out of the record"
+        );
     }
 
     #[test]

@@ -1407,6 +1407,96 @@ fn hold_connection_for_body(
     crate::mcp::modern_sse::observe_response(response, move |_| connection_guard.release())
 }
 
+/// The facts for a request refused while routing to `surface`: its trace id
+/// is not assigned yet.
+fn routing_facts(
+    surface: &crate::config::agent_surface::AgentSurface
+) -> crate::audit::request_events::RequestFacts<'_> {
+    crate::audit::request_events::RequestFacts {
+        surface_id: &surface.surface_id,
+        channel_name: &surface.name,
+        trace_id: None,
+        via_fabric: false,
+    }
+}
+
+/// Records a request refused by request-extension inspection: an extension
+/// rule, or an inbound identity that is missing or fails validation.
+fn record_extension_refusal(
+    response: &Response,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+) {
+    crate::audit::request_events::request_rejected(
+        facts,
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::ExtensionRejected,
+        response.status().as_u16(),
+        None,
+    );
+}
+
+/// Refuses a body that is not a JSON-RPC 2.0 request on a legacy MCP surface.
+/// The legacy path answers with HTTP 200 and a JSON-RPC error: -32700 for a
+/// body that is not JSON, -32600 for one that is not a JSON-RPC request.
+fn refuse_malformed_legacy_mcp_body(
+    body_bytes: &[u8],
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+) -> Response {
+    let (response, code) = match serde_json::from_slice::<serde_json::Value>(body_bytes) {
+        Ok(json) => (
+            crate::mcp::create_mcp_error_response(
+                json.get("id").cloned(),
+                crate::mcp::error_codes::INVALID_REQUEST,
+                "Invalid JSON-RPC request",
+                None,
+            ),
+            crate::mcp::error_codes::INVALID_REQUEST,
+        ),
+        Err(e) => (
+            crate::mcp::create_mcp_error_response(
+                None,
+                crate::mcp::error_codes::PARSE_ERROR,
+                "Invalid JSON",
+                Some(serde_json::json!({ "details": e.to_string() })),
+            ),
+            crate::mcp::error_codes::PARSE_ERROR,
+        ),
+    };
+    crate::audit::request_events::request_rejected(
+        facts,
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::InvalidEnvelope,
+        response.status().as_u16(),
+        Some(i64::from(code)),
+    );
+    response
+}
+
+/// Records a legacy MCP refusal that `handle_mcp_request` answered: a JSON-RPC
+/// error in a 200, -32700 for a body that is not JSON, else -32600. A 204
+/// acknowledges a notification and is not a refusal.
+fn record_legacy_mcp_refusal(
+    response: &Response,
+    body_bytes: &[u8],
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+) {
+    if response.status() != StatusCode::OK {
+        return;
+    }
+    let code = if serde_json::from_slice::<serde_json::Value>(body_bytes).is_err() {
+        crate::mcp::error_codes::PARSE_ERROR
+    } else {
+        crate::mcp::error_codes::INVALID_REQUEST
+    };
+    crate::audit::request_events::request_rejected(
+        facts,
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::InvalidEnvelope,
+        200,
+        Some(i64::from(code)),
+    );
+}
+
 /// Refuses a new SSE session because the session cap is reached, releasing the
 /// request's connection.
 fn sse_session_limit_response(
@@ -1976,14 +2066,25 @@ async fn proxy_handler_with_mcp_runtime(
     if let Some(policy) = &mcp_http
         && let Err(error) = policy.validate_headers(&headers)
     {
+        let error = error.into_validation_error(None);
+        crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
         connection_guard
             .decrement()
             .await;
-        return Ok(error.into_response(None));
+        return Ok((*error).into_response());
     }
     if let Some(policy) = &mcp_http
         && let Some(response) = policy.non_post_response(&method, &headers)
     {
+        // A 400 is a malformed MCP-Protocol-Version header; a 405 has no JSON-RPC body.
+        let http_status = response.status().as_u16();
+        crate::audit::request_events::request_rejected(
+            &audit_facts,
+            crate::audit::request_events::RejectionStage::Admission,
+            crate::audit::request_events::RejectionReason::McpAdmission,
+            http_status,
+            (http_status == 400).then_some(i64::from(crate::mcp::error_codes::HEADER_MISMATCH)),
+        );
         connection_guard
             .decrement()
             .await;
@@ -2014,7 +2115,12 @@ async fn proxy_handler_with_mcp_runtime(
         }
         // Connection guard will automatically decrement when dropped
         if let Some(policy) = &mcp_http {
-            return (*policy.body_read_error(e)).into_response();
+            let error = policy.body_read_error(e);
+            // Only an oversized body is a refusal; any other read failure is the connection.
+            if error.status == StatusCode::PAYLOAD_TOO_LARGE {
+                crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
+            }
+            return (*error).into_response();
         }
         create_error_response(StatusCode::BAD_REQUEST, "Failed to read request body")
     })?;
@@ -2033,14 +2139,15 @@ async fn proxy_handler_with_mcp_runtime(
                     validation_error.code,
                     validation_error.message
                 );
+                let error = crate::mcp::upstream_versions::restrict_unsupported(
+                    validation_error,
+                    &access_point_upstream_key(&state),
+                );
+                crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
                 connection_guard
                     .decrement()
                     .await;
-                return Ok((*crate::mcp::upstream_versions::restrict_unsupported(
-                    validation_error,
-                    &access_point_upstream_key(&state),
-                ))
-                .into_response());
+                return Ok((*error).into_response());
             }
         };
         let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
@@ -2062,6 +2169,13 @@ async fn proxy_handler_with_mcp_runtime(
         body_bytes = match crate::mcp::meta::normalize_bytes(&body_bytes, mcp_metadata_context) {
             Ok(body) => body,
             Err(error) => {
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::McpAdmission,
+                    400,
+                    Some(i64::from(crate::mcp::error_codes::INVALID_PARAMS)),
+                );
                 connection_guard
                     .decrement()
                     .await;
@@ -2086,6 +2200,13 @@ async fn proxy_handler_with_mcp_runtime(
         .await
         .map_err(|error| {
             warn!(channel = channel_name, error = %error, "Invalid MCP identity presentation");
+            crate::audit::request_events::request_rejected(
+                &audit_facts,
+                crate::audit::request_events::RejectionStage::Admission,
+                crate::audit::request_events::RejectionReason::ExtensionRejected,
+                422,
+                None,
+            );
             create_error_response(StatusCode::UNPROCESSABLE_ENTITY, "Invalid MCP identity presentation")
         })?;
         let session_id = if matches!(
@@ -2125,7 +2246,17 @@ async fn proxy_handler_with_mcp_runtime(
             .decrement()
             .await;
         let status = match error {
-            crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(_) => StatusCode::NOT_FOUND,
+            crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(_) => {
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Routing,
+                    crate::audit::request_events::RejectionReason::UnknownVariant,
+                    404,
+                    Some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)),
+                );
+                StatusCode::NOT_FOUND
+            }
+            // A misconfigured default variant is a gateway fault, not a refusal.
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
         return Ok(crate::mcp::request_validation::McpRequestValidationError {
@@ -2230,6 +2361,13 @@ async fn proxy_handler_with_mcp_runtime(
                     .await;
             });
         }
+        crate::audit::request_events::request_rejected(
+            &audit_facts,
+            crate::audit::request_events::RejectionStage::Admission,
+            crate::audit::request_events::RejectionReason::ProtocolMismatch,
+            422,
+            None,
+        );
         // Connection guard will automatically decrement when dropped.
         return Err(create_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2781,6 +2919,13 @@ async fn proxy_handler_with_mcp_runtime(
             }
             Err(requested) => {
                 channel_warn!(config_id, "Unsupported A2A protocol version requested: {}", requested);
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::VersionUnsupported,
+                    400,
+                    Some(i64::from(crate::a2a::version::ERR_VERSION_NOT_SUPPORTED)),
+                );
                 connection_guard
                     .decrement()
                     .await;
@@ -2803,6 +2948,13 @@ async fn proxy_handler_with_mcp_runtime(
         && let Err((code, message)) = validate_jsonrpc_envelope(&body_bytes)
     {
         channel_warn!(config_id, "JSON-RPC validation failed: {}", message);
+        crate::audit::request_events::request_rejected(
+            &audit_facts,
+            crate::audit::request_events::RejectionStage::Admission,
+            crate::audit::request_events::RejectionReason::InvalidEnvelope,
+            400,
+            Some(i64::from(code)),
+        );
         connection_guard
             .decrement()
             .await;
@@ -2842,6 +2994,13 @@ async fn proxy_handler_with_mcp_runtime(
                 .map(|e| e.field.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
+        );
+        crate::audit::request_events::request_rejected(
+            &audit_facts,
+            crate::audit::request_events::RejectionStage::Admission,
+            crate::audit::request_events::RejectionReason::InvalidRequestShape,
+            400,
+            Some(i64::from(crate::a2a::validation::ERR_INVALID_PARAMS)),
         );
         connection_guard
             .decrement()
@@ -3392,20 +3551,7 @@ async fn proxy_handler_with_mcp_runtime(
                 channel = channel_name,
                 "Malformed MCP body on MCP fabric surface — returning JSON-RPC error envelope"
             );
-            let err_response = match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                Ok(json) => crate::mcp::create_mcp_error_response(
-                    json.get("id").cloned(),
-                    crate::mcp::error_codes::INVALID_REQUEST,
-                    "Invalid JSON-RPC request",
-                    None,
-                ),
-                Err(e) => crate::mcp::create_mcp_error_response(
-                    None,
-                    crate::mcp::error_codes::PARSE_ERROR,
-                    "Invalid JSON",
-                    Some(serde_json::json!({ "details": e.to_string() })),
-                ),
-            };
+            let err_response = refuse_malformed_legacy_mcp_body(&body_bytes, &audit_facts);
             connection_guard
                 .decrement()
                 .await;
@@ -3521,6 +3667,7 @@ async fn proxy_handler_with_mcp_runtime(
                     .and_then(|v| v.to_str().ok())
                     == Some("true");
                 if !should_forward {
+                    record_legacy_mcp_refusal(&response, &body_bytes, &audit_facts);
                     connection_guard
                         .decrement()
                         .await;
@@ -3654,7 +3801,7 @@ async fn proxy_handler_with_mcp_runtime(
     let is_mcp_proxy_target = target_url.starts_with("proxy://");
     let mut forward_client: Option<reqwest::Client> = None;
     if !is_a2a_proxy_target && !is_mcp_proxy_target {
-        match pinned_target_client(&state, &channel_name, &target_url).await {
+        match pinned_target_client(&state, &channel_name, &target_url, &audit_facts).await {
             Ok(client) => forward_client = Some(client),
             Err(blocked) => return Ok(blocked),
         }
@@ -3680,6 +3827,13 @@ async fn proxy_handler_with_mcp_runtime(
             size = body_bytes.len(),
             max = state.config.a2a.max_body_size,
             "Request body too large"
+        );
+        crate::audit::request_events::request_rejected(
+            &audit_facts,
+            crate::audit::request_events::RejectionStage::Admission,
+            crate::audit::request_events::RejectionReason::BodyTooLarge,
+            413,
+            None,
         );
         connection_guard
             .decrement()
@@ -4123,20 +4277,7 @@ async fn proxy_handler_with_mcp_runtime(
         // otherwise leak that signal to the caller instead of an error.
         if modern_request.is_none() && !crate::mcp::is_mcp_request(&headers, &body_bytes) {
             warn!(channel = channel_name, "Malformed MCP body on MCP surface — returning JSON-RPC error envelope");
-            let err_response = match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                Ok(json) => crate::mcp::create_mcp_error_response(
-                    json.get("id").cloned(),
-                    crate::mcp::error_codes::INVALID_REQUEST,
-                    "Invalid JSON-RPC request",
-                    None,
-                ),
-                Err(e) => crate::mcp::create_mcp_error_response(
-                    None,
-                    crate::mcp::error_codes::PARSE_ERROR,
-                    "Invalid JSON",
-                    Some(serde_json::json!({ "details": e.to_string() })),
-                ),
-            };
+            let err_response = refuse_malformed_legacy_mcp_body(&body_bytes, &audit_facts);
             connection_guard
                 .decrement()
                 .await;
@@ -4416,6 +4557,7 @@ async fn proxy_handler_with_mcp_runtime(
                         // Fall through to normal forwarding logic below
                     } else {
                         // Actual error, return it
+                        record_legacy_mcp_refusal(&err_response, &body_bytes, &audit_facts);
                         connection_guard
                             .decrement()
                             .await;
@@ -4478,6 +4620,7 @@ async fn proxy_handler_with_mcp_runtime(
         {
             Ok(result) => result,
             Err(response) => {
+                record_extension_refusal(&response, &audit_facts);
                 // Record failed connection due to validation rejection
                 if let Some(ref metrics) = state.metrics_store {
                     let latency_ms = start_time
@@ -6191,6 +6334,13 @@ async fn proxy_handler_with_mcp_runtime(
                 target: "credential_delegation",
                 surface = %channel_name,
                 "Credential delegation requires source authentication — rejecting anonymous request"
+            );
+            crate::audit::request_events::request_rejected(
+                &audit_facts,
+                crate::audit::request_events::RejectionStage::Admission,
+                crate::audit::request_events::RejectionReason::ConsentIdentityRequired,
+                403,
+                None,
             );
             let body = serde_json::json!({
                 "type": "https://affinidi.com/atg/errors/identity-required",
@@ -9014,6 +9164,13 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
                                 available_variants = ?ch.surface.variants.iter().map(|v| &v.alias).collect::<Vec<_>>(),
                                 "❌ ROUTING FAILED: Virtual channel alias not found"
                             );
+                            crate::audit::request_events::request_rejected(
+                                &routing_facts(&ch.surface),
+                                crate::audit::request_events::RejectionStage::Routing,
+                                crate::audit::request_events::RejectionReason::UnknownVariant,
+                                400,
+                                None,
+                            );
                             return create_error_response(
                                 StatusCode::BAD_REQUEST,
                                 &format!("Virtual channel alias '{}' not found for this channel", alias),
@@ -9063,6 +9220,13 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
                         variant_id = %vid,
                         variant_alias = %variant.alias,
                         "❌ Virtual channel variant is DISABLED"
+                    );
+                    crate::audit::request_events::request_rejected(
+                        &routing_facts(&ch.surface),
+                        crate::audit::request_events::RejectionStage::Routing,
+                        crate::audit::request_events::RejectionReason::VariantDisabled,
+                        503,
+                        None,
                     );
                     return create_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -9349,6 +9513,13 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
             for ch in channels.iter() {
                 warn!("  Available: surface='{}' route='{}'", ch.surface.name, ch.surface.route());
             }
+            crate::audit::request_events::request_rejected(
+                &crate::audit::request_events::RequestFacts::unroutable(),
+                crate::audit::request_events::RejectionStage::Routing,
+                crate::audit::request_events::RejectionReason::NoRoute,
+                404,
+                None,
+            );
             create_error_response(StatusCode::NOT_FOUND, &format!("No route configured for path: {}", path))
         }
     }
@@ -10064,6 +10235,15 @@ async fn handle_fabric_request(
             }
             Err(response) => {
                 channel_warn!(config_id, "✗ Fabric path inbound identity check rejected request");
+                record_extension_refusal(
+                    &response,
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: config_id,
+                        channel_name,
+                        trace_id: Some(&trace_id),
+                        via_fabric: false,
+                    },
+                );
                 connection_guard
                     .decrement()
                     .await;
@@ -14017,10 +14197,20 @@ async fn fetch_agent_card_from_surface_target(
     } else {
         let credential = agent_card_target_credential(state, source_addr, channel_name).await?;
         let mut req = match credential {
-            Some(_) => pinned_target_client(state, channel_name, target_url)
-                .await
-                .inspect_err(|_| record_agent_card_gateway_fault(state, source_addr))?
-                .get(target_url),
+            Some(_) => pinned_target_client(
+                state,
+                channel_name,
+                target_url,
+                &crate::audit::request_events::RequestFacts {
+                    surface_id: &state.surface.surface_id,
+                    channel_name,
+                    trace_id: None,
+                    via_fabric: false,
+                },
+            )
+            .await
+            .inspect_err(|_| record_agent_card_gateway_fault(state, source_addr))?
+            .get(target_url),
             None => state.client.get(target_url),
         };
 
@@ -14122,11 +14312,13 @@ async fn agent_card_target_credential(
 /// A redirect-disabled client pinned to the vetted address of `target_url`, or
 /// the 403 to answer when egress policy blocks it. Pinning stops DNS rebinding
 /// between vetting and connect; disabling redirects stops a 3xx from sending
-/// the request, and any credential on it, to an unvetted host.
+/// the request, and any credential on it, to an unvetted host. A block is
+/// recorded as a refusal; a vetting task that did not run is a gateway fault.
 async fn pinned_target_client(
     state: &ProxyState,
     channel_name: &str,
     target_url: &str,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
 ) -> Result<reqwest::Client, Response> {
     let candidate = target_url.to_string();
     let timeout = std::time::Duration::from_secs(
@@ -14139,6 +14331,13 @@ async fn pinned_target_client(
         Ok(Ok((client, _target))) => Ok(client),
         Ok(Err(e)) => {
             warn!(channel = channel_name, target = %target_url, "SSRF blocked by egress policy: {}", e);
+            crate::audit::request_events::request_rejected(
+                facts,
+                crate::audit::request_events::RejectionStage::Forward,
+                crate::audit::request_events::RejectionReason::SsrfBlocked,
+                403,
+                None,
+            );
             Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"))
         }
         Err(e) => {
@@ -16177,6 +16376,159 @@ mod tests {
         }
     }
 
+    type RecordedRefusal =
+        (crate::audit::request_events::RejectionStage, crate::audit::request_events::RejectionReason, u16, Option<i64>);
+
+    /// Sends one request through the Access Point and returns its status with
+    /// the `request_rejected` records it produced.
+    async fn access_point_refusal(
+        router: crate::state::MultiSurfaceProxyState,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, Vec<RecordedRefusal>) {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (response, events) =
+            crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                router,
+                request,
+                crate::mcp::request_validation::McpVersionPolicy::new(
+                    &[crate::mcp::MCP_MODERN_VERSION],
+                    &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+                ),
+                None,
+            )))
+            .await;
+        let refusals = events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    rpc_error_code,
+                } => Some((stage, reason, http_status, rpc_error_code)),
+                _ => None,
+            })
+            .collect();
+        (response.status(), refusals)
+    }
+
+    /// Each refusal the Access Point answers itself is recorded as
+    /// `request_rejected` with the status and JSON-RPC code the caller got.
+    async fn access_point_records_request_refusals(state: &crate::state::ProxyState) {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use serde_json::json;
+
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
+        )
+        .await;
+        let a2a_surface = |extra: serde_json::Value| -> crate::config::agent_surface::AgentSurface {
+            let mut surface = json!({
+                "surface_id": "refusals", "name": "Refusals",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                "target": {"endpoint": target.url()}
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                surface[key] = value.clone();
+            }
+            serde_json::from_value(surface).unwrap()
+        };
+        let message = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+            "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hello"}]
+        }}});
+        let shapeless = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+            "parts": [{"kind": "text", "text": "hello"}]
+        }}});
+        let mcp_call =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo", "arguments": {}}});
+        let mut small_config = (*state.config).clone();
+        small_config.a2a.max_body_size = 64;
+        let small_state = crate::state::ProxyState {
+            config: std::sync::Arc::new(small_config),
+            ..state.clone()
+        };
+        let variants = json!({
+            "variants": [{"id": "v-default", "alias": "default", "name": "default", "description": "",
+                "enabled": true, "overrides": {}}],
+            "default_variant_id": "v-default"
+        });
+        let metadata_target = json!({"target": {"endpoint": "http://169.254.169.254/rpc"}});
+        let delegated = json!({"outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"]}]});
+
+        let cases: Vec<(&str, crate::state::MultiSurfaceProxyState, &str, serde_json::Value, u16, RecordedRefusal)> = vec![
+            (
+                "no surface matches",
+                direct_router_state(state, a2a_surface(json!({}))),
+                "/elsewhere/rpc",
+                message.clone(),
+                404,
+                (RejectionStage::Routing, RejectionReason::NoRoute, 404, None),
+            ),
+            (
+                "unknown variant alias",
+                direct_router_state(state, a2a_surface(variants)),
+                "/a2a$missing/rpc",
+                message.clone(),
+                400,
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, 400, None),
+            ),
+            (
+                "MCP body on an A2A Access Point",
+                direct_router_state(state, a2a_surface(json!({}))),
+                "/a2a/rpc",
+                mcp_call,
+                422,
+                (RejectionStage::Admission, RejectionReason::ProtocolMismatch, 422, None),
+            ),
+            (
+                "A2A message without messageId or role",
+                direct_router_state(state, a2a_surface(json!({}))),
+                "/a2a/rpc",
+                shapeless,
+                400,
+                (RejectionStage::Admission, RejectionReason::InvalidRequestShape, 400, Some(-32602)),
+            ),
+            (
+                "body over a2a.max_body_size",
+                direct_router_state(&small_state, a2a_surface(json!({}))),
+                "/a2a/rpc",
+                message.clone(),
+                413,
+                (RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None),
+            ),
+            (
+                "target blocked by egress policy",
+                direct_router_state(state, a2a_surface(metadata_target)),
+                "/a2a/rpc",
+                message.clone(),
+                403,
+                (RejectionStage::Forward, RejectionReason::SsrfBlocked, 403, None),
+            ),
+            (
+                "credential delegation for an anonymous caller",
+                direct_router_state(state, a2a_surface(delegated)),
+                "/a2a/rpc",
+                message,
+                403,
+                (RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, 403, None),
+            ),
+        ];
+        for (case, router, path, body, status, expected) in cases {
+            let (observed_status, refusals) = access_point_refusal(router, path, body).await;
+            assert_eq!(observed_status.as_u16(), status, "{case}: status");
+            assert_eq!(refusals, vec![expected], "{case}: recorded refusals");
+        }
+    }
+
     /// An Access Point targeting `proxy://` is backed by a gateway-owned server,
     /// so it answers modern `server/discover` itself with its truthful
     /// versions, capabilities and `serverInfo`.
@@ -17497,6 +17849,7 @@ mod tests {
         modern_resource_not_found_passes_through(&state).await;
         modern_extensions_survive_forwarding(&state).await;
         proxy_access_point_answers_modern_discovery(&state).await;
+        access_point_records_request_refusals(&state).await;
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
         let runtime = Arc::new(ContinuationRuntime {
             config: serde_json::from_value(json!({"deployment": "deployment", "ttl_secs": 300, "active_key": "key",

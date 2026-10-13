@@ -166,6 +166,23 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
   stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
   when there is one; the surface limit also sends it as `Retry-After` in whole seconds.
+- `request_rejected`: the Access Point refused the request before or while forwarding it.
+  `http_status` is what the caller received and `rpc_error_code` the JSON-RPC error code, when
+  the refusal was one; legacy MCP refuses a malformed request with HTTP 200 and a JSON-RPC error,
+  so read the two together. `stage` and `reason`:
+  - `routing`: `no_route` (no surface matches; recorded against surface `unknown`, with no trace
+    id on the direct path), `unknown_variant`, `variant_disabled`.
+  - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
+    reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
+    revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
+    `mcp_admission` (MCP transport rules: Origin, header size, mirrored method or protocol
+    headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
+    extension rules, and an inbound identity that is missing or invalid),
+    `consent_identity_required` (credential delegation for an anonymous caller).
+  - `forward`: `ssrf_blocked` (egress policy refuses the target address).
+
+  Requests answered before any gateway handler runs (a path under no configured route) and
+  gateway faults (a misconfigured default variant, a failed egress check task) are not recorded.
 
 **Recipients.** Every integration with category `audit`, status `active` and no tenant owner,
 whatever its type. Every record is one delivery, so Email and Slack send one message per record;

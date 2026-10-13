@@ -670,6 +670,28 @@ async fn vp_audit_log_records_non_blocking_source_auth_failure(
     .await;
 }
 
+/// The audit reason code for a refused request, as the step names the refusal.
+fn audited_refusal_reason(refusal: &str) -> &'static str {
+    match refusal {
+        "a disabled surface variant" => "variant_disabled",
+        "an unsupported protocol version" => "version_unsupported",
+        "a request that fails MCP admission" => "mcp_admission",
+        "a malformed request" => "invalid_envelope",
+        "a rejected request extension" => "extension_rejected",
+        other => panic!("no audited reason for the request refusal '{other}'"),
+    }
+}
+
+#[then(expr = "the VP Audit Log records a request refusal for {string}")]
+async fn vp_audit_log_records_request_refusal(
+    world: &mut SurfaceWorld,
+    refusal: String,
+) {
+    let reason = audited_refusal_reason(&refusal);
+    let what = format!("a request refusal for {refusal}");
+    expect_vp_audit_record(world, &what, |event| event["event"]["request_rejected"]["reason"] == reason).await;
+}
+
 #[then("the VP Audit Log records the surface rate limit refusal")]
 async fn vp_audit_log_records_surface_rate_limit_refusal(world: &mut SurfaceWorld) {
     expect_vp_audit_record(world, "a surface rate limit refusal", |event| {

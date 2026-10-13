@@ -3548,7 +3548,7 @@ async fn authorize_fabric_sender(
 async fn forward_client_for(
     target_url: &str,
     timeout: std::time::Duration,
-) -> Result<reqwest::Client, String> {
+) -> Result<reqwest::Client, ForwardClientError> {
     if !(target_url.starts_with("http://") || target_url.starts_with("https://")) {
         return Ok(GLOBAL_HTTP_CLIENT
             .get()
@@ -3558,8 +3558,29 @@ async fn forward_client_for(
     let candidate = target_url.to_string();
     match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, timeout)).await {
         Ok(Ok((client, _target))) => Ok(client),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(error) => Err(format!("egress validation failed: {error}")),
+        Ok(Err(error)) => Err(ForwardClientError::Blocked(error.to_string())),
+        Err(error) => Err(ForwardClientError::VettingFailed(error.to_string())),
+    }
+}
+
+/// Why no pinned client could be built for a Fabric receive target.
+#[derive(Debug)]
+enum ForwardClientError {
+    /// Egress policy refuses the target address.
+    Blocked(String),
+    /// The vetting task did not complete: a gateway fault, not a refusal.
+    VettingFailed(String),
+}
+
+impl std::fmt::Display for ForwardClientError {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match self {
+            Self::Blocked(reason) => f.write_str(reason),
+            Self::VettingFailed(reason) => write!(f, "egress validation failed: {reason}"),
+        }
     }
 }
 
@@ -3931,6 +3952,17 @@ async fn process_forward_request_with_mcp_runtime(
         Ok(Some(ch)) => ch,
         Ok(None) => {
             warn!("Channel {} not found", channel_id);
+            crate::audit::request_events::request_rejected(
+                &crate::audit::request_events::RequestFacts {
+                    trace_id: (!trace_id_field.is_empty()).then_some(trace_id_field),
+                    via_fabric: true,
+                    ..crate::audit::request_events::RequestFacts::unroutable()
+                },
+                crate::audit::request_events::RejectionStage::Routing,
+                crate::audit::request_events::RejectionReason::NoRoute,
+                404,
+                None,
+            );
             let error_body = serde_json::json!({
                 "error": format!("Channel {} not found", channel_id),
                 "status": 404,
@@ -4242,8 +4274,10 @@ async fn process_forward_request_with_mcp_runtime(
                     let error = crate::mcp::modern_http::HttpAdmissionError {
                         status: axum::http::StatusCode::BAD_REQUEST,
                         message: "Malformed MCP HTTP header in Fabric request",
-                    };
-                    return axum_response_to_forward_result(error.into_response(None)).await;
+                    }
+                    .into_validation_error(None);
+                    crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
+                    return axum_response_to_forward_result((*error).into_response()).await;
                 }
             }
         }
@@ -4251,6 +4285,7 @@ async fn process_forward_request_with_mcp_runtime(
             Ok(headers) => headers,
             Err(message) => {
                 let error = crate::mcp::request_validation::malformed_transport_header(&body_bytes, message);
+                crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
                 return axum_response_to_forward_result((*error).into_response()).await;
             }
         };
@@ -4259,16 +4294,28 @@ async fn process_forward_request_with_mcp_runtime(
                 Ok(classification) => Some(classification),
                 Err(validation_error) => {
                     channel_warn!(config_id, "Rejecting fabric MCP request at protocol boundary: code={} message={}", validation_error.code, validation_error.message);
+                    crate::audit::request_events::mcp_request_rejected(&audit_facts, &validation_error);
                     return axum_response_to_forward_result((*validation_error).into_response()).await;
                 }
             }
         } else {
             if let Err(error) = http_policy.validate_headers(&mcp_headers) {
-                return axum_response_to_forward_result(error.into_response(None)).await;
+                let error = error.into_validation_error(None);
+                crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
+                return axum_response_to_forward_result((*error).into_response()).await;
             }
             if let Ok(http_method) = axum::http::Method::from_bytes(method.as_bytes())
                 && let Some(response) = http_policy.non_post_response(&http_method, &mcp_headers)
             {
+                // A 400 is a malformed MCP-Protocol-Version header; a 405 has no JSON-RPC body.
+                let http_status = response.status().as_u16();
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::McpAdmission,
+                    http_status,
+                    (http_status == 400).then_some(i64::from(crate::mcp::error_codes::HEADER_MISMATCH)),
+                );
                 return axum_response_to_forward_result(response).await;
             }
             None
@@ -4281,7 +4328,16 @@ async fn process_forward_request_with_mcp_runtime(
         }
         body_bytes = match crate::mcp::meta::normalize_bytes(&body_bytes, mcp_metadata_context) {
             Ok(body) => body,
-            Err(error) => return axum_response_to_forward_result(error.into_response(&body_bytes, axum::http::StatusCode::BAD_REQUEST)).await,
+            Err(error) => {
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::McpAdmission,
+                    400,
+                    Some(i64::from(crate::mcp::error_codes::INVALID_PARAMS)),
+                );
+                return axum_response_to_forward_result(error.into_response(&body_bytes, axum::http::StatusCode::BAD_REQUEST)).await;
+            }
         };
         if let Some(capped) = http_policy.cap_legacy_initialize(&body_bytes, &classification) {
             channel_info!(config_id, "Forwarding MCP initialize with protocolVersion {} in place of unsupported {}", capped.offered, capped.requested);
@@ -4293,6 +4349,13 @@ async fn process_forward_request_with_mcp_runtime(
             Ok(binding) => binding,
             Err(error) => {
                 channel_warn!(config_id, "Invalid MCP identity presentation: {}", error);
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::ExtensionRejected,
+                    422,
+                    None,
+                );
                 return axum_response_to_forward_result(crate::a2a::create_error_response(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Invalid MCP identity presentation")).await;
             }
         };
@@ -4939,6 +5002,15 @@ async fn process_forward_request_with_mcp_runtime(
         Ok(client) => client,
         Err(error) => {
             channel_warn!(config_id, "GW2: target {} blocked by egress policy: {}", target_url, error);
+            if let ForwardClientError::Blocked(_) = error {
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Forward,
+                    crate::audit::request_events::RejectionReason::SsrfBlocked,
+                    403,
+                    None,
+                );
+            }
             return egress_blocked_forward_response();
         }
     };
@@ -10534,10 +10606,11 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let timeout = std::time::Duration::from_secs(5);
         assert!(
-            forward_client_for("http://169.254.169.254/latest/meta-data/", timeout)
-                .await
-                .is_err(),
-            "a cloud-metadata Target was dialled"
+            matches!(
+                forward_client_for("http://169.254.169.254/latest/meta-data/", timeout).await,
+                Err(ForwardClientError::Blocked(_))
+            ),
+            "a cloud-metadata Target is refused by egress policy, and recorded as a block"
         );
 
         let followed = Arc::new(AtomicUsize::new(0));

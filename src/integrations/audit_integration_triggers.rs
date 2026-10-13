@@ -545,6 +545,7 @@ mod tests {
                 stage: RejectionStage::Routing,
                 reason: RejectionReason::NoRoute,
                 http_status: 404,
+                rpc_error_code: None,
             },
             DelegationAuditAction::IdentityBindingFailed {
                 outcome: IdentityBindingFailure::Absent,

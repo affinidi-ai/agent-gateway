@@ -5,6 +5,8 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+pub use crate::audit::events::{RejectionReason, RejectionStage};
+
 use crate::audit::events::{AuthScheme, RateLimitScope};
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent, audit_event, emit};
 use crate::mcp::resource_server::ResourceTokenError;
@@ -20,7 +22,21 @@ pub struct RequestFacts<'a> {
     pub via_fabric: bool,
 }
 
+/// The surface id and name of a record for a request no surface matched.
+pub const UNKNOWN_SURFACE: &str = "unknown";
+
 impl RequestFacts<'_> {
+    /// A request refused before any surface matched it, and before its trace
+    /// id was assigned.
+    pub fn unroutable() -> RequestFacts<'static> {
+        RequestFacts {
+            surface_id: UNKNOWN_SURFACE,
+            channel_name: UNKNOWN_SURFACE,
+            trace_id: None,
+            via_fabric: false,
+        }
+    }
+
     fn record(
         &self,
         action: DelegationAuditAction,
@@ -67,6 +83,56 @@ pub fn rate_limited(
             retry_after_ms: retry_after.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
         })
     })
+}
+
+/// The Access Point refused the request. `http_status` and `rpc_error_code`
+/// are what the caller received.
+pub fn request_rejected(
+    facts: &RequestFacts<'_>,
+    stage: RejectionStage,
+    reason: RejectionReason,
+    http_status: u16,
+    rpc_error_code: Option<i64>,
+) {
+    emit("request_rejected", || {
+        facts.record(DelegationAuditAction::RequestRejected {
+            stage,
+            reason,
+            http_status,
+            rpc_error_code,
+        })
+    })
+}
+
+/// The reason for an MCP transport refusal, from the HTTP status and JSON-RPC
+/// code the caller received. A malformed JSON-RPC envelope is the same reason
+/// on every path; an Origin, header, method or capability rule is MCP admission.
+pub fn mcp_refusal_reason(
+    http_status: u16,
+    rpc_error_code: Option<i64>,
+) -> RejectionReason {
+    match (http_status, rpc_error_code) {
+        (413, _) => RejectionReason::BodyTooLarge,
+        (_, Some(-32022)) => RejectionReason::VersionUnsupported,
+        (200 | 400, Some(-32700 | -32600)) => RejectionReason::InvalidEnvelope,
+        _ => RejectionReason::McpAdmission,
+    }
+}
+
+/// An MCP transport refusal, recorded from the validation error the caller receives.
+pub fn mcp_request_rejected(
+    facts: &RequestFacts<'_>,
+    error: &crate::mcp::request_validation::McpRequestValidationError,
+) {
+    let http_status = error.status.as_u16();
+    let rpc_error_code = Some(i64::from(error.code));
+    request_rejected(
+        facts,
+        RejectionStage::Admission,
+        mcp_refusal_reason(http_status, rpc_error_code),
+        http_status,
+        rpc_error_code,
+    );
 }
 
 /// An MCP resource token was refused; the request gets the OAuth challenge.
@@ -171,6 +237,99 @@ mod tests {
                 .as_deref(),
             Some("surf-1")
         );
+    }
+
+    fn rejected(
+        events: &[crate::delegation_vault::audit::DelegationAuditEvent]
+    ) -> Vec<(RejectionStage, RejectionReason, u16, Option<i64>)> {
+        events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    rpc_error_code,
+                } => (*stage, *reason, *http_status, *rpc_error_code),
+                other => panic!("expected RequestRejected, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn request_rejected_records_stage_reason_status_and_json_rpc_code() {
+        let ((), events) = crate::audit::producer::capture(async {
+            request_rejected(&facts(), RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700));
+            request_rejected(&facts(), RejectionStage::Forward, RejectionReason::SsrfBlocked, 403, None);
+        })
+        .await;
+
+        assert_eq!(
+            rejected(&events),
+            vec![
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700)),
+                (RejectionStage::Forward, RejectionReason::SsrfBlocked, 403, None),
+            ]
+        );
+        assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[tokio::test]
+    async fn an_unroutable_request_is_recorded_against_an_unknown_surface() {
+        let ((), events) = crate::audit::producer::capture(async {
+            request_rejected(&RequestFacts::unroutable(), RejectionStage::Routing, RejectionReason::NoRoute, 404, None);
+        })
+        .await;
+
+        assert_eq!(rejected(&events), vec![(RejectionStage::Routing, RejectionReason::NoRoute, 404, None)]);
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some(UNKNOWN_SURFACE)
+        );
+        assert_eq!(
+            events[0]
+                .channel_name
+                .as_deref(),
+            Some(UNKNOWN_SURFACE)
+        );
+        assert_eq!(events[0].trace_id, None);
+    }
+
+    #[tokio::test]
+    async fn an_mcp_validation_error_is_recorded_as_the_caller_received_it() {
+        let error = crate::mcp::request_validation::McpRequestValidationError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            id: None,
+            code: crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+            message: "unsupported".into(),
+            data: None,
+        };
+        let ((), events) = crate::audit::producer::capture(async {
+            mcp_request_rejected(&facts(), &error);
+        })
+        .await;
+
+        assert_eq!(
+            rejected(&events),
+            vec![(RejectionStage::Admission, RejectionReason::VersionUnsupported, 400, Some(-32022))]
+        );
+    }
+
+    #[test]
+    fn mcp_refusals_are_classified_by_status_and_json_rpc_code() {
+        assert_eq!(mcp_refusal_reason(413, Some(-32600)), RejectionReason::BodyTooLarge);
+        assert_eq!(mcp_refusal_reason(400, Some(-32022)), RejectionReason::VersionUnsupported);
+        assert_eq!(mcp_refusal_reason(400, Some(-32700)), RejectionReason::InvalidEnvelope);
+        assert_eq!(mcp_refusal_reason(400, Some(-32600)), RejectionReason::InvalidEnvelope);
+        assert_eq!(mcp_refusal_reason(400, Some(-32020)), RejectionReason::McpAdmission);
+        assert_eq!(mcp_refusal_reason(400, Some(-32602)), RejectionReason::McpAdmission);
+        // A rejected Origin or oversized headers carry -32600 too, but are
+        // transport rules, not a malformed envelope.
+        assert_eq!(mcp_refusal_reason(403, Some(-32600)), RejectionReason::McpAdmission);
+        assert_eq!(mcp_refusal_reason(431, Some(-32600)), RejectionReason::McpAdmission);
+        assert_eq!(mcp_refusal_reason(405, None), RejectionReason::McpAdmission);
     }
 
     #[tokio::test]

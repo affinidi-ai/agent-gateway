@@ -43,10 +43,12 @@ Feature: MCP identity handling
 
   Scenario: Schema-invalid inbound MCP identity payload is rejected before reaching the MCP server
     Given the surface has an explicit inbound identity slot for MCP
+    And the VP Audit Log keeps every audit event
     When the caller invokes MCP tool "get_news" with a schema-invalid inbound identity payload
     Then the response status is 422
     And the response is an "inbound_identity" identity validation error
     And MCP server "bravo" was not called
+    And the VP Audit Log records a request refusal for "a rejected request extension"
 
   Scenario: Explicit inbound identity slot rejects a request missing the identity field
     Given the surface has an explicit inbound identity slot for MCP

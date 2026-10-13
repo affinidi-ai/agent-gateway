@@ -705,19 +705,69 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(envelope["id"], "http-receive");
         assert_eq!(envelope["error"]["code"], -32022);
     }
-    for (body, headers, expected_status) in [
+    use crate::audit::request_events::RejectionReason;
+    for (body, headers, expected_status, expected_refusal) in [
         (
             legacy_body.clone(),
             json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION, "origin": "https://untrusted.example", "Origin": "https://untrusted.example"}),
             200,
+            None,
         ),
-        (json!(" ".repeat(1025)), json!({}), 413),
-        (legacy_body.clone(), json!({"x-extra": "x".repeat(513)}), 431),
-        (legacy_body, json!({"Origin": format!("https://{}.example", "a".repeat(500))}), 431),
+        (json!(" ".repeat(1025)), json!({}), 413, Some(RejectionReason::BodyTooLarge)),
+        (legacy_body.clone(), json!({"x-extra": "x".repeat(513)}), 431, Some(RejectionReason::McpAdmission)),
+        (
+            legacy_body.clone(),
+            json!({"Origin": format!("https://{}.example", "a".repeat(500))}),
+            431,
+            Some(RejectionReason::McpAdmission),
+        ),
     ] {
-        let (response, _) = receive(&forward_message(body, headers)).await;
+        let ((response, _), audit) = crate::audit::producer::capture(receive(&forward_message(body, headers))).await;
         assert_eq!(response["status"], expected_status);
+        let refusals: Vec<_> = audit
+            .iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    reason, http_status, ..
+                } => {
+                    assert!(event.via_fabric, "a Fabric receive refusal is marked as such");
+                    Some((reason, http_status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refusals,
+            expected_refusal
+                .map(|reason| (reason, expected_status))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "recorded refusals for a {expected_status}"
+        );
     }
+    let mut unknown_surface = forward_message(legacy_body, json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION}));
+    unknown_surface.message_body["channel_id"] = json!("no-such-surface");
+    let (response, audit) = crate::audit::producer::capture(refused(&unknown_surface)).await;
+    assert_eq!(response["status"], 404);
+    let unroutable = audit
+        .iter()
+        .find(|event| {
+            matches!(
+                event.event,
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    reason: RejectionReason::NoRoute,
+                    ..
+                }
+            )
+        })
+        .unwrap_or_else(|| panic!("an unknown surface is recorded as unroutable: {audit:?}"));
+    assert_eq!(
+        unroutable
+            .surface_id
+            .as_deref(),
+        Some(crate::audit::request_events::UNKNOWN_SURFACE)
+    );
+    assert!(unroutable.via_fabric);
     for method in ["GET", "DELETE"] {
         let mut message = forward_message(
             Value::Null,
