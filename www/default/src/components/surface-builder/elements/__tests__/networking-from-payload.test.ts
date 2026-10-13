@@ -375,4 +375,82 @@ describe('Networking changed through the API after a dashboard save', () => {
     const nodes = registry.nodesFromPayload(payload);
     expect(nodes.find(n => n.id === 'networking')?.position).toEqual({ x: 12, y: 34 });
   });
+
+  /** A dashboard save whose only Networking element sits on one path. */
+  const savedWithNetworkingOn = (path: 'target' | 'transit-point', id?: string): any => {
+    const nodes = [
+      { id: 'access-point', type: 'access-point', config: { route: '/api' } },
+      {
+        id: 'target',
+        type: 'target',
+        parentId: 'access-point',
+        config: { endpoint: 'https://upstream.example' },
+      },
+      {
+        id: 'transit-point-a2a-1',
+        type: 'transit-point-a2a',
+        parentId: 'access-point',
+        config: { id: 'tp-1', target_endpoint: 'https://tp.example' },
+      },
+      path === 'target'
+        ? {
+            id: id ?? 'networking',
+            type: 'networking',
+            parentId: 'target',
+            slotId: 'request:networking',
+            position: { x: 12, y: 34 },
+            config: { timeout_secs: '30' },
+          }
+        : {
+            id: id ?? 'networking-transit-point-a2a-1',
+            type: 'networking',
+            parentId: 'transit-point-a2a-1',
+            position: { x: 56, y: 78 },
+            config: { timeout_secs: '10' },
+          },
+    ];
+    const payload = save(nodes);
+    payload.canvas = buildCanvasBlob(nodes as any);
+    return payload;
+  };
+
+  it('keeps Networking the API moved to a Transit Point on that Transit Point', () => {
+    const payload = savedWithNetworkingOn('target');
+    delete payload.target.networking;
+    payload.transit.points[0].networking = { timeout: { request_secs: 10 } };
+
+    const nodes = nodesFromSurface(payload);
+    const networking = nodes.filter(n => n.type === 'networking');
+    expect(networking).toHaveLength(1);
+    expect(networking[0].parentId).toBe('transit-point-a2a-1');
+
+    const resaved = save(nodes);
+    expect(resaved.target.networking).toBeUndefined();
+    expect(resaved.transit.points[0].networking).toEqual({ timeout: { request_secs: 10 } });
+  });
+
+  it('keeps Networking the API moved to the Target on the Target', () => {
+    const payload = savedWithNetworkingOn('transit-point');
+    delete payload.transit.points[0].networking;
+    payload.target.networking = { timeout: { request_secs: 30 } };
+
+    const nodes = nodesFromSurface(payload);
+    const networking = nodes.filter(n => n.type === 'networking');
+    expect(networking).toHaveLength(1);
+    expect(networking[0].parentId).not.toBe('transit-point-a2a-1');
+
+    const resaved = save(nodes);
+    expect(resaved.target.networking).toEqual({ timeout: { request_secs: 30 } });
+    expect(resaved.transit.points[0].networking).toBeUndefined();
+  });
+
+  it('still restores the layout of Networking saved under another id on the same path', () => {
+    const payload = savedWithNetworkingOn('transit-point', 'networking-dropped');
+
+    const nodes = registry.nodesFromPayload(payload);
+    const networking = nodes.filter(n => n.type === 'networking');
+    expect(networking).toHaveLength(1);
+    expect(networking[0].parentId).toBe('transit-point-a2a-1');
+    expect(networking[0].position).toEqual({ x: 56, y: 78 });
+  });
 });

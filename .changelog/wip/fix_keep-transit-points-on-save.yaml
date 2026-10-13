@@ -25,9 +25,10 @@ changes:
       title: Stop the dashboard restoring Networking settings removed through the API
       description: >-
         After Networking was changed or removed through the API, the next dashboard
-        save could write the old settings back from the canvas layout data. The
-        dashboard now takes Networking settings only from the stored surface, for the
-        Target and for each Transit Point.
+        save could write the old settings back from the canvas layout data, or write a
+        Transit Point's settings to the Target and the other way round when the API
+        moved Networking between them. The dashboard now takes Networking settings only
+        from the stored surface, for the Target and for each Transit Point.
   removed: []
   security:
     - timestamp: '2026-10-12T11:55:15.000Z'
@@ -53,4 +54,5 @@ changes:
       description: >-
         Adds dashboard tests that an empty status-code list and stored zeros survive a
         load and save, that Networking removed through the API is not restored from the
-        canvas data for the Target and for a Transit Point, and that its layout still is.
+        canvas data for the Target and for a Transit Point, that Networking moved between
+        them stays where the API put it, and that its layout is still restored.

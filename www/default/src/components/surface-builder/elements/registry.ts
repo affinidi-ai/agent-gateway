@@ -938,6 +938,20 @@ class ElementRegistry {
       // parented on the drifted id. A dropped `payloadOwnsConfig` blob
       // node maps to its own parent, so its children stay attached.
       const renameMap = new Map<string, string>();
+      const blobById = new Map(blob.nodes.map(b => [b.id, b] as const));
+      // The Transit Point a node hangs off, or '' on the Target path.
+      const transitPointOf = (parentId: string | null | undefined): string => {
+        const seen = new Set<string>();
+        let id = parentId;
+        while (typeof id === 'string' && !seen.has(id)) {
+          seen.add(id);
+          const parent = blobById.get(id) ?? byId.get(id);
+          if (!parent) break;
+          if (this.isTransitPointType(parent.type)) return id;
+          id = parent.parentId;
+        }
+        return '';
+      };
       for (const bn of blob.nodes) {
         let target = byId.get(bn.id);
         if (target) claimedIds.add(target.id);
@@ -950,12 +964,18 @@ class ElementRegistry {
           // Hydration emits the ap-ma variant first; if the user
           // actually dropped on ma-external the blob carries
           // `networking-target`. Without adoption we'd render both.
+          // An element whose payload owns its config only adopts a node
+          // on the same path (the Target, or the same Transit Point), so
+          // a stale blob node never moves its settings to another path.
+          const ownsConfig = !!this.get(bn.type)?.payloadOwnsConfig;
+          const bnTransitPoint = ownsConfig ? transitPointOf(bn.parentId) : '';
           const candidates = nodes.filter(
             n =>
               n.type === bn.type &&
               !claimedIds.has(n.id) &&
               !byId.has(bn.id) &&
-              !blob.nodes.some(b => b.id === n.id)
+              !blob.nodes.some(b => b.id === n.id) &&
+              (!ownsConfig || transitPointOf(n.parentId) === bnTransitPoint)
           );
           // Prefer slotId-based adoption when the blob carries one and
           // exactly one hydrated candidate owns the same slot. Keeps
