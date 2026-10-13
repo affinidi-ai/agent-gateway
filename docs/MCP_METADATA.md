@@ -209,7 +209,8 @@ limits independently before Target dispatch. A malformed HTTP security header
 in the Fabric JSON envelope is rejected rather than silently dropped.
 
 The shared admission order is header budget, Origin, body budget, the existing
-MCP wire validator, then the admitted modern message's media contract. Standard
+MCP wire validator, the admitted modern message's media contract, then the
+single-object check below. Standard
 mirror/version errors therefore retain their existing ordering. Modern request
 fixtures require exactly one `application/json` Content-Type with UTF-8 when
 a charset is supplied, and explicit positive-quality `application/json` and
@@ -222,11 +223,42 @@ admitted modern messages. Notifications do not inherit request-only
 Accept requirements; extension notification acceptance is a separate dispatch
 decision.
 
-GET/DELETE with an explicit single
+An admitted POST, legacy or modern, must then be one JSON-RPC object that reads
+the same to every parser (`single_object_refusal` in `src/mcp/tool_analyzer.rs`).
+Direct Access Points, including their `fabric://` send and `proxy://` legs,
+Transit Points, Fabric receive and standalone proxies refuse, before tool gating
+or tool-scoped credentials:
+
+| Body | Legacy result | Modern result |
+| --- | --- | --- |
+| JSON-RPC batch (top-level array) | HTTP `422` problem details | HTTP `400`, `-32600` |
+| Not valid JSON, such as a batch behind a UTF-8 BOM | HTTP `200`, `-32700` | HTTP `400`, `-32700` |
+| JSON that is not an object | HTTP `200`, `-32600` | HTTP `400`, `-32600` |
+| Two keys of one object, at any depth, that are equal or differ only in case | HTTP `200`, `-32600` | HTTP `400`, `-32600` |
+| A lone case variant of a field the gateway reads | HTTP `200`, `-32600` | HTTP `400`, `-32600` |
+
+The fields the gateway reads are the envelope `jsonrpc`, `id`, `method` and
+`params`; `params._meta` on any method; `params.name` and `params.arguments` on
+`tools/call` and `prompts/get`; and `params.uri` on `resources/read`. A lone
+`"Method"` or `params.Name` gives the gateway nothing to check, while a
+case-folding upstream such as Go's `encoding/json` reads it as the real field.
+Keys inside tool arguments are not case-checked, since a tool may take a `Name`
+argument, but duplicates there are still refused. Case folding goes through
+upper then lower case, so `ſ` and the Kelvin sign match `s` and `k`. Legacy
+JSON-RPC refusals answer `id: null`; modern refusals echo the request `id`
+unless the `id` key itself is duplicated or a case variant.
+
+Only POST carries an MCP body. On direct Access Points, Transit Points and
+Fabric receive, PUT, PATCH and any extension method return `405` with
+`Allow: POST, GET, DELETE, HEAD, OPTIONS`, and any other method with a body
+returns HTTP `400` / `-32600`. A standalone proxy refuses DELETE with `405` and
+`Allow: POST, GET, HEAD`. GET/DELETE with an explicit single
 `MCP-Protocol-Version: 2026-07-28` return `405` with `Allow: POST`, even with an
-attached legacy session ID. Unmarked or legacy-version GET/DELETE retain the
-existing route behavior, including legacy GET-SSE. This rule applies to direct
-Access Points, Transit Points, standalone proxies, and Fabric receive.
+attached legacy session ID. Unmarked or legacy-version GET/DELETE without a body
+retain the existing route behavior: the Access Point answers DELETE itself with
+`204`, Transit Points and Fabric receive forward it, and legacy GET-SSE is
+unchanged. The modern-version rule applies to direct Access Points, Transit
+Points, standalone proxies, and Fabric receive.
 
 Standalone proxy POSTs run the same raw-body wire validator before legacy SSE
 session lookup, so an attached session ID cannot bypass a modern rejection.
@@ -713,7 +745,9 @@ service for gateway-originated consent (MRTR), which needs both
 request to an endpoint that has `outbound_credentials` while
 `[mcp.continuations]` is not configured fails with HTTP `503`, JSON-RPC
 `-32603` ("MCP credential service unavailable"); there is no legacy consent
-fallback. Full cross-gateway delivery and callback conformance is not verified.
+fallback. Two-gateway delivery from a sending Access Point is verified under
+`make gw-e2e` (see [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric));
+callback conformance with real providers is not verified.
 The separate modern
 consent connect/callback routes reuse the existing Credential Provider and JWT
 verification strategy stores to verify provider-issued OIDC identity tokens.
@@ -880,8 +914,10 @@ distinct from the receiver's `fabric` role. Prepared credentials are added
 after source-token stripping; they must authorize the receiving resource,
 never reuse the ingress bearer. The sender wraps a remote `input_required`
 response with its own state when local consent is configured, preserving the
-remote state as opaque data. Sender-side wiring and receipt preservation still
-require full two-gateway and managed-mediator conformance.
+remote state as opaque data. `make gw-e2e` verifies sender-side consent and
+delivery of the delegated access token between two gateway binaries over the
+harness-managed Docker mediator; wrapping a remote `input_required` round still requires
+two-gateway conformance.
 
 `claim_delegation` leaves pending consent pending even when an ordinary vault
 record matches the agent/user/provider and scopes. Only a verified callback
@@ -1049,8 +1085,11 @@ existing legacy behavior. Releases without these fields ignore `resource` and
 provider. In-process callback-route tests use a real isolated token endpoint
 and signed ID tokens, covering same-user success, wrong-user rejection,
 configuration changes, provider denial, PKCE and single-use exchange.
-Full cross-gateway and routed callback integration, distributed coverage, and
-provider/redirect conformance remain required.
+The `make gw-e2e` scenarios in
+`tests/features/g2g/mcp_credential_delegation_over_fabric.feature` drive the
+routed connect and callback routes of a real gateway binary against a local
+OpenID provider. Distributed coverage and conformance with real providers and
+redirects remain required.
 
 Startup-only `[mcp.continuations]` settings in the bootstrap TOML explicitly
 select a deployment namespace, TTL, active key, key ring and storage backend.
@@ -1802,9 +1841,9 @@ Every MCP endpoint (Agent Surface, Transit Point, standalone MCP Proxy, Fabric f
 
 The MCP conformance harness (`scripts/mcp-conformance/`, `make mcp-conformance`) runs the published suite (`@modelcontextprotocol/conformance`, pinned exactly by its lockfile, frozen `2026-07-28` requirement set) against the ordinary gateway binary, used for both phases: the pinned reference server directly, an Access Point and Transit Point forwarding to it, an owned MCP Proxy standalone and behind `proxy://` (`tools-list`, `tools-call-simple-text` and `caching` only), and a `fabric` target: `scripts/mcp-conformance/fabric.feature` through the g2g BDD runner (Docker mediator), an Access Point on gateway 1 targeting `fabric://` gateway 2, which forwards to the reference server; the suite runs from a step. Expected failures live in `scripts/mcp-conformance/expected-failures/*.yaml`, one `<scenario>:<check-id>` with a one-line reason each; the suite fails a run on an unlisted failure or warning and on a listed check that passes, so remove an entry in the change that fixes it and never list a gateway defect. `check-results.mjs` adds caching parity with the reference server, real owned tool results and result completeness; `compat.mjs` checks a `2024-11-05` session on every endpoint in both phases, `2026-07-28` admission on every endpoint (including `legacy-surface`, whose record still carries the retired `mcp_protocol_mode`) in the modern phase, and `-32022` for the unmodelled `2025-11-25` with a `supported` list offering `2024-11-05` on every endpoint in the legacy phase. Envs are generated under the ignored `target/mcp-conformance/` from `--generate-bootstrap`, a generated certificate and an `openssl rand` backup key held only in the gateway's environment; nothing is copied from `envs/`. The `test:mcp-conformance` CI job runs only when `MCP_CONFORMANCE` is `"true"`, passes the `build:rust` binary to both phases and tolerates only exit `3` (dependency fetch failure). Modern MCP crosses Fabric only as framed streams; the CI job leaves out the `fabric` target (no Docker daemon). See `docs/MCP_METADATA.md` (Conformance Harness).
 
-`mcp_http` holds endpoint-local `allowed_origins`, `max_request_bytes` (default 1 MiB), `max_header_bytes` (16 KiB), `max_accept_ranges` (32), the modern response bounds below, and an optional `authorization`. `mcp_http.authorization` (Resource Server tokens; see the STS section) and the Origin, size and response settings apply to every MCP endpoint and every revision; Origin and size checks run through `mcp::modern_http::EndpointHttpPolicy`. A public endpoint given as a bare listen address has no HTTP(S) origin and adds nothing to the Origin allowlist. Direct, Transit Point, standalone proxy POST, and independent Fabric receive paths use the shared admission wrapper. Origin authority comes only from configured public listener origins and exact allowlisted origins, never request forwarding headers or CORS; missing Origin is allowed, invalid present Origin is `403`. Body/header budgets return `413`/`431`. The existing wire validator precedes modern media checks and rejects every revision the path does not admit. Standalone proxy raw-body validation runs before legacy session lookup. See `docs/MCP_METADATA.md` for defaults, errors and lifecycle semantics.
+`mcp_http` holds endpoint-local `allowed_origins`, `max_request_bytes` (default 1 MiB), `max_header_bytes` (16 KiB), `max_accept_ranges` (32), the modern response bounds below, and an optional `authorization`. `mcp_http.authorization` (Resource Server tokens; see the STS section) and the Origin, size and response settings apply to every MCP endpoint and every revision; Origin and size checks run through `mcp::modern_http::EndpointHttpPolicy`. A public endpoint given as a bare listen address has no HTTP(S) origin and adds nothing to the Origin allowlist. Direct, Transit Point, standalone proxy POST, and independent Fabric receive paths use the shared admission wrapper. Origin authority comes only from configured public listener origins and exact allowlisted origins, never request forwarding headers or CORS; missing Origin is allowed, invalid present Origin is `403`. Body/header budgets return `413`/`431`. The existing wire validator precedes modern media checks and rejects every revision the path does not admit. Every admitted POST must then be one JSON-RPC object with no duplicate or case-variant keys (`tool_analyzer::single_object_refusal`), on every path including the standalone proxy. Standalone proxy raw-body validation runs before legacy session lookup. See `docs/MCP_METADATA.md` for defaults, errors and lifecycle semantics.
 
-GET/DELETE with an explicit `2026-07-28` version return `405` / `Allow: POST` without consulting a legacy session; unmarked legacy routes remain unchanged. Modern response config additionally bounds JSON/SSE events (`max_response_bytes`, 1 MiB), source chunks (`max_chunk_bytes`, 256 KiB), idle time (60s) and lifetime (3600s; maximum 86400s). Direct/Transit modern response branches use the shared bounded adapter and existing complete-result processing, skip legacy fallback/session synthesis, and keep metrics/cleanup on response-body lifetime. Admitted modern requests on Access Points and Transit Points reach these branches; unit tests use explicit admitted fixtures, and the conformance harness exercises them on the mounted routes. Real TCP adapter tests cover incremental progress and quiet upstream cancellation. Result-only header production after SSE has started remains fail-closed, never silently dropped or injected into nonfinal results.
+GET/DELETE with an explicit `2026-07-28` version return `405` / `Allow: POST` without consulting a legacy session; unmarked legacy GET/DELETE without a body remain unchanged. PUT, PATCH and extension methods return `405` with the endpoint's `Allow` list (`EndpointHttpPolicy::non_post_response`), and on Access Points, Transit Points and Fabric receive a body on any method but POST returns `400` (`non_post_body_response`). Modern response config additionally bounds JSON/SSE events (`max_response_bytes`, 1 MiB), source chunks (`max_chunk_bytes`, 256 KiB), idle time (60s) and lifetime (3600s; maximum 86400s). Direct/Transit modern response branches use the shared bounded adapter and existing complete-result processing, skip legacy fallback/session synthesis, and keep metrics/cleanup on response-body lifetime. Admitted modern requests on Access Points and Transit Points reach these branches; unit tests use explicit admitted fixtures, and the conformance harness exercises them on the mounted routes. Real TCP adapter tests cover incremental progress and quiet upstream cancellation. Result-only header production after SSE has started remains fail-closed, never silently dropped or injected into nonfinal results.
 
 Owned modern MCP dispatch (`mcp_proxies/handlers.rs`) handles discovery, deterministic tool catalogs and tool calls behind the `OwnedProxy` version policy, which admits `2026-07-28` for every Proxy and surface. Standalone dispatch precedes legacy sessions; modern surface-backed `proxy://` dispatch follows the shared request gates and feeds the common final-response path. Catalogs preserve available schemas/annotations and calls preserve structured results; tools are cloned before execution so catalog locks do not span network work. `mcp::tool_headers` validates bounded, properties-only `x-mcp-header` annotations and exact mirrored values, using the shared Base64 rules and exact safe-integer comparisons. Invalid tools are individually excluded; header mismatches return `400` / `-32020` before execution. Modern schema construction restores OpenAPI source schemas lost by the library and rejects unsafe flattening. The modern-only `mcp_proxies::modern_rest` adapter retains library parameter extraction/validation while using no-redirect, byte-bounded HTTP, authority-preserving path encoding, protected Target headers and bounded JSON/form/text/multipart encoding. Catalogs and execution select the same media type and only resolve bounded local OpenAPI references. Legacy conversion and execution remain unchanged. Full schema fidelity and complete client-security conformance are not verified, and the conformance harness scores owned endpoints only on its tool subset; see `docs/MCP_METADATA.md`.
 
@@ -1838,7 +1877,7 @@ The direct modern branch uses shared `proxy::credential_delegation::modern` prep
 
 Fabric receive prepares modern consent after its own resource authorization, verified agent-presentation admission and policy gates, before payment and Target dispatch. Continuations additionally bind the authenticated sending peer; ingress-audience tokens do not authorize the receiver. An isolated signed-identity receiver test covers pending consent, delegated credential delivery, JSON/SSE upstream continuation restoration, cross-peer rejection and single-use concurrent retries. This does not establish encrypted-frame or managed-mediator conformance.
 
-The sending Access Point uses a distinct `FabricSend` continuation role bound to the selected remote peer; modern consent precedes mirroring, payment and remote dispatch, with delegated credentials applied after caller-token stripping. Modern-provenance vault credentials use durable, version- and revocation-bound refresh claims across filesystem instances, including when a legacy request reaches the same credential. Provider refresh calls are bounded, resource-scoped and cannot widen scopes; publication rejects concurrent replacement/revocation. Ambiguous refreshes never automatically reuse the rotating token. Remote-filesystem, crash-durability, payment-retry and full two-gateway consent conformance are not verified.
+The sending Access Point uses a distinct `FabricSend` continuation role bound to the selected remote peer; when its Target sets `fabric_delegated_credentials`, modern consent precedes mirroring, payment and remote dispatch, with delegated credentials applied after caller-token stripping; otherwise the caller's token is stripped and no delegated credential is sent (see [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric)). Modern-provenance vault credentials use durable, version- and revocation-bound refresh claims across filesystem instances, including when a legacy request reaches the same credential. Provider refresh calls are bounded, resource-scoped and cannot widen scopes; publication rejects concurrent replacement/revocation. Ambiguous refreshes never automatically reuse the rotating token. The `make gw-e2e` feature `tests/features/g2g/mcp_credential_delegation_over_fabric.feature` covers two-gateway consent on a sending Access Point: consent before the peer gateway receives a Fabric forward, the access token at the peer's Target after consent, rejection of a consent callback with an altered `state` before any token exchange (a retry afterwards still gets `input_required` and reaches nothing; a new tool call can still complete consent), and, once the Target opts out again, no consent request and neither an `Authorization` header, the stored access token nor the caller's token at the peer's Target. A separate scenario shows that a Target with the setting off and no stored credential also gets no consent request, so "no consent request" does not depend on consent already being stored. These checks observe the peer's Target, not the Fabric message itself. Remote-filesystem, crash-durability, payment-retry, Transit Point Fabric consent and refresh across gateways are not verified.
 
 Modern credential preparation owns all configured bindings, including tool-filtered skips, on every modern method. Only `tools/call`, `prompts/get` and `resources/read` may initiate or resume gateway consent; other methods reuse verified credentials or fail authorization without legacy elicitation. API-key and client-credentials providers resolve through the prepared injection path, fail closed on missing credentials, and require no browser identity strategy. Modern machine grants use bounded no-redirect requests, the configured resource and exact scopes, and a provider-configuration-bound cache distinct from legacy machine tokens. Service-only bindings preserve opaque upstream continuation state.
 

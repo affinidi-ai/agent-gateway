@@ -20,6 +20,9 @@ use crate::bdd_support::admin_client::{ExternalMediatorBlob, GatewayAdminClient,
 use crate::bdd_support::config;
 use crate::bdd_support::config::ReservedPort;
 use crate::bdd_support::config::fabric_surface_fixture::SurfaceSpec;
+use crate::bdd_support::config::modern_consent::{
+    ModernConsentFixture, oauth_endpoint_allowlist, write_modern_consent_config,
+};
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::mock_server::MockServer;
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
@@ -106,6 +109,8 @@ pub struct GatewayPlan {
     /// Admits only legacy MCP on Fabric streams it receives, as a gateway
     /// whose surfaces do not serve modern MCP does.
     pub legacy_only_fabric_receive: bool,
+    /// Modern MCP consent for the gateway's surfaces with delegated credentials.
+    pub modern_consent: Option<ModernConsentFixture>,
 }
 
 impl GatewayPlan {
@@ -234,19 +239,22 @@ impl MultiGatewayHarness {
     /// Number of fabric forward requests received by `gateway_index`, read from
     /// that gateway's own Prometheus counter and summed across destination
     /// surfaces. Returns 0 when the counter is absent (the gateway has never
-    /// received a fabric forward). Harness-owned observation point: it scrapes
-    /// the metrics endpoint rather than parsing `gateway.log`.
+    /// received a fabric forward) and an error when the metrics cannot be
+    /// read, so a failed scrape never reads as "nothing arrived". It counts
+    /// only what this gateway received, not what a peer sent to the mediator.
+    /// Harness-owned observation point: it scrapes the metrics endpoint
+    /// rather than parsing `gateway.log`.
     pub async fn fabric_forward_request_count(
         &self,
         gateway_index: usize,
-    ) -> usize {
+    ) -> Result<usize> {
         let exposition = self
             .gw(gateway_index)
             .admin
             .prometheus_metrics()
             .await
-            .unwrap_or_default();
-        sum_prometheus_counter(&exposition, FABRIC_FORWARD_RECEIVED_METRIC)
+            .with_context(|| format!("read gateway {gateway_index}'s fabric forward counter"))?;
+        Ok(sum_prometheus_counter(&exposition, FABRIC_FORWARD_RECEIVED_METRIC))
     }
 
     /// The `from` gateway's id for the `to` gateway after federation.
@@ -494,6 +502,55 @@ impl MultiGatewayHarness {
             .with_context(|| format!("update surface {surface_id} MCP origins on gateway {gw_index}"))?;
         tokio::time::sleep(CHANNEL_RELOAD_SETTLE).await;
         Ok(())
+    }
+
+    /// Set whether `gw_index`'s `surface_id` sends its delegated credentials
+    /// to the peer its `fabric://` Target routes to. The update returns only
+    /// after the gateway has applied the surface to its running channels, so
+    /// the readback confirms the stored setting rather than waiting on a
+    /// reload; it fails if the API dropped the field.
+    pub async fn set_fabric_delegated_credentials(
+        &self,
+        gw_index: usize,
+        surface_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let admin = &self.gw(gw_index).admin;
+        let mut surface = admin
+            .get_surface(surface_id)
+            .await
+            .with_context(|| format!("fetch surface {surface_id} on gateway {gw_index}"))?;
+        surface["target"]["fabric_delegated_credentials"] = Value::Bool(enabled);
+        admin
+            .update_surface(surface_id, &surface)
+            .await
+            .with_context(|| {
+                format!("set fabric_delegated_credentials={enabled} on surface {surface_id} gateway {gw_index}")
+            })?;
+        let stored = admin
+            .get_surface(surface_id)
+            .await
+            .with_context(|| format!("read back surface {surface_id} on gateway {gw_index}"))?;
+        // The API omits the field when it is false.
+        let stored_enabled = stored["target"]["fabric_delegated_credentials"]
+            .as_bool()
+            .unwrap_or(false);
+        if stored_enabled != enabled {
+            bail!(
+                "surface {surface_id} on gateway {gw_index} reads back fabric_delegated_credentials={}, expected {enabled}",
+                stored["target"]["fabric_delegated_credentials"]
+            );
+        }
+        Ok(())
+    }
+
+    /// Forget every request the target collaborators have received so far.
+    pub async fn clear_mock_requests(&self) {
+        for node in &self.nodes {
+            for mock in node.mocks.values() {
+                mock.clear_requests().await;
+            }
+        }
     }
 
     /// Point one Transit Point on `from_gw`'s `surface_id` at `to_gw`'s
@@ -807,6 +864,9 @@ async fn spawn_node(
     };
     let temp_dir = create_project_temp_dir(name)?;
     config::fabric_gateway_writer::write_fabric_gateway_config(temp_dir.path(), gateway_port, outbound_port, &surfaces);
+    if let Some(consent) = &plan.modern_consent {
+        write_modern_consent_config(temp_dir.path(), consent);
+    }
 
     let config_path = temp_dir
         .path()
@@ -821,6 +881,9 @@ async fn spawn_node(
     }
     if plan.legacy_only_fabric_receive {
         extra_env.insert("AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY".to_string(), "true".to_string());
+    }
+    if let Some(consent) = &plan.modern_consent {
+        extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoint_allowlist(consent));
     }
     let mut gateway = GatewayProcess::start_g2g_with_env(&config_path, temp_dir.path(), &extra_env);
     gateway = gateway

@@ -208,6 +208,16 @@ pub struct McpContext {
     pub client_info: Option<serde_json::Value>,
 }
 
+impl McpContext {
+    /// The tool this request calls. `tool_name` mirrors `params.name` for any
+    /// method in policy input, so only a `tools/call` names a called tool.
+    pub fn called_tool_name(&self) -> Option<&str> {
+        (self.method == "tools/call")
+            .then_some(self.tool_name.as_deref())
+            .flatten()
+    }
+}
+
 /// A2A/AP2 request payload injected as `input.a2a` into Rego, letting policies
 /// inspect the actual agent message. `message` is the A2A message object
 /// (`params.message` or top-level `message`), carrying `role`, `parts`,
@@ -652,6 +662,25 @@ impl Serialize for IdentityBindingContext {
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn mcp_context_called_tool_name_is_set_only_for_tools_call() {
+        let context = |method: &str| McpContext {
+            method: method.to_string(),
+            tool_name: Some("echo".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(context("tools/call").called_tool_name(), Some("echo"));
+        assert_eq!(context("prompts/get").called_tool_name(), None);
+        assert_eq!(
+            McpContext {
+                method: "tools/call".to_string(),
+                ..Default::default()
+            }
+            .called_tool_name(),
+            None
+        );
+    }
 
     #[test]
     fn source_auth_failed_variant_serializes_without_tag_collision() {

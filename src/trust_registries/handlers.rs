@@ -13,7 +13,9 @@ use super::types::{
     TrustRegistry, TrustRegistryConnectionStatus, TrustRegistryListRecordsResponse, TrustRegistryStatus,
 };
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+};
 
 /// Request body for creating a trust registry
 #[derive(Debug, Deserialize)]
@@ -46,6 +48,22 @@ fn registry_allowed(
     scope: &Option<Extension<PatResourceScope>>,
 ) -> bool {
     can_access(registry.tenant_id.as_deref(), tenant_context(context))
+        && scope_allows_resource(
+            resource_scope(scope),
+            tenant_context(context),
+            ResourceKind::TrustRegistries,
+            &registry.id,
+        )
+}
+
+/// May this caller change or delete the trust registry? Requires [`can_mutate`]
+/// ownership and a resource scope that matches the trust registry id.
+fn registry_writable(
+    registry: &TrustRegistry,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> bool {
+    can_mutate(registry.tenant_id.as_deref(), tenant_context(context))
         && scope_allows_resource(
             resource_scope(scope),
             tenant_context(context),
@@ -121,7 +139,7 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
         .unwrap_or_default();
     let mut trust_registry = TrustRegistry::new(req.name, req.description, req.oob_url, did_method);
     trust_registry.tenant_id = req.tenant_id;
-    if !registry_allowed(&trust_registry, &context, &scope) {
+    if !registry_writable(&trust_registry, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Trust registry is outside this token's permitted scope".into()));
     }
 
@@ -214,6 +232,9 @@ pub async fn update_trust_registry<S: TrustRegistryStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get trust registry: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Trust registry not found".to_string()))?;
     if !registry_allowed(&trust_registry, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Trust registry not found".to_string()));
+    }
+    if !registry_writable(&trust_registry, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Trust registry is outside this token's permitted scope".into()));
     }
 
@@ -273,6 +294,9 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get trust registry: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Trust registry not found".to_string()))?;
     if !registry_allowed(&trust_registry, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Trust registry not found".to_string()));
+    }
+    if !registry_writable(&trust_registry, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Trust registry is outside this token's permitted scope".into()));
     }
 
@@ -494,6 +518,9 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get trust registry: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Trust registry not found".to_string()))?;
     if !registry_allowed(&tr, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Trust registry not found".to_string()));
+    }
+    if !registry_writable(&tr, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Trust registry is outside this token's permitted scope".to_string()));
     }
 
@@ -704,5 +731,235 @@ mod tests {
 
         let still_encoded = trust_registry_artifact_dir(base.path(), "..%2F..%2Fetc").unwrap();
         assert_eq!(still_encoded.parent(), Some(base.path()));
+    }
+
+    #[test]
+    fn a_tenant_may_read_an_appliance_wide_trust_registry_but_not_change_it() {
+        let tenant = Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+        let mut record = TrustRegistry::new(
+            "Registry".into(),
+            String::new(),
+            "https://example.com/oob".into(),
+            DidMethod::default(),
+        );
+        record.id = "registry-a".into();
+        record.tenant_id = None;
+        assert!(registry_allowed(&record, &tenant, &None));
+        assert!(!registry_writable(&record, &tenant, &None));
+        assert!(registry_writable(&record, &None, &None));
+
+        record.tenant_id = Some("tenant-a".into());
+        assert!(registry_writable(&record, &tenant, &None));
+
+        record.tenant_id = Some("tenant-b".into());
+        assert!(!registry_writable(&record, &tenant, &None));
+    }
+
+    async fn stored_registry(
+        tenant_id: Option<&str>
+    ) -> (Arc<super::super::FileSystemTrustRegistryStore>, TrustRegistry, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            super::super::FileSystemTrustRegistryStore::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut registry = TrustRegistry::new(
+            "Operator registry".into(),
+            String::new(),
+            "https://example.com/oob".into(),
+            DidMethod::default(),
+        );
+        registry.tenant_id = tenant_id.map(str::to_string);
+        store
+            .create(&registry)
+            .await
+            .unwrap();
+        (store, registry, dir)
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn bootstrap(dir: &tempfile::TempDir) -> Arc<crate::config::BootstrapConfig> {
+        Arc::new(
+            toml::from_str(&format!(
+                "backup_encryption_key = \"env://UNUSED\"\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n[storage_paths]\ntrust_registries = \"{}\"\n",
+                dir.path()
+                    .join("keys")
+                    .display()
+            ))
+            .unwrap(),
+        )
+    }
+
+    async fn delete_as_tenant_a(
+        store: &Arc<super::super::FileSystemTrustRegistryStore>,
+        dir: &tempfile::TempDir,
+        id: &str,
+    ) -> StatusCode {
+        match delete_trust_registry(
+            Extension(store.clone()),
+            None,
+            None,
+            Extension(None),
+            Extension(bootstrap(dir)),
+            Path(id.to_string()),
+            tenant_a(),
+            None,
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err((status, _)) => status,
+        }
+    }
+
+    fn rename() -> Json<UpdateTrustRegistryRequest> {
+        Json(UpdateTrustRegistryRequest {
+            name: Some("Tenant registry".into()),
+            description: None,
+            status: None,
+            main_did: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_update_reconnect_or_delete_an_appliance_wide_registry() {
+        let (store, registry, dir) = stored_registry(None).await;
+
+        let Json(read) = get_trust_registry(Extension(store.clone()), Path(registry.id.clone()), tenant_a(), None)
+            .await
+            .unwrap();
+        assert_eq!(read.name, "Operator registry");
+
+        let update = update_trust_registry(
+            Extension(store.clone()),
+            Extension(None),
+            Path(registry.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let reconnect = reconnect_trust_registry(
+            Extension(store.clone()),
+            None,
+            None,
+            Extension(None),
+            Path(registry.id.clone()),
+            tenant_a(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reconnect
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(delete_as_tenant_a(&store, &dir, &registry.id).await, StatusCode::FORBIDDEN);
+
+        let after = store
+            .get(&registry.id)
+            .await
+            .unwrap()
+            .expect("appliance-wide registry must survive");
+        assert_eq!(after.name, "Operator registry");
+        assert_eq!(after.updated_at, registry.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_registry_is_not_found_on_update_reconnect_or_delete() {
+        let (store, registry, dir) = stored_registry(Some("tenant-b")).await;
+
+        let update = update_trust_registry(
+            Extension(store.clone()),
+            Extension(None),
+            Path(registry.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let reconnect = reconnect_trust_registry(
+            Extension(store.clone()),
+            None,
+            None,
+            Extension(None),
+            Path(registry.id.clone()),
+            tenant_a(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reconnect
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(delete_as_tenant_a(&store, &dir, &registry.id).await, StatusCode::NOT_FOUND);
+
+        let after = store
+            .get(&registry.id)
+            .await
+            .unwrap()
+            .expect("another tenant's registry must survive");
+        assert_eq!(after.name, "Operator registry");
+        assert_eq!(after.updated_at, registry.updated_at);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_and_delete_its_own_registry() {
+        let (store, registry, dir) = stored_registry(Some("tenant-a")).await;
+
+        let Json(updated) = update_trust_registry(
+            Extension(store.clone()),
+            Extension(None),
+            Path(registry.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.name, "Tenant registry");
+        assert_eq!(
+            store
+                .get(&registry.id)
+                .await
+                .unwrap()
+                .map(|r| r.name),
+            Some("Tenant registry".to_string())
+        );
+        assert_eq!(delete_as_tenant_a(&store, &dir, &registry.id).await, StatusCode::NO_CONTENT);
+        assert!(
+            store
+                .get(&registry.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

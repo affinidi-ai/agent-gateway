@@ -16,6 +16,7 @@ pub mod gateway_bootstrap;
 pub mod jwt_verification_strategy;
 pub mod managed_identity;
 pub mod mcp_proxy;
+pub mod modern_consent;
 pub mod policy_definitions;
 pub mod secrets;
 pub mod single_surface_fixture;

@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+};
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
@@ -124,6 +126,9 @@ pub async fn update_certificate(
     if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(resource_scope(&scope), tenant_context(&context), ResourceKind::Certificates, &id)
     {
+        return Err((StatusCode::NOT_FOUND, format!("Certificate not found: {id}")));
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "certificate is outside this token's permitted scope".into()));
     }
     info!("[Certificates] UPDATE request received for: {}", id);
@@ -150,6 +155,9 @@ pub async fn delete_certificate(
     if !can_access(existing.tenant_id.as_deref(), tenant_context(&context))
         || !scope_allows_resource(resource_scope(&scope), tenant_context(&context), ResourceKind::Certificates, &id)
     {
+        return Err((StatusCode::NOT_FOUND, format!("Certificate not found: {id}")));
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "certificate is outside this token's permitted scope".into()));
     }
     info!("[Certificates] DELETE request received for: {}", id);
@@ -240,6 +248,158 @@ mod tests {
                 .creates
                 .load(Ordering::SeqCst),
             0
+        );
+    }
+
+    async fn stored_certificate(
+        tenant_id: Option<&str>
+    ) -> (Arc<dyn CertificateStore>, super::super::Certificate, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn CertificateStore> = Arc::new(
+            super::super::FilesystemCertificateStore::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let certificate = store
+            .create_with_ids(
+                CreateCertificateRequest {
+                    tenant_id: tenant_id.map(str::to_string),
+                    name: "Operator certificate".into(),
+                    description: None,
+                    tags: None,
+                    kind: Default::default(),
+                    certificate_pem: "pem".into(),
+                    private_key_pem: None,
+                    expires_at: None,
+                    active: None,
+                    identity_did: None,
+                },
+                "certificate-a".into(),
+                "certificate-id-a".into(),
+            )
+            .await
+            .unwrap();
+        (store, certificate, dir)
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn rename() -> Json<UpdateCertificateRequest> {
+        Json(UpdateCertificateRequest {
+            name: Some("Tenant certificate".into()),
+            description: None,
+            tags: None,
+            kind: None,
+            certificate_pem: None,
+            private_key_pem: None,
+            expires_at: None,
+            active: None,
+            identity_did: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_update_or_delete_an_appliance_wide_certificate() {
+        let (store, certificate, _dir) = stored_certificate(None).await;
+
+        let read = get_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None).await;
+        assert_eq!(read.into_response().status(), StatusCode::OK);
+
+        let update =
+            update_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None, rename()).await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let delete = delete_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None).await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let after = store
+            .get(&certificate.id)
+            .await
+            .unwrap()
+            .expect("appliance-wide certificate must survive");
+        assert_eq!(after.name, "Operator certificate");
+        assert_eq!(after.updated_at, certificate.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_certificate_is_not_found_on_update_or_delete() {
+        let (store, certificate, _dir) = stored_certificate(Some("tenant-b")).await;
+
+        let update =
+            update_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None, rename()).await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let delete = delete_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None).await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let after = store
+            .get(&certificate.id)
+            .await
+            .unwrap()
+            .expect("another tenant's certificate must survive");
+        assert_eq!(after.name, "Operator certificate");
+        assert_eq!(after.updated_at, certificate.updated_at);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_and_delete_its_own_certificate() {
+        let (store, certificate, _dir) = stored_certificate(Some("tenant-a")).await;
+
+        let update =
+            update_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None, rename()).await;
+        assert_eq!(
+            update
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            store
+                .get(&certificate.id)
+                .await
+                .unwrap()
+                .map(|c| c.name),
+            Some("Tenant certificate".to_string())
+        );
+
+        let delete = delete_certificate(State(store.clone()), Path(certificate.id.clone()), tenant_a(), None).await;
+        assert_eq!(
+            delete
+                .into_response()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            store
+                .get(&certificate.id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

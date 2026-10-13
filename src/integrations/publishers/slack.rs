@@ -129,7 +129,7 @@ impl IntegrationPublisher for SlackPublisher {
         }
 
         debug!("Slack payload: {:?}", payload);
-        info!("Sending Slack notification to webhook: {}", webhook_url);
+        info!("Sending Slack notification via integration: {}", integration.name);
 
         // Send HTTP POST to Slack webhook with timeout
         let client = crate::http_client::external()?;
@@ -139,86 +139,12 @@ impl IntegrationPublisher for SlackPublisher {
             .json(&payload)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to send Slack webhook")?;
 
         if response.status().is_success() {
             info!("Slack notification sent successfully via integration: {}", integration.name);
             Ok(())
-        } else {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_default();
-            Err(anyhow::anyhow!("Slack webhook failed: {} - {}", status, body))
-        }
-    }
-
-    async fn test(
-        &self,
-        config: &Value,
-        content: &Value,
-        variables: &HashMap<String, String>,
-    ) -> Result<String> {
-        let webhook_url = config
-            .get("webhook_url")
-            .and_then(|v| v.as_str())
-            .context("Missing webhook_url in configuration")?;
-
-        crate::url_validation::validate_resolved_webhook_url(webhook_url)
-            .map_err(|e| anyhow::anyhow!("webhook_url rejected: {}", e))?;
-
-        let text_template = content
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("This is a test message from the integration system.");
-
-        let text = substitute_variables(text_template, None, &escape_mrkdwn_values(variables));
-
-        let bot_name = content
-            .get("bot_name")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                config
-                    .get("bot_name")
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("Agent Gateway");
-
-        let icon_emoji = content
-            .get("icon_emoji")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                config
-                    .get("icon_emoji")
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or(":robot_face:");
-
-        let mut payload = serde_json::json!({
-            "text": text,
-            "username": bot_name,
-            "icon_emoji": icon_emoji
-        });
-
-        if let Some(channel) = content
-            .get("channel")
-            .and_then(|v| v.as_str())
-        {
-            payload["channel"] = serde_json::json!(channel);
-        }
-
-        let client = crate::http_client::external()?;
-
-        let response = client
-            .post(webhook_url)
-            .json(&payload)
-            .send()
-            .await
-            .context("Failed to send test Slack webhook")?;
-
-        if response.status().is_success() {
-            Ok("Test Slack message sent successfully".to_string())
         } else {
             let status = response.status();
             let body = response

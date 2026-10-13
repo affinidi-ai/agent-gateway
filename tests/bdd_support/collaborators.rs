@@ -54,6 +54,35 @@ pub fn assert_header_absent(
     );
 }
 
+/// No URL, header value or body of `requests` contains `secret`.
+pub fn assert_requests_omit_value(
+    requests: &[ReceivedRequest],
+    secret: &str,
+    context: &str,
+) {
+    assert!(!requests.is_empty(), "{context} received no request to inspect");
+    for request in requests {
+        assert!(
+            !request
+                .path_and_query
+                .contains(secret),
+            "{context} carried {secret} in its URL"
+        );
+        let header = request
+            .headers
+            .iter()
+            .find(|(_, value)| value.contains(secret))
+            .map(|(name, _)| name);
+        assert!(header.is_none(), "{context} carried {secret} in header {header:?}");
+        assert!(
+            !request
+                .raw_body
+                .contains(secret),
+            "{context} carried {secret} in its body"
+        );
+    }
+}
+
 pub fn assert_request_content_type_starts_with(
     request: &ReceivedRequest,
     expected: &str,
@@ -147,6 +176,17 @@ mod tests {
         let request = request();
 
         super::assert_request_content_type_starts_with(&request, "application/json", "request");
+    }
+
+    #[test]
+    #[should_panic(expected = "in its URL")]
+    fn omitted_value_is_checked_in_the_url() {
+        let requests = vec![ReceivedRequest {
+            path_and_query: "/example?token=bdd-secret".to_string(),
+            ..request()
+        }];
+
+        super::assert_requests_omit_value(&requests, "bdd-secret", "MCP server 'bravo'");
     }
 
     #[test]

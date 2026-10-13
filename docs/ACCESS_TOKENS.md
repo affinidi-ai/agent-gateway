@@ -123,7 +123,12 @@ Tenant-owned top-level management records carry an optional `tenant_id`. Its abs
 means appliance-global, for backward compatibility.
 
 A tenant PAT sees same-tenant records plus global ones. Dashboard sessions remain
-appliance-wide.
+appliance-wide. A record that belongs to another tenant answers `404` on read and on every
+write (update, delete, trigger, reconnect, retry and the other record actions), with the same
+body as a missing record, so its ID cannot be probed. A record whose ID falls outside the PAT's
+resource pattern answers `404` on read and `403` on write; secrets, certificates and API keys
+answer `404` on both. An appliance-wide record the PAT can read answers `403` on those writes. For API keys and
+Connection Points, the parent Agent Surface or Gateway decides which applies.
 
 ### What a tenant PAT may do with global records
 
@@ -131,9 +136,11 @@ appliance-wide.
 | --- | --- | --- |
 | Policy definitions, Agent Surfaces, MCP Proxies, A2A Proxies | Yes | No, including surface `PATCH` and variant writes |
 | `/v1/policy-assignments` | Yes | No |
+| JWT verification strategies, Secrets, Certificates, Credential Providers, STS clients, Mediators, Authorities, Issuers, Trust Registries, Surface Templates, Integrations | Yes | No, `403` on update and delete, issuer trust-registry registration retry, trust registry reconnect, and triggering an Integration (`POST /v1/integrations/{id}/trigger` and the multi-trigger) |
 | API keys of a global Agent Surface | List and read | No, `403` on create, revoke, rotate, and delete |
 | Appliance-wide Gateway records (peer gateways) | Yes | No, `403` on update, exposure, policy, delete, issuer, `POST /v1/gateways/{id}/approve` and `PUT /v1/gateways/{id}/integrations` |
 | User and identity event integrations (`/v1/users/integrations`, `/v1/identities/integrations`) | No, `403` on `GET` | No, `403` on `PUT`; these mappings describe the whole appliance, so a tenant or resource-scoped PAT can neither read nor change them |
+| Connection Points of an appliance-wide Gateway | List, read, metrics and messages | No, `403` on create, update, delete, exposed surfaces, use, reconnect, and marking or deleting messages. Connection Points are created only on the appliance's own Gateway, which is appliance-wide, so a tenant PAT cannot create Connection Points |
 
 Peers that arrive through the inbound Fabric handshake are always appliance-wide, so a tenant
 PAT cannot approve, rename or reconfigure them. Approving one needs an appliance-wide

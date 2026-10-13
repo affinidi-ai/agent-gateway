@@ -159,6 +159,7 @@ impl IntegrationPublisher for WebhookPublisher {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 error!("Failed to send webhook: {} (timeout: {}, connect: {})", e, e.is_timeout(), e.is_connect());
                 e
             })
@@ -175,103 +176,6 @@ impl IntegrationPublisher for WebhookPublisher {
                 .unwrap_or_default();
             error!("Webhook failed with status {}: {}", status, body);
             Err(anyhow::anyhow!("Webhook failed: {} - {}", status, body))
-        }
-    }
-
-    async fn test(
-        &self,
-        config: &Value,
-        content: &Value,
-        variables: &HashMap<String, String>,
-    ) -> Result<String> {
-        let webhook_url = config
-            .get("url")
-            .and_then(|v| v.as_str())
-            .context("Missing url in configuration")?;
-        crate::url_validation::validate_resolved_webhook_url(webhook_url).map_err(|e| anyhow::anyhow!("{}", e))?;
-
-        let method = config
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("POST")
-            .to_uppercase();
-
-        let signing_secret = config
-            .get("signing_secret")
-            .and_then(|v| v.as_str());
-
-        // Build test payload
-        let payload = if !content.is_null() && content.is_object() {
-            substitute_variables_in_json(content, None, variables)
-        } else {
-            serde_json::json!({
-                "test": true,
-                "message": "This is a test webhook",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            })
-        };
-
-        let payload_json = serde_json::to_string(&payload).context("Failed to serialize payload")?;
-
-        let client = crate::http_client::external()?;
-
-        let mut request = match method.as_str() {
-            "POST" => client.post(webhook_url),
-            "PUT" => client.put(webhook_url),
-            "PATCH" => client.patch(webhook_url),
-            _ => {
-                return Err(anyhow::anyhow!("Unsupported HTTP method: {}", method));
-            }
-        };
-
-        let timestamp = chrono::Utc::now()
-            .timestamp()
-            .to_string();
-        request = request.header("X-Webhook-Timestamp", &timestamp);
-
-        if let Some(secret) = signing_secret {
-            use hmac::{Hmac, Mac};
-            use sha2::Sha256;
-
-            let signed_content = format!("{}.{}", timestamp, payload_json);
-
-            type HmacSha256 = Hmac<Sha256>;
-            let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).context("Invalid HMAC key")?;
-            mac.update(signed_content.as_bytes());
-            let signature = mac.finalize();
-            let signature_hex = hex::encode(signature.into_bytes());
-
-            request = request.header("X-Webhook-Signature-256", format!("sha256={}", signature_hex));
-        }
-
-        if let Some(headers) = config
-            .get("headers")
-            .and_then(|v| v.as_object())
-        {
-            for (key, value) in headers {
-                if let Some(value_str) = value.as_str() {
-                    let substituted_value = substitute_variables(value_str, None, variables);
-                    request = request.header(key, substituted_value);
-                }
-            }
-        }
-
-        let response = request
-            .header("Content-Type", "application/json")
-            .body(payload_json)
-            .send()
-            .await
-            .context("Failed to send test webhook")?;
-
-        if response.status().is_success() {
-            Ok(format!("Test webhook sent successfully to {} ({})", webhook_url, response.status()))
-        } else {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_default();
-            Err(anyhow::anyhow!("Webhook test failed: {} - {}", status, body))
         }
     }
 }

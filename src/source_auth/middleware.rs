@@ -115,6 +115,14 @@ pub struct SourceAuthMiddleware {
     trust_cache: Arc<DashMap<String, CachedTrustEntry>>,
 }
 
+/// Return the installed middleware, or an internal (non-caller) error when a
+/// surface requires source authentication but none is installed.
+pub fn require_installed(middleware: Option<Arc<SourceAuthMiddleware>>) -> SourceAuthResult<Arc<SourceAuthMiddleware>> {
+    middleware.ok_or_else(|| SourceAuthError::Internal {
+        reason: "source authentication is not initialised".to_string(),
+    })
+}
+
 impl SourceAuthMiddleware {
     /// Create a new middleware instance.
     pub fn new(
@@ -928,6 +936,27 @@ mod tests {
             api_key_validator,
             None,
         )
+    }
+
+    #[test]
+    fn require_installed_without_middleware_is_a_server_error() {
+        let error = match require_installed(None) {
+            Err(error) => error,
+            Ok(_) => panic!("a missing middleware must not authenticate"),
+        };
+
+        assert!(matches!(error, SourceAuthError::Internal { .. }));
+        assert!(!error.is_caller_attributable());
+    }
+
+    #[test]
+    fn require_installed_returns_the_installed_middleware() {
+        let (_, didauth, strategies) = default_stores();
+        let middleware = Arc::new(build_middleware(None, None, didauth, strategies, default_jwks_client()));
+
+        let resolved = require_installed(Some(middleware.clone())).expect("installed middleware");
+
+        assert!(Arc::ptr_eq(&resolved, &middleware));
     }
 
     fn default_jwks_client() -> Arc<JwksClient> {

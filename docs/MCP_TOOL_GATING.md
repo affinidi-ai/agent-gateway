@@ -33,6 +33,17 @@ select validation, and duplicate version headers are rejected. Decode `Mcp-Name`
 only when both Base64 sentinel markers are present, using checked extraction so
 overlapping markers return `HeaderMismatch` rather than panicking.
 
+Admit only one JSON-RPC object per POST, before tool gating or tool-scoped
+credentials read it (`single_object_refusal`). Refuse a batch, a body that is not
+JSON or not an object, any object with two keys that are equal or differ only in
+case at any depth, and a lone case variant of a field the gateway reads
+(`method`, `params.name` of a `tools/call`, and the rest listed in
+[`MCP_METADATA.md`](MCP_METADATA.md#http-endpoint-admission)). Otherwise an upstream
+parser that keeps the first duplicate, folds case, or strips a UTF-8 BOM could run
+a different method or tool from the one the gates checked. Only POST may carry a
+body: PUT, PATCH and extension methods return `405`, and a body on any other
+method returns `400`.
+
 Validate every supplied `Mcp-Name` before version rejection, including methods
 without a mirrored name source. Well-formed extra headers are tolerated;
 malformed values return HTTP `400` / `HeaderMismatch` (`-32020`). Modern
@@ -97,6 +108,13 @@ tools/list filter) on **both** the `tools/list` response (hiding tools) and
 `tools/call` requests (blocking invocation), so a hidden tool is uncallable.
 Gates evaluate their condition **once per request**, then apply the precompiled
 regex per tool.
+
+Every gate fails closed on a `tools/call` whose tool name it cannot read (no
+`params.name`, or one that is not a string): the direct Access Point, the
+`fabric://` send leg, the `proxy://` MCP proxy path, Fabric receive and each
+Transit Point deny it and record a deny decision, rather than checking an empty
+name that a deny-pattern gate would pass. A surface or Transit Point without
+gating is unaffected.
 
 - **SSE / Streamable-HTTP note**: when the upstream MCP server answers
   `tools/list` with `text/event-stream` (SSE), `src/proxy/handler.rs` buffers

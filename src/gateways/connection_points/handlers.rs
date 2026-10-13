@@ -20,7 +20,7 @@ use crate::mediators::filesystem::MediatorStore;
 use crate::mediators::utils::set_acl_to_allow_everything_and_more;
 use crate::messages::MessageType;
 use crate::surfaces::AgentSurfaceStore;
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, can_reference, scope_allows_resource};
+use crate::tenancy::{PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource};
 
 /// Generates a `did:webvh` identity for a connection point.
 ///
@@ -495,6 +495,24 @@ fn connection_point_allowed(
         )
 }
 
+/// May this caller change or delete the connection point? A connection point takes
+/// its ownership from its gateway, so this requires [`can_mutate`] on the gateway
+/// and a resource scope that matches the connection point id.
+fn connection_point_writable(
+    connection_point: &GatewayConnectionPoint,
+    gateway: &Gateway,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> bool {
+    can_mutate(gateway.tenant_id.as_deref(), tenant_context(context))
+        && scope_allows_resource(
+            resource_scope(scope),
+            tenant_context(context),
+            ResourceKind::ConnectionPoints,
+            &connection_point.id,
+        )
+}
+
 async fn load_accessible_connection_point<S: ConnectionPointStore>(
     store: &S,
     gateway_store: &crate::gateways::FileSystemGatewayStore,
@@ -514,12 +532,10 @@ async fn load_accessible_connection_point<S: ConnectionPointStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get parent gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Connection point not found".to_string()))?;
     if !connection_point_allowed(&connection_point, &gateway, context, scope) {
-        let status = if mutation {
-            StatusCode::FORBIDDEN
-        } else {
-            StatusCode::NOT_FOUND
-        };
-        return Err((status, "Connection point not accessible".to_string()));
+        return Err((StatusCode::NOT_FOUND, "Connection point not found".to_string()));
+    }
+    if mutation && !connection_point_writable(&connection_point, &gateway, context, scope) {
+        return Err((StatusCode::FORBIDDEN, "Connection point not accessible".to_string()));
     }
     Ok((connection_point, gateway))
 }
@@ -710,7 +726,7 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
         return Err((StatusCode::BAD_REQUEST, "Can only create connection points for self gateway".to_string()));
     }
 
-    if !can_access(gateway.tenant_id.as_deref(), tenant_context(&context)) {
+    if !can_mutate(gateway.tenant_id.as_deref(), tenant_context(&context)) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
     }
 
@@ -1210,19 +1226,26 @@ async fn create_oob_invitation(
     info!("  To mediator: {}", mediator_did);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let oob_result = oob_discovery
+    let oob_result = match oob_discovery
         .create_invite(&atm, &profile, expiry)
-        .await;
+        .await
+    {
+        Ok(oobid) => {
+            let oob_url = format!("{}/oob?_oobid={}", mediator_url, oobid);
+            oob_discovery
+                .retrieve_invite(&atm, &oob_url)
+                .await
+                .map(|invitation| (oobid, oob_url, invitation.id))
+        }
+        Err(e) => Err(e),
+    };
 
     // Cleanup: Graceful shutdown of ATM
     atm.graceful_shutdown().await;
 
     match oob_result {
-        Ok(oobid) => {
+        Ok((oobid, oob_url, invitation_message_id)) => {
             info!("✓ OOB invitation created successfully with ID: {}", oobid);
-
-            // Construct the OOB URL
-            let oob_url = format!("{}/oob?_oobid={}", mediator_url, oobid);
 
             // Create the message structure for storage
             let now = SystemTime::now()
@@ -1237,7 +1260,7 @@ async fn create_oob_invitation(
 
             let oob_message = json!({
                 "@type": MessageType::OOBInvitation.to_string(),
-                "@id": uuid::Uuid::new_v4().to_string(),
+                "@id": invitation_message_id,
                 "label": label,
                 "goal_code": "gateway-connection",
                 "goal": goal,
@@ -2323,5 +2346,244 @@ mod tests {
             .await
             .expect("load_all_raw must succeed");
         assert_eq!(raw_entries.len(), 1, "Exactly one birth log entry must be registered in DidLogStorage");
+    }
+
+    fn connection_point_for(gateway_id: &str) -> crate::gateways::connection_points::types::GatewayConnectionPoint {
+        crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+            gateway_id.to_string(),
+            "did:example:mediator".to_string(),
+            "did:example:cp".to_string(),
+            "CP".to_string(),
+            "desc".to_string(),
+            "oob-1".to_string(),
+            "https://oob.example".to_string(),
+            serde_json::json!({}),
+            None,
+            crate::gateways::connection_points::ConnectionPointType::User,
+            "secret".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_reads_but_cannot_change_a_connection_point_of_the_appliance_gateway() {
+        use crate::gateways::connection_points::ConnectionPointStore;
+        use crate::gateways::store::GatewayStore;
+        use crate::gateways::types::{Gateway, GatewayCreationType, GatewayType};
+        use crate::tenancy::PatTenantContext;
+        use axum::Extension;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gateways = crate::gateways::FileSystemGatewayStore::new(
+            dir.path().join("gateways"),
+            Some("did:web:self.example".to_string()),
+        )
+        .await
+        .unwrap();
+        let appliance = gateways
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|gateway| gateway.gateway_type == GatewayType::SelfGateway)
+            .expect("the store creates the appliance gateway on first boot");
+        assert_eq!(appliance.tenant_id, None);
+        let mut tenant_gateway = Gateway::new_with_creation_type(
+            "Tenant gateway".to_string(),
+            String::new(),
+            "did:web:tenant.example".to_string(),
+            GatewayType::Remote,
+            GatewayCreationType::User,
+        );
+        tenant_gateway.tenant_id = Some("tenant-a".to_string());
+        gateways
+            .create(&tenant_gateway)
+            .await
+            .unwrap();
+
+        let points = crate::gateways::connection_points::FileSystemConnectionPointStore::new(dir.path().join("points"))
+            .await
+            .unwrap();
+        let appliance_point = connection_point_for(&appliance.id);
+        let tenant_point = connection_point_for(&tenant_gateway.id);
+        points
+            .create(&appliance_point)
+            .await
+            .unwrap();
+        points
+            .create(&tenant_point)
+            .await
+            .unwrap();
+
+        let tenant = Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+        let load = |id: String, context: Option<Extension<PatTenantContext>>, mutation: bool| {
+            let (points, gateways) = (&points, &gateways);
+            async move { super::load_accessible_connection_point(points, gateways, &id, &context, &None, mutation).await }
+        };
+
+        assert!(
+            load(appliance_point.id.clone(), tenant.clone(), false)
+                .await
+                .is_ok()
+        );
+        let refused = load(appliance_point.id.clone(), tenant.clone(), true).await;
+        assert_eq!(
+            refused
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert!(
+            load(appliance_point.id.clone(), None, true)
+                .await
+                .is_ok()
+        );
+        assert!(
+            load(tenant_point.id.clone(), tenant, true)
+                .await
+                .is_ok()
+        );
+        let other_tenant = Some(Extension(PatTenantContext {
+            token_id: "token-b".into(),
+            tenant_id: "tenant-b".into(),
+        }));
+        for mutation in [false, true] {
+            let hidden = load(tenant_point.id.clone(), other_tenant.clone(), mutation)
+                .await
+                .err();
+            assert_eq!(
+                hidden
+                    .as_ref()
+                    .map(|(status, _)| *status),
+                Some(StatusCode::NOT_FOUND),
+                "another tenant's connection point is hidden (mutation: {mutation})"
+            );
+            assert_eq!(
+                hidden,
+                load("no-such-connection-point".into(), other_tenant.clone(), mutation)
+                    .await
+                    .err(),
+                "a hidden connection point answers exactly like a missing one (mutation: {mutation})"
+            );
+        }
+    }
+
+    async fn create_on_appliance_gateway(tenant: Option<crate::tenancy::PatTenantContext>) -> (StatusCode, usize) {
+        use crate::gateways::connection_points::{ConnectionPointStore, FileSystemConnectionPointStore};
+        use crate::gateways::store::GatewayStore;
+        use crate::gateways::types::GatewayType;
+        use crate::mediators::FileSystemMediatorStore;
+        use axum::Extension;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                dir.path().join("gateways"),
+                Some("did:web:self.example".to_string()),
+            )
+            .await
+            .unwrap(),
+        );
+        let appliance = gateways
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|gateway| gateway.gateway_type == GatewayType::SelfGateway)
+            .expect("the store creates the appliance gateway on first boot");
+        let points = Arc::new(
+            FileSystemConnectionPointStore::new(dir.path().join("points"))
+                .await
+                .unwrap(),
+        );
+        let mediators = Arc::new(
+            FileSystemMediatorStore::new(dir.path().join("mediators"))
+                .await
+                .unwrap(),
+        );
+        let (vc_issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let (listener_manager, _listener_dir) = crate::gateways::test_helpers::test_listener_manager(dir.path()).await;
+        let bootstrap: crate::config::BootstrapConfig = toml::from_str(
+            "backup_encryption_key = \"env://UNUSED\"\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n",
+        )
+        .unwrap();
+        let network: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+        }))
+        .unwrap();
+
+        let mut router = axum::Router::new()
+            .route(
+                "/v1/connection-points",
+                axum::routing::post(
+                    super::create_connection_point::<
+                        FileSystemConnectionPointStore,
+                        crate::gateways::FileSystemGatewayStore,
+                        FileSystemMediatorStore,
+                    >,
+                ),
+            )
+            .layer(Extension(points.clone()))
+            .layer(Extension(gateways))
+            .layer(Extension(mediators))
+            .layer(Extension(Arc::new(vc_issuer)))
+            .layer(Extension(Arc::new(crate::config::GatewayConfig::default_config())))
+            .layer(Extension(Arc::new(bootstrap)))
+            .layer(Extension(Arc::new(network)))
+            .layer(Extension(Arc::new(listener_manager)))
+            .layer(Extension(None::<Arc<crate::integrations::FileSystemNotificationStore>>))
+            .layer(Extension(None::<Arc<crate::storage::IntegrationStorage>>))
+            .layer(Extension(None::<Arc<dyn crate::storage::DidLogStorage>>))
+            .layer(Extension(None::<Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>));
+        if let Some(tenant) = tenant {
+            router = router.layer(Extension(tenant));
+        }
+        let body = serde_json::json!({
+            "gateway_id": appliance.id,
+            "mediator_id": "missing-mediator",
+            "name": "Tenant point",
+            "description": "",
+            "expiry_seconds": null,
+            "integration_id": null,
+            "secret": "secret",
+        });
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/connection-points")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stored = points
+            .list_all()
+            .await
+            .unwrap()
+            .len();
+        (response.status(), stored)
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_create_a_connection_point_on_the_appliance_gateway() {
+        let tenant = crate::tenancy::PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        };
+        assert_eq!(create_on_appliance_gateway(Some(tenant)).await, (StatusCode::FORBIDDEN, 0));
+        assert_eq!(
+            create_on_appliance_gateway(None).await,
+            (StatusCode::NOT_FOUND, 0),
+            "an appliance-wide caller passes the ownership check and stops at the missing mediator"
+        );
     }
 }

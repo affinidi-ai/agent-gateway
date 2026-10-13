@@ -30,6 +30,9 @@ async fn load_pending_gateway<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !crate::gateways::handlers::gateway_allowed(&gateway, context, scope) {
+        return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+    }
     if !crate::gateways::handlers::gateway_writable(&gateway, context, scope) {
         return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
     }
@@ -444,7 +447,7 @@ mod tests {
                 .await
                 .expect_err("another tenant's peer is out of reach")
                 .0,
-            StatusCode::FORBIDDEN
+            StatusCode::NOT_FOUND
         );
         assert!(
             load_pending_gateway(&store, "appliance-peer", &None, &None)

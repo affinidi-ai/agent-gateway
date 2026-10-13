@@ -5,7 +5,9 @@ use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::comm::client::CommClient;
 use crate::gateways::connection_points::ConnectionPointStore;
 use crate::mediators::utils::extract_mediator_info;
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource, tenant_for_create};
+use crate::tenancy::{
+    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+};
 
 use super::MediatorStore;
 use super::types::{Mediator, MediatorResponse, MediatorStatus};
@@ -118,6 +120,17 @@ fn mediator_allowed(
     scope: &Option<Extension<PatResourceScope>>,
 ) -> bool {
     can_access(mediator.tenant_id.as_deref(), tenant_context(context))
+        && scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Mediators, &mediator.id)
+}
+
+/// May this caller change or delete the mediator? Requires [`can_mutate`]
+/// ownership and a resource scope that matches the mediator id.
+fn mediator_writable(
+    mediator: &Mediator,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> bool {
+    can_mutate(mediator.tenant_id.as_deref(), tenant_context(context))
         && scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Mediators, &mediator.id)
 }
 
@@ -270,7 +283,7 @@ pub async fn create_mediator<S: MediatorStore>(
 
     let mut mediator = Mediator::new(req.name, req.description, req.did, fixed_did_document);
     mediator.tenant_id = req.tenant_id;
-    if !mediator_allowed(&mediator, &context, &scope) {
+    if !mediator_writable(&mediator, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
     }
     mediator.our_did = Some(our_did);
@@ -413,6 +426,9 @@ pub async fn update_mediator<S: MediatorStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Mediator not found".to_string()))?;
     if !mediator_allowed(&mediator, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()));
+    }
+    if !mediator_writable(&mediator, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
     }
 
@@ -533,6 +549,9 @@ pub async fn delete_mediator<S: MediatorStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Mediator not found".to_string()))?;
     if !mediator_allowed(&mediator, &context, &scope) {
+        return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()));
+    }
+    if !mediator_writable(&mediator, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
     }
 
@@ -909,7 +928,7 @@ pub async fn trust_ping_mediator<S: MediatorStore>(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Mediator not found".to_string()))?;
     if !mediator_allowed(&mediator, &context, &scope) {
-        return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".to_string()));
+        return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()));
     }
 
     tracing::warn!("🆕 [{request_id}] Mediator: {} ({})", mediator.name, mediator.did);
@@ -989,11 +1008,13 @@ pub async fn trust_ping_mediator<S: MediatorStore>(
 #[cfg(test)]
 mod tests {
     use super::{
-        fix_malformed_service_endpoints, is_stale_connection_error, mediator_allowed, remove_cached_client_entries,
+        fix_malformed_service_endpoints, is_stale_connection_error, mediator_allowed, mediator_writable,
+        remove_cached_client_entries,
     };
     use crate::auth_manager::pat::PatResourceScope;
     use crate::mediators::types::Mediator;
     use crate::tenancy::PatTenantContext;
+    use axum::Extension;
     use regex::Regex;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1060,5 +1081,205 @@ mod tests {
         assert_eq!(removed, 2);
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key("did:example:mediator-b:did:peer:three"));
+    }
+
+    #[test]
+    fn a_tenant_may_read_an_appliance_wide_mediator_but_not_change_it() {
+        let tenant = Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }));
+        let mut record = Mediator::new("Mediator".into(), String::new(), "did:example:mediator".into(), None);
+        record.id = "mediator-a".into();
+        record.tenant_id = None;
+        assert!(mediator_allowed(&record, &tenant, &None));
+        assert!(!mediator_writable(&record, &tenant, &None));
+        assert!(mediator_writable(&record, &None, &None));
+
+        record.tenant_id = Some("tenant-a".into());
+        assert!(mediator_writable(&record, &tenant, &None));
+
+        record.tenant_id = Some("tenant-b".into());
+        assert!(!mediator_writable(&record, &tenant, &None));
+    }
+
+    async fn stored_mediator(
+        tenant_id: Option<&str>
+    ) -> (Arc<crate::mediators::FileSystemMediatorStore>, Mediator, tempfile::TempDir) {
+        use crate::mediators::MediatorStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::mediators::FileSystemMediatorStore::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut mediator =
+            Mediator::new("Operator mediator".into(), String::new(), "did:example:mediator".into(), None);
+        mediator.tenant_id = tenant_id.map(str::to_string);
+        store
+            .create(&mediator)
+            .await
+            .unwrap();
+        (store, mediator, dir)
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn rename() -> axum::Json<super::UpdateMediatorRequest> {
+        axum::Json(super::UpdateMediatorRequest {
+            name: Some("Tenant mediator".into()),
+            description: None,
+            did: None,
+            status: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_cannot_update_or_delete_an_appliance_wide_mediator() {
+        use crate::mediators::MediatorStore;
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        let (store, mediator, _dir) = stored_mediator(None).await;
+
+        let axum::Json(read) =
+            super::get_mediator(Extension(store.clone()), Path(mediator.id.clone()), tenant_a(), None)
+                .await
+                .unwrap();
+        assert_eq!(read.name, "Operator mediator");
+
+        let update = super::update_mediator(
+            Extension(store.clone()),
+            Extension(None),
+            Path(mediator.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let delete = super::delete_mediator(
+            Extension(store.clone()),
+            Extension(None),
+            Extension(None),
+            Extension(None),
+            Path(mediator.id.clone()),
+            tenant_a(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let after = store
+            .get(&mediator.id)
+            .await
+            .unwrap()
+            .expect("appliance-wide mediator must survive");
+        assert_eq!(after.name, "Operator mediator");
+        assert_eq!(after.updated_at, mediator.updated_at);
+    }
+
+    #[tokio::test]
+    async fn another_tenants_mediator_is_not_found_on_update_or_delete() {
+        use crate::mediators::MediatorStore;
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        let (store, mediator, _dir) = stored_mediator(Some("tenant-b")).await;
+
+        let update = super::update_mediator(
+            Extension(store.clone()),
+            Extension(None),
+            Path(mediator.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await;
+        assert_eq!(
+            update
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let delete = super::delete_mediator(
+            Extension(store.clone()),
+            Extension(None),
+            Extension(None),
+            Extension(None),
+            Path(mediator.id.clone()),
+            tenant_a(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            delete
+                .err()
+                .map(|(status, _)| status),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let after = store
+            .get(&mediator.id)
+            .await
+            .unwrap()
+            .expect("another tenant's mediator must survive");
+        assert_eq!(after.name, "Operator mediator");
+        assert_eq!(after.updated_at, mediator.updated_at);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_can_update_and_delete_its_own_mediator() {
+        use crate::mediators::MediatorStore;
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        let (store, mediator, _dir) = stored_mediator(Some("tenant-a")).await;
+
+        let axum::Json(updated) = super::update_mediator(
+            Extension(store.clone()),
+            Extension(None),
+            Path(mediator.id.clone()),
+            tenant_a(),
+            None,
+            rename(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.name, "Tenant mediator");
+
+        let status = super::delete_mediator(
+            Extension(store.clone()),
+            Extension(None),
+            Extension(None),
+            Extension(None),
+            Path(mediator.id.clone()),
+            tenant_a(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            store
+                .get(&mediator.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

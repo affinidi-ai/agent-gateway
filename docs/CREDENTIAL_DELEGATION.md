@@ -41,7 +41,7 @@ Each entry in `AgentSurface.outbound_credentials`
 
 | Field | Options | Default |
 | --- | --- | --- |
-| `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names | `all` |
+| `required_for` | `all` outbound requests, or `tools`: a list of MCP tool names, matched against `params.name` of a `tools/call` on Access Points and Fabric receive, never on Transit Points | `all` |
 | `consent_mode` | `on_demand`, `pre_authorize`, or `elicit` | `on_demand` |
 | `inject_as` | `bearer_header`, `custom_header { name, format }`, or `meta { field }` | `bearer_header` |
 | `scopes` | Scopes to request | The provider's defaults |
@@ -49,6 +49,21 @@ Each entry in `AgentSurface.outbound_credentials`
 `custom_header` takes a format string, so a provider that expects `token {value}` rather
 than `Bearer {value}` still works. `meta` writes the token into a JSON-RPC `_meta` field
 instead of a header.
+
+A binding carries no destination, so where it applies depends on the hop.
+
+- **Access Points and Fabric receive** forward only to their own Target, so a `tools`
+  binding applies to a `tools/call` whose `params.name` it lists.
+- **Transit Points** never apply a `tools` binding. A partner upstream names its own tools,
+  so matching its tool names would hand it a credential meant for the Target's tools. A
+  `tools` binding that lists a JSON-RPC method, such as `tools/call` or `message/send`,
+  does not apply there either.
+
+An `all` binding applies on every Transit Point of the surface, so every partner upstream
+behind them receives the delegated credential. A surface with no `outbound_credentials` reads
+each Transit Point's `transit_credentials` as an `all` binding, which therefore also reaches
+every Transit Point, not only the one that declares it. Use `all` only when every Transit
+Point's upstream should hold the credential.
 
 ## When a token is missing
 
@@ -68,12 +83,19 @@ degrades to the 401 response, and `fail` fails the tool call with a JSON-RPC err
 
 ## Across Fabric
 
-When a surface's Target is `fabric://`, its delegated credential depends on the request's MCP
-revision. A legacy request never carries it to the peer. A modern (`2026-07-28`) request
-does: the sending gateway applies the credential after stripping the caller's token,
-and sends the access token, never the refresh token, inside the encrypted framed stream to the
-peer, which can use it until it expires. Consent, refresh and revocation stay on the sending
-gateway. See [Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric).
+When a surface's Target or Transit Point is `fabric://`, its delegated credential reaches the peer
+only if that Target or Transit Point opts in with `fabric_delegated_credentials: true`. The setting
+is off by default, including on existing surfaces. With it off, the caller's own token is still
+stripped and the peer receives no delegated credential.
+
+With it on, the access token, never the refresh token, crosses to the peer, which can use it until
+it expires. On the Target only a modern (`2026-07-28`) request carries it, inside the encrypted
+framed stream; a legacy MCP or A2A request never does. On a Transit Point, every protocol carries
+it, including A2A through header injection. A Transit Point on a surface without `outbound_credentials` uses only its own
+`transit_credentials`, never another Transit Point's, whatever its destination. The surface's
+Target uses only `outbound_credentials`, never a Transit Point's `transit_credentials`. Consent, refresh
+and revocation stay on the sending gateway. See
+[Delegated credentials over Fabric](FABRIC.md#delegated-credentials-over-fabric).
 
 ## Consent flow
 

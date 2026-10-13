@@ -10,12 +10,17 @@ use crate::bdd_support::config::fabric_surface_fixture::{
     McpProxySpec, McpToolPolicySpec, SourceAuthSpec, SurfaceSpec, TargetAuthSpec,
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
+use crate::bdd_support::config::modern_consent::ModernConsentFixture;
 use crate::bdd_support::json_rpc::{IdentityBindingProof, build_mcp_echo_response_body, build_target_ok_response};
+use crate::bdd_support::mcp_consent::{ConsentRequest, complete_consent, open_consent_callback_with_tampered_state};
+use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
 use crate::bdd_support::policies::{
     build_gateway_deny_all_policy, build_gateway_deny_unverified_source_auth_policy, build_mcp_tool_allow_policy,
     build_surface_identity_binding_issuer_policy,
 };
-use crate::world::{FabricLink, G2gWorld, TransitPointFabricLink};
+use crate::world::{FabricLink, G2gWorld, McpCaller, TransitPointFabricLink};
+
+const MODERN_MCP_VERSION: &str = "2026-07-28";
 
 fn set_target_response(
     world: &mut G2gWorld,
@@ -831,4 +836,221 @@ pub async fn mediator_lost_every_account(world: &mut G2gWorld) {
         .flush_store()
         .await
         .unwrap_or_else(|error| panic!("{error:#}"));
+}
+
+/// The OAuth provider is also the identity provider callers sign in with, so
+/// the consent callback can prove the consenting user is the caller.
+#[given(expr = "surface {string} requires delegated credentials from OAuth provider {string}")]
+async fn surface_requires_delegated_credentials(
+    world: &mut G2gWorld,
+    surface_name: String,
+    provider_name: String,
+) {
+    if !world
+        .oauth_providers
+        .contains_key(&provider_name)
+    {
+        let provider = OidcProvider::start().await;
+        world
+            .oauth_providers
+            .insert(provider_name.clone(), provider);
+    }
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    let provider = &world.oauth_providers[&provider_name];
+    let plan = world
+        .topology
+        .plan_mut(gw_index);
+    assert!(plan.modern_consent.is_none(), "gateway {gw_index} already has a surface with delegated credentials");
+    let surface = plan
+        .surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == surface_id)
+        .unwrap_or_else(|| panic!("surface '{surface_id}' not declared on gateway {gw_index}"));
+    surface.delegated_credentials = Some(provider_name.clone());
+    plan.modern_consent = Some(ModernConsentFixture {
+        provider_id: provider_name,
+        authorization_endpoint: provider.authorization_endpoint(),
+        token_endpoint: provider.token_endpoint(),
+        identity_issuer: OIDC_ISSUER.to_string(),
+        identity_client_id: OIDC_CLIENT_ID.to_string(),
+        identity_client_secret: OIDC_CLIENT_SECRET.to_string(),
+        identity_jwk: provider.public_jwk(),
+        route: surface.route.clone(),
+    });
+}
+
+#[given(
+    expr = "caller {string} holds an MCP access token from gateway {int} for an identity issued by OAuth provider {string}"
+)]
+async fn caller_holds_mcp_access_token(
+    world: &mut G2gWorld,
+    caller: String,
+    gw_index: usize,
+    provider: String,
+) {
+    world
+        .topology
+        .mcp_callers
+        .push(McpCaller {
+            name: caller,
+            gw_index,
+            provider,
+        });
+}
+
+#[given(expr = "surface {string} sends delegated credentials over fabric")]
+async fn surface_sends_delegated_credentials_over_fabric(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    let surface = world.surface(&surface_name);
+    world
+        .topology
+        .fabric_delegated_credentials
+        .push(surface);
+}
+
+#[given(
+    expr = "caller {string} has been asked for consent on MCP tool {string} through gateway {int} surface {string}"
+)]
+async fn caller_has_been_asked_for_consent(
+    world: &mut G2gWorld,
+    caller: String,
+    tool: String,
+    gw_index: usize,
+    surface_name: String,
+) {
+    crate::steps::when::caller_invokes_modern_mcp_tool(
+        world,
+        &caller,
+        &tool,
+        gw_index,
+        &surface_name,
+        MODERN_MCP_VERSION,
+    )
+    .await;
+    let response = world
+        .response_body
+        .take()
+        .unwrap_or(Value::Null);
+    let consent = ConsentRequest::from_response(&response).unwrap_or_else(|| {
+        panic!("gateway {gw_index} did not ask caller '{caller}' for consent: {:?} {response}", world.response_status)
+    });
+    let original = world
+        .sent_body
+        .take()
+        .expect("the request that needs consent was sent");
+    world.response_status = None;
+    world.consent_request = Some((consent, original));
+}
+
+/// The consented retry activates the caller's stored delegated credentials.
+#[given(
+    expr = "caller {string} has completed MCP tool {string} through gateway {int} surface {string} with the consent request state"
+)]
+async fn caller_has_completed_consented_tool_call(
+    world: &mut G2gWorld,
+    caller: String,
+    tool: String,
+    gw_index: usize,
+    surface_name: String,
+) {
+    crate::steps::when::caller_retries_mcp_tool(world, &caller, &tool, gw_index, &surface_name).await;
+    let response = world
+        .response_body
+        .take()
+        .unwrap_or(Value::Null);
+    assert!(
+        world.response_status == Some(200) && ConsentRequest::from_response(&response).is_none(),
+        "caller '{caller}' did not complete MCP tool '{tool}' after consent: {:?} {response}",
+        world.response_status
+    );
+    world.response_status = None;
+    world.sent_body = None;
+    world
+        .harness()
+        .clear_mock_requests()
+        .await;
+}
+
+#[given(expr = "surface {string} no longer sends delegated credentials over fabric")]
+async fn surface_no_longer_sends_delegated_credentials_over_fabric(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    world.start().await;
+    world
+        .harness()
+        .set_fabric_delegated_credentials(gw_index, &surface_id, false)
+        .await
+        .expect("opt the fabric route out of delegated credentials");
+}
+
+/// The caller signs in at the provider, which redirects back with a valid
+/// code; the gateway must refuse the callback because its `state` was altered.
+#[given(
+    expr = "caller {string} has had a consent callback with a tampered state rejected for OAuth provider {string} at gateway {int}"
+)]
+async fn caller_has_had_tampered_consent_callback_rejected(
+    world: &mut G2gWorld,
+    caller: String,
+    provider_name: String,
+    gw_index: usize,
+) {
+    let (consent, _) = world
+        .consent_request
+        .as_ref()
+        .expect("caller was asked for consent");
+    let provider = world
+        .oauth_providers
+        .get(&provider_name)
+        .unwrap_or_else(|| panic!("unknown OAuth provider '{provider_name}'"));
+    provider
+        .sign_in(&caller)
+        .await;
+    let status = open_consent_callback_with_tampered_state(
+        world
+            .harness()
+            .gw(gw_index)
+            .port,
+        consent,
+        provider,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("caller '{caller}' could not reach the consent callback: {error:#}"));
+    assert!(
+        status.is_client_error(),
+        "the consent callback with a tampered state should be rejected with a 4xx, got {status}"
+    );
+}
+
+#[given(expr = "caller {string} has completed consent for OAuth provider {string} at gateway {int}")]
+async fn caller_has_completed_consent(
+    world: &mut G2gWorld,
+    caller: String,
+    provider_name: String,
+    gw_index: usize,
+) {
+    let (consent, _) = world
+        .consent_request
+        .as_ref()
+        .expect("caller was asked for consent");
+    let provider = world
+        .oauth_providers
+        .get(&provider_name)
+        .unwrap_or_else(|| panic!("unknown OAuth provider '{provider_name}'"));
+    provider
+        .sign_in(&caller)
+        .await;
+    complete_consent(
+        world
+            .harness()
+            .gw(gw_index)
+            .port,
+        consent,
+        provider,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("caller '{caller}' could not complete consent: {error:#}"));
 }
