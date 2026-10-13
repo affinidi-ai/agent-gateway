@@ -248,6 +248,7 @@ pub fn create_identity_api_router(
         .route("/v1/version", get(handlers::get_version))
         // Settings routes (GET is open to all; POST/DELETE require admin and are registered below)
         .route("/v1/settings", get(handlers::get_settings))
+        .route("/v1/settings/audit-events", get(handlers::get_audit_event_catalog))
         // NOTE: storage backup/restore/export and agents-api sign-jwt are admin-only
         // and are registered on the RBAC-gated `auth_manager_router` below, not here.
         // Metrics routes

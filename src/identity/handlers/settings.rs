@@ -68,6 +68,35 @@ pub async fn get_settings(State(state): State<IdentityApiState>) -> Result<Json<
     Ok(Json(settings))
 }
 
+/// One selectable audit event, as the dashboard lists it.
+#[derive(Debug, Serialize)]
+pub struct AuditEventCatalogEntry {
+    /// Name stored in `audit_events` and sent to the settings and integrations APIs.
+    pub event: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub group: crate::audit::catalog::AuditEventGroup,
+    pub group_label: &'static str,
+}
+
+/// The audit events a sink can select, in catalog order, grouped as the
+/// dashboard shows them. The same names are valid for the VP Audit Log
+/// (`audit_events` in settings) and for Governance Audit integrations.
+pub async fn get_audit_event_catalog() -> Json<Vec<AuditEventCatalogEntry>> {
+    Json(
+        crate::audit::catalog::AUDIT_EVENTS
+            .iter()
+            .map(|spec| AuditEventCatalogEntry {
+                event: spec.category,
+                label: spec.name,
+                description: spec.description,
+                group: spec.group,
+                group_label: spec.group.label(),
+            })
+            .collect(),
+    )
+}
+
 /// Helper to check if the calling user has the required RBAC permission.
 /// Returns `Ok(())` if the user is authorised, or an `AppError` otherwise.
 async fn require_settings_edit(
@@ -244,6 +273,31 @@ pub async fn update_settings(
     settings.prometheus_auth_password_hash = String::new();
 
     Ok(Json(settings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_audit_event_catalog_lists_every_event_with_its_group() {
+        let Json(catalog) = get_audit_event_catalog().await;
+
+        assert_eq!(catalog.len(), crate::audit::catalog::AUDIT_EVENTS.len());
+        for (entry, spec) in catalog
+            .iter()
+            .zip(crate::audit::catalog::AUDIT_EVENTS)
+        {
+            assert_eq!(entry.event, spec.category);
+            assert_eq!(entry.label, spec.name);
+            assert_eq!(entry.description, spec.description);
+            assert_eq!(entry.group, spec.group);
+        }
+        let policy = serde_json::to_value(&catalog[0]).unwrap();
+        assert_eq!(policy["event"], "policy_decision");
+        assert_eq!(policy["group"], "policies");
+        assert_eq!(policy["group_label"], "Policies");
+    }
 }
 
 /// Reset settings to defaults

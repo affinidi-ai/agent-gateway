@@ -149,7 +149,9 @@ selection. Each Governance Audit integration receives the events in its own `aud
 an empty list receives nothing. Both take event names from the audit event catalog
 (`src/audit/catalog.rs`), for example `policy_decision`, `auth_failed`, `token_injected`; an
 unknown name is rejected (400). An integration update that leaves `audit_events` out keeps the
-integration's current list. The catalog is also listed in the category's
+integration's current list. `GET /v1/settings/audit-events` lists the catalog in order, each entry
+with its `event` name, `label`, `description`, `group` and `group_label`; the dashboard builds its
+event pickers from it. The catalog is also listed in the category's
 `metadata.event_types` as `audit.<event>` with the event's `group`.
 
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.

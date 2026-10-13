@@ -48,7 +48,7 @@ pub use policy_definitions::{
     update_policy_assignments, update_policy_definition,
 };
 pub use policy_validation::validate_policy;
-pub use settings::{get_settings, reset_settings, update_settings};
+pub use settings::{get_audit_event_catalog, get_settings, reset_settings, update_settings};
 pub use surfaces::{
     create_surface, create_variant, delete_surface, delete_variant, get_resolved_variant, get_surface, list_surfaces,
     promote_variant_to_default, update_surface, update_variant,

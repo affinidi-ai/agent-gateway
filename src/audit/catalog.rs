@@ -18,6 +18,22 @@ pub enum AuditEventGroup {
     Requests,
 }
 
+impl AuditEventGroup {
+    /// The heading the dashboard shows for the group.
+    pub fn label(self) -> &'static str {
+        match self {
+            Policies => "Policies",
+            Trust => "Trust",
+            Identity => "Identity",
+            Trace => "Trace",
+            Auth => "Auth",
+            Delegation => "Delegation",
+            Payments => "Payments",
+            Requests => "Requests",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AuditEventSpec {
     pub category: &'static str,
