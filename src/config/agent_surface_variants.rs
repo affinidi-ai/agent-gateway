@@ -882,6 +882,7 @@ mod tests {
                 response_custom_metadata: None,
                 didwebvh_identity: None,
                 terminate_trace_id: false,
+                a2a: None,
             },
             target: Target {
                 endpoint: "https://prod.example.com".to_string(),

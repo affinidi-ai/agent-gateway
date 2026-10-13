@@ -13,6 +13,7 @@ import FabricDelegatedCredentialsSection, {
   hasOutboundCredentialBindings,
 } from '../_shared/FabricDelegatedCredentialsSection';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
+import { a2aProxyVersions } from '../access-point/a2aSettings';
 
 interface Gateway {
   id: string;
@@ -450,6 +451,9 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
             selectedProxyId={config.a2a_proxy_id || ''}
             a2aProxies={a2aProxies}
             updateFields={updateFields}
+            acceptedVersions={a2aProxyVersions(
+              allNodes?.find(n => n.type === 'access-point')?.config
+            )}
           />
         )}
       </div>

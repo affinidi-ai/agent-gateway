@@ -56,6 +56,32 @@ pub fn canonical_method(method: &str) -> &str {
     recognised_canonical(method).unwrap_or(method)
 }
 
+/// The A2A version a wire method name is spelled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodEra {
+    /// The v0.3 slash form, such as `message/send`.
+    V0_3,
+    /// The v1.0 PascalCase form, such as `SendMessage`.
+    V1_0,
+}
+
+impl MethodEra {
+    /// The era of a method in the table, or `None` for any other method.
+    pub fn of(method: &str) -> Option<Self> {
+        METHOD_TABLE
+            .iter()
+            .find_map(|(canonical, pascal)| {
+                if method == *canonical {
+                    Some(Self::V0_3)
+                } else if method == *pascal {
+                    Some(Self::V1_0)
+                } else {
+                    None
+                }
+            })
+    }
+}
+
 /// Which A2A era a wire method name belongs to, as a metric label:
 /// `"0.3"` (slash-form), `"1.0"` (PascalCase), or `"unknown"`.
 ///
@@ -64,15 +90,11 @@ pub fn canonical_method(method: &str) -> &str {
 /// v1.0 method name while negotiating 0.3 (for example by omitting the header).
 /// Surfacing that skew is the point of tracking it.
 pub fn method_era(method: &str) -> &'static str {
-    for (canonical, pascal) in METHOD_TABLE {
-        if method == *canonical {
-            return "0.3";
-        }
-        if method == *pascal {
-            return "1.0";
-        }
+    match MethodEra::of(method) {
+        Some(MethodEra::V0_3) => "0.3",
+        Some(MethodEra::V1_0) => "1.0",
+        None => "unknown",
     }
-    "unknown"
 }
 
 /// True when `method` is a recognised A2A JSON-RPC method in either era

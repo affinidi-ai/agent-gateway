@@ -283,11 +283,6 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
 - The switch carries `data-testid="settings-flag-<flag>"`, `role="switch"`, and
   `aria-labelledby` pointing at the row's flag-name cell, so its accessible name is the
   flag key.
-- `a2a_legacy_compatibility` is default on, and every reader uses
-  `isA2aLegacyCompatibilityOn` (`utils/a2aLegacyCompatibility.ts`), where unset counts as
-  on, the gateway's rule. On, surfaces accept A2A 1.0 and 0.3 and generated agent cards list
-  both. Off, they serve 1.0 only, and a 0.3 or version-less call gets an
-  unsupported-version error.
 - `mediator_federation` is default off and experimental. On, the Connect via OOB wizard's
   details step (`gateway-add-via-oob/EnterDetailsStep.tsx`) shows a mediator picker
   (`wizard-oob-acceptor-mediator`) that lists only mediators with `status === 'active'` and
@@ -309,10 +304,35 @@ The hidden file input is `data-testid="restore-file-input"`.
   known A2A method in either spelling (v0.3 slash-form or v1.0 PascalCase) or a
   `params.message` envelope is A2A; any other JSON-RPC method is MCP.
 - The A2A method table mirrors `src/a2a/methods.rs`. Keep them in step.
-- The A2A proxy **Agent Card** tab (`a2a-proxy-agent-card-version`) states that the
-  generated card is A2A 1.0 and, following the current `a2a_legacy_compatibility` value,
-  that it also carries the 0.3 fields (on) or is 1.0 only (off). It does not follow
-  `[a2a] default_version`.
+- A2A versions and message validation are per surface, not feature flags. The Access Point
+  panel of an A2A or AP2 surface has an **A2A Protocol** section (`access-point-a2a-protocol`): a
+  checkbox per version (`access-point-a2a-version-0.3`, `-1.0`, both checked by default) and a
+  **Message validation** dropdown (`access-point-a2a-validation`) with **Off**, **JSON-RPC
+  envelope** (the default) and **Envelope + A2A fields**, each with field help. Keep the option
+  labels short: the sidebar is narrow, and the field help explains each level, including that only
+  an appliance-wide administrator can choose Off (the API refuses it from tenant-scoped tokens). The node keeps
+  them flat as `a2a_accepted_versions` and `a2a_validation`; `access-point/a2aSettings.ts` maps
+  them to and from the payload's `access_point.a2a`, which every A2A and AP2 save sends.
+- With no version checked, the section shows `access-point-a2a-versions-error` and a
+  blocking dependency error stops the save.
+- When the Target is an `a2a-proxy://` endpoint, the section is disabled and shows the gateway's
+  fixed versions with **JSON-RPC envelope**, and `access-point-a2a-proxy-locked` gives the same
+  reason when the versions include 0.3: the stored versions
+  of a surface loaded with an A2A proxy Target (kept on the node as `a2a_locked_versions`), and 1.0
+  only for a new surface or one whose Target was just moved to a proxy. The payload leaves
+  `access_point.a2a` out, so the gateway settles it, and saving while viewing an A2A proxy variant
+  keeps the surface's own settings, which still configure any variant whose Target is a URL.
+- When the Managed Agent element targets an A2A proxy, its panel shows
+  `managed-agent-a2a-proxy-protocol-hint`, built from the same fixed versions the Access Point
+  shows: a heading naming them (`managed-agent-a2a-proxy-versions`: "Accepts A2A 1.0 only" or
+  "Accepts A2A 0.3 and 1.0"); for a surface that accepts 0.3, the reason
+  (`managed-agent-a2a-proxy-0-3-reason`: it was created as an A2A 0.3 proxy and keeps 0.3 for its
+  existing callers, while new surfaces accept 1.0 only); then one short line each for the header
+  callers send, the reply per method (`SendMessage` 1.0, `message/send` 0.3), envelope-only
+  validation, and that the versions are fixed.
+- The A2A proxy **Agent Card** tab (`a2a-proxy-agent-card-version`) states that the generated
+  card lists the versions the exposing surface accepts (1.0 by default) and which reply each send
+  method gets. It does not follow `[a2a] default_version`.
 
 ## Governance Audit integrations
 
