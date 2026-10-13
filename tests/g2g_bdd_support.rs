@@ -626,7 +626,7 @@ mod restart_support {
             .build()
             .expect("tokio runtime");
         rt.block_on(async {
-            let mut harness = MultiGatewayHarness::spawn(vec![GatewayPlan::new()])
+            let mut harness = MultiGatewayHarness::spawn(vec![GatewayPlan::new()], vec![None])
                 .await
                 .expect("spawn one gateway");
             let before = harness

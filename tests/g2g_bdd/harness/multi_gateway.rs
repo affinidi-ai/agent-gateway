@@ -27,7 +27,7 @@ use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::mock_server::MockServer;
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
 
-use crate::bdd_support::mediator::{Mediator, ScenarioDockerMediator};
+use crate::bdd_support::mediator::{Mediator, MediatorCrossBridge, ScenarioDockerMediator, bridge_mediator_pairs};
 
 const FEDERATION_SECRET: &str = "g2g-bdd-secret";
 const FEDERATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -48,6 +48,11 @@ pub struct GatewayNode {
     pub port: u16,
     pub outbound_port: Option<u16>,
     pub mediator_id: String,
+    /// Index into `MultiGatewayHarness::mediators` this node registered its
+    /// mediator record against. Two nodes sharing an index share the same
+    /// underlying `ScenarioDockerMediator`; differing indices mean each
+    /// gateway is on its own mediator.
+    pub mediator_index: usize,
     extra_env: HashMap<String, String>,
     _temp_dir: TempDirGuard,
     gateway: GatewayProcess,
@@ -135,40 +140,131 @@ pub struct FabricRouteReadyProbe {
     pub expected_status: u16,
 }
 
-/// Owns N gateway nodes plus the scenario mediator and the directional federation
-/// views built by `federate_pairs`.
+/// Owns N gateway nodes plus the scenario mediator(s) and the directional
+/// federation views built by `federate_pairs`.
 #[derive(Debug)]
 pub struct MultiGatewayHarness {
     nodes: Vec<GatewayNode>,
     remote_views: HashMap<(usize, usize), GatewayRecord>,
-    pub mediator: ScenarioDockerMediator,
+    /// One entry per distinct mediator alias requested by the scenario
+    /// (`gateway N uses mediator "M"`); a scenario that never declares an
+    /// alias gets exactly one entry here, shared by every gateway.
+    mediators: Vec<ScenarioDockerMediator>,
+    /// Cross-mediator relay sidecars (only when gateways use different mediators;
+    /// empty when there is a single shared mediator). Held here purely for
+    /// their `Drop` cleanup — see [`bridge_mediator_pairs`].
+    _mediator_cross_bridges: Vec<MediatorCrossBridge>,
 }
 
 impl MultiGatewayHarness {
     /// Boot one gateway per plan. Mocks are started first so surface targets
     /// can point at them; `fabric://` targets are left as written and wired up
     /// later by `point_surface_at_peer`.
-    pub async fn spawn(plans: Vec<GatewayPlan>) -> Result<Self> {
+    ///
+    /// `mediator_aliases` is 1:1 with `plans`: `None` (or a shared `Some`
+    /// alias) means that gateway shares the default mediator with every other
+    /// `None`/same-alias gateway; a distinct `Some(alias)` gets its own
+    /// independent `ScenarioDockerMediator` (per-gateway mediator
+    /// federation).
+    pub async fn spawn(
+        plans: Vec<GatewayPlan>,
+        mediator_aliases: Vec<Option<String>>,
+    ) -> Result<Self> {
         if plans.is_empty() {
             bail!("MultiGatewayHarness::spawn requires at least one gateway plan");
         }
+        if plans.len() != mediator_aliases.len() {
+            bail!("mediator_aliases must have exactly one entry per gateway plan");
+        }
 
-        let mediator = ScenarioDockerMediator::start().await?;
+        let mut alias_to_index: HashMap<String, usize> = HashMap::new();
+        let mut mediators: Vec<ScenarioDockerMediator> = Vec::new();
+        let mut node_mediator_index: Vec<usize> = Vec::with_capacity(plans.len());
+        for alias in &mediator_aliases {
+            let key = alias
+                .clone()
+                .unwrap_or_else(|| "__default__".to_string());
+            let index = if let Some(&index) = alias_to_index.get(&key) {
+                index
+            } else {
+                // The first mediator in a scenario takes the fast path (fixed
+                // default port unless `G2G_BDD_PARALLELISM` > 1).
+                // A second (or later) distinct alias always reserves its own
+                // free port so it never collides with an already-running
+                // mediator in this same test process.
+                let mediator = if mediators.is_empty() {
+                    ScenarioDockerMediator::start().await?
+                } else {
+                    ScenarioDockerMediator::start_with_free_port().await?
+                };
+                let index = mediators.len();
+                mediators.push(mediator);
+                alias_to_index.insert(key, index);
+                index
+            };
+            node_mediator_index.push(index);
+        }
+
+        // Per-gateway mediator federation gives every mediator its own
+        // isolated Docker bridge network, so a mediator container cannot
+        // resolve a peer mediator's `http://localhost:<port>` service
+        // endpoint on its own. Bridge every pair before any relay traffic
+        // flows; a no-op when there is a single shared mediator.
+        let mediator_refs: Vec<&dyn Mediator> = mediators
+            .iter()
+            .map(|mediator| mediator as &dyn Mediator)
+            .collect();
+        let mediator_cross_bridges = bridge_mediator_pairs(&mediator_refs)
+            .await
+            .context("bridge cross-mediator relay networking")?;
+
+        // Every gateway must be able to fetch the OOB invitation content (and
+        // DID document) hosted on ANY mediator in this topology, not only its
+        // own: the acceptor fetches the invitation from the *inviter's*
+        // mediator during `connect-via-oob`. So the egress allow-list is the
+        // union across every mediator instance, applied to every node.
+        let egress_allowlist = combined_mediator_egress_allowlist(&mediator_refs);
 
         let mut nodes = Vec::with_capacity(plans.len());
         for (offset, plan) in plans.into_iter().enumerate() {
             let index = offset + 1;
-            let node = spawn_node(&format!("g2g-gw{index}"), plan, &mediator, index)
-                .await
-                .with_context(|| format!("spawn gateway {index}"))?;
+            let mediator_index = node_mediator_index[offset];
+            let node = spawn_node(
+                &format!("g2g-gw{index}"),
+                plan,
+                &mediators[mediator_index],
+                index,
+                mediator_index,
+                egress_allowlist.as_deref(),
+            )
+            .await
+            .with_context(|| format!("spawn gateway {index}"))?;
             nodes.push(node);
         }
 
         Ok(Self {
             nodes,
             remote_views: HashMap::new(),
-            mediator,
+            mediators,
+            _mediator_cross_bridges: mediator_cross_bridges,
         })
+    }
+
+    /// The default/shared mediator for this scenario — the first one created.
+    /// Scenarios that never assign per-gateway mediator aliases have exactly
+    /// one mediator, so this is simply *the* mediator.
+    pub fn mediator(&self) -> &ScenarioDockerMediator {
+        &self.mediators[0]
+    }
+
+    /// The mediator a gateway registered against.
+    pub fn mediator_of(
+        &self,
+        one_based_index: usize,
+    ) -> &ScenarioDockerMediator {
+        &self.mediators[self
+            .gw(one_based_index)
+            .mediator_index]
     }
 
     /// 1-indexed accessor.
@@ -309,7 +405,7 @@ impl MultiGatewayHarness {
         pairs: &[(usize, usize)],
     ) -> Result<()> {
         let did_method = self
-            .mediator
+            .mediator()
             .did_method()
             .to_string();
         for (inviter_index, acceptor_index) in pairs {
@@ -328,6 +424,14 @@ impl MultiGatewayHarness {
     ) -> Result<()> {
         let inviter = self.gw(inviter_index);
         let acceptor = self.gw(acceptor_index);
+        // A gateway on its own mediator accepts with that mediator selected, so
+        // its permanent connection point is homed there. Gateways sharing one
+        // mediator accept without selecting one.
+        let acceptor_mediator_id = if acceptor.mediator_index != inviter.mediator_index {
+            Some(acceptor.mediator_id.clone())
+        } else {
+            None
+        };
         let inviter_existing_remotes = inviter
             .admin
             .remote_gateway_ids()
@@ -367,6 +471,7 @@ impl MultiGatewayHarness {
                 &format!("gateway {inviter_index} from gateway {acceptor_index}"),
                 &format!("gateway {acceptor_index}'s view of gateway {inviter_index}"),
                 did_method,
+                acceptor_mediator_id.as_deref(),
             )
             .await
             .with_context(|| format!("gateway {acceptor_index} connect via OOB to gateway {inviter_index}"))?;
@@ -818,6 +923,8 @@ async fn spawn_node(
     plan: GatewayPlan,
     mediator: &dyn Mediator,
     index: usize,
+    mediator_index: usize,
+    egress_allowlist: Option<&str>,
 ) -> Result<GatewayNode> {
     // Start a mock per surface that needs one, then patch the surface target to
     // the mock URL before writing config.
@@ -876,8 +983,8 @@ async fn spawn_node(
         reservation.release_listener();
     }
     let mut extra_env: HashMap<String, String> = HashMap::new();
-    if let Some(allowlist) = mediator_egress_allowlist(mediator) {
-        extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), allowlist);
+    if let Some(allowlist) = egress_allowlist {
+        extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), allowlist.to_string());
     }
     if plan.legacy_only_fabric_receive {
         extra_env.insert("AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY".to_string(), "true".to_string());
@@ -938,10 +1045,31 @@ async fn spawn_node(
         port: gateway_port,
         outbound_port,
         mediator_id: mediator_record.id,
+        mediator_index,
         extra_env,
         _temp_dir: TempDirGuard::new(temp_dir, name),
         gateway,
     })
+}
+
+/// Union of `mediator_egress_allowlist` across every mediator instance in the
+/// topology, so any gateway can fetch an OOB invitation / DID document hosted
+/// on any of them (not just its own).
+fn combined_mediator_egress_allowlist(mediators: &[&dyn Mediator]) -> Option<String> {
+    let mut urls: Vec<String> = Vec::new();
+    for mediator in mediators {
+        if let Some(entries) = mediator_egress_allowlist(*mediator) {
+            for entry in entries.split(',') {
+                if !urls
+                    .iter()
+                    .any(|existing| existing == entry)
+                {
+                    urls.push(entry.to_string());
+                }
+            }
+        }
+    }
+    (!urls.is_empty()).then(|| urls.join(","))
 }
 
 /// Exact mediator DID-document probe URLs to allow-list so `EgressPolicy::Strict`
@@ -1111,6 +1239,89 @@ pub(crate) fn tail_file(
 
 #[cfg(test)]
 mod tests {
+    use super::Mediator;
+
+    #[derive(Debug)]
+    struct MockMediator {
+        did: String,
+        did_document: Option<super::Value>,
+        internal_port: u16,
+    }
+
+    impl Mediator for MockMediator {
+        fn did(&self) -> &str {
+            &self.did
+        }
+
+        fn did_document(&self) -> Option<&super::Value> {
+            self.did_document.as_ref()
+        }
+
+        fn did_method(&self) -> &str {
+            "test"
+        }
+
+        fn internal_port(&self) -> u16 {
+            self.internal_port
+        }
+    }
+
+    // These #[test] fns run under the default libtest harness (see
+    // tests/g2g_bdd_support.rs, which shares this module). The g2g_bdd
+    // binary itself uses a custom cucumber main (harness = false in
+    // Cargo.toml) where #[test] items never execute, so this helper has no
+    // reachable caller there and needs an explicit allow.
+    #[allow(dead_code)]
+    fn mock_mediator(
+        did: &str,
+        internal_port: u16,
+    ) -> Box<dyn Mediator> {
+        Box::new(MockMediator {
+            did: did.to_string(),
+            did_document: None,
+            internal_port,
+        })
+    }
+
+    #[test]
+    fn combined_egress_allowlist_is_none_when_no_mediator_has_an_endpoint() {
+        let mediators = [mock_mediator("did:test:a", 0)];
+        let refs: Vec<&dyn Mediator> = mediators
+            .iter()
+            .map(|mediator| mediator.as_ref())
+            .collect();
+        assert_eq!(super::combined_mediator_egress_allowlist(&refs), None);
+    }
+
+    #[test]
+    fn combined_egress_allowlist_unions_and_dedupes_across_mediators() {
+        let mediators = [
+            mock_mediator("did:test:a", 7030),
+            // Same port as the first mediator: every derived entry is a
+            // duplicate and must be collapsed, not doubled.
+            mock_mediator("did:test:b", 7030),
+            mock_mediator("did:test:c", 7031),
+        ];
+        let refs: Vec<&dyn Mediator> = mediators
+            .iter()
+            .map(|mediator| mediator.as_ref())
+            .collect();
+        let combined = super::combined_mediator_egress_allowlist(&refs).expect("non-empty allowlist");
+        let entries: Vec<&str> = combined.split(',').collect();
+
+        assert_eq!(entries.len(), 6, "expected 3 deduped entries per distinct port, got: {entries:?}");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| **entry == "http://127.0.0.1:7030")
+                .count(),
+            1
+        );
+        assert!(entries.contains(&"http://127.0.0.1:7031"));
+        assert!(entries.contains(&"http://127.0.0.1:7030/.well-known/did.json"));
+        assert!(entries.contains(&"http://127.0.0.1:7031/.well-known/did.jsonl"));
+    }
+
     #[test]
     fn absent_metric_sums_to_zero() {
         let metric = super::FABRIC_FORWARD_RECEIVED_METRIC;

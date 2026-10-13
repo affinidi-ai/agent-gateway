@@ -162,4 +162,13 @@ else
   echo "✅ Mediator config already present at ${ABS_TARGET} (use --force to regenerate)"
 fi
 
+# A gateway whose peer is on another mediator sends a routing/2.0/forward to its
+# own mediator, so the mediator must recognise its public URL (the --public-url
+# host) as itself.
+# Reconcile on every run so cached configs are repaired too.
+CONFIG_PORT="$(sed -n 's/^listen_address *= *"[^"]*:\([0-9]*\)"/\1/p' "${CONF_DIR}/mediator.toml" | head -1)"
+"${REPO_ROOT}/scripts/mediator/reconcile-mediator-config.sh" \
+  "${CONF_DIR}/mediator.toml" \
+  "http://localhost:${CONFIG_PORT:-${MEDIATOR_PORT}}"
+
 echo "TARGET_DIR=${ABS_TARGET}"

@@ -845,6 +845,22 @@ pub async fn response_status_is(
     );
 }
 
+#[then(expr = "the response says {string}")]
+pub async fn response_says(
+    world: &mut G2gWorld,
+    expected: String,
+) {
+    let body = world
+        .response_body
+        .as_ref()
+        .expect("a When must record the response body before this Then");
+    let text = match body {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    assert!(text.contains(&expected), "response body {text:?} does not contain {expected:?}");
+}
+
 #[then(regex = r"^all (\d+) responses have status (\d+)$")]
 pub async fn all_concurrent_responses_have_status(
     world: &mut G2gWorld,
@@ -1116,4 +1132,140 @@ fn expected_response_for_request(
         expected_object.insert("id".to_string(), request_id.clone());
     }
     expected
+}
+
+#[then(regex = r"^gateway (\d+) and gateway (\d+) see each other as Active$")]
+pub async fn gateways_see_each_other_as_active(
+    world: &mut G2gWorld,
+    first: usize,
+    second: usize,
+) {
+    for (viewer, peer) in [(first, second), (second, first)] {
+        let remote = only_remote_gateway(world, viewer, peer).await;
+        assert_eq!(
+            remote.status,
+            crate::bdd_support::admin_client::GatewayStatus::Active,
+            "gateway {viewer}'s record of gateway {peer}"
+        );
+    }
+}
+
+#[then(regex = r#"^gateway (\d+) reaches gateway (\d+) through mediator "([^"]+)"$"#)]
+pub async fn gateway_reaches_gateway_through_mediator(
+    world: &mut G2gWorld,
+    viewer: usize,
+    peer: usize,
+    mediator_alias: String,
+) {
+    let owner = world
+        .topology
+        .gateway_mediator_alias
+        .iter()
+        .find(|(_, alias)| **alias == mediator_alias)
+        .map(|(gateway, _)| *gateway)
+        .unwrap_or_else(|| panic!("no gateway uses mediator '{mediator_alias}'"));
+    let expected = mediator_authority(
+        world
+            .harness()
+            .mediator_of(owner),
+    );
+    let remote = only_remote_gateway(world, viewer, peer).await;
+    let peer_did = remote
+        .did
+        .unwrap_or_else(|| panic!("gateway {viewer}'s record of gateway {peer} has no DID"));
+    let service_uri = peer_did_service_uri(&peer_did);
+
+    assert_eq!(
+        endpoint_authority(&service_uri),
+        expected,
+        "gateway {peer}'s DID {peer_did} should name mediator '{mediator_alias}'"
+    );
+}
+
+async fn only_remote_gateway(
+    world: &G2gWorld,
+    viewer: usize,
+    peer: usize,
+) -> crate::bdd_support::admin_client::GatewayRecord {
+    let mut remotes = world
+        .harness()
+        .gw(viewer)
+        .admin
+        .remote_gateways()
+        .await
+        .expect("list remote gateways");
+    assert_eq!(remotes.len(), 1, "gateway {viewer} should know only gateway {peer}");
+    remotes.remove(0)
+}
+
+fn mediator_authority(mediator: &dyn crate::bdd_support::mediator::Mediator) -> (String, u16) {
+    let uri = mediator
+        .did_document()
+        .and_then(|doc| {
+            doc.get("service")?
+                .as_array()
+                .cloned()
+        })
+        .into_iter()
+        .flatten()
+        .find_map(|service| {
+            let endpoints = service.get("serviceEndpoint")?;
+            let candidates: Vec<Value> = match endpoints {
+                Value::Array(entries) => entries.clone(),
+                other => vec![other.clone()],
+            };
+            candidates
+                .into_iter()
+                .find_map(|endpoint| {
+                    let uri = match &endpoint {
+                        Value::String(uri) => uri.clone(),
+                        other => other
+                            .get("uri")?
+                            .as_str()?
+                            .to_string(),
+                    };
+                    uri.starts_with("http")
+                        .then_some(uri)
+                })
+        })
+        .unwrap_or_else(|| panic!("mediator {} has no HTTP endpoint in its DID document", mediator.did()));
+    endpoint_authority(&uri)
+}
+
+fn endpoint_authority(uri: &str) -> (String, u16) {
+    let url = url::Url::parse(uri).unwrap_or_else(|e| panic!("invalid endpoint {uri}: {e}"));
+    (
+        url.host_str()
+            .expect("endpoint host")
+            .to_ascii_lowercase(),
+        url.port_or_known_default()
+            .expect("endpoint port"),
+    )
+}
+
+/// The `DIDCommMessaging` service URI encoded in a `did:peer:2` DID.
+fn peer_did_service_uri(did: &str) -> String {
+    let encoded = did
+        .strip_prefix("did:peer:2.")
+        .unwrap_or_else(|| panic!("{did} is not a did:peer:2 DID; run with FABRIC_BDD_DID_METHOD=peer"))
+        .split('.')
+        .find_map(|element| element.strip_prefix('S'))
+        .unwrap_or_else(|| panic!("{did} has no service"));
+    let service: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.trim_end_matches('='))
+            .expect("decode did:peer service"),
+    )
+    .expect("parse did:peer service");
+    let endpoint = service
+        .get("s")
+        .expect("did:peer service endpoint");
+    match endpoint {
+        Value::String(uri) => uri.clone(),
+        other => other
+            .get("uri")
+            .and_then(Value::as_str)
+            .expect("did:peer service uri")
+            .to_string(),
+    }
 }

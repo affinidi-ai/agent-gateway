@@ -55,6 +55,12 @@ pub struct PendingOOBConnection {
 
     #[serde(default)]
     pub temporary_cp_id: Option<String>,
+
+    /// Record id of the acceptor mediator, validated against the caller's
+    /// tenant and token scope when the invitation was accepted. `None` when
+    /// the permanent connection point uses the inviter's mediator.
+    #[serde(default)]
+    pub mediator_record_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

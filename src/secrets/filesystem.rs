@@ -305,6 +305,7 @@ impl SecretsStore for FilesystemSecretsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -338,5 +339,71 @@ mod tests {
         assert_eq!(loaded.id, created.id);
         assert_eq!(loaded.secret_id, "bdd-secret");
         assert_eq!(loaded.value, "top-secret");
+    }
+
+    #[tokio::test]
+    async fn update_changes_updated_at_for_value_and_metadata_changes() {
+        let dir = tempdir().unwrap();
+        let store = FilesystemSecretsStore::new_async(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let created = store
+            .create(CreateSecretRequest {
+                tenant_id: None,
+                name: "Timestamp Secret".to_string(),
+                secret_id: "timestamp-secret".to_string(),
+                description: Some("before".to_string()),
+                value: "old-value".to_string(),
+                secret_type: "General".to_string(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let value_updated = store
+            .update(
+                &created.id,
+                UpdateSecretRequest {
+                    name: None,
+                    description: None,
+                    value: Some("new-value".to_string()),
+                    update_value: Some(true),
+                    secret_type: None,
+                    tags: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value_updated.created_at, created.created_at);
+        assert!(value_updated.updated_at > created.updated_at);
+        assert_eq!(value_updated.value, "new-value");
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let metadata_updated = store
+            .update(
+                &created.id,
+                UpdateSecretRequest {
+                    name: None,
+                    description: Some("after".to_string()),
+                    value: None,
+                    update_value: None,
+                    secret_type: None,
+                    tags: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(metadata_updated.created_at, created.created_at);
+        assert!(metadata_updated.updated_at > value_updated.updated_at);
+        assert_eq!(
+            metadata_updated
+                .description
+                .as_deref(),
+            Some("after")
+        );
     }
 }

@@ -123,6 +123,25 @@ approval sends `connection-accepted` from its DID. System Connection Points (`oo
 `oobacceptor`, `system`) never accept a `connection-setup`. Invitations created before the gateway
 recorded the message id are refused and must be created again.
 
+The handshake always runs on the inviter's mediator. The acceptor's permanent connection point uses
+the inviter's mediator too, unless `connect-via-oob` names one of the acceptor's own mediators in
+`acceptor_mediator_id`. The field is refused with `400` unless the experimental `mediator_federation`
+feature flag is on (it is off by default). That mediator must be within the caller's tenant and token
+scope, referenceable by the new gateway's tenant (as for connection points), Active, and registered
+(`our_did` / `our_secrets`), otherwise the request fails with `400`
+before any outbound call. If the pending connection is lost before `connection-accepted` arrives, the
+acceptor recovers its mediator from the temporary connection point. If that is the temporary
+connection point's own (the inviter's) mediator, recovery proceeds; otherwise it refuses to finish
+unless the acceptor mediator record recorded at accept time is still Active with that DID. The
+acceptor's permanent connection point stores that record id as its `mediator_id`, so finalize,
+recovery and its listener read that record by id, never a mediator found by DID. See [per-gateway mediators](PER_GATEWAY_MEDIATOR_FEDERATION.md).
+
+`pack_and_send_message` chooses each send's route from the recipient's DID: when its
+`DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
+in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
+directly. The route does not depend on the feature flag. Fabric stream frames and the x402
+facilitator always send directly.
+
 ## Peer issuer DIDs
 
 A gateway sends fabric envelopes from a per-pairing Connection Point DID but signs the identity

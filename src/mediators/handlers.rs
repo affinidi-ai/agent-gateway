@@ -114,7 +114,11 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
         .map(|Extension(scope)| scope)
 }
 
-fn mediator_allowed(
+/// Whether `mediator` is visible/usable by the caller identified by `context`
+/// / `scope`. Reused outside this module (e.g. `connect_via_oob`'s
+/// `acceptor_mediator_id` selection) so every mediator lookup enforces the
+/// same tenant/resource-scope boundary.
+pub(crate) fn mediator_allowed(
     mediator: &Mediator,
     context: &Option<Extension<PatTenantContext>>,
     scope: &Option<Extension<PatResourceScope>>,

@@ -445,6 +445,7 @@ const SecretsPage: React.FC = () => {
                         <th>Tags</th>
                         <th>Type</th>
                         <th>Created</th>
+                        <th>Updated</th>
                         <th>Actions</th>
                       </tr>
                     </thead>
@@ -480,6 +481,9 @@ const SecretsPage: React.FC = () => {
                           </td>
                           <td>
                             <small>{formatDateTime(secret.created_at)}</small>
+                          </td>
+                          <td>
+                            <small>{formatDateTime(secret.updated_at)}</small>
                           </td>
                           <td>
                             <DeleteButton

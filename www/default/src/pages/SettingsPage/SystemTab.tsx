@@ -456,6 +456,27 @@ const SystemTab: React.FC<SystemTabProps> = ({
                   featureFlags={featureFlags}
                   updateSettings={updateSettings}
                 />
+                <FeatureFlagRow
+                  flag="mediator_federation"
+                  // Default off when unset — must be explicit `true` to reveal.
+                  checked={featureFlags.mediator_federation === true}
+                  disabled={isSubmitting}
+                  description={
+                    <>
+                      Lets a connection be homed on this gateway's own mediator instead of the
+                      inviter's, by adding a mediator picker to the <code>Connect via OOB</code>{' '}
+                      wizard. Experimental: such a connection becomes Active, but requests between
+                      gateways on different mediators are not relayed yet. Turning this off does not
+                      affect existing connections.
+                    </>
+                  }
+                  onChangeMessages={{
+                    on: 'Mediator federation enabled.',
+                    off: 'Mediator federation disabled.',
+                  }}
+                  featureFlags={featureFlags}
+                  updateSettings={updateSettings}
+                />
               </tbody>
             </table>
           </div>

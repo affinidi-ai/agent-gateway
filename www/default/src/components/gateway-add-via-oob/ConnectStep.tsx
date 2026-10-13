@@ -8,6 +8,7 @@ interface ConnectStepProps {
   name: string;
   description: string;
   didMethod?: string;
+  acceptorMediatorId?: string;
   onConnected: (gateway: any) => void;
   onBack: () => void;
   onCancel: () => void;
@@ -19,6 +20,7 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
   name,
   description,
   didMethod,
+  acceptorMediatorId,
   onConnected,
   onBack,
   onCancel,
@@ -54,6 +56,7 @@ const ConnectStep: React.FC<ConnectStepProps> = ({
         name: name,
         description: description,
         did_method: didMethod || 'web',
+        acceptor_mediator_id: acceptorMediatorId || undefined,
       });
 
       setProgress(70);
