@@ -2193,6 +2193,11 @@ async fn proxy_handler_with_mcp_runtime(
         };
         if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body_bytes) {
             channel_warn!(config_id, "Rejecting MCP request body at admission: {}", refusal.reason());
+            crate::audit::request_events::mcp_body_refused(
+                &audit_facts,
+                &refusal,
+                matches!(classification, crate::mcp::request_validation::McpRequestClassification::Modern(_)),
+            );
             connection_guard
                 .decrement()
                 .await;

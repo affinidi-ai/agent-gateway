@@ -170,6 +170,17 @@ pub fn mcp_request_rejected(
     );
 }
 
+/// An MCP body that is not one unambiguous JSON-RPC object was refused. Every
+/// such body is a malformed envelope, a batch included.
+pub fn mcp_body_refused(
+    facts: &RequestFacts<'_>,
+    refusal: &crate::mcp::tool_analyzer::BodyRefusal,
+    modern: bool,
+) {
+    let (http_status, rpc_error_code) = refusal.caller_status_and_code(modern);
+    request_rejected(facts, RejectionStage::Admission, RejectionReason::InvalidEnvelope, http_status, rpc_error_code);
+}
+
 /// An MCP resource token was refused; the request gets the OAuth challenge.
 pub fn resource_token_failed(
     facts: &RequestFacts<'_>,
@@ -349,6 +360,28 @@ mod tests {
         assert_eq!(
             rejected(&events),
             vec![(RejectionStage::Admission, RejectionReason::VersionUnsupported, 400, Some(-32022))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_mcp_body_is_an_invalid_envelope_recorded_as_the_caller_received_it() {
+        use crate::mcp::tool_analyzer::BodyRefusal;
+        let ((), events) = crate::audit::producer::capture(async {
+            mcp_body_refused(&facts(), &BodyRefusal::NotJson("eof".into()), false);
+            mcp_body_refused(&facts(), &BodyRefusal::AmbiguousKeys, false);
+            mcp_body_refused(&facts(), &BodyRefusal::Batch, false);
+            mcp_body_refused(&facts(), &BodyRefusal::Batch, true);
+        })
+        .await;
+
+        assert_eq!(
+            rejected(&events),
+            vec![
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32600)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 422, None),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 400, Some(-32600)),
+            ]
         );
     }
 
