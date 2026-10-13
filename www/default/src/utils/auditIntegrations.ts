@@ -1,4 +1,4 @@
-/** Integration category that receives every record written to the VP Audit Log. */
+/** Integration category that receives the audit events it selects. */
 export const AUDIT_INTEGRATION_CATEGORY = 'audit';
 
 /** Integration types with a JSON payload that can carry the full audit record. */

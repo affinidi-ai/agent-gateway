@@ -22,6 +22,7 @@ import {
 } from '../utils/auditIntegrations';
 import { usePermissions } from '../context/PermissionsContext';
 import AuditIntegrationCard from '../components/integrations/AuditIntegrationCard';
+import AuditEventsSection from '../components/integrations/AuditEventsSection';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
 import { useIntegrationSamples } from '../hooks/useIntegrationSamples';
 import { IntegrationContents } from '../utils/integrationSamples';
@@ -119,6 +120,8 @@ interface IntegrationFormData {
   configuration: string;
   content: string;
   status: string;
+  /** Events a Governance Audit integration receives; sent only for that category. */
+  audit_events: string[];
 }
 
 const EditIntegrationPage: React.FC = () => {
@@ -139,6 +142,7 @@ const EditIntegrationPage: React.FC = () => {
     configuration: '{}',
     content: '{}',
     status: 'active',
+    audit_events: [],
   });
   const categories = useMemo(
     () => selectableCategories(integrationConfig?.categories ?? [], canViewAudit),
@@ -372,6 +376,7 @@ const EditIntegrationPage: React.FC = () => {
             ? integration.content
             : JSON.stringify(integration.content, null, 2),
         status: integration.status || 'active',
+        audit_events: Array.isArray(integration.audit_events) ? integration.audit_events : [],
       });
 
       // Load email-specific state if it's an email integration
@@ -597,6 +602,10 @@ const EditIntegrationPage: React.FC = () => {
         configuration: configObj,
         content: contentObj,
         status: formData.status,
+        // The event list belongs to Governance Audit integrations only.
+        ...(formData.category === AUDIT_INTEGRATION_CATEGORY
+          ? { audit_events: formData.audit_events }
+          : {}),
       };
 
       if (isEditMode && id) {
@@ -669,6 +678,7 @@ const EditIntegrationPage: React.FC = () => {
         configuration: '{}',
         content: '{}',
         status: 'active',
+        audit_events: [],
       });
       setEmailConfiguration({
         smtp_host: '',
@@ -1218,6 +1228,17 @@ const EditIntegrationPage: React.FC = () => {
                       When disabled, this integration will not send notifications
                     </small>
                   </div>
+
+                  {formData.category === AUDIT_INTEGRATION_CATEGORY && (
+                    <AuditEventsSection
+                      selected={formData.audit_events}
+                      onChange={events => {
+                        setFormData(prev => ({ ...prev, audit_events: events }));
+                        setIsModified(true);
+                      }}
+                      disabled={isSaving}
+                    />
+                  )}
 
                   <div className="d-flex justify-content-between">
                     <button

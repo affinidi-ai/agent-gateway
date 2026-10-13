@@ -10,6 +10,7 @@ jest.mock('../../api', () => ({
   apiClient: {
     get: jest.fn(),
     post: jest.fn(),
+    getAuditEventCatalog: jest.fn(),
   },
 }));
 
@@ -35,6 +36,24 @@ if (typeof globalThis.crypto?.randomUUID !== 'function') {
 
 const mockGet = apiClient.get as jest.Mock;
 const mockPost = apiClient.post as jest.Mock;
+const mockGetAuditEventCatalog = apiClient.getAuditEventCatalog as jest.Mock;
+
+const AUDIT_EVENT_CATALOG = [
+  {
+    event: 'policy_decision',
+    label: 'Policy Decision',
+    description: 'An OPA policy allowed or denied a request',
+    group: 'policies',
+    group_label: 'Policies',
+  },
+  {
+    event: 'auth_failed',
+    label: 'Auth Failed',
+    description: 'A caller failed authentication',
+    group: 'auth',
+    group_label: 'Auth',
+  },
+];
 
 const INTEGRATION_CONFIG = {
   types: [
@@ -49,7 +68,7 @@ const INTEGRATION_CONFIG = {
     {
       enum_value: 'audit',
       name: 'Governance Audit',
-      description: 'Forwards every record written to the VP Audit Log',
+      description: 'Sends the audit events you select',
       metadata: {},
     },
   ],
@@ -150,6 +169,58 @@ describe('AddIntegrationWizardPage category samples', () => {
       })
     );
     mockPost.mockResolvedValue({ data: {} });
+    mockGetAuditEventCatalog.mockReset();
+    mockGetAuditEventCatalog.mockResolvedValue(AUDIT_EVENT_CATALOG);
+  });
+
+  it('creates a Governance Audit integration with the events chosen to send', async () => {
+    renderWizard();
+    await categorySelect('audit');
+    fireEvent.click(await screen.findByTestId('integration-audit-group-policies'));
+
+    fireEvent.change(screen.getByPlaceholderText('e.g., Email integration'), {
+      target: { value: 'Audit to Kafka' },
+    });
+    fireEvent.change(screen.getByTestId('stream-topic-input'), {
+      target: { value: 'governance-audit' },
+    });
+    fireEvent.change(screen.getByTestId('stream-brokers-input'), {
+      target: { value: 'kafka-1:9092' },
+    });
+    const createButton = screen.getByRole('button', { name: /Create integration/ });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.submit(screen.getByTestId('integration-form'));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPost.mock.calls[0][1]).toMatchObject({
+      category: 'audit',
+      audit_events: ['policy_decision'],
+    });
+  });
+
+  it('offers events to send only for the Governance Audit category', async () => {
+    renderWizard('?category=general&type=webhook');
+    await categorySelect('general');
+
+    expect(screen.queryByTestId('integration-audit-events')).not.toBeInTheDocument();
+  });
+
+  it('sends no event list for other categories', async () => {
+    renderWizard('?category=general&type=webhook');
+    await categorySelect('general');
+    fireEvent.change(screen.getByPlaceholderText('e.g., Email integration'), {
+      target: { value: 'General hook' },
+    });
+    fireEvent.change(
+      screen.getByPlaceholderText('https://api.example.com/webhooks/notifications'),
+      {
+        target: { value: 'https://hooks.example.test/general' },
+      }
+    );
+    fireEvent.submit(screen.getByTestId('integration-form'));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPost.mock.calls[0][1]).not.toHaveProperty('audit_events');
   });
 
   it('opens on a Kafka audit stream seeded with the full-record template and creates it', async () => {

@@ -17,6 +17,7 @@ import { useIntegrationSamples } from '../hooks/useIntegrationSamples';
 import { IntegrationContents } from '../utils/integrationSamples';
 import RuntimeVariablesSidebar from '../components/RuntimeVariablesSidebar';
 import AuditIntegrationCard from '../components/integrations/AuditIntegrationCard';
+import AuditEventsSection from '../components/integrations/AuditEventsSection';
 
 interface IntegrationFieldMetadata {
   name: string;
@@ -124,6 +125,8 @@ const AddIntegrationWizardPage: React.FC = () => {
   const [category, setCategory] = useState('general');
   const [configuration, setConfiguration] = useState('{}');
   const [content, setContent] = useState('{}');
+  // Events a Governance Audit integration receives; nothing until chosen.
+  const [auditEvents, setAuditEvents] = useState<string[]>([]);
 
   // Email-specific state
   const [emailConfiguration, setEmailConfiguration] = useState<EmailConfiguration>({
@@ -582,6 +585,8 @@ const AddIntegrationWizardPage: React.FC = () => {
         configuration: configObj,
         content: contentObj,
         status: 'active',
+        // The event list belongs to Governance Audit integrations only.
+        ...(category === AUDIT_INTEGRATION_CATEGORY ? { audit_events: auditEvents } : {}),
       };
 
       const response = await apiClient.post('/integrations', payload);
@@ -905,6 +910,17 @@ const AddIntegrationWizardPage: React.FC = () => {
                         </small>
                       </div>
                     </>
+                  )}
+
+                  {category === AUDIT_INTEGRATION_CATEGORY && (
+                    <AuditEventsSection
+                      selected={auditEvents}
+                      onChange={events => {
+                        setAuditEvents(events);
+                        setIsModified(true);
+                      }}
+                      disabled={isSubmitting}
+                    />
                   )}
 
                   <div className="d-flex justify-content-between">
