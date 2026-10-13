@@ -275,31 +275,6 @@ pub async fn update_settings(
     Ok(Json(settings))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn the_audit_event_catalog_lists_every_event_with_its_group() {
-        let Json(catalog) = get_audit_event_catalog().await;
-
-        assert_eq!(catalog.len(), crate::audit::catalog::AUDIT_EVENTS.len());
-        for (entry, spec) in catalog
-            .iter()
-            .zip(crate::audit::catalog::AUDIT_EVENTS)
-        {
-            assert_eq!(entry.event, spec.category);
-            assert_eq!(entry.label, spec.name);
-            assert_eq!(entry.description, spec.description);
-            assert_eq!(entry.group, spec.group);
-        }
-        let policy = serde_json::to_value(&catalog[0]).unwrap();
-        assert_eq!(policy["event"], "policy_decision");
-        assert_eq!(policy["group"], "policies");
-        assert_eq!(policy["group_label"], "Policies");
-    }
-}
-
 /// Reset settings to defaults
 pub async fn reset_settings(
     Extension(user_id): Extension<String>,
@@ -329,4 +304,29 @@ pub async fn reset_settings(
     info!("Settings reset to defaults");
 
     Ok(Json(default_settings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_audit_event_catalog_lists_every_event_with_its_group() {
+        let Json(catalog) = get_audit_event_catalog().await;
+
+        assert_eq!(catalog.len(), crate::audit::catalog::AUDIT_EVENTS.len());
+        for (entry, spec) in catalog
+            .iter()
+            .zip(crate::audit::catalog::AUDIT_EVENTS)
+        {
+            assert_eq!(entry.event, spec.category);
+            assert_eq!(entry.label, spec.name);
+            assert_eq!(entry.description, spec.description);
+            assert_eq!(entry.group, spec.group);
+        }
+        let policy = serde_json::to_value(&catalog[0]).unwrap();
+        assert_eq!(policy["event"], "policy_decision");
+        assert_eq!(policy["group"], "policies");
+        assert_eq!(policy["group_label"], "Policies");
+    }
 }
