@@ -91,6 +91,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Networking** retryable status codes: an empty field means the gateway default and
+  saves no `retryable_status_codes`, and its placeholder says so. The **Retry on
+  connection errors only** switch saves an empty list and disables the field. A field
+  that isn't a comma-separated list of HTTP status codes (100 to 599) blocks Save. Test
+  ids: `networking-retry-status-codes-input` and
+  `networking-retry-connection-errors-only-switch`.
 
 ## Access Tokens page
 

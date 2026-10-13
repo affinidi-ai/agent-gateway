@@ -3,7 +3,7 @@ import { Form } from 'react-bootstrap';
 import type { ConfigPanelProps } from '../types';
 import FieldHelp from '../../../shared/FieldHelp';
 
-const NetworkingPanel: React.FC<ConfigPanelProps> = ({ config, updateField }) => (
+const NetworkingPanel: React.FC<ConfigPanelProps> = ({ config, updateField, errorByField }) => (
   <>
     <div className="config-section">
       <label>Timeouts</label>
@@ -166,16 +166,56 @@ const NetworkingPanel: React.FC<ConfigPanelProps> = ({ config, updateField }) =>
             />
           </Form.Group>
           <Form.Group className="mt-2">
-            <Form.Label className="small text-muted mb-1">Retryable status codes</Form.Label>
+            <div className="d-flex align-items-center gap-1 mb-1">
+              <Form.Label className="small text-muted mb-0">Retryable status codes</Form.Label>
+              <FieldHelp
+                testId="field-help-networking-retryable-status-codes"
+                ariaLabel="About Retryable status codes"
+              >
+                The response status codes that make the gateway retry a request. Leave the field
+                empty to use the gateway default: 408, 429, 500, 502, 503 and 504.
+              </FieldHelp>
+            </div>
             <Form.Control
               size="sm"
               type="text"
+              placeholder="Gateway default"
+              data-testid="networking-retry-status-codes-input"
+              disabled={config.retry_connection_errors_only === true}
+              isInvalid={!!errorByField?.retry_status_codes}
               value={config.retry_status_codes ?? ''}
               onChange={e => updateField('retry_status_codes', e.target.value)}
             />
-            <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-              Comma-separated HTTP status codes (e.g. 502,503,504)
-            </Form.Text>
+            {errorByField?.retry_status_codes ? (
+              <Form.Control.Feedback type="invalid" style={{ fontSize: '10px' }}>
+                {errorByField.retry_status_codes}
+              </Form.Control.Feedback>
+            ) : (
+              <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
+                Comma-separated HTTP status codes (e.g. 502,503,504)
+              </Form.Text>
+            )}
+            <Form.Check
+              type="switch"
+              id="retry-connection-errors-only"
+              className="mt-1"
+              data-testid="networking-retry-connection-errors-only-switch"
+              label={
+                <span className="d-flex align-items-center gap-1">
+                  Retry on connection errors only
+                  <FieldHelp
+                    testId="field-help-networking-retry-on-connection-errors-only"
+                    ariaLabel="About Retry on connection errors only"
+                  >
+                    When on, the gateway retries only a request that fails without a response, for
+                    example when the target can't be reached. It never retries because of a status
+                    code.
+                  </FieldHelp>
+                </span>
+              }
+              checked={config.retry_connection_errors_only === true}
+              onChange={e => updateField('retry_connection_errors_only', e.target.checked)}
+            />
           </Form.Group>
         </>
       )}

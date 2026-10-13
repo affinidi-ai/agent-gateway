@@ -7,6 +7,7 @@ import {
 import { nodesFromSurface } from '../../nodesFromSurface';
 
 const incomplete = (c: any) => networkingDefinition.incompleteReason!(c);
+const validate = (c: any) => networkingDefinition.validate!(c);
 
 describe('networking configFromPayload', () => {
   it('is registered on the definition', () => {
@@ -124,11 +125,76 @@ describe('networkingConfigFromWire edge cases', () => {
     expect(endpointRule.check(flat)).toBe(false);
   });
 
-  it('omits an empty list of retryable status codes', () => {
-    const flat = networkingConfigFromWire({
-      retry: { max_attempts: 2, retryable_status_codes: [] },
+  it('loads an empty list of retryable status codes as connection errors only', () => {
+    const wire = { retry: { max_attempts: 2, retryable_status_codes: [] } };
+    const flat = networkingConfigFromWire(wire);
+    expect(flat).toEqual({
+      retry_enabled: true,
+      retry_max: '2',
+      retry_connection_errors_only: true,
     });
-    expect(flat).toEqual({ retry_enabled: true, retry_max: '2' });
+    expect(networkingConfigToWire(flat)).toEqual(wire);
+  });
+
+  it('saves connection errors only as an empty list whatever the field holds', () => {
+    expect(
+      networkingConfigToWire({
+        retry_enabled: true,
+        retry_connection_errors_only: true,
+        retry_status_codes: '502',
+      })
+    ).toEqual({ retry: { max_attempts: 3, retryable_status_codes: [] } });
+  });
+
+  it('leaves the status codes to the gateway default when the field is unset or empty', () => {
+    for (const retry_status_codes of [undefined, '', ' , ']) {
+      expect(networkingConfigToWire({ retry_enabled: true, retry_status_codes })).toEqual({
+        retry: { max_attempts: 3 },
+      });
+    }
+  });
+
+  it('flags status codes that are not HTTP status codes', () => {
+    for (const retry_status_codes of ['abc', '502,abc', '5000', '99', '502x', '600']) {
+      expect(validate({ retry_enabled: true, retry_status_codes })).toEqual([
+        {
+          field: 'retry_status_codes',
+          message: 'Enter HTTP status codes separated by commas, e.g. 502,503,504',
+        },
+      ]);
+    }
+  });
+
+  it('accepts status codes, an empty field, connection errors only and disabled retry', () => {
+    expect(validate({ retry_enabled: true, retry_status_codes: '408, 502,503' })).toEqual([]);
+    expect(validate({ retry_enabled: true, retry_status_codes: '' })).toEqual([]);
+    expect(validate({ retry_enabled: true })).toEqual([]);
+    expect(
+      validate({ retry_enabled: true, retry_connection_errors_only: true, retry_status_codes: 'x' })
+    ).toEqual([]);
+    expect(validate({ retry_enabled: false, retry_status_codes: 'x' })).toEqual([]);
+  });
+
+  it('keeps stored zeros through a load and save', () => {
+    const wire = {
+      retry: { max_attempts: 0, retryable_status_codes: [502] },
+      circuit_breaker: { failure_threshold: 0, timeout_secs: 0 },
+    };
+    expect(networkingConfigToWire(networkingConfigFromWire(wire))).toEqual(wire);
+  });
+
+  it('uses the defaults only for empty or non-numeric fields', () => {
+    expect(
+      networkingConfigToWire({
+        retry_enabled: true,
+        retry_max: '',
+        circuit_breaker_enabled: true,
+        cb_threshold: 'x',
+      })
+    ).toEqual({
+      retry: { max_attempts: 3 },
+      circuit_breaker: { failure_threshold: 5, timeout_secs: 30 },
+    });
   });
 
   it('ignores blocks that are not objects', () => {
@@ -254,5 +320,177 @@ describe('Networking set through the API on the canvas', () => {
     const nodes = nodesFromSurface(surface({}));
     expect(nodes.some(n => n.type === 'networking')).toBe(false);
     expect(save(nodes).target.networking).toBeUndefined();
+  });
+});
+
+describe('Networking changed through the API after a dashboard save', () => {
+  const save = (nodes: any[]): any =>
+    registry.buildPayload({
+      protocol: 'a2a',
+      surfaceMeta: { name: 'networking-api', tags: [], status: 'active' },
+      allNodes: nodes,
+      nodesOfType: type => nodes.filter(n => n.type === type),
+      firstNodeOfType: type => nodes.find(n => n.type === type),
+    });
+
+  /** A surface saved from the dashboard, carrying its canvas blob. */
+  const savedFromDashboard = (): any => {
+    const nodes = [
+      { id: 'access-point', type: 'access-point', config: { route: '/api' } },
+      {
+        id: 'target',
+        type: 'target',
+        parentId: 'access-point',
+        config: { endpoint: 'https://upstream.example' },
+      },
+      {
+        id: 'networking',
+        type: 'networking',
+        parentId: 'target',
+        slotId: 'request:networking',
+        config: { timeout_secs: '30', retry_enabled: true, retry_max: '4' },
+      },
+      {
+        id: 'transit-point-a2a-1',
+        type: 'transit-point-a2a',
+        parentId: 'access-point',
+        config: { id: 'tp-1', target_endpoint: 'https://tp.example' },
+      },
+      {
+        id: 'networking-transit-point-a2a-1',
+        type: 'networking',
+        parentId: 'transit-point-a2a-1',
+        config: { timeout_secs: '10', retry_enabled: true, retry_max: '2' },
+      },
+    ];
+    const payload = save(nodes);
+    payload.canvas = buildCanvasBlob(nodes as any);
+    expect(payload.target.networking).toEqual({
+      timeout: { request_secs: 30 },
+      retry: { max_attempts: 4 },
+    });
+    expect(payload.transit.points[0].networking).toEqual({
+      timeout: { request_secs: 10 },
+      retry: { max_attempts: 2 },
+    });
+    return payload;
+  };
+
+  it('does not restore a block the API removed', () => {
+    const payload = savedFromDashboard();
+    payload.target.networking = { timeout: { request_secs: 30 } };
+    payload.transit.points[0].networking = { timeout: { request_secs: 10 } };
+
+    const nodes = nodesFromSurface(payload);
+    const target = nodes.find(n => n.type === 'networking' && n.id === 'networking');
+    expect(target?.config).toEqual({ timeout_secs: '30' });
+
+    const resaved = save(nodes);
+    expect(resaved.target.networking).toEqual({ timeout: { request_secs: 30 } });
+    expect(resaved.transit.points[0].networking).toEqual({ timeout: { request_secs: 10 } });
+  });
+
+  it('does not restore Networking the API removed entirely', () => {
+    const payload = savedFromDashboard();
+    delete payload.target.networking;
+    delete payload.transit.points[0].networking;
+
+    const nodes = nodesFromSurface(payload);
+    expect(nodes.some(n => n.type === 'networking')).toBe(false);
+    const ids = new Set(nodes.map(n => n.id));
+    const danglingParents = nodes.filter(n => n.parentId && !ids.has(n.parentId));
+    expect(danglingParents).toEqual([]);
+
+    const resaved = save(nodes);
+    expect(resaved.target.networking).toBeUndefined();
+    expect(resaved.transit.points[0].networking).toBeUndefined();
+  });
+
+  it('still restores the layout of a Networking element the payload keeps', () => {
+    const payload = savedFromDashboard();
+    payload.canvas.nodes = payload.canvas.nodes.map((n: any) =>
+      n.id === 'networking' ? { ...n, position: { x: 12, y: 34 } } : n
+    );
+
+    const nodes = registry.nodesFromPayload(payload);
+    expect(nodes.find(n => n.id === 'networking')?.position).toEqual({ x: 12, y: 34 });
+  });
+
+  /** A dashboard save whose only Networking element sits on one path. */
+  const savedWithNetworkingOn = (path: 'target' | 'transit-point', id?: string): any => {
+    const nodes = [
+      { id: 'access-point', type: 'access-point', config: { route: '/api' } },
+      {
+        id: 'target',
+        type: 'target',
+        parentId: 'access-point',
+        config: { endpoint: 'https://upstream.example' },
+      },
+      {
+        id: 'transit-point-a2a-1',
+        type: 'transit-point-a2a',
+        parentId: 'access-point',
+        config: { id: 'tp-1', target_endpoint: 'https://tp.example' },
+      },
+      path === 'target'
+        ? {
+            id: id ?? 'networking',
+            type: 'networking',
+            parentId: 'target',
+            slotId: 'request:networking',
+            position: { x: 12, y: 34 },
+            config: { timeout_secs: '30' },
+          }
+        : {
+            id: id ?? 'networking-transit-point-a2a-1',
+            type: 'networking',
+            parentId: 'transit-point-a2a-1',
+            position: { x: 56, y: 78 },
+            config: { timeout_secs: '10' },
+          },
+    ];
+    const payload = save(nodes);
+    payload.canvas = buildCanvasBlob(nodes as any);
+    return payload;
+  };
+
+  it('keeps Networking the API moved to a Transit Point on that Transit Point', () => {
+    const payload = savedWithNetworkingOn('target');
+    delete payload.target.networking;
+    payload.transit.points[0].networking = { timeout: { request_secs: 10 } };
+
+    const nodes = nodesFromSurface(payload);
+    const networking = nodes.filter(n => n.type === 'networking');
+    expect(networking).toHaveLength(1);
+    expect(networking[0].parentId).toBe('transit-point-a2a-1');
+
+    const resaved = save(nodes);
+    expect(resaved.target.networking).toBeUndefined();
+    expect(resaved.transit.points[0].networking).toEqual({ timeout: { request_secs: 10 } });
+  });
+
+  it('keeps Networking the API moved to the Target on the Target', () => {
+    const payload = savedWithNetworkingOn('transit-point');
+    delete payload.transit.points[0].networking;
+    payload.target.networking = { timeout: { request_secs: 30 } };
+
+    const nodes = nodesFromSurface(payload);
+    const networking = nodes.filter(n => n.type === 'networking');
+    expect(networking).toHaveLength(1);
+    expect(networking[0].parentId).not.toBe('transit-point-a2a-1');
+
+    const resaved = save(nodes);
+    expect(resaved.target.networking).toEqual({ timeout: { request_secs: 30 } });
+    expect(resaved.transit.points[0].networking).toBeUndefined();
+  });
+
+  it('still restores the layout of Networking saved under another id on the same path', () => {
+    const payload = savedWithNetworkingOn('transit-point', 'networking-dropped');
+
+    const nodes = registry.nodesFromPayload(payload);
+    const networking = nodes.filter(n => n.type === 'networking');
+    expect(networking).toHaveLength(1);
+    expect(networking[0].parentId).toBe('transit-point-a2a-1');
+    expect(networking[0].position).toEqual({ x: 56, y: 78 });
   });
 });

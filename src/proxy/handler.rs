@@ -9774,7 +9774,6 @@ fn modern_fabric_failure_response(
     create_error_response(status, "Modern Fabric transport is unavailable")
 }
 
-/// Handle requests through the fabric:// protocol by forwarding via gateway
 /// Policy input for MCP tool gating on the fabric leg. The `tools/list`
 /// filter and the `tools/call` gate build it here from the same caller
 /// context, so a tool shown in the list is one the call gate admits.
@@ -9787,6 +9786,8 @@ fn fabric_mcp_gate_input(
     config_id: &str,
     surface_name: &str,
     source_auth: Option<&crate::surface_context::SourceAuthContext>,
+    extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
+    payment: Option<&crate::surface_context::PaymentContext>,
     mcp: crate::surface_context::McpContext,
     identity_binding: Option<&crate::surface_context::IdentityBindingContext>,
 ) -> serde_json::Value {
@@ -9801,12 +9802,15 @@ fn fabric_mcp_gate_input(
         surface_name,
     );
     policy_input.source_auth = source_auth.cloned();
+    policy_input.extension_identity = extension_identity.cloned();
+    policy_input.payment = payment.cloned();
     policy_input.mcp = Some(mcp);
     policy_input.identity_binding = identity_binding.cloned();
     policy_input.normalize_caller_did();
     serde_json::to_value(&policy_input).unwrap_or_default()
 }
 
+/// Handle requests through the fabric:// protocol by forwarding via gateway
 async fn handle_fabric_request(
     state: ProxyState,
     channel_name: &str,
@@ -10715,6 +10719,8 @@ async fn handle_fabric_request(
                 config_id_str,
                 &state.surface.name,
                 source_auth_context.as_ref(),
+                extension_identity.as_ref(),
+                payment_context.as_ref(),
                 modern_mcp_context
                     .clone()
                     .unwrap_or_else(|| crate::surface_context::McpContext {
@@ -12935,6 +12941,8 @@ async fn handle_fabric_request(
                                     config_id,
                                     &state.surface.name,
                                     source_auth_context.as_ref(),
+                                    extension_identity.as_ref(),
+                                    payment_context.as_ref(),
                                     modern_mcp_context
                                         .clone()
                                         .unwrap_or_else(|| crate::surface_context::McpContext {
@@ -15691,26 +15699,56 @@ allow if {
 }
 "#;
 
-    /// Deny-by-default gating whose only allow gate grants `read_*` tools to
-    /// callers whose source credential carries `role: reader`.
-    fn caller_scoped_gating() -> crate::policies::CompiledMcpToolGating {
-        use crate::config::agent_surface::{McpToolGate, McpToolGateAction, McpToolGateEffect, McpToolGatingConfig};
+    /// Activates its gate for every caller that is not an admin, including
+    /// one with no source credential at all.
+    const NOT_ADMIN_CONDITION: &str = r#"
+package surface.policy
+
+default allow = false
+
+allow if {
+    not input.source_auth.claims.role == "admin"
+}
+"#;
+
+    const KNOWN_CALLER_CONDITION: &str = r#"
+package surface.policy
+
+default allow = false
+
+allow if {
+    input.agent.did == "did:example:caller"
+}
+"#;
+
+    fn single_gate(
+        default_effect: crate::config::agent_surface::McpToolGateEffect,
+        effect: crate::config::agent_surface::McpToolGateEffect,
+        pattern: &str,
+        condition: &'static str,
+    ) -> crate::policies::CompiledMcpToolGating {
+        use crate::config::agent_surface::{McpToolGate, McpToolGateAction, McpToolGatingConfig};
         let config = McpToolGatingConfig {
-            default_effect: McpToolGateEffect::Deny,
+            default_effect,
             gates: vec![McpToolGate {
-                id: "readers".to_string(),
+                id: "gate".to_string(),
                 name: String::new(),
                 description: String::new(),
-                condition_policy_definition_id: Some("reader-only".to_string()),
+                condition_policy_definition_id: Some("condition".to_string()),
                 action: McpToolGateAction {
-                    effect: McpToolGateEffect::Allow,
-                    patterns: vec!["^read_".to_string()],
+                    effect,
+                    patterns: vec![pattern.to_string()],
                 },
             }],
         };
-        crate::policies::CompiledMcpToolGating::build(&config, |id| {
-            (id == "reader-only").then(|| READER_CONDITION.to_string())
-        })
+        crate::policies::CompiledMcpToolGating::build(&config, |id| (id == "condition").then(|| condition.to_string()))
+    }
+
+    /// Deny-by-default gating whose only allow gate grants `read_*` tools to
+    /// callers whose source credential carries `role: reader`.
+    fn caller_scoped_gating() -> crate::policies::CompiledMcpToolGating {
+        use crate::config::agent_surface::McpToolGateEffect;
+        single_gate(McpToolGateEffect::Deny, McpToolGateEffect::Allow, "^read_", READER_CONDITION)
     }
 
     fn caller(role: &str) -> crate::surface_context::SourceAuthContext {
@@ -15720,8 +15758,17 @@ allow if {
         }
     }
 
+    fn caller_did(did: &str) -> crate::surface_context::ExtensionIdentityContext {
+        crate::surface_context::ExtensionIdentityContext {
+            did: Some(did.to_string()),
+            identity_hash: None,
+            verification: crate::surface_context::IdentityVerification::Vp,
+        }
+    }
+
     fn fabric_gate_input(
         source_auth: Option<&crate::surface_context::SourceAuthContext>,
+        extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
         mcp_method: &str,
         tool_name: Option<&str>,
     ) -> serde_json::Value {
@@ -15733,6 +15780,8 @@ allow if {
             "surface-1",
             "Surface",
             source_auth,
+            extension_identity,
+            None,
             crate::surface_context::McpContext {
                 method: mcp_method.to_string(),
                 tool_name: tool_name.map(str::to_string),
@@ -15745,17 +15794,18 @@ allow if {
     fn listed_tools(
         gating: &crate::policies::CompiledMcpToolGating,
         input: &serde_json::Value,
+        names: &[&str],
     ) -> Vec<String> {
-        let mut list = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": { "tools": [{ "name": "read_file" }, { "name": "write_file" }] }
-        });
+        let tools: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        let mut list = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": tools } });
         assert_eq!(
             gating
                 .filter_tools_list_value(&mut list, input)
                 .map(|(before, _)| before),
-            Some(2)
+            Some(names.len())
         );
         list["result"]["tools"]
             .as_array()
@@ -15770,17 +15820,19 @@ allow if {
             .collect()
     }
 
+    const FILE_TOOLS: &[&str] = &["read_file", "write_file"];
+
     #[test]
     fn fabric_tools_list_shows_the_tools_a_caller_scoped_gate_grants() {
         let gating = caller_scoped_gating();
         assert!(gating.has_policy_conditions());
         let reader = caller("reader");
 
-        let list_input = fabric_gate_input(Some(&reader), "tools/list", None);
-        assert_eq!(listed_tools(&gating, &list_input), vec!["read_file".to_string()]);
+        let list_input = fabric_gate_input(Some(&reader), None, "tools/list", None);
+        assert_eq!(listed_tools(&gating, &list_input, FILE_TOOLS), vec!["read_file".to_string()]);
 
-        let read_call = fabric_gate_input(Some(&reader), "tools/call", Some("read_file"));
-        let write_call = fabric_gate_input(Some(&reader), "tools/call", Some("write_file"));
+        let read_call = fabric_gate_input(Some(&reader), None, "tools/call", Some("read_file"));
+        let write_call = fabric_gate_input(Some(&reader), None, "tools/call", Some("write_file"));
         assert!(gating.is_tool_call_allowed("read_file", &read_call));
         assert!(!gating.is_tool_call_allowed("write_file", &write_call));
     }
@@ -15790,16 +15842,58 @@ allow if {
         let gating = caller_scoped_gating();
         let guest = caller("guest");
 
-        assert!(listed_tools(&gating, &fabric_gate_input(Some(&guest), "tools/list", None)).is_empty());
-        assert!(listed_tools(&gating, &fabric_gate_input(None, "tools/list", None)).is_empty());
         assert!(
-            !gating
-                .is_tool_call_allowed("read_file", &fabric_gate_input(Some(&guest), "tools/call", Some("read_file")))
+            listed_tools(&gating, &fabric_gate_input(Some(&guest), None, "tools/list", None), FILE_TOOLS).is_empty()
         );
+        assert!(listed_tools(&gating, &fabric_gate_input(None, None, "tools/list", None), FILE_TOOLS).is_empty());
+        assert!(!gating.is_tool_call_allowed(
+            "read_file",
+            &fabric_gate_input(Some(&guest), None, "tools/call", Some("read_file"))
+        ));
     }
 
     #[test]
-    fn fabric_gate_input_carries_the_caller_and_identity_binding_without_secret_headers() {
+    fn fabric_tools_list_hides_tools_a_caller_scoped_deny_gate_denies() {
+        use crate::config::agent_surface::McpToolGateEffect;
+        let gating = single_gate(McpToolGateEffect::Allow, McpToolGateEffect::Deny, "^admin_", NOT_ADMIN_CONDITION);
+        let tools = &["read_file", "admin_reset"];
+
+        for denied in [Some(caller("guest")), None] {
+            let list_input = fabric_gate_input(denied.as_ref(), None, "tools/list", None);
+            assert_eq!(listed_tools(&gating, &list_input, tools), vec!["read_file".to_string()]);
+            let call_input = fabric_gate_input(denied.as_ref(), None, "tools/call", Some("admin_reset"));
+            assert!(!gating.is_tool_call_allowed("admin_reset", &call_input));
+        }
+
+        let admin = caller("admin");
+        let list_input = fabric_gate_input(Some(&admin), None, "tools/list", None);
+        assert_eq!(listed_tools(&gating, &list_input, tools), vec!["read_file".to_string(), "admin_reset".to_string()]);
+        let call_input = fabric_gate_input(Some(&admin), None, "tools/call", Some("admin_reset"));
+        assert!(gating.is_tool_call_allowed("admin_reset", &call_input));
+    }
+
+    #[test]
+    fn fabric_gate_decides_on_the_caller_did_from_the_extension_identity() {
+        use crate::config::agent_surface::McpToolGateEffect;
+        let gating = single_gate(McpToolGateEffect::Deny, McpToolGateEffect::Allow, "^read_", KNOWN_CALLER_CONDITION);
+        let known = caller_did("did:example:caller");
+        let other = caller_did("did:example:someone-else");
+
+        let list_input = fabric_gate_input(None, Some(&known), "tools/list", None);
+        assert_eq!(listed_tools(&gating, &list_input, FILE_TOOLS), vec!["read_file".to_string()]);
+        let call_input = fabric_gate_input(None, Some(&known), "tools/call", Some("read_file"));
+        assert!(gating.is_tool_call_allowed("read_file", &call_input));
+
+        for unknown in [Some(&other), None] {
+            let list_input = fabric_gate_input(None, unknown, "tools/list", None);
+            assert!(listed_tools(&gating, &list_input, FILE_TOOLS).is_empty());
+            let call_input = fabric_gate_input(None, unknown, "tools/call", Some("read_file"));
+            assert!(!gating.is_tool_call_allowed("read_file", &call_input));
+        }
+    }
+
+    #[test]
+    fn fabric_gate_input_carries_the_caller_payment_and_identity_binding_without_secret_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Bearer secret-token"));
         headers.insert("x-request-id", HeaderValue::from_static("req-1"));
@@ -15811,6 +15905,11 @@ allow if {
             true,
         );
         let reader = caller("reader");
+        let known = caller_did("did:example:caller");
+        let payment = crate::surface_context::PaymentContext {
+            verified: true,
+            response_header: None,
+        };
 
         let input = fabric_mcp_gate_input(
             "POST",
@@ -15820,6 +15919,8 @@ allow if {
             "surface-1",
             "Surface",
             Some(&reader),
+            Some(&known),
+            Some(&payment),
             crate::surface_context::McpContext {
                 method: "tools/list".to_string(),
                 ..Default::default()
@@ -15829,6 +15930,11 @@ allow if {
 
         assert_eq!(input["source_auth"]["method"], "jwt_bearer");
         assert_eq!(input["source_auth"]["claims"]["role"], "reader");
+        assert_eq!(input["extension_identity"]["did"], "did:example:caller");
+        assert_eq!(input["extension_identity"]["verification"], "vp");
+        assert_eq!(input["agent"]["did"], "did:example:caller");
+        assert_eq!(input["agent"]["did_verified"], true);
+        assert_eq!(input["payment"]["verified"], true);
         assert_eq!(input["identity_binding"]["agent"]["did"], "did:example:agent");
         assert_eq!(input["identity_binding"]["verified"], true);
         assert_eq!(input["mcp"]["method"], "tools/list");

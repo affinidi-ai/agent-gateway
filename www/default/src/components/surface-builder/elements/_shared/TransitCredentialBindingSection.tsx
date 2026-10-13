@@ -19,6 +19,9 @@ export interface TransitCredentialsForm {
   inject_as_custom_name?: string;
   inject_as_custom_format?: string;
   inject_as_meta_field?: string;
+  /** Kept from the stored value: the panel has no control for them. */
+  elicit_timeout_secs?: number;
+  elicit_fallback?: string;
 }
 
 export const EMPTY_TRANSIT_CREDENTIALS: TransitCredentialsForm = {
@@ -51,6 +54,8 @@ export function transitCredentialsFormToApi(f: TransitCredentialsForm | null | u
     scopes,
     consent_mode: f.consent_mode,
     inject_as,
+    ...(f.elicit_timeout_secs !== undefined ? { elicit_timeout_secs: f.elicit_timeout_secs } : {}),
+    ...(f.elicit_fallback !== undefined ? { elicit_fallback: f.elicit_fallback } : {}),
   };
 }
 
@@ -77,7 +82,25 @@ export function transitCredentialsApiToForm(api: any): TransitCredentialsForm | 
     inject_as_custom_name,
     inject_as_custom_format,
     inject_as_meta_field,
+    ...(api.elicit_timeout_secs !== undefined
+      ? { elicit_timeout_secs: api.elicit_timeout_secs }
+      : {}),
+    ...(api.elicit_fallback !== undefined ? { elicit_fallback: api.elicit_fallback } : {}),
   };
+}
+
+/**
+ * Convert a Transit Point node's credentials to the runtime shape. A node
+ * reloaded from a saved surface holds the runtime shape until its panel
+ * normalizes it to form-state, so both shapes are accepted, and the
+ * runtime shape is returned as stored.
+ */
+export function transitCredentialsToApi(value: unknown) {
+  if (!value || typeof value !== 'object') return undefined;
+  if ('inject_as_type' in value) {
+    return transitCredentialsFormToApi(value as TransitCredentialsForm);
+  }
+  return (value as { credential_provider_id?: unknown }).credential_provider_id ? value : undefined;
 }
 
 interface Props {

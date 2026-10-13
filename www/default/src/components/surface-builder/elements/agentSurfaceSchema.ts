@@ -125,8 +125,18 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.points[*].gateway_url',
   'transit.points[*].listen_address',
   'transit.points[*].listen_path',
+  'transit.points[*].agent_card_path',
+  'transit.points[*].extension_inspection',
+  'transit.points[*].require_transit_token',
   'transit.points[*].fabric_delegated_credentials',
 ]);
+
+/** Fields of a stored Transit Point: the `X` of every `transit.points[*].X` path. */
+export const TRANSIT_POINT_FIELDS: ReadonlySet<string> = new Set(
+  [...AGENT_SURFACE_PATHS]
+    .filter(p => p.startsWith('transit.points[*].'))
+    .map(p => p.slice('transit.points[*].'.length))
+);
 
 /**
  * UI-side aliases the api.ts translation layer rewrites on submit.
