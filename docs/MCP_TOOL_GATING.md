@@ -69,9 +69,11 @@ inherited from the surface-wide target gate.
   **fails closed toward denial** — effect-aware: a `Deny` gate stays **active**
   (keep hiding), an `Allow` gate is forced **inactive** (never grant on an
   unknowable condition), so a broken/missing condition can never silently widen
-  an allow-list. Evaluated against the same `PolicyInput` the surface OPA gate and
-  the tools/list filter see, so a gate that hides a tool from the list decides
-  identically on a call.
+  an allow-list. Evaluated against a `PolicyInput` built from the request's
+  caller context. On each path the tools/list filter and the tools/call gate
+  share that input, so a gate that hides a tool from the list decides
+  identically on a call. The fields a condition can read differ by path; see
+  [Enforcement points](#enforcement-points).
 - **Action** — `effect: allow | deny` plus a regex `patterns` list over tool
   names (empty/whitespace patterns ignored; RegexSet-compiled once).
 - **Default** — `default_effect: allow | deny` (top-level on
@@ -170,9 +172,12 @@ gating is unaffected.
   fabric response (already plain JSON — the remote gateway de-SSE'd it) strips
   denied tools via `CompiledMcpToolGating::filter_tools_list_value`. Both build
   their condition input with `fabric_mcp_gate_input`, carrying the caller's
-  `source_auth`, the `mcp` context and the `identity_binding`, so a tool the
-  list shows is one the call gate admits. Both gateways in a G2G chain filter
-  independently and compose.
+  `source_auth`, `extension_identity` (promoted to `agent.did`), `payment`, the
+  `mcp` context and the `identity_binding`, so a tool the list shows is one the
+  call gate admits. The input has no trust-registry `agent` fields and no
+  `trust_check_results`; a condition that reads them is undefined, which leaves
+  a `Deny` gate inactive, so write such conditions so an absent field fails
+  toward denial. Both gateways in a G2G chain filter independently and compose.
 - **MCP proxy (`proxy://`) targets** — a surface whose target is a stored MCP
   proxy is answered by `src/proxy/handler.rs::handle_mcp_proxy_request` (the
   gateway *is* the MCP server), which returns before the direct-path gate in

@@ -7,6 +7,7 @@ import type {
   SurfaceContext,
 } from './types';
 import { getArchetype, ANY_EDGE_MW } from './edges/archetypes';
+import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
 import { workloadBindingApiToForm } from './workload-binding/config';
 
@@ -700,14 +701,38 @@ class ElementRegistry {
     const tpDefs = this.all().filter(d => d.isTransitPoint);
     const fallbackTpType = (tpDefs[0]?.type ?? 'transit-point-a2a') as SurfaceNodeType;
     const perTypeCounter = new Map<SurfaceNodeType, number>();
+    // A Transit Point takes the canvas node saved with its own `id`, so it
+    // keeps its node, layout and per-TP nodes when another Transit Point is
+    // removed or added through the API. Other Transit Points are numbered
+    // around the node ids the canvas has given to a stored `id`.
+    const savedTpNodes = new Map<string, { id: string; type?: string }>();
+    const takenTpNodeIds = new Set<string>();
+    for (const bn of readCanvasBlob(payload?.canvas)?.nodes ?? []) {
+      const savedId = bn.config?.id;
+      if (this.isTransitPointType(bn.type) && typeof savedId === 'string' && savedId) {
+        savedTpNodes.set(savedId, bn);
+        takenTpNodeIds.add(bn.id);
+      }
+    }
+    const usedTpNodeIds = new Set<string>();
     transitPoints.forEach((tp, idx) => {
       const protocol = tp?.protocol;
       const def = tpDefs.find(d => d.getProtocol?.() === protocol) ?? tpDefs[0];
       const effectiveProtocol = protocol ?? def?.getProtocol?.();
       const tpType = (def?.type ?? fallbackTpType) as SurfaceNodeType;
-      const next = (perTypeCounter.get(tpType) ?? 0) + 1;
-      perTypeCounter.set(tpType, next);
-      const tpId = `${tpType}-${next}`;
+      const saved = typeof tp?.id === 'string' ? savedTpNodes.get(tp.id) : undefined;
+      let tpId: string;
+      if (saved && saved.type === tpType && !usedTpNodeIds.has(saved.id)) {
+        tpId = saved.id;
+      } else {
+        let next = perTypeCounter.get(tpType) ?? 0;
+        do {
+          next += 1;
+        } while (takenTpNodeIds.has(`${tpType}-${next}`) || usedTpNodeIds.has(`${tpType}-${next}`));
+        perTypeCounter.set(tpType, next);
+        tpId = `${tpType}-${next}`;
+      }
+      usedTpNodeIds.add(tpId);
       const tpConfig = tp && typeof tp === 'object' ? { ...tp } : tp;
       if (tpConfig && typeof tpConfig === 'object') {
         delete tpConfig.header_metadata_mapping;
@@ -935,9 +960,31 @@ class ElementRegistry {
       // hydrated nodes — that still points at the discarded blob id,
       // otherwise `validateSurface` fires a "references missing parent"
       // warning for legacy blobs where a chain-spliced node was
-      // parented on the drifted id.
+      // parented on the drifted id. A dropped `payloadOwnsConfig` blob
+      // node maps to its own parent, so its children stay attached.
       const renameMap = new Map<string, string>();
+      const blobById = new Map(blob.nodes.map(b => [b.id, b] as const));
+      // The Transit Point a node hangs off, or '' on the Target path.
+      const transitPointOf = (parentId: string | null | undefined): string => {
+        const seen = new Set<string>();
+        let id = parentId;
+        while (typeof id === 'string' && !seen.has(id)) {
+          seen.add(id);
+          const parent = blobById.get(id) ?? byId.get(id);
+          if (!parent) break;
+          if (this.isTransitPointType(parent.type)) return id;
+          id = parent.parentId;
+        }
+        return '';
+      };
+      // The stored surface is the only source of Transit Points. A canvas
+      // Transit Point with no stored entry was removed through the API, so
+      // neither it nor anything that hangs off it is restored.
+      const removedTps = new Set(
+        blob.nodes.filter(b => this.isTransitPointType(b.type) && !byId.has(b.id)).map(b => b.id)
+      );
       for (const bn of blob.nodes) {
+        if (removedTps.has(bn.id) || removedTps.has(transitPointOf(bn.parentId))) continue;
         let target = byId.get(bn.id);
         if (target) claimedIds.add(target.id);
         if (!target && bn.type) {
@@ -949,12 +996,18 @@ class ElementRegistry {
           // Hydration emits the ap-ma variant first; if the user
           // actually dropped on ma-external the blob carries
           // `networking-target`. Without adoption we'd render both.
+          // An element whose payload owns its config only adopts a node
+          // on the same path (the Target, or the same Transit Point), so
+          // a stale blob node never moves its settings to another path.
+          const ownsConfig = !!this.get(bn.type)?.payloadOwnsConfig;
+          const bnTransitPoint = ownsConfig ? transitPointOf(bn.parentId) : '';
           const candidates = nodes.filter(
             n =>
               n.type === bn.type &&
               !claimedIds.has(n.id) &&
               !byId.has(bn.id) &&
-              !blob.nodes.some(b => b.id === n.id)
+              !blob.nodes.some(b => b.id === n.id) &&
+              (!ownsConfig || transitPointOf(n.parentId) === bnTransitPoint)
           );
           // Prefer slotId-based adoption when the blob carries one and
           // exactly one hydrated candidate owns the same slot. Keeps
@@ -981,6 +1034,10 @@ class ElementRegistry {
         }
         if (!target) {
           if (!bn.type) continue;
+          if (this.get(bn.type)?.payloadOwnsConfig) {
+            if (typeof bn.parentId === 'string') renameMap.set(bn.id, bn.parentId);
+            continue;
+          }
           // Compute `configured` from the blob's config rather than
           // hard-coding `true`. Otherwise an element that the user
           // dropped but never finished configuring (no payload slice
@@ -1010,14 +1067,26 @@ class ElementRegistry {
           target.slotId = bn.slotId;
         }
         const blobConfig = bn.config;
-        if (target && blobConfig && typeof blobConfig === 'object') {
+        if (
+          target &&
+          blobConfig &&
+          typeof blobConfig === 'object' &&
+          !this.get(target.type)?.payloadOwnsConfig
+        ) {
           // Backend-truth fields (set by `nodesFromPayload`) win on key
           // collision; canvas-blob fields fill in UI-only keys (e.g.
           // `endpoint_type`, `route_prefix`, `route_suffix`,
           // `gateway_id`, `auth_type`) so the panel doesn't "reset"
           // after save. Without this, every save round-trip strips
           // those fields and the panel re-derives them on next mount.
-          target.config = { ...blobConfig, ...(target.config ?? {}) };
+          // A Transit Point's stored fields come only from the stored
+          // surface, so one removed through the API stays removed.
+          const fill = this.isTransitPointType(target.type)
+            ? Object.fromEntries(
+                Object.entries(blobConfig).filter(([key]) => !TRANSIT_POINT_FIELDS.has(key))
+              )
+            : blobConfig;
+          target.config = { ...fill, ...(target.config ?? {}) };
           // Recompute `configured` after the merge — UI-only fields
           // pulled from the blob can flip validity (e.g. an element
           // whose `incompleteReason` looks at a field that isn't part

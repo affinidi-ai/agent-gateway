@@ -6,7 +6,7 @@ import type { NodeDefinition, Protocol } from '../types';
 import type { SurfaceNodeType } from '../nodeTypes';
 import { urlError } from '../validators';
 import TransitPointPanel from './TransitPointPanel';
-import { transitCredentialsFormToApi } from '../_shared/TransitCredentialBindingSection';
+import { transitCredentialsToApi } from '../_shared/TransitCredentialBindingSection';
 import { identityConfigToWire } from '../identity/definition';
 import { workloadBindingFormToApi } from '../workload-binding/config';
 import { getCachedOutboundListenAddresses } from '../access-point/defaults';
@@ -339,7 +339,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   n => n.type === 'mcp-tool-gating' && n.parentId === tp.id
                 );
                 const mcpToolGating = mcpToolGatingConfigToWire(mcpToolGatingNode?.config);
-                const credentials = transitCredentialsFormToApi(c.transit_credentials);
+                const credentials = transitCredentialsToApi(c.transit_credentials);
                 const headerMetadataNode = ctx.allNodes.find(
                   n => n.type === 'metadata-extraction' && n.parentId === tp.id
                 );

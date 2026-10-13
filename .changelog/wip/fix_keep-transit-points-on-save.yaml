@@ -1,0 +1,82 @@
+branch: fix/keep-transit-points-on-save
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-12T10:12:37.000Z'
+      title: Keep Transit Points with credentials when saving a reloaded surface
+      description: >-
+        After a surface was reloaded in the dashboard, saving it from any panel other
+        than its Transit Point's dropped the whole transit block when a Transit Point
+        had credentials, so the gateway lost its Transit Points while the canvas still
+        showed them. The Surface Builder now accepts the credentials in the shape they
+        are loaded in, so every Transit Point on the canvas is saved. It also keeps a
+        stored elicitation timeout and fallback, which a save used to reset to 300
+        seconds and on_demand.
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Keep explicit empty or zero retry values when saving from the dashboard
+      description: >-
+        Saving a surface from the dashboard dropped an empty list of retryable status
+        codes, so the gateway fell back to its default codes and retried calls on 5xx
+        that the operator had limited to connection errors. Zeros for retry attempts,
+        the circuit-breaker failure threshold and its timeout were saved as 3, 5 and
+        30. The dashboard now keeps these values as stored. An empty list shows as a
+        new Retry on connection errors only switch, an empty codes field still means
+        the gateway default, and input that is not a list of HTTP status codes blocks
+        Save instead of being saved as an empty list.
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Stop the dashboard restoring Networking settings removed through the API
+      description: >-
+        After Networking was changed or removed through the API, the next dashboard
+        save could write the old settings back from the canvas layout data, or write a
+        Transit Point's settings to the Target and the other way round when the API
+        moved Networking between them. The dashboard now takes Networking settings only
+        from the stored surface, for the Target and for each Transit Point.
+  removed: []
+  security:
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Apply MCP tool gates that read the caller DID or payment on Fabric routes
+      description: >-
+        On a fabric:// target, the MCP tool gate's policy input left out the caller's
+        extension identity, and so input.agent.did, and the payment context. A Deny
+        gate whose condition read them switched off, so its tools were listed and
+        callable over Fabric while the same gate blocked them on a direct target, and
+        an Allow gate hid every tool it grants. The input now carries both, as on the
+        direct path.
+    - timestamp: '2026-10-13T10:08:01.000Z'
+      title: Keep Transit Point credentials on their own upstream after API changes
+      description: >-
+        After a Transit Point was removed through the API, the next dashboard save gave
+        its credential and its elements to the Transit Point that took its place on the
+        canvas, and saved that Transit Point twice. A credential or a Fabric delegated
+        credentials switch removed through the API also came back from the canvas layout
+        data. The dashboard now matches each Transit Point to its canvas node by its id,
+        does not restore a Transit Point the stored surface no longer has, and takes
+        every stored Transit Point field only from the stored surface.
+  breaking: []
+  internal:
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Test Fabric tool gates on caller DID, payment and deny conditions
+      description: >-
+        Adds unit tests for a caller-scoped Deny gate under allow-by-default, an Allow
+        gate on the caller DID from the extension identity, and the Fabric gate input
+        carrying the payment context, and moves the handle_fabric_request doc comment
+        back above that function.
+    - timestamp: '2026-10-12T11:55:15.000Z'
+      title: Test Networking values and stale canvas data across load and save
+      description: >-
+        Adds dashboard tests that an empty status-code list and stored zeros survive a
+        load and save, that the status-code field tells the gateway default, connection
+        errors only and invalid input apart, that Networking removed through the API is
+        not restored from the canvas data for the Target and for a Transit Point, that
+        Networking moved between them stays where the API put it, and that its layout is
+        still restored.
+    - timestamp: '2026-10-13T10:08:01.000Z'
+      title: Test Transit Points removed, added or changed through the API
+      description: >-
+        Adds dashboard tests that a removed Transit Point's credential, elements and
+        settings do not move to another Transit Point, that a credential and the Fabric
+        delegated credentials switch removed through the API stay removed, and that the
+        remaining Transit Point keeps its node and layout. Adds agent_card_path,
+        extension_inspection and require_transit_token to the dashboard's list of stored
+        Transit Point fields, to match the gateway.
