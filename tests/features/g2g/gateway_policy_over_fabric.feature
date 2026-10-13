@@ -4,7 +4,7 @@ Feature: Gateway-level policies control fabric callers
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And gateway 2 has a Gateway-level policy that rejects all fabric callers
-    When the caller asks gateway 1 surface "charlie" for available MCP tools
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 403
     And MCP server "bravo" was not called
 
@@ -13,7 +13,7 @@ Feature: Gateway-level policies control fabric callers
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 3 has an MCP surface "delta" forwarding over fabric to gateway 2 surface "alpha"
     And gateway 2 has a Gateway-level policy that accepts fabric calls only from gateway 1
-    When the caller asks gateway 3 surface "delta" for available MCP tools
+    When the caller asks gateway 3 MCP surface "delta" for available tools
     Then the response status is 403
     And MCP server "bravo" was not called
 
@@ -22,7 +22,7 @@ Feature: Gateway-level policies control fabric callers
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And gateway 2 has a Gateway-level policy that accepts fabric calls only from gateway 1
-    When the caller asks gateway 1 surface "charlie" for available MCP tools
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then MCP server "bravo" received the forwarded MCP request with the original body
     And the response status is 200
     And the MCP response result matches MCP server "bravo" response result

@@ -24,6 +24,7 @@ use crate::bdd_support::config::modern_consent::{
     ModernConsentFixture, oauth_endpoint_allowlist, write_modern_consent_config,
 };
 use crate::bdd_support::gateway_process::GatewayProcess;
+use crate::bdd_support::json_rpc::McpVersion;
 use crate::bdd_support::mock_server::MockServer;
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
 
@@ -111,9 +112,9 @@ pub struct GatewayPlan {
     pub surfaces: Vec<SurfaceSpec>,
     pub mock_responses: HashMap<String, serde_json::Value>,
     pub mock_response_delays: HashMap<String, (u64, u64)>,
-    /// Admits only legacy MCP on Fabric streams it receives, as a gateway
-    /// whose surfaces do not serve modern MCP does.
-    pub legacy_only_fabric_receive: bool,
+    /// The only MCP revision admitted on Fabric streams it receives, as a
+    /// gateway whose surfaces serve just that revision does.
+    pub fabric_receive_only: Option<McpVersion>,
     /// Modern MCP consent for the gateway's surfaces with delegated credentials.
     pub modern_consent: Option<ModernConsentFixture>,
 }
@@ -986,8 +987,14 @@ async fn spawn_node(
     if let Some(allowlist) = egress_allowlist {
         extra_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), allowlist.to_string());
     }
-    if plan.legacy_only_fabric_receive {
-        extra_env.insert("AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY".to_string(), "true".to_string());
+    match &plan.fabric_receive_only {
+        None => {}
+        Some(McpVersion::Legacy) => {
+            extra_env.insert("AG_BDD_FABRIC_RECEIVE_LEGACY_ONLY".to_string(), "true".to_string());
+        }
+        Some(other) => {
+            bail!("setup failed: gateway {index} cannot be limited to MCP protocol version {other} over Fabric")
+        }
     }
     if let Some(consent) = &plan.modern_consent {
         extra_env.insert("AG_BDD_OAUTH_ENDPOINT_ALLOWLIST".to_string(), oauth_endpoint_allowlist(consent));

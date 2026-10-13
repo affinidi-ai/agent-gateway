@@ -96,14 +96,26 @@ impl EndpointHttpPolicy {
         admit_post(headers, body, session, self.versions, self.origins.as_ref(), self.limits)
     }
 
-    /// Caps an admitted legacy `initialize` to a revision this endpoint serves;
-    /// see [`super::request_validation::cap_legacy_initialize`].
+    /// Returns `body` with an admitted legacy `initialize` capped to a revision
+    /// this endpoint serves, logging the rewrite; see
+    /// [`super::request_validation::cap_legacy_initialize`].
     pub fn cap_legacy_initialize(
         &self,
-        body: &[u8],
+        body: bytes::Bytes,
         classification: &McpRequestClassification,
-    ) -> Option<super::request_validation::CappedInitialize> {
-        super::request_validation::cap_legacy_initialize(body, classification, self.versions)
+        config_id: &str,
+    ) -> bytes::Bytes {
+        let Some(capped) = super::request_validation::cap_legacy_initialize(&body, classification, self.versions)
+        else {
+            return body;
+        };
+        crate::channel_info!(
+            config_id,
+            "Forwarding MCP initialize with protocolVersion {} in place of unsupported {}",
+            capped.offered,
+            capped.requested_for_log()
+        );
+        capped.body
     }
 
     pub fn non_post_response(
@@ -544,7 +556,7 @@ mod tests {
     fn subscription_admission_checks_filters_after_wire_and_media_validation() {
         let origins = OriginPolicy::new(&["https://gateway.example".to_string()], &[]).unwrap();
         let limits = HttpLimits::from(&crate::config::McpHttpConfig::default());
-        let versions = McpVersionPolicy::new(&[crate::mcp::MCP_MODERN_VERSION], &[crate::mcp::MCP_MODERN_VERSION]);
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let headers = HeaderMap::from_iter([
             (
                 header::CONTENT_TYPE,
@@ -798,6 +810,34 @@ mod tests {
                 "{path:?} admits modern requests"
             );
         }
+    }
+
+    #[test]
+    fn cap_legacy_initialize_rewrites_only_an_unserved_legacy_initialize_revision() {
+        use super::super::request_validation::{LegacyRequestKind, MODERN_CAPABLE_POLICY};
+        let policy = EndpointHttpPolicy::with_versions(None, &[], MODERN_CAPABLE_POLICY).unwrap();
+        let opening = McpRequestClassification::Legacy(LegacyRequestKind::Opening);
+        let initialize = |version: &str| {
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": version, "capabilities": {}}
+                }))
+                .unwrap(),
+            )
+        };
+
+        assert_eq!(
+            policy.cap_legacy_initialize(initialize("2025-11-25"), &opening, "config"),
+            initialize(super::super::MCP_LEGACY_VERSION)
+        );
+
+        let served = initialize(super::super::MCP_LEGACY_VERSION);
+        assert_eq!(policy.cap_legacy_initialize(served.clone(), &opening, "config"), served);
+
+        let session = McpRequestClassification::Legacy(LegacyRequestKind::Session);
+        let tools_list = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
+        assert_eq!(policy.cap_legacy_initialize(tools_list.clone(), &session, "config"), tools_list);
     }
 
     #[test]
@@ -1106,7 +1146,7 @@ mod tests {
 
     #[test]
     fn admission_applies_the_origin_policy_to_legacy_and_modern_requests() {
-        let versions = McpVersionPolicy::new(&[super::super::MCP_MODERN_VERSION], &[super::super::MCP_MODERN_VERSION]);
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let origins = OriginPolicy::new(&[], &[]).unwrap();
         let mut legacy_headers = HeaderMap::new();
         let legacy = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
@@ -1153,7 +1193,7 @@ mod tests {
     #[test]
     fn admission_prioritizes_origin_then_wire_validation_then_media_types() {
         let origins = OriginPolicy::new(&[], &[]).unwrap();
-        let versions = McpVersionPolicy::new(&[super::super::MCP_MODERN_VERSION], &[super::super::MCP_MODERN_VERSION]);
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let mut headers = modern_headers();
         headers.insert(
             header::ORIGIN,
@@ -1197,7 +1237,7 @@ mod tests {
     #[test]
     fn admission_enforces_request_body_limits_without_parsing_oversized_content() {
         let origins = OriginPolicy::new(&[], &[]).unwrap();
-        let versions = McpVersionPolicy::new(&[super::super::MCP_MODERN_VERSION], &[super::super::MCP_MODERN_VERSION]);
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let body = modern_body();
         let headers = modern_headers();
         let mut limits = limits();

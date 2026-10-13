@@ -105,7 +105,7 @@ impl McpSandboxMockServer {
 
                         let result = match method {
                             "initialize" => serde_json::json!({
-                                "protocolVersion": "2024-11-05",
+                                "protocolVersion": crate::mcp::MCP_LEGACY_VERSION,
                                 "capabilities": { "tools": { "listChanged": false } },
                                 "serverInfo": { "name": "sandbox-mock-server", "version": "1.0.0" }
                             }),
@@ -328,7 +328,7 @@ async fn mcp_sandbox_connect_and_tools_list_succeeds() {
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": crate::mcp::MCP_LEGACY_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "agent-gateway-sandbox", "version": "1.0.0" }
         }

@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn fail_closed_tools_list_echoes_the_request_id_and_keeps_modern_results_valid() {
         use crate::mcp::meta::McpMetadataContext;
-        use crate::mcp::request_validation::{McpRequestClassification, McpVersionPolicy, validate_mcp_post};
+        use crate::mcp::request_validation::{McpRequestClassification, validate_mcp_post};
 
         let request = body(json!({"jsonrpc": "2.0", "id": "list-1", "method": "tools/list"}));
         let legacy: serde_json::Value =
@@ -344,7 +344,7 @@ mod tests {
             &headers,
             &modern_request,
             crate::mcp::request_validation::LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(&[crate::mcp::MCP_MODERN_VERSION], &[crate::mcp::MCP_MODERN_VERSION]),
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
         )
         .unwrap();
         let McpRequestClassification::Modern(admitted) = &classification else {

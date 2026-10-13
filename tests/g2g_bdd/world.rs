@@ -16,15 +16,13 @@ use crate::bdd_support::actors::ActorRegistry;
 use crate::bdd_support::admin_client::GatewayRecord;
 use crate::bdd_support::config::fabric_surface_fixture::{SourceAuthSpec, SurfaceSpec};
 use crate::bdd_support::json_rpc::{
-    IdentityBindingProof, build_a2a_request_body, build_mcp_list_tools_body, build_mcp_tool_call_body,
+    IdentityBindingProof, McpVersion, build_a2a_request_body, build_mcp_list_tools_body, build_mcp_tool_call_body,
     build_modern_mcp_list_tools_body, modern_mcp_request_headers,
 };
 use crate::bdd_support::mcp_consent::{ConsentRequest, exchange_identity_token};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::policies::build_gateway_source_did_allow_policy;
 use crate::harness::multi_gateway::{FabricRouteReadyProbe, GatewayPlan, MultiGatewayHarness};
-
-const MODERN_PROBE_VERSION: &str = "2026-07-28";
 
 /// A fabric link: `from_gw`'s `from_surface` forwards to `to_gw`'s
 /// `to_surface` over DIDComm once federation is complete.
@@ -159,8 +157,8 @@ pub(crate) fn fabric_route_probe(
         // answer only legacy MCP, which every MCP surface also carries, so
         // their routes are probed with legacy MCP.
         "mcp" if target.external_target => {
-            extra_headers.extend(modern_mcp_request_headers(MODERN_PROBE_VERSION, "tools/list"));
-            build_modern_mcp_list_tools_body(Value::from("fabric-route-probe"), MODERN_PROBE_VERSION, true)
+            extra_headers.extend(modern_mcp_request_headers(&McpVersion::Modern, "tools/list"));
+            build_modern_mcp_list_tools_body(Value::from("fabric-route-probe"), &McpVersion::Modern, true)
         }
         "mcp" => match target
             .mcp_tool_policy
@@ -306,8 +304,8 @@ pub struct G2gWorld {
     /// Outcome of the last MCP conformance suite run.
     pub conformance_run: Option<ConformanceRun>,
     /// Requests sent over one Legacy SSE session, each with the SSE reply
-    /// that answered it.
-    pub legacy_sse_exchange: Vec<(Value, Value)>,
+    /// that answered it, if one arrived.
+    pub legacy_sse_exchange: Vec<(Value, Option<Value>)>,
     /// Mediator record ids created for negative-path mediator-selection
     /// scenarios, keyed by the Gherkin-facing mediator label (e.g. `"M1"`).
     pub named_mediators: HashMap<String, String>,

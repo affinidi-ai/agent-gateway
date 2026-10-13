@@ -20,6 +20,7 @@ use crate::bdd_support::collaborators::{
     assert_unique_json_rpc_request_ids,
 };
 use crate::bdd_support::config::modern_consent::PUBLIC_ORIGIN;
+use crate::bdd_support::json_rpc::McpVersion;
 use crate::bdd_support::mcp_consent::ConsentRequest;
 use crate::bdd_support::oidc::OidcProvider;
 use crate::world::G2gWorld;
@@ -998,7 +999,11 @@ pub async fn mcp_unsupported_version_error_has_exact_versions(
     requested: String,
     supported: String,
 ) {
-    assert_mcp_unsupported_version_error(response_body(world), &requested, &supported);
+    let supported: Vec<McpVersion> = supported
+        .split(", ")
+        .map(McpVersion::from)
+        .collect();
+    assert_mcp_unsupported_version_error(response_body(world), &McpVersion::from(requested.as_str()), &supported);
 }
 
 #[then(expr = "the response arrives in under {int} seconds")]
@@ -1046,6 +1051,9 @@ pub async fn each_legacy_sse_reply_answers_its_request(
     );
     let expected = expected_response_for_target(world, &target_name);
     for (request, reply) in &world.legacy_sse_exchange {
+        let reply = reply
+            .as_ref()
+            .unwrap_or_else(|| panic!("no Legacy SSE reply answered request {request}"));
         assert_json_rpc_id_matches_request_body(reply, request, "Legacy SSE reply");
         assert_json_rpc_result_matches_response(reply, expected, &target_name);
     }

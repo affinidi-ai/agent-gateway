@@ -508,18 +508,13 @@ pub fn constrain_forwarded_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::request_validation::{
-        LegacySessionEvidence, McpRequestClassification, McpVersionPolicy, validate_mcp_post,
-    };
+    use crate::mcp::request_validation::{LegacySessionEvidence, McpRequestClassification, validate_mcp_post};
 
     #[test]
     fn forwarded_discovery_intersects_path_support_without_replacing_server_metadata() {
         let request = request("server/discover", json!({}));
         let support = ForwardingSupport {
-            versions: McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-            ),
+            versions: crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
             request_streams: true,
             subscriptions: false,
             capabilities: &["tools", "resources", "prompts", "completions"],
@@ -558,7 +553,7 @@ mod tests {
     fn forwarded_discovery_never_infers_modern_support_from_a_legacy_result() {
         let request = request("server/discover", json!({}));
         let support = ForwardingSupport {
-            versions: McpVersionPolicy::new(&[crate::mcp::MCP_MODERN_VERSION], &[crate::mcp::MCP_MODERN_VERSION]),
+            versions: crate::mcp::request_validation::MODERN_ONLY_POLICY,
             request_streams: true,
             subscriptions: true,
             capabilities: &["tools"],
@@ -619,10 +614,7 @@ mod tests {
     fn owned_discovery_is_truthful_and_does_not_activate_modern_runtime() {
         let wrong_method = request("tools/list", json!({}));
         let request = request("server/discover", json!({}));
-        let versions = McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let response = owned_discovery_response(&request, versions, "Owned tools", "1.0").unwrap();
         assert_eq!(response["result"]["resultType"], "complete");
         assert_eq!(
@@ -710,7 +702,7 @@ mod tests {
             &headers,
             &serde_json::to_vec(&body).unwrap(),
             LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(&[crate::mcp::MCP_MODERN_VERSION], &[crate::mcp::MCP_MODERN_VERSION]),
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
         )
         .unwrap();
         let McpRequestClassification::Modern(message) = classification else { panic!("modern fixture required") };

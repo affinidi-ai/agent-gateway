@@ -26,6 +26,17 @@ pub trait GatewayStore: Send + Sync {
         did: &str,
     ) -> Result<Option<Gateway>>;
 
+    /// The active gateway registered under `did`, of any type.
+    async fn get_active_by_did(
+        &self,
+        did: &str,
+    ) -> Result<Option<Gateway>> {
+        Ok(self
+            .get_by_did(did)
+            .await?
+            .filter(Gateway::is_active))
+    }
+
     /// List all gateways
     async fn list_all(&self) -> Result<Vec<Gateway>>;
 

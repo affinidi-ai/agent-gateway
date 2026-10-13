@@ -4,7 +4,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" requires "API Key" source authentication
-    When the caller asks gateway 1 surface "charlie" for available MCP tools with a valid API key
+    When the caller asks gateway 1 MCP surface "charlie" for available tools with a valid API key
     Then MCP server "bravo" received the forwarded MCP request with the original body
     And MCP server "bravo" did not receive header "x-api-key"
     And the response status is 200
@@ -15,7 +15,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 surface "charlie" for available MCP tools
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then MCP server "bravo" received header "x-target-api-key" with value "bdd-target-secret"
     And the response status is 200
     And the MCP response result matches MCP server "bravo" response result
@@ -25,7 +25,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" requires "API Key" source authentication
-    When the caller asks gateway 1 surface "charlie" for available MCP tools without an API key
+    When the caller asks gateway 1 MCP surface "charlie" for available tools without an API key
     Then MCP server "bravo" received the forwarded MCP request
     And the response status is 200
 
@@ -35,7 +35,7 @@ Feature: Source authentication and target authentication over fabric
     And surface "alpha" requires "API Key" source authentication
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 surface "charlie" for available MCP tools without an API key
+    When the caller asks gateway 1 MCP surface "charlie" for available tools without an API key
     Then MCP server "bravo" received the forwarded MCP request
     And MCP server "bravo" did not receive header "x-target-api-key"
     And the response status is 200
@@ -46,7 +46,7 @@ Feature: Source authentication and target authentication over fabric
     And surface "alpha" requires "API Key" source authentication
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 surface "charlie" for available MCP tools with a valid API key
+    When the caller asks gateway 1 MCP surface "charlie" for available tools with a valid API key
     Then MCP server "bravo" received header "x-target-api-key" with value "bdd-target-secret"
     And the response status is 200
 
@@ -75,7 +75,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" requires "API Key" source authentication
     And surface "charlie" injects target authentication from secret "bdd-sender-auth-secret" with value "bdd-sender-secret" as header "x-sender-api-key"
-    When the caller asks gateway 1 surface "charlie" for available MCP tools without an API key
+    When the caller asks gateway 1 MCP surface "charlie" for available tools without an API key
     Then MCP server "bravo" received the forwarded MCP request
     And MCP server "bravo" did not receive header "x-sender-api-key"
     And the response status is 200
@@ -86,7 +86,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" requires "API Key" source authentication
     And surface "charlie" injects target authentication from secret "bdd-sender-auth-secret" with value "bdd-sender-secret" as header "x-sender-api-key"
-    When the caller asks gateway 1 surface "charlie" for available MCP tools with a valid API key
+    When the caller asks gateway 1 MCP surface "charlie" for available tools with a valid API key
     Then MCP server "bravo" received header "x-sender-api-key" with value "bdd-sender-secret"
     And the response status is 200
 
@@ -104,7 +104,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And surface "charlie" requires "API Key" source authentication
     And gateway 1 has a Gateway-level policy that denies unverified callers
-    When the caller asks gateway 1 surface "charlie" for available MCP tools without an API key
+    When the caller asks gateway 1 MCP surface "charlie" for available tools without an API key
     Then the response status is 403
     And MCP server "bravo" was not called
 
@@ -113,7 +113,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And surface "alpha" is configured with missing target authentication secret "bdd-missing-target-auth-secret" for header "x-target-api-key" and fallback reject
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 surface "charlie" for available MCP tools
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 502
     And MCP server "bravo" was not called
 
@@ -122,7 +122,7 @@ Feature: Source authentication and target authentication over fabric
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And surface "alpha" is configured with missing target authentication secret "bdd-missing-target-auth-secret" for header "x-target-api-key" and fallback passthrough
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 surface "charlie" for available MCP tools
+    When the caller asks gateway 1 MCP surface "charlie" for available tools
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request
     And MCP server "bravo" did not receive header "x-target-api-key"
