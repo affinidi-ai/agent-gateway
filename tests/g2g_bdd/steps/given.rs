@@ -14,8 +14,8 @@ use crate::bdd_support::config::fabric_surface_fixture::{
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
 use crate::bdd_support::json_rpc::{IdentityBindingProof, build_mcp_echo_response_body, build_target_ok_response};
 use crate::bdd_support::mcp_consent::{ConsentRequest, complete_consent, open_consent_callback_with_tampered_state};
-use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
 use crate::bdd_support::mediator::Mediator as _;
+use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
 use crate::bdd_support::policies::{
     build_gateway_deny_all_policy, build_gateway_deny_unverified_source_auth_policy, build_mcp_tool_allow_policy,
     build_surface_identity_binding_issuer_policy,
