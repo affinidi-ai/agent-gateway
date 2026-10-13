@@ -383,7 +383,10 @@ jobs:
     if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
     # Exercises the documented Linux quick start (build -> prepare env -> boot
     # -> GET /api/v1/health). Non-blocking: a failure here does not fail the run.
+    # Replace the line below with the commented one to make this job block merges; it
+    # is left advisory until that is decided.
     continue-on-error: true
+    # continue-on-error: false
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
