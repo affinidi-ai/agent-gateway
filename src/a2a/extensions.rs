@@ -602,6 +602,34 @@ pub async fn upsert_credential_into_agent_card(
     inject_credential_into_agent_card_inner(agent_card, resolved_identity, vc_issuer.as_ref(), channel_name, true).await
 }
 
+/// Remove every `agent-identity-credential/v1` extension the card's sender put
+/// there, then upsert the gateway's own credential. Used where an upstream
+/// credential is not trusted, so none survives next to the gateway's, even when
+/// the agent identity is anonymous.
+pub async fn replace_credential_in_agent_card(
+    agent_card: &mut JsonValue,
+    resolved_identity: &ProtectedAgentIdentity,
+    vc_issuer: &Arc<crate::identity::VCIssuer>,
+    channel_name: &str,
+) -> anyhow::Result<()> {
+    remove_credential_extensions(agent_card);
+    upsert_credential_into_agent_card(agent_card, resolved_identity, vc_issuer, channel_name).await
+}
+
+fn remove_credential_extensions(agent_card: &mut JsonValue) {
+    if let Some(extensions) = agent_card
+        .get_mut("capabilities")
+        .and_then(|c| c.get_mut("extensions"))
+        .and_then(|e| e.as_array_mut())
+    {
+        extensions.retain(|ext| {
+            ext.get("uri")
+                .and_then(|u| u.as_str())
+                != Some(crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION)
+        });
+    }
+}
+
 async fn inject_credential_into_agent_card_inner(
     agent_card: &mut JsonValue,
     resolved_identity: &ProtectedAgentIdentity,
@@ -1280,6 +1308,74 @@ mod tests {
                 .contains("Failed to create identity presentation"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── Replacing an untrusted credential ───────────────────────────────
+
+    fn self_asserted_credential_extension() -> JsonValue {
+        json!({
+            "uri": CREDENTIAL_URI,
+            "params": {"did": "did:key:zSelfAsserted", "verifiablePresentation": "forged"}
+        })
+    }
+
+    #[tokio::test]
+    async fn replace_leaves_only_the_gateway_credential() {
+        let (issuer, did, _tmp) = issuer_with_identity().await;
+        let mut card = agent_card_with_identity();
+        let extensions = card["capabilities"]["extensions"]
+            .as_array_mut()
+            .unwrap();
+        extensions.insert(0, self_asserted_credential_extension());
+        extensions.push(self_asserted_credential_extension());
+
+        replace_credential_in_agent_card(&mut card, &managed_identity_with_did(&did), &issuer, "test-channel")
+            .await
+            .unwrap();
+
+        let credentials: Vec<&JsonValue> = card["capabilities"]["extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|ext| ext["uri"] == CREDENTIAL_URI)
+            .collect();
+        assert_eq!(credentials.len(), 1, "{card}");
+        assert_eq!(credentials[0]["params"]["did"], did.as_str());
+    }
+
+    #[tokio::test]
+    async fn replace_removes_an_untrusted_credential_for_an_anonymous_identity() {
+        let (issuer, _did, _tmp) = issuer_with_identity().await;
+        let mut card = agent_card_with_identity();
+        card["capabilities"]["extensions"]
+            .as_array_mut()
+            .unwrap()
+            .push(self_asserted_credential_extension());
+
+        replace_credential_in_agent_card(&mut card, &ProtectedAgentIdentity::Anonymous, &issuer, "test-channel")
+            .await
+            .unwrap();
+
+        assert!(
+            card["capabilities"]["extensions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|ext| ext["uri"] != CREDENTIAL_URI),
+            "{card}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_keeps_an_upstream_gateway_credential() {
+        let (issuer, did, _tmp) = issuer_with_identity().await;
+        let mut card = json!({"capabilities": {"extensions": [self_asserted_credential_extension()]}});
+
+        inject_credential_into_agent_card(&mut card, &managed_identity_with_did(&did), &issuer, "test-channel")
+            .await
+            .unwrap();
+
+        assert_eq!(card["capabilities"]["extensions"], json!([self_asserted_credential_extension()]));
     }
 
     // ── Happy path ───────────────────────────────────────────────────────
