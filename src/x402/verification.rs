@@ -1698,9 +1698,9 @@ mod tests {
     use super::*;
     use crate::config::types::X402VerificationMode;
     use base64::Engine;
-use uuid::Uuid;
     use std::sync::Mutex;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     const MERCHANT: &str = "0x00000000000000000000000000000000000000AA";
     const ATTACKER: &str = "0x00000000000000000000000000000000000000BB";
