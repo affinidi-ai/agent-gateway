@@ -64,7 +64,9 @@ changes:
         recovery and the permanent connection point's listener use only the mediator record
         validated at accept time, by id: the connection point stores that record id as its
         `mediator_id`, so another tenant's record with the same DID is not used for it, and
-        deleting the mediator stops its listener. On the acceptor's cache-miss
+        deleting the mediator stops its listener. Finalize, like recovery, fails if that
+        record has been deleted, given another DID or disabled since the invitation was
+        accepted. On the acceptor's cache-miss
         recovery path, a recovered mediator other than the temporary connection point's own
         must be that record, still Active, and recovery fails closed without it or without a
         mediator store. Shared-mediator recovery needs no registered inviter mediator.

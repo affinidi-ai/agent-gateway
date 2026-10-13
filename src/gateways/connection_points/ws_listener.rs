@@ -3190,18 +3190,41 @@ async fn validate_recovered_mediator(
             format!("Failed to validate recovered secure_mediator_did '{}' against MediatorStore: {}", recovered_did, e)
         })?;
     match mediator {
-        Some(mediator) if recovered_mediator_is_valid(&mediator, recovered_did) => Ok(()),
+        Some(mediator) if selected_mediator_is_valid(&mediator, recovered_did) => Ok(()),
         _ => Err(refuse()),
     }
 }
 
-/// True when the recorded acceptor mediator still carries `recovered_did` and
+/// True when the recorded acceptor mediator still carries `mediator_did` and
 /// is `Active`.
-fn recovered_mediator_is_valid(
+fn selected_mediator_is_valid(
     mediator: &crate::mediators::types::Mediator,
-    recovered_did: &str,
+    mediator_did: &str,
 ) -> bool {
-    mediator.did == recovered_did && mediator.status == crate::mediators::types::MediatorStatus::Active
+    mediator.did == mediator_did && mediator.status == crate::mediators::types::MediatorStatus::Active
+}
+
+/// The DID document of the acceptor mediator selected when the invitation was
+/// accepted, or `None` for a shared-mediator connection, which selected none.
+/// A selected record that is missing, carries another DID or is not `Active`
+/// fails finalize, as it fails recovery.
+async fn selected_mediator_document(
+    mediator_store: Option<&crate::mediators::FileSystemMediatorStore>,
+    mediator_record_id: Option<&str>,
+    mediator_did: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(record_id) = mediator_record_id else {
+        return Ok(None);
+    };
+    let mediator_store = mediator_store
+        .ok_or_else(|| format!("Mediator store unavailable; cannot read the selected mediator '{}'", record_id))?;
+    match get_mediator(mediator_store, record_id).await? {
+        Some(mediator) if selected_mediator_is_valid(&mediator, mediator_did) => Ok(mediator.did_document),
+        _ => Err(format!(
+            "Selected mediator '{}' is no longer an Active mediator with DID '{}'; refusing to finalize",
+            record_id, mediator_did
+        )),
+    }
 }
 
 async fn get_mediator(
@@ -3596,37 +3619,16 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
         .clone();
     info!("   Using mediator from connection: {}", connection_mediator_did);
 
-    // Only the acceptor mediator record validated when the invitation was
-    // accepted is consulted; a shared-mediator connection uses no record.
-    let connection_mediator_doc = match (
+    let connection_mediator_doc = selected_mediator_document(
+        listener_manager
+            .mediator_store
+            .as_deref(),
         pending_conn
             .mediator_record_id
             .as_deref(),
-        listener_manager
-            .mediator_store
-            .as_ref(),
-    ) {
-        (Some(record_id), Some(mediator_store)) => match get_mediator(mediator_store, record_id).await {
-            Ok(Some(mediator)) if mediator.did == connection_mediator_did => mediator.did_document,
-            Ok(_) => {
-                warn!(
-                    mediator_record_id = record_id,
-                    mediator_did = %connection_mediator_did,
-                    "Selected mediator record is missing or changed DID; resolving the endpoint from the mediator DID"
-                );
-                None
-            }
-            Err(e) => {
-                warn!(
-                    mediator_record_id = record_id,
-                    error = %e,
-                    "Mediator store read failed; resolving the endpoint from the mediator DID"
-                );
-                None
-            }
-        },
-        _ => None,
-    };
+        &connection_mediator_did,
+    )
+    .await?;
     let connection_mediator_url = permanent_mediator_url(
         &connection_mediator_did,
         connection_mediator_doc.as_ref(),
@@ -5111,9 +5113,9 @@ mod tests {
         let active = mediator(own, crate::mediators::types::MediatorStatus::Active);
         let disabled = mediator(own, crate::mediators::types::MediatorStatus::Disabled);
 
-        assert!(super::recovered_mediator_is_valid(&active, own));
-        assert!(!super::recovered_mediator_is_valid(&active, "did:web:attacker.example.com:.well-known"));
-        assert!(!super::recovered_mediator_is_valid(&disabled, own));
+        assert!(super::selected_mediator_is_valid(&active, own));
+        assert!(!super::selected_mediator_is_valid(&active, "did:web:attacker.example.com:.well-known"));
+        assert!(!super::selected_mediator_is_valid(&disabled, own));
     }
 
     async fn mediator_store_with(
@@ -5223,6 +5225,54 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_refuses_a_selected_mediator_that_is_gone_changed_or_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let own_did = "did:web:m2.example.com:.well-known";
+        let mut own = mediator(own_did, crate::mediators::types::MediatorStatus::Active);
+        own.did_document = Some(serde_json::json!({ "id": own_did }));
+        let mut disabled = mediator("did:web:m3.example.com", crate::mediators::types::MediatorStatus::Disabled);
+        disabled.id = "mediator-disabled".to_string();
+        let store = mediator_store_with(root.path(), &[own.clone(), disabled.clone()]).await;
+
+        assert_eq!(
+            super::selected_mediator_document(Some(&store), Some(&own.id), own_did)
+                .await
+                .unwrap(),
+            Some(serde_json::json!({ "id": own_did }))
+        );
+        assert!(
+            super::selected_mediator_document(Some(&store), Some("deleted-id"), own_did)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::selected_mediator_document(Some(&store), Some(&own.id), "did:web:other.example.com")
+                .await
+                .is_err()
+        );
+        assert!(
+            super::selected_mediator_document(Some(&store), Some(&disabled.id), &disabled.did)
+                .await
+                .is_err()
+        );
+        assert!(
+            super::selected_mediator_document(None, Some(&own.id), own_did)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_mediator_connection_reads_no_mediator_record() {
+        assert_eq!(
+            super::selected_mediator_document(None, None, "did:web:m1.example.com")
+                .await
+                .unwrap(),
+            None
         );
     }
 

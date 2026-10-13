@@ -149,7 +149,9 @@ connection point moves.
    same mediator and its record id, so recovery after the pending connection is
    lost rebuilds the acceptor's choice. The permanent connection point stores
    that record id as its `mediator_id`, so finalize, recovery and its listener
-   read only that record, never a mediator found by DID. Recovery onto a mediator other
+   read only that record, never a mediator found by DID. Finalize, like
+   recovery, refuses to finish if that record is gone, carries another DID or is
+   no longer `Active`. Recovery onto a mediator other
    than the temporary connection point's own requires that record to be
    `Active` with the same DID, and fails without it or without a store. A
    shared-mediator connection reads no mediator record.
