@@ -115,9 +115,10 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
   in the parameters above. It is disabled until the configuration would pass Create's
   validation (name, scopes, resource pattern, headers, expiry), and it is not shown in edit
   mode.
-- A successful create replaces the editor with the secret page. The secret is never
-  rendered: the field shows a masked placeholder and only **Copy** puts the real value on
-  the clipboard.
+- A successful create replaces the editor with the secret page. The secret isn't rendered:
+  the field shows a masked placeholder and **Copy** puts the real value on the clipboard.
+  If copying fails (clipboard denied, or no clipboard API on a plain-HTTP origin), the
+  field shows the secret, selected on focus, so it can be copied by hand.
 - The right column always shows **About Access Tokens**. Edit mode also shows **Access
   Token Details**, resolving the bound user UUID to a name and email while keeping the
   UUID as a fallback.

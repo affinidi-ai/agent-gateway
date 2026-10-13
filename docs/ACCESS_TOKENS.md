@@ -219,8 +219,10 @@ tester.
 Two points from that specification matter to the token contract itself rather than to the
 interface:
 
-- A created secret is shown once. The dashboard clears it on route exit or unmount, which
-  is why there is no endpoint to retrieve it again.
+- A created secret is delivered once, through **Copy**, and is not displayed. Only when
+  copying fails (no clipboard access) does the field show it for copying by hand. The
+  dashboard clears it on route exit or unmount, which is why there is no endpoint to
+  retrieve it again.
 - The resource-pattern editor enforces the same canonical grammar described under
   [Resource patterns and required headers](#resource-patterns-and-required-headers). A
   pattern the editor refuses is one the API would also refuse.

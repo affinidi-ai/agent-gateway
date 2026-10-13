@@ -9,8 +9,8 @@ changes:
       description: Create Access Token has a Copy creation link button that copies a /access-tokens/new URL carrying the configured name, description, scopes, expiry, resource pattern and headers, so the same form can be shared and reopened prefilled. The button is disabled until the configuration is valid, so only links that would pass Create are shared.
   changed:
     - timestamp: "2026-10-12T00:00:00.000Z"
-      title: Hide a new access token's secret and offer it only through Copy
-      description: The created-token page no longer renders the secret. The field shows a masked placeholder and the Copy button puts the real value on the clipboard.
+      title: Hide a new access token's secret and offer it through Copy
+      description: The created-token page no longer renders the secret. The field shows a masked placeholder and the Copy button puts the real value on the clipboard. If copying fails, for example without clipboard access on a plain-HTTP origin, the field shows the secret so it can still be copied by hand instead of being lost.
   fixed:
     - timestamp: "2026-10-12T00:00:00.000Z"
       title: Keep a new access token link and its presets across sign-in

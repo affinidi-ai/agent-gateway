@@ -82,6 +82,7 @@ describe('EditAccessTokenPage', () => {
 
     await userEvent.click(screen.getByTestId('access-token-copy-secret-button'));
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('agpat_once-only');
+    expect(screen.getByTestId('access-token-secret')).not.toHaveValue('agpat_once-only');
 
     await userEvent.click(screen.getByTestId('access-token-done-button'));
     expect(screen.getByTestId('location')).toHaveTextContent('/secrets?tab=access-tokens');
@@ -308,19 +309,36 @@ describe('EditAccessTokenPage', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
-  it('reports clipboard rejection without claiming success', async () => {
-    (navigator.clipboard.writeText as jest.Mock).mockRejectedValueOnce(new Error('denied'));
+  const createAndCopy = async () => {
     renderPage();
     await userEvent.type(screen.getByTestId('access-token-name'), 'Copy test');
     await userEvent.click(screen.getByTestId('access-token-form-save-button'));
-
     const copy = await screen.findByTestId('access-token-copy-secret-button');
+    expect(screen.getByTestId('access-token-secret')).not.toHaveValue('agpat_once-only');
     await userEvent.click(copy);
+    return copy;
+  };
+
+  it('shows the secret for copying by hand when the clipboard refuses it', async () => {
+    (navigator.clipboard.writeText as jest.Mock).mockRejectedValueOnce(new Error('denied'));
+    const copy = await createAndCopy();
+
     expect(showToast).toHaveBeenCalledWith(
       'error',
-      'Could not copy the token. Allow clipboard access and try again.'
+      'Could not copy the token. It is now shown in the field: select it and copy it by hand.'
     );
+    const secret = screen.getByTestId('access-token-secret');
+    expect(secret).toHaveValue('agpat_once-only');
+    expect(secret).toHaveAttribute('aria-label', 'Token secret');
     expect(copy).toHaveTextContent('Copy');
     expect(copy).not.toHaveTextContent('Copied');
+  });
+
+  it('shows the secret for copying by hand when the page has no clipboard API', async () => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    await createAndCopy();
+
+    expect(showToast).toHaveBeenCalledWith('error', expect.stringContaining('copy it by hand'));
+    expect(screen.getByTestId('access-token-secret')).toHaveValue('agpat_once-only');
   });
 });
