@@ -1,0 +1,25 @@
+.github/scripts/test_check_docs.py
+  s_09d9fb08a24a2a::t_c43a357e069817 23-43
+.github/scripts/check_docs.py
+  s_09d9fb08a24a2a::t_c43a357e069817 14-15,29-44,48
+CONTRIBUTING.md
+  s_09d9fb08a24a2a::t_c43a357e069817 27-31
+AGENTS.md
+  s_09d9fb08a24a2a::t_c43a357e069817 16,25,45-48,55,57-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2308c860039d33f5f845e01f65fd2a6c948520ab",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
