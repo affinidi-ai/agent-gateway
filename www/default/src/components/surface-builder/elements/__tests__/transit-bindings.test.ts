@@ -127,6 +127,17 @@ describe('transitCredentialsToApi', () => {
     expect(transitCredentialsToApi(api)).toEqual(api);
   });
 
+  it('keeps the stored elicitation timeout and fallback in either shape', () => {
+    const elicit = {
+      ...api,
+      consent_mode: 'elicit',
+      elicit_timeout_secs: 45,
+      elicit_fallback: 'fail',
+    };
+    expect(transitCredentialsToApi(elicit)).toEqual(elicit);
+    expect(transitCredentialsToApi(transitCredentialsApiToForm(elicit))).toEqual(elicit);
+  });
+
   it('returns undefined for missing, non-object or provider-less values', () => {
     expect(transitCredentialsToApi(undefined)).toBeUndefined();
     expect(transitCredentialsToApi(null)).toBeUndefined();
@@ -192,6 +203,21 @@ describe('saving a reloaded surface with a Transit Point', () => {
       target_endpoint: 'https://upstream.example.com',
       transit_credentials: api,
     });
+  });
+
+  it('keeps the stored elicitation settings when another element is edited after reload', () => {
+    const elicit = {
+      ...api,
+      consent_mode: 'elicit',
+      elicit_timeout_secs: 45,
+      elicit_fallback: 'fail',
+    };
+    const saved = savedSurface({ transit_credentials: transitCredentialsApiToForm(elicit) });
+    expect(saved.transit.points[0].transit_credentials).toEqual(elicit);
+
+    const resaved = saveAfterEditingTarget(saved);
+
+    expect(resaved.transit.points[0].transit_credentials).toEqual(elicit);
   });
 
   it('keeps a Transit Point without credentials when another element is edited after reload', () => {

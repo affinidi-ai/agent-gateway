@@ -10,7 +10,9 @@ changes:
         than its Transit Point's dropped the whole transit block when a Transit Point
         had credentials, so the gateway lost its Transit Points while the canvas still
         showed them. The Surface Builder now accepts the credentials in the shape they
-        are loaded in, so every Transit Point on the canvas is saved.
+        are loaded in, so every Transit Point on the canvas is saved. It also keeps a
+        stored elicitation timeout and fallback, which a save used to reset to 300
+        seconds and on_demand.
     - timestamp: '2026-10-12T11:55:15.000Z'
       title: Keep explicit empty or zero retry values when saving from the dashboard
       description: >-
