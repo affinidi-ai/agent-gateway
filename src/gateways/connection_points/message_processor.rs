@@ -2603,6 +2603,8 @@ fn fabric_surface_policies(
 /// then evaluates surface-level OPA policies. Returns the (potentially modified)
 /// body bytes on allow, or a deny `ProcessingResult`.
 async fn enrich_and_evaluate_surface_policies(
+    appliance_policy: Option<&crate::policies::GlobalPolicyManager>,
+    surface_policy: Option<&crate::policies::SurfacePolicyManager>,
     surface: &crate::config::agent_surface::AgentSurface,
     channel_id: &str,
     config_id: &str,
@@ -2898,12 +2900,8 @@ async fn enrich_and_evaluate_surface_policies(
     let policies = fabric_surface_policies(
         surface.opa_enabled(),
         is_agent_card_request,
-        GLOBAL_APPLIANCE_POLICY_MANAGER
-            .get()
-            .is_some_and(|pm| pm.has_global(crate::policies::global_policy::PLANE_AGENT_SURFACE)),
-        GLOBAL_POLICY_MANAGER
-            .get()
-            .map(Arc::as_ref),
+        appliance_policy.is_some_and(|pm| pm.has_global(crate::policies::global_policy::PLANE_AGENT_SURFACE)),
+        surface_policy,
         config_id,
         variant_alias,
     );
@@ -3137,7 +3135,7 @@ async fn enrich_and_evaluate_surface_policies(
         // of the per-surface policy, evaluated on every fabric request
         // regardless of the surface's own OPA configuration.
         if policies.global
-            && let Some(global_pm) = GLOBAL_APPLIANCE_POLICY_MANAGER.get()
+            && let Some(global_pm) = appliance_policy
         {
             let gd = global_pm.evaluate_global(crate::policies::global_policy::PLANE_AGENT_SURFACE, &input_value);
             let global_policy_name = gd.policy_name.as_deref();
@@ -3190,7 +3188,7 @@ async fn enrich_and_evaluate_surface_policies(
         }
 
         if policies.surface == Some(Ok(()))
-            && let Some(policy_manager) = GLOBAL_POLICY_MANAGER.get()
+            && let Some(policy_manager) = surface_policy
         {
             let channel_opa_def_id = surface.opa_policy_definition_id();
             let (channel_opa_name, channel_opa_version, channel_opa_hash) = policy_manager
@@ -4742,6 +4740,12 @@ async fn process_forward_request_with_mcp_runtime(
     }
 
     let mut body_bytes = match Box::pin(enrich_and_evaluate_surface_policies(
+        GLOBAL_APPLIANCE_POLICY_MANAGER
+            .get()
+            .map(Arc::as_ref),
+        GLOBAL_POLICY_MANAGER
+            .get()
+            .map(Arc::as_ref),
         &surface,
         channel_id,
         config_id,
