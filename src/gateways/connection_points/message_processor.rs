@@ -9527,6 +9527,172 @@ mod tests {
         assert_eq!(fabric_surface_policies(true, true, false, None, "surf-1", None).surface, None);
     }
 
+    const GATED_BODY: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"message/send"}"#;
+
+    fn gated_surface(surface_opa: bool) -> crate::config::agent_surface::AgentSurface {
+        let mut target = serde_json::json!({"endpoint": "a2a-proxy://gated"});
+        if surface_opa {
+            target["policy"] = serde_json::json!({"policy_definition_id": "gated-policy"});
+        }
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "gated", "name": "gated",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/gated", "protocol": "a2a"},
+            "target": target
+        }))
+        .unwrap()
+    }
+
+    async fn appliance_surface_policy(rego: &str) -> crate::policies::GlobalPolicyManager {
+        use crate::policies::global_policy::tests::{gw_def, store_with};
+        use crate::policies::global_policy::{GlobalAssignment, GlobalPolicyAssignments, PLANE_AGENT_SURFACE};
+        let manager = crate::policies::GlobalPolicyManager::new();
+        manager.set_policy_definition_store(
+            store_with(vec![crate::policies::policy_definitions::PolicyDefinition {
+                policy_type: crate::policies::policy_definitions::PolicyType::AgentSurface,
+                ..gw_def("appliance-surface", rego)
+            }])
+            .await,
+        );
+        let mut assignments = GlobalPolicyAssignments::default();
+        assignments
+            .assignments
+            .insert(
+                PLANE_AGENT_SURFACE.to_string(),
+                vec![GlobalAssignment {
+                    policy_id: "appliance-surface".to_string(),
+                    monitor_only: false,
+                }],
+            );
+        manager
+            .refresh(&assignments)
+            .await;
+        manager
+    }
+
+    /// Drive the Fabric surface-policy gate and return its result with the
+    /// policy decisions it recorded.
+    async fn gate_fabric_request(
+        surface: &crate::config::agent_surface::AgentSurface,
+        appliance_policy: Option<&crate::policies::GlobalPolicyManager>,
+        surface_policy: Option<&crate::policies::SurfacePolicyManager>,
+    ) -> (Result<bytes::Bytes, ProcessingResult>, Vec<crate::delegation_vault::audit::DelegationAuditAction>) {
+        let peer_issuers = crate::gateways::types::PeerIssuers {
+            attested: None,
+            trusted: Vec::new(),
+        };
+        let (result, events) = crate::audit::producer::capture(Box::pin(enrich_and_evaluate_surface_policies(
+            appliance_policy,
+            surface_policy,
+            surface,
+            "gated",
+            "gated",
+            "POST",
+            "/rpc",
+            bytes::Bytes::from_static(GATED_BODY),
+            None,
+            Some("did:web:peer.example".into()),
+            None,
+            None,
+            crate::surface_context::IdentityVerification::Unverified,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &peer_issuers,
+            None,
+        )))
+        .await;
+        let decisions = events
+            .into_iter()
+            .map(|event| event.event)
+            .filter(|event| {
+                matches!(event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
+            })
+            .collect();
+        (result, decisions)
+    }
+
+    fn denied_status(result: &Result<bytes::Bytes, ProcessingResult>) -> serde_json::Value {
+        match result {
+            Err(ProcessingResult::RequiresResponse { response_body, .. }) => response_body["status"].clone(),
+            other => panic!("expected a deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fabric_gate_denies_a_surface_whose_opa_policy_is_not_compiled() {
+        let surface_policy = crate::policies::SurfacePolicyManager::new();
+        let (result, decisions) = gate_fabric_request(&gated_surface(true), None, Some(&surface_policy)).await;
+
+        assert_eq!(denied_status(&result), 403);
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        match &decisions[0] {
+            crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                scope,
+                flow,
+                decision,
+                deny_reason,
+                surface_id,
+                policy_definition_id,
+                ..
+            } => {
+                assert_eq!(scope, "surface");
+                assert_eq!(flow, "fabric");
+                assert_eq!(decision, "error");
+                assert_eq!(deny_reason.as_deref(), Some("policy_not_compiled"));
+                assert_eq!(surface_id.as_deref(), Some("gated"));
+                assert_eq!(policy_definition_id.as_deref(), Some("gated-policy"));
+            }
+            other => panic!("expected a policy decision, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fabric_gate_applies_the_appliance_wide_policy_to_a_surface_without_opa() {
+        let appliance_policy = appliance_surface_policy("package surface.policy\ndefault allow = false").await;
+        let surface_policy = crate::policies::SurfacePolicyManager::new();
+        let (result, decisions) =
+            gate_fabric_request(&gated_surface(false), Some(&appliance_policy), Some(&surface_policy)).await;
+
+        assert_eq!(denied_status(&result), 403);
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        match &decisions[0] {
+            crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                scope,
+                flow,
+                decision,
+                deny_reason,
+                surface_id,
+                policy_definition_id,
+                ..
+            } => {
+                assert_eq!(scope, "surface");
+                assert_eq!(flow, "fabric");
+                assert_eq!(decision, "deny");
+                assert_eq!(deny_reason.as_deref(), Some("Blocked by appliance-wide policy"));
+                assert_eq!(surface_id.as_deref(), Some("gated"));
+                assert_eq!(policy_definition_id.as_deref(), Some("appliance-surface"));
+            }
+            other => panic!("expected a policy decision, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fabric_gate_allows_when_no_surface_policy_applies() {
+        let appliance_policy = crate::policies::GlobalPolicyManager::new();
+        let surface_policy = crate::policies::SurfacePolicyManager::new();
+        let (result, decisions) =
+            gate_fabric_request(&gated_surface(false), Some(&appliance_policy), Some(&surface_policy)).await;
+
+        match result {
+            Ok(body) => assert_eq!(body.as_ref(), GATED_BODY),
+            Err(other) => panic!("expected the request to pass the gate, got {other:?}"),
+        }
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
     #[tokio::test]
     async fn fabric_mcp_tool_policy_error_records_the_reason_it_could_not_decide() {
         let (result, decisions) = collect_policy_decisions(|| {

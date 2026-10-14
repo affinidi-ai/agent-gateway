@@ -130,3 +130,6 @@ changes:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Add the audit producer and the deferred-audit guard
       description: The producer is the one place an audit record is finalised. It builds a record only when a sink selects its event, decides the recipients from the current sinks, gives it an event id and hands it to the journal without waiting, counting it in agent_gateway_audit_records_produced_total. The deferred-audit guard holds records until the request's identity VP is known and stamps them with it; whatever it still holds when dropped is submitted without a VP, so no return path loses them.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Test the Fabric surface-policy gate with injected policy managers
+      description: The Fabric surface-policy gate takes the appliance-wide and surface policy managers as parameters, and unit tests drive it to show that a surface with OPA enabled but no compiled policy is denied, that the appliance-wide surface policy denies a surface with OPA off, and that a request no surface policy applies to passes, each with the policy decision it records.
