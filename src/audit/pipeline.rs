@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::sync::{oneshot, watch};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{error, info};
 
 use crate::audit::audit_log_sink::AuditLogSink;
@@ -26,38 +26,75 @@ use crate::integrations::audit_integration_triggers::publish_audit_delivery;
 
 const SEGMENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const REMEMBERED_IDS: usize = 1024;
-const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a graceful stop lets the writer journal what it was handed.
+const WRITER_GRACE: Duration = Duration::from_secs(5);
+/// How long a stop waits for a cancelled writer before reporting it stuck.
+const WRITER_BACKSTOP: Duration = Duration::from_secs(10);
 
-/// A running pipeline.
+/// A running pipeline. Every job runs under its cancellation token: the
+/// journal writer, the dispatcher and, under the dispatcher, one reader per
+/// sink. Dropping a pipeline cancels them all.
 pub struct Pipeline {
     producer: &'static Producer,
-    cancel: CancellationToken,
+    cancel: DropGuard,
+    cursors: Arc<CursorStore>,
     writer: oneshot::Receiver<WriterStopped<JournalWriter>>,
+    /// What the writer handed back once it stopped during a graceful stop.
+    writer_stopped: Option<Result<WriterStopped<JournalWriter>, oneshot::error::RecvError>>,
     dispatcher: tokio::task::JoinHandle<()>,
 }
 
 impl Pipeline {
-    /// Disconnects the producer, waits for the writer to journal the records
-    /// it was already handed, then for the dispatcher to stop delivering and
-    /// saving cursors, and releases the journal.
-    pub async fn stop(self) {
+    /// Stops gracefully: disconnects the producer and gives the writer up to
+    /// [`WRITER_GRACE`] to journal the records it was already handed, then
+    /// stops everything with [`Pipeline::abort`].
+    pub async fn stop(mut self) {
+        self.producer.disconnect();
+        if let Ok(stopped) = tokio::time::timeout(WRITER_GRACE, &mut self.writer).await {
+            self.writer_stopped = Some(stopped);
+        }
+        self.abort().await;
+    }
+
+    /// Stops every job now: disconnects the producer, cancels the writer, the
+    /// dispatcher and its readers, and closes the cursor store, so no cursor
+    /// is saved after it. Records the writer had not journalled are
+    /// discarded and counted as `aborted`. The journal, and its lock, is
+    /// released last, once the dispatcher and the writer have stopped.
+    pub async fn abort(self) {
         let Self {
             producer,
             cancel,
+            cursors,
             writer,
+            writer_stopped,
             dispatcher,
         } = self;
         producer.disconnect();
-        let Ok(stopped) = tokio::time::timeout(WRITER_STOP_TIMEOUT, writer).await else {
-            error!("The audit journal writer did not stop in time; stopping delivery without it");
-            cancel.cancel();
-            dispatcher.abort();
-            return;
+        drop(cancel);
+        cursors.close();
+        if let Err(e) = dispatcher.await {
+            error!(error = %e, "The audit dispatcher ended abnormally");
+        }
+        let stopped = match writer_stopped {
+            Some(stopped) => stopped,
+            None => match tokio::time::timeout(WRITER_BACKSTOP, writer).await {
+                Ok(stopped) => stopped,
+                Err(_) => {
+                    error!(
+                        critical = true,
+                        "The audit journal writer is stuck in I/O and did not stop; it keeps the journal lock, so no node can take over the audit journal until this node is rebooted"
+                    );
+                    return;
+                }
+            },
         };
-        let _ = dispatcher.await;
-        if let Ok(WriterStopped { journal, lost, aborted }) = stopped {
-            info!(lost, aborted, "Audit journal writer stopped");
-            drop(journal);
+        match stopped {
+            Ok(WriterStopped { journal, lost, aborted }) => {
+                info!(lost, aborted, "Audit journal writer stopped");
+                drop(journal);
+            }
+            Err(_) => error!("The audit journal writer ended abnormally"),
         }
     }
 }
@@ -90,7 +127,7 @@ pub fn start_with(
     producer.connect(journal);
 
     let source = JournalSource {
-        cursors,
+        cursors: cursors.clone(),
         dir: journal_dir,
         durable,
     };
@@ -98,8 +135,10 @@ pub fn start_with(
         tokio::spawn(run_dispatcher(factory, sinks, source, DispatcherConfig::default(), cancel.child_token()));
     Ok(Pipeline {
         producer,
-        cancel,
+        cancel: cancel.drop_guard(),
+        cursors,
         writer,
+        writer_stopped: None,
         dispatcher,
     })
 }
@@ -245,7 +284,7 @@ mod tests {
         sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
         let producer: &'static Producer = Box::leak(Box::new(Producer::new(sinks)));
 
-        start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
         let record = audit_event(DelegationAuditAction::ConsentGranted, None, None, Some("github"), None);
         let event_id = record.event_id.clone();
         producer.submit(record);
@@ -258,6 +297,7 @@ mod tests {
                 .join("journal")
                 .is_dir()
         );
+        pipeline.stop().await;
     }
 
     #[tokio::test]
@@ -275,13 +315,82 @@ mod tests {
             ],
             Vec::new(),
         );
-        start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
 
         producer.submit(audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None));
         let journal = dir.path().join("journal");
         wait_until(|| crate::audit::cursors::journal_bytes(&journal).unwrap() > 0).await;
 
         assert!(stored(&log).is_empty());
+        pipeline.stop().await;
+    }
+
+    fn journal_locked(audit_dir: &Path) -> bool {
+        JournalWriter::open(&audit_dir.join("journal"), SEGMENT_MAX_BYTES)
+            .err()
+            .is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+    }
+
+    #[tokio::test]
+    async fn the_journal_opens_for_another_writer_only_once_stop_returns() {
+        let dir = TempDir::new().unwrap();
+        let log = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let (producer, sinks) = parts();
+        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        producer.submit(consent());
+        wait_until(|| stored(&log).len() == 1).await;
+
+        assert!(journal_locked(dir.path()));
+        pipeline.stop().await;
+
+        assert!(!journal_locked(dir.path()));
+        assert_eq!(journal_seqs(dir.path()), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_pipeline_releases_the_journal_and_saves_no_more_cursors() {
+        let dir = TempDir::new().unwrap();
+        let log = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let (producer, sinks) = parts();
+        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        producer.submit(consent());
+        wait_until(|| stored(&log).len() == 1).await;
+        let cursors = pipeline.cursors.clone();
+        wait_until(|| cursors.get(&SinkId::AuditLog) == Some(1)).await;
+
+        pipeline.abort().await;
+        cursors
+            .set(&SinkId::AuditLog, 9)
+            .unwrap();
+        producer.submit(consent());
+
+        assert!(!journal_locked(dir.path()));
+        assert_eq!(
+            CursorStore::open(&dir.path().join("journal"))
+                .unwrap()
+                .get(&SinkId::AuditLog),
+            Some(1)
+        );
+        assert_eq!(journal_seqs(dir.path()), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_pipeline_stops_its_jobs_and_releases_the_journal() {
+        let dir = TempDir::new().unwrap();
+        let log = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let (producer, sinks) = parts();
+        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        assert!(journal_locked(dir.path()));
+
+        drop(pipeline);
+
+        wait_until(|| !journal_locked(dir.path())).await;
     }
 
     fn parts() -> (&'static Producer, &'static Sinks) {

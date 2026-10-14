@@ -248,8 +248,11 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   The journal directory is owner-only (`0700`) and its files `0600`.
 - *One writer.* Only an Active node runs the pipeline (see
   [Server mode](CONFIGURATION_RELOAD.md#server-mode)); a Standby node keeps no audit records.
-  On stepping down a node journals what it was handed, stops delivering and releases the
-  journal; on becoming Active it re-opens the journal and cursors from disk and continues after
+  On stepping down a node stops taking records, gives the writer up to 5 s to journal what it
+  was handed, then cancels the writer, the dispatcher and every reader: a delivery in flight is
+  dropped, no cursor is saved after that, and records still unwritten are counted with
+  `reason="aborted"`. The journal lock is released last, once all of them have stopped. On
+  becoming Active it re-opens the journal and cursors from disk and continues after
   the last record the previous Active node wrote. Before the pipeline starts, on start-up or on
   becoming Active, the sinks are built from the current settings and integrations, so delivery
   never starts from sinks that were never built or are stale; while the integrations cannot be
@@ -318,6 +321,15 @@ records a sink skipped in
 (the journal directory cannot be created or written, for example) or the node is in Standby.
 While it is 0 on an Active node the gateway keeps serving requests but keeps and forwards no
 audit records; alert on that.
+
+*A writer stuck in I/O.* A journal writer blocked inside a write or sync (a failing disk, for
+example) cannot see that the pipeline was stopped. It keeps the journal lock, deliberately, so no
+other writer interleaves with it; ten seconds after the stop the node logs an error saying the
+writer is stuck in I/O and keeps the journal lock. The node taking over then cannot open the
+journal and keeps retrying every 5 s. Alert when `agent_gateway_audit_pipeline_started` is 0 on
+the Active node, or `agent_gateway_audit_records_lost_total{reason="pipeline_not_running"}`
+increases; if the stuck-writer error was logged on the node that stepped down, reboot that node to
+release the lock.
 
 **Payload.** Audit templates may use `EVENT_TYPE`, `TIMESTAMP` (the record's own timestamp),
 `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
