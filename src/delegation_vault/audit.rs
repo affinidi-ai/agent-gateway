@@ -689,13 +689,19 @@ pub async fn init_audit_logger(log_directory: Option<&str>) {
 }
 
 /// Follows the node's mode: an Active node runs the audit pipeline, and a
-/// Standby node stops it, releasing the journal for the node taking over.
+/// Standby node stops it, releasing the journal for the node taking over. A
+/// node becoming Active first re-reads the dashboard settings and forgets its
+/// cached integrations (see [`crate::audit::sources::reload_sources`]), so the
+/// sinks the pipeline builds as it starts follow what is stored now.
 pub async fn set_audit_pipeline_mode(mode: ServerMode) {
     let Some(control) = AUDIT_PIPELINE.get() else {
         return;
     };
     match mode {
-        ServerMode::Active => start_audit_pipeline(control).await,
+        ServerMode::Active => {
+            crate::audit::sources::reload_sources().await;
+            start_audit_pipeline(control).await;
+        }
         ServerMode::Standby => {
             control.stop().await;
             set_audit_pipeline_started(false);

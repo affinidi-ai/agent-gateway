@@ -16,6 +16,14 @@ pub fn set_global_settings_store(store: Arc<SettingsStore>) {
     let _ = GLOBAL_SETTINGS.set(store);
 }
 
+/// The global settings store, or `None` before `set_global_settings_store`
+/// has been called.
+pub fn global_settings_store() -> Option<&'static SettingsStore> {
+    GLOBAL_SETTINGS
+        .get()
+        .map(Arc::as_ref)
+}
+
 /// Read the current system-level settings from the global store.
 /// Returns `None` only before `set_global_settings_store` has been called.
 pub fn global_settings() -> Option<DashboardSettings> {

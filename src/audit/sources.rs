@@ -10,8 +10,9 @@ use tracing::warn;
 
 use crate::audit::registry::{EventMask, Sink, SinkId, Sinks, sinks};
 use crate::integrations::audit_integration_triggers::receives_audit_records;
+use crate::integrations::cache::INTEGRATION_CACHE;
 use crate::metrics::backends::prometheus::track_audit_sink_rebuild_failed;
-use crate::storage::settings_store::{DashboardSettings, global_settings};
+use crate::storage::settings_store::{DashboardSettings, SettingsStore, global_settings, global_settings_store};
 use crate::storage::{Integration, IntegrationStorage, get_integration_storage};
 
 /// Held for a whole rebuild, so rebuilds apply in the order they start.
@@ -125,6 +126,32 @@ where
             false
         }
     }
+}
+
+/// The integrations deliveries load, by id.
+type IntegrationCache = moka::future::Cache<String, Arc<Integration>>;
+
+/// Re-reads the dashboard settings from disk and forgets every cached
+/// integration, so the sinks built next, and the deliveries to them, follow
+/// what is stored now rather than what this node loaded before. A node
+/// becoming Active calls it before the audit pipeline starts: the node that
+/// was Active may have changed both.
+pub async fn reload_sources() {
+    reload(global_settings_store(), &INTEGRATION_CACHE).await;
+}
+
+/// Reloads `settings` from disk, keeping the settings already loaded when
+/// that fails, and empties `integrations`.
+async fn reload(
+    settings: Option<&SettingsStore>,
+    integrations: &IntegrationCache,
+) {
+    if let Some(settings) = settings
+        && let Err(e) = settings.load().await
+    {
+        warn!(error = %e, "Failed to reload the dashboard settings; building the audit sinks from those already loaded");
+    }
+    integrations.invalidate_all();
 }
 
 async fn retry_until_rebuilt<A, F>(
@@ -401,6 +428,85 @@ mod tests {
         assert!(!rebuilt);
         assert!(list_from(None).await.is_err());
         assert!(log_selects(registry, "policy_decision"));
+    }
+
+    #[tokio::test]
+    async fn a_reload_rebuilds_from_the_settings_and_integrations_stored_now() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings_dir = dir.path().join("settings");
+        let settings = SettingsStore::new(&settings_dir);
+        settings.load().await.unwrap();
+        let storage = IntegrationStorage::new(
+            dir.path()
+                .join("integrations"),
+        )
+        .await
+        .unwrap();
+        let integration = audit_integration("active", None, &["auth_failed"]);
+        storage
+            .save(&integration)
+            .await
+            .unwrap();
+        let cache = IntegrationCache::builder().build();
+        cache
+            .insert(integration.id.clone(), Arc::new(integration.clone()))
+            .await;
+        let serial = Mutex::new(());
+        let registry: &'static Sinks = Box::leak(Box::default());
+        assert!(rebuild(&serial, registry, || settings.get(), || storage.list()).await);
+
+        let other_node = SettingsStore::new(&settings_dir);
+        other_node
+            .update(selecting("policy_decision"))
+            .unwrap();
+        other_node
+            .save()
+            .await
+            .unwrap();
+        let mut changed = integration.clone();
+        changed.audit_events = vec!["trust_check".to_string()];
+        storage
+            .save(&changed)
+            .await
+            .unwrap();
+        assert!(!settings.get().audit_enabled);
+
+        reload(Some(&settings), &cache).await;
+        assert!(rebuild(&serial, registry, || settings.get(), || storage.list()).await);
+
+        let siem = SinkId::Integration(integration.id.clone());
+        let snapshot = registry.snapshot();
+        assert!(log_selects(registry, "policy_decision"));
+        assert_eq!(snapshot.recipients(event_bit("trust_check").unwrap()), std::slice::from_ref(&siem));
+        assert!(
+            snapshot
+                .recipients(event_bit("auth_failed").unwrap())
+                .is_empty()
+        );
+        assert!(
+            cache
+                .get(&integration.id)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_without_a_settings_store_still_forgets_the_cached_integrations() {
+        let cache = IntegrationCache::builder().build();
+        let integration = audit_integration("active", None, &["auth_failed"]);
+        cache
+            .insert(integration.id.clone(), Arc::new(integration.clone()))
+            .await;
+
+        reload(None, &cache).await;
+
+        assert!(
+            cache
+                .get(&integration.id)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -66,6 +66,9 @@ changes:
     - timestamp: '2026-10-14T00:00:00.000Z'
       title: Build the audit sinks before the audit pipeline starts
       description: The audit pipeline started before the Governance Audit integrations were loaded, and a node becoming Active kept the sinks it had built before, missing integration changes made on the other node. The sinks are now built from the current settings and integrations every time the pipeline starts, on start-up and on becoming Active; while the integrations cannot be listed the pipeline waits and tries again every 5 s.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Forward audit records with current settings after becoming Active
+      description: A node promoted to Active kept the dashboard settings it loaded at boot and its cached integrations, so it could keep the VP Audit Log selection or send to an integration as configured before the other node changed them. On becoming Active the node now re-reads the settings from disk and empties its integration cache before the audit pipeline starts, so the sinks and every delivery follow what is stored now. The node still admits traffic after one start attempt and keeps retrying a refused start in the background.
   removed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Remove the unused Pre-Authorize Blocked governance audit event

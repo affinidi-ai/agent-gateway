@@ -250,10 +250,15 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   the last record the previous Active node wrote. Before the pipeline starts, on start-up or on
   becoming Active, the sinks are built from the current settings and integrations, so delivery
   never starts from sinks that were never built or are stale; while the integrations cannot be
-  listed the pipeline does not start and is tried again every 5 s. The writer holds an
-  exclusive lock on `journal/journal.lock`, so a second process sharing the directory cannot
-  write to it; a node that becomes Active while another still holds the lock tries again every
-  5 s.
+  listed the pipeline does not start and is tried again every 5 s. A node becoming Active
+  first re-reads the dashboard settings (`settings.json`, which hold the VP Audit Log
+  selection) from disk and empties its integration cache, so the sinks it builds and every
+  delivery follow the settings and integrations the previous Active node left, not those this
+  node loaded before (see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). The node admits
+  traffic after one start attempt; a refused start keeps being retried in the background. The
+  writer holds an exclusive lock on `journal/journal.lock`, so a second process sharing the
+  directory cannot write to it; a node that becomes Active while another still holds the lock
+  tries again every 5 s.
 - *Dispatch.* Each sink has its own reader and cursor (`journal/cursors.json`). A reader
   delivers the records addressed to its sink in journal order and saves its cursor after each
   batch, so it resumes there after a restart; a slow or unreachable destination only delays
