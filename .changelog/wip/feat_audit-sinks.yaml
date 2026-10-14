@@ -142,3 +142,6 @@ changes:
     - timestamp: '2026-10-14T00:00:00.000Z'
       title: Test the Fabric surface-policy gate with injected policy managers
       description: The Fabric surface-policy gate takes the appliance-wide and surface policy managers as parameters, and unit tests drive it to show that a surface with OPA enabled but no compiled policy is denied, that the appliance-wide surface policy denies a surface with OPA off, and that a request no surface policy applies to passes, each with the policy decision it records.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Parse Cucumber Expressions fully in the BDD Gherkin linter
+      description: scripts/bdd-gherkin.py now understands escapes, optional text such as request(s), alternation and the int, float, word and string parameter types as cucumber-rs does, so valid bindings are no longer reported as unused and their steps as unmatched. A binding whose expression cannot be parsed, or whose regex does not compile, is reported with the reason.
