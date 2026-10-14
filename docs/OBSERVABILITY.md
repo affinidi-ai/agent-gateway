@@ -197,6 +197,14 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).
     `error_detail` is a short diagnostic and never carries the presentation itself.
 
+**Volume.** Request events are unbounded by design: each is recorded once per request, with no
+aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
+the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,
+so an unauthenticated or unroutable client produces one record per request it sends
+(unroutable ones against surface `unknown`). Selecting these events for an Email or Slack
+integration sends one message per record. They also count towards the journal size and its
+1 GiB backlog cap (see _Backlog_ below), so a flood can make a slow sink skip records.
+
 **Recipients.** Every integration with category `audit`, status `active` and no tenant owner,
 whatever its type. Every record is one delivery, so Email and Slack send one message per record;
 Stream (Kafka, Kinesis, Pulsar or Redis Streams) and Webhook suit busy appliances. The records
