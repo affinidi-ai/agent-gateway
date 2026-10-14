@@ -1,3 +1,4 @@
+---
 branch: fix/cleanup-mcp-over-fabric-tests
 changes:
   added: []
@@ -5,64 +6,11 @@ changes:
   fixed: []
   removed: []
   security:
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Log a capped Fabric MCP initialize revision only when it is a date
-      description: >-
-        When Fabric receive rewrote a legacy MCP initialize to a served revision, it logged the
-        caller's requested protocolVersion as sent, at info level and with no length limit. It
-        now logs it as the direct Access Point and Transit Points already did: the value only
-        when it is a well-formed date revision, otherwise only its length.
+  - timestamp: '2026-10-13T00:00:00.000Z'
+    title: Log a capped Fabric MCP initialize revision only when it is a date
+    description: 'When Fabric receive rewrote a legacy MCP initialize to a served
+      revision, it logged the caller''s requested protocolVersion as sent, at info
+      level and with no length limit. It now logs it as the direct Access Point and
+      Transit Points already did: the value only when it is a well-formed date revision,
+      otherwise only its length.'
   breaking: []
-  internal:
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Share the MCP initialize cap and its log between all three receive paths
-      description: >-
-        EndpointHttpPolicy::cap_legacy_initialize now returns the capped body and logs the
-        rewrite itself, replacing the copied call blocks on the direct Access Point, Transit
-        Points and Fabric receive.
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Test the Fabric capability-query gate and Error frame handling end to end
-      description: >-
-        The listener's capability-query gate is now one function, tested to refuse a stranger
-        and a non-active peer without creating an offer and to admit an active peer. A transport
-        test shows an Open the peer answers with an Error frame fails with its code well before
-        the header deadline, for each refusal reason.
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Use one active-peer check on the Fabric receive paths
-      description: >-
-        Gateway::is_active, Gateway::is_active_remote_peer and GatewayStore::get_active_by_did
-        replace the copied status checks in the listener, Fabric receive, stream admission,
-        revocation and issuer reconciliation. Which paths require a Remote gateway is unchanged.
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Share MCP test policies, version constants and MRTR negative cases
-      description: >-
-        Tests use the shared modern-capable, modern-only and legacy-only version policies and the
-        MCP version constants instead of building their own. One helper drives the tampered,
-        cross-user, incapable-client and expired continuation cases on the direct, Transit and
-        Fabric consent tests.
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Keep BDD actions in When steps and assertions in Then steps
-      description: >-
-        Then steps for streamed progress, Fabric forward counts, gateway DIDs and the delegation
-        audit trail only check what the When recorded, Given steps report setup failures instead
-        of asserting behaviour, and the Legacy SSE and concurrent-request steps record the real
-        response status. MCP protocol versions in the BDD fixtures use a typed McpVersion, step
-        wording for MCP tool listing matches across the surface and g2g suites, and Scenario
-        Outlines cover the Legacy SSE and Streamable HTTP proxy scenarios.
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Add support tests for the BDD mock stream modes and the conformance shim
-      description: >-
-        The mock MCP server's SSE, progress-then-release and quiet stream modes and its release,
-        completion and cancellation tracking have support tests. The conformance upstream shim
-        exports its reframing helpers, has node:test tests (npm test), and make mcp-conformance
-        runs them before starting the shim.
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Remove the uncalled one-shot Legacy SSE round-trip helper
-      description: >-
-        legacy_sse_roundtrip and its event-size helper had no callers; Legacy SSE upstreams are
-        reached through the persistent UpstreamSseSession.
-    - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Remove the conformance harness --legacy-binary option
-      description: >-
-        Both phases of make mcp-conformance run the same gateway binary, so --binary now sets it
-        for the modern and legacy phases and the separate legacy option is gone.

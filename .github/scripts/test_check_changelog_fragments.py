@@ -83,6 +83,27 @@ class ChangelogFragmentValidationTests(unittest.TestCase):
         )
         self.assertTrue(any("unknown change buckets" in error for error in errors))
 
+    def test_rejects_duplicate_change_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fragment.yaml"
+            path.write_text(
+                "branch: test/duplicate\n"
+                "changes:\n"
+                "  added: []\n"
+                "  changed: []\n"
+                "  fixed: []\n"
+                "  removed: []\n"
+                "  security: []\n"
+                "  breaking: []\n"
+                "  breaking:\n"
+                "    - timestamp: '2026-09-21T00:00:00Z'\n"
+                "      title: Hidden entry\n"
+                "      description: This must not be discarded.\n",
+                encoding="utf-8",
+            )
+            errors = check(str(path))
+        self.assertTrue(any("invalid YAML" in error and "duplicate key" in error for error in errors))
+
     def test_rejects_invalid_timestamp(self) -> None:
         errors = self.check_fragment(
             "    - title: Fix the thing\n"

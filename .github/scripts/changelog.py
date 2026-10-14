@@ -19,7 +19,7 @@ from pathlib import Path
 
 import yaml
 
-from check_changelog_fragments import BUCKETS, check
+from check_changelog_fragments import BUCKETS, check, load_yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WIP_DIR = ROOT / ".changelog" / "wip"
@@ -40,7 +40,7 @@ def validate(path: Path) -> tuple[dict | None, list[str]]:
     errors = check(str(path))
     if errors:
         return None, errors
-    return yaml.safe_load(path.read_text(encoding="utf-8")), []
+    return load_yaml(path.read_text(encoding="utf-8")), []
 
 
 def load_all() -> list[tuple[Path, dict]]:
@@ -158,12 +158,56 @@ def render(version: str, date: str, fragments: list[tuple[Path, dict]]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def release_sections(text: str) -> tuple[str, dict[str, list[str]]]:
+    lines = text.strip().splitlines()
+    heading = lines[0] if lines and lines[0].startswith("## [") else ""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in lines[1:]:
+        if line.startswith("### "):
+            current = line
+            sections.setdefault(current, [])
+        elif current and line.strip():
+            sections[current].append(line)
+    return heading, sections
+
+
+def merge_release_blocks(block: str, legacy: str) -> str:
+    heading, sections = release_sections(block)
+    _, legacy_sections = release_sections(legacy)
+    for section, entries in legacy_sections.items():
+        sections.setdefault(section, []).extend(entries)
+
+    lines = [heading, ""]
+    ordered_sections = [f"### {section.capitalize()}" for section in SECTIONS]
+    for section in ordered_sections:
+        entries = sections.get(section, [])
+        if not entries:
+            continue
+        lines += [section, "", *entries, ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def remove_undated_release(existing: str, version: str) -> tuple[str, str]:
+    lines = existing.splitlines(keepends=True)
+    target = f"## [{version}]"
+    start = next((i for i, line in enumerate(lines) if line.strip() == target), None)
+    if start is None:
+        return existing, ""
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## [")), len(lines))
+    legacy = "".join(lines[start:end])
+    return "".join(lines[:start] + lines[end:]), legacy
+
+
 def prepend_release(existing: str, block: str) -> str:
-    first_release = existing.find("\n## [")
-    if first_release == -1:
-        return existing.rstrip() + "\n\n" + block
-    insert_at = first_release + 1
-    return existing[:insert_at] + block + "\n" + existing[insert_at:]
+    lines = existing.splitlines(keepends=True)
+    unreleased = next((i for i, line in enumerate(lines) if line.strip() == "## [Unreleased]"), None)
+    if unreleased is not None:
+        insert_at = next((i for i in range(unreleased + 1, len(lines)) if lines[i].startswith("## [")), len(lines))
+    else:
+        insert_at = next((i for i, line in enumerate(lines) if line.startswith("## [")), len(lines))
+    rendered = block.rstrip() + "\n\n"
+    return "".join(lines[:insert_at]) + rendered + "".join(lines[insert_at:])
 
 
 def archive_fragments(version: str, fragments: list[tuple[Path, dict]]) -> None:
@@ -180,8 +224,11 @@ def cmd_release(args: argparse.Namespace) -> None:
     if not fragments:
         print("error: no changelog fragments in .changelog/wip/", file=sys.stderr)
         raise SystemExit(1)
-    block = render(args.version, args.date, fragments)
     existing = CHANGELOG.read_text(encoding="utf-8")
+    existing, legacy = remove_undated_release(existing, args.version)
+    block = render(args.version, args.date, fragments)
+    if legacy:
+        block = merge_release_blocks(block, legacy)
     CHANGELOG.write_text(prepend_release(existing, block), encoding="utf-8")
     if args.notes_out:
         Path(args.notes_out).write_text(block, encoding="utf-8")

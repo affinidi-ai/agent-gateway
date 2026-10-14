@@ -132,7 +132,7 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
       - name: Validate release PR changelog
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')
+        if: github.event_name == 'pull_request'
         run: python3 .github/scripts/changelog.py check
 
       - name: Require a changelog fragment change on pull requests

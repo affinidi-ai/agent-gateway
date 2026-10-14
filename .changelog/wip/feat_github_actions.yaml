@@ -42,6 +42,9 @@ changes:
       description: >-
         Publishing now verifies that the triggering commit belongs to a release pull request,
         disables persisted checkout credentials, and uses explicit token headers for release pushes.
+    - timestamp: '2026-10-14T00:00:00Z'
+      title: Require protected release environment configuration
+      description: Document that release secrets require a protected main-only environment, required reviewers, and a dedicated least-privilege GitHub App.
   fixed:
     - timestamp: '2026-10-07T00:00:00.000Z'
       title: Pull G2G BDD images from workflow version variables
@@ -71,3 +74,12 @@ changes:
     - timestamp: '2026-10-13T00:00:00Z'
       title: Explain RustSec findings in the audit job
       description: The local audit job now prints advisory IDs, affected packages, versions, and remediation URLs while preserving cargo-audit's failing exit status.
+    - timestamp: '2026-10-14T00:00:00Z'
+      title: Handle annotated tags when retrying a release
+      description: Compare release reruns with the peeled commit SHA so annotated tags are recognized as pointing at the expected commit.
+    - timestamp: '2026-10-14T00:00:00Z'
+      title: Preserve release ordering and first-release notes
+      description: Place dated releases after the Unreleased section and merge any undated same-version changelog stub into the new release notes.
+    - timestamp: '2026-10-14T00:00:00Z'
+      title: Reject duplicate changelog YAML keys
+      description: Use a shared YAML loader that rejects duplicate mapping keys so release entries cannot silently disappear before validation or rendering.

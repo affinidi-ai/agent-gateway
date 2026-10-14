@@ -24,11 +24,40 @@ BUCKETS = {"added", "changed", "fixed", "removed", "security", "breaking"}
 REQUIRED_ENTRY_KEYS = {"title", "description"}
 
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(loader: UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key ({key!r})",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def load_yaml(stream: object) -> object:
+    return yaml.load(stream, Loader=UniqueKeyLoader)
+
+
 def check(path: str) -> list[str]:
     errors: list[str] = []
     try:
         with open(path, encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
+            data = load_yaml(fh)
     except yaml.YAMLError as exc:
         return [f"{path}: invalid YAML: {exc}"]
 

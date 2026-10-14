@@ -61,6 +61,40 @@ class ChangelogTests(unittest.TestCase):
         self.assertTrue(result.startswith("# Changelog\n\nProject preamble.\n\n## [0.3.17]"))
         self.assertIn("## [0.3.16]", result)
 
+    def test_first_release_is_inserted_after_unreleased_and_merges_stub(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wip = root / ".changelog" / "wip"
+            history = root / ".changelog" / "history"
+            changelog_file = root / "CHANGELOG.md"
+            notes = root / "notes.md"
+            wip.mkdir(parents=True)
+            (wip / "first_release.yaml").write_text(yaml.safe_dump(fragment("feat/first", "fixed")))
+            changelog_file.write_text(
+                "# Changelog\n\n"
+                "## [Unreleased]\n\n"
+                "## [1.0.0]\n\n"
+                "### Added\n\n"
+                "- Existing reviewed feature.\n",
+                encoding="utf-8",
+            )
+            args = type("Args", (), {"version": "1.0.0", "date": "2026-10-14", "notes_out": notes})()
+            with (
+                patch.object(changelog, "ROOT", root),
+                patch.object(changelog, "WIP_DIR", wip),
+                patch.object(changelog, "HISTORY_DIR", history),
+                patch.object(changelog, "CHANGELOG", changelog_file),
+                patch("builtins.print"),
+            ):
+                changelog.cmd_release(args)
+
+            released = changelog_file.read_text(encoding="utf-8")
+            self.assertEqual(released.count("## [1.0.0]"), 1)
+            self.assertLess(released.index("## [Unreleased]"), released.index("## [1.0.0] - 2026-10-14"))
+            self.assertIn("Existing reviewed feature.", released)
+            self.assertIn("Fix release behavior", released)
+            self.assertIn("## [1.0.0] - 2026-10-14", notes.read_text(encoding="utf-8"))
+
     def test_github_notes_use_changelog_heading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             changelog_file = Path(directory) / "CHANGELOG.md"

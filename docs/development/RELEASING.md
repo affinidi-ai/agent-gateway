@@ -15,6 +15,36 @@ the release PR and push the tag:
 | `RELEASE_BOT_APP_ID`     | App ID of the GitHub App used to mint the release PR/push token    |
 | `RELEASE_BOT_PRIVATE_KEY`| That App's private key                                              |
 
+The `release` environment is a security boundary and must be configured in GitHub repository
+settings; workflow YAML cannot restrict which branches may read environment secrets. Configure it
+with:
+
+- **Deployment branches and tags:** `Protected branches only`, with `main` protected by the
+   repository branch ruleset. Do not use an unrestricted environment or a wildcard custom branch
+   policy.
+- **Required reviewers:** require the release owners to approve deployments to `release`.
+- **Environment secrets:** store `RELEASE_BOT_APP_ID` and `RELEASE_BOT_PRIVATE_KEY` only in this
+   environment, not as repository-wide secrets.
+- **GitHub App installation:** use a dedicated release App installed only on this repository with
+   the minimum permissions needed by these workflows: contents write and pull requests write.
+
+The branch-policy portion can be configured with the GitHub CLI after replacing `OWNER/REPO`:
+
+```sh
+gh api --method PUT repos/OWNER/REPO/environments/release --input - <<'JSON'
+{
+   "deployment_branch_policy": {
+      "protected_branches": true,
+      "custom_branch_policies": false
+   }
+}
+JSON
+```
+
+Required reviewers are configured in the environment's **Protection rules** UI. Verify the result
+with `gh api repos/OWNER/REPO/environments/release`; the response should show a protected-branch
+deployment policy and the configured reviewer rules rather than `null` and `[]`.
+
 ## Prepare release
 
 Run manually from the Actions tab: `Prepare release` → `Run workflow`, choosing `patch`, `minor`,

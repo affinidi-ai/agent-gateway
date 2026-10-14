@@ -128,7 +128,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${{ steps.app-token.outputs.token }}" | base64 -w0)"
-          existing_sha="$(git -c "http.extraheader=${auth_header}" ls-remote origin "refs/tags/${TAG}" | awk '{print $1}')"
+          existing_sha="$(git -c "http.extraheader=${auth_header}" ls-remote origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -1 | awk '{print $1}')"
           if [[ -n "${existing_sha}" ]]; then
             if [[ "${existing_sha}" != "${GITHUB_SHA}" ]]; then
               echo "::error::Tag ${TAG} already exists on a different commit (${existing_sha})."
