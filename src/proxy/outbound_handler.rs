@@ -3827,7 +3827,7 @@ async fn step_inject_trusted_identity(
                 vp_jwt: &vp_jwt,
                 trace_id: Some(&ctx.request_id),
                 detail: "transit_point".to_string(),
-                caller: None,
+                caller: outbound_caller(ctx),
                 via_fabric: true,
             })
         });
@@ -10029,6 +10029,72 @@ mod tests {
         assert!(
             matches!(err, OutboundPipelineError::IdentityInjectionFailed(_)),
             "expected IdentityInjectionFailed, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transit_point_vp_injection_record_names_the_transit_caller() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface)
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                extension_uri: None,
+                meta_field: "agentIdentity".to_string(),
+                fields: Vec::new(),
+                json_schema: None,
+                extension_rules: None,
+                strip_raw_meta: false,
+            },
+        ));
+        ctx.protocol = Some(ChannelProtocol::A2a);
+        ctx.body_bytes = Some(Bytes::from(
+            serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "method": "message/send",
+                "params": { "message": { "metadata": {
+                    "https://fabric.affinidi.io/extensions/agent-identity/v1": { "cloudProvider": "local", "model": "gpt-4" }
+                }}}
+            }))
+            .unwrap(),
+        ));
+        step_resolve_agent_identity(&state, &mut ctx)
+            .await
+            .unwrap();
+        ctx.transit_token_claims = Some(crate::proxy::transit_token::TransitTokenClaims {
+            iss: "gw".to_string(),
+            sub: None,
+            surface_id: "surf-001".to_string(),
+            iat: 0,
+            exp: u64::MAX,
+            jti: "jti".to_string(),
+            identity_source: None,
+            caller_dna_uai: None,
+            user_identity_hash: None,
+            caller_context_fields: serde_json::Map::from_iter([("email".to_string(), json!("ada@example.com"))]),
+            allowed_transit_points: vec![],
+            trace_id: None,
+        });
+
+        let (result, events) =
+            crate::audit::producer::capture(async { step_inject_trusted_identity(&state, &mut ctx).await }).await;
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        let injected: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::VpInjected))
+            .collect();
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].detail.as_deref(), Some("transit_point"));
+        assert_eq!(
+            injected[0]
+                .caller
+                .as_ref()
+                .and_then(|caller| caller.email.as_deref()),
+            Some("ada@example.com")
         );
     }
 
