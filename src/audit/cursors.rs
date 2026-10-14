@@ -214,6 +214,44 @@ pub fn journal_bytes(dir: &Path) -> io::Result<u64> {
         .try_fold(0u64, |total, path| Ok(total.saturating_add(fs::metadata(path)?.len())))
 }
 
+/// Entries [`skipped_between`] reads at a time.
+const SKIP_SCAN_BATCH: usize = 1024;
+
+/// What `sink` skips when its cursor moves from `after` to `upto`: the
+/// entries addressed to it, and the unreadable lines, after `after` up to and
+/// including `upto`.
+pub fn skipped_between(
+    dir: &Path,
+    sink: &SinkId,
+    after: u64,
+    upto: u64,
+) -> io::Result<MovedSink> {
+    let mut moved = MovedSink {
+        sink: sink.clone(),
+        skipped: 0,
+        corrupt: 0,
+    };
+    let mut cursor = after;
+    while cursor < upto {
+        let read = read_entries(dir, cursor, upto, SKIP_SCAN_BATCH)?;
+        moved.skipped += read
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .recipients
+                    .contains(sink)
+            })
+            .count() as u64;
+        moved.corrupt += read.corrupt;
+        if read.through <= cursor {
+            break;
+        }
+        cursor = read.through;
+    }
+    Ok(moved)
+}
+
 /// Sinks moved past the oldest segment so it can be deleted.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BacklogSkip {
@@ -222,7 +260,7 @@ pub struct BacklogSkip {
     pub sinks: Vec<MovedSink>,
 }
 
-/// A sink moved past the oldest segment.
+/// A sink moved past records it had not received.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MovedSink {
     pub sink: SinkId,
@@ -423,6 +461,24 @@ impl CursorStore {
         cursors
             .parked
             .insert(sink.clone(), seq);
+        self.persist(&cursors)
+    }
+
+    /// Stops delivering to the sink and parks its cursor at `seq`, or where
+    /// it is when that is further on. A sink without an active cursor is left
+    /// as it is.
+    pub fn park_at(
+        &self,
+        sink: &SinkId,
+        seq: u64,
+    ) -> io::Result<()> {
+        let mut cursors = self.cursors.lock();
+        let Some(cursor) = cursors.active.remove(sink) else {
+            return Ok(());
+        };
+        cursors
+            .parked
+            .insert(sink.clone(), cursor.max(seq));
         self.persist(&cursors)
     }
 
@@ -1039,6 +1095,118 @@ mod tests {
                     corrupt: 0
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn skipping_ahead_counts_the_entries_addressed_to_the_sink_and_unreadable_lines() {
+        let siem = integration("siem");
+        let dir = journal_for(&[
+            &[std::slice::from_ref(&siem), &[SinkId::AuditLog], std::slice::from_ref(&siem)],
+            &[&[SinkId::AuditLog, siem.clone()], std::slice::from_ref(&siem), &[SinkId::AuditLog]],
+            &[std::slice::from_ref(&siem)],
+        ]);
+        garble(dir.path(), 5);
+
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 1, 6).unwrap(),
+            MovedSink {
+                sink: siem.clone(),
+                skipped: 2,
+                corrupt: 1
+            }
+        );
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 0, 7).unwrap(),
+            MovedSink {
+                sink: siem.clone(),
+                skipped: 4,
+                corrupt: 1
+            }
+        );
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 5, 6).unwrap(),
+            MovedSink {
+                sink: siem.clone(),
+                skipped: 0,
+                corrupt: 0
+            }
+        );
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 7, 7).unwrap(),
+            MovedSink {
+                sink: siem,
+                skipped: 0,
+                corrupt: 0
+            }
+        );
+    }
+
+    #[test]
+    fn skipping_ahead_reads_past_one_batch() {
+        let siem = integration("siem");
+        let addressed = std::slice::from_ref(&siem);
+        let many: Vec<&[SinkId]> = std::iter::repeat_n(addressed, SKIP_SCAN_BATCH + 3).collect();
+        let dir = journal_for(&[&many]);
+
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 0, (SKIP_SCAN_BATCH + 3) as u64)
+                .unwrap()
+                .skipped,
+            (SKIP_SCAN_BATCH + 3) as u64
+        );
+    }
+
+    #[test]
+    fn a_sink_parked_at_a_later_seq_resumes_from_it() {
+        let dir = TempDir::new().unwrap();
+        let store = CursorStore::open(dir.path()).unwrap();
+        store
+            .set(&SinkId::AuditLog, 4)
+            .unwrap();
+        store
+            .set(&integration("siem"), 2)
+            .unwrap();
+
+        store
+            .park_at(&integration("siem"), 9)
+            .unwrap();
+        assert_eq!(store.get(&integration("siem")), None);
+        assert_eq!(store.min(), Some(4));
+        assert_eq!(
+            CursorStore::open(dir.path())
+                .unwrap()
+                .start(&integration("siem"))
+                .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn parking_at_an_earlier_seq_keeps_the_cursor() {
+        let dir = TempDir::new().unwrap();
+        let store = CursorStore::open(dir.path()).unwrap();
+        store
+            .set(&integration("siem"), 6)
+            .unwrap();
+
+        store
+            .park_at(&integration("siem"), 3)
+            .unwrap();
+        store
+            .park_at(&integration("never-started"), 3)
+            .unwrap();
+        assert_eq!(
+            store
+                .start(&integration("siem"))
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            store
+                .start(&integration("never-started"))
+                .unwrap(),
+            0
         );
     }
 
