@@ -331,8 +331,9 @@ The hidden file input is `data-testid="restore-file-input"`.
   category's Stream/Webhook sample (see [Starting content](#starting-content)).
 - The card states that only the selected events are sent, whether or not the VP Audit Log
   keeps them (`integration-audit-scope-note`), and that delivery is at least once, so
-  receivers deduplicate on `event_id`, with a stuck destination catching up in order
-  (`integration-audit-delivery-note`).
+  receivers deduplicate on `event_id`, with a stuck destination catching up in order, and
+  that disabling the integration pauses it, letting go of what it has not received, so once
+  re-enabled it receives only new records (`integration-audit-delivery-note`).
 
 ### Events to send
 
@@ -366,11 +367,21 @@ shows the `integration-category-unavailable` warning instead of silently falling
 The Audit Log header shows `audit-forward-button` beside Refresh for users with
 `integrations.view`, only when `/integrations/config` offers the `audit` category.
 
-- **Forwarding to N integration(s)** counts active integrations without a `tenant_id`,
-  the ones the gateway forwards to, and opens the Integrations list. It adds
-  "(VP Auditing off)" and a tooltip when VP Auditing is disabled in Settings › Security.
-- With none, users with `integrations.edit` get **Forward records**, which opens the wizard
-  at `?category=audit&type=stream`.
+- **Forwarding to N integration(s)** counts active `audit` integrations without a
+  `tenant_id` whose `audit_events` is not empty, the ones that receive records, and opens
+  the Integrations list (`useAuditForwarding`).
+- When active appliance-wide `audit` integrations select no events, the button shows a
+  warning icon (`audit-forward-no-events-warning`) and its tooltip says how many select no
+  events and receive nothing.
+- When VP Auditing is disabled in Settings › Security, the label is unchanged and the
+  tooltip says the VP Audit Log keeps nothing while integrations still receive the events
+  selected for them.
+- With none receiving, users with `integrations.edit` get **Forward records**, which opens
+  the wizard at `?category=audit&type=stream`.
+- The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says the log keeps the events
+  selected under Settings › Security › VP Audit while VP Auditing is enabled, and that each
+  Governance Audit integration receives its own selected events independently of the log,
+  at least once, so receivers deduplicate on `event_id`.
 
 ### Starting content
 
