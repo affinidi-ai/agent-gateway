@@ -278,7 +278,8 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   delivers the records addressed to its sink in journal order and saves its cursor after each
   batch, so it resumes there after a restart; a slow or unreachable destination only delays
   itself. A failed delivery is retried with backoff (1 s up to 5 min) and holds back the records
-  after it; the integration retry policy still applies inside each attempt. Delivery is
+  after it, until the integration's drop policy or attempt limit (below) skips it; the
+  integration retry policy still applies inside each attempt. Delivery is
   at-least-once: a record may be delivered again after a restart, so receivers should
   deduplicate on `event_id`. The VP Audit Log does this itself for the records at the end of
   its file.
@@ -312,6 +313,17 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
 - *Drop policy.* A Governance Audit integration may set `audit_drop_after_secs`: records older
   than that are skipped for it, including one still being retried, and counted with
   `reason="expired"`. Without it nothing is skipped.
+- *Attempt limit.* A Governance Audit integration may set `audit_max_attempts`: a record that
+  fails that many delivery attempts is skipped for it, so a record the destination never
+  accepts does not hold back the records after it. Every failed attempt counts, whatever the
+  error; one attempt is one hand-over to the integration, including the integration retry
+  policy inside it. The skipped record is counted with `reason="rejected"` and one warning gives
+  its seq, the attempt count and the last error. Attempts are counted while the reader stays on
+  the record, so a restart starts the count again. A changed limit applies to the record being
+  retried. Without it a record is retried until it is delivered. The limit does not tell a
+  rejected record from an outage: while the destination is down, each record is skipped once it
+  reaches the limit. With the retry backoff (1 s, doubling, up to 5 min), 10 attempts span
+  about 8.5 minutes and 20 about an hour, plus the time the attempts themselves take.
 - *Damage.* A damaged journal or cursors file never stops the pipeline. On start, everything
   after the last readable line of the newest segment is cut off and logged with the number of
   bytes discarded; a segment with no readable line is emptied. Files in `journal/` that are not
@@ -324,7 +336,7 @@ Records produced are counted in `agent_gateway_audit_records_produced_total{even
 integration deliveries in
 `agent_gateway_audit_forward_total{result="delivered"|"failed"|"not_receiving", integration_id}`;
 records a sink skipped in
-`agent_gateway_audit_sink_skipped_total{sink, reason="backlog_cap"|"expired"|"corrupt"|"paused"}`.
+`agent_gateway_audit_sink_skipped_total{sink, reason="backlog_cap"|"expired"|"corrupt"|"paused"|"rejected"}`.
 
 `agent_gateway_audit_pipeline_started` is 1 while the pipeline runs and 0 when it could not start
 (the journal directory cannot be created or written, for example) or the node is in Standby.
