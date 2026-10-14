@@ -1,9 +1,11 @@
 //! Endpoints, event sets and the integrations that join them.
 
 pub mod endpoint;
+pub mod event_set;
 pub mod store;
 
 pub use endpoint::{Endpoint, EndpointType};
+pub use event_set::{EventSet, EventSetError};
 pub use store::{Definition, DefinitionStore};
 
 use serde::{Deserialize, Serialize};
