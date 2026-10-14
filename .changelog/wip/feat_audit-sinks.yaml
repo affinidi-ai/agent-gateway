@@ -36,6 +36,12 @@ changes:
     - timestamp: '2026-10-14T00:00:00.000Z'
       title: Keep audit records addressed to a Governance Audit integration while it is disabled
       description: Records addressed to a Governance Audit integration that was disabled, given a tenant or moved to another category were passed over as delivered until its delivery stopped, so they were never sent when it was re-enabled. The integration now refuses them, they wait in the journal, and it receives them once re-enabled. Each refusal is counted in agent_gateway_audit_forward_total with result not_receiving rather than failed.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Run the governance audit pipeline only on the Active node
+      description: A Standby node also started the audit pipeline, so in a failover pair sharing storage both nodes could open the same journal, write records with the same sequence numbers and overwrite each other's cursors, and a promoted node continued from a stale position. Only the Active node now runs the pipeline. Stepping down journals what was handed over, stops delivery and releases the journal; becoming Active re-opens the journal and cursors from disk and continues after the last record. The journal holds an exclusive lock, so a second writer cannot open it, and a node that becomes Active while another still holds it tries again every 5 s. agent_gateway_audit_pipeline_started is 0 on a Standby node.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Re-read the audit journal after a failed append that could not be undone
+      description: When appending to the audit journal failed and the partial batch could not be cut off again, the next batch was written after the partial line. The segment is now re-read before the next append, as on start, so no partial line is left behind and no sequence number is reused.
   removed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Remove the unused Pre-Authorize Blocked governance audit event
@@ -50,6 +56,9 @@ changes:
     - timestamp: '2026-10-13T00:00:00.000Z'
       title: Stop returning OPA engine error text to callers
       description: When a policy cannot decide, callers get the generic denial and the OPA engine's error detail stays in the gateway log; the error text was returned to the caller.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Make the governance audit journal readable by its owner only
+      description: The audit journal holds caller identities, trace ids and delegation and payment details. Its directory is now created owner-only (0700) and its segments, lock file and cursors.json are 0600; they were created with the process umask.
   breaking:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: ⭐ Record only the audit events each destination selects

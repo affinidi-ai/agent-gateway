@@ -396,12 +396,13 @@ lazy_static! {
         counter
     };
 
-    /// Whether the governance audit pipeline started: 1 when it did, 0 when it
-    /// failed to start and no audit records are kept or forwarded.
+    /// Whether the governance audit pipeline is running: 1 when it is, 0 when
+    /// it failed to start or the node is in Standby, keeping and forwarding no
+    /// audit records.
     pub static ref AUDIT_PIPELINE_STARTED: IntGauge = {
         let opts = Opts::new(
             names::AUDIT_PIPELINE_STARTED,
-            "Whether the governance audit pipeline started (1) or failed to start, keeping and forwarding no audit records (0)",
+            "Whether the governance audit pipeline is running (1) or not, keeping and forwarding no audit records (0: failed to start, or the node is in Standby)",
         );
         let gauge = IntGauge::with_opts(opts).unwrap();
         REGISTRY.register(Box::new(gauge.clone())).unwrap();

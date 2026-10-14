@@ -132,8 +132,11 @@ converges through its periodic `DashboardDelta` stream or an explicit refetch. T
 
 A node runs in one of two modes, set by `server_mode` in the bootstrap config (default `active`):
 
-- **Active** serves traffic and runs the fabric and trust listeners.
-- **Standby** keeps the fabric and trust listeners inactive and reports not ready.
+- **Active** serves traffic, runs the fabric and trust listeners, and writes the governance audit
+  journal.
+- **Standby** keeps the fabric and trust listeners inactive, keeps no audit records, and reports not
+  ready. It takes over the audit journal when it becomes Active (see
+  [Governance audit delivery](OBSERVABILITY.md)).
 
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see

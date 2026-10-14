@@ -2,14 +2,16 @@
 //! sink has passed.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::audit::journal::{JournalEntry, segment_first_seq, segment_paths};
+use crate::audit::journal::{JournalEntry, OWNER_ONLY_FILE, create_owner_only_dir, segment_first_seq, segment_paths};
 use crate::audit::registry::SinkId;
 
 /// What one read of the journal found after a sink's cursor.
@@ -311,6 +313,8 @@ struct Cursors {
     /// Removed sinks, kept so one that comes back resumes where it stopped.
     /// They do not hold back pruning, and writes to them are ignored.
     parked: HashMap<SinkId, u64>,
+    /// Set by [`CursorStore::close`]: nothing is written to disk after it.
+    closed: bool,
 }
 
 /// Each sink's cursor: the `seq` of the last entry it has finished with.
@@ -336,7 +340,7 @@ impl CursorStore {
     /// is renamed to `cursors.json.corrupt-<unix seconds>`, kept for
     /// inspection, and the store starts empty.
     pub fn open(dir: &Path) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        create_owner_only_dir(dir)?;
         let path = dir.join(CURSORS_FILE);
         let mut cursors = Cursors::default();
         match fs::read(&path) {
@@ -487,12 +491,23 @@ impl CursorStore {
             .copied()
     }
 
-    /// Writes a temporary file, syncs it and renames it over the cursors file,
-    /// so a crash leaves either the old or the new cursors.
+    /// Stops writing the cursors to disk. Every write runs under the same
+    /// lock, so once this returns no write is in flight and none follows, and
+    /// another store can open the cursors file safely.
+    pub fn close(&self) {
+        self.cursors.lock().closed = true;
+    }
+
+    /// Writes an owner-only temporary file, syncs it and renames it over the
+    /// cursors file, so a crash leaves either the old or the new cursors.
+    /// Writes nothing once the store is closed.
     fn persist(
         &self,
         cursors: &Cursors,
     ) -> io::Result<()> {
+        if cursors.closed {
+            return Ok(());
+        }
         let stored: Vec<StoredCursor> = cursors
             .active
             .iter()
@@ -514,7 +529,13 @@ impl CursorStore {
             .path
             .with_extension("json.tmp");
         {
-            let mut file = File::create(&temp)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(OWNER_ONLY_FILE)
+                .open(&temp)?;
+            file.set_permissions(fs::Permissions::from_mode(OWNER_ONLY_FILE))?;
             io::Write::write_all(&mut file, &bytes)?;
             file.sync_all()?;
         }
@@ -1050,5 +1071,45 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["cursors.json".to_string()]);
+    }
+
+    #[test]
+    fn the_cursors_file_is_owner_only_even_over_a_wider_one() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(CURSORS_FILE);
+        fs::write(&path, b"[]").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = CursorStore::open(dir.path()).unwrap();
+        store
+            .set(&SinkId::AuditLog, 7)
+            .unwrap();
+
+        let mode = fs::metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn a_closed_store_writes_nothing_more() {
+        let dir = TempDir::new().unwrap();
+        let store = CursorStore::open(dir.path()).unwrap();
+        store
+            .set(&SinkId::AuditLog, 3)
+            .unwrap();
+        store.close();
+
+        store
+            .set(&SinkId::AuditLog, 9)
+            .unwrap();
+        store
+            .park(&SinkId::AuditLog)
+            .unwrap();
+
+        let reopened = CursorStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(&SinkId::AuditLog), Some(3));
     }
 }

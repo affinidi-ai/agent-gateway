@@ -1744,13 +1744,14 @@ pub async fn run_axum_proxy(
             crate::proxy::server::init_transit_token_issuer(Arc::new(issuer));
         }
 
-        // Initialize delegation vault audit logger
+        // Initialize delegation vault audit logger (started only on an Active node)
         crate::delegation_vault::audit::init_audit_logger(
             bootstrap_config
                 .logging
                 .log_directory
                 .as_deref(),
-        );
+        )
+        .await;
 
         let trust_registry_store: Option<Arc<crate::trust_registries::FileSystemTrustRegistryStore>> =
             match crate::trust_registries::FileSystemTrustRegistryStore::new(PathBuf::from(
@@ -4045,6 +4046,13 @@ pub async fn run_axum_proxy(
                             // gateway/surface OPA, MCP gating, or global policy.
                             rederive_planes_on_activation(&identity_state_for_mode, &gateway_store_for_mode).await;
 
+                            // Take over the audit journal before admitting traffic,
+                            // continuing from what the previous Active node wrote.
+                            crate::delegation_vault::audit::set_audit_pipeline_mode(
+                                crate::server::mode::ServerMode::Active,
+                            )
+                            .await;
+
                             // Config + policy planes are now fresh: admit direct
                             // traffic (health → 200) without waiting on fabric
                             // listener reconnection below, and replay any surface
@@ -4131,6 +4139,10 @@ pub async fn run_axum_proxy(
                                 }
                             };
                             tokio::join!(g2g_fut, tr_fut);
+                            crate::delegation_vault::audit::set_audit_pipeline_mode(
+                                crate::server::mode::ServerMode::Standby,
+                            )
+                            .await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
