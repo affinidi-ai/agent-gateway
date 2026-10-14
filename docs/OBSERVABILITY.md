@@ -231,7 +231,10 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   addresses it to the sinks that select its event at that moment, and hands it to the journal
   without waiting. Records a proxied request produces while credential delegation runs are held
   until the request's identity VP is minted, then stamped with it; any still held when the
-  request ends, on any path, are submitted without a VP.
+  request ends, on any path, are submitted without a VP. A selected record produced while the
+  pipeline is not running is dropped and counted in
+  `agent_gateway_audit_records_lost_total{reason="pipeline_not_running"}`, and one handed to a
+  journal writer that has stopped in `reason="journal_closed"`.
 - *Journal.* Every record is appended to the journal (`{log_directory}/journal/`, segment
   files named by their first sequence number) by a dedicated thread that writes in batches of up
   to 256 records or 5 ms and syncs each batch to disk before any sink may read it. A crash can

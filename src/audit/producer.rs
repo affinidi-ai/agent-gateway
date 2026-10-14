@@ -32,8 +32,8 @@ impl Producer {
         }
     }
 
-    /// Connects the producer to the journal writer. Records produced before
-    /// this are dropped.
+    /// Connects the producer to the journal writer. Selected records produced
+    /// before this are dropped and counted as `pipeline_not_running`.
     pub fn connect(
         &self,
         journal: Sender<Pending>,
@@ -106,6 +106,7 @@ impl Producer {
             event.event_id = new_event_id();
         }
         let Some(journal) = self.journal.get() else {
+            track_audit_records_lost("pipeline_not_running", 1);
             debug!(category, "Audit journal not started; record dropped");
             return;
         };
@@ -277,11 +278,20 @@ mod tests {
     }
 
     #[test]
-    fn a_record_submitted_before_the_journal_is_connected_is_dropped() {
+    fn a_selected_record_with_no_journal_connected_is_dropped_and_counted() {
+        let lost = || {
+            crate::metrics::backends::prometheus::AUDIT_RECORDS_LOST
+                .with_label_values(&["pipeline_not_running"])
+                .get()
+        };
         let sinks: &'static Sinks = Box::leak(Box::default());
         sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))]);
         let producer = Producer::new(sinks);
+        let before = lost();
+
         producer.submit(consent());
+
+        assert!(lost() > before, "the dropped record is counted");
     }
 
     #[tokio::test]
