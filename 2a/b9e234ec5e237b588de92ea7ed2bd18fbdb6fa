@@ -1,0 +1,19 @@
+.changelog/wip/feat_human-friendly-metadata.yaml
+  s_09d9fb08a24a2a::t_415dfcdfeed455 77-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2ab9e234ec5e237b588de92ea7ed2bd18fbdb6fa",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
