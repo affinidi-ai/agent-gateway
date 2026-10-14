@@ -67,19 +67,32 @@ needs work, confirm `Cargo.toml` and `Cargo.lock` both show the new version, the
 
 ## Publish release
 
-Merging a `release/vX.Y.Z` PR triggers "Publish release" automatically; it does not run for any
-other push to `main`, even one that happens to touch `Cargo.toml` or `CHANGELOG.md` (detected
-from the merge commit's message, so an unrelated merge cannot publish). It then:
+"Publish release" runs on a push to `main` that touches `Cargo.toml` or `CHANGELOG.md`, but only
+publishes when the pushed commit is the merge of a pull request that was opened by a bot from a
+`release/v*` branch of this repository. A `gate` job checks that through the GitHub API, so an
+unrelated merge (a Dependabot bump, a hand-edited `CHANGELOG.md`) never reaches the `release`
+environment or its secrets. The `publish` job then:
 
 1. Checks out the exact commit that triggered the run (not whatever `main`'s tip is by the time
-   the job starts), so the binary it builds always matches the commit it tags.
-2. Builds the release binary (`cargo build --release --bin agent-gateway`).
-3. Tags that commit `vX.Y.Z` and pushes the tag. Re-running the job after a partial failure does
-   not fail on "tag already exists": it skips re-tagging if the tag already points at the same
-   commit, and only errors if it points somewhere else.
-4. Creates the GitHub Release from the reviewed `CHANGELOG.md` section, attaching the
+   the job starts), without persisting credentials, so the binary it builds always matches the
+   commit it tags.
+2. Skips everything when the release already has its binary asset, or when `CHANGELOG.md` has no
+   reviewed section for the version.
+3. Builds the release binary (`cargo build --release --locked --bin agent-gateway`) with no access
+   to the release app token, which is minted afterwards, then attaches a SHA256 checksum and
+   attests the binary's build provenance.
+4. Tags that commit `vX.Y.Z` and pushes the tag. If the tag already exists on the same commit it
+   is reused; if it points elsewhere the job fails.
+5. Creates the GitHub Release from the reviewed `CHANGELOG.md` section, attaching the
    `agent-gateway-linux-x86_64` binary and its SHA256 checksum. GitHub's generated PR-title
-   notes are disabled, and the binary receives a build-provenance attestation.
+   notes are disabled.
+
+Because the skip decision depends on the Release's assets rather than the tag, re-running the
+workflow after a partial failure (for example the tag was pushed but the Release was not created)
+finishes the release.
+
+The release app must be allowed to create tags: add it as a bypass actor on the `tags_managed`
+ruleset.
 
 ## Changelog fragments
 
