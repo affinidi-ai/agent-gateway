@@ -348,8 +348,9 @@ struct StoredCursor {
 struct Cursors {
     /// Sinks being delivered to.
     active: HashMap<SinkId, u64>,
-    /// Removed sinks, kept so one that comes back resumes where it stopped.
-    /// They do not hold back pruning, and writes to them are ignored.
+    /// Paused sinks, parked at the durable seq when they were paused, so one
+    /// that resumes receives only records written after the pause. They do
+    /// not hold back pruning, and writes to them are ignored.
     parked: HashMap<SinkId, u64>,
     /// Set by [`CursorStore::close`]: nothing is written to disk after it.
     closed: bool,
@@ -449,21 +450,6 @@ impl CursorStore {
         self.persist(&cursors)
     }
 
-    /// Stops delivering to the sink, keeping its cursor for when it returns.
-    pub fn park(
-        &self,
-        sink: &SinkId,
-    ) -> io::Result<()> {
-        let mut cursors = self.cursors.lock();
-        let Some(seq) = cursors.active.remove(sink) else {
-            return Ok(());
-        };
-        cursors
-            .parked
-            .insert(sink.clone(), seq);
-        self.persist(&cursors)
-    }
-
     /// Stops delivering to the sink and parks its cursor at `seq`, or where
     /// it is when that is further on. A sink without an active cursor is left
     /// as it is.
@@ -482,9 +468,11 @@ impl CursorStore {
         self.persist(&cursors)
     }
 
-    /// The sink's cursor: its active one, its parked one when it returns, or
-    /// the start of the journal for a sink never seen. No entry is addressed
-    /// to a sink before it exists, so a new sink misses nothing.
+    /// The sink's cursor: its active one, its parked one when it resumes, or
+    /// the start of the journal for a sink without one. No entry is addressed
+    /// to a sink before it exists, so a new sink misses nothing; a parked
+    /// cursor is dropped only once every entry up to it is gone, so a resumed
+    /// sink without one still receives nothing from before its pause.
     pub fn start(
         &self,
         sink: &SinkId,
@@ -518,6 +506,18 @@ impl CursorStore {
             return Ok(());
         }
         self.persist(&cursors)
+    }
+
+    #[cfg(test)]
+    pub fn parked(
+        &self,
+        sink: &SinkId,
+    ) -> Option<u64> {
+        self.cursors
+            .lock()
+            .parked
+            .get(sink)
+            .copied()
     }
 
     pub fn snapshot(&self) -> HashMap<SinkId, u64> {
@@ -905,7 +905,7 @@ mod tests {
             .set(&integration("siem"), 3)
             .unwrap();
         store
-            .park(&integration("siem"))
+            .park_at(&integration("siem"), 0)
             .unwrap();
         assert_eq!(store.min(), Some(7));
         assert_eq!(store.get(&integration("siem")), None);
@@ -920,7 +920,7 @@ mod tests {
             .set(&integration("siem"), 3)
             .unwrap();
         store
-            .park(&integration("siem"))
+            .park_at(&integration("siem"), 0)
             .unwrap();
         store
             .set(&integration("siem"), 5)
@@ -948,7 +948,7 @@ mod tests {
                 .set(&integration("siem"), 3)
                 .unwrap();
             store
-                .park(&integration("siem"))
+                .park_at(&integration("siem"), 0)
                 .unwrap();
         }
         let store = CursorStore::open(dir.path()).unwrap();
@@ -1000,7 +1000,7 @@ mod tests {
                 .set(&integration(sink), seq)
                 .unwrap();
             store
-                .park(&integration(sink))
+                .park_at(&integration(sink), 0)
                 .unwrap();
         }
         store
@@ -1274,7 +1274,7 @@ mod tests {
             .set(&SinkId::AuditLog, 9)
             .unwrap();
         store
-            .park(&SinkId::AuditLog)
+            .park_at(&SinkId::AuditLog, 9)
             .unwrap();
 
         let reopened = CursorStore::open(dir.path()).unwrap();

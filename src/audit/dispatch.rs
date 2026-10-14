@@ -5,6 +5,15 @@
 //! `agent_gateway_audit_sink_skipped_total{reason="corrupt"}` and logs one
 //! warning per batch naming the segments. Entries with a seq at or below the
 //! cursor are ignored, and entries are delivered in file order.
+//!
+//! A sink that leaves the registry (a Governance Audit integration disabled,
+//! given a tenant, moved to another category or deleted) is paused: its
+//! cursor moves to the durable seq and is parked there, letting go of the
+//! records it had not received, counted in
+//! `agent_gateway_audit_sink_skipped_total{reason="paused"}`. A sink that
+//! resumes continues from its parked cursor. Records produced while the
+//! registry change takes effect may still be delivered after the sink resumes,
+//! or be counted as paused. The VP Audit Log is never paused.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -17,7 +26,9 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
 
-use crate::audit::cursors::{CursorStore, JournalRead, journal_bytes, plan_backlog_skip, prune_segments, read_entries};
+use crate::audit::cursors::{
+    CursorStore, JournalRead, journal_bytes, plan_backlog_skip, prune_segments, read_entries, skipped_between,
+};
 use crate::audit::journal::{JournalEntry, segment_first_seq, segment_paths};
 use crate::audit::registry::{SinkId, Sinks};
 use crate::metrics::backends::prometheus::{set_audit_journal_bytes, track_audit_sink_skipped};
@@ -65,9 +76,11 @@ pub struct JournalSource {
 }
 
 /// Delivers every durable entry addressed to `sink`, in order, starting after
-/// its saved cursor. A sink without a cursor starts at the current durable
-/// seq and saves it at once. A failed delivery is retried with backoff and
-/// the cursor does not move past it. Runs until the journal writer is gone.
+/// its saved cursor, or after its parked one when it resumes from a pause. A
+/// sink with neither starts at the start of the journal and saves that at
+/// once (see [`CursorStore::start`]). A failed delivery is retried with
+/// backoff and the cursor does not move past it. Runs until the journal
+/// writer is gone.
 pub async fn run_reader<D: Deliver>(
     sink: SinkId,
     deliver: D,
@@ -205,9 +218,9 @@ impl Default for DispatcherConfig {
 }
 
 /// Keeps one reader running per sink in `sinks`: starts readers for new
-/// sinks, stops removed sinks' readers and drops their cursors, drops cursors
-/// of sinks that no longer exist, and deletes segments every cursor has
-/// passed. Start it after the sinks have been built. It runs until the
+/// sinks, pauses removed sinks and sinks with a cursor that are not in
+/// `sinks`, and deletes segments every active cursor has passed. Start it
+/// after the sinks have been built: a sink missing from them is paused. It runs until the
 /// journal writer is gone (`source.durable` closes), then stops its readers
 /// and closes the cursor store, so nothing is delivered or saved after it
 /// returns.
@@ -225,7 +238,7 @@ pub async fn run_dispatcher<F: SinkFactory>(
     let mut over_warning = false;
 
     let current = sinks.snapshot();
-    park_unknown_cursors(&source.cursors, current.ids(), &readers).await;
+    park_unknown_cursors(&source, current.ids(), &readers).await;
     reconcile(&factory, sinks, &mut readers, &source, &config.reader).await;
     loop {
         tokio::select! {
@@ -242,7 +255,7 @@ pub async fn run_dispatcher<F: SinkFactory>(
             }
             _ = prune.tick() => {
                 let current = sinks.snapshot();
-                park_unknown_cursors(&source.cursors, current.ids(), &readers).await;
+                park_unknown_cursors(&source, current.ids(), &readers).await;
                 prune_passed_segments(&source).await;
                 enforce_journal_limits(&source, &config, &mut over_warning).await;
             }
@@ -255,6 +268,8 @@ pub async fn run_dispatcher<F: SinkFactory>(
     source.cursors.close();
 }
 
+/// Starts readers for new sinks and pauses removed ones: a removed sink's
+/// reader is stopped, then the sink is paused (see [`pause`]).
 async fn reconcile<F: SinkFactory>(
     factory: &F,
     sinks: &'static Sinks,
@@ -266,7 +281,7 @@ async fn reconcile<F: SinkFactory>(
     let ids = current.ids();
     let removed: Vec<SinkId> = readers
         .keys()
-        .filter(|id| !ids.contains(id))
+        .filter(|id| !ids.contains(id) && **id != SinkId::AuditLog)
         .cloned()
         .collect();
     for id in removed {
@@ -274,7 +289,7 @@ async fn reconcile<F: SinkFactory>(
             reader.abort();
             let _ = reader.await;
         }
-        park_cursor(&source.cursors, &id).await;
+        pause(source, &id).await;
     }
     for id in ids {
         if !readers.contains_key(id) {
@@ -291,33 +306,73 @@ async fn reconcile<F: SinkFactory>(
     }
 }
 
-/// Parks cursors of sinks that are neither configured nor being read. A sink
+/// Pauses sinks with an active cursor that are neither configured nor being
+/// read, such as an integration paused while the gateway was stopped. A sink
 /// that still has a reader is left to [`reconcile`], which stops the reader
-/// before parking, so a parked sink is never delivered to.
+/// before pausing, so a paused sink is never delivered to. The VP Audit Log
+/// is never paused.
 async fn park_unknown_cursors(
-    cursors: &Arc<CursorStore>,
+    source: &JournalSource,
     ids: &[SinkId],
     readers: &HashMap<SinkId, JoinHandle<()>>,
 ) {
-    for sink in cursors.sinks() {
-        if !ids.contains(&sink) && !readers.contains_key(&sink) {
-            park_cursor(cursors, &sink).await;
+    for sink in source.cursors.sinks() {
+        if !ids.contains(&sink) && !readers.contains_key(&sink) && sink != SinkId::AuditLog {
+            pause(source, &sink).await;
         }
     }
 }
 
-async fn park_cursor(
-    cursors: &Arc<CursorStore>,
+/// Pauses a sink with an active cursor: its cursor moves to the durable seq
+/// and is parked there, so the sink lets go of the records it had not
+/// received and, if it resumes, receives only records written after the
+/// pause. The entries addressed to it that it lets go are counted with
+/// `reason="paused"`, the unreadable lines with `reason="corrupt"`, and one
+/// warning gives both counts.
+async fn pause(
+    source: &JournalSource,
     sink: &SinkId,
 ) {
-    let (cursors, owned) = (cursors.clone(), sink.clone());
-    if let Err(e) = blocking(move || cursors.park(&owned)).await {
+    let Some(cursor) = source.cursors.get(sink) else {
+        return;
+    };
+    let upto = *source.durable.borrow();
+    let (dir, owned) = (source.dir.clone(), sink.clone());
+    match blocking(move || skipped_between(&dir, &owned, cursor, upto)).await {
+        Ok(moved) => {
+            track_audit_sink_skipped(sink.label(), "paused", moved.skipped);
+            if moved.corrupt > 0 {
+                track_audit_sink_skipped(sink.label(), "corrupt", moved.corrupt);
+            }
+            warn!(
+                ?sink,
+                skipped = moved.skipped,
+                unreadable = moved.corrupt,
+                from = cursor,
+                to = upto,
+                "Audit sink paused: it lets go of the records it had not received"
+            );
+        }
+        Err(e) => {
+            warn!(
+                ?sink,
+                from = cursor,
+                to = upto,
+                error = %e,
+                "Audit sink paused: it lets go of the records it had not received, which could not be counted"
+            );
+        }
+    }
+    let (cursors, owned) = (source.cursors.clone(), sink.clone());
+    if let Err(e) = blocking(move || cursors.park_at(&owned, upto)).await {
         warn!(?sink, error = %e, "Failed to park an audit sink cursor");
     }
 }
 
 /// Deletes segments every active cursor has passed and forgets parked
-/// cursors whose entries are gone. Returns how many segments were deleted.
+/// cursors whose entries are gone; a paused sink without a cursor that
+/// resumes reads what is left, all of it written after its pause. Returns how
+/// many segments were deleted.
 async fn prune_passed_segments(source: &JournalSource) -> usize {
     let Some(passed) = source.cursors.min() else {
         return 0;
@@ -906,78 +961,121 @@ mod tests {
         manager.abort();
     }
 
+    fn paused_skips(sink: &SinkId) -> u64 {
+        crate::metrics::backends::prometheus::AUDIT_SINK_SKIPPED
+            .with_label_values(&[sink.label(), "paused"])
+            .get()
+    }
+
     #[tokio::test]
-    async fn a_re_enabled_sink_resumes_where_it_stopped() {
+    async fn a_paused_sink_skips_to_the_durable_seq_and_counts_its_backlog() {
+        let paused = SinkId::Integration("paused-with-backlog".to_string());
         let mut f = Fixture::new();
         let factory = RecordingFactory::default();
-        let sinks = registry(&[SinkId::AuditLog, siem()]);
+        factory
+            .deliverer(&paused)
+            .failures_left
+            .store(usize::MAX, Ordering::SeqCst);
+        let sinks = registry(&[SinkId::AuditLog, paused.clone()]);
         let manager =
             tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
-        f.append(&[&[SinkId::AuditLog, siem()]]);
-        wait_until(|| f.cursors.get(&siem()) == Some(1)).await;
-
-        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        let addressed = std::slice::from_ref(&paused);
+        f.append(&[addressed, &[SinkId::AuditLog], addressed, &[SinkId::AuditLog, paused.clone()]]);
         wait_until(|| {
-            f.cursors
-                .get(&siem())
-                .is_none()
+            factory
+                .deliverer(&paused)
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 2
         })
         .await;
-        f.append(&[&[SinkId::AuditLog]]);
-        sinks.replace(selecting_everything(&[SinkId::AuditLog, siem()]));
-        f.append(&[&[SinkId::AuditLog, siem()]]);
-        wait_until(|| f.cursors.get(&siem()) == Some(3)).await;
+        let before = paused_skips(&paused);
 
-        assert_eq!(factory.delivered(&siem()), vec![1, 3]);
+        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        wait_until(|| f.cursors.parked(&paused) == Some(4)).await;
+        manager.abort();
+        let _ = manager.await;
+
+        assert_eq!(f.cursors.get(&paused), None);
+        assert_eq!(paused_skips(&paused), before + 3);
+        assert!(
+            factory
+                .delivered(&paused)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_sink_receives_only_records_produced_after_the_pause() {
+        let sink = SinkId::Integration("resumed-after-pause".to_string());
+        let mut f = Fixture::new();
+        let factory = RecordingFactory::default();
+        let sinks = registry(&[SinkId::AuditLog, sink.clone()]);
+        let manager =
+            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
+        f.append(&[&[SinkId::AuditLog, sink.clone()]]);
+        wait_until(|| f.cursors.get(&sink) == Some(1)).await;
+        factory
+            .deliverer(&sink)
+            .refuse_from
+            .store(2, Ordering::SeqCst);
+        f.append(&[std::slice::from_ref(&sink), std::slice::from_ref(&sink)]);
+        wait_until(|| {
+            factory
+                .deliverer(&sink)
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 2
+        })
+        .await;
+        let before = paused_skips(&sink);
+
+        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        wait_until(|| f.cursors.parked(&sink) == Some(3)).await;
+        f.append(&[&[SinkId::AuditLog]]);
+        factory
+            .deliverer(&sink)
+            .refuse_from
+            .store(0, Ordering::SeqCst);
+        sinks.replace(selecting_everything(&[SinkId::AuditLog, sink.clone()]));
+        f.append(&[&[SinkId::AuditLog, sink.clone()]]);
+        wait_until(|| f.cursors.get(&sink) == Some(5)).await;
+
+        assert_eq!(factory.delivered(&sink), vec![1, 5]);
+        assert_eq!(paused_skips(&sink), before + 2);
         manager.abort();
     }
 
     #[tokio::test]
-    async fn a_sink_disabled_mid_batch_keeps_every_record_it_refused() {
-        let mut f = Fixture::new();
+    async fn a_resumed_sink_whose_parked_cursor_was_pruned_receives_only_newer_records() {
+        let sink = SinkId::Integration("resumed-after-prune".to_string());
+        let mut f = Fixture::with_segment_bytes(1);
         let factory = RecordingFactory::default();
-        factory
-            .deliverer(&siem())
-            .refuse_from
-            .store(2, Ordering::SeqCst);
-        let sinks = registry(&[SinkId::AuditLog, siem()]);
+        let sinks = registry(&[SinkId::AuditLog, sink.clone()]);
         let manager =
-            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
-        wait_until(|| {
-            f.cursors
-                .get(&siem())
-                .is_some()
-        })
-        .await;
-
-        f.append(&[&[siem()], &[siem()], &[siem()]]);
-        wait_until(|| {
-            factory
-                .deliverer(&siem())
-                .attempts
-                .load(Ordering::SeqCst)
-                >= 3
-        })
-        .await;
-        assert!(f.cursors.get(&siem()) < Some(2));
+            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_millis(5))));
+        f.append(&[std::slice::from_ref(&sink)]);
+        f.append(&[std::slice::from_ref(&sink)]);
+        wait_until(|| f.cursors.get(&sink) == Some(2)).await;
 
         sinks.replace(selecting_everything(&[SinkId::AuditLog]));
-        wait_until(|| {
-            f.cursors
-                .get(&siem())
-                .is_none()
-        })
-        .await;
-        factory
-            .deliverer(&siem())
-            .refuse_from
-            .store(0, Ordering::SeqCst);
-        sinks.replace(selecting_everything(&[SinkId::AuditLog, siem()]));
-        wait_until(|| f.cursors.get(&siem()) == Some(3)).await;
+        wait_until(|| f.cursors.parked(&sink) == Some(2)).await;
+        for _ in 0..3 {
+            f.append(&[&[SinkId::AuditLog]]);
+        }
+        wait_until(|| f.cursors.parked(&sink).is_none()).await;
+        assert_eq!(
+            segment_paths(f.dir.path())
+                .unwrap()
+                .len(),
+            1
+        );
 
-        let delivered = factory.delivered(&siem());
-        assert_eq!(delivered.first(), Some(&1));
-        assert_eq!(delivered[delivered.len() - 2..], [2, 3]);
+        sinks.replace(selecting_everything(&[SinkId::AuditLog, sink.clone()]));
+        f.append(&[&[SinkId::AuditLog, sink.clone()]]);
+        wait_until(|| f.cursors.get(&sink) == Some(6)).await;
+
+        assert_eq!(factory.delivered(&sink), vec![1, 2, 6]);
         manager.abort();
     }
 
@@ -1020,25 +1118,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursors_of_sinks_that_no_longer_exist_are_parked_at_start() {
-        let f = Fixture::new();
-        f.cursors
-            .set(&SinkId::Integration("deleted".to_string()), 0)
-            .unwrap();
-        let sinks = registry(&[SinkId::AuditLog]);
-        let manager = tokio::spawn(run_dispatcher(
-            RecordingFactory::default(),
-            sinks,
-            f.source(),
-            manager_config(Duration::from_secs(60)),
-        ));
-
-        wait_until(|| {
+    async fn a_sink_paused_when_the_dispatcher_starts_skips_to_the_durable_seq() {
+        let paused = SinkId::Integration("paused-at-start".to_string());
+        let active = SinkId::Integration("active-at-start".to_string());
+        let mut f = Fixture::new();
+        f.append(&[&[SinkId::AuditLog, active.clone(), paused.clone()], &[paused.clone()], &[paused.clone()]]);
+        for sink in [&SinkId::AuditLog, &active, &paused] {
             f.cursors
-                .get(&SinkId::Integration("deleted".to_string()))
-                .is_none()
+                .set(sink, 0)
+                .unwrap();
+        }
+        let factory = RecordingFactory::default();
+        for sink in [&SinkId::AuditLog, &active] {
+            factory
+                .deliverer(sink)
+                .failures_left
+                .store(usize::MAX, Ordering::SeqCst);
+        }
+        let before = paused_skips(&paused);
+        let sinks = registry(&[SinkId::AuditLog, active.clone()]);
+
+        let manager =
+            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
+        wait_until(|| f.cursors.parked(&paused) == Some(3)).await;
+        wait_until(|| {
+            factory
+                .deliverer(&active)
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 1
         })
         .await;
+
+        assert_eq!(paused_skips(&paused), before + 3);
+        assert_eq!(f.cursors.get(&SinkId::AuditLog), Some(0));
+        assert_eq!(f.cursors.get(&active), Some(0));
+        assert_eq!(f.cursors.parked(&SinkId::AuditLog), None);
         manager.abort();
     }
 
