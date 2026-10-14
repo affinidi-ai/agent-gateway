@@ -329,6 +329,31 @@ The hidden file input is `data-testid="restore-file-input"`.
   template** action (`integration-audit-template-button`) replaces the payload with the
   audit template (routing fields plus `record: ${AUDIT_RECORD}`), which is the `audit`
   category's Stream/Webhook sample (see [Starting content](#starting-content)).
+- The card states that only the selected events are sent, whether or not the VP Audit Log
+  keeps them (`integration-audit-scope-note`), and that delivery is at least once, so
+  receivers deduplicate on `event_id`, with a stuck destination catching up in order
+  (`integration-audit-delivery-note`).
+
+### Events to send
+
+- The Add wizard and Edit page show **Events to send**
+  (`components/integrations/AuditEventsSection.tsx`, `integration-audit-events`) in the main
+  form, above the action buttons, only for the `audit` category. It is bound to the
+  integration's `audit_events`, and `audit_events` is sent only for that category.
+- It renders `components/integrations/AuditEventPicker.tsx` with the test id prefix
+  `integration-audit`: `integration-audit-picker`, one group toggle per group
+  (`integration-audit-group-<group>`, checked, unchecked or indeterminate) and one toggle
+  per event (`integration-audit-event-<event>`). Groups, labels and descriptions come from
+  `GET /v1/settings/audit-events` (`apiClient.getAuditEventCatalog`), never a hard-coded
+  list. Selected names the catalogue does not list are kept.
+- With nothing selected, saving is allowed and `integration-audit-events-empty` warns that
+  the integration will receive nothing. When the catalogue cannot be loaded,
+  `integration-audit-events-error` says so, no toggles are shown and saving keeps the stored
+  selection.
+- Settings › Security › VP Audit uses the same picker with the prefix `vp-audit` under
+  **Events to keep**, bound to the settings' `audit_events`. Its `vp-audit-scope-note` says
+  those settings control the VP Audit Log only, and `vp-audit-catalog-error` replaces the
+  picker when the catalogue cannot be loaded.
 
 ### Query parameters
 
