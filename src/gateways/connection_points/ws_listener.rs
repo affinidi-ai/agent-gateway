@@ -1263,8 +1263,7 @@ impl ConnectionPointListenerManager {
             .get(gateway_id)
             .await
             .ok()??;
-        (peer.status == crate::gateways::types::GatewayStatus::Active
-            && peer.gateway_type == crate::gateways::types::GatewayType::Remote)
+        peer.is_active_remote_peer()
             .then_some((peer.did, peer.tenant_id))
     }
 
@@ -2127,32 +2126,44 @@ fn mediator_account_loss<'a>(
     Some(code)
 }
 
-/// Whether the sender is a registered, active gateway. A capability query
-/// creates an offer in a table every peer shares, so only such a gateway may
-/// send one, and only such a gateway is answered when its `Open` is refused.
-/// The listener's store is read in memory, so the reader never loads the
-/// gateway directory for it.
-async fn sender_is_active_peer_gateway(
-    gateway_store: Option<&crate::gateways::FileSystemGatewayStore>,
-    from_did: Option<&str>,
-) -> bool {
-    active_peer_gateway(gateway_store, from_did)
-        .await
-        .is_some()
-}
-
-/// The sender's gateway record, when it is an active peer.
+/// The sender's gateway record, when it is a registered, active gateway. A
+/// capability query creates an offer in a table every peer shares, so only
+/// such a gateway may send one, and only such a gateway is answered when its
+/// `Open` is refused. The listener's store is read in memory, so the reader
+/// never loads the gateway directory for it.
 async fn active_peer_gateway(
     gateway_store: Option<&crate::gateways::FileSystemGatewayStore>,
     from_did: Option<&str>,
 ) -> Option<crate::gateways::types::Gateway> {
-    let (store, from_did) = (gateway_store?, from_did?);
-    store
-        .get_by_did(from_did)
+    use crate::gateways::GatewayStore;
+    gateway_store?
+        .get_active_by_did(from_did?)
         .await
         .ok()
         .flatten()
-        .filter(|gateway| gateway.status == crate::gateways::types::GatewayStatus::Active)
+}
+
+/// Whether the reader stores and dispatches a capability query: its sender is
+/// within its query rate and an active peer. An admitted query carries the
+/// peer's tenant, which its offer is bound to.
+async fn admit_capability_query(
+    query_rate: &PeerRateLimiter,
+    gateway_store: Option<&crate::gateways::FileSystemGatewayStore>,
+    query: &mut ReceivedMessage,
+) -> bool {
+    let from_did = query.from_did.as_deref();
+    if !admits_from_peer(query_rate, from_did) {
+        debug!(from = ?from_did, "Dropping a Fabric capability query past its sender's rate");
+        return false;
+    }
+    let Some(peer) = active_peer_gateway(gateway_store, from_did).await else {
+        debug!(from = ?from_did, "Dropping a Fabric capability query from a sender that is not an active peer");
+        return false;
+    };
+    query
+        .context
+        .insert(crate::proxy::fabric_stream::PEER_TENANT_CONTEXT.to_string(), serde_json::json!(peer.tenant_id));
+    true
 }
 
 /// A refused `Open` from an active peer is answered with an `Error` frame, so
@@ -2165,7 +2176,10 @@ async fn answer_refused_open(
     gateway_store: Option<&crate::gateways::FileSystemGatewayStore>,
     bootstrap_config: &Option<Arc<crate::config::BootstrapConfig>>,
 ) {
-    if !sender_is_active_peer_gateway(gateway_store, message.from_did.as_deref()).await {
+    if active_peer_gateway(gateway_store, message.from_did.as_deref())
+        .await
+        .is_none()
+    {
         return;
     }
     if let Ok(runtime) = crate::proxy::fabric_stream::global() {
@@ -2749,37 +2763,10 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                 }
 
                 if matches!(MessageType::from_str(&received_msg.message_type), MessageType::ForwardStreamQuery)
-                    && !admits_from_peer(
-                        &query_rate,
-                        received_msg
-                            .from_did
-                            .as_deref(),
-                    )
+                    && !admit_capability_query(&query_rate, gateway_store.as_deref(), &mut received_msg).await
                 {
-                    debug!(from = ?received_msg.from_did, "Dropping a Fabric capability query past its sender's rate");
                     delete_message_after_processing(client, &message_sha256_hash, &connection_point.name).await;
                     continue;
-                }
-                if matches!(MessageType::from_str(&received_msg.message_type), MessageType::ForwardStreamQuery) {
-                    let Some(peer) = active_peer_gateway(
-                        gateway_store.as_deref(),
-                        received_msg
-                            .from_did
-                            .as_deref(),
-                    )
-                    .await
-                    else {
-                        debug!(
-                            from = ?received_msg.from_did,
-                            "Dropping a Fabric capability query from a sender that is not an active peer"
-                        );
-                        delete_message_after_processing(client, &message_sha256_hash, &connection_point.name).await;
-                        continue;
-                    };
-                    received_msg.context.insert(
-                        crate::proxy::fabric_stream::PEER_TENANT_CONTEXT.to_string(),
-                        serde_json::json!(peer.tenant_id),
-                    );
                 }
 
                 // Store the message
@@ -5028,7 +5015,7 @@ mod tests {
             .await
             .unwrap();
         for (did, status) in
-            [("did:web:active.example", GatewayStatus::Active), ("did:web:paused.example", GatewayStatus::Disabled)]
+            [("did:web:active.example", GatewayStatus::Active), ("did:web:disabled.example", GatewayStatus::Disabled)]
         {
             let mut gateway = Gateway::new("Peer".into(), String::new(), did.into(), GatewayType::Remote);
             gateway.status = status;
@@ -5037,11 +5024,84 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(super::sender_is_active_peer_gateway(Some(&store), Some("did:web:active.example")).await);
-        for sender in [Some("did:web:paused.example"), Some("did:web:stranger.example"), None] {
-            assert!(!super::sender_is_active_peer_gateway(Some(&store), sender).await, "{sender:?}");
+        let active = super::active_peer_gateway(Some(&store), Some("did:web:active.example")).await;
+        assert_eq!(active.map(|gateway| gateway.did), Some("did:web:active.example".to_string()));
+        for sender in [Some("did:web:disabled.example"), Some("did:web:stranger.example"), None] {
+            assert!(
+                super::active_peer_gateway(Some(&store), sender)
+                    .await
+                    .is_none(),
+                "{sender:?}"
+            );
         }
-        assert!(!super::sender_is_active_peer_gateway(None, Some("did:web:active.example")).await);
+        assert!(
+            super::active_peer_gateway(None, Some("did:web:active.example"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reader_admits_a_capability_query_only_from_an_active_peer() {
+        use crate::gateways::GatewayStore;
+        use crate::gateways::types::GatewayStatus;
+        use crate::proxy::fabric_stream::test_fixture::{OpenFixture, in_isolated_child};
+
+        if !in_isolated_child("capability query admission").await {
+            return;
+        }
+        let fixture = OpenFixture::new().await;
+        let directory = tempfile::tempdir().unwrap();
+        let gateways = crate::gateways::FileSystemGatewayStore::new(directory.path().to_path_buf(), None)
+            .await
+            .unwrap();
+        let query_rate = super::query_rate_limiter();
+        let tenant_context = crate::proxy::fabric_stream::PEER_TENANT_CONTEXT;
+
+        let nonce = uuid::Uuid::new_v4();
+        let mut from_stranger = fixture.capability_query(nonce);
+        assert!(!super::admit_capability_query(&query_rate, Some(&gateways), &mut from_stranger).await);
+        assert!(
+            !from_stranger
+                .context
+                .contains_key(tenant_context)
+        );
+        assert!(!fixture.offered(&from_stranger, nonce, std::time::Instant::now()), "no offer for a stranger");
+
+        let mut disabled = fixture.peer.clone();
+        disabled.status = GatewayStatus::Disabled;
+        gateways
+            .create(&disabled)
+            .await
+            .unwrap();
+        let nonce = uuid::Uuid::new_v4();
+        let mut from_disabled = fixture.capability_query(nonce);
+        assert!(!super::admit_capability_query(&query_rate, Some(&gateways), &mut from_disabled).await);
+        assert!(
+            !from_disabled
+                .context
+                .contains_key(tenant_context)
+        );
+        assert!(!fixture.offered(&from_disabled, nonce, std::time::Instant::now()), "no offer for a disabled peer");
+
+        let mut active = fixture.peer.clone();
+        active.status = GatewayStatus::Active;
+        active.tenant_id = Some("tenant-a".into());
+        gateways
+            .update(&active)
+            .await
+            .unwrap();
+        let nonce = uuid::Uuid::new_v4();
+        let mut from_peer = fixture.capability_query(nonce);
+        assert!(super::admit_capability_query(&query_rate, Some(&gateways), &mut from_peer).await);
+        assert_eq!(from_peer.context[tenant_context], serde_json::json!("tenant-a"));
+        assert!(matches!(
+            fixture
+                .runtime
+                .process(&from_peer, &MessageType::ForwardStreamQuery),
+            super::message_processor::ProcessingResult::RequiresResponse { .. }
+        ));
+        assert!(fixture.offered(&from_peer, nonce, std::time::Instant::now()), "the active peer is offered streams");
     }
 
     #[test]

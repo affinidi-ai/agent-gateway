@@ -3445,23 +3445,26 @@ fn build_surface_policy_denied_forward_body(
 /// claim another peer's DID.
 async fn active_sender_peer(message: &ReceivedMessage) -> Option<crate::gateways::types::Gateway> {
     let from_did = message.from_did.as_deref()?;
-    let Some(storage_root) = storage_root_from_context(message) else {
-        warn!("Refusing {} from {}: storage path not found in message context", message.message_type, from_did);
-        return None;
-    };
-    match crate::gateways::FileSystemGatewayStore::new(storage_root.join("gateways"), None).await {
-        Ok(store) => match store
-            .get_by_did(from_did)
+    match message_gateway_store(message).await {
+        Ok(store) => store
+            .get_active_by_did(from_did)
             .await
-        {
-            Ok(Some(gateway)) if gateway.status == crate::gateways::types::GatewayStatus::Active => Some(gateway),
-            _ => None,
-        },
+            .ok()
+            .flatten(),
         Err(e) => {
-            warn!("Refusing {} from {}: gateway store unavailable: {}", message.message_type, from_did, e);
+            warn!("Refusing {} from {}: {}", message.message_type, from_did, e);
             None
         }
     }
+}
+
+/// The gateway store under the message's storage root.
+async fn message_gateway_store(message: &ReceivedMessage) -> Result<crate::gateways::FileSystemGatewayStore, String> {
+    let storage_root =
+        storage_root_from_context(message).ok_or_else(|| "storage path not found in message context".to_string())?;
+    crate::gateways::FileSystemGatewayStore::new(storage_root.join("gateways"), None)
+        .await
+        .map_err(|e| format!("gateway store unavailable: {e}"))
 }
 
 /// Whether a Fabric peer may reach a surface. A tenant-owned peer reaches only
@@ -3501,21 +3504,20 @@ async fn authorize_fabric_sender(
             .get_by_did(from_did)
             .await
     } else {
-        let Some(storage_root) = storage_root_from_context(message) else {
-            warn!("Refusing forward-request from {}: storage path not found in message context", from_did);
-            return Err(refuse(UNREGISTERED));
-        };
-        match crate::gateways::FileSystemGatewayStore::new(storage_root.join("gateways"), None).await {
+        match message_gateway_store(message).await {
             Ok(store) => {
                 store
                     .get_by_did(from_did)
                     .await
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                warn!("Refusing forward-request from {}: {}", from_did, e);
+                return Err(refuse(UNREGISTERED));
+            }
         }
     };
     match lookup {
-        Ok(Some(gateway)) if gateway.status == crate::gateways::types::GatewayStatus::Active => {
+        Ok(Some(gateway)) if gateway.is_active() => {
             if !gateway.exposes_surface(channel_id) {
                 warn!(
                     "Refusing forward-request from gateway {} ({}): channel {} is not exposed to it",
@@ -4278,10 +4280,7 @@ async fn process_forward_request_with_mcp_runtime(
             Ok(body) => body,
             Err(error) => return axum_response_to_forward_result(error.into_response(&body_bytes, axum::http::StatusCode::BAD_REQUEST)).await,
         };
-        if let Some(capped) = http_policy.cap_legacy_initialize(&body_bytes, &classification) {
-            channel_info!(config_id, "Forwarding MCP initialize with protocolVersion {} in place of unsupported {}", capped.offered, capped.requested);
-            body_bytes = capped.body;
-        }
+        body_bytes = http_policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
         mcp_verified_binding = match crate::protocols::extensions::verify_mcp_metadata_identity(
             &body_bytes, GLOBAL_VC_ISSUER.get(), config_id, Some(&peer_issuers),
         ).await {
@@ -9148,8 +9147,9 @@ mod tests {
 
     #[tokio::test]
     async fn fabric_mcp_headers_feed_legacy_only_version_rejection() {
+        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
         let headers = serde_json::json!({
-            "MCP-PROTOCOL-VERSION": "2026-07-28",
+            "MCP-PROTOCOL-VERSION": MCP_MODERN_VERSION,
             "MCP-METHOD": "tools/list"
         });
         let body = serde_json::to_vec(&serde_json::json!({
@@ -9158,7 +9158,7 @@ mod tests {
             "method": "tools/list",
             "params": {
                 "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/protocolVersion": MCP_MODERN_VERSION,
                     "io.modelcontextprotocol/clientCapabilities": {}
                 }
             }
@@ -9180,8 +9180,8 @@ mod tests {
         assert_eq!(
             error.data,
             Some(serde_json::json!({
-                "requested": "2026-07-28",
-                "supported": ["2024-11-05"]
+                "requested": MCP_MODERN_VERSION,
+                "supported": [MCP_LEGACY_VERSION]
             }))
         );
 

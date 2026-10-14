@@ -20,6 +20,7 @@ use crate::bdd_support::collaborators::{
     assert_unique_json_rpc_request_ids,
 };
 use crate::bdd_support::config::modern_consent::PUBLIC_ORIGIN;
+use crate::bdd_support::json_rpc::McpVersion;
 use crate::bdd_support::mcp_consent::ConsentRequest;
 use crate::bdd_support::oidc::OidcProvider;
 use crate::world::G2gWorld;
@@ -189,18 +190,28 @@ pub async fn gateway_did_not_receive_fabric_forward_request(
     let baseline = world
         .fabric_forward_baseline
         .get(&gateway_index)
-        .copied()
-        .expect("a When step must record the fabric forward baseline before this Then");
-    let actual = world
-        .harness()
-        .fabric_forward_request_count(gateway_index)
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
-    assert_eq!(
-        actual, baseline,
-        "gateway {gateway_index} received a fabric forward request after the caller action; caller_status={:?}; caller_body={:?}",
-        world.response_status, world.response_body
-    );
+        .cloned()
+        .expect("a When step must record the fabric forward baseline before this Then")
+        .unwrap_or_else(|error| panic!("reading gateway {gateway_index}'s fabric forward baseline failed: {error}"));
+    // Keep watching briefly so a forward that lands after the caller's
+    // response is still caught.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let actual = world
+            .harness()
+            .fabric_forward_request_count(gateway_index)
+            .await
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        assert_eq!(
+            actual, baseline,
+            "gateway {gateway_index} received a fabric forward request after the caller action; caller_status={:?}; caller_body={:?}",
+            world.response_status, world.response_body
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[then(regex = r#"^MCP server "([^"]+)" received (\d+) forwarded MCP requests$"#)]
@@ -383,10 +394,8 @@ pub async fn managed_agent_received_forwarded_request_with_identity_presentation
         .actors
         .expect_target_kind(&target_name, TargetActorKind::ManagedAgent);
     let expected_issuer = world
-        .harness()
         .self_gateway_did(issuer_gw)
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
+        .to_string();
     let messages = forwarded_messages_for(world, &target_name).await;
     assert_eq!(
         messages.len(),
@@ -668,10 +677,8 @@ pub async fn gateway_recorded_peer_gateway_did_as_issuer_did(
 ) {
     assert_eq!(peer_gw, record_of_gw, "the recorded issuer DID is compared with the same peer gateway's own DID");
     let expected = world
-        .harness()
         .self_gateway_did(peer_gw)
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
+        .to_string();
     let record = match world
         .remote_gateway_records
         .get(&gw_index)
@@ -718,11 +725,7 @@ pub async fn reported_issuer_did_equals_peer_gateway_did(
         requested_gw, reporting_gw,
         "the issuer DID was requested from gateway {requested_gw}, not {reporting_gw}"
     );
-    let expected = world
-        .harness()
-        .self_gateway_did(peer_gw)
-        .await
-        .unwrap_or_else(|error| panic!("{error:#}"));
+    let expected = world.self_gateway_did(peer_gw);
     assert_eq!(
         reported, expected,
         "gateway {reporting_gw} reported issuer DID {reported}, expected its gateway DID {expected}"
@@ -998,7 +1001,11 @@ pub async fn mcp_unsupported_version_error_has_exact_versions(
     requested: String,
     supported: String,
 ) {
-    assert_mcp_unsupported_version_error(response_body(world), &requested, &supported);
+    let supported: Vec<McpVersion> = supported
+        .split(", ")
+        .map(McpVersion::from)
+        .collect();
+    assert_mcp_unsupported_version_error(response_body(world), &McpVersion::from(requested.as_str()), &supported);
 }
 
 #[then(expr = "the response arrives in under {int} seconds")]
@@ -1046,6 +1053,9 @@ pub async fn each_legacy_sse_reply_answers_its_request(
     );
     let expected = expected_response_for_target(world, &target_name);
     for (request, reply) in &world.legacy_sse_exchange {
+        let reply = reply
+            .as_ref()
+            .unwrap_or_else(|| panic!("no Legacy SSE reply answered request {request}"));
         assert_json_rpc_id_matches_request_body(reply, request, "Legacy SSE reply");
         assert_json_rpc_result_matches_response(reply, expected, &target_name);
     }
@@ -1079,15 +1089,7 @@ pub async fn response_includes_fabric_gateway_did_metadata_for_target(
         })
         .expect("fabric gateway DID metadata must be a string or array of strings");
     let (gw_index, _) = world.target(&target_name);
-    let expected_gateway_did = world
-        .harness()
-        .gw(gw_index)
-        .admin
-        .find_self_gateway()
-        .await
-        .unwrap_or_else(|error| panic!("failed to find self gateway for gateway {gw_index}: {error}"))
-        .did
-        .unwrap_or_else(|| panic!("self gateway for gateway {gw_index} must have a DID"));
+    let expected_gateway_did = world.self_gateway_did(gw_index);
 
     assert_eq!(
         gateway_did, expected_gateway_did,

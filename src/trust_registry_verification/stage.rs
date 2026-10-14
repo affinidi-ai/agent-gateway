@@ -611,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn caller_trust_check_resolves_only_admitted_modern_protocol_version() {
-        use crate::mcp::request_validation::{LegacySessionEvidence, McpVersionPolicy, validate_mcp_post};
+        use crate::mcp::request_validation::{LegacySessionEvidence, validate_mcp_post};
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {
             "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
             "io.modelcontextprotocol/clientCapabilities": {}
@@ -629,7 +629,7 @@ mod tests {
             &headers,
             &bytes,
             LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(&[crate::mcp::MCP_MODERN_VERSION], &[crate::mcp::MCP_MODERN_VERSION]),
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
         )
         .unwrap();
         let mut input = crate::surface_context::PolicyInput {

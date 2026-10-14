@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::bdd_support::json_rpc::McpVersion;
+
 pub fn assert_response_status(
     actual: Option<u16>,
     expected: u16,
@@ -174,22 +176,23 @@ pub fn assert_json_rpc_error_code(
 
 pub fn assert_mcp_unsupported_version_error(
     response_body: &serde_json::Value,
-    requested: &str,
-    supported: &str,
+    requested: &McpVersion,
+    supported: &[McpVersion],
 ) {
     assert_json_rpc_error_code(response_body, -32022);
     assert_eq!(
         response_body
             .pointer("/error/data/requested")
             .and_then(serde_json::Value::as_str),
-        Some(requested),
+        Some(requested.as_str()),
         "unsupported-version error must identify the requested MCP version: {response_body}"
     );
     assert_eq!(
         response_body.pointer("/error/data/supported"),
         Some(&serde_json::json!(
             supported
-                .split(", ")
+                .iter()
+                .map(McpVersion::as_str)
                 .collect::<Vec<_>>()
         )),
         "unsupported-version error must list exactly the active MCP versions: {response_body}"
@@ -453,7 +456,11 @@ mod tests {
                 }
             }
         });
-        super::assert_mcp_unsupported_version_error(&response, "2026-07-28", "2024-11-05");
+        super::assert_mcp_unsupported_version_error(
+            &response,
+            &super::McpVersion::Modern,
+            &[super::McpVersion::Legacy],
+        );
     }
 
     #[test]

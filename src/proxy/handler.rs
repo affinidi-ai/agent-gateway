@@ -2061,15 +2061,7 @@ async fn proxy_handler_with_mcp_runtime(
                 return Ok(error.into_response(&body_bytes, StatusCode::BAD_REQUEST));
             }
         };
-        if let Some(capped) = policy.cap_legacy_initialize(&body_bytes, &classification) {
-            channel_info!(
-                config_id,
-                "Forwarding MCP initialize with protocolVersion {} in place of unsupported {}",
-                capped.offered,
-                capped.requested_for_log()
-            );
-            body_bytes = capped.body;
-        }
+        body_bytes = policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
         let binding = crate::protocols::extensions::verify_mcp_metadata_identity(
             &body_bytes,
             state.vc_issuer.as_ref(),
@@ -16254,10 +16246,7 @@ allow if {
         let address = "127.0.0.1:12345"
             .parse()
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for (router, path, modern, expected) in [
             (&router, "/mcp", true, axum::http::StatusCode::OK),
             (&router, "/mcp$missing", false, axum::http::StatusCode::OK),
@@ -16468,10 +16457,7 @@ allow if {
             .header("last-event-id", "7")
             .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let response = Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
             "127.0.0.1:12345"
                 .parse()
@@ -16574,10 +16560,7 @@ allow if {
                 .unwrap(),
             direct_router_state(&state, surface),
             request,
-            crate::mcp::request_validation::McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-            ),
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
             None,
         ))
         .await;
@@ -16609,10 +16592,7 @@ allow if {
     async fn modern_extensions_survive_forwarding(state: &crate::state::ProxyState) {
         use serde_json::json;
 
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         // Extension negotiation is between the client and the upstream: the
         // gateway originates no extension traffic, so it forwards an extension
         // request whether or not the client declared the extension, and never
@@ -16733,10 +16713,7 @@ allow if {
             .header("mcp-name", "file:///missing.md")
             .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let response = Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
             "127.0.0.1:12345"
                 .parse()
@@ -16827,10 +16804,7 @@ allow if {
             json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
         )
         .await;
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let surface = |endpoint: String| -> crate::config::agent_surface::AgentSurface {
             serde_json::from_value(json!({
                 "surface_id": "method-cases", "name": "Method cases",
@@ -16943,10 +16917,7 @@ allow if {
             json!({"jsonrpc": "2.0", "id": "unexpected", "result": {}}).to_string(),
         )
         .await;
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for (path, endpoint) in [
             ("direct Access Point", target.url()),
             ("Fabric send", "fabric://gw/ch".to_string()),
@@ -17152,10 +17123,7 @@ allow if {
     async fn direct_access_point_preserves_every_result_field(state: &crate::state::ProxyState) {
         use serde_json::json;
 
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for fixture in crate::mcp::result_fixtures::result_fixtures() {
             let id = "preserved";
             let target = crate::component_tests::helpers::MockServer::start_with_response(
@@ -17327,10 +17295,7 @@ allow if {
             }
             assert_eq!(active().await, expected, "{context}");
         };
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let send = |surface: crate::config::agent_surface::AgentSurface,
                     request: axum::http::Request<axum::body::Body>| {
             let router = direct_router_state(&state, surface);
@@ -17543,10 +17508,7 @@ allow if {
                 "io.modelcontextprotocol/clientCapabilities": {}, "progressToken": "work"
             }
         }});
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
@@ -17587,10 +17549,7 @@ allow if {
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[MCP_MODERN_VERSION],
-            &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let request = |path: &str, id: &str, method: &str, version: &str| {
             let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {"_meta": {
                 "io.modelcontextprotocol/protocolVersion": version,
@@ -17689,10 +17648,7 @@ allow if {
             policy_manager: Some(manager.clone()),
             ..state.clone()
         };
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let upstream = json!({"jsonrpc": "2.0", "id": "cache", "result": {
             "resultType": "complete", "tools": [{"name": "echo"}, {"name": "admin_delete"}],
             "ttlMs": 60000, "cacheScope": "public"
@@ -17848,12 +17804,7 @@ allow if {
         use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
         use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
         use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
-        use crate::mcp::continuations::{
-            config::ContinuationRuntime,
-            embedded::EmbeddedContinuations,
-            protected::{ContinuationCipher, ContinuationKey},
-            service::ContinuationService,
-        };
+        use crate::mcp::continuations::{config::ContinuationRuntime, negative_cases};
         use futures::TryStreamExt;
         use serde_json::json;
         use sha2::{Digest, Sha256};
@@ -17996,14 +17947,7 @@ allow if {
         modern_extensions_survive_forwarding(&state).await;
         proxy_access_point_answers_modern_discovery(&state).await;
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
-        let runtime = Arc::new(ContinuationRuntime {
-            config: serde_json::from_value(json!({"deployment": "deployment", "ttl_secs": 300, "active_key": "key",
-                "keys": [{"id": "key", "secret_id": "key-secret", "not_before": now - 1, "seal_until": now + 3600, "open_until": now + 4500}],
-                "storage": {"backend": "embedded", "capacity": 32}})).unwrap(),
-            service: Arc::new(ContinuationService::new(ContinuationCipher::new("deployment".into(), "key".into(), vec![
-                ContinuationKey::new("key".into(), [7; 32], now - 1, now + 3600, now + 4500).unwrap(),
-            ]).unwrap(), Arc::new(EmbeddedContinuations::new(32).unwrap()))),
-        });
+        let runtime = negative_cases::continuation_runtime(now, 300);
         let bearer = issuer.sign_jwt_with_gateway_key_typ(&json!({
             "iss": "https://gateway.example/api/oauth2/mcp", "sub": "user", "aud": "https://gateway.example/mcp",
             "scope": "read", "exp": now + 300
@@ -18030,10 +17974,7 @@ allow if {
         let address = "127.0.0.1:12345"
             .parse()
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let response = Box::pin(super::proxy_handler_with_mcp_runtime(
             address,
             state.clone(),
@@ -18126,8 +18067,6 @@ allow if {
                 "{surface_id} runtime={with_runtime}: {status} {body}"
             );
         }
-        // Tampered, expired, cross-user and incapable MRTR retries, on a continuation of their
-        // own so the flow below keeps its state.
         {
             let send = |message: serde_json::Value, bearer: Option<String>, runtime: Arc<ContinuationRuntime>| {
                 let mut request = build_request(&message);
@@ -18160,35 +18099,6 @@ allow if {
                     (status, body)
                 }
             };
-            let pending = |id: &str| {
-                let mut pending = message.clone();
-                pending["id"] = json!(id);
-                pending
-            };
-            let (_, issued) = send(pending("negatives"), None, runtime.clone()).await;
-            let issued_state = issued["result"]["requestState"]
-                .as_str()
-                .expect("a continuation to replay")
-                .to_string();
-
-            // A tampered state does not open.
-            let mut tampered = pending("tampered");
-            let mut bytes = issued_state
-                .clone()
-                .into_bytes();
-            let last = bytes.len() - 1;
-            bytes[last] = if bytes[last] == b'A' {
-                b'B'
-            } else {
-                b'A'
-            };
-            tampered["params"]["requestState"] = json!(String::from_utf8(bytes).unwrap());
-            let (status, body) = send(tampered, None, runtime.clone()).await;
-            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "tampered: {body}");
-            assert_eq!(body["error"]["code"], crate::mcp::error_codes::INVALID_PARAMS, "tampered: {body}");
-            assert_eq!(body["id"], "tampered");
-
-            // Another principal cannot resume it.
             let other = issuer
                 .sign_jwt_with_gateway_key_typ(
                     &json!({
@@ -18199,39 +18109,7 @@ allow if {
                 )
                 .await
                 .unwrap();
-            let mut cross_user = pending("cross-user");
-            cross_user["params"]["requestState"] = json!(issued_state);
-            let (status, body) = send(cross_user, Some(other), runtime.clone()).await;
-            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "cross-user: {body}");
-            assert_eq!(body["error"]["code"], -32001, "cross-user: {body}");
-
-            // A client that did not declare URL elicitation is not sent a consent request.
-            let mut incapable = pending("incapable");
-            incapable["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
-            let (status, body) = send(incapable, None, runtime.clone()).await;
-            assert_eq!(
-                body["error"]["code"],
-                crate::mcp::error_codes::MISSING_REQUIRED_CLIENT_CAPABILITY,
-                "incapable: {status} {body}"
-            );
-            assert!(body.get("result").is_none(), "incapable: {body}");
-
-            // An expired state does not open.
-            let short: Arc<ContinuationRuntime> = Arc::new(ContinuationRuntime {
-                config: serde_json::from_value(json!({"deployment": "deployment", "ttl_secs": 1, "active_key": "key",
-                    "keys": [{"id": "key", "secret_id": "key-secret", "not_before": now - 1, "seal_until": now + 3600, "open_until": now + 4500}],
-                    "storage": {"backend": "embedded", "capacity": 32}})).unwrap(),
-                service: Arc::new(ContinuationService::new(ContinuationCipher::new("deployment".into(), "key".into(), vec![
-                    ContinuationKey::new("key".into(), [7; 32], now - 1, now + 3600, now + 4500).unwrap(),
-                ]).unwrap(), Arc::new(EmbeddedContinuations::new(32).unwrap()))),
-            });
-            let (_, short_issued) = send(pending("short"), None, short.clone()).await;
-            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
-            let mut expired = pending("expired");
-            expired["params"]["requestState"] = short_issued["result"]["requestState"].clone();
-            let (status, body) = send(expired, None, short).await;
-            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "expired: {body}");
-            assert_eq!(body["error"]["code"], crate::mcp::error_codes::INVALID_PARAMS, "expired: {body}");
+            negative_cases::assert_rejected_retries(&message, runtime.clone(), other, now, send).await;
         }
         message["id"] = json!(2);
         message["params"]["requestState"] = response["result"]["requestState"].clone();

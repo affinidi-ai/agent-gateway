@@ -16,6 +16,7 @@ use crate::bdd_support::collaborators::{
     assert_header_value as assert_collaborator_header_value, assert_json_request_body,
     assert_request_content_type_starts_with,
 };
+use crate::bdd_support::json_rpc::McpVersion;
 
 use crate::world::{ObservedTarget, SurfaceWorld, identity_schema_has_field};
 
@@ -2073,7 +2074,15 @@ fn mcp_unsupported_version_error_has_exact_versions(
     requested: String,
     supported: String,
 ) {
-    assert_mcp_unsupported_version_error(get_response_body_value(world), &requested, &supported);
+    let supported: Vec<McpVersion> = supported
+        .split(", ")
+        .map(McpVersion::from)
+        .collect();
+    assert_mcp_unsupported_version_error(
+        get_response_body_value(world),
+        &McpVersion::from(requested.as_str()),
+        &supported,
+    );
 }
 
 #[then(expr = "the MCP response tool catalog does not include a tool named {string}")]
@@ -2963,26 +2972,21 @@ fn oauth_provider_requests(world: &SurfaceWorld) -> Vec<crate::bdd_support::mock
         .unwrap_or_default()
 }
 
-fn delegation_audit_text(world: &mut SurfaceWorld) -> String {
+fn delegation_audit_text(world: &SurfaceWorld) -> String {
     serde_json::to_string(&read_delegation_audit_events(world)).expect("delegation audit events should serialize")
 }
 
-fn read_delegation_audit_events(world: &mut SurfaceWorld) -> Vec<serde_json::Value> {
-    refresh_delegation_audit_trail(world);
-    get_admin_response(world)
+fn read_delegation_audit_events(world: &SurfaceWorld) -> Vec<serde_json::Value> {
+    let trail = world
+        .delegation_audit_trail
+        .as_ref()
+        .expect("a When must record the delegation audit trail before this Then");
+    trail
         .body
         .get("events")
         .and_then(|events| events.as_array())
         .cloned()
-        .unwrap_or_else(|| {
-            panic!("admin delegation audit response should include events, got {}", get_admin_response(world).body)
-        })
-}
-
-fn refresh_delegation_audit_trail(world: &mut SurfaceWorld) {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(crate::steps::when::read_delegation_audit_trail(world));
-    });
+        .unwrap_or_else(|| panic!("admin delegation audit response should include events, got {}", trail.body))
 }
 
 fn consent_entry<'a>(
@@ -3488,48 +3492,6 @@ fn agent_card_first_endpoint_url_excludes_managed_agent_endpoint(
     );
 }
 
-/// Reads the next JSON-RPC message from the open MCP response stream,
-/// skipping SSE comments. `Ok(None)` means the stream ended; `Err` means it
-/// stayed open with nothing new within `wait`.
-async fn next_mcp_stream_message(
-    world: &mut SurfaceWorld,
-    wait: std::time::Duration,
-) -> Result<Option<serde_json::Value>, ()> {
-    loop {
-        if let Some(end) = world
-            .mcp_stream_buffer
-            .find("\n\n")
-        {
-            let event: String = world
-                .mcp_stream_buffer
-                .drain(..end + 2)
-                .collect();
-            let data: Vec<&str> = event
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect();
-            if data.is_empty() {
-                continue;
-            }
-            return Ok(Some(serde_json::from_str(&data.join("\n")).expect("MCP stream event data is JSON")));
-        }
-        let stream = world
-            .mcp_stream
-            .as_mut()
-            .expect("an open MCP response stream");
-        match tokio::time::timeout(wait, stream.chunk()).await {
-            Err(_) => return Err(()),
-            Ok(chunk) => match chunk.expect("read the MCP response stream") {
-                Some(chunk) => world
-                    .mcp_stream_buffer
-                    .push_str(&String::from_utf8_lossy(&chunk)),
-                None => return Ok(None),
-            },
-        }
-    }
-}
-
 fn primary_mock_for<'a>(
     world: &'a SurfaceWorld,
     server_name: &str,
@@ -3568,37 +3530,30 @@ fn response_does_not_include_header(
 }
 
 #[then(expr = "the caller receives MCP progress before MCP server {string} completes the tool")]
-async fn caller_receives_progress_before_completion(
+fn caller_receives_progress_before_completion(
     world: &mut SurfaceWorld,
     server_name: String,
 ) {
-    let wait = std::time::Duration::from_secs(10);
-    let progress = next_mcp_stream_message(world, wait)
-        .await
-        .expect("progress arrives while the tool is still running")
-        .expect("the stream stays open for progress");
-    assert_eq!(progress["method"], "notifications/progress", "{progress}");
+    primary_mock_for(world, &server_name);
+    let progress = world
+        .mcp_stream_progress
+        .as_ref()
+        .expect("the caller received no message while the tool was running");
+    assert_eq!(progress["method"], "notifications/progress", "expected an MCP progress notification, got {progress}");
     let sent_token = world
         .sent_body
         .as_ref()
         .and_then(|body| body.pointer("/params/_meta/progressToken"))
-        .cloned();
-    assert_eq!(progress["params"]["progressToken"], sent_token.unwrap_or_default());
-    let mock = primary_mock_for(world, &server_name);
-    assert!(!mock.stream_completed().await, "progress must arrive before the tool completes");
-    mock.release_stream().await;
-    let complete = next_mcp_stream_message(world, wait)
-        .await
-        .expect("the final response arrives after release")
-        .expect("the stream carries a final response");
-    world.mcp_stream_closed_after_final =
-        matches!(next_mcp_stream_message(world, std::time::Duration::from_secs(5)).await, Ok(None));
-    world
-        .caller_response
-        .as_mut()
-        .expect("caller response")
-        .body = complete;
-    crate::steps::when::record_mock_observation(world).await;
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        progress["params"]["progressToken"], sent_token,
+        "progress must carry the caller's progress token, got {progress}"
+    );
+    assert!(
+        world.mcp_progress_before_completion,
+        "MCP server '{server_name}' completed the tool before the caller received progress"
+    );
 }
 
 #[then("the MCP response stream closes after the final response")]

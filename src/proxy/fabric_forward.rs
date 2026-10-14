@@ -772,14 +772,10 @@ mod tests {
     ) {
         use crate::gateways::connection_points::message_processor::ProcessingResult;
         use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
-        use crate::mcp::request_validation::McpVersionPolicy;
         use crate::messages::MessageType;
         use crate::proxy::fabric_stream::{transport, wire};
 
-        let versions = McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let mut streams = tokio::task::JoinSet::new();
         let mut next_message = Box::pin(client.live_stream_next(Duration::from_secs(10), true));
         loop {
@@ -1189,10 +1185,7 @@ mod tests {
             .save(&streaming_surface)
             .await
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for finish in [true, false] {
             let mut request = request.clone();
             request["params"]["_meta"]["progressToken"] = json!("encrypted-progress");

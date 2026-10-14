@@ -764,6 +764,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_open_the_peer_answers_with_an_error_fails_with_its_code_before_the_header_deadline() {
+        struct RefusingSink {
+            caller: Arc<ReceiveRegistry>,
+            code: StreamErrorCode,
+        }
+        #[async_trait]
+        impl FrameSink for RefusingSink {
+            async fn send(
+                &self,
+                frame: StreamFrame,
+            ) -> Result<(), StreamErrorCode> {
+                if matches!(frame.payload, FramePayload::Open { .. }) {
+                    let (caller, code, stream_id) = (self.caller.clone(), self.code, frame.stream_id);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let error = StreamFrame {
+                            stream_id,
+                            payload: FramePayload::Error { code },
+                        };
+                        caller
+                            .deliver(&message(stream_id), "instance", error)
+                            .unwrap();
+                    });
+                }
+                Ok(())
+            }
+        }
+
+        for code in [StreamErrorCode::LegacyOnly, StreamErrorCode::StaleOffer, StreamErrorCode::Unavailable] {
+            let caller = registry();
+            let id = Uuid::new_v4();
+            let header_deadline = Instant::now() + Duration::from_secs(30);
+            let receiver = caller
+                .register(id, binding(), StreamDirection::Response, MAX_CHUNK_BYTES)
+                .unwrap();
+            let sender = caller
+                .register_sender(id, binding(), StreamDirection::Request, MAX_CHUNK_BYTES)
+                .unwrap();
+            let body = Bytes::from_static(b"{}");
+            let open = StreamFrame {
+                stream_id: id,
+                payload: FramePayload::Open {
+                    request: super::super::wire::OpenRequest {
+                        capability_nonce: Uuid::new_v4(),
+                        channel_id: "surface".into(),
+                        variant_alias: None,
+                        path: "/mcp".into(),
+                        headers: Default::default(),
+                        body_bytes: body.len() as u64,
+                        response_window_bytes: MAX_CHUNK_BYTES as u32,
+                        deadline_ms: 1,
+                        trace_id: Uuid::new_v4(),
+                    },
+                },
+            };
+            let sink = Arc::new(RefusingSink { caller: caller.clone(), code });
+            let (response, sending) =
+                prepare_outgoing_request(sink, receiver, sender, open, body, header_deadline, header_deadline);
+            let sending = tokio::spawn(sending);
+
+            let outcome = tokio::time::timeout(Duration::from_millis(500), response)
+                .await
+                .expect("the Error frame ends the wait long before the header deadline");
+            assert_eq!(outcome.err(), Some(code), "{code:?}");
+            tokio::time::timeout(Duration::from_millis(500), sending)
+                .await
+                .expect("the upload stops with the stream")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn composed_subscription_preserves_acknowledgement_and_cancels_quiet_peer() {
         use crate::mcp::request_validation::{McpMessageKind, ValidatedModernMessage};
         use crate::mcp::subscriptions::{CatalogChange, CatalogSubscriptions, owned_catalog_response};

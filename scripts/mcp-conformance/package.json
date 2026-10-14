@@ -4,6 +4,9 @@
   "description": "Runs the published MCP conformance suite against Agent Trust Gateway",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "node --test shim.test.mjs"
+  },
   "devDependencies": {
     "@modelcontextprotocol/conformance": "0.2.0-alpha.11"
   },

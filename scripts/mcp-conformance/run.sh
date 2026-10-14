@@ -46,9 +46,8 @@ usage() {
 Usage: scripts/mcp-conformance/run.sh [options]
 
   --skip-build            Use existing binaries instead of building them
-  --binary PATH           Gateway binary for the modern phase;
+  --binary PATH           Gateway binary for the modern and legacy phases;
                           the fabric target always builds its own through Cargo
-  --legacy-binary PATH    Gateway binary for the legacy phase
   --only LIST             Comma-separated, non-empty subset of:
                           direct,access-point,transit,owned-proxy,proxy-surface,fabric,legacy
                           (fabric needs Docker for the mediator between its two gateways)
@@ -73,7 +72,6 @@ option_value() {
 SKIP_BUILD=false
 UNIT_TESTS=false
 BINARY=""
-LEGACY_BINARY=""
 ONLY="direct,access-point,transit,owned-proxy,proxy-surface,fabric,legacy"
 
 while [[ $# -gt 0 ]]; do
@@ -81,9 +79,9 @@ while [[ $# -gt 0 ]]; do
         --skip-build) SKIP_BUILD=true ;;
         --unit-tests) UNIT_TESTS=true ;;
         --binary) option_value "$1" "${2:-}"; BINARY="$2"; shift ;;
-        --legacy-binary) option_value "$1" "${2:-}"; LEGACY_BINARY="$2"; shift ;;
         --only) option_value "$1" "${2:-}"; ONLY="$2"; shift ;;
         -h|--help) usage; exit 0 ;;
+        --legacy-binary) echo "--legacy-binary was removed: --binary now runs both the modern and legacy phases" >&2; exit 2 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
     shift
@@ -120,7 +118,6 @@ absolute_path() {
     printf -v "${var}" '%s/%s' "${dir}" "$(basename -- "${path}")"
 }
 [[ -z "${BINARY}" ]] || absolute_path BINARY --binary "${BINARY}"
-[[ -z "${LEGACY_BINARY}" ]] || absolute_path LEGACY_BINARY --legacy-binary "${LEGACY_BINARY}"
 
 SUMMARY=()
 FAILED=false
@@ -492,17 +489,11 @@ run_fabric_suite() {
 # run holds it and every check has passed.
 take_lock
 
-# --skip-build uses the binaries a build would write, so they are checked below
-# with any passed in. A phase whose binary is still unset builds it.
-if [[ "${SKIP_BUILD}" == true ]]; then
-    if [[ "${RUN_MODERN}" == true && -z "${BINARY}" ]]; then BINARY="${DEFAULT_BINARY}"; fi
-    if [[ "${RUN_LEGACY}" == true && -z "${LEGACY_BINARY}" ]]; then LEGACY_BINARY="${DEFAULT_BINARY}"; fi
-fi
+# --skip-build uses the binary a build would write, so it is checked below like
+# one passed in. While the binary is still unset, the first phase builds it.
+if [[ "${SKIP_BUILD}" == true && -z "${BINARY}" ]]; then BINARY="${DEFAULT_BINARY}"; fi
 NEED_CARGO=false
-if [[ "${RUN_MODERN}" == true && ( "${UNIT_TESTS}" == true || -z "${BINARY}" ) ]]; then
-    NEED_CARGO=true
-fi
-if [[ "${RUN_LEGACY}" == true && -z "${LEGACY_BINARY}" ]]; then
+if [[ -z "${BINARY}" ]] || [[ "${RUN_MODERN}" == true && "${UNIT_TESTS}" == true ]]; then
     NEED_CARGO=true
 fi
 if selected fabric; then NEED_CARGO=true; fi
@@ -522,9 +513,7 @@ process.exit(a > x || (a === x && (b > y || (b === y && c >= z))) ? 0 : 1);
 ' "${NODE_MIN}" || fail 2 "preflight: node >= ${NODE_MIN} is required (found $(node --version))"
 require_free_ports preflight "${REFERENCE_PORT}" "${FIXTURE_PORT}" "${SHIM_PORT}" "${MODERN_INBOUND_PORT}" "${MODERN_OUTBOUND_PORT}" \
     "${LEGACY_INBOUND_PORT}" "${LEGACY_OUTBOUND_PORT}"
-for binary in "${BINARY}" "${LEGACY_BINARY}"; do
-    [[ -z "${binary}" || ( -f "${binary}" && -x "${binary}" ) ]] || fail 2 "preflight: $(relative "${binary}") is not an executable file"
-done
+[[ -z "${BINARY}" || ( -f "${BINARY}" && -x "${BINARY}" ) ]] || fail 2 "preflight: $(relative "${BINARY}") is not an executable file"
 if selected fabric && ! docker info > /dev/null 2>&1; then
     fail 2 "preflight: the fabric target needs a running Docker daemon for its mediator"
 fi
@@ -551,6 +540,8 @@ start_process "${LOGS}/reference-server.log" "${REFERENCE_SERVER_DIR}" \
 REFERENCE_PID="${STARTED_PID}"
 wait_for_ports "${FIXTURE_PID}" "${FIXTURE_PORT}" || fail 1 "fixtures: REST fixture did not start"
 wait_for_ports "${REFERENCE_PID}" "${REFERENCE_PORT}" || fail 1 "fixtures: reference server did not start"
+node --test "${HERE}/shim.test.mjs" > "${LOGS}/shim-test.log" 2>&1 ||
+    fail 1 "fixtures: upstream shim tests failed (log: $(relative "${LOGS}/shim-test.log"))"
 start_process "${LOGS}/shim.log" "${HERE}" node shim.mjs --port "${SHIM_PORT}" \
     --upstream "http://127.0.0.1:${REFERENCE_PORT}"
 SHIM_PID="${STARTED_PID}"
@@ -604,11 +595,11 @@ fi
 
 # 5. Legacy phase: the legacy regression checks on their own gateway
 if [[ "${RUN_LEGACY}" == true ]]; then
-    if [[ -z "${LEGACY_BINARY}" ]]; then
-        LEGACY_BINARY="${BINARY:-${DEFAULT_BINARY}}"
-        [[ -n "${BINARY}" ]] || build_step "legacy: build" "${LOGS}/build.log" gateway_cargo build
+    if [[ -z "${BINARY}" ]]; then
+        BINARY="${DEFAULT_BINARY}"
+        build_step "legacy: build" "${LOGS}/build.log" gateway_cargo build
     fi
-    start_gateway legacy "${LEGACY_BINARY}" "${LEGACY_INBOUND_PORT}" "${LEGACY_OUTBOUND_PORT}"
+    start_gateway legacy "${BINARY}" "${LEGACY_INBOUND_PORT}" "${LEGACY_OUTBOUND_PORT}"
     check "legacy: compat rejected (every endpoint -32022 for 2025-11-25)" "${LOGS}/compat-rejected-legacy.log" \
         node "${HERE}/compat.mjs" rejected --targets "${TARGETS_FILE}"
     check "legacy: compat legacy session (2024-11-05)" "${LOGS}/compat-legacy-legacy.log" \

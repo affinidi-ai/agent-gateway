@@ -1,4 +1,45 @@
+pub const LEGACY_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 pub const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// The MCP revision a BDD request or fixture speaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpVersion {
+    /// `2024-11-05`, with sessions established by `initialize`.
+    Legacy,
+    /// `2026-07-28`, stateless, carrying its version in every request.
+    Modern,
+    /// Any other revision, such as one the gateway does not admit.
+    Other(String),
+}
+
+impl McpVersion {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Legacy => LEGACY_MCP_PROTOCOL_VERSION,
+            Self::Modern => MODERN_MCP_PROTOCOL_VERSION,
+            Self::Other(version) => version,
+        }
+    }
+}
+
+impl From<&str> for McpVersion {
+    fn from(version: &str) -> Self {
+        match version {
+            LEGACY_MCP_PROTOCOL_VERSION => Self::Legacy,
+            MODERN_MCP_PROTOCOL_VERSION => Self::Modern,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for McpVersion {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 pub fn build_a2a_request_body() -> serde_json::Value {
     build_a2a_message_send_body("g2g-bdd")
@@ -102,11 +143,11 @@ pub fn build_mcp_list_tools_body_with_id(id: serde_json::Value) -> serde_json::V
 
 pub fn build_modern_mcp_list_tools_body(
     id: serde_json::Value,
-    protocol_version: &str,
+    protocol_version: &McpVersion,
     include_capabilities: bool,
 ) -> serde_json::Value {
     let mut meta = serde_json::json!({
-        "io.modelcontextprotocol/protocolVersion": protocol_version,
+        "io.modelcontextprotocol/protocolVersion": protocol_version.as_str(),
         "io.modelcontextprotocol/clientInfo": {
             "name": "bdd-test-client",
             "version": "0.1.0"
@@ -124,7 +165,7 @@ pub fn build_modern_mcp_list_tools_body(
 }
 
 pub fn modern_mcp_request_headers(
-    protocol_version: &str,
+    protocol_version: &McpVersion,
     method: &str,
 ) -> Vec<(String, String)> {
     vec![
@@ -282,7 +323,7 @@ pub fn build_target_agent_card_with_identity() -> serde_json::Value {
 pub fn build_modern_mcp_tool_call_body(
     id: serde_json::Value,
     tool_name: &str,
-    protocol_version: &str,
+    protocol_version: &McpVersion,
 ) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -292,7 +333,7 @@ pub fn build_modern_mcp_tool_call_body(
             "name": tool_name,
             "arguments": {"value": "bdd"},
             "_meta": {
-                "io.modelcontextprotocol/protocolVersion": protocol_version,
+                "io.modelcontextprotocol/protocolVersion": protocol_version.as_str(),
                 "io.modelcontextprotocol/clientInfo": {"name": "bdd-test-client", "version": "0.1.0"},
                 "io.modelcontextprotocol/clientCapabilities": {},
                 "progressToken": "bdd-progress"
@@ -414,9 +455,11 @@ mod tests {
 
     #[test]
     fn modern_list_tools_fixture_can_omit_capabilities() {
-        let complete = super::build_modern_mcp_list_tools_body(serde_json::json!(1), "2026-07-28", true);
-        let incomplete = super::build_modern_mcp_list_tools_body(serde_json::json!(1), "2026-07-28", false);
+        let complete = super::build_modern_mcp_list_tools_body(serde_json::json!(1), &super::McpVersion::Modern, true);
+        let incomplete =
+            super::build_modern_mcp_list_tools_body(serde_json::json!(1), &super::McpVersion::Modern, false);
 
+        assert_eq!(complete["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
         assert_eq!(complete["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"], serde_json::json!({}));
         assert!(
             incomplete["params"]["_meta"]
@@ -427,9 +470,22 @@ mod tests {
 
     #[test]
     fn modern_request_headers_include_both_response_media_types() {
-        let headers = super::modern_mcp_request_headers("2026-07-28", "tools/list");
+        let headers = super::modern_mcp_request_headers(&super::McpVersion::Modern, "tools/list");
         assert!(headers.contains(&("accept".to_string(), "application/json, text/event-stream".to_string())));
         assert!(headers.contains(&("MCP-Protocol-Version".to_string(), "2026-07-28".to_string())));
         assert!(headers.contains(&("Mcp-Method".to_string(), "tools/list".to_string())));
+    }
+
+    #[test]
+    fn mcp_version_round_trips_known_and_other_revisions() {
+        for (text, version) in [
+            ("2024-11-05", super::McpVersion::Legacy),
+            ("2026-07-28", super::McpVersion::Modern),
+            ("2025-11-25", super::McpVersion::Other("2025-11-25".to_string())),
+        ] {
+            assert_eq!(super::McpVersion::from(text), version);
+            assert_eq!(version.as_str(), text);
+            assert_eq!(version.to_string(), text);
+        }
     }
 }

@@ -46,12 +46,6 @@ pub fn is_sse_content_type(content_type: &str) -> bool {
     content_type.starts_with(CT_EVENT_STREAM)
 }
 
-/// Byte cap on one SSE event a Legacy SSE roundtrip holds while it is
-/// incomplete: the default `a2a.max_body_size`, which that path cannot reach.
-fn legacy_sse_event_limit() -> usize {
-    crate::config::A2aConfig::default().max_body_size
-}
-
 /// An upstream SSE event grew past its byte cap before it was complete.
 #[derive(Debug, thiserror::Error)]
 #[error("upstream SSE event exceeds {0} bytes")]
@@ -300,8 +294,9 @@ pub(crate) async fn consume_sse_response(
 
     let request_id = single_request_id(request);
     let mut chunks = crate::proxy::upstream_body::BoundedChunks::new(upstream_response, limits)?;
-    // `chunks` already caps the whole stream, and so every event in it.
-    let mut events = SseEventBuffer::new(usize::MAX);
+    // `chunks` already caps the whole stream; the same cap on each event keeps
+    // the buffer bounded on its own.
+    let mut events = SseEventBuffer::new(limits.max_bytes());
     let mut last: Option<String> = None;
     loop {
         let (chunk, ended) = match chunks.next().await {
@@ -714,151 +709,6 @@ fn resolve_session_post_url(
     Ok(resolved.to_string())
 }
 
-/// Perform a complete Legacy SSE round-trip for a single JSON-RPC request.
-///
-/// Used by GW2 when the upstream only supports Legacy SSE transport (not
-/// Streamable HTTP).  The flow is:
-///
-/// 1. `GET {base_url}/sse` → establish SSE stream
-/// 2. Read the first `endpoint` event to obtain the session POST URL
-/// 3. `POST` the JSON-RPC body to that session URL
-/// 4. Continue reading the SSE stream until a JSON-RPC response arrives
-/// 5. Return the JSON-RPC response as a string
-///
-/// The SSE connection is dropped when this function returns.
-#[allow(dead_code)]
-pub async fn legacy_sse_roundtrip(
-    client: &reqwest::Client,
-    base_url: &str,
-    json_rpc_body: &[u8],
-    channel_name: &str,
-) -> Result<String, String> {
-    use tokio::time::{Duration, timeout};
-
-    let sse_url = format!("{}/sse", base_url.trim_end_matches('/'));
-    debug!(channel = channel_name, "Legacy SSE roundtrip: connecting to {}", sse_url);
-
-    let response = client
-        .get(&sse_url)
-        .header(ACCEPT, CT_EVENT_STREAM)
-        .send()
-        .await
-        .map_err(|e| format!("SSE connect failed: {e}"))?;
-
-    if !response.status().is_success() {
-        return Err(format!("SSE endpoint returned {}", response.status()));
-    }
-
-    let mut byte_stream = response.bytes_stream();
-    let mut events = SseEventBuffer::new(legacy_sse_event_limit());
-
-    // Step 1: read events until we get the endpoint URL (max 10 s)
-    let deadline = Duration::from_secs(10);
-    let endpoint_result = timeout(deadline, async {
-        while let Some(chunk) = byte_stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    for raw in events
-                        .push(&bytes)
-                        .map_err(|e| e.to_string())?
-                    {
-                        // Look for "event: endpoint" (or "event:endpoint")
-                        let is_endpoint_event = raw.lines().any(|l| {
-                            l.strip_prefix("event:")
-                                .map(|v| v.trim() == "endpoint")
-                                .unwrap_or(false)
-                        });
-
-                        if is_endpoint_event {
-                            for line in raw.lines() {
-                                if let Some(data) = line.strip_prefix("data:") {
-                                    return Ok::<String, String>(data.trim().to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => return Err(format!("SSE stream error: {e}")),
-            }
-        }
-        Err("SSE stream closed before endpoint event".to_string())
-    })
-    .await;
-
-    let raw_endpoint = match endpoint_result {
-        Ok(Ok(url)) => url,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("Timeout waiting for endpoint event from SSE".to_string()),
-    };
-
-    let post_url = resolve_session_post_url(&raw_endpoint, &sse_url)?;
-
-    debug!(channel = channel_name, "Legacy SSE roundtrip: posting to {}", post_url);
-
-    // Step 2: POST the JSON-RPC body to the session endpoint
-    let post_resp = client
-        .post(&post_url)
-        .header(CONTENT_TYPE, CT_JSON)
-        .body(json_rpc_body.to_vec())
-        .send()
-        .await
-        .map_err(|e| format!("POST to session endpoint failed: {e}"))?;
-
-    let post_status = post_resp.status();
-    if !post_status.is_success() && post_status.as_u16() != 202 {
-        return Err(format!("Session POST returned {}", post_status));
-    }
-
-    // Check if the request was a notification (no id → no response expected)
-    if let Ok(req_json) = serde_json::from_slice::<serde_json::Value>(json_rpc_body)
-        && req_json.get("id").is_none()
-    {
-        return Ok(String::new()); // notifications don't get responses
-    }
-
-    // Step 3: read SSE stream for the JSON-RPC response (max 30 s)
-    let response_deadline = Duration::from_secs(30);
-    let response_result = timeout(response_deadline, async {
-        loop {
-            match byte_stream.next().await {
-                Some(Ok(bytes)) => {
-                    for raw in events
-                        .push(&bytes)
-                        .map_err(|e| e.to_string())?
-                    {
-                        let mut data_lines: Vec<String> = Vec::new();
-                        for line in raw.lines() {
-                            if let Some(d) = line.strip_prefix("data:") {
-                                data_lines.push(d.trim_start().to_string());
-                            }
-                        }
-                        if !data_lines.is_empty() {
-                            let data = data_lines.join("\n");
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
-                                && (json.get("result").is_some() || json.get("error").is_some())
-                            {
-                                return Ok::<String, String>(data);
-                            }
-                        }
-                    }
-                }
-                Some(Err(e)) => return Err(format!("SSE stream error reading response: {e}")),
-                None => return Err("SSE stream ended without response".to_string()),
-            }
-        }
-    })
-    .await;
-
-    match response_result {
-        Ok(Ok(json)) => {
-            debug!(channel = channel_name, "Legacy SSE roundtrip: got response");
-            Ok(json)
-        }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("Timeout waiting for JSON-RPC response from SSE".to_string()),
-    }
-}
-
 /// Parse a raw SSE event text block into an axum SseEvent.
 ///
 /// Supports `event:`, `data:`, `id:`, and `retry:` fields.
@@ -912,8 +762,7 @@ fn is_filtered_header(key: &str) -> bool {
 // ── Persistent upstream SSE session (GW2) ───────────────────────────────────
 //
 // Legacy SSE servers expect `initialize` → `notifications/initialized` →
-// other requests all on the **same** SSE session.  `legacy_sse_roundtrip`
-// opens a fresh connection per request which breaks that invariant.
+// other requests all on the **same** SSE session.
 //
 // `UpstreamSseSession` keeps one GET /sse connection alive, runs a
 // background reader task that routes responses by JSON-RPC `id`, and
