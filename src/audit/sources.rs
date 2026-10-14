@@ -43,6 +43,7 @@ pub fn integration_sinks(integrations: &[Integration]) -> Vec<Sink> {
                     .audit_drop_after_secs
                     .map(Duration::from_secs),
             )
+            .giving_up_after(integration.audit_max_attempts)
         })
         .collect()
 }
@@ -292,6 +293,16 @@ mod tests {
         let sinks = integration_sinks(&[integration, without]);
         assert_eq!(sinks[0].drop_older_than, Some(std::time::Duration::from_secs(3600)));
         assert_eq!(sinks[1].drop_older_than, None);
+    }
+
+    #[test]
+    fn an_integrations_attempt_limit_carries_into_its_sink() {
+        let mut integration = audit_integration("active", None, &["auth_failed"]);
+        integration.audit_max_attempts = Some(10);
+        let without = audit_integration("active", None, &["auth_failed"]);
+        let sinks = integration_sinks(&[integration, without]);
+        assert_eq!(sinks[0].max_attempts, Some(10));
+        assert_eq!(sinks[1].max_attempts, None);
     }
 
     #[test]

@@ -65,6 +65,9 @@ pub struct Sink {
     pub events: EventMask,
     /// Records older than this are skipped for this sink instead of delivered.
     pub drop_older_than: Option<Duration>,
+    /// A record this sink has failed to accept this many times is skipped
+    /// instead of retried.
+    pub max_attempts: Option<u32>,
 }
 
 impl Sink {
@@ -76,6 +79,7 @@ impl Sink {
             id,
             events,
             drop_older_than: None,
+            max_attempts: None,
         }
     }
 
@@ -84,6 +88,14 @@ impl Sink {
         age: Option<Duration>,
     ) -> Self {
         self.drop_older_than = age;
+        self
+    }
+
+    pub fn giving_up_after(
+        mut self,
+        attempts: Option<u32>,
+    ) -> Self {
+        self.max_attempts = attempts;
         self
     }
 }
@@ -96,6 +108,7 @@ pub struct SinkRegistry {
     index: Vec<Vec<SinkId>>,
     ids: Vec<SinkId>,
     drop_older_than: HashMap<SinkId, Duration>,
+    max_attempts: HashMap<SinkId, u32>,
     paused: Vec<SinkId>,
 }
 
@@ -105,10 +118,14 @@ impl SinkRegistry {
         let mut union = 0;
         let mut ids = Vec::with_capacity(sinks.len());
         let mut drop_older_than = HashMap::new();
+        let mut max_attempts = HashMap::new();
         for sink in sinks {
             union |= sink.events.0;
             if let Some(age) = sink.drop_older_than {
                 drop_older_than.insert(sink.id.clone(), age);
+            }
+            if let Some(attempts) = sink.max_attempts {
+                max_attempts.insert(sink.id.clone(), attempts);
             }
             for (bit, recipients) in (0..).zip(index.iter_mut()) {
                 if sink.events.contains(bit) {
@@ -122,6 +139,7 @@ impl SinkRegistry {
             index,
             ids,
             drop_older_than,
+            max_attempts,
             paused: Vec::new(),
         }
     }
@@ -143,6 +161,15 @@ impl SinkRegistry {
         sink: &SinkId,
     ) -> Option<Duration> {
         self.drop_older_than
+            .get(sink)
+            .copied()
+    }
+
+    pub fn max_attempts(
+        &self,
+        sink: &SinkId,
+    ) -> Option<u32> {
+        self.max_attempts
             .get(sink)
             .copied()
     }
@@ -258,6 +285,17 @@ mod tests {
         assert_eq!(registry.drop_older_than(&SinkId::AuditLog), None);
         assert_eq!(registry.drop_older_than(&integration("slack")), Some(hour));
         assert_eq!(registry.drop_older_than(&integration("gone")), None);
+    }
+
+    #[test]
+    fn registry_keeps_each_sinks_attempt_limit() {
+        let registry = SinkRegistry::new(vec![
+            sink(SinkId::AuditLog, &[]),
+            sink(integration("slack"), &["auth_failed"]).giving_up_after(Some(10)),
+        ]);
+        assert_eq!(registry.max_attempts(&SinkId::AuditLog), None);
+        assert_eq!(registry.max_attempts(&integration("slack")), Some(10));
+        assert_eq!(registry.max_attempts(&integration("gone")), None);
     }
 
     fn integration(id: &str) -> SinkId {
