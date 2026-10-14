@@ -764,6 +764,7 @@ dependencies = [
  "tokio-retry",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tonic",
  "tower",
