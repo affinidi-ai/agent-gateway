@@ -13,3 +13,8 @@ changes:
         Lists the 45 delivered gateway, user, connection point message, x402, MPP and governance
         audit events with their family, audit group and the template variables each delivery
         fills, so integrations can pick events without categories.
+    - timestamp: '2026-10-14T09:10:57.000Z'
+      title: Store endpoints, event sets and integrations as separate definitions
+      description: >-
+        Adds the endpoint definition (transport, destination and credentials) and a shared
+        store that keeps one JSON file per definition and lists them newest first.
