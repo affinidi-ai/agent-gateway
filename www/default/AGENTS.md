@@ -351,6 +351,17 @@ The hidden file input is `data-testid="restore-file-input"`.
   the integration will receive nothing. When the catalogue cannot be loaded,
   `integration-audit-events-error` says so, no toggles are shown and saving keeps the stored
   selection.
+- Below it, **Delivery limits**
+  (`components/integrations/AuditDeliveryLimitsSection.tsx`, `integration-audit-limits`), also
+  only for the `audit` category, has two optional number fields with the placeholder
+  **Never**: **Give up on a record after … attempts** (`integration-audit-max-attempts-input`,
+  bound to `audit_max_attempts`) and **Skip records older than … seconds**
+  (`integration-audit-drop-after-input`, bound to `audit_drop_after_secs`). Empty means no
+  limit. A value that is not a whole number of 1 or more is marked invalid
+  (`integration-audit-max-attempts-error`, `integration-audit-drop-after-error`) and blocks
+  saving with a message naming the field. Both are sent only for the `audit` category: the
+  Add wizard leaves an empty one out, and the Edit page loads the stored values and sends an
+  emptied one as `null`, which clears it. The helpers live in `utils/auditIntegrations.ts`.
 - Settings › Security › VP Audit uses the same picker with the prefix `vp-audit` under
   **Events to keep**, bound to the settings' `audit_events`. Its `vp-audit-scope-note` says
   those settings control the VP Audit Log only, and `vp-audit-catalog-error` replaces the
