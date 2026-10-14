@@ -130,6 +130,15 @@ pub struct JournalWriter {
     segment_max_bytes: u64,
     next_seq: u64,
     segment: Option<(File, u64)>,
+    /// Makes a new segment's directory entry durable.
+    sync_dir: Box<dyn FnMut(&Path) -> io::Result<()> + Send>,
+    /// The current segment was created but its directory entry is not yet
+    /// durable; nothing is written to it until it is.
+    dir_unsynced: bool,
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 impl JournalWriter {
@@ -147,6 +156,8 @@ impl JournalWriter {
             segment_max_bytes,
             next_seq: 1,
             segment: None,
+            sync_dir: Box::new(sync_dir),
+            dir_unsynced: false,
         };
         warn_about_foreign_files(dir)?;
         if let Some(last) = segment_paths(dir)?.pop() {
@@ -185,6 +196,10 @@ impl JournalWriter {
         self.next_seq
     }
 
+    /// The segment to append to, rolling to a new one when the current one is
+    /// full. A new segment becomes current as soon as it is created, so a
+    /// failed directory sync is retried on the next append rather than
+    /// creating the same file again.
     fn current_segment(&mut self) -> io::Result<&mut (File, u64)> {
         let full = self
             .segment
@@ -198,8 +213,12 @@ impl JournalWriter {
                     self.dir
                         .join(segment_name(self.next_seq)),
                 )?;
-            File::open(&self.dir)?.sync_all()?;
             self.segment = Some((file, 0));
+            self.dir_unsynced = true;
+        }
+        if self.dir_unsynced {
+            (self.sync_dir)(&self.dir)?;
+            self.dir_unsynced = false;
         }
         self.segment
             .as_mut()
@@ -530,6 +549,48 @@ mod tests {
             .iter()
             .map(|entry| entry.seq)
             .collect()
+    }
+
+    #[test]
+    fn a_failed_directory_sync_at_rollover_is_retried_by_the_next_append() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = JournalWriter::open(dir.path(), 1).unwrap();
+        writer
+            .append(&[pending("a")])
+            .unwrap();
+        let failures_left = Arc::new(AtomicUsize::new(1));
+        let syncs = Arc::new(AtomicUsize::new(0));
+        writer.sync_dir = {
+            let (failures_left, syncs) = (failures_left.clone(), syncs.clone());
+            Box::new(move |_| {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                match failures_left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)) {
+                    Ok(_) => Err(io::Error::other("EIO")),
+                    Err(_) => Ok(()),
+                }
+            })
+        };
+
+        assert!(
+            writer
+                .append(&[pending("b")])
+                .is_err()
+        );
+        assert_eq!(
+            writer
+                .append(&[pending("b")])
+                .unwrap(),
+            Some(2)
+        );
+
+        assert_eq!(syncs.load(Ordering::SeqCst), 2, "the second append synced the directory again");
+        assert_eq!(seqs_in(dir.path()), vec![1, 2]);
+        assert_eq!(
+            segment_paths(dir.path())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
