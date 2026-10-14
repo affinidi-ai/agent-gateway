@@ -11839,7 +11839,9 @@ async fn handle_fabric_request(
                         } else {
                             "request_path_fabric".to_string()
                         },
-                        caller: None,
+                        caller: authenticated_identity
+                            .as_ref()
+                            .map(crate::delegation_vault::audit::build_caller_context),
                         via_fabric: true,
                     })
                 });
@@ -20613,5 +20615,95 @@ mod fabric_extended_card_tests {
             .as_str()
             .unwrap_or_default();
         assert!(url.starts_with("https://gateway.example"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_fabric_forward_vp_injection_record_names_the_authenticated_caller() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let (vc_issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let vc_issuer = Arc::new(vc_issuer);
+        peer.state.identity_selector = Some(Arc::new(
+            crate::identity::IdentitySelector::new(
+                &json!({"type": "object", "properties": {
+                    "cloudProvider": {"type": "string", "x-identity": true},
+                    "model": {"type": "string", "x-identity": true}
+                }}),
+                vc_issuer.clone(),
+            )
+            .unwrap(),
+        ));
+        peer.state.vc_issuer = Some(vc_issuer);
+        let mut surface = (*peer.state.surface).clone();
+        surface.identity_slots.inbound = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                extension_uri: None,
+                meta_field: "agentIdentity".to_string(),
+                fields: Vec::new(),
+                json_schema: None,
+                extension_rules: None,
+                strip_raw_meta: false,
+            },
+        ));
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1",
+                "extensions": ["https://fabric.affinidi.io/extensions/agent-identity/v1"],
+                "metadata": {"https://fabric.affinidi.io/extensions/agent-identity/v1": {"cloudProvider": "local", "model": "gpt-4"}}}}
+        });
+        let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "user-123".to_string(),
+            claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
+        };
+
+        let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            "Fabric A2A",
+            axum::http::Method::POST,
+            "https://gateway.example/a2a"
+                .parse()
+                .unwrap(),
+            axum::http::HeaderMap::new(),
+            "127.0.0.1:12345".to_string(),
+            std::time::Instant::now(),
+            super::ConnectionGuard::new(None, None),
+            axum::body::Bytes::from(body.to_string()),
+            "trace-1".to_string(),
+            None,
+            Some(caller),
+            None,
+            None,
+            crate::mcp::meta::McpMetadataContext::default(),
+            None,
+            None,
+            None,
+            None,
+        )))
+        .await;
+
+        if let Err(refused) = result {
+            let status = refused.status();
+            let body = axum::body::to_bytes(refused.into_body(), 65536)
+                .await
+                .unwrap();
+            panic!("refused with {status}: {}", String::from_utf8_lossy(&body));
+        }
+        let injected: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("request_path_fabric"))
+            })
+            .collect();
+        assert_eq!(injected.len(), 1, "{events:?}");
+        assert_eq!(
+            injected[0]
+                .caller
+                .as_ref()
+                .and_then(|caller| caller.email.as_deref()),
+            Some("ada@example.com")
+        );
     }
 }
