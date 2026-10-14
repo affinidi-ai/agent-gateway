@@ -160,12 +160,12 @@ description that exists today.
 ## `gateway.json`
 
 Network topology and the surfaces served. The largest configuration file; the example is
-1,137 lines.
+1,271 lines.
 
 | Key | Controls |
 | --- | --- |
 | `listeners` | Named bind addresses and ports. Access Points and Transit Points reference these. |
-| `channels` | Route prefixes. The legacy wire name for surface routes. |
+| `channels` | Route prefixes. The legacy wire name for surface routes. The dashboard offers them as an Access Point's **Surface Prefix**, in this order, and preselects the first for a new surface. |
 | `routes` | Route categories and their types, prefixes, and fallbacks |
 | `mcp_proxies` | Route prefixes for MCP proxy endpoints |
 | `did` | The domain used when generating `did:web` and `did:webvh` identifiers |

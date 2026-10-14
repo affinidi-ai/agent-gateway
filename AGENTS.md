@@ -79,6 +79,10 @@ The Surface Builder's **Send delegated credentials over Fabric** switch is per r
 a surface with credential bindings; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
+Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.

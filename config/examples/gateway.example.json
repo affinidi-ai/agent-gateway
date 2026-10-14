@@ -1030,19 +1030,39 @@
   ],
   "channels": [
     {
+      "id": "agents",
+      "name": "agents",
+      "prefix": "/agents"
+    },
+    {
+      "id": "customer-support",
+      "name": "customer-support",
+      "prefix": "/customer-support"
+    },
+    {
       "id": "payments",
       "name": "payments",
       "prefix": "/payments"
     },
     {
-      "id": "cats",
-      "name": "cats",
-      "prefix": "/cats"
+      "id": "order-status",
+      "name": "order-status",
+      "prefix": "/order-status"
     },
     {
-      "id": "agents",
-      "name": "agents",
-      "prefix": "/agents"
+      "id": "product-catalog",
+      "name": "product-catalog",
+      "prefix": "/product-catalog"
+    },
+    {
+      "id": "helpdesk",
+      "name": "helpdesk",
+      "prefix": "/helpdesk"
+    },
+    {
+      "id": "inventory",
+      "name": "inventory",
+      "prefix": "/inventory"
     },
     {
       "id": "routes",

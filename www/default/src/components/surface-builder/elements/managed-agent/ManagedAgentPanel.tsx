@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Form } from 'react-bootstrap';
 import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
@@ -6,7 +6,6 @@ import { deepLinks } from '../../../../utils/deepLinks';
 import { ENABLE_MPP_PAYWALL } from '../../../../utils/featureFlags';
 import { filterSelectableGateways } from '../../../../utils/gateways';
 import type { ConfigPanelProps } from '../types';
-import { RouteListenerBanner } from '../_shared/RouteListenerSection';
 import FieldHelp from '../../../shared/FieldHelp';
 import FabricDelegatedCredentialsSection, {
   fabricPeerGatewayId,
@@ -118,28 +117,8 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
       .finally(() => setIsLoadingChannels(false));
   }, [selectedGatewayId, endpointType, channelsRefreshTick]);
 
-  // Convenience banner: show the Access Point's listener URL so the
-  // user can see at a glance where this Managed Agent will be reached
-  // from. Read-only — the AP panel owns the actual listener config.
-  const accessPointUrl: string = useMemo(() => {
-    const ap = allNodes?.find(n => n.type === 'access-point');
-    const apc: any = ap?.config ?? {};
-    const listen: string = (apc.listen_address || '').trim();
-    const route: string = (apc.route || '').trim();
-    if (!listen || !route) return '';
-    const base = listen.replace(/\/$/, '');
-    const path = route.startsWith('/') ? route : `/${route}`;
-    return `${base}${path}`;
-  }, [allNodes]);
-
   return (
     <>
-      <RouteListenerBanner
-        label="Reached at"
-        url={accessPointUrl}
-        placeholder="(configure the Access Point to derive a URL)"
-      />
-
       <div className="config-section">
         <label>Endpoint</label>
         <Form.Group className="mb-2">

@@ -119,15 +119,36 @@ body.dark-theme .canvas-grid-dot {
   font-weight: 700;
 }
 
-/* Always-on Variants widget pinned to the top-left of the canvas,
-   sitting next to (or in place of) the collapsible element palette.
-   The underlying `target-variant` node is hidden from the canvas — the
+/* Floating controls along the top of the canvas: the variants widget
+   on the left, the toolbar on the right, and the Entry point URL banner
+   filling the space between them. A flex row, so the banner shrinks
+   instead of sliding under either neighbour. The row itself lets canvas
+   clicks through; only the controls take them. */
+.surface-canvas-topbar {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  right: 8px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.surface-canvas-topbar .surface-variants-widget,
+.surface-canvas-topbar .surface-variants-widget-wrapper,
+.surface-canvas-topbar .surface-toolbar-widget,
+.surface-canvas-topbar .surface-access-point-url-widget .alert {
+  pointer-events: auto;
+}
+
+/* Always-on Variants widget at the start of the canvas top bar. The
+   underlying `target-variant` node is hidden from the canvas — the
    widget is the only entry point to the variants editor. */
 .surface-variants-widget {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 10;
+  position: relative;
+  flex: none;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -231,43 +252,57 @@ body.dark-theme .surface-variants-widget .widget-title {
    pill button. The pill itself keeps the same look as the standalone
    button when no variants exist. */
 .surface-variants-widget-wrapper {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 10;
+  position: relative;
+  flex: none;
 }
 
 .surface-variants-widget-wrapper .surface-variants-widget {
   position: static;
 }
 
-/* Access Point URL banner reused from the property sidebar, shown at
-   the top of the canvas next to the variants widget for quick discovery
-   and one-click copy. Capped width keeps the canvas usable on narrow
-   viewports; the banner truncates its own URL text. */
+/* Entry point URL banner reused from the Access Point panel, centred in
+   the top bar's free space for quick discovery and one-click copy. Only
+   the URL text truncates; the label, help icon and copy button keep their
+   size so copy stays reachable. The decorative info icon is left out to
+   leave the URL as much room as the narrow canvas allows. */
 .surface-access-point-url-widget {
-  position: absolute;
-  top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 10;
-  max-width: 640px;
-  width: max-content;
-  pointer-events: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
 }
 
 .surface-access-point-url-widget .alert {
+  display: flex;
+  min-width: 0;
+  max-width: 640px;
+  overflow: hidden;
+  align-items: center;
   margin-bottom: 0 !important;
   padding: 4px 10px;
   font-size: 12px !important;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   background: rgba(255, 255, 255, 0.55);
   backdrop-filter: blur(10px);
   border: 1px solid rgba(0, 0, 0, 0.06);
   color: #1e3a5f;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.05);
+}
+
+.surface-access-point-url-widget .route-listener-banner > * {
+  flex-shrink: 0;
+}
+
+.surface-access-point-url-widget .route-listener-banner__icon {
+  display: none;
+}
+
+.surface-access-point-url-widget .route-listener-banner__url {
+  flex-shrink: 1;
+  min-width: 0;
+  margin-left: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 body.dark-theme .surface-access-point-url-widget .alert {
@@ -276,16 +311,11 @@ body.dark-theme .surface-access-point-url-widget .alert {
   color: #f1f5f9;
 }
 
-/* Floating canvas toolbar (undo / redo / auto-layout). Mirrors the
-   glassmorphism of the variants widget. Positioned top-right just to
-   the left of the centre / reset-view button rendered inside the
-   canvas so it doesn't fight with the variants pill (top-left) or
-   the AP URL banner (top-center). */
+/* Floating canvas toolbar (undo / redo / auto-layout) at the end of the
+   canvas top bar. Mirrors the glassmorphism of the variants widget. */
 .surface-toolbar-widget {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 10;
+  flex: none;
+  margin-left: auto;
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -452,10 +482,6 @@ body.dark-theme .surface-variants-widget-divider {
    container reuses `.surface-variants-widget` for chrome but renders a
    row + add-button as siblings so each click target is independent. */
 .surface-variants-widget--zero {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 10;
   padding: 0;
   cursor: default;
   gap: 0;

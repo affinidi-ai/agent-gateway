@@ -8,8 +8,13 @@ import {
   type RoutingConfig,
 } from '../access-point/defaults';
 import { generateRandomPath } from '../../../../utils/stringUtils';
+import { showToast } from '../../../../utils/toaster';
 import InfoBanner from '../../../shared/InfoBanner';
 import FieldHelp from '../../../shared/FieldHelp';
+import { CopyButton } from '../../../shared/CopyButton';
+
+export const ENTRY_POINT_URL_LABEL = 'Entry point URL';
+export const ENTRY_POINT_URL_HELP = 'The URL used to access this gateway';
 
 export interface RouteListenerSectionProps {
   config: any;
@@ -26,8 +31,12 @@ export interface RouteListenerSectionProps {
    * APs write `route`; TPs write `listen_path`.
    */
   routeFieldName: 'route' | 'listen_path';
-  /** Banner heading, e.g. "Channel Route" or "Listener URL". */
+  /** Banner heading, e.g. "Entry point URL" or "Listener URL". */
   bannerLabel: string;
+  /** Tooltip explaining the banner URL, shown behind a help icon beside the heading. */
+  bannerHelp?: React.ReactNode;
+  /** `data-testid` of the banner; its copy button gets `<bannerTestId>-copy-button`. */
+  bannerTestId: string;
   /**
    * Replace the top history snapshot after the seed runs so undo skips
    * past the auto-seeded defaults. Optional; only APs (auto-created on
@@ -131,6 +140,8 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
   addressSource,
   routeFieldName,
   bannerLabel,
+  bannerHelp,
+  bannerTestId,
   replaceCommit,
   hasAttemptedSave,
 }) => {
@@ -328,9 +339,9 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     </>
   ) : (
     <>
-      This is the network address and path other agents will use to reach this surface. The gateway
-      auto-fills a random path so you can save immediately, but you can change it to something
-      memorable before sharing the URL.
+      This URL is how other agents connect to this surface. A unique path is generated automatically
+      so you can save and start using the surface immediately. Before sharing it, you can customise
+      the path to make it easier to recognise and manage.
     </>
   );
   const listenAddressHelp = isOutboundListener ? (
@@ -363,6 +374,8 @@ const RouteListenerSection: React.FC<RouteListenerSectionProps> = ({
     <>
       <RouteListenerBanner
         label={bannerLabel}
+        help={bannerHelp}
+        testId={bannerTestId}
         url={fullRouteDisplay}
         warning={pathError ?? undefined}
       />
@@ -495,6 +508,10 @@ export default RouteListenerSection;
 export interface RouteListenerBannerProps {
   /** Heading text shown in bold before the URL. */
   label: string;
+  /** Tooltip explaining the URL, shown behind a help icon beside the heading. */
+  help?: React.ReactNode;
+  /** `data-testid` of the banner; its copy button gets `<testId>-copy-button`. */
+  testId: string;
   /** Composed URL to display. Empty string renders the placeholder hint. */
   url: string;
   /** When set, the banner switches to warning style and shows this message instead of the URL. */
@@ -504,13 +521,14 @@ export interface RouteListenerBannerProps {
 }
 
 /**
- * Read-only banner used by `RouteListenerSection` and by panels that
- * want to surface another node's listener URL (e.g. a Managed Agent
- * showing the Access Point's URL as a convenience). Identical look,
- * feel, and copy behaviour as the editing variant.
+ * Read-only banner used by `RouteListenerSection` and by the canvas
+ * Entry point URL widget, with a copy-to-clipboard button once a URL
+ * is composed.
  */
 export const RouteListenerBanner: React.FC<RouteListenerBannerProps> = ({
   label,
+  help,
+  testId,
   url,
   warning,
   placeholder = '(select address and prefix)',
@@ -519,29 +537,33 @@ export const RouteListenerBanner: React.FC<RouteListenerBannerProps> = ({
   const display = warning ? warning : url || placeholder;
   return (
     <div
-      className={`alert ${warning ? 'alert-warning' : 'alert-success'} mb-3`}
+      className={`alert ${warning ? 'alert-warning' : 'alert-success'} route-listener-banner mb-3`}
       style={{ fontSize: '13px' }}
+      data-testid={testId}
     >
-      <i className="fas fa-info-circle me-2"></i>
-      <strong>{label}:</strong> {display}
+      <i className="fas fa-info-circle me-2 route-listener-banner__icon"></i>
+      <strong className="route-listener-banner__label">{label}:</strong>
+      {help && (
+        <span className="route-listener-banner__help ms-1">
+          <FieldHelp testId={`${testId}-help`} ariaLabel={`About ${label}`}>
+            {help}
+          </FieldHelp>
+        </span>
+      )}{' '}
+      <span className="route-listener-banner__url" title={hasUrl ? url : undefined}>
+        {display}
+      </span>
       {hasUrl && (
-        <button
-          type="button"
-          className="btn btn-xs ms-2"
-          style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
-          onClick={e => {
-            navigator.clipboard.writeText(url);
-            const btn = e.currentTarget as HTMLButtonElement;
-            const originalHtml = btn.innerHTML;
-            btn.innerHTML = '<i class="fas fa-check"></i>';
-            setTimeout(() => {
-              btn.innerHTML = originalHtml;
-            }, 2000);
-          }}
+        <CopyButton
+          text={url}
           title="Copy to clipboard"
-        >
-          <i className="fas fa-copy"></i>
-        </button>
+          aria-label={`Copy ${label}`}
+          className="route-listener-banner__copy text-reset"
+          data-testid={`${testId}-copy-button`}
+          onCopyError={() =>
+            showToast('error', `Could not copy the ${label}: select it and copy it by hand.`)
+          }
+        />
       )}
     </div>
   );
