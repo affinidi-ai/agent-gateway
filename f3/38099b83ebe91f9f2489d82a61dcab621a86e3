@@ -1,0 +1,23 @@
+.github/scripts/changelog.py
+  s_09d9fb08a24a2a::t_0940bd971ef1bd 29,139-147
+.github/scripts/test_changelog.py
+  s_09d9fb08a24a2a::t_21439e44f13f6e 1-2,120-127,129-153
+docs/development/RELEASING.md
+  s_09d9fb08a24a2a::t_6010fb5dd35b4a 55-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f338099b83ebe91f9f2489d82a61dcab621a86e3",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
