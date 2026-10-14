@@ -10,19 +10,34 @@ changes:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Give every governance audit record a unique event_id
       description: Each record written to the VP Audit Log and sent to Governance Audit integrations now carries event_id, a UUID v4. Receivers can use it to recognise a record delivered more than once. Records stored before this change have no event_id and still read.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Choose the audit events each Governance Audit integration receives
+      description: Governance Audit integrations carry audit_events, the audit event names they receive, accepted only with names from the audit event catalog; an update that leaves the field out keeps the current events. The integration add and edit pages show the events grouped by area, with a warning when none is selected. GET /v1/settings/audit-events lists every selectable event with its label, description and group, and Settings › VP Audit uses the same picker.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Record failed authentication, rate limits and refused requests
+      description: New audit events auth_failed (scheme and reason, never the credential), rate_limited (scope and retry delay) and request_rejected (stage, reason, HTTP status and JSON-RPC code) record requests the Access Point refused, including refusals before any surface matched, recorded against surface unknown. Fabric receive records the same refusals.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Record identity binding verification
+      description: New audit events identity_binding_verified and identity_binding_failed record whether a request's identity binding VP verified, with the agent DID, issuing gateway and, on failure, whether the presentation was absent, invalid or from an untrusted issuer.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Record the tools a tools/list filter removed
+      description: When MCP tool gating removes tools from a tools/list response, a policy_decision record with scope mcp_tool_list names the removed tools.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Skip audit records older than a set age for an integration
+      description: Governance Audit integrations accept audit_drop_after_secs. Records older than that are skipped for the integration instead of delivered, including a record still being retried, and counted in agent_gateway_audit_sink_skipped_total{reason="expired"}. An update that leaves the field out keeps it; null clears it. Without it nothing is skipped.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Report governance audit delivery metrics
+      description: New metrics agent_gateway_audit_records_produced_total{event}, agent_gateway_audit_journal_bytes, agent_gateway_audit_sink_skipped_total{sink, reason=backlog_cap|expired|corrupt}, agent_gateway_audit_records_lost_total{reason=journal_write|journal_closed|pipeline_not_running} and agent_gateway_audit_pipeline_started (alert when 0). agent_gateway_audit_forward_total gains result not_receiving.
   changed:
     - timestamp: '2026-10-13T00:00:00.000Z'
       title: Stop embedding policy decisions in minted VPs
       description: The workloadBinding of a VP minted on the Transit Point, response, outbound and Fabric paths no longer carries policyDecisions. Whether it did depended on the VP Audit Log selection, so an audit setting changed what the gateway sent to another gateway. Policy decisions are still recorded as policy_decision audit records. VPs received from older gateways that still carry policyDecisions are read as before.
-    - timestamp: '2026-10-12T00:00:00.000Z'
-      title: Store VP Audit selections as audit event names
-      description: Settings › VP Audit now saves the selected audit events as audit_events, a list of event names such as policy_decision, instead of the audit_categories booleans. The settings API takes and returns audit_events and rejects names that are not audit events. Settings saved with audit_categories are read as the matching events (policies as policy_decision, trust_checks as trust_check, identity as vp_injected), so existing selections are kept.
   fixed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Audit requests denied because a policy could not decide
       description: When a gateway, access-point inbound, surface or MCP tool policy raised an evaluation error, had no policy engine, or was enabled without a compiled policy, the request was denied without a policy decision record. These denials are now recorded with decision error and deny_reason evaluation_error, no_policy_manager or policy_not_compiled, on the direct, Fabric and MCP-proxy paths.
     - timestamp: '2026-10-12T00:00:00.000Z'
-      title: Audit trust checks failed because an A2A proxy target's agent card is unavailable
+      title: Audit trust checks that failed on an unavailable A2A proxy agent card
       description: When an A2A proxy target's agent card could not be synthesized, its target-leg trust checks failed with AGENT_CARD_UNAVAILABLE without a trust_check audit record or metric. They are now recorded like the same failure on the outbound path.
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Keep delegation audit records when a request ends before its VP is minted
@@ -31,11 +46,14 @@ changes:
       title: Send Retry-After when an Access Point rate limit refuses a request
       description: A request refused with 429 by an Access Point rate limit now carries a Retry-After header; it was never set.
     - timestamp: '2026-10-13T00:00:00.000Z'
-      title: Keep the governance audit pipeline running when its journal or cursors are damaged
+      title: Keep the audit pipeline running when its journal or cursors are damaged
       description: An unreadable line at the end of the audit journal, or an unreadable cursors.json, stopped the audit pipeline from starting, so the gateway kept serving with no audit records kept or forwarded until restarted with the file repaired. An unreadable line elsewhere in the journal stopped every sink behind it for good. On start the journal is now cut back to its last readable line and an unreadable cursors.json is renamed to cursors.json.corrupt-<unix seconds>; readers move past unreadable lines and count them in agent_gateway_audit_sink_skipped_total with reason corrupt. agent_gateway_audit_pipeline_started reports 0 when the pipeline could not start.
     - timestamp: '2026-10-14T00:00:00.000Z'
-      title: Keep audit records addressed to a Governance Audit integration while it is disabled
+      title: Keep audit records for a Governance Audit integration while it is disabled
       description: Records addressed to a Governance Audit integration that was disabled, given a tenant or moved to another category were passed over as delivered until its delivery stopped, so they were never sent when it was re-enabled. The integration now refuses them, they wait in the journal, and it receives them once re-enabled. Each refusal is counted in agent_gateway_audit_forward_total with result not_receiving rather than failed.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Record x402 settlements that fail immediately
+      description: An immediate x402 settlement that returned an error without marking itself failed left the transaction without a settlement failure. It is now marked failed and recorded once as a failed payment event.
   removed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Remove the unused Pre-Authorize Blocked governance audit event
@@ -57,28 +75,31 @@ changes:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Deliver governance audit records at least once from a durable journal
       description: Audit records are journalled to disk before any destination receives them, and each destination reads the journal from its own position, so a slow or unreachable integration falls behind instead of losing records, and delivery resumes after a restart. A record may be delivered more than once; deduplicate on event_id. Integrations no longer depend on the VP Audit Log keeping a record. The journal lives in the audit log directory under journal/. A record no destination selects is not built at all, so unselected events cost nothing, including the signed VP a consent-granted record may carry.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Store VP Audit selections as audit_events instead of audit_categories
+      description: The settings API takes and returns audit_events, a list of event names such as policy_decision, and rejects names that are not audit events. A request that still sends audit_categories gets 200 and the field is ignored; send audit_events instead. Settings stored with audit_categories are read as the matching events (policies as policy_decision, trust_checks as trust_check, identity as vp_injected), so existing selections are kept.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Remove the dropped result from agent_gateway_audit_forward_total
+      description: Records are no longer dropped from a full forwarding queue, so agent_gateway_audit_forward_total no longer reports result dropped, and integration_id is never empty. Alert rules on result dropped never fire; alert on agent_gateway_audit_sink_skipped_total and agent_gateway_audit_records_lost_total instead.
   internal:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Move the governance audit event catalog into its own module with groups
       description: The list of governance audit events now lives in the audit module and gives each event a group (policies, trust, identity, trace, delegation, payments). The Governance Audit integration category lists the group with each event type, so the dashboard can show events grouped.
     - timestamp: '2026-10-12T00:00:00.000Z'
-      title: Define the authentication, identity binding and request audit event types
-      description: Adds the auth_failed, rate_limited, request_rejected, identity_binding_failed, identity_binding_verified, delegation_failed, request_failed and request_completed audit records and lists them in the catalog under the auth, identity, delegation and requests groups. Nothing produces them yet.
+      title: Define the delegation_failed, request_failed and request_completed record types
+      description: The record types exist with their stored form, but nothing produces them, so the catalog does not offer them for selection.
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Add the audit sink registry
       description: Each audit destination (the VP Audit Log and each Governance Audit integration) is a sink with its own set of selected events. The registry keeps, per event, the sinks that selected it, and the union of all selections as an atomic so the request path can check whether any sink wants an event without taking a lock.
     - timestamp: '2026-10-12T00:00:00.000Z'
-      title: Let each Governance Audit integration store the audit events it selects
-      description: Integrations carry audit_events, a list of audit event names, accepted only on Governance Audit integrations and only with names from the audit event catalog. An update that omits the field keeps an audit integration's current events. The sink registry is rebuilt at startup and whenever settings or integrations change.
+      title: Rebuild the audit sinks when settings or integrations change
+      description: The sink registry is rebuilt at startup and whenever settings or integrations are saved or deleted.
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Add the durable audit journal
       description: Produced audit records are appended to journal segment files by a dedicated writer thread that batches them (up to 256 records or 5 ms), syncs them to disk and only then publishes them as durable. On restart the journal continues its sequence and cuts off a partial last line left by a crash. When the journal cannot be written, the writer retries with backoff and keeps up to 10,000 records waiting; beyond that the oldest are discarded and counted in agent_gateway_audit_records_lost_total{reason="journal_write"}. Handing a record to the journal never waits.
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Deliver journalled audit records to each sink from its own cursor
       description: A dispatcher runs one reader per audit sink. Each reader delivers the durable journal entries addressed to its sink in order, retries a failed delivery with backoff without moving past it, and saves its cursor after each batch so it resumes there after a restart. A new sink reads from the start of the journal, which misses nothing since no record is addressed to a sink before it exists. A removed sink's cursor is parked, so it no longer holds back pruning, and a sink that comes back resumes where it stopped. Journal segments every cursor has passed are deleted. The journal's size is reported in agent_gateway_audit_journal_bytes and logged as a warning above 256 MiB; above 1 GiB every sink still in the oldest segment is moved past it so it can be deleted, and the records each skips are counted in agent_gateway_audit_sink_skipped_total{reason="backlog_cap"}.
-    - timestamp: '2026-10-12T00:00:00.000Z'
-      title: Let a Governance Audit integration skip records older than a set age
-      description: Governance Audit integrations accept audit_drop_after_secs. Records older than that are skipped for the integration instead of delivered, including a record still being retried, and counted in agent_gateway_audit_sink_skipped_total{reason="expired"}. An update that leaves the field out keeps it; null clears it. Without it nothing is skipped.
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Add the VP Audit Log sink
       description: The VP Audit Log becomes a sink that appends delivered records to delegation-audit.jsonl in the existing format and syncs the file once per batch before the dispatcher saves its cursor; a failed sync makes the batch be read again. It remembers the event ids at the end of the log and those it has written, so a record delivered again is not written twice.
