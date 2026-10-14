@@ -260,7 +260,11 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   is parked, and the sink resumes from it if it comes back. An integration that is disabled, or
   changed so it no longer receives audit records, refuses records until its reader is stopped,
   so nothing addressed to it is passed over; each refusal is counted with
-  `result="not_receiving"`.
+  `result="not_receiving"`. The sinks are rebuilt from the settings and integrations one rebuild
+  at a time, so an older rebuild never replaces newer sinks. When the integrations cannot be
+  listed the previous sinks are kept, the failure is counted in
+  `agent_gateway_audit_sink_rebuild_failed_total`, and the rebuild is retried every 5 s until it
+  succeeds.
 - *Backlog.* Journal segments every active cursor has passed are deleted. The journal size is
   reported in `agent_gateway_audit_journal_bytes` and logged as a warning above 256 MiB. Above
   1 GiB, every sink still in the oldest segment is moved past it so the segment can be deleted;

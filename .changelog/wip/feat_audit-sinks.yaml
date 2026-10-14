@@ -40,6 +40,9 @@ changes:
       title: Run the governance audit pipeline only on the Active node
       description: A Standby node also started the audit pipeline, so in a failover pair sharing storage both nodes could open the same journal, write records with the same sequence numbers and overwrite each other's cursors, and a promoted node continued from a stale position. Only the Active node now runs the pipeline. Stepping down journals what was handed over, stops delivery and releases the journal; becoming Active re-opens the journal and cursors from disk and continues after the last record. The journal holds an exclusive lock, so a second writer cannot open it, and a node that becomes Active while another still holds it tries again every 5 s. agent_gateway_audit_pipeline_started is 0 on a Standby node.
     - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Retry rebuilding the audit sinks when integrations cannot be listed
+      description: When the integrations could not be listed, the previous audit sinks were kept until the next settings or integration change, so a just-disabled integration could keep receiving records. The rebuild is now retried every 5 s until it succeeds and each failure is counted in agent_gateway_audit_sink_rebuild_failed_total. Rebuilds also run one at a time, so a slower rebuild can no longer replace newer sinks.
+    - timestamp: '2026-10-14T00:00:00.000Z'
       title: Re-read the audit journal after a failed append that could not be undone
       description: When appending to the audit journal failed and the partial batch could not be cut off again, the next batch was written after the partial line. The segment is now re-read before the next append, as on start, so no partial line is left behind and no sequence number is reused.
   removed:

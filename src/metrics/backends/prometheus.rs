@@ -409,6 +409,18 @@ lazy_static! {
         gauge
     };
 
+    /// Governance audit sink rebuilds that could not list the integrations and
+    /// kept the previous sinks until a retry succeeds.
+    pub static ref AUDIT_SINK_REBUILD_FAILED: IntCounter = {
+        let opts = Opts::new(
+            names::AUDIT_SINK_REBUILD_FAILED_TOTAL,
+            "Governance audit sink rebuilds that failed to list integrations, keeping the previous sinks until a retry succeeds",
+        );
+        let counter = IntCounter::with_opts(opts).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// Consent epoch reads that failed, each closing every MCP subscription on the vault.
     pub static ref MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE: IntCounter = {
         let opts = Opts::new(
@@ -783,6 +795,10 @@ pub fn set_audit_pipeline_started(started: bool) {
     AUDIT_PIPELINE_STARTED.set(i64::from(started));
 }
 
+pub fn track_audit_sink_rebuild_failed() {
+    AUDIT_SINK_REBUILD_FAILED.inc();
+}
+
 pub fn track_audit_sink_skipped(
     sink: &str,
     reason: &str,
@@ -842,8 +858,9 @@ pub fn set_active_users(count: i64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, get_metrics, names, set_audit_pipeline_started,
-        track_a2a_protocol_version, track_fabric_forward_received,
+        A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, AUDIT_SINK_REBUILD_FAILED, get_metrics, names,
+        set_audit_pipeline_started, track_a2a_protocol_version, track_audit_sink_rebuild_failed,
+        track_fabric_forward_received,
     };
 
     #[test]
@@ -854,6 +871,15 @@ mod tests {
         set_audit_pipeline_started(true);
         assert_eq!(AUDIT_PIPELINE_STARTED.get(), 1);
         assert!(get_metrics().contains("agent_gateway_audit_pipeline_started 1"));
+    }
+
+    #[test]
+    fn a_failed_audit_sink_rebuild_is_counted() {
+        assert_eq!(names::AUDIT_SINK_REBUILD_FAILED_TOTAL, "agent_gateway_audit_sink_rebuild_failed_total");
+        let before = AUDIT_SINK_REBUILD_FAILED.get();
+        track_audit_sink_rebuild_failed();
+        assert!(AUDIT_SINK_REBUILD_FAILED.get() > before);
+        assert!(get_metrics().contains("agent_gateway_audit_sink_rebuild_failed_total"));
     }
 
     #[test]

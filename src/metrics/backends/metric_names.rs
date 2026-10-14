@@ -71,6 +71,8 @@ pub mod prom {
     pub const AUDIT_SINK_SKIPPED_TOTAL: &str = "agent_gateway_audit_sink_skipped_total";
     // Whether the governance audit pipeline is running (1) or not (0: failed to start, or the node is in Standby).
     pub const AUDIT_PIPELINE_STARTED: &str = "agent_gateway_audit_pipeline_started";
+    // Governance audit sink rebuilds that failed to list integrations, keeping the previous sinks.
+    pub const AUDIT_SINK_REBUILD_FAILED_TOTAL: &str = "agent_gateway_audit_sink_rebuild_failed_total";
 
     // Consent epoch reads that failed, each closing every MCP subscription on the vault.
     pub const MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE_TOTAL: &str = "agent_gateway_mcp_subscription_epoch_unavailable_total";
