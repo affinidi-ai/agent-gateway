@@ -683,7 +683,7 @@ clean-e2e: ## Remove leftover g2g_bdd mediator containers + networks + temp dirs
 	@rm -rf tmp/g2g-* 2>/dev/null || true
 	@echo "$(GREEN)✅ BDD test containers cleaned!$(NC)"
 
-# Needs Node >= 20.18.1, git and openssl; the first run fetches the pinned suite
+# Needs Node >= 22, git and openssl; the first run fetches the pinned suite
 # and reference server. ARGS passes options through, e.g. ARGS="--unit-tests" or
 # ARGS="--only access-point,legacy". See scripts/mcp-conformance/README.md.
 mcp-conformance: ## Run the MCP 2026-07-28 conformance harness (ARGS="--unit-tests" etc.)
