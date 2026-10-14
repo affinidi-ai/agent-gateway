@@ -333,9 +333,7 @@ mod tests {
     }
 
     fn modern_context(request: &JsonValue) -> McpMetadataContext {
-        use crate::mcp::request_validation::{
-            LegacySessionEvidence, McpRequestClassification, McpVersionPolicy, validate_mcp_post,
-        };
+        use crate::mcp::request_validation::{LegacySessionEvidence, McpRequestClassification, validate_mcp_post};
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "mcp-protocol-version",
@@ -349,10 +347,7 @@ mod tests {
             &headers,
             &serde_json::to_vec(request).unwrap(),
             LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-            ),
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )
         .unwrap();
         assert!(matches!(classification, McpRequestClassification::Modern(_)));

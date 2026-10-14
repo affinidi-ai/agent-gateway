@@ -9,11 +9,10 @@ use crate::bdd_support::debug::log_to_file;
 use crate::bdd_support::gateway_process::{GatewayProcess, SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN};
 use crate::bdd_support::http::collect_headers;
 use crate::bdd_support::json_rpc::{
-    MODERN_MCP_PROTOCOL_VERSION, build_a2a_message_send_body, build_mcp_agent_identity_payload,
-    build_mcp_initialize_body, build_mcp_initialized_notification_body, build_mcp_list_tools_body_with_id,
-    build_mcp_request_without_method_body, build_mcp_schema_invalid_agent_identity_tool_call_body,
-    build_mcp_tool_call_body, build_mcp_tool_call_with_meta, build_mcp_tool_call_without_meta,
-    build_modern_mcp_list_tools_body, modern_mcp_request_headers,
+    McpVersion, build_a2a_message_send_body, build_mcp_agent_identity_payload, build_mcp_initialize_body,
+    build_mcp_initialized_notification_body, build_mcp_list_tools_body_with_id, build_mcp_request_without_method_body,
+    build_mcp_schema_invalid_agent_identity_tool_call_body, build_mcp_tool_call_body, build_mcp_tool_call_with_meta,
+    build_mcp_tool_call_without_meta, build_modern_mcp_list_tools_body, modern_mcp_request_headers,
 };
 use crate::bdd_support::jwt::{self, JwksServer};
 use crate::bdd_support::mock_server::MockServer;
@@ -1114,9 +1113,12 @@ async fn caller_sends_a2a_message_send_with_text_and_header(
     send_a2a_proxy_request_and_record(world, body, vec![(header_name, header_value)]).await;
 }
 
-async fn send_legacy_sse_tool_call_and_record(
+/// Sends `bodies` over one Legacy SSE session and records what the caller
+/// saw: the session's status and event-stream headers, the last reply as the
+/// response body, and every reply in order.
+async fn send_over_legacy_sse_session_and_record(
     world: &mut SurfaceWorld,
-    body: serde_json::Value,
+    bodies: Vec<serde_json::Value>,
 ) {
     ensure_gateway_running(world).await;
 
@@ -1127,17 +1129,28 @@ async fn send_legacy_sse_tool_call_and_record(
         .route
         .clone();
 
-    world.sent_body = Some(body.clone());
+    world.sent_body = bodies.last().cloned();
 
-    let parsed = crate::bdd_support::sse_client::legacy_sse_tool_call(&gateway_base, &route, &body)
+    let exchange = crate::bdd_support::sse_client::legacy_sse_session(&gateway_base, &route, &bodies)
         .await
-        .expect("legacy SSE tool call should produce a parsed JSON-RPC payload");
+        .unwrap_or_else(|error| panic!("the caller could not reach the gateway over Legacy SSE: {error:#}"));
+    if let Some(error) = &exchange.stream_error {
+        eprintln!("Legacy SSE stream ended early: {error}");
+    }
 
     world.caller_response = Some(RecordedResponse {
-        status: 200,
-        headers: std::collections::HashMap::new(),
-        body: parsed,
+        status: exchange.status(),
+        headers: exchange
+            .stream_headers
+            .clone(),
+        body: exchange
+            .replies
+            .last()
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
     });
+    world.sse_endpoint_path = exchange.endpoint_path;
+    world.sse_responses = exchange.replies;
 
     record_mock_observation(world).await;
     record_replacement_mock_observation(world).await;
@@ -1381,34 +1394,51 @@ async fn read_audit_log_as_operator(
 }
 
 pub(crate) async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
+    record_delegation_audit_trail(world).await;
+    let response = world
+        .delegation_audit_trail
+        .clone()
+        .expect("the delegation audit trail was just recorded");
+    record_admin_response(world, response);
+}
+
+/// Records the delegation audit trail alongside the caller's observations.
+/// Audit events may be written after the gateway answers, and earlier steps
+/// may already have written some, so the read is retried briefly until the
+/// trail has events and two reads in a row agree on how many.
+async fn record_delegation_audit_trail(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
 
     let client = world
         .admin_client
         .as_ref()
         .expect("admin client must exist");
+    let event_count = |response: &RecordedResponse| {
+        response
+            .body
+            .get("events")
+            .and_then(|events| events.as_array())
+            .map_or(0, Vec::len)
+    };
     let mut response = client
         .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/delegation-audit?page_size=100", None)
         .await
         .expect("read delegation audit trail through admin API");
 
     for _ in 0..10 {
-        let has_events = response
-            .body
-            .get("events")
-            .and_then(|events| events.as_array())
-            .is_some_and(|events| !events.is_empty());
-        if has_events {
-            break;
-        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        response = client
+        let next = client
             .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/delegation-audit?page_size=100", None)
             .await
             .expect("read delegation audit trail through admin API");
+        let settled = event_count(&next) > 0 && event_count(&next) == event_count(&response);
+        response = next;
+        if settled {
+            break;
+        }
     }
 
-    record_admin_response(world, response);
+    world.delegation_audit_trail = Some(response);
 }
 
 #[when("the operator reads the surface through the admin API")]
@@ -1918,6 +1948,7 @@ async fn caller_asks_mcp_surface_using_protocol_version(
     world: &mut SurfaceWorld,
     protocol_version: String,
 ) {
+    let protocol_version = McpVersion::from(protocol_version.as_str());
     let body = build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), &protocol_version, true);
     send_json_request_and_record(world, body, modern_mcp_request_headers(&protocol_version, "tools/list")).await;
 }
@@ -1929,6 +1960,7 @@ async fn caller_asks_mcp_surface_without_modern_capabilities(
     world: &mut SurfaceWorld,
     protocol_version: String,
 ) {
+    let protocol_version = McpVersion::from(protocol_version.as_str());
     let body = build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), &protocol_version, false);
     send_json_request_and_record(world, body, modern_mcp_request_headers(&protocol_version, "tools/list")).await;
 }
@@ -1938,14 +1970,8 @@ async fn caller_sends_modern_mcp_list_with_mirrored_method(
     world: &mut SurfaceWorld,
     mirrored_method: String,
 ) {
-    let body =
-        build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), MODERN_MCP_PROTOCOL_VERSION, true);
-    send_json_request_and_record(
-        world,
-        body,
-        modern_mcp_request_headers(MODERN_MCP_PROTOCOL_VERSION, &mirrored_method),
-    )
-    .await;
+    let body = build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), &McpVersion::Modern, true);
+    send_json_request_and_record(world, body, modern_mcp_request_headers(&McpVersion::Modern, &mirrored_method)).await;
 }
 
 async fn send_mcp_request_through_transit_point(
@@ -2308,7 +2334,7 @@ async fn mcp_tool_call_with_city_argument_over_legacy_sse(
     city: String,
 ) {
     let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
-    send_legacy_sse_tool_call_and_record(world, body).await;
+    send_over_legacy_sse_session_and_record(world, vec![body]).await;
 }
 
 #[when(expr = "the caller invokes the MCP tool {string} for city {string} over Streamable HTTP")]
@@ -2323,61 +2349,13 @@ async fn mcp_tool_call_with_city_argument_over_streamable_http(
 
 #[when("the caller connects to the Legacy SSE endpoint")]
 async fn caller_connects_to_legacy_sse_endpoint(world: &mut SurfaceWorld) {
-    ensure_gateway_running(world).await;
-
-    let infra = world.infra.as_ref().unwrap();
-    let gateway_base = format!("http://127.0.0.1:{}", infra.gateway_port);
-    let route = world
-        .surface_config
-        .route
-        .clone();
-
-    let (_, endpoint_path, content_type) =
-        crate::bdd_support::sse_client::open_legacy_sse_connection(&gateway_base, &route)
-            .await
-            .expect("Legacy SSE connection should succeed");
-
-    world.sse_endpoint_path = Some(endpoint_path);
-    world.caller_response = Some(RecordedResponse {
-        status: 200,
-        headers: {
-            let mut h = std::collections::HashMap::new();
-            h.insert("content-type".to_string(), content_type);
-            h
-        },
-        body: serde_json::Value::Null,
-    });
+    send_over_legacy_sse_session_and_record(world, Vec::new()).await;
 }
 
 #[when(expr = "the caller sends two MCP tool calls over Legacy SSE on the same session")]
 async fn caller_sends_two_mcp_tool_calls_over_legacy_sse(world: &mut SurfaceWorld) {
-    ensure_gateway_running(world).await;
-
-    let infra = world.infra.as_ref().unwrap();
-    let gateway_base = format!("http://127.0.0.1:{}", infra.gateway_port);
-    let route = world
-        .surface_config
-        .route
-        .clone();
-
     let body = build_mcp_tool_call_body("get_weather", serde_json::json!({ "city": "Paris" }));
-    world.sent_body = Some(body.clone());
-
-    let responses = crate::bdd_support::sse_client::legacy_sse_multi_call(&gateway_base, &route, &body, 2)
-        .await
-        .expect("Legacy SSE multi-call should produce 2 replies");
-
-    world.sse_responses = responses.clone();
-    if let Some(last) = responses.into_iter().last() {
-        world.caller_response = Some(RecordedResponse {
-            status: 200,
-            headers: std::collections::HashMap::new(),
-            body: last,
-        });
-    }
-
-    record_mock_observation(world).await;
-    record_replacement_mock_observation(world).await;
+    send_over_legacy_sse_session_and_record(world, vec![body.clone(), body]).await;
 }
 
 #[when("the caller sends an MCP initialize request over Streamable HTTP")]
@@ -2418,6 +2396,14 @@ async fn mcp_tools_call_sent_to_surface_with_args(
 }
 
 #[when(expr = "OAuth provider {string} redirects the caller back with a valid authorization code")]
+async fn oauth_provider_redirects_back_with_valid_code_and_audit_recorded(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    oauth_provider_redirects_back_with_valid_code(world, provider).await;
+    record_delegation_audit_trail(world).await;
+}
+
 pub(crate) async fn oauth_provider_redirects_back_with_valid_code(
     world: &mut SurfaceWorld,
     provider: String,
@@ -2678,24 +2664,28 @@ async fn concurrent_requests_sent_to_surface(
         })
         .collect();
 
+    let mut statuses = Vec::with_capacity(count);
     for handle in handles {
-        handle
-            .await
-            .expect("task panicked");
+        statuses.push(
+            handle
+                .await
+                .expect("task panicked"),
+        );
     }
 
-    // Record the last observation so world state is populated for then steps.
-    let observations = {
-        let infra = world.infra.as_ref().unwrap();
-        read_mock_observation(&infra.mock).await
-    };
-    world.record_primary_observations(observations);
-    // Store a placeholder caller_response so the world is not empty.
-    world.caller_response = Some(RecordedResponse {
-        status: 200,
-        headers: Default::default(),
-        body: serde_json::Value::Null,
-    });
+    record_mock_observation(world).await;
+    // The caller response carries the first status that is not 200, so a
+    // status assertion fails if any concurrent caller was refused.
+    world.caller_response = statuses
+        .iter()
+        .copied()
+        .find(|status| *status != 200)
+        .or_else(|| statuses.first().copied())
+        .map(|status| RecordedResponse {
+            status,
+            headers: Default::default(),
+            body: serde_json::Value::Null,
+        });
 }
 
 fn build_mcp_tool_call_with_valid_identity(tool_name: &str) -> serde_json::Value {
@@ -2869,6 +2859,15 @@ async fn mcp_tool_call_without_identity(
 }
 
 #[when(expr = "caller {string} invokes MCP tool {string} with a valid token")]
+async fn caller_invokes_mcp_tool_with_valid_token_and_audit_recorded(
+    world: &mut SurfaceWorld,
+    caller: String,
+    tool_name: String,
+) {
+    caller_invokes_mcp_tool_with_valid_token(world, caller, tool_name).await;
+    record_delegation_audit_trail(world).await;
+}
+
 pub(crate) async fn caller_invokes_mcp_tool_with_valid_token(
     world: &mut SurfaceWorld,
     caller: String,
@@ -2881,6 +2880,15 @@ pub(crate) async fn caller_invokes_mcp_tool_with_valid_token(
 }
 
 #[when(expr = "caller {string} invokes MCP tool {string} with a valid token and a valid inbound identity payload")]
+async fn caller_invokes_mcp_tool_with_valid_token_and_identity_and_audit_recorded(
+    world: &mut SurfaceWorld,
+    caller: String,
+    tool_name: String,
+) {
+    caller_invokes_mcp_tool_with_valid_token_and_identity(world, caller, tool_name).await;
+    record_delegation_audit_trail(world).await;
+}
+
 pub(crate) async fn caller_invokes_mcp_tool_with_valid_token_and_identity(
     world: &mut SurfaceWorld,
     caller: String,
@@ -3042,19 +3050,10 @@ async fn mcp_malformed_request_sent(world: &mut SurfaceWorld) {
 #[when("the caller sends a batch of modern MCP tool catalog requests")]
 async fn mcp_modern_batch_sent(world: &mut SurfaceWorld) {
     let batch = serde_json::Value::Array(vec![
-        build_modern_mcp_list_tools_body(
-            serde_json::json!("modern-mcp-batch-first"),
-            MODERN_MCP_PROTOCOL_VERSION,
-            true,
-        ),
-        build_modern_mcp_list_tools_body(
-            serde_json::json!("modern-mcp-batch-second"),
-            MODERN_MCP_PROTOCOL_VERSION,
-            true,
-        ),
+        build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-batch-first"), &McpVersion::Modern, true),
+        build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-batch-second"), &McpVersion::Modern, true),
     ]);
-    send_json_request_and_record(world, batch, modern_mcp_request_headers(MODERN_MCP_PROTOCOL_VERSION, "tools/list"))
-        .await;
+    send_json_request_and_record(world, batch, modern_mcp_request_headers(&McpVersion::Modern, "tools/list")).await;
 }
 
 #[when(expr = "the caller asks the MCP surface for available tools with header {string} set to {string}")]
@@ -3286,12 +3285,82 @@ async fn request_sent_to_surface_path_in_gateway(
     record_caller_response(world, response);
 }
 
-/// Sends a modern `tools/call`. A streaming upstream keeps its response open,
-/// so the response is kept for later steps to read instead of being drained.
+/// Reads the next JSON-RPC message from the open MCP response stream,
+/// skipping SSE comments. `Ok(None)` means the stream ended; `Err` means
+/// nothing new arrived within `wait` or the stream failed.
+async fn next_mcp_stream_message(
+    world: &mut SurfaceWorld,
+    wait: std::time::Duration,
+) -> Result<Option<serde_json::Value>, ()> {
+    loop {
+        if let Some(end) = world
+            .mcp_stream_buffer
+            .find("\n\n")
+        {
+            let event: String = world
+                .mcp_stream_buffer
+                .drain(..end + 2)
+                .collect();
+            let data: Vec<&str> = event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect();
+            if data.is_empty() {
+                continue;
+            }
+            let data = data.join("\n");
+            return Ok(Some(serde_json::from_str(&data).unwrap_or(serde_json::Value::String(data))));
+        }
+        let Some(stream) = world.mcp_stream.as_mut() else {
+            return Ok(None);
+        };
+        match tokio::time::timeout(wait, stream.chunk()).await {
+            Ok(Ok(Some(chunk))) => world
+                .mcp_stream_buffer
+                .push_str(&String::from_utf8_lossy(&chunk)),
+            Ok(Ok(None)) => return Ok(None),
+            Ok(Err(_)) | Err(_) => return Err(()),
+        }
+    }
+}
+
+/// Reads a streamed tool call to its end the way a caller does: the first
+/// message, then, once the MCP server is let finish the tool, the final
+/// response and the end of the stream.
+async fn read_progress_then_final_response(world: &mut SurfaceWorld) {
+    let wait = std::time::Duration::from_secs(10);
+    let progress = next_mcp_stream_message(world, wait)
+        .await
+        .ok()
+        .flatten();
+    let mock = &world
+        .infra
+        .as_ref()
+        .expect("scenario infrastructure")
+        .mock;
+    world.mcp_progress_before_completion = progress.is_some() && !mock.stream_completed().await;
+    world.mcp_stream_progress = progress;
+    mock.release_stream().await;
+    if let Ok(Some(complete)) = next_mcp_stream_message(world, wait).await {
+        world
+            .caller_response
+            .as_mut()
+            .expect("caller response")
+            .body = complete;
+        world.mcp_stream_closed_after_final =
+            matches!(next_mcp_stream_message(world, std::time::Duration::from_secs(5)).await, Ok(None));
+    }
+    world.mcp_stream = None;
+    record_mock_observation(world).await;
+}
+
+/// Sends a modern `tools/call`. A tool that reports progress is read to its
+/// end; a quiet tool's response stays open for the caller to close.
 pub(crate) async fn send_modern_mcp_tool_call(
     world: &mut SurfaceWorld,
     tool_name: &str,
-    protocol_version: &str,
+    protocol_version: &McpVersion,
     extra_headers: Vec<(String, String)>,
 ) {
     use crate::bdd_support::mock_server::MockStream;
@@ -3304,14 +3373,11 @@ pub(crate) async fn send_modern_mcp_tool_call(
     let mut headers = modern_mcp_request_headers(protocol_version, "tools/call");
     headers.push(("Mcp-Name".to_string(), tool_name.to_string()));
     headers.extend(extra_headers);
-    let streaming = matches!(
-        world
-            .collaborator_target(PRIMARY_COLLABORATOR_KEY)
-            .configured_response
-            .stream,
-        MockStream::ProgressThenRelease | MockStream::Quiet
-    );
-    if !streaming {
+    let stream = world
+        .collaborator_target(PRIMARY_COLLABORATOR_KEY)
+        .configured_response
+        .stream;
+    if !matches!(stream, MockStream::ProgressThenRelease | MockStream::Quiet) {
         send_json_request_and_record(world, body, headers).await;
         return;
     }
@@ -3346,7 +3412,12 @@ pub(crate) async fn send_modern_mcp_tool_call(
     world
         .mcp_stream_buffer
         .clear();
+    world.mcp_stream_progress = None;
+    world.mcp_progress_before_completion = false;
     world.mcp_stream_closed_after_final = false;
+    if stream == MockStream::ProgressThenRelease {
+        read_progress_then_final_response(world).await;
+    }
 }
 
 #[when(expr = "the caller invokes MCP tool {string} using protocol version {string} without a protocol session")]
@@ -3355,7 +3426,7 @@ async fn caller_invokes_modern_mcp_tool(
     tool_name: String,
     protocol_version: String,
 ) {
-    send_modern_mcp_tool_call(world, &tool_name, &protocol_version, Vec::new()).await;
+    send_modern_mcp_tool_call(world, &tool_name, &McpVersion::from(protocol_version.as_str()), Vec::new()).await;
 }
 
 #[when(expr = "the caller invokes MCP tool {string} using protocol version {string} with Origin {string}")]
@@ -3365,12 +3436,20 @@ async fn caller_invokes_modern_mcp_tool_with_origin(
     protocol_version: String,
     origin: String,
 ) {
-    send_modern_mcp_tool_call(world, &tool_name, &protocol_version, vec![("Origin".to_string(), origin)]).await;
+    send_modern_mcp_tool_call(
+        world,
+        &tool_name,
+        &McpVersion::from(protocol_version.as_str()),
+        vec![("Origin".to_string(), origin)],
+    )
+    .await;
 }
 
 #[when("the caller closes the MCP response stream")]
 fn caller_closes_mcp_response_stream(world: &mut SurfaceWorld) {
-    let stream = world.mcp_stream.take();
-    assert!(stream.is_some(), "no open MCP response stream to close");
+    let stream = world
+        .mcp_stream
+        .take()
+        .expect("setup failed: the caller has no open MCP response stream to close");
     drop(stream);
 }

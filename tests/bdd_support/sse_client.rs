@@ -3,6 +3,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -64,116 +65,45 @@ pub async fn read_named_event(
     }
 }
 
-/// Open a Legacy-SSE connection to the gateway and return the SSE stream,
-/// the per-session POST URL path (from the `endpoint` event), and the
-/// response `Content-Type` header value.
-///
-/// The caller is responsible for driving the stream further (POSTing
-/// requests and reading `message` events).
-pub async fn open_legacy_sse_connection(
-    gateway_base: &str,
-    route: &str,
-) -> Result<(BoxStream<'static, reqwest::Result<Bytes>>, String, String)> {
-    let client = reqwest::Client::new();
-    let sse_url = format!("{gateway_base}{route}/sse");
-    let sse_resp = client
-        .get(&sse_url)
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .with_context(|| format!("GET {sse_url} failed"))?;
-    if !sse_resp.status().is_success() {
-        return Err(anyhow!("SSE handshake returned non-2xx: {}", sse_resp.status()));
-    }
-    let content_type = sse_resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let mut stream: BoxStream<'static, _> = sse_resp
-        .bytes_stream()
-        .boxed();
-    let mut buf = String::new();
-    let endpoint_path = read_named_event(&mut stream, &mut buf, "endpoint")
-        .await
-        .context("waiting for SSE endpoint event")?;
-    Ok((stream, endpoint_path, content_type))
+/// What a caller observed over one Legacy SSE session. The exchange stops at
+/// the first step the gateway does not complete, so later fields stay empty.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LegacySseExchange {
+    /// Status of the event stream (`GET {route}/sse`).
+    pub stream_status: u16,
+    pub stream_headers: HashMap<String, String>,
+    /// The session message URL path announced by the `endpoint` event.
+    pub endpoint_path: Option<String>,
+    /// Status of each session POST, in order.
+    pub post_statuses: Vec<u16>,
+    /// The `message` event reply to each accepted POST, in order. A reply that
+    /// is not JSON is kept as a JSON string.
+    pub replies: Vec<Value>,
+    /// Why the event stream ended before the expected event, if it did.
+    pub stream_error: Option<String>,
 }
 
-/// Drive a full Legacy-SSE MCP tool-call exchange against the gateway:
-///
-/// 1. `GET {gateway_base}{route}/sse` → read the `endpoint` event to
-///    discover the per-session POST URL.
-/// 2. `POST {gateway_base}{endpoint_path}` with `body` → expect `202`.
-/// 3. Wait for the `message` event on the SSE stream and return its
-///    parsed JSON-RPC payload.
-pub async fn legacy_sse_tool_call(
-    gateway_base: &str,
-    route: &str,
-    body: &Value,
-) -> Result<Value> {
-    let client = reqwest::Client::new();
-
-    let sse_url = format!("{gateway_base}{route}/sse");
-    let sse_resp = client
-        .get(&sse_url)
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .with_context(|| format!("GET {sse_url} failed"))?;
-    if !sse_resp.status().is_success() {
-        return Err(anyhow!("SSE handshake returned non-2xx: {}", sse_resp.status()));
+impl LegacySseExchange {
+    /// The status the caller saw: the first refused session POST, otherwise
+    /// the event stream's.
+    pub fn status(&self) -> u16 {
+        self.post_statuses
+            .iter()
+            .copied()
+            .find(|status| *status != reqwest::StatusCode::ACCEPTED.as_u16())
+            .unwrap_or(self.stream_status)
     }
-    let mut stream: BoxStream<'_, _> = sse_resp
-        .bytes_stream()
-        .boxed();
-    let mut buf = String::new();
-
-    let endpoint_path = read_named_event(&mut stream, &mut buf, "endpoint")
-        .await
-        .context("waiting for SSE endpoint event")?;
-
-    let post_url = format!("{gateway_base}{endpoint_path}");
-    let post_resp = client
-        .post(&post_url)
-        .header("content-type", "application/json")
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("POST {post_url} failed"))?;
-    let post_status = post_resp.status();
-    if post_status != reqwest::StatusCode::ACCEPTED {
-        return Err(anyhow!("Legacy SSE session POST returned {} (expected 202 Accepted)", post_status));
-    }
-
-    let message_data = read_named_event(&mut stream, &mut buf, "message")
-        .await
-        .context("waiting for SSE message event")?;
-
-    serde_json::from_str(&message_data).with_context(|| format!("SSE message data is not valid JSON: {message_data}"))
 }
 
-/// Open one Legacy-SSE session and send `count` identical JSON-RPC requests
-/// over it, collecting a parsed `message` event reply for each one.
-/// Each POST must return `202 Accepted`.
-pub async fn legacy_sse_multi_call(
-    gateway_base: &str,
-    route: &str,
-    body: &Value,
-    count: usize,
-) -> Result<Vec<Value>> {
-    legacy_sse_session_calls(gateway_base, route, &vec![body.clone(); count]).await
-}
-
-/// Open one Legacy-SSE session and send each of `bodies` over it in order,
-/// collecting a parsed `message` event reply for each one. Each POST must
-/// return `202 Accepted`.
-pub async fn legacy_sse_session_calls(
+/// Open one Legacy SSE session (`GET {route}/sse`), then POST each of
+/// `bodies` in order to the session URL from the `endpoint` event, reading
+/// the `message` event that answers each. Only transport failures are errors;
+/// everything the gateway answered is recorded in the exchange.
+pub async fn legacy_sse_session(
     gateway_base: &str,
     route: &str,
     bodies: &[Value],
-) -> Result<Vec<Value>> {
+) -> Result<LegacySseExchange> {
     let client = reqwest::Client::new();
     let sse_url = format!("{gateway_base}{route}/sse");
     let sse_resp = client
@@ -182,20 +112,27 @@ pub async fn legacy_sse_session_calls(
         .send()
         .await
         .with_context(|| format!("GET {sse_url} failed"))?;
+    let mut exchange = LegacySseExchange {
+        stream_status: sse_resp.status().as_u16(),
+        stream_headers: crate::bdd_support::http::collect_headers(sse_resp.headers()),
+        ..LegacySseExchange::default()
+    };
     if !sse_resp.status().is_success() {
-        return Err(anyhow!("SSE handshake returned non-2xx: {}", sse_resp.status()));
+        return Ok(exchange);
     }
     let mut stream: BoxStream<'static, _> = sse_resp
         .bytes_stream()
         .boxed();
     let mut buf = String::new();
-
-    let endpoint_path = read_named_event(&mut stream, &mut buf, "endpoint")
-        .await
-        .context("waiting for SSE endpoint event")?;
-
+    let endpoint_path = match read_named_event(&mut stream, &mut buf, "endpoint").await {
+        Ok(path) => path,
+        Err(error) => {
+            exchange.stream_error = Some(error.to_string());
+            return Ok(exchange);
+        }
+    };
     let post_url = format!("{gateway_base}{endpoint_path}");
-    let mut results = Vec::with_capacity(bodies.len());
+    exchange.endpoint_path = Some(endpoint_path);
 
     for (i, body) in bodies.iter().enumerate() {
         let post_resp = client
@@ -206,18 +143,25 @@ pub async fn legacy_sse_session_calls(
             .await
             .with_context(|| format!("POST {post_url} failed on call {i}"))?;
         let post_status = post_resp.status();
+        exchange
+            .post_statuses
+            .push(post_status.as_u16());
         if post_status != reqwest::StatusCode::ACCEPTED {
-            return Err(anyhow!("Legacy SSE session POST (call {i}) returned {} (expected 202 Accepted)", post_status));
+            break;
         }
-        let message_data = read_named_event(&mut stream, &mut buf, "message")
-            .await
-            .with_context(|| format!("waiting for SSE message event on call {i}"))?;
-        let parsed: Value = serde_json::from_str(&message_data)
-            .with_context(|| format!("SSE message data (call {i}) is not valid JSON: {message_data}"))?;
-        results.push(parsed);
+        let message_data = match read_named_event(&mut stream, &mut buf, "message").await {
+            Ok(data) => data,
+            Err(error) => {
+                exchange.stream_error = Some(error.to_string());
+                break;
+            }
+        };
+        exchange
+            .replies
+            .push(serde_json::from_str(&message_data).unwrap_or(Value::String(message_data)));
     }
 
-    Ok(results)
+    Ok(exchange)
 }
 
 #[cfg(test)]
@@ -276,6 +220,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(message, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    }
+
+    #[test]
+    fn legacy_sse_exchange_status_is_the_stream_status_when_every_post_is_accepted() {
+        let exchange = super::LegacySseExchange {
+            stream_status: 200,
+            post_statuses: vec![202, 202],
+            ..Default::default()
+        };
+        assert_eq!(exchange.status(), 200);
+    }
+
+    #[test]
+    fn legacy_sse_exchange_status_is_the_first_refused_post() {
+        let exchange = super::LegacySseExchange {
+            stream_status: 200,
+            post_statuses: vec![202, 404],
+            ..Default::default()
+        };
+        assert_eq!(exchange.status(), 404);
+    }
+
+    #[test]
+    fn legacy_sse_exchange_status_is_a_refused_stream() {
+        let exchange = super::LegacySseExchange {
+            stream_status: 403,
+            ..Default::default()
+        };
+        assert_eq!(exchange.status(), 403);
     }
 
     #[tokio::test]

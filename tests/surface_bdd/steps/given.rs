@@ -3694,16 +3694,18 @@ async fn caller_has_open_modern_mcp_stream(
     crate::steps::when::send_modern_mcp_tool_call(
         world,
         &tool_name,
-        crate::bdd_support::json_rpc::MODERN_MCP_PROTOCOL_VERSION,
+        &crate::bdd_support::json_rpc::McpVersion::Modern,
         Vec::new(),
     )
     .await;
-    let response = world
+    let opened = world
         .caller_response
         .as_ref()
-        .expect("caller response");
-    assert_eq!(response.status, 200, "the modern stream opened: {response:?}");
-    assert!(world.mcp_stream.is_some(), "the response is still streaming");
+        .is_some_and(|response| response.status == 200)
+        && world.mcp_stream.is_some();
+    if !opened {
+        panic!("setup failed: the caller could not open a modern MCP response stream: {:?}", world.caller_response);
+    }
     let mock = &world
         .infra
         .as_ref()
@@ -3715,5 +3717,5 @@ async fn caller_has_open_modern_mcp_stream(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("the upstream never received the tool call");
+    panic!("setup failed: the MCP server never received the tool call");
 }

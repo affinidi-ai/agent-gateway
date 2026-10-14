@@ -185,10 +185,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::mcp::request_validation::McpVersionPolicy;
-
-    const DUAL: McpVersionPolicy<'static> =
-        McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
+    use crate::mcp::request_validation::{MODERN_CAPABLE_POLICY, MODERN_ONLY_POLICY, McpVersionPolicy};
 
     fn key(surface_id: &str) -> UpstreamKey {
         UpstreamKey {
@@ -227,11 +224,11 @@ mod tests {
     fn upstream_versions_narrow_the_advertised_list_to_what_discovery_listed() {
         let modern_only = key("upstream-versions-modern-only");
         record_discovery(modern_only.clone(), &discovery(&[MCP_MODERN_VERSION, "2025-11-25"]));
-        assert_eq!(advertised(&modern_only, DUAL), json!([MCP_MODERN_VERSION]));
+        assert_eq!(advertised(&modern_only, MODERN_CAPABLE_POLICY), json!([MCP_MODERN_VERSION]));
         let both = key("upstream-versions-both");
         record_discovery(both.clone(), &discovery(&[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
-        assert_eq!(advertised(&both, DUAL), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
-        let error = restrict_unsupported(unsupported(DUAL), &modern_only);
+        assert_eq!(advertised(&both, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
+        let error = restrict_unsupported(unsupported(MODERN_CAPABLE_POLICY), &modern_only);
         assert_eq!(error.id, Some(json!("request")));
         assert_eq!(error.data.unwrap()["requested"], "2025-11-25");
     }
@@ -240,7 +237,7 @@ mod tests {
     fn upstream_versions_treat_method_not_found_as_a_legacy_only_upstream() {
         let legacy = key("upstream-versions-method-not-found");
         record_discovery(legacy.clone(), &error(error_codes::METHOD_NOT_FOUND));
-        assert_eq!(advertised(&legacy, DUAL), json!([MCP_LEGACY_VERSION]));
+        assert_eq!(advertised(&legacy, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION]));
     }
 
     #[test]
@@ -250,19 +247,23 @@ mod tests {
             error(-32001),
             error(error_codes::INTERNAL_ERROR),
             error(error_codes::UNSUPPORTED_PROTOCOL_VERSION),
-            json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete", "supportedVersions": "2026-07-28"}}),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete", "supportedVersions": MCP_MODERN_VERSION}}),
             json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete"}}),
             json!({"jsonrpc": "2.0", "id": 1, "error": {"code": "-32601", "message": "failed"}}),
         ] {
             record_discovery(untouched.clone(), &message);
-            assert_eq!(advertised(&untouched, DUAL), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]), "{message}");
+            assert_eq!(
+                advertised(&untouched, MODERN_CAPABLE_POLICY),
+                json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]),
+                "{message}"
+            );
         }
     }
 
     #[test]
     fn upstream_versions_keep_the_path_list_for_an_unknown_upstream() {
         assert_eq!(
-            advertised(&key("upstream-versions-unknown"), DUAL),
+            advertised(&key("upstream-versions-unknown"), MODERN_CAPABLE_POLICY),
             json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION])
         );
         let learned = key("upstream-versions-distinct-keys");
@@ -281,9 +282,13 @@ mod tests {
                 ..learned.clone()
             },
         ] {
-            assert_eq!(advertised(&other, DUAL), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]), "{other:?}");
+            assert_eq!(
+                advertised(&other, MODERN_CAPABLE_POLICY),
+                json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]),
+                "{other:?}"
+            );
         }
-        assert_eq!(advertised(&learned, DUAL), json!([MCP_MODERN_VERSION]));
+        assert_eq!(advertised(&learned, MODERN_CAPABLE_POLICY), json!([MCP_MODERN_VERSION]));
     }
 
     #[test]
@@ -291,11 +296,11 @@ mod tests {
         let latest = key("upstream-versions-latest");
         record_discovery(latest.clone(), &discovery(&[MCP_MODERN_VERSION]));
         record_discovery(latest.clone(), &error(error_codes::METHOD_NOT_FOUND));
-        assert_eq!(advertised(&latest, DUAL), json!([MCP_LEGACY_VERSION]));
+        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION]));
         record_discovery(latest.clone(), &error(error_codes::INTERNAL_ERROR));
-        assert_eq!(advertised(&latest, DUAL), json!([MCP_LEGACY_VERSION]));
+        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION]));
         record_discovery(latest.clone(), &discovery(&[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
-        assert_eq!(advertised(&latest, DUAL), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
+        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
     }
 
     #[test]
@@ -345,11 +350,10 @@ mod tests {
     fn upstream_versions_never_empty_the_advertised_list() {
         let legacy = key("upstream-versions-never-empty");
         record_discovery(legacy.clone(), &error(error_codes::METHOD_NOT_FOUND));
-        let modern_only = McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_MODERN_VERSION]);
-        assert_eq!(advertised(&legacy, modern_only), json!([MCP_MODERN_VERSION]));
+        assert_eq!(advertised(&legacy, MODERN_ONLY_POLICY), json!([MCP_MODERN_VERSION]));
         let unmodelled = key("upstream-versions-unmodelled");
         record_discovery(unmodelled.clone(), &discovery(&["2025-11-25"]));
-        assert_eq!(advertised(&unmodelled, DUAL), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
+        assert_eq!(advertised(&unmodelled, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
     }
 
     #[test]
@@ -364,7 +368,7 @@ mod tests {
             data: Some(json!({"supported": [MCP_LEGACY_VERSION, MCP_MODERN_VERSION]})),
         });
         assert_eq!(restrict_unsupported(other.clone(), &legacy), other);
-        let mut without_data = unsupported(DUAL);
+        let mut without_data = unsupported(MODERN_CAPABLE_POLICY);
         without_data.data = None;
         assert_eq!(restrict_unsupported(without_data.clone(), &legacy), without_data);
     }

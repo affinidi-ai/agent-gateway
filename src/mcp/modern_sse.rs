@@ -1394,10 +1394,7 @@ mod tests {
                 message.to_string()
             };
             let support = super::super::modern::ForwardingSupport {
-                versions: super::super::request_validation::McpVersionPolicy::new(
-                    &[super::super::MCP_MODERN_VERSION],
-                    &[super::super::MCP_MODERN_VERSION],
-                ),
+                versions: crate::mcp::request_validation::MODERN_ONLY_POLICY,
                 request_streams: true,
                 subscriptions: false,
                 capabilities: &["tools", "resources"],
@@ -1444,12 +1441,12 @@ mod tests {
 
     #[tokio::test]
     async fn forwarded_discovery_records_the_versions_the_client_received_over_json_and_sse() {
-        use super::super::request_validation::{McpRequestValidationError, McpVersionPolicy};
+        use super::super::request_validation::McpRequestValidationError;
         use super::super::upstream_versions::{UpstreamKey, UpstreamRoute, restrict_unsupported};
         use super::super::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
         use serde_json::json;
 
-        let dual = McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
+        let dual = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let advertised = |key: &UpstreamKey| {
             restrict_unsupported(McpRequestValidationError::unsupported(None, "2025-11-25", dual), key)
                 .data

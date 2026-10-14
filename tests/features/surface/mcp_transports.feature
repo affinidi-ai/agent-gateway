@@ -6,14 +6,16 @@ Feature: MCP transport contracts
     Given REST API "bravo" exposes a Weather OpenAPI
     And MCP surface "alpha" exists for route "/example" targeting an MCP proxy endpoint backed by REST API "bravo"
     When the caller connects to the Legacy SSE endpoint
-    Then the response content type is "text/event-stream"
+    Then the response status is 200
+    And the response content type is "text/event-stream"
     And the SSE stream emits an endpoint event with a session message URL
 
   Scenario: Legacy SSE stream delivers message events and remains stable across repeated calls
     Given REST API "bravo" exposes a Weather OpenAPI
     And MCP surface "alpha" exists for route "/example" targeting an MCP proxy endpoint backed by REST API "bravo"
     When the caller sends two MCP tool calls over Legacy SSE on the same session
-    Then both calls receive a reply as an SSE message event
+    Then the response status is 200
+    And both calls receive a reply as an SSE message event
     And REST API "bravo" received exactly 2 requests
 
   Scenario: Streamable HTTP initialize response is SSE-wrapped and carries Mcp-Session-Id

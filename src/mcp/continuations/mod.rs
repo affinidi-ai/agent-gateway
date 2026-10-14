@@ -3,6 +3,8 @@ pub mod consent;
 pub mod delegation;
 pub mod dynamodb;
 pub mod embedded;
+#[cfg(test)]
+pub(crate) mod negative_cases;
 pub mod protected;
 pub mod service;
 

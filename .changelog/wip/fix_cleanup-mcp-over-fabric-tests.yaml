@@ -1,0 +1,16 @@
+---
+branch: fix/cleanup-mcp-over-fabric-tests
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+  - timestamp: '2026-10-13T00:00:00.000Z'
+    title: Log a capped Fabric MCP initialize revision only when it is a date
+    description: 'When Fabric receive rewrote a legacy MCP initialize to a served
+      revision, it logged the caller''s requested protocolVersion as sent, at info
+      level and with no length limit. It now logs it as the direct Access Point and
+      Transit Points already did: the value only when it is a well-formed date revision,
+      otherwise only its length.'
+  breaking: []
