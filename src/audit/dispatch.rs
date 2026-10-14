@@ -720,7 +720,8 @@ mod tests {
         f.cursors
             .set(&sink_id, 0)
             .unwrap();
-        f.append(&[&[sink_id.clone()], &[sink_id.clone()], &[sink_id.clone()]]);
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed, addressed]);
         crate::audit::cursors::garble(f.dir.path(), 2);
         let before = corrupt_skips(&sink_id);
 
@@ -741,7 +742,7 @@ mod tests {
             .set(&sink_id, 0)
             .unwrap();
         for _ in 0..3 {
-            f.append(&[&[sink_id.clone()]]);
+            f.append(&[std::slice::from_ref(&sink_id)]);
         }
         assert_eq!(
             segment_paths(f.dir.path())
@@ -755,7 +756,7 @@ mod tests {
         let sink = RecordingSink::default();
         let reader = f.spawn(sink_id.clone(), sink.clone());
         wait_until(|| f.cursors.get(&sink_id) == Some(3)).await;
-        f.append(&[&[sink_id.clone()]]);
+        f.append(&[std::slice::from_ref(&sink_id)]);
         wait_until(|| f.cursors.get(&sink_id) == Some(4)).await;
 
         assert_eq!(*sink.delivered.lock(), vec![1, 2, 4]);

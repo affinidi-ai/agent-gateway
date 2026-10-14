@@ -130,12 +130,14 @@ pub struct JournalWriter {
     segment_max_bytes: u64,
     next_seq: u64,
     segment: Option<(File, u64)>,
-    /// Makes a new segment's directory entry durable.
-    sync_dir: Box<dyn FnMut(&Path) -> io::Result<()> + Send>,
+    sync_dir: DirSync,
     /// The current segment was created but its directory entry is not yet
     /// durable; nothing is written to it until it is.
     dir_unsynced: bool,
 }
+
+/// Makes a new segment's directory entry durable.
+type DirSync = Box<dyn FnMut(&Path) -> io::Result<()> + Send>;
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
