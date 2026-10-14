@@ -1,9 +1,16 @@
 .github/scripts/changelog.py
   s_09d9fb08a24a2a::t_0940bd971ef1bd 29,139-147
+  s_09d9fb08a24a2a::t_19c2b6c22edfe0 29,139-147,238
 .github/scripts/test_changelog.py
   s_09d9fb08a24a2a::t_21439e44f13f6e 1-2,120-127,129-153
+  s_09d9fb08a24a2a::t_720c0c24510f6d 1-2
+  s_09d9fb08a24a2a::t_8c211aef9fa545 120-127,129,131-154
+  s_09d9fb08a24a2a::t_bf47097d68bfb6 130
 docs/development/RELEASING.md
   s_09d9fb08a24a2a::t_6010fb5dd35b4a 55-59
+  s_09d9fb08a24a2a::t_099cbd225b1b58 55-59
+.github/scripts/check_changelog_fragments.py
+  s_09d9fb08a24a2a::t_19c2b6c22edfe0 27,29-30,54-55
 ---
 {
   "schema_version": "authorship/3.0.0",
