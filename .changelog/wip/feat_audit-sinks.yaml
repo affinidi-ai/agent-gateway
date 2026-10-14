@@ -98,6 +98,9 @@ changes:
     - timestamp: '2026-10-14T00:00:00.000Z'
       title: Make the governance audit journal readable by its owner only
       description: The audit journal holds caller identities, trace ids and delegation and payment details. Its directory is now created owner-only (0700) and its segments, lock file and cursors.json are 0600; they were created with the process umask.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Update rustls to 0.23.46
+      description: rustls 0.23.45 had four advisories, RUSTSEC-2026-0346 (Debug output of client session values exposed TLS secrets), RUSTSEC-2026-0347 (buffered data sent to the outer server after an ECH rejection), RUSTSEC-2026-0348 (Brotli certificate decompression could allocate up to 1 GiB before authentication) and RUSTSEC-2026-0349 (an unauthenticated ServerHello could downgrade later connections to classical key exchange). The gateway now uses 0.23.46, which fixes all four.
   breaking:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: ⭐ Record only the audit events each destination selects
