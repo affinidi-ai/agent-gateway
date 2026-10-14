@@ -314,7 +314,9 @@ describe('AuditPage forwarding', () => {
     expect(within(button).getByTestId('audit-forward-no-events-warning')).toBeInTheDocument();
     expect(button).toHaveAttribute(
       'title',
-      expect.stringContaining('1 Governance Audit integration selects no events and receives nothing.')
+      expect.stringContaining(
+        '1 Governance Audit integration selects no events and receives nothing.'
+      )
     );
     expect(button).toHaveAttribute('title', expect.stringContaining('VP Audit Log keeps nothing'));
   });
