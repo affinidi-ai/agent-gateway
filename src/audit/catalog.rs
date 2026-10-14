@@ -19,6 +19,19 @@ pub enum AuditEventGroup {
 }
 
 impl AuditEventGroup {
+    pub fn id(self) -> &'static str {
+        match self {
+            Policies => "policies",
+            Trust => "trust",
+            Identity => "identity",
+            Trace => "trace",
+            Auth => "auth",
+            Delegation => "delegation",
+            Payments => "payments",
+            Requests => "requests",
+        }
+    }
+
     /// The heading the dashboard shows for the group.
     pub fn label(self) -> &'static str {
         match self {
@@ -183,6 +196,13 @@ pub fn event_bit(category: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_group_id_is_its_serialized_name() {
+        for group in [Policies, Trust, Identity, Trace, Auth, Delegation, Payments, Requests] {
+            assert_eq!(serde_json::to_value(group).expect("serializes"), group.id());
+        }
+    }
 
     #[test]
     fn each_event_has_its_own_bit_below_64() {
