@@ -43,6 +43,17 @@ pub fn integration_sinks(integrations: &[Integration]) -> Vec<Sink> {
         .collect()
 }
 
+/// Each integration that exists but does not receive audit records: a
+/// Governance Audit integration disabled, given a tenant or moved to another
+/// category, or one never in that category.
+fn paused_integrations(integrations: &[Integration]) -> Vec<SinkId> {
+    integrations
+        .iter()
+        .filter(|integration| !receives_audit_records(integration))
+        .map(|integration| SinkId::Integration(integration.id.clone()))
+        .collect()
+}
+
 pub fn build_sinks(
     settings: &DashboardSettings,
     integrations: &[Integration],
@@ -87,7 +98,8 @@ async fn list_from(storage: Option<Arc<IntegrationStorage>>) -> anyhow::Result<V
     }
 }
 
-/// Builds the sinks from `settings` and `list` and replaces `registry`'s, under
+/// Builds the sinks and the paused integrations from `settings` and `list`
+/// and replaces `registry`'s, under
 /// `serial` for the whole rebuild so a slower rebuild never replaces newer
 /// sinks. Keeps the current sinks and returns false when `list` fails.
 async fn rebuild<L, F>(
@@ -104,7 +116,7 @@ where
     let settings = settings();
     match list().await {
         Ok(integrations) => {
-            registry.replace(build_sinks(&settings, &integrations));
+            registry.replace(build_sinks(&settings, &integrations), paused_integrations(&integrations));
             true
         }
         Err(e) => {
@@ -225,6 +237,42 @@ mod tests {
     }
 
     #[test]
+    fn integrations_that_do_not_receive_audit_records_are_paused() {
+        let receiving = audit_integration("active", None, &["auth_failed"]);
+        let disabled = audit_integration("disabled", None, &["auth_failed"]);
+        let tenant_owned = audit_integration("active", Some("tenant-a"), &["auth_failed"]);
+        let mut general = audit_integration("active", None, &["auth_failed"]);
+        general.category = Some("general".to_string());
+
+        let paused = paused_integrations(&[receiving, disabled.clone(), tenant_owned.clone(), general.clone()]);
+
+        assert_eq!(
+            paused,
+            vec![
+                SinkId::Integration(disabled.id),
+                SinkId::Integration(tenant_owned.id),
+                SinkId::Integration(general.id)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_keeps_the_paused_integrations() {
+        let serial = Mutex::new(());
+        let registry: &'static Sinks = Box::leak(Box::default());
+        let receiving = audit_integration("active", None, &["auth_failed"]);
+        let disabled = audit_integration("disabled", None, &["auth_failed"]);
+        let listed = vec![receiving.clone(), disabled.clone()];
+
+        let rebuilt = rebuild(&serial, registry, || selecting("policy_decision"), || async move { Ok(listed) }).await;
+
+        assert!(rebuilt);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.ids(), &[SinkId::AuditLog, SinkId::Integration(receiving.id)]);
+        assert_eq!(snapshot.paused(), &[SinkId::Integration(disabled.id)]);
+    }
+
+    #[test]
     fn build_lists_the_audit_log_then_each_integration() {
         let settings = DashboardSettings {
             audit_enabled: true,
@@ -301,7 +349,7 @@ mod tests {
     async fn a_failed_listing_keeps_the_current_sinks_and_reports_the_failure() {
         let serial = Mutex::new(());
         let registry: &'static Sinks = Box::leak(Box::default());
-        registry.replace(build_sinks(&selecting("policy_decision"), &[]));
+        registry.replace(build_sinks(&selecting("policy_decision"), &[]), Vec::new());
 
         let rebuilt = rebuild(
             &serial,
@@ -346,7 +394,7 @@ mod tests {
     async fn listing_without_integration_storage_fails_so_the_sinks_are_kept() {
         let serial = Mutex::new(());
         let registry: &'static Sinks = Box::leak(Box::default());
-        registry.replace(build_sinks(&selecting("policy_decision"), &[]));
+        registry.replace(build_sinks(&selecting("policy_decision"), &[]), Vec::new());
 
         let rebuilt = rebuild(&serial, registry, || selecting("trust_check"), || list_from(None)).await;
 

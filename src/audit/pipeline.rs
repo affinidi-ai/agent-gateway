@@ -223,7 +223,7 @@ mod tests {
             .path()
             .join("delegation-audit.jsonl");
         let sinks: &'static Sinks = Box::leak(Box::default());
-        sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))]);
+        sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
         let producer: &'static Producer = Box::leak(Box::new(Producer::new(sinks)));
 
         start_with(producer, sinks, dir.path(), &log).unwrap();
@@ -252,7 +252,9 @@ mod tests {
         sinks.replace(vec![
             Sink::new(SinkId::AuditLog, EventMask::default()),
             Sink::new(SinkId::Integration("siem".to_string()), EventMask::from_categories(["consent_granted"])),
-        ]);
+            ],
+            Vec::new(),
+        );
         start_with(producer, sinks, dir.path(), &log).unwrap();
 
         producer.submit(audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None));
@@ -264,7 +266,7 @@ mod tests {
 
     fn parts() -> (&'static Producer, &'static Sinks) {
         let sinks: &'static Sinks = Box::leak(Box::default());
-        sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))]);
+        sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
         let producer: &'static Producer = Box::leak(Box::new(Producer::new(sinks)));
         (producer, sinks)
     }
@@ -463,7 +465,7 @@ mod tests {
         let seen = built_first.clone();
         let build: BuildSinks = Arc::new(move || {
             seen.store(!journal.exists(), std::sync::atomic::Ordering::SeqCst);
-            sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))]);
+            sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
             Box::pin(async { true })
         });
         let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log.clone(), build);

@@ -508,6 +508,22 @@ impl CursorStore {
         self.persist(&cursors)
     }
 
+    /// Forgets the parked cursors of sinks `keep` returns false for.
+    pub fn retain_parked(
+        &self,
+        keep: impl Fn(&SinkId) -> bool,
+    ) -> io::Result<()> {
+        let mut cursors = self.cursors.lock();
+        let before = cursors.parked.len();
+        cursors
+            .parked
+            .retain(|sink, _| keep(sink));
+        if cursors.parked.len() == before {
+            return Ok(());
+        }
+        self.persist(&cursors)
+    }
+
     #[cfg(test)]
     pub fn parked(
         &self,
@@ -1018,6 +1034,32 @@ mod tests {
                 .unwrap(),
             9
         );
+    }
+
+    #[test]
+    fn only_the_parked_cursors_kept_survive_and_active_ones_are_untouched() {
+        let dir = TempDir::new().unwrap();
+        let store = CursorStore::open(dir.path()).unwrap();
+        for (sink, seq) in [("deleted", 2), ("paused", 5)] {
+            store
+                .set(&integration(sink), seq)
+                .unwrap();
+            store
+                .park_at(&integration(sink), seq)
+                .unwrap();
+        }
+        store
+            .set(&integration("active"), 7)
+            .unwrap();
+
+        store
+            .retain_parked(|sink| *sink == integration("paused"))
+            .unwrap();
+
+        let reopened = CursorStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.parked(&integration("deleted")), None);
+        assert_eq!(reopened.parked(&integration("paused")), Some(5));
+        assert_eq!(reopened.get(&integration("active")), Some(7));
     }
 
     #[test]

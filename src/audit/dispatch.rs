@@ -30,7 +30,7 @@ use crate::audit::cursors::{
     CursorStore, JournalRead, journal_bytes, plan_backlog_skip, prune_segments, read_entries, skipped_between,
 };
 use crate::audit::journal::{JournalEntry, segment_first_seq, segment_paths};
-use crate::audit::registry::{SinkId, Sinks};
+use crate::audit::registry::{SinkId, SinkRegistry, Sinks};
 use crate::metrics::backends::prometheus::{set_audit_journal_bytes, track_audit_sink_skipped};
 
 /// Hands one journalled record to a sink.
@@ -269,7 +269,8 @@ pub async fn run_dispatcher<F: SinkFactory>(
 }
 
 /// Starts readers for new sinks and pauses removed ones: a removed sink's
-/// reader is stopped, then the sink is paused (see [`pause`]).
+/// reader is stopped, then the sink is paused (see [`pause`]). Then drops the
+/// parked cursors of deleted integrations: those neither a sink nor paused.
 async fn reconcile<F: SinkFactory>(
     factory: &F,
     sinks: &'static Sinks,
@@ -291,6 +292,7 @@ async fn reconcile<F: SinkFactory>(
         }
         pause(source, &id).await;
     }
+    drop_deleted_cursors(&source.cursors, &current).await;
     for id in ids {
         if !readers.contains_key(id) {
             let (sinks, owned) = (sinks, id.clone());
@@ -303,6 +305,25 @@ async fn reconcile<F: SinkFactory>(
                 tokio::spawn(run_reader(id.clone(), factory.deliverer(id), source.clone(), config.clone(), max_age));
             readers.insert(id.clone(), reader);
         }
+    }
+}
+
+/// Forgets the parked cursors of sinks that are neither in `registry` nor
+/// paused in it. The VP Audit Log's cursor is never dropped.
+async fn drop_deleted_cursors(
+    cursors: &Arc<CursorStore>,
+    registry: &SinkRegistry,
+) {
+    let known: Vec<SinkId> = registry
+        .ids()
+        .iter()
+        .chain(registry.paused())
+        .cloned()
+        .collect();
+    let cursors = cursors.clone();
+    let dropped = blocking(move || cursors.retain_parked(|sink| *sink == SinkId::AuditLog || known.contains(sink)));
+    if let Err(e) = dropped.await {
+        warn!(error = %e, "Failed to drop the cursors of deleted audit integrations");
     }
 }
 
@@ -884,8 +905,18 @@ mod tests {
 
     fn registry(ids: &[SinkId]) -> &'static Sinks {
         let sinks: &'static Sinks = Box::leak(Box::default());
-        sinks.replace(selecting_everything(ids));
+        sinks.replace(selecting_everything(ids), Vec::new());
         sinks
+    }
+
+    /// Replaces the sinks with `ids`, `paused` being integrations that exist
+    /// but do not receive audit records.
+    fn rebuild(
+        sinks: &Sinks,
+        ids: &[SinkId],
+        paused: &[SinkId],
+    ) {
+        sinks.replace(selecting_everything(ids), paused.to_vec());
     }
 
     fn selecting_everything(ids: &[SinkId]) -> Vec<crate::audit::registry::Sink> {
@@ -953,7 +984,7 @@ mod tests {
         })
         .await;
 
-        sinks.replace(selecting_everything(&[SinkId::AuditLog, siem()]));
+        rebuild(sinks, &[SinkId::AuditLog, siem()], &[]);
         f.append(&[&[SinkId::AuditLog, siem()]]);
         wait_until(|| f.cursors.get(&siem()) == Some(2)).await;
 
@@ -991,7 +1022,7 @@ mod tests {
         .await;
         let before = paused_skips(&paused);
 
-        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        rebuild(sinks, &[SinkId::AuditLog], std::slice::from_ref(&paused));
         wait_until(|| f.cursors.parked(&paused) == Some(4)).await;
         manager.abort();
         let _ = manager.await;
@@ -1030,14 +1061,14 @@ mod tests {
         .await;
         let before = paused_skips(&sink);
 
-        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        rebuild(sinks, &[SinkId::AuditLog], std::slice::from_ref(&sink));
         wait_until(|| f.cursors.parked(&sink) == Some(3)).await;
         f.append(&[&[SinkId::AuditLog]]);
         factory
             .deliverer(&sink)
             .refuse_from
             .store(0, Ordering::SeqCst);
-        sinks.replace(selecting_everything(&[SinkId::AuditLog, sink.clone()]));
+        rebuild(sinks, &[SinkId::AuditLog, sink.clone()], &[]);
         f.append(&[&[SinkId::AuditLog, sink.clone()]]);
         wait_until(|| f.cursors.get(&sink) == Some(5)).await;
 
@@ -1058,7 +1089,7 @@ mod tests {
         f.append(&[std::slice::from_ref(&sink)]);
         wait_until(|| f.cursors.get(&sink) == Some(2)).await;
 
-        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        rebuild(sinks, &[SinkId::AuditLog], std::slice::from_ref(&sink));
         wait_until(|| f.cursors.parked(&sink) == Some(2)).await;
         for _ in 0..3 {
             f.append(&[&[SinkId::AuditLog]]);
@@ -1071,7 +1102,7 @@ mod tests {
             1
         );
 
-        sinks.replace(selecting_everything(&[SinkId::AuditLog, sink.clone()]));
+        rebuild(sinks, &[SinkId::AuditLog, sink.clone()], &[]);
         f.append(&[&[SinkId::AuditLog, sink.clone()]]);
         wait_until(|| f.cursors.get(&sink) == Some(6)).await;
 
@@ -1093,7 +1124,7 @@ mod tests {
         })
         .await;
 
-        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        rebuild(sinks, &[SinkId::AuditLog], &[siem()]);
         wait_until(|| {
             f.cursors
                 .get(&siem())
@@ -1136,7 +1167,8 @@ mod tests {
                 .store(usize::MAX, Ordering::SeqCst);
         }
         let before = paused_skips(&paused);
-        let sinks = registry(&[SinkId::AuditLog, active.clone()]);
+        let sinks = registry(&[]);
+        rebuild(sinks, &[SinkId::AuditLog, active.clone()], std::slice::from_ref(&paused));
 
         let manager =
             tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
@@ -1154,6 +1186,63 @@ mod tests {
         assert_eq!(f.cursors.get(&SinkId::AuditLog), Some(0));
         assert_eq!(f.cursors.get(&active), Some(0));
         assert_eq!(f.cursors.parked(&SinkId::AuditLog), None);
+        manager.abort();
+    }
+
+    #[tokio::test]
+    async fn a_deleted_integrations_parked_cursor_is_dropped_on_rebuild() {
+        let deleted = SinkId::Integration("deleted-on-rebuild".to_string());
+        let kept = SinkId::Integration("still-paused-on-rebuild".to_string());
+        let f = Fixture::new();
+        for sink in [&deleted, &kept] {
+            f.cursors
+                .set(sink, 0)
+                .unwrap();
+            f.cursors
+                .park_at(sink, 0)
+                .unwrap();
+        }
+        let sinks = registry(&[]);
+        rebuild(sinks, &[SinkId::AuditLog, siem()], &[deleted.clone(), kept.clone()]);
+        let manager = tokio::spawn(run_dispatcher(
+            RecordingFactory::default(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+        ));
+        wait_until(|| f.cursors.get(&siem()) == Some(0)).await;
+        assert_eq!(f.cursors.parked(&deleted), Some(0));
+
+        rebuild(sinks, &[SinkId::AuditLog, siem()], std::slice::from_ref(&kept));
+        wait_until(|| f.cursors.parked(&deleted).is_none()).await;
+
+        assert_eq!(f.cursors.parked(&kept), Some(0));
+        assert_eq!(f.cursors.get(&SinkId::AuditLog), Some(0));
+        manager.abort();
+    }
+
+    #[tokio::test]
+    async fn the_vp_audit_logs_cursor_is_never_dropped() {
+        let f = Fixture::new();
+        f.cursors
+            .set(&SinkId::AuditLog, 0)
+            .unwrap();
+        f.cursors
+            .park_at(&SinkId::AuditLog, 0)
+            .unwrap();
+        let sinks = registry(&[siem()]);
+        let manager = tokio::spawn(run_dispatcher(
+            RecordingFactory::default(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+        ));
+        wait_until(|| f.cursors.get(&siem()) == Some(0)).await;
+
+        rebuild(sinks, &[siem()], &[]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(f.cursors.parked(&SinkId::AuditLog), Some(0));
         manager.abort();
     }
 

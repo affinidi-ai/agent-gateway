@@ -223,6 +223,7 @@ mod tests {
                 .iter()
                 .map(|(id, events)| Sink::new(id.clone(), EventMask::from_categories(events.iter().copied())))
                 .collect(),
+            Vec::new(),
         );
         let producer: &'static Producer = Box::leak(Box::new(Producer::new(sinks)));
         let (tx, rx) = mpsc::channel();
@@ -292,7 +293,7 @@ mod tests {
                 .get()
         };
         let sinks: &'static Sinks = Box::leak(Box::default());
-        sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))]);
+        sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
         let producer = Producer::new(sinks);
         let before = lost();
 
@@ -378,7 +379,9 @@ mod tests {
         producer.sinks.replace(vec![
             Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"])),
             Sink::new(siem(), EventMask::from_categories(["consent_granted"])),
-        ]);
+            ],
+            Vec::new(),
+        );
         deferred.flush_with_vp("vp");
 
         assert_eq!(received(&rx)[0].recipients, vec![SinkId::AuditLog, siem()]);

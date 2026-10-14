@@ -88,13 +88,15 @@ impl Sink {
     }
 }
 
-/// The sinks that selected each event, and the union of every selection.
+/// The sinks that selected each event, the union of every selection, and the
+/// paused integrations.
 #[derive(Debug, Default)]
 pub struct SinkRegistry {
     union: EventMask,
     index: Vec<Vec<SinkId>>,
     ids: Vec<SinkId>,
     drop_older_than: HashMap<SinkId, Duration>,
+    paused: Vec<SinkId>,
 }
 
 impl SinkRegistry {
@@ -120,12 +122,20 @@ impl SinkRegistry {
             index,
             ids,
             drop_older_than,
+            paused: Vec::new(),
         }
     }
 
     /// Every sink, whether or not it selects any event.
     pub fn ids(&self) -> &[SinkId] {
         &self.ids
+    }
+
+    /// Integrations that exist but do not receive audit records. They are not
+    /// sinks; the dispatcher keeps their parked cursors so they resume from
+    /// their pause, and drops the parked cursors of every other integration.
+    pub fn paused(&self) -> &[SinkId] {
+        &self.paused
     }
 
     pub fn drop_older_than(
@@ -183,11 +193,17 @@ impl Default for Sinks {
 }
 
 impl Sinks {
+    /// Replaces the sinks, and the paused integrations (see
+    /// [`SinkRegistry::paused`]).
     pub fn replace(
         &self,
         sinks: Vec<Sink>,
+        paused: Vec<SinkId>,
     ) {
-        let registry = Arc::new(SinkRegistry::new(sinks));
+        let registry = Arc::new(SinkRegistry {
+            paused,
+            ..SinkRegistry::new(sinks)
+        });
         let union = registry.union.0;
         *self.registry.write() = registry;
         self.union
@@ -334,7 +350,7 @@ mod tests {
         let sinks = Sinks::default();
         assert!(!sinks.wants(bit("auth_failed")));
 
-        sinks.replace(vec![sink(integration("siem"), &["auth_failed"])]);
+        sinks.replace(vec![sink(integration("siem"), &["auth_failed"])], Vec::new());
         assert!(sinks.wants(bit("auth_failed")));
         assert_eq!(
             sinks
@@ -343,7 +359,7 @@ mod tests {
             &[integration("siem")]
         );
 
-        sinks.replace(vec![sink(SinkId::AuditLog, &["trust_check"])]);
+        sinks.replace(vec![sink(SinkId::AuditLog, &["trust_check"])], Vec::new());
         assert!(!sinks.wants(bit("auth_failed")));
         assert!(sinks.wants(bit("trust_check")));
     }
@@ -356,24 +372,44 @@ mod tests {
     }
 
     #[test]
+    fn a_registry_keeps_the_paused_integrations_apart_from_its_sinks() {
+        let sinks = Sinks::default();
+        assert!(
+            sinks
+                .snapshot()
+                .paused()
+                .is_empty()
+        );
+
+        sinks.replace(
+            vec![sink(SinkId::AuditLog, &[]), sink(integration("siem"), &["auth_failed"])],
+            vec![integration("disabled")],
+        );
+        let registry = sinks.snapshot();
+        assert_eq!(registry.ids(), &[SinkId::AuditLog, integration("siem")]);
+        assert_eq!(registry.paused(), &[integration("disabled")]);
+        assert_eq!(registry.recipients(bit("auth_failed")), &[integration("siem")]);
+    }
+
+    #[test]
     fn replacing_the_sinks_notifies_subscribers() {
         let sinks = Sinks::default();
         let mut changes = sinks.subscribe();
         assert!(!changes.has_changed().unwrap());
-        sinks.replace(vec![sink(SinkId::AuditLog, &[])]);
+        sinks.replace(vec![sink(SinkId::AuditLog, &[])], Vec::new());
         assert!(changes.has_changed().unwrap());
         changes.mark_unchanged();
-        sinks.replace(Vec::new());
+        sinks.replace(Vec::new(), Vec::new());
         assert!(changes.has_changed().unwrap());
     }
 
     #[test]
     fn a_snapshot_is_unchanged_by_a_later_replace() {
         let sinks = Sinks::default();
-        sinks.replace(vec![sink(integration("siem"), &["auth_failed"])]);
+        sinks.replace(vec![sink(integration("siem"), &["auth_failed"])], Vec::new());
         let before = sinks.snapshot();
 
-        sinks.replace(Vec::new());
+        sinks.replace(Vec::new(), Vec::new());
         assert_eq!(before.recipients(bit("auth_failed")), &[integration("siem")]);
         assert!(
             sinks
