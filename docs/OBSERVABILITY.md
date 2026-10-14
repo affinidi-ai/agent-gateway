@@ -248,7 +248,10 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   its file.
 - *Sinks coming and going.* A new sink reads from the start of the journal; no record is
   addressed to a sink before it exists, so it misses nothing. A removed or disabled sink's cursor
-  is parked, and the sink resumes from it if it comes back.
+  is parked, and the sink resumes from it if it comes back. An integration that is disabled, or
+  changed so it no longer receives audit records, refuses records until its reader is stopped,
+  so nothing addressed to it is passed over; each refusal is counted with
+  `result="not_receiving"`.
 - *Backlog.* Journal segments every active cursor has passed are deleted. The journal size is
   reported in `agent_gateway_audit_journal_bytes` and logged as a warning above 256 MiB. Above
   1 GiB, every sink still in the oldest segment is moved past it so the segment can be deleted;
@@ -267,7 +270,7 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
 
 Records produced are counted in `agent_gateway_audit_records_produced_total{event}`;
 integration deliveries in
-`agent_gateway_audit_forward_total{result="delivered"|"failed", integration_id}`.
+`agent_gateway_audit_forward_total{result="delivered"|"failed"|"not_receiving", integration_id}`.
 
 `agent_gateway_audit_pipeline_started` is 1 once the pipeline has started and 0 when it could
 not start (the journal directory cannot be created or written, for example). While it is 0 the

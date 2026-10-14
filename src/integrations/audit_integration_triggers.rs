@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use anyhow::Context;
 use futures::future::BoxFuture;
 
 use crate::audit::catalog::AUDIT_EVENTS;
@@ -183,34 +184,53 @@ impl AuditDelivery {
     }
 }
 
-/// Publishes one rendered record to a Governance Audit integration. An
-/// integration that no longer receives audit records is skipped. Counted in
-/// `agent_gateway_audit_forward_total`.
+/// The integration no longer receives audit records: it was disabled, given a
+/// tenant or moved out of the Governance Audit category.
+#[derive(Debug, thiserror::Error)]
+#[error("integration {0} no longer receives audit records")]
+pub(crate) struct NotReceiving(String);
+
+/// Publishes one rendered record to a Governance Audit integration, counted in
+/// `agent_gateway_audit_forward_total`. An integration that no longer
+/// receives audit records refuses it with [`NotReceiving`], counted as
+/// `not_receiving`: its reader retries until the dispatcher parks the sink,
+/// and the record is delivered once the integration receives records again.
 pub(crate) fn publish_audit_delivery(
     integration_id: String,
     delivery: AuditDelivery,
 ) -> BoxFuture<'static, anyhow::Result<()>> {
-    use crate::integrations::integration_service::{load_integration, publish_to_integration};
-    use crate::metrics::backends::prometheus::track_audit_forward;
+    use crate::integrations::integration_service::load_integration;
 
     Box::pin(async move {
         let integration = load_integration(&integration_id)
             .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        if !receives_audit_records(&integration) {
-            return Ok(());
-        }
-        match publish_to_integration(&integration, delivery.subject(), delivery.message(), delivery.variables()).await {
-            Ok(()) => {
-                track_audit_forward("delivered", Some(&integration_id));
-                Ok(())
-            }
-            Err(e) => {
-                track_audit_forward("failed", Some(&integration_id));
-                Err(anyhow::anyhow!(e.to_string()))
-            }
-        }
+            .with_context(|| format!("loading audit integration {integration_id}"))?;
+        publish_audit_record(&integration, &delivery).await
     })
+}
+
+/// [`publish_audit_delivery`] for an integration already loaded.
+async fn publish_audit_record(
+    integration: &Integration,
+    delivery: &AuditDelivery,
+) -> anyhow::Result<()> {
+    use crate::integrations::integration_service::publish_to_integration;
+    use crate::metrics::backends::prometheus::track_audit_forward;
+
+    if !receives_audit_records(integration) {
+        track_audit_forward("not_receiving", Some(&integration.id));
+        return Err(NotReceiving(integration.id.clone()).into());
+    }
+    match publish_to_integration(integration, delivery.subject(), delivery.message(), delivery.variables()).await {
+        Ok(()) => {
+            track_audit_forward("delivered", Some(&integration.id));
+            Ok(())
+        }
+        Err(e) => {
+            track_audit_forward("failed", Some(&integration.id));
+            Err(anyhow::Error::from(e).context(format!("publishing to audit integration {}", integration.id)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +310,34 @@ mod tests {
         event.via_fabric = true;
         event.vp_jwt = Some("vp-jwt".to_string());
         event
+    }
+
+    fn forwards(
+        result: &str,
+        integration_id: &str,
+    ) -> u64 {
+        crate::metrics::backends::prometheus::AUDIT_FORWARD
+            .with_label_values(&[result, integration_id])
+            .get()
+    }
+
+    #[tokio::test]
+    async fn an_integration_that_no_longer_receives_audit_records_refuses_the_record() {
+        let delivery = AuditDelivery::from_event(&policy_decision("allow"));
+        for stopped in [
+            integration(Some(AUDIT_CATEGORY), "disabled", None),
+            integration(Some(AUDIT_CATEGORY), "active", Some("tenant-a")),
+            integration(Some("general"), "active", None),
+        ] {
+            let error = publish_audit_record(&stopped, &delivery)
+                .await
+                .unwrap_err();
+
+            assert!(error.is::<NotReceiving>(), "{error:#}");
+            assert_eq!(forwards("not_receiving", &stopped.id), 1);
+            assert_eq!(forwards("failed", &stopped.id), 0);
+            assert_eq!(forwards("delivered", &stopped.id), 0);
+        }
     }
 
     #[test]

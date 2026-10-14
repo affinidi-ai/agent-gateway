@@ -30,6 +30,9 @@ changes:
     - timestamp: '2026-10-13T00:00:00.000Z'
       title: Keep the governance audit pipeline running when its journal or cursors are damaged
       description: An unreadable line at the end of the audit journal, or an unreadable cursors.json, stopped the audit pipeline from starting, so the gateway kept serving with no audit records kept or forwarded until restarted with the file repaired. An unreadable line elsewhere in the journal stopped every sink behind it for good. On start the journal is now cut back to its last readable line and an unreadable cursors.json is renamed to cursors.json.corrupt-<unix seconds>; readers move past unreadable lines and count them in agent_gateway_audit_sink_skipped_total with reason corrupt. agent_gateway_audit_pipeline_started reports 0 when the pipeline could not start.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Keep audit records addressed to a Governance Audit integration while it is disabled
+      description: Records addressed to a Governance Audit integration that was disabled, given a tenant or moved to another category were passed over as delivered until its delivery stopped, so they were never sent when it was re-enabled. The integration now refuses them, they wait in the journal, and it receives them once re-enabled. Each refusal is counted in agent_gateway_audit_forward_total with result not_receiving rather than failed.
   removed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Remove the unused Pre-Authorize Blocked governance audit event

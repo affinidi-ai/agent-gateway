@@ -406,7 +406,13 @@ async fn deliver_until_accepted<D: Deliver>(
 ) -> bool {
     let mut backoff = config.retry_initial;
     while let Err(e) = deliver.deliver(entry).await {
-        warn!(?sink, seq = entry.seq, error = %e, retry_in_ms = backoff.as_millis() as u64, "Audit sink did not accept a record; retrying");
+        warn!(
+            ?sink,
+            seq = entry.seq,
+            error = format!("{e:#}"),
+            retry_in_ms = backoff.as_millis() as u64,
+            "Audit sink did not accept a record; retrying"
+        );
         tokio::time::sleep(backoff).await;
         if give_up() {
             return false;
@@ -458,6 +464,9 @@ mod tests {
         attempts: Arc<AtomicUsize>,
         commit_failures_left: Arc<AtomicUsize>,
         commits: Arc<AtomicUsize>,
+        /// Refuses every entry from this seq on, like an integration that
+        /// stopped receiving audit records; 0 refuses nothing.
+        refuse_from: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl Deliver for RecordingSink {
@@ -467,6 +476,12 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.attempts
                 .fetch_add(1, Ordering::SeqCst);
+            let refuse_from = self
+                .refuse_from
+                .load(Ordering::SeqCst);
+            if refuse_from > 0 && entry.seq >= refuse_from {
+                anyhow::bail!("not receiving audit records");
+            }
             if self
                 .failures_left
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
@@ -635,7 +650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_cursor_stays_put_while_delivery_fails() {
+    async fn the_cursor_stays_put_while_delivery_fails_and_a_new_reader_resumes_there() {
         let mut f = Fixture::new();
         f.cursors
             .set(&siem(), 0)
@@ -645,7 +660,7 @@ mod tests {
             .store(usize::MAX, Ordering::SeqCst);
         let reader = f.spawn(siem(), sink.clone());
 
-        f.append(&[&[siem()]]);
+        f.append(&[&[siem()], &[siem()]]);
         wait_until(|| {
             sink.attempts
                 .load(Ordering::SeqCst)
@@ -659,6 +674,13 @@ mod tests {
                 .lock()
                 .is_empty()
         );
+        reader.abort();
+        let _ = reader.await;
+
+        let resumed = RecordingSink::default();
+        let reader = f.spawn(siem(), resumed.clone());
+        wait_until(|| f.cursors.get(&siem()) == Some(2)).await;
+        assert_eq!(*resumed.delivered.lock(), vec![1, 2]);
         reader.abort();
     }
 
@@ -895,6 +917,55 @@ mod tests {
         wait_until(|| f.cursors.get(&siem()) == Some(3)).await;
 
         assert_eq!(factory.delivered(&siem()), vec![1, 3]);
+        manager.abort();
+    }
+
+    #[tokio::test]
+    async fn a_sink_disabled_mid_batch_keeps_every_record_it_refused() {
+        let mut f = Fixture::new();
+        let factory = RecordingFactory::default();
+        factory
+            .deliverer(&siem())
+            .refuse_from
+            .store(2, Ordering::SeqCst);
+        let sinks = registry(&[SinkId::AuditLog, siem()]);
+        let manager =
+            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
+        wait_until(|| {
+            f.cursors
+                .get(&siem())
+                .is_some()
+        })
+        .await;
+
+        f.append(&[&[siem()], &[siem()], &[siem()]]);
+        wait_until(|| {
+            factory
+                .deliverer(&siem())
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 3
+        })
+        .await;
+        assert!(f.cursors.get(&siem()) < Some(2));
+
+        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        wait_until(|| {
+            f.cursors
+                .get(&siem())
+                .is_none()
+        })
+        .await;
+        factory
+            .deliverer(&siem())
+            .refuse_from
+            .store(0, Ordering::SeqCst);
+        sinks.replace(selecting_everything(&[SinkId::AuditLog, siem()]));
+        wait_until(|| f.cursors.get(&siem()) == Some(3)).await;
+
+        let delivered = factory.delivered(&siem());
+        assert_eq!(delivered.first(), Some(&1));
+        assert_eq!(delivered[delivered.len() - 2..], [2, 3]);
         manager.abort();
     }
 

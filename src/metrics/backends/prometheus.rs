@@ -339,13 +339,14 @@ lazy_static! {
         counter
     };
 
-    /// Governance audit records forwarded to audit integrations (labeled by result:
-    /// delivered|failed|dropped). `dropped` means a full queue discarded the record before
-    /// delivery; the record is still in the VP Audit Log.
+    /// Attempts to deliver governance audit records to audit integrations (labeled by
+    /// result: delivered|failed|not_receiving). `not_receiving` means the integration was
+    /// disabled or changed so it no longer receives audit records; the record is kept and
+    /// delivered if it receives them again.
     pub static ref AUDIT_FORWARD: IntCounterVec = {
         let opts = Opts::new(
             names::AUDIT_FORWARD_TOTAL,
-            "Governance audit records forwarded to audit integrations (result = delivered|failed|dropped; integration_id is empty when the shared intake queue dropped the record)",
+            "Attempts to deliver governance audit records to audit integrations (result = delivered|failed|not_receiving)",
         );
         let counter = IntCounterVec::new(opts, &["result", "integration_id"]).unwrap();
         REGISTRY.register(Box::new(counter.clone())).unwrap();
@@ -747,9 +748,8 @@ pub fn track_storage_plaintext_removal_failed(entity: &str) {
         .inc();
 }
 
-/// Track the outcome of forwarding a governance audit record to an audit
-/// integration; `None` when the shared intake queue dropped it before any
-/// destination was chosen.
+/// Track the outcome of one attempt to deliver a governance audit record to
+/// an audit integration.
 pub fn track_audit_forward(
     result: &str,
     integration_id: Option<&str>,
