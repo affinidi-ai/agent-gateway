@@ -1,0 +1,33 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /www/default
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /ui-tests
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Keep the SHA-pinned actions in .github/workflows/* current. Dependabot bumps
+  # each pin and rewrites the trailing `# vX.Y.Z` comment, so pins stay both
+  # immutable (SHA) and readable. Grouped into a single weekly PR rather than one
+  # per action.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
