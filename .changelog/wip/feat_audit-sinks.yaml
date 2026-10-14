@@ -74,7 +74,7 @@ changes:
       description: A node promoted to Active kept the dashboard settings it loaded at boot and its cached integrations, so it could keep the VP Audit Log selection or send to an integration as configured before the other node changed them. On becoming Active the node now re-reads the settings from disk and empties its integration cache before the audit pipeline starts, so the sinks and every delivery follow what is stored now. The node still admits traffic after one start attempt and keeps retrying a refused start in the background.
     - timestamp: '2026-10-14T00:00:00.000Z'
       title: Count only Governance Audit integrations that receive events on the Audit Log
-      description: The Audit Log's "Forwarding to N integrations" counted every active appliance-wide Governance Audit integration, including ones that select no events and so receive nothing. It now counts only those that select at least one event.
+      description: The Audit Log's "Forwarding to N integrations" counted every active appliance-wide Governance Audit integration, including ones that select no events and so receive nothing. It now counts only those that select at least one event, and shows a warning naming how many select none. With VP Auditing off it no longer adds "(VP Auditing off)" or says nothing is forwarded; its tooltip says the VP Audit Log keeps nothing while integrations still receive the events selected for them.
   removed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Remove the unused Pre-Authorize Blocked governance audit event

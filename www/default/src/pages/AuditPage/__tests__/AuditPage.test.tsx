@@ -270,15 +270,53 @@ describe('AuditPage forwarding', () => {
     );
   });
 
-  it('says forwarding is idle while VP Auditing is off', async () => {
+  it('keeps forwarding while VP Auditing is off and says only the log keeps nothing', async () => {
     mockPermissions = { 'integrations.view': true };
     mockAuditEnabled = false;
     withIntegrations([{ category: 'audit', status: 'active', audit_events: SELECTED }]);
     renderWithRoutes();
 
     const button = await screen.findByTestId('audit-forward-button');
-    expect(button).toHaveTextContent('Forwarding to 1 integration (VP Auditing off)');
-    expect(button).toHaveAttribute('title', expect.stringContaining('Settings › Security'));
+    expect(button).toHaveTextContent(/^Forwarding to 1 integration$/);
+    expect(button).toHaveAttribute(
+      'title',
+      'VP Auditing is off in Settings › Security, so the VP Audit Log keeps nothing; ' +
+        'Governance Audit integrations still receive the events selected for them.'
+    );
+  });
+
+  it('warns that Governance Audit integrations selecting no events receive nothing', async () => {
+    mockPermissions = { 'integrations.view': true };
+    withIntegrations([
+      { category: 'audit', status: 'active', audit_events: SELECTED },
+      { category: 'audit', status: 'active', audit_events: [] },
+      { category: 'audit', status: 'active' },
+    ]);
+    renderWithRoutes();
+
+    const button = await screen.findByTestId('audit-forward-button');
+    expect(button).toHaveTextContent(/^Forwarding to 1 integration$/);
+    expect(within(button).getByTestId('audit-forward-no-events-warning')).toBeInTheDocument();
+    expect(button).toHaveAttribute(
+      'title',
+      '2 Governance Audit integrations select no events and receive nothing.'
+    );
+  });
+
+  it('warns about an integration selecting no events while VP Auditing is off', async () => {
+    mockPermissions = { 'integrations.view': true, 'integrations.edit': true };
+    mockAuditEnabled = false;
+    withIntegrations([{ category: 'audit', status: 'active', audit_events: [] }]);
+    renderWithRoutes();
+
+    const button = await screen.findByTestId('audit-forward-button');
+    expect(button).toHaveTextContent(/^Forward records$/);
+    expect(within(button).getByTestId('audit-forward-no-events-warning')).toBeInTheDocument();
+    expect(button).toHaveAttribute(
+      'title',
+      expect.stringContaining('1 Governance Audit integration selects no events and receives nothing.')
+    );
+    expect(button).toHaveAttribute('title', expect.stringContaining('VP Audit Log keeps nothing'));
   });
 
   it('offers no forwarding when the gateway has no Governance Audit category', async () => {
@@ -316,6 +354,8 @@ describe('AuditPage forwarding', () => {
 
     const button = await screen.findByTestId('audit-forward-button');
     expect(button).toHaveTextContent('Forwarding to 2 integrations');
+    expect(within(button).queryByTestId('audit-forward-no-events-warning')).not.toBeInTheDocument();
+    expect(button).not.toHaveAttribute('title');
     fireEvent.click(button);
     expect(screen.getByTestId('location')).toHaveTextContent(/^\/integrations$/);
   });
