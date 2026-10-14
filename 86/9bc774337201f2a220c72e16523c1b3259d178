@@ -1,0 +1,21 @@
+.github/workflows/publish-release.yml
+  s_09d9fb08a24a2a::t_8e27c69e4c11cb 18-46,49-50,53-56,80,134-145,151,156-157,166
+docs/development/RELEASING.md
+  s_09d9fb08a24a2a::t_ec40dc683bf9fe 70-74,77-86,88-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "869bc774337201f2a220c72e16523c1b3259d178",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
