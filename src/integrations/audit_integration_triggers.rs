@@ -643,14 +643,17 @@ mod tests {
     }
 
     #[test]
-    fn audit_category_lists_every_audit_record_category() {
+    fn audit_category_lists_every_audit_record_category_the_gateway_produces() {
+        let unproduced = ["delegation_failed", "request_failed", "request_completed"];
         let actions = every_action();
         actions
             .iter()
             .for_each(listed);
         let produced: HashSet<String> = actions
             .iter()
-            .map(|action| format!("audit.{}", action_category(action)))
+            .map(action_category)
+            .filter(|category| !unproduced.contains(category))
+            .map(|category| format!("audit.{category}"))
             .collect();
 
         let category = audit_integration_category();

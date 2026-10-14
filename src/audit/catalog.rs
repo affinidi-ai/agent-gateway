@@ -140,12 +140,6 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         Identity,
     ),
     event(
-        "delegation_failed",
-        "Delegation Failed",
-        "A delegated credential could not be resolved, stored or used for the caller",
-        Delegation,
-    ),
-    event(
         "rate_limited",
         "Rate Limited",
         "A request was refused because a surface rate limit, SSE session cap or Fabric stream capacity was reached",
@@ -155,18 +149,6 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "request_rejected",
         "Request Rejected",
         "A request was refused at routing, admission or forwarding before it reached the target",
-        Requests,
-    ),
-    event(
-        "request_failed",
-        "Request Failed",
-        "A forwarded request failed upstream, timed out, or failed in the gateway",
-        Requests,
-    ),
-    event(
-        "request_completed",
-        "Request Completed",
-        "A request was forwarded and its response returned to the caller",
         Requests,
     ),
 ];
@@ -231,11 +213,10 @@ mod tests {
         assert_eq!(group_of("auth_failed"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("identity_binding_failed"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("identity_binding_verified"), Some(AuditEventGroup::Identity));
-        for request in ["request_rejected", "request_failed", "rate_limited", "request_completed"] {
+        for request in ["request_rejected", "rate_limited"] {
             assert_eq!(group_of(request), Some(AuditEventGroup::Requests), "{request}");
         }
         for delegation in [
-            "delegation_failed",
             "token_injected",
             "token_refreshed",
             "token_not_found",
@@ -251,6 +232,13 @@ mod tests {
             "elicitation_timed_out",
         ] {
             assert_eq!(group_of(delegation), Some(AuditEventGroup::Delegation), "{delegation}");
+        }
+    }
+
+    #[test]
+    fn record_types_the_gateway_does_not_produce_are_not_offered() {
+        for unproduced in ["delegation_failed", "request_failed", "request_completed"] {
+            assert_eq!(event_bit(unproduced), None, "{unproduced}");
         }
     }
 

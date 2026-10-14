@@ -1013,12 +1013,6 @@
               "group": "identity"
             },
             {
-              "event_type": "audit.delegation_failed",
-              "name": "Delegation Failed",
-              "description": "A delegated credential could not be resolved, stored or used for the caller",
-              "group": "delegation"
-            },
-            {
               "event_type": "audit.rate_limited",
               "name": "Rate Limited",
               "description": "A request was refused because a surface rate limit, SSE session cap or Fabric stream capacity was reached",
@@ -1028,18 +1022,6 @@
               "event_type": "audit.request_rejected",
               "name": "Request Rejected",
               "description": "A request was refused at routing, admission or forwarding before it reached the target",
-              "group": "requests"
-            },
-            {
-              "event_type": "audit.request_failed",
-              "name": "Request Failed",
-              "description": "A forwarded request failed upstream, timed out, or failed in the gateway",
-              "group": "requests"
-            },
-            {
-              "event_type": "audit.request_completed",
-              "name": "Request Completed",
-              "description": "A request was forwarded and its response returned to the caller",
               "group": "requests"
             }
           ]
