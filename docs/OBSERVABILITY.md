@@ -269,7 +269,7 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   so nothing addressed to it is passed over; each refusal is counted with
   `result="not_receiving"`. The sinks are rebuilt from the settings and integrations one rebuild
   at a time, so an older rebuild never replaces newer sinks. When the integrations cannot be
-  listed the previous sinks are kept, the failure is counted in
+  listed, including before integration storage is set up, the previous sinks are kept, the failure is counted in
   `agent_gateway_audit_sink_rebuild_failed_total`, and the rebuild is retried every 5 s until it
   succeeds.
 - *Backlog.* Journal segments every active cursor has passed are deleted. The journal size is

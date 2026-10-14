@@ -1,6 +1,7 @@
 //! Builds the audit sinks from where each one is configured.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use crate::audit::registry::{EventMask, Sink, SinkId, Sinks, sinks};
 use crate::integrations::audit_integration_triggers::receives_audit_records;
 use crate::metrics::backends::prometheus::track_audit_sink_rebuild_failed;
 use crate::storage::settings_store::{DashboardSettings, global_settings};
-use crate::storage::{Integration, get_integration_storage};
+use crate::storage::{Integration, IntegrationStorage, get_integration_storage};
 
 /// Held for a whole rebuild, so rebuilds apply in the order they start.
 static REBUILDING: Mutex<()> = Mutex::const_new(());
@@ -74,9 +75,15 @@ async fn rebuild_current() -> bool {
 }
 
 async fn list_integrations() -> anyhow::Result<Vec<Integration>> {
-    match get_integration_storage() {
+    list_from(get_integration_storage()).await
+}
+
+/// The integrations in `storage`. Without storage they cannot be listed: an
+/// empty list would read as every integration deleted.
+async fn list_from(storage: Option<Arc<IntegrationStorage>>) -> anyhow::Result<Vec<Integration>> {
+    match storage {
         Some(storage) => storage.list().await,
-        None => Ok(Vec::new()),
+        None => anyhow::bail!("integration storage is not set up yet"),
     }
 }
 
@@ -333,6 +340,19 @@ mod tests {
         assert!(older && newer);
         assert!(log_selects(registry, "trust_check"));
         assert!(!log_selects(registry, "policy_decision"));
+    }
+
+    #[tokio::test]
+    async fn listing_without_integration_storage_fails_so_the_sinks_are_kept() {
+        let serial = Mutex::new(());
+        let registry: &'static Sinks = Box::leak(Box::default());
+        registry.replace(build_sinks(&selecting("policy_decision"), &[]));
+
+        let rebuilt = rebuild(&serial, registry, || selecting("trust_check"), || list_from(None)).await;
+
+        assert!(!rebuilt);
+        assert!(list_from(None).await.is_err());
+        assert!(log_selects(registry, "policy_decision"));
     }
 
     #[tokio::test(start_paused = true)]
