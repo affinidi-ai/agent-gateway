@@ -19548,11 +19548,30 @@ allow if {
 
 #[cfg(test)]
 mod fabric_extended_card_tests {
+    use std::future::Future;
     use std::sync::Arc;
 
     use serde_json::json;
 
     const TARGET_URL: &str = "https://backend.internal/a2a";
+
+    fn run_on_large_stack<F>(test: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(test);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     struct FabricPeer {
         state: crate::state::ProxyState,
@@ -19730,57 +19749,65 @@ mod fabric_extended_card_tests {
         (status, body)
     }
 
-    #[tokio::test]
-    async fn extended_card_from_a_fabric_peer_is_rewritten() {
-        let card = json!({"name": "agent", "supportedInterfaces": [{"url": TARGET_URL, "protocolBinding": "JSONRPC"}]});
-        let peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "card-1", "result": card})).await;
-
-        let (status, body) = get_extended_card(&peer).await;
-
-        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-        assert_eq!(body["id"], "card-1", "{body}");
-        let url = body["result"]["supportedInterfaces"][0]["url"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(url.starts_with("https://gateway.example"), "{body}");
-        assert!(
-            !body
-                .to_string()
-                .contains("backend.internal"),
-            "{body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unrewritable_extended_card_from_a_fabric_peer_is_refused_with_a_jsonrpc_error() {
-        for result in [json!(TARGET_URL), json!({"agentCard": {"supportedInterfaces": [{"url": TARGET_URL}]}})] {
-            let peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "card-1", "result": result})).await;
+    #[test]
+    fn extended_card_from_a_fabric_peer_is_rewritten() {
+        run_on_large_stack(async {
+            let card =
+                json!({"name": "agent", "supportedInterfaces": [{"url": TARGET_URL, "protocolBinding": "JSONRPC"}]});
+            let peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "card-1", "result": card})).await;
 
             let (status, body) = get_extended_card(&peer).await;
 
-            assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
-            assert_eq!(body["jsonrpc"], "2.0", "{body}");
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
             assert_eq!(body["id"], "card-1", "{body}");
-            assert_eq!(body["error"]["code"], -32603, "{body}");
+            let url = body["result"]["supportedInterfaces"][0]["url"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(url.starts_with("https://gateway.example"), "{body}");
             assert!(
                 !body
                     .to_string()
                     .contains("backend.internal"),
                 "{body}"
             );
-        }
+        });
     }
 
-    #[tokio::test]
-    async fn extended_card_from_a_fabric_peer_on_an_error_status_is_still_rewritten() {
-        let card = json!({"name": "agent", "url": TARGET_URL});
-        let peer = fabric_peer_answering(500, json!({"jsonrpc": "2.0", "id": "card-1", "result": card})).await;
+    #[test]
+    fn unrewritable_extended_card_from_a_fabric_peer_is_refused_with_a_jsonrpc_error() {
+        run_on_large_stack(async {
+            for result in [json!(TARGET_URL), json!({"agentCard": {"supportedInterfaces": [{"url": TARGET_URL}]}})] {
+                let peer =
+                    fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "card-1", "result": result})).await;
 
-        let (_, body) = get_extended_card(&peer).await;
+                let (status, body) = get_extended_card(&peer).await;
 
-        let url = body["result"]["url"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(url.starts_with("https://gateway.example"), "{body}");
+                assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+                assert_eq!(body["jsonrpc"], "2.0", "{body}");
+                assert_eq!(body["id"], "card-1", "{body}");
+                assert_eq!(body["error"]["code"], -32603, "{body}");
+                assert!(
+                    !body
+                        .to_string()
+                        .contains("backend.internal"),
+                    "{body}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn extended_card_from_a_fabric_peer_on_an_error_status_is_still_rewritten() {
+        run_on_large_stack(async {
+            let card = json!({"name": "agent", "url": TARGET_URL});
+            let peer = fabric_peer_answering(500, json!({"jsonrpc": "2.0", "id": "card-1", "result": card})).await;
+
+            let (_, body) = get_extended_card(&peer).await;
+
+            let url = body["result"]["url"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(url.starts_with("https://gateway.example"), "{body}");
+        });
     }
 }

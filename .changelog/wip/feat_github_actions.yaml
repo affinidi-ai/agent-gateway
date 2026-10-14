@@ -83,3 +83,6 @@ changes:
     - timestamp: '2026-10-14T00:00:00Z'
       title: Reject duplicate changelog YAML keys
       description: Use a shared YAML loader that rejects duplicate mapping keys so release entries cannot silently disappear before validation or rendering.
+    - timestamp: '2026-10-14T00:00:00Z'
+      title: Give Fabric extended-card tests a larger stack
+      description: Run the deep Fabric extended-card proxy tests on an 8 MiB stack to prevent stack overflow in CI unit and coverage jobs.
