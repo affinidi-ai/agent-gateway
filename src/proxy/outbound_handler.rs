@@ -3685,7 +3685,6 @@ async fn step_inject_trusted_identity(
                         .target_endpoint
                         .as_str(),
                 ),
-                policy_decisions: crate::observability::policy_audit::current_policy_decisions(),
                 ..Default::default()
             },
         );

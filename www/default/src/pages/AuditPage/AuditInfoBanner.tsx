@@ -34,9 +34,8 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
             whether a caller or target agent is recognised.
           </FieldHelp>{' '}
           trust-check outcome, and Verifiable Presentation injected on behalf of the calling agent.
-          Each entry is embedded in the signed VP, so its <code>policyDecisions</code> are
-          cryptographically attested. Entries appear only when a request actually exercises the
-          pipeline, and only while VP Auditing is enabled in Settings › Security.
+          Entries appear only when a request actually exercises the pipeline, and only while VP
+          Auditing is enabled in Settings › Security.
         </p>
         <p className="mb-2">
           To send every entry to Kafka, Kinesis, Pulsar, Redis Streams, a webhook, email, or Slack
@@ -47,8 +46,7 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
         <ul className="mb-0 ps-3">
           <li>
             <strong>Policy Decisions</strong> (<code>policy_decision</code>): a gateway, surface,
-            MCP-tool or response OPA policy allowed or denied the request; the decision is attested
-            in the signed VP&rsquo;s <code>policyDecisions</code>.
+            MCP-tool or response OPA policy allowed or denied the request.
           </li>
           <li>
             <strong>Trust Checks</strong> (<code>trust_check</code>): a per-leg TRQP

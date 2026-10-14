@@ -135,9 +135,8 @@ pub struct DelegationAuditEvent {
     /// VP JWT injected into the upstream response (if identity VP was sent)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vp_jwt: Option<String>,
-    /// SHA-256 fingerprint of the VP JWT (`sha256:<hex>`). Lets verifiers
-    /// confirm that the policy decisions listed in `workloadBinding.policyDecisions`
-    /// inside the signed VP match what the audit log recorded for this request.
+    /// SHA-256 fingerprint of the VP JWT (`sha256:<hex>`). Lets verifiers tie
+    /// this record to the exact signed VP that was injected for the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vp_fingerprint: Option<String>,
     /// Request trace ID — correlates all audit events for the same request

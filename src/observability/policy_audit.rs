@@ -17,17 +17,14 @@
 //! This module is logging-only: it never alters the HTTP response returned to
 //! a caller.
 //!
-//! ## Per-request VP embedding
+//! ## Per-request collection
 //!
 //! When a task-local [`POLICY_DECISION_COLLECTOR`] scope is active (installed
-//! by `multi_channel_proxy_handler` around the entire request), every decision is also
-//! pushed into a lightweight [`PolicyDecisionSummary`] list. The workload
-//! binding builder reads this list from [`POLICY_DECISION_COLLECTOR`] and embeds
-//! it as `policyDecisions` in the VP minted for that request — so the signed VP
-//! carries a cryptographic proof of every allow/deny decision that governed it.
-//! Embedding is gated by the `policies` VP audit category (Settings › Security):
-//! the builder skips embedding when it is disabled, so operators
-//! can turn off all policy-decision evidence recording.
+//! by `multi_channel_proxy_handler` and the fabric `ForwardRequest` dispatch
+//! around the entire request), every decision is also pushed into a
+//! lightweight [`PolicyDecisionSummary`] list for that request. The list is
+//! never embedded in a minted VP: what goes on the wire to another gateway
+//! does not depend on audit configuration.
 
 use std::sync::{Arc, Mutex};
 
@@ -100,28 +97,6 @@ tokio::task_local! {
     /// so a request's audit events + policy decisions share a `trace_id` even
     /// when no OTEL exporter is configured. Absent elsewhere (`try_with` errs).
     pub static REQUEST_TRACE_ID: String;
-}
-
-/// Snapshot the current decisions as a JSON array for embedding in a VP.
-/// Returns `None` when the collector is empty or inactive.
-///
-/// Also returns `None` when no audit sink selects `policy_decision`: the
-/// signed `policyDecisions` are embedded in minted VPs only while policy
-/// decisions are being audited.
-pub fn current_policy_decisions() -> Option<serde_json::Value> {
-    if !crate::audit::producer::producer().wants("policy_decision") {
-        return None;
-    }
-    POLICY_DECISION_COLLECTOR
-        .try_with(|q| {
-            let g = q.lock().ok()?;
-            if g.is_empty() {
-                return None;
-            }
-            serde_json::to_value(&*g).ok()
-        })
-        .ok()
-        .flatten()
 }
 
 /// Push a decision into the per-request collector (no-op when no scope is active).
@@ -451,9 +426,8 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
         );
     }
 
-    // A record is built only when an audit sink selects `policy_decision`; the
-    // same selection decides whether the signed `policyDecisions` are embedded
-    // in minted VPs. The `policy_audit` tracing events above are always emitted.
+    // A record is built only when an audit sink selects `policy_decision`. The
+    // `policy_audit` tracing events above are always emitted.
     if crate::audit::producer::producer().wants("policy_decision") {
         crate::delegation_vault::audit::audit_policy_decision(
             scope,
@@ -495,11 +469,8 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
         );
     }
 
-    // Push the full decision into the per-request VP collector so the signed VP
-    // carries a tamper-evident record of every decision that governed this
-    // request. The collector is always populated; whether these decisions are
-    // actually embedded into a minted VP is gated at the embedding site by the
-    // same `policies` audit category.
+    // Push the full decision into the per-request collector. It is always
+    // populated when a scope is active and is never embedded in a minted VP.
     let deny_reason_val = (!allowed && !reason.is_empty()).then(|| reason.to_string());
     let id = compute_decision_id(scope, policy_id, decision, deny_reason_val.as_deref(), resolved_trace_id.as_deref());
     // Use the operator-assigned definition name when available; fall back to the Rego package name.

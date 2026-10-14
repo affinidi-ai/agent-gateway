@@ -69,8 +69,9 @@ The impact endpoint does not count those surfaces either.
 
 Every OPA decision made by a stored policy definition records the definition's name and
 the enforced `policy_version` and `content_hash` in the audit event, and, when the
-`policy_decision` audit event is selected, in the JSONL `PolicyDecision` and the signed
-`PolicyDecisionSummary`. That covers gateway, appliance-wide, surface, access-point
+`policy_decision` audit event is selected, in the JSONL `PolicyDecision`. Policy decisions
+are never embedded in a minted VP: audit configuration does not change what the gateway
+sends on the wire. That covers gateway, appliance-wide, surface, access-point
 inbound, Transit Point, and response policies, and a denying MCP tool policy, on the
 direct, MCP-proxy, outbound, and fabric paths.
 

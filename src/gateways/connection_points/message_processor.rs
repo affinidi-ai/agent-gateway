@@ -516,8 +516,7 @@ pub async fn process_message_internal(
         // tokio worker thread stack overflow. Installs the per-request policy
         // decision collector (a task-local otherwise only set by the HTTP
         // `multi_channel_proxy_handler`) so surface/gateway OPA decisions on the fabric leg
-        // are captured and can be embedded as `workloadBinding.policyDecisions`
-        // in the backend-agent VP GW2 injects into the response.
+        // are gathered per request like on the direct path.
         MessageType::ForwardRequest => {
             // Continue the upstream gateway's trace (from the message `trace_id`),
             // seeded into `REQUEST_TRACE_ID` so audit + the injected VP `traceId`
@@ -6745,12 +6744,6 @@ async fn process_forward_request_with_mcp_runtime(
                                         binding.as_object_mut(),
                                     ) {
                                         obj.insert("traceId".to_string(), serde_json::Value::String(tid));
-                                    }
-                                    if let (Some(decisions), Some(obj)) = (
-                                        crate::observability::policy_audit::current_policy_decisions(),
-                                        binding.as_object_mut(),
-                                    ) {
-                                        obj.insert("policyDecisions".to_string(), decisions);
                                     }
                                     Some(binding)
                                 } else {

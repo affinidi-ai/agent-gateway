@@ -11,6 +11,9 @@ changes:
       title: Give every governance audit record a unique event_id
       description: Each record written to the VP Audit Log and sent to Governance Audit integrations now carries event_id, a UUID v4. Receivers can use it to recognise a record delivered more than once. Records stored before this change have no event_id and still read.
   changed:
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Stop embedding policy decisions in minted VPs
+      description: The workloadBinding of a VP minted on the Transit Point, response, outbound and Fabric paths no longer carries policyDecisions. Whether it did depended on the VP Audit Log selection, so an audit setting changed what the gateway sent to another gateway. Policy decisions are still recorded as policy_decision audit records. VPs received from older gateways that still carry policyDecisions are read as before.
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Store VP Audit selections as audit event names
       description: Settings › VP Audit now saves the selected audit events as audit_events, a list of event names such as policy_decision, instead of the audit_categories booleans. The settings API takes and returns audit_events and rejects names that are not audit events. Settings saved with audit_categories are read as the matching events (policies as policy_decision, trust_checks as trust_check, identity as vp_injected), so existing selections are kept.

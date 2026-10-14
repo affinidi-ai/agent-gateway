@@ -9536,8 +9536,8 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
                 .config_id()
                 .unwrap_or("unknown");
             // Install the per-request policy-decision collector so OPA decisions
-            // pushed inside `proxy_handler_with_mcp_runtime` are visible to the VP injectors
-            // when they read POLICY_DECISION_COLLECTOR to embed policyDecisions in the VP.
+            // pushed inside `proxy_handler_with_mcp_runtime` are gathered per request
+            // in POLICY_DECISION_COLLECTOR.
             let policy_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
                 crate::observability::policy_audit::PolicyDecisionSummary,
             >::new()));
@@ -15736,7 +15736,7 @@ async fn inject_backend_agent_vp(
 
     // Build the fabric-style workload binding for the response-leg VP:
     // agentIdentity (the managed agent) + userIdentity.id (the resolved inbound
-    // caller) + delegated + traceId + policyDecisions.
+    // caller) + delegated + traceId.
     let workload_binding: Option<serde_json::Value> =
         build_response_workload_binding(identity_fields, caller_id, trace_id);
 
@@ -15995,7 +15995,6 @@ fn build_target_request_workload_binding(
             caller: captured.as_ref(),
             trace_id: Some(trace_id),
             target: Some(surface.target_endpoint()),
-            policy_decisions: crate::observability::policy_audit::current_policy_decisions(),
             delegation_actions,
             ..Default::default()
         },
@@ -16005,7 +16004,7 @@ fn build_target_request_workload_binding(
 /// Build the fabric-style `workloadBinding` credential-subject for a response-
 /// or outbound-leg VP: `agentIdentity` (the managed agent, raw dot-notation
 /// fields) plus, when a caller id is present, `userIdentity.id` + `delegated`,
-/// and `traceId` / `policyDecisions` when available for this request. Matches the
+/// and `traceId` when available for this request. Matches the
 /// GW2 fabric response-leg shape (see
 /// `gateways::connection_points::message_processor`) so the direct and fabric
 /// paths carry the same envelope. Always returns `Some(..)`, so the injected VP
@@ -16027,9 +16026,6 @@ fn build_response_workload_binding(
     }
     if !trace_id.is_empty() {
         binding.insert("traceId".to_string(), serde_json::Value::String(trace_id.to_string()));
-    }
-    if let Some(decisions) = crate::observability::policy_audit::current_policy_decisions() {
-        binding.insert("policyDecisions".to_string(), decisions);
     }
     Some(serde_json::Value::Object(binding))
 }
