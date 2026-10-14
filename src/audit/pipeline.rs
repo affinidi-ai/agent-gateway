@@ -21,7 +21,7 @@ use crate::audit::integration_sink::ProductionSinks;
 use crate::audit::journal::{JournalWriter, WriterConfig, WriterStopped, spawn_writer};
 use crate::audit::producer::{Producer, producer};
 use crate::audit::registry::{Sinks, sinks};
-use crate::audit::sources::rebuild_sinks;
+use crate::audit::sources::rebuild_sinks_within;
 use crate::integrations::audit_integration_triggers::publish_audit_delivery;
 
 const SEGMENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -101,13 +101,15 @@ impl Pipeline {
 
 /// Starts the pipeline for `producer` and `sinks`, keeping the journal under
 /// `audit_dir/journal` and the VP Audit Log at `audit_log`. Everything that
-/// can fail is opened before anything starts. Fails with
-/// [`io::ErrorKind::WouldBlock`] while another writer has the journal open.
+/// can fail is opened before anything starts. Every job runs under `cancel`.
+/// Fails with [`io::ErrorKind::WouldBlock`] while another writer has the
+/// journal open.
 pub fn start_with(
     producer: &'static Producer,
     sinks: &'static Sinks,
     audit_dir: &Path,
     audit_log: &Path,
+    cancel: CancellationToken,
 ) -> io::Result<Pipeline> {
     let journal_dir = audit_dir.join("journal");
     let writer = JournalWriter::open(&journal_dir, SEGMENT_MAX_BYTES)?;
@@ -122,7 +124,6 @@ pub fn start_with(
             .saturating_sub(1),
     );
     let (journal, pending) = mpsc::channel();
-    let cancel = CancellationToken::new();
     let writer = spawn_writer(writer, pending, durable_tx, WriterConfig::default(), cancel.clone())?;
     producer.connect(journal);
 
@@ -144,18 +145,25 @@ pub fn start_with(
 }
 
 /// Builds the current sinks into the registry; false when they could not be
-/// built.
-pub type BuildSinks = Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
+/// built. Anything it leaves running, such as a rebuild retry, ends once the
+/// given token is cancelled.
+pub type BuildSinks = Arc<dyn Fn(&CancellationToken) -> BoxFuture<'static, bool> + Send + Sync>;
 
 /// Runs at most one pipeline for a journal, started and stopped as the node
 /// becomes Active or Standby. The sinks are built before every start, so the
 /// dispatcher never starts from sinks that were never built or are stale.
+///
+/// Each period between stops has its own cancellation token, its epoch: a
+/// wait to start, the sink rebuild retries and the pipeline's own token are
+/// all under it, and [`PipelineControl::stop`] cancels it once the pipeline
+/// has stopped gracefully.
 pub struct PipelineControl {
     producer: &'static Producer,
     sinks: &'static Sinks,
     audit_dir: PathBuf,
     audit_log: PathBuf,
     build_sinks: BuildSinks,
+    epoch: parking_lot::Mutex<CancellationToken>,
     running: tokio::sync::Mutex<Option<Pipeline>>,
 }
 
@@ -173,6 +181,7 @@ impl PipelineControl {
             audit_dir,
             audit_log,
             build_sinks,
+            epoch: parking_lot::Mutex::new(CancellationToken::new()),
             running: tokio::sync::Mutex::new(None),
         }
     }
@@ -184,7 +193,19 @@ impl PipelineControl {
         audit_dir: PathBuf,
         audit_log: PathBuf,
     ) -> Self {
-        Self::new(producer(), sinks(), audit_dir, audit_log, Arc::new(|| Box::pin(rebuild_sinks())))
+        Self::new(
+            producer(),
+            sinks(),
+            audit_dir,
+            audit_log,
+            Arc::new(|epoch| Box::pin(rebuild_sinks_within(epoch.clone()))),
+        )
+    }
+
+    /// The token of the current period, cancelled by the next
+    /// [`PipelineControl::stop`].
+    pub fn epoch(&self) -> CancellationToken {
+        self.epoch.lock().clone()
     }
 
     /// Starts the pipeline unless it is running. Fails with
@@ -192,28 +213,29 @@ impl PipelineControl {
     /// another writer has the journal open.
     pub async fn try_start(&self) -> io::Result<()> {
         let mut running = self.running.lock().await;
-        self.start_into(&mut running)
+        let epoch = self.epoch();
+        self.start_into(&mut running, &epoch)
             .await
     }
 
     /// Starts the pipeline, trying again every `retry` while the sinks cannot
     /// be built or another writer has the journal open. Gives up with
-    /// `Ok(false)` once `wanted` returns false. `wanted` is checked under the
-    /// lock [`PipelineControl::stop`] takes, so a late start never undoes a
-    /// stop.
+    /// `Ok(false)` once `epoch` is cancelled. `epoch` is checked under the
+    /// lock [`PipelineControl::stop`] takes, so a start for a period that a
+    /// stop ended never happens.
     pub async fn start_when_free(
         &self,
         retry: Duration,
-        wanted: impl Fn() -> bool,
+        epoch: &CancellationToken,
     ) -> io::Result<bool> {
         loop {
             {
                 let mut running = self.running.lock().await;
-                if !wanted() {
+                if epoch.is_cancelled() {
                     return Ok(false);
                 }
                 match self
-                    .start_into(&mut running)
+                    .start_into(&mut running, epoch)
                     .await
                 {
                     Ok(()) => return Ok(true),
@@ -221,32 +243,42 @@ impl PipelineControl {
                     Err(e) => return Err(e),
                 }
             }
-            tokio::time::sleep(retry).await;
+            if epoch
+                .run_until_cancelled(tokio::time::sleep(retry))
+                .await
+                .is_none()
+            {
+                return Ok(false);
+            }
         }
     }
 
-    /// Builds the sinks, then starts the pipeline into `running` unless one
-    /// is already there.
+    /// Builds the sinks, then starts the pipeline into `running`, under
+    /// `epoch`, unless one is already there.
     async fn start_into(
         &self,
         running: &mut Option<Pipeline>,
+        epoch: &CancellationToken,
     ) -> io::Result<()> {
         if running.is_some() {
             return Ok(());
         }
-        if !(self.build_sinks)().await {
+        if !(self.build_sinks)(epoch).await {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "the audit sinks could not be built"));
         }
-        *running = Some(start_with(self.producer, self.sinks, &self.audit_dir, &self.audit_log)?);
+        *running = Some(start_with(self.producer, self.sinks, &self.audit_dir, &self.audit_log, epoch.child_token())?);
         Ok(())
     }
 
-    /// Stops the pipeline if it is running, releasing the journal.
+    /// Stops the pipeline gracefully if it is running, releasing the journal,
+    /// then ends the period: a wait to start and the sink rebuild retries end
+    /// with it.
     pub async fn stop(&self) {
         let mut running = self.running.lock().await;
         if let Some(pipeline) = running.take() {
             pipeline.stop().await;
         }
+        std::mem::take(&mut *self.epoch.lock()).cancel();
     }
 }
 
@@ -284,7 +316,7 @@ mod tests {
         sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
         let producer: &'static Producer = Box::leak(Box::new(Producer::new(sinks)));
 
-        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
         let record = audit_event(DelegationAuditAction::ConsentGranted, None, None, Some("github"), None);
         let event_id = record.event_id.clone();
         producer.submit(record);
@@ -315,7 +347,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
 
         producer.submit(audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None));
         let journal = dir.path().join("journal");
@@ -338,7 +370,7 @@ mod tests {
             .path()
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
-        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
         producer.submit(consent());
         wait_until(|| stored(&log).len() == 1).await;
 
@@ -356,7 +388,7 @@ mod tests {
             .path()
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
-        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
         producer.submit(consent());
         wait_until(|| stored(&log).len() == 1).await;
         let cursors = pipeline.cursors.clone();
@@ -385,7 +417,7 @@ mod tests {
             .path()
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
-        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
         assert!(journal_locked(dir.path()));
 
         drop(pipeline);
@@ -401,7 +433,7 @@ mod tests {
     }
 
     fn built() -> BuildSinks {
-        Arc::new(|| Box::pin(async { true }))
+        Arc::new(|_| Box::pin(async { true }))
     }
 
     fn consent() -> DelegationAuditEvent {
@@ -431,13 +463,13 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (producer, sinks) = parts();
 
-        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
         producer.submit(consent());
         pipeline.stop().await;
         assert_eq!(journal_seqs(dir.path()), vec![1]);
 
         producer.submit(consent());
-        let pipeline = start_with(producer, sinks, dir.path(), &log).unwrap();
+        let pipeline = start_with(producer, sinks, dir.path(), &log, CancellationToken::new()).unwrap();
         producer.submit(consent());
 
         wait_until(|| stored(&log).len() == 2).await;
@@ -454,14 +486,14 @@ mod tests {
         let (first_producer, first_sinks) = parts();
         let (second_producer, second_sinks) = parts();
 
-        let first = start_with(first_producer, first_sinks, dir.path(), &log).unwrap();
-        let busy = start_with(second_producer, second_sinks, dir.path(), &log)
+        let first = start_with(first_producer, first_sinks, dir.path(), &log, CancellationToken::new()).unwrap();
+        let busy = start_with(second_producer, second_sinks, dir.path(), &log, CancellationToken::new())
             .err()
             .unwrap();
         assert_eq!(busy.kind(), io::ErrorKind::WouldBlock);
 
         first.stop().await;
-        let second = start_with(second_producer, second_sinks, dir.path(), &log).unwrap();
+        let second = start_with(second_producer, second_sinks, dir.path(), &log, CancellationToken::new()).unwrap();
         second.stop().await;
     }
 
@@ -488,7 +520,12 @@ mod tests {
             .await
             .unwrap();
         active_producer.submit(consent());
-        let promoted = tokio::spawn(standby.start_when_free(Duration::from_millis(10), || true));
+        let epoch = standby.epoch();
+        let promoted = tokio::spawn(async move {
+            standby
+                .start_when_free(Duration::from_millis(10), &epoch)
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!promoted.is_finished());
 
@@ -506,10 +543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_for_the_journal_ends_once_starting_is_no_longer_wanted() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
+    async fn waiting_for_the_journal_ends_once_the_control_is_stopped() {
         let dir = TempDir::new().unwrap();
         let log = dir
             .path()
@@ -524,18 +558,77 @@ mod tests {
             .await
             .unwrap();
 
-        let wanted = Arc::new(AtomicBool::new(true));
-        let still_wanted = wanted.clone();
-        let (started, ()) = tokio::join!(
-            waiting.start_when_free(Duration::from_millis(10), move || still_wanted.load(Ordering::SeqCst)),
-            async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                wanted.store(false, Ordering::SeqCst);
-            }
-        );
+        let epoch = waiting.epoch();
+        let (started, ()) = tokio::join!(waiting.start_when_free(Duration::from_secs(60), &epoch), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waiting.stop().await;
+        });
 
         assert!(!started.unwrap());
+        assert!(epoch.is_cancelled());
+        assert!(!waiting.epoch().is_cancelled());
         active.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_wait_to_start_from_before_a_stop_never_starts_the_pipeline() {
+        let dir = TempDir::new().unwrap();
+        let log = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let (producer, sinks) = parts();
+        let (build, attempts) = building(&[true]);
+        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, build);
+        let epoch = control.epoch();
+
+        control.stop().await;
+        let started = control
+            .start_when_free(Duration::from_millis(5), &epoch)
+            .await
+            .unwrap();
+
+        assert!(!started);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            !dir.path()
+                .join("journal")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sinks_are_built_under_the_period_a_stop_ends() {
+        let dir = TempDir::new().unwrap();
+        let log = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let (producer, sinks) = parts();
+        let seen: Arc<parking_lot::Mutex<Vec<CancellationToken>>> = Arc::default();
+        let recorded = seen.clone();
+        let build: BuildSinks = Arc::new(move |epoch| {
+            recorded
+                .lock()
+                .push(epoch.clone());
+            Box::pin(async { true })
+        });
+        let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log, build);
+
+        control
+            .try_start()
+            .await
+            .unwrap();
+        assert!(!seen.lock()[0].is_cancelled());
+        control.stop().await;
+        control
+            .try_start()
+            .await
+            .unwrap();
+
+        let seen = seen.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].is_cancelled());
+        assert!(!seen[1].is_cancelled());
+        control.stop().await;
     }
 
     #[tokio::test]
@@ -571,7 +664,7 @@ mod tests {
     fn building(outcomes: &[bool]) -> (BuildSinks, Arc<std::sync::atomic::AtomicUsize>) {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (outcomes, counted) = (outcomes.to_vec(), attempts.clone());
-        let build: BuildSinks = Arc::new(move || {
+        let build: BuildSinks = Arc::new(move |_| {
             let attempt = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let built = outcomes
                 .get(attempt)
@@ -594,7 +687,7 @@ mod tests {
         let journal = dir.path().join("journal");
         let built_first = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = built_first.clone();
-        let build: BuildSinks = Arc::new(move || {
+        let build: BuildSinks = Arc::new(move |_| {
             seen.store(!journal.exists(), std::sync::atomic::Ordering::SeqCst);
             sinks.replace(
                 vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))],
@@ -651,7 +744,7 @@ mod tests {
         let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log.clone(), build);
 
         let started = control
-            .start_when_free(Duration::from_millis(5), || true)
+            .start_when_free(Duration::from_millis(5), &control.epoch())
             .await
             .unwrap();
         producer.submit(consent());

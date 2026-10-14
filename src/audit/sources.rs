@@ -1,11 +1,11 @@
 //! Builds the audit sinks from where each one is configured.
 
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::audit::registry::{EventMask, Sink, SinkId, Sinks, sinks};
@@ -17,7 +17,10 @@ use crate::storage::{Integration, IntegrationStorage, get_integration_storage};
 
 /// Held for a whole rebuild, so rebuilds apply in the order they start.
 static REBUILDING: Mutex<()> = Mutex::const_new(());
-static RETRY_SCHEDULED: AtomicBool = AtomicBool::new(false);
+/// The rebuild retry scheduled after a failed rebuild.
+static RETRY: parking_lot::Mutex<Option<CancellationToken>> = parking_lot::const_mutex(None);
+/// The token rebuild retries run under (see [`rebuild_sinks_within`]).
+static RETRY_SCOPE: LazyLock<parking_lot::Mutex<CancellationToken>> = LazyLock::new(Default::default);
 const REBUILD_RETRY: Duration = Duration::from_secs(5);
 
 /// Each active, appliance-wide Governance Audit integration as a sink.
@@ -68,18 +71,45 @@ pub fn build_sinks(
 /// at a time. When the integrations cannot be listed the current sinks are
 /// kept, so no record addressed to an integration is lost, the failure is
 /// counted, and the rebuild is retried every [`REBUILD_RETRY`] until it
-/// succeeds. Returns whether this rebuild replaced the sinks.
+/// succeeds or the scope set by [`rebuild_sinks_within`] is cancelled.
+/// Returns whether this rebuild replaced the sinks.
 pub async fn rebuild_sinks() -> bool {
     if rebuild_current().await {
         return true;
     }
-    if !RETRY_SCHEDULED.swap(true, Ordering::SeqCst) {
-        tokio::spawn(async {
-            retry_until_rebuilt(REBUILD_RETRY, rebuild_current).await;
-            RETRY_SCHEDULED.store(false, Ordering::SeqCst);
-        });
-    }
+    schedule_retry();
     false
+}
+
+/// [`rebuild_sinks`] for the audit pipeline: rebuild retries from now on run
+/// under `scope` and end once it is cancelled, and a retry scheduled under an
+/// earlier scope is stopped.
+pub async fn rebuild_sinks_within(scope: CancellationToken) -> bool {
+    *RETRY_SCOPE.lock() = scope;
+    if let Some(retry) = RETRY.lock().take() {
+        retry.cancel();
+    }
+    rebuild_sinks().await
+}
+
+/// Schedules a rebuild retry under the current scope unless one is running.
+/// A retry that ends is cancelled, so the next failure schedules another.
+fn schedule_retry() {
+    let mut scheduled = RETRY.lock();
+    if scheduled
+        .as_ref()
+        .is_some_and(|retry| !retry.is_cancelled())
+    {
+        return;
+    }
+    let retry = RETRY_SCOPE
+        .lock()
+        .child_token();
+    *scheduled = Some(retry.clone());
+    tokio::spawn(async move {
+        retry_until_rebuilt(REBUILD_RETRY, rebuild_current, &retry).await;
+        retry.cancel();
+    });
 }
 
 async fn rebuild_current() -> bool {
@@ -154,16 +184,29 @@ async fn reload(
     integrations.invalidate_all();
 }
 
+/// Attempts the rebuild every `delay` until an attempt succeeds or `cancel`
+/// fires, which also drops an attempt in flight.
 async fn retry_until_rebuilt<A, F>(
     delay: Duration,
     mut attempt: A,
+    cancel: &CancellationToken,
 ) where
     A: FnMut() -> F,
     F: Future<Output = bool>,
 {
     loop {
-        tokio::time::sleep(delay).await;
-        if attempt().await {
+        if cancel
+            .run_until_cancelled(tokio::time::sleep(delay))
+            .await
+            .is_none()
+        {
+            return;
+        }
+        if cancel
+            .run_until_cancelled(attempt())
+            .await
+            .is_none_or(|rebuilt| rebuilt)
+        {
             return;
         }
     }
@@ -511,15 +554,64 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_failed_rebuild_is_retried_until_it_succeeds() {
-        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let attempts = AtomicUsize::new(0);
-        retry_until_rebuilt(Duration::from_secs(5), || {
-            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            async move { attempt == 3 }
-        })
+        retry_until_rebuilt(
+            Duration::from_secs(5),
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { attempt == 3 }
+            },
+            &CancellationToken::new(),
+        )
         .await;
 
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuild_retry_ends_once_cancelled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let cancel = CancellationToken::new();
+        retry_until_rebuilt(
+            Duration::from_secs(5),
+            || {
+                if attempts.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    cancel.cancel();
+                }
+                async { false }
+            },
+            &cancel,
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuild_retry_cancelled_while_waiting_makes_no_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let cancel = CancellationToken::new();
+        let (_, ()) = tokio::join!(
+            retry_until_rebuilt(
+                Duration::from_secs(5),
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async { false }
+                },
+                &cancel,
+            ),
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                cancel.cancel();
+            }
+        );
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
     }
 }

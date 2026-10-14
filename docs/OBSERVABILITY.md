@@ -264,7 +264,8 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   traffic after one start attempt; a refused start keeps being retried in the background. The
   writer holds an exclusive lock on `journal/journal.lock`, so a second process sharing the
   directory cannot write to it; a node that becomes Active while another still holds the lock
-  tries again every 5 s.
+  tries again every 5 s. Stepping down ends these retries, and the sink rebuild retries below,
+  along with the pipeline.
 - *Dispatch.* Each sink has its own reader and cursor (`journal/cursors.json`). A reader
   delivers the records addressed to its sink in journal order and saves its cursor after each
   batch, so it resumes there after a restart; a slow or unreachable destination only delays
@@ -294,7 +295,7 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   rebuild never replaces newer sinks. When the integrations cannot be listed, including before
   integration storage is set up, the previous sinks are kept, the failure is counted in
   `agent_gateway_audit_sink_rebuild_failed_total`, and the rebuild is retried every 5 s until it
-  succeeds.
+  succeeds or the node steps down.
 - *Backlog.* Journal segments every active cursor has passed are deleted. The journal size is
   reported in `agent_gateway_audit_journal_bytes` and logged as a warning above 256 MiB. Above
   1 GiB, every sink still in the oldest segment is moved past it so the segment can be deleted;

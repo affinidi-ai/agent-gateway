@@ -713,8 +713,9 @@ pub async fn set_audit_pipeline_mode(mode: ServerMode) {
 /// Builds the audit sinks and starts the pipeline. While the sinks cannot be
 /// built, or another writer still has the journal open (a node that has not
 /// finished stepping down), keeps trying in the background until it starts
-/// or this node is no longer Active.
+/// or the pipeline is stopped for Standby.
 async fn start_audit_pipeline(control: &'static PipelineControl) {
+    let epoch = control.epoch();
     match control.try_start().await {
         Ok(()) => audit_pipeline_started(),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -726,7 +727,7 @@ async fn start_audit_pipeline(control: &'static PipelineControl) {
             );
             tokio::spawn(async move {
                 match control
-                    .start_when_free(AUDIT_JOURNAL_RETRY, || !crate::server::mode::is_standby())
+                    .start_when_free(AUDIT_JOURNAL_RETRY, &epoch)
                     .await
                 {
                     Ok(true) => audit_pipeline_started(),
