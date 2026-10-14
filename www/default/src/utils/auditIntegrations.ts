@@ -88,8 +88,7 @@ export function auditDeliveryLimitsPayload(
   limits: AuditDeliveryLimits,
   clearEmpty: boolean
 ): { audit_max_attempts?: number | null; audit_drop_after_secs?: number | null } {
-  const payload: { audit_max_attempts?: number | null; audit_drop_after_secs?: number | null } =
-    {};
+  const payload: { audit_max_attempts?: number | null; audit_drop_after_secs?: number | null } = {};
   const maxAttempts = limitValue(limits.maxAttempts, clearEmpty);
   if (maxAttempts !== undefined) payload.audit_max_attempts = maxAttempts;
   const dropAfterSecs = limitValue(limits.dropAfterSecs, clearEmpty);

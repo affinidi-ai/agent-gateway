@@ -160,9 +160,14 @@ async fn deliver_from_cursor<D: Deliver>(
                 let delivery = if expired() {
                     Delivery::Abandoned
                 } else {
-                    deliver_until_accepted(&deliver, entry, &sink, &config, || max_attempts(), || {
-                        moved_past() || expired()
-                    })
+                    deliver_until_accepted(
+                        &deliver,
+                        entry,
+                        &sink,
+                        &config,
+                        || max_attempts(),
+                        || moved_past() || expired(),
+                    )
                     .await
                 };
                 match delivery {
@@ -590,7 +595,10 @@ enum Delivery {
     Abandoned,
     /// It failed as many times as the sink's attempt limit; `error` is the
     /// last failure.
-    Rejected { attempts: u32, error: anyhow::Error },
+    Rejected {
+        attempts: u32,
+        error: anyhow::Error,
+    },
 }
 
 /// Retries until the sink accepts the record, it has failed `max_attempts`

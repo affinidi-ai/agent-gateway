@@ -362,7 +362,12 @@ pub async fn create_notifier(
     ensure_audit_integration_is_global(req.category.as_deref(), req.tenant_id.as_deref())?;
     validate_audit_events(req.category.as_deref(), &req.audit_events)?;
     validate_audit_limit(req.category.as_deref(), "audit_drop_after_secs", req.audit_drop_after_secs)?;
-    validate_audit_limit(req.category.as_deref(), "audit_max_attempts", req.audit_max_attempts.map(u64::from))?;
+    validate_audit_limit(
+        req.category.as_deref(),
+        "audit_max_attempts",
+        req.audit_max_attempts
+            .map(u64::from),
+    )?;
     // Validate name
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Integration name is required".to_string()));
