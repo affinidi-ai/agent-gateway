@@ -240,7 +240,16 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   to 256 records or 5 ms and syncs each batch to disk before any sink may read it. A crash can
   lose at most the last unsynced batch. If the journal cannot be written the writer retries with
   backoff while holding up to 10,000 records in memory; beyond that the oldest are discarded and
-  counted in `agent_gateway_audit_records_lost_total{reason="journal_write"}`.
+  counted in `agent_gateway_audit_records_lost_total{reason="journal_write"}`. A failed batch
+  is cut off again; if that fails too, the segment is re-read before the next batch, as on start.
+  The journal directory is owner-only (`0700`) and its files `0600`.
+- *One writer.* Only an Active node runs the pipeline (see
+  [Server mode](CONFIGURATION_RELOAD.md#server-mode)); a Standby node keeps no audit records.
+  On stepping down a node journals what it was handed, stops delivering and releases the
+  journal; on becoming Active it re-opens the journal and cursors from disk and continues after
+  the last record the previous Active node wrote. The writer holds an exclusive lock on
+  `journal/journal.lock`, so a second process sharing the directory cannot write to it; a node
+  that becomes Active while another still holds the lock tries again every 5 s.
 - *Dispatch.* Each sink has its own reader and cursor (`journal/cursors.json`). A reader
   delivers the records addressed to its sink in journal order and saves its cursor after each
   batch, so it resumes there after a restart; a slow or unreachable destination only delays
@@ -254,7 +263,11 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   is parked, and the sink resumes from it if it comes back. An integration that is disabled, or
   changed so it no longer receives audit records, refuses records until its reader is stopped,
   so nothing addressed to it is passed over; each refusal is counted with
-  `result="not_receiving"`.
+  `result="not_receiving"`. The sinks are rebuilt from the settings and integrations one rebuild
+  at a time, so an older rebuild never replaces newer sinks. When the integrations cannot be
+  listed the previous sinks are kept, the failure is counted in
+  `agent_gateway_audit_sink_rebuild_failed_total`, and the rebuild is retried every 5 s until it
+  succeeds.
 - *Backlog.* Journal segments every active cursor has passed are deleted. The journal size is
   reported in `agent_gateway_audit_journal_bytes` and logged as a warning above 256 MiB. Above
   1 GiB, every sink still in the oldest segment is moved past it so the segment can be deleted;
@@ -275,9 +288,10 @@ Records produced are counted in `agent_gateway_audit_records_produced_total{even
 integration deliveries in
 `agent_gateway_audit_forward_total{result="delivered"|"failed"|"not_receiving", integration_id}`.
 
-`agent_gateway_audit_pipeline_started` is 1 once the pipeline has started and 0 when it could
-not start (the journal directory cannot be created or written, for example). While it is 0 the
-gateway keeps serving requests but keeps and forwards no audit records; alert on it.
+`agent_gateway_audit_pipeline_started` is 1 while the pipeline runs and 0 when it could not start
+(the journal directory cannot be created or written, for example) or the node is in Standby.
+While it is 0 on an Active node the gateway keeps serving requests but keeps and forwards no
+audit records; alert on that.
 
 **Payload.** Audit templates may use `EVENT_TYPE`, `TIMESTAMP` (the record's own timestamp),
 `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,

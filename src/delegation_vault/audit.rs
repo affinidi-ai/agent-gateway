@@ -17,10 +17,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::{error, info, warn};
+
+use crate::audit::pipeline::PipelineControl;
+use crate::metrics::backends::prometheus::set_audit_pipeline_started;
+use crate::server::mode::ServerMode;
 
 /// Global audit file path — for reading the log
 static AUDIT_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// The audit pipeline, run only while the node is Active.
+static AUDIT_PIPELINE: OnceLock<PipelineControl> = OnceLock::new();
+
+/// How often a node waiting for the journal tries to take it.
+const AUDIT_JOURNAL_RETRY: Duration = Duration::from_secs(5);
 
 /// Whether any sink selects `vp_injected`, so identity-binding VP injections
 /// should be recorded.
@@ -651,10 +662,12 @@ fn enrich_policy_decisions_from_signed_vps(events: &mut [DelegationAuditEvent]) 
     }
 }
 
-/// Starts the audit pipeline with the VP Audit Log at
-/// `{log_directory}/delegation-audit.jsonl` and the journal next to it.
-/// Call once at startup from the orchestrator.
-pub fn init_audit_logger(log_directory: Option<&str>) {
+/// Sets up the audit pipeline with the VP Audit Log at
+/// `{log_directory}/delegation-audit.jsonl` and the journal next to it, and
+/// starts it unless the node is in Standby: only the Active node writes the
+/// journal (see [`set_audit_pipeline_mode`]). Call once at startup from the
+/// orchestrator.
+pub async fn init_audit_logger(log_directory: Option<&str>) {
     let dir = log_directory
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("_storage/audit"));
@@ -663,20 +676,76 @@ pub fn init_audit_logger(log_directory: Option<&str>) {
         .set(audit_path.clone())
         .is_err()
     {
-        warn!(target: "credential_delegation", "Audit pipeline already started");
+        warn!(target: "credential_delegation", "Audit pipeline already set up");
         return;
     }
-    let started = crate::audit::pipeline::start(&dir, &audit_path);
-    crate::metrics::backends::prometheus::set_audit_pipeline_started(started.is_ok());
-    match started {
-        Ok(()) => info!(target: "credential_delegation", path = %audit_path.display(), "Audit pipeline started"),
-        Err(e) => error!(
-            target: "credential_delegation",
-            path = %dir.display(),
-            error = %e,
-            "Failed to start the audit pipeline; no audit records will be kept or forwarded"
-        ),
+    let control = AUDIT_PIPELINE.get_or_init(|| PipelineControl::process_wide(dir, audit_path));
+    if crate::server::mode::is_standby() {
+        set_audit_pipeline_started(false);
+        info!(target: "credential_delegation", "Standby mode: audit pipeline not started until the node becomes active");
+        return;
     }
+    start_audit_pipeline(control).await;
+}
+
+/// Follows the node's mode: an Active node runs the audit pipeline, and a
+/// Standby node stops it, releasing the journal for the node taking over.
+pub async fn set_audit_pipeline_mode(mode: ServerMode) {
+    let Some(control) = AUDIT_PIPELINE.get() else {
+        return;
+    };
+    match mode {
+        ServerMode::Active => start_audit_pipeline(control).await,
+        ServerMode::Standby => {
+            control.stop().await;
+            set_audit_pipeline_started(false);
+            info!(target: "credential_delegation", "Standby mode: audit pipeline stopped");
+        }
+    }
+}
+
+/// Starts the pipeline. While another writer still has the journal open (a
+/// node that has not finished stepping down), keeps trying in the background
+/// until it is released or this node is no longer Active.
+async fn start_audit_pipeline(control: &'static PipelineControl) {
+    match control.try_start().await {
+        Ok(()) => audit_pipeline_started(),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            set_audit_pipeline_started(false);
+            warn!(
+                target: "credential_delegation",
+                error = %e,
+                "Audit journal is in use by another writer; starting the audit pipeline once it is released"
+            );
+            tokio::spawn(async move {
+                match control
+                    .start_when_free(AUDIT_JOURNAL_RETRY, || !crate::server::mode::is_standby())
+                    .await
+                {
+                    Ok(true) => audit_pipeline_started(),
+                    Ok(false) => {}
+                    Err(e) => audit_pipeline_failed(&e),
+                }
+            });
+        }
+        Err(e) => audit_pipeline_failed(&e),
+    }
+}
+
+fn audit_pipeline_started() {
+    set_audit_pipeline_started(true);
+    if let Some(path) = AUDIT_PATH.get() {
+        info!(target: "credential_delegation", path = %path.display(), "Audit pipeline started");
+    }
+}
+
+fn audit_pipeline_failed(e: &std::io::Error) {
+    set_audit_pipeline_started(false);
+    error!(
+        target: "credential_delegation",
+        error = %e,
+        "Failed to start the audit pipeline; no audit records will be kept or forwarded"
+    );
 }
 
 /// Whether any audit sink selects `category`. For records whose building

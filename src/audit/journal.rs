@@ -8,10 +8,15 @@
 //! seq. Files in the journal directory that are not segments are logged and
 //! ignored. Readers skip unreadable lines anywhere else (see
 //! [`crate::audit::cursors::read_entries`]).
+//!
+//! One writer at a time: the writer holds an exclusive lock on `journal.lock`
+//! for as long as it is open, so a second process sharing the directory
+//! cannot open it. The directory and its files are owner-only.
 
 use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -54,6 +59,42 @@ struct EntryRef<'a> {
 }
 
 const SEGMENT_EXTENSION: &str = "jsonl";
+const LOCK_FILE: &str = "journal.lock";
+pub(crate) const OWNER_ONLY_FILE: u32 = 0o600;
+const OWNER_ONLY_DIR: u32 = 0o700;
+
+/// Creates `dir` readable by the owner only; missing parents get the usual
+/// mode. An existing directory is left as it is.
+pub(crate) fn create_owner_only_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::DirBuilder::new()
+        .mode(OWNER_ONLY_DIR)
+        .create(dir)
+    {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        created => created,
+    }
+}
+
+/// Takes the journal's exclusive lock, held until the returned file is closed.
+fn lock_journal(dir: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(OWNER_ONLY_FILE)
+        .open(dir.join(LOCK_FILE))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("the audit journal in {} is in use by another writer", dir.display()),
+        )),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
 
 fn segment_name(first_seq: u64) -> String {
     format!("{first_seq:020}.{SEGMENT_EXTENSION}")
@@ -108,18 +149,28 @@ fn last_readable_entry(content: &[u8]) -> (usize, Option<JournalEntry>) {
     (0, None)
 }
 
-/// Logs files in the journal directory that are neither segments nor the
-/// cursors file, so a stray or misnamed file is noticed rather than read.
-fn warn_about_foreign_files(dir: &Path) -> io::Result<()> {
+/// Files in the journal directory that are neither segments, the cursors file
+/// nor the lock.
+fn foreign_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut foreign = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        let cursors = path
+        let known = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("cursors.json"));
-        if segment_first_seq(&path).is_none() && !cursors {
-            tracing::warn!(path = %path.display(), "Ignoring a file in the audit journal directory that is not a segment");
+            .is_some_and(|name| name.starts_with("cursors.json") || name == LOCK_FILE);
+        if segment_first_seq(&path).is_none() && !known {
+            foreign.push(path);
         }
+    }
+    Ok(foreign)
+}
+
+/// Logs the foreign files, so a stray or misnamed file is noticed rather than
+/// read.
+fn warn_about_foreign_files(dir: &Path) -> io::Result<()> {
+    for path in foreign_files(dir)? {
+        tracing::warn!(path = %path.display(), "Ignoring a file in the audit journal directory that is not a segment");
     }
     Ok(())
 }
@@ -134,6 +185,10 @@ pub struct JournalWriter {
     /// The current segment was created but its directory entry is not yet
     /// durable; nothing is written to it until it is.
     dir_unsynced: bool,
+    /// A failed append could not be cut off again: the newest segment is
+    /// re-read before the next append.
+    resume_pending: bool,
+    _lock: File,
 }
 
 /// Makes a new segment's directory entry durable.
@@ -147,12 +202,14 @@ impl JournalWriter {
     /// Opens the journal and continues after the last readable entry of the
     /// newest segment. Whatever follows that entry, a partial line left by a
     /// crash or lines that do not parse, is cut off and logged. Files in `dir`
-    /// that are not segments are left in place and ignored.
+    /// that are not segments are left in place and ignored. Fails with
+    /// [`io::ErrorKind::WouldBlock`] while another writer has the journal open.
     pub fn open(
         dir: &Path,
         segment_max_bytes: u64,
     ) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        create_owner_only_dir(dir)?;
+        let lock = lock_journal(dir)?;
         let mut writer = Self {
             dir: dir.to_path_buf(),
             segment_max_bytes,
@@ -160,6 +217,8 @@ impl JournalWriter {
             segment: None,
             sync_dir: Box::new(sync_dir),
             dir_unsynced: false,
+            resume_pending: false,
+            _lock: lock,
         };
         warn_about_foreign_files(dir)?;
         if let Some(last) = segment_paths(dir)?.pop() {
@@ -211,6 +270,7 @@ impl JournalWriter {
             let file = OpenOptions::new()
                 .create_new(true)
                 .append(true)
+                .mode(OWNER_ONLY_FILE)
                 .open(
                     self.dir
                         .join(segment_name(self.next_seq)),
@@ -228,13 +288,21 @@ impl JournalWriter {
     }
 
     /// Appends the batch and syncs it to disk. Returns the last `seq` written.
-    /// On failure nothing from the batch is left in the journal.
+    /// On failure the batch is cut off again. When that fails too, the newest
+    /// segment is re-read before the next append, as on open, so the next
+    /// batch never follows a partial line or reuses a seq already on disk.
     pub fn append(
         &mut self,
         batch: &[Pending],
     ) -> io::Result<Option<u64>> {
         if batch.is_empty() {
             return Ok(None);
+        }
+        if self.resume_pending {
+            if let Some(newest) = segment_paths(&self.dir)?.pop() {
+                self.resume(&newest)?;
+            }
+            self.resume_pending = false;
         }
         let mut bytes = Vec::new();
         for (seq, pending) in (self.next_seq..).zip(batch) {
@@ -252,7 +320,13 @@ impl JournalWriter {
         let (file, size) = self.current_segment()?;
         let written = io::Write::write_all(file, &bytes).and_then(|()| file.sync_data());
         if let Err(e) = written {
-            let _ = file.set_len(*size);
+            if let Err(rollback) = file.set_len(*size) {
+                tracing::error!(
+                    error = %rollback,
+                    "Could not cut a failed append off the audit journal; re-reading the segment before the next append"
+                );
+                self.resume_pending = true;
+            }
             return Err(e);
         }
         *size += bytes.len() as u64;
@@ -978,5 +1052,120 @@ mod tests {
             1
         );
         assert!(collect_batch(&rx, 256, Duration::from_millis(5)).is_none());
+    }
+
+    #[test]
+    fn a_second_writer_cannot_open_the_journal_until_the_first_is_closed() {
+        let dir = TempDir::new().unwrap();
+        let first = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+
+        let busy = JournalWriter::open(dir.path(), 1 << 20)
+            .err()
+            .unwrap();
+        assert_eq!(busy.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first);
+        assert!(JournalWriter::open(dir.path(), 1 << 20).is_ok());
+    }
+
+    #[test]
+    fn the_journal_directory_and_its_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let dir = root
+            .path()
+            .join("audit")
+            .join("journal");
+        let mut writer = JournalWriter::open(&dir, 1 << 20).unwrap();
+        writer
+            .append(&[pending("a")])
+            .unwrap();
+
+        let mode = |path: &Path| {
+            fs::metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join(LOCK_FILE)), 0o600);
+        let segments = segment_paths(&dir).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(mode(&segments[0]), 0o600);
+    }
+
+    #[test]
+    fn the_lock_and_cursors_files_are_not_foreign_but_a_stray_file_is() {
+        let dir = TempDir::new().unwrap();
+        drop(JournalWriter::open(dir.path(), 1 << 20).unwrap());
+        fs::write(
+            dir.path()
+                .join("cursors.json"),
+            b"[]",
+        )
+        .unwrap();
+        fs::write(dir.path().join("notes.txt"), b"stray").unwrap();
+
+        assert!(
+            dir.path()
+                .join(LOCK_FILE)
+                .is_file()
+        );
+        assert_eq!(foreign_files(dir.path()).unwrap(), vec![dir.path().join("notes.txt")]);
+    }
+
+    #[test]
+    fn a_partial_line_left_by_a_failed_rollback_is_cut_off_before_the_next_append() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+        writer
+            .append(&[pending("a")])
+            .unwrap();
+        let segment = segment_paths(dir.path())
+            .unwrap()
+            .pop()
+            .unwrap();
+        append_raw(&segment, b"{\"seq\":2,\"recipients\":[");
+        writer.resume_pending = true;
+
+        assert_eq!(
+            writer
+                .append(&[pending("b")])
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(seqs_in(dir.path()), vec![1, 2]);
+    }
+
+    #[test]
+    fn whole_lines_left_by_a_failed_rollback_keep_their_seqs_and_the_retry_follows_them() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+        writer
+            .append(&[pending("a")])
+            .unwrap();
+        let segment = segment_paths(dir.path())
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut line = serde_json::to_vec(&EntryRef {
+            seq: 2,
+            recipients: &[SinkId::AuditLog],
+            record: &pending("b").record,
+        })
+        .unwrap();
+        line.push(b'\n');
+        append_raw(&segment, &line);
+        writer.resume_pending = true;
+
+        assert_eq!(
+            writer
+                .append(&[pending("b")])
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(seqs_in(dir.path()), vec![1, 2, 3]);
     }
 }

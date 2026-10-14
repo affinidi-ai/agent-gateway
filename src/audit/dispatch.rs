@@ -207,7 +207,10 @@ impl Default for DispatcherConfig {
 /// Keeps one reader running per sink in `sinks`: starts readers for new
 /// sinks, stops removed sinks' readers and drops their cursors, drops cursors
 /// of sinks that no longer exist, and deletes segments every cursor has
-/// passed. Start it after the sinks have been built; it runs until aborted.
+/// passed. Start it after the sinks have been built. It runs until the
+/// journal writer is gone (`source.durable` closes), then stops its readers
+/// and closes the cursor store, so nothing is delivered or saved after it
+/// returns.
 pub async fn run_dispatcher<F: SinkFactory>(
     factory: F,
     sinks: &'static Sinks,
@@ -215,6 +218,7 @@ pub async fn run_dispatcher<F: SinkFactory>(
     config: DispatcherConfig,
 ) {
     let mut changes = sinks.subscribe();
+    let mut written = source.durable.clone();
     let mut readers: HashMap<SinkId, JoinHandle<()>> = HashMap::new();
     let mut prune = tokio::time::interval(config.prune_interval);
     prune.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -231,6 +235,11 @@ pub async fn run_dispatcher<F: SinkFactory>(
                 }
                 reconcile(&factory, sinks, &mut readers, &source, &config.reader).await;
             }
+            writer = written.changed() => {
+                if writer.is_err() {
+                    break;
+                }
+            }
             _ = prune.tick() => {
                 let current = sinks.snapshot();
                 park_unknown_cursors(&source.cursors, current.ids(), &readers).await;
@@ -239,9 +248,11 @@ pub async fn run_dispatcher<F: SinkFactory>(
             }
         }
     }
-    readers
-        .values()
-        .for_each(JoinHandle::abort);
+    for reader in readers.into_values() {
+        reader.abort();
+        let _ = reader.await;
+    }
+    source.cursors.close();
 }
 
 async fn reconcile<F: SinkFactory>(
@@ -1029,6 +1040,42 @@ mod tests {
         })
         .await;
         manager.abort();
+    }
+
+    #[tokio::test]
+    async fn the_dispatcher_ends_and_saves_no_more_cursors_once_the_journal_writer_is_gone() {
+        let mut f = Fixture::new();
+        let sinks = registry(&[SinkId::AuditLog]);
+        let manager = tokio::spawn(run_dispatcher(
+            RecordingFactory::default(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+        ));
+        f.append(&[&[SinkId::AuditLog]]);
+        wait_until(|| {
+            f.cursors
+                .get(&SinkId::AuditLog)
+                == Some(1)
+        })
+        .await;
+
+        let Fixture { dir, cursors, durable, .. } = f;
+        drop(durable);
+        tokio::time::timeout(Duration::from_secs(5), manager)
+            .await
+            .expect("the dispatcher ends once the writer is gone")
+            .unwrap();
+
+        cursors
+            .set(&SinkId::AuditLog, 9)
+            .unwrap();
+        assert_eq!(
+            CursorStore::open(dir.path())
+                .unwrap()
+                .get(&SinkId::AuditLog),
+            Some(1)
+        );
     }
 
     #[tokio::test]
