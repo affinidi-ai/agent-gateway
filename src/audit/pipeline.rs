@@ -94,7 +94,8 @@ pub fn start_with(
         dir: journal_dir,
         durable,
     };
-    let dispatcher = tokio::spawn(run_dispatcher(factory, sinks, source, DispatcherConfig::default()));
+    let dispatcher =
+        tokio::spawn(run_dispatcher(factory, sinks, source, DispatcherConfig::default(), cancel.child_token()));
     Ok(Pipeline {
         producer,
         cancel,
