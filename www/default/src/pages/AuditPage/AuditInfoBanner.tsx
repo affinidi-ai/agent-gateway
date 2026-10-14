@@ -23,8 +23,8 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
     {open && (
       <div className="small mt-2" data-testid="audit-about-body">
         <p className="mb-2">
-          This tamper-evident log records the decisions that governed proxied requests: every
-          gateway, surface, MCP-tool and response OPA
+          This tamper-evident log records the decisions that governed proxied requests: gateway,
+          surface, MCP-tool and response OPA
           <FieldHelp testId="field-help-audit-opa" ariaLabel="About OPA">
             OPA (Open Policy Agent) is the engine that evaluates this gateway's policies.
           </FieldHelp>{' '}
@@ -34,13 +34,15 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
             whether a caller or target agent is recognised.
           </FieldHelp>{' '}
           trust-check outcome, and Verifiable Presentation injected on behalf of the calling agent.
-          Entries appear only when a request actually exercises the pipeline, and only while VP
-          Auditing is enabled in Settings › Security.
+          Entries appear only when a request actually exercises the pipeline. The log keeps the
+          events selected under Settings › Security › VP Audit, and only while VP Auditing is
+          enabled there.
         </p>
         <p className="mb-2">
-          To send every entry to Kafka, Kinesis, Pulsar, Redis Streams, a webhook, email, or Slack
-          as it is written, add an integration in the <strong>Governance Audit</strong> category.
-          Forwarding is best-effort; this log stays the record of truth.
+          To send audit records to Kafka, Kinesis, Pulsar, Redis Streams, a webhook, email, or
+          Slack, add an integration in the <strong>Governance Audit</strong> category. Each
+          integration receives the events selected for it, independently of this log and of VP
+          Auditing. Delivery is at least once, so receivers deduplicate on <code>event_id</code>.
         </p>
         <p className="mb-1 fw-semibold">Categories</p>
         <ul className="mb-0 ps-3">
