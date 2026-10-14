@@ -52,11 +52,11 @@ or `major`. It must be run from `main` and refuses to start if a `release/*` PR 
 It then:
 
 1. Validates every `.changelog/wip/*.yaml` fragment.
-2. Computes the next version. If the version already in `Cargo.toml` has no matching tag yet
-   (the first release, or a previous prepare run that was never merged), it releases that version
-   as-is instead of bumping past it; otherwise it bumps from the last tagged version by the chosen
-   increment, or by whatever the fragments imply (`breaking` entries force a major/minor bump,
-   `added` entries force at least a minor bump) if a larger bump is implied than requested.
+2. Computes the next version. If the version in `Cargo.toml` has no matching tag yet (the first
+   release), it releases that version as-is. Otherwise it applies the chosen increment to the
+   `Cargo.toml` version. The run fails if the pending fragments need a bigger increment than the
+   chosen one: `breaking` entries need at least `minor` before 1.0.0 and `major` from 1.0.0, and
+   `added` entries need at least `minor`. Choose a larger increment, or change the fragments.
 3. Bumps `Cargo.toml` and `Cargo.lock` to that version.
 4. Folds every fragment into a new `CHANGELOG.md` section and archives the fragments under
    `.changelog/history/<version>/`.
