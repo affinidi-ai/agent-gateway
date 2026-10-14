@@ -15,7 +15,7 @@ make mcp-conformance-legacy             # legacy compatibility checks only
 ./scripts/mcp-conformance/run.sh --help
 ```
 
-Requires Node >= 20.18.1 with npm, git and openssl. Cargo is needed for builds,
+Requires Node >= 22 with npm, git and openssl. Cargo is needed for builds,
 for `--unit-tests` and for the `fabric` target, not for a run whose binaries are
 all passed in or, with `--skip-build`, already built. The `fabric` target also
 needs a running Docker daemon. The first run needs the npm registry and GitHub;

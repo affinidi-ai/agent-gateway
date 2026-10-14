@@ -27,7 +27,7 @@ REFERENCE_SERVER_DIR="${REFERENCE_DIR}/examples/servers/typescript"
 # The binary name is read from Cargo.toml.
 BIN_NAME="$(sed -n 's/^name = "\(.*\)"/\1/p' "${REPO}/Cargo.toml" | head -1)"
 DEFAULT_BINARY="${REPO}/target/debug/${BIN_NAME}"
-NODE_MIN="20.18.1"
+NODE_MIN="22.0.0"
 SUITE_VERSION="$(sed -n 's|.*"@modelcontextprotocol/conformance": "\(.*\)".*|\1|p' "${HERE}/package.json")"
 SUITE_TARGETS=(direct access-point transit owned-proxy proxy-surface fabric)
 OWNED_SCENARIOS=(tools-list tools-call-simple-text caching)

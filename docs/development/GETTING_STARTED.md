@@ -68,7 +68,7 @@ sudo apt-get install -y --no-install-recommends \
   pkg-config protobuf-compiler xmlsec1
 ```
 
-Then install a stable Rust toolchain via [rustup](https://rustup.rs) and Node.js 20 or newer with npm.
+Then install a stable Rust toolchain via [rustup](https://rustup.rs) and Node.js 20 or newer with npm (Node.js 22 or newer for `make mcp-conformance`).
 
 Build and run with the standard target. It calls `cargo build` and the frontend build directly, so it does not require the macOS Homebrew tool checks:
 

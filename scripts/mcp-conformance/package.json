@@ -11,6 +11,6 @@
     "@modelcontextprotocol/conformance": "0.2.0-alpha.11"
   },
   "engines": {
-    "node": ">=20.18.1"
+    "node": ">=22"
   }
 }
