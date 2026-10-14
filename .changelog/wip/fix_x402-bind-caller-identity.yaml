@@ -1,7 +1,10 @@
 branch: fix/x402-bind-caller-identity
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-10-07T00:00:06.000Z'
+      title: Document x402 payment requirement binding
+      description: Documents configured requirement binding, facilitator behavior, settlement handling, and the test-only nature of mock verification in PROTOCOLS.md, ARCHITECTURE.md, and CONFIGURATION_REFERENCE.md.
   fixed: []
   removed: []
   security:
@@ -24,7 +27,3 @@ changes:
     - timestamp: '2026-10-07T00:00:05.000Z'
       title: Require token_name and token_version for the EIP-3009 x402 test endpoint
       description: The x402 test endpoints issue and verify one requirement built from test-endpoints.json. `/protected` (EIP-3009) needs the new optional `token_name` and `token_version` fields in the `evm` entry, since the EIP-712 domain is no longer taken from the client.
-  internal:
-    - timestamp: '2026-10-07T00:00:06.000Z'
-      title: Test x402 requirement binding across verification modes and facilitators
-      description: Covers requirement resolution (recipient, amount, scheme, network, asset, transfer method, EIP-712 domain, EVM and Solana address case), rejection before any facilitator call in every verification mode, the requirement sent to external and fabric facilitators with a handler-level fabric test, real EIP-3009 signatures checked against the configured domain and amount, Solana lamport checks, and settlement of records written before requirement binding. Documents the behaviour in PROTOCOLS.md, ARCHITECTURE.md and CONFIGURATION_REFERENCE.md, including that `mock` verification is for tests only.

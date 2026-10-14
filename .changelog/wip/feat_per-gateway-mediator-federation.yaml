@@ -1,110 +1,82 @@
+---
 branch: feat/per-gateway-mediator-federation
 changes:
   added:
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Show when each secret was last updated
-      description: >-
-        The Secrets list now has an Updated column next to Created, showing the
-        secret's updated_at timestamp. That timestamp advances on both value and
-        metadata changes.
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Add an experimental flag to home a connection on the acceptor's own mediator
-      description: >-
-        The experimental `mediator_federation` feature flag (Settings › System › Feature
-        Flags, off by default) adds a mediator picker to the Connect via OOB wizard and lets
-        the OOB connect request take `acceptor_mediator_id`. The acceptor's permanent
-        connection point is then homed on that mediator instead of the inviter's. Such a
-        connection becomes Active, but requests between gateways on different mediators are
-        not relayed yet. The named mediator must be within the caller's tenant and token
-        scope, Active and registered, and is checked before any outbound call; otherwise the
-        request fails with 400. With the flag off, the field is refused with 400. Mediator
-        API responses now include `registered`, true when the gateway has an identity on the
-        mediator. See docs/PER_GATEWAY_MEDIATOR_FEDERATION.md.
+  - timestamp: '2026-10-08T00:00:00.000Z'
+    title: Show when each secret was last updated
+    description: The Secrets list now has an Updated column next to Created, showing
+      the secret's updated_at timestamp. That timestamp advances on both value and
+      metadata changes.
+  - timestamp: '2026-10-08T00:00:00.000Z'
+    title: Add an experimental flag to home a connection on the acceptor's own mediator
+    description: The experimental `mediator_federation` feature flag (Settings › System
+      › Feature Flags, off by default) adds a mediator picker to the Connect via OOB
+      wizard and lets the OOB connect request take `acceptor_mediator_id`. The acceptor's
+      permanent connection point is then homed on that mediator instead of the inviter's.
+      Such a connection becomes Active, but requests between gateways on different
+      mediators are not relayed yet. The named mediator must be within the caller's
+      tenant and token scope, Active and registered, and is checked before any outbound
+      call; otherwise the request fails with 400. With the flag off, the field is
+      refused with 400. Mediator API responses now include `registered`, true when
+      the gateway has an identity on the mediator. See docs/PER_GATEWAY_MEDIATOR_FEDERATION.md.
   changed:
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Forward gateway messages through the sender's mediator across mediators
-      description: >-
-        `pack_and_send_message` reads the recipient's DIDComm service endpoint. When it names
-        a mediator other than the sender's own, the send is wrapped in a
-        `routing/2.0/forward` addressed to the sender's mediator, which relays it, and the
-        forward is logged; otherwise it is sent directly as before. The sender's mediator is
-        recognised by its REST endpoint, every service endpoint in its DID document and its
-        `did:web` origin, so one mediator reached under several names stays direct. The route does not depend on the feature flag, so
-        connections that share a mediator are unchanged. The primary fabric forward in
-        `handle_fabric_request` now goes through this helper too. Fabric stream frames and
-        the x402 facilitator still send directly.
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Return 502 when a fabric request cannot be sent to the remote gateway
-      description: >-
-        A fabric request whose ForwardRequest cannot be sent now gets 502 with a generic
-        message naming the remote gateway, instead of 500 "Failed to send message".
+  - timestamp: '2026-10-08T00:00:00.000Z'
+    title: Forward gateway messages through the sender's mediator across mediators
+    description: "`pack_and_send_message` reads the recipient's DIDComm service endpoint.
+      When it names a mediator other than the sender's own, the send is wrapped in
+      a `routing/2.0/forward` addressed to the sender's mediator, which relays it,
+      and the forward is logged; otherwise it is sent directly as before. The sender's
+      mediator is recognised by its REST endpoint, every service endpoint in its DID
+      document and its `did:web` origin, so one mediator reached under several names
+      stays direct. The route does not depend on the feature flag, so connections
+      that share a mediator are unchanged. The primary fabric forward in `handle_fabric_request`
+      now goes through this helper too. Fabric stream frames and the x402 facilitator
+      still send directly."
+  - timestamp: '2026-10-08T00:00:00.000Z'
+    title: Return 502 when a fabric request cannot be sent to the remote gateway
+    description: A fabric request whose ForwardRequest cannot be sent now gets 502
+      with a generic message naming the remote gateway, instead of 500 "Failed to
+      send message".
   fixed:
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Resolve connection-point mediator endpoints from the mediator's DID document
-      description: >-
-        The inviter's approve flow and the acceptor's finalize and recovery paths used to
-        guess an https origin from the mediator DID string, which is wrong for plaintext
-        mediators and for mediators whose endpoint has a path. They now prefer the stored
-        mediator DID document. When the acceptor shares the inviter's mediator and has no
-        record of it, it uses the mediator URL from the OOB invitation. A failed mediator
-        store read during finalize is logged before falling back.
+  - timestamp: '2026-10-08T00:00:00.000Z'
+    title: Resolve connection-point mediator endpoints from the mediator's DID document
+    description: The inviter's approve flow and the acceptor's finalize and recovery
+      paths used to guess an https origin from the mediator DID string, which is wrong
+      for plaintext mediators and for mediators whose endpoint has a path. They now
+      prefer the stored mediator DID document. When the acceptor shares the inviter's
+      mediator and has no record of it, it uses the mediator URL from the OOB invitation.
+      A failed mediator store read during finalize is logged before falling back.
   removed: []
   security:
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Scope and validate the acceptor mediator selection
-      description: >-
-        `acceptor_mediator_id` goes through the same tenant and resource-scope check as every
-        other mediator lookup, and the new gateway's tenant must be allowed to reference the
-        mediator, as for connection points: a tenant gateway may use its own tenant's
-        mediators or global ones, a global gateway only global ones. An unknown mediator,
-        one outside the caller's scope and one the gateway may not reference get the same
-        400, so a scoped caller cannot learn that it exists. An in-scope mediator that is
-        disabled, unregistered or has no usable endpoint gets one generic 400 that names
-        neither the mediator nor its state; the detail is logged server-side. Finalize,
-        recovery and the permanent connection point's listener use only the mediator record
-        validated at accept time, by id: the connection point stores that record id as its
-        `mediator_id`, so another tenant's record with the same DID is not used for it, and
-        deleting the mediator stops its listener. Finalize, like recovery, fails if that
-        record has been deleted, given another DID or disabled since the invitation was
-        accepted. On the acceptor's cache-miss
-        recovery path, a recovered mediator other than the temporary connection point's own
-        must be that record, still Active, and recovery fails closed without it or without a
-        mediator store. Shared-mediator recovery needs no registered inviter mediator.
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Keep mediator send errors out of fabric forward responses
-      description: >-
-        When a fabric ForwardRequest fails to send, every client-facing path (the inbound
-        fabric proxy, outbound fabric forwards, A2A agent-card fetches and x402 payment
-        delegation) returns a generic message. The underlying SDK or mediator error is logged
-        only.
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Keep send and lookup errors out of gateway management responses
-      description: >-
-        Connection setup, ping, retry ping, surface discovery and the acceptor mediator lookup
-        now return a generic message when the send or lookup fails, and log the underlying
-        error server-side instead of returning it to the client.
+  - timestamp: '2026-10-08T00:00:00.000Z'
+    title: Scope and validate the acceptor mediator selection
+    description: "`acceptor_mediator_id` goes through the same tenant and resource-scope
+      check as every other mediator lookup, and the new gateway's tenant must be allowed
+      to reference the mediator, as for connection points: a tenant gateway may use
+      its own tenant's mediators or global ones, a global gateway only global ones.
+      An unknown mediator, one outside the caller's scope and one the gateway may
+      not reference get the same 400, so a scoped caller cannot learn that it exists.
+      An in-scope mediator that is disabled, unregistered or has no usable endpoint
+      gets one generic 400 that names neither the mediator nor its state; the detail
+      is logged server-side. Finalize, recovery and the permanent connection point's
+      listener use only the mediator record validated at accept time, by id: the connection
+      point stores that record id as its `mediator_id`, so another tenant's record
+      with the same DID is not used for it, and deleting the mediator stops its listener.
+      Finalize, like recovery, fails if that record has been deleted, given another
+      DID or disabled since the invitation was accepted. On the acceptor's cache-miss
+      recovery path, a recovered mediator other than the temporary connection point's
+      own must be that record, still Active, and recovery fails closed without it
+      or without a mediator store. Shared-mediator recovery needs no registered inviter
+      mediator."
+  - timestamp: '2026-10-08T00:00:00.000Z'
+    title: Keep mediator send errors out of fabric forward responses
+    description: When a fabric ForwardRequest fails to send, every client-facing path
+      (the inbound fabric proxy, outbound fabric forwards, A2A agent-card fetches
+      and x402 payment delegation) returns a generic message. The underlying SDK or
+      mediator error is logged only.
+  - timestamp: '2026-10-08T00:00:00.000Z'
+    title: Keep send and lookup errors out of gateway management responses
+    description: Connection setup, ping, retry ping, surface discovery and the acceptor
+      mediator lookup now return a generic message when the send or lookup fails,
+      and log the underlying error server-side instead of returning it to the client.
   breaking: []
-  internal:
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Cover per-gateway mediators in the g2g BDD suite
-      description: >-
-        A g2g scenario can give each gateway its own mediator (`gateway N uses mediator "M"`)
-        and turn on `mediator_federation` per gateway. Each mediator has its own Docker
-        network, so a socat sidecar bridges every mediator pair. A scenario checks that a
-        two-mediator connection becomes Active with each side's DID naming its own
-        mediator; relay scenarios are tagged @known-bug. Negative scenarios cover the flag
-        being off and an unavailable or unknown `acceptor_mediator_id`. `set_feature_flags`
-        keeps flags already set.
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Declare the g2g BDD mediator's own URL in local_endpoints
-      description: >-
-        scripts/g2g-mediator.sh now runs reconcile-mediator-config.sh on every run, including
-        for a cached config, to set `server.local_endpoints` to the mediator's
-        `http://localhost:<port>` URL, which relayed sends between mediators need.
-    - timestamp: '2026-10-08T00:00:00.000Z'
-      title: Test the Connect via OOB mediator picker
-      description: >-
-        Frontend tests cover the picker hidden and shown by the flag, its filter to active,
-        registered mediators, its empty and load-error states, and `acceptor_mediator_id`
-        being sent only for a selected mediator. The Secrets Updated test no longer depends
-        on the local timezone.
