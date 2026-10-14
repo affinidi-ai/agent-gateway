@@ -10,14 +10,15 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use tokio::sync::watch;
-use tracing::error;
+use tokio::sync::{oneshot, watch};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 use crate::audit::audit_log_sink::AuditLogSink;
 use crate::audit::cursors::CursorStore;
 use crate::audit::dispatch::{DispatcherConfig, JournalSource, run_dispatcher};
 use crate::audit::integration_sink::ProductionSinks;
-use crate::audit::journal::{JournalWriter, WriterConfig, spawn_writer};
+use crate::audit::journal::{JournalWriter, WriterConfig, WriterStopped, spawn_writer};
 use crate::audit::producer::{Producer, producer};
 use crate::audit::registry::{Sinks, sinks};
 use crate::audit::sources::rebuild_sinks;
@@ -30,27 +31,34 @@ const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// A running pipeline.
 pub struct Pipeline {
     producer: &'static Producer,
-    writer: std::thread::JoinHandle<u64>,
+    cancel: CancellationToken,
+    writer: oneshot::Receiver<WriterStopped<JournalWriter>>,
     dispatcher: tokio::task::JoinHandle<()>,
 }
 
 impl Pipeline {
     /// Disconnects the producer, waits for the writer to journal the records
-    /// it was already handed and release the journal, then for the dispatcher
-    /// to stop delivering and saving cursors.
+    /// it was already handed, then for the dispatcher to stop delivering and
+    /// saving cursors, and releases the journal.
     pub async fn stop(self) {
-        let Self { producer, writer, dispatcher } = self;
+        let Self {
+            producer,
+            cancel,
+            writer,
+            dispatcher,
+        } = self;
         producer.disconnect();
-        let joined = tokio::task::spawn_blocking(move || writer.join());
-        if tokio::time::timeout(WRITER_STOP_TIMEOUT, joined)
-            .await
-            .is_err()
-        {
+        let Ok(stopped) = tokio::time::timeout(WRITER_STOP_TIMEOUT, writer).await else {
             error!("The audit journal writer did not stop in time; stopping delivery without it");
+            cancel.cancel();
             dispatcher.abort();
             return;
-        }
+        };
         let _ = dispatcher.await;
+        if let Ok(WriterStopped { journal, lost, aborted }) = stopped {
+            info!(lost, aborted, "Audit journal writer stopped");
+            drop(journal);
+        }
     }
 }
 
@@ -77,7 +85,8 @@ pub fn start_with(
             .saturating_sub(1),
     );
     let (journal, pending) = mpsc::channel();
-    let writer = spawn_writer(writer, pending, durable_tx, WriterConfig::default())?;
+    let cancel = CancellationToken::new();
+    let writer = spawn_writer(writer, pending, durable_tx, WriterConfig::default(), cancel.clone())?;
     producer.connect(journal);
 
     let source = JournalSource {
@@ -86,7 +95,12 @@ pub fn start_with(
         durable,
     };
     let dispatcher = tokio::spawn(run_dispatcher(factory, sinks, source, DispatcherConfig::default()));
-    Ok(Pipeline { producer, writer, dispatcher })
+    Ok(Pipeline {
+        producer,
+        cancel,
+        writer,
+        dispatcher,
+    })
 }
 
 /// Builds the current sinks into the registry; false when they could not be

@@ -22,6 +22,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::metrics::backends::prometheus::track_audit_records_lost;
 
@@ -373,67 +375,122 @@ impl Default for WriterConfig {
     }
 }
 
+/// What the writer hands back when it stops.
+pub struct WriterStopped<W> {
+    /// The journal, which keeps its lock until it is dropped.
+    pub journal: W,
+    /// Records discarded beyond the pending cap.
+    pub lost: u64,
+    /// Records discarded unwritten because the writer was cancelled.
+    pub aborted: u64,
+}
+
+/// How often a waiting or backing-off writer checks whether it was cancelled.
+const CANCEL_CHECK: Duration = Duration::from_millis(20);
+
 /// Runs the writer on its own thread: batches records from `rx`, appends them,
 /// and publishes the last durable `seq` on `durable`. A failed append is
 /// retried with backoff while records keep arriving; beyond
 /// `config.pending_cap` the oldest waiting records are discarded and counted.
-/// Ends once every sender is gone and nothing is waiting, returning how many
-/// records were discarded.
+/// Ends once every sender is gone and nothing is waiting, or once `cancel`
+/// fires: between batches, while waiting for records or during a backoff.
+/// Records it had not written when cancelled are discarded and counted as
+/// `aborted`. A writer inside an append (a sync on a failing disk, for
+/// example) only sees the cancel once the append returns. Hands the journal
+/// back with what it discarded on the returned channel; when nobody receives
+/// it, the journal and its lock are dropped as the thread ends.
 pub fn spawn_writer<W: JournalAppend + Send + 'static>(
-    mut writer: W,
+    writer: W,
     rx: Receiver<Pending>,
     durable: tokio::sync::watch::Sender<u64>,
     config: WriterConfig,
-) -> io::Result<std::thread::JoinHandle<u64>> {
+    cancel: CancellationToken,
+) -> io::Result<oneshot::Receiver<WriterStopped<W>>> {
+    let (stopped_tx, stopped) = oneshot::channel();
     std::thread::Builder::new()
         .name("audit-journal".to_string())
         .spawn(move || {
-            let mut waiting: VecDeque<Pending> = VecDeque::new();
-            let mut open = true;
-            let mut lost = 0u64;
-            let mut backoff = config.retry_initial;
-            loop {
-                if waiting.is_empty() {
-                    match open
-                        .then(|| collect_batch(&rx, config.batch_max, config.batch_window))
-                        .flatten()
-                    {
-                        Some(batch) => waiting.extend(batch),
-                        None => return lost,
-                    }
-                } else if open {
-                    open = drain_ready(&rx, &mut waiting);
-                }
+            let _ = stopped_tx.send(write_until_stopped(writer, rx, durable, &config, &cancel));
+        })?;
+    Ok(stopped)
+}
 
-                let overflow = waiting
-                    .len()
-                    .saturating_sub(config.pending_cap);
-                if overflow > 0 {
-                    waiting.drain(..overflow);
-                    lost += overflow as u64;
-                    track_audit_records_lost("journal_write", overflow as u64);
-                    tracing::error!(records = overflow, "Discarded audit records the journal could not write");
-                }
-
-                let count = waiting
-                    .len()
-                    .min(config.batch_max);
-                match writer.append(&waiting.make_contiguous()[..count]) {
-                    Ok(last) => {
-                        waiting.drain(..count);
-                        if let Some(last) = last {
-                            durable.send_replace(last);
-                        }
-                        backoff = config.retry_initial;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, waiting = waiting.len(), "Failed to append audit records to the journal; retrying");
-                        std::thread::sleep(backoff);
-                        backoff = (backoff * 2).min(config.retry_max);
-                    }
-                }
+fn write_until_stopped<W: JournalAppend>(
+    mut writer: W,
+    rx: Receiver<Pending>,
+    durable: tokio::sync::watch::Sender<u64>,
+    config: &WriterConfig,
+    cancel: &CancellationToken,
+) -> WriterStopped<W> {
+    let mut waiting: VecDeque<Pending> = VecDeque::new();
+    let mut open = true;
+    let mut lost = 0u64;
+    let mut backoff = config.retry_initial;
+    while !cancel.is_cancelled() {
+        if waiting.is_empty() {
+            match open
+                .then(|| collect_batch(&rx, config.batch_max, config.batch_window, cancel))
+                .flatten()
+            {
+                Some(batch) => waiting.extend(batch),
+                None => break,
             }
-        })
+        } else if open {
+            open = drain_ready(&rx, &mut waiting);
+        }
+
+        let overflow = waiting
+            .len()
+            .saturating_sub(config.pending_cap);
+        if overflow > 0 {
+            waiting.drain(..overflow);
+            lost += overflow as u64;
+            track_audit_records_lost("journal_write", overflow as u64);
+            tracing::error!(records = overflow, "Discarded audit records the journal could not write");
+        }
+
+        let count = waiting
+            .len()
+            .min(config.batch_max);
+        match writer.append(&waiting.make_contiguous()[..count]) {
+            Ok(last) => {
+                waiting.drain(..count);
+                if let Some(last) = last {
+                    durable.send_replace(last);
+                }
+                backoff = config.retry_initial;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, waiting = waiting.len(), "Failed to append audit records to the journal; retrying");
+                sleep_unless_cancelled(backoff, cancel);
+                backoff = (backoff * 2).min(config.retry_max);
+            }
+        }
+    }
+    let aborted = (waiting.len() + rx.try_iter().count()) as u64;
+    if aborted > 0 {
+        track_audit_records_lost("aborted", aborted);
+        tracing::error!(
+            records = aborted,
+            "Discarded audit records the journal had not written when the audit pipeline stopped"
+        );
+    }
+    WriterStopped { journal: writer, lost, aborted }
+}
+
+/// Sleeps for `duration`, waking early once `cancel` fires.
+fn sleep_unless_cancelled(
+    duration: Duration,
+    cancel: &CancellationToken,
+) {
+    let deadline = Instant::now() + duration;
+    while !cancel.is_cancelled() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        std::thread::sleep(remaining.min(CANCEL_CHECK));
+    }
 }
 
 /// Moves every record already sent into `waiting`. False once every sender is gone.
@@ -451,13 +508,22 @@ fn drain_ready(
 }
 
 /// Waits for one record, then gathers more until `max` records or `window`
-/// has passed. `None` once every sender is gone and nothing is left.
+/// has passed. `None` once every sender is gone and nothing is left, or once
+/// `cancel` fires while waiting.
 pub fn collect_batch(
     rx: &Receiver<Pending>,
     max: usize,
     window: Duration,
+    cancel: &CancellationToken,
 ) -> Option<Vec<Pending>> {
-    let mut batch = vec![rx.recv().ok()?];
+    let first = loop {
+        match rx.recv_timeout(CANCEL_CHECK) {
+            Ok(pending) => break pending,
+            Err(RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {}
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
+        }
+    };
+    let mut batch = vec![first];
     let deadline = Instant::now() + window;
     while batch.len() < max {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -845,9 +911,10 @@ mod tests {
             tx.send(pending(sink))
                 .unwrap();
         }
-        let batch = collect_batch(&rx, 2, Duration::from_secs(5)).unwrap();
+        let cancel = CancellationToken::new();
+        let batch = collect_batch(&rx, 2, Duration::from_secs(5), &cancel).unwrap();
         assert_eq!(batch.len(), 2);
-        let batch = collect_batch(&rx, 2, Duration::from_millis(10)).unwrap();
+        let batch = collect_batch(&rx, 2, Duration::from_millis(10), &cancel).unwrap();
         assert_eq!(batch.len(), 1);
     }
 
@@ -856,7 +923,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         tx.send(pending("a")).unwrap();
         let started = Instant::now();
-        let batch = collect_batch(&rx, 256, Duration::from_millis(20)).unwrap();
+        let batch = collect_batch(&rx, 256, Duration::from_millis(20), &CancellationToken::new()).unwrap();
         assert_eq!(batch.len(), 1);
         assert!(started.elapsed() >= Duration::from_millis(20));
         drop(tx);
@@ -868,7 +935,7 @@ mod tests {
         let writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
         let (tx, rx) = mpsc::channel();
         let (durable_tx, mut durable_rx) = tokio::sync::watch::channel(0);
-        let handle = spawn_writer(writer, rx, durable_tx, WriterConfig::default()).unwrap();
+        let handle = spawn_writer(writer, rx, durable_tx, WriterConfig::default(), CancellationToken::new()).unwrap();
 
         for sink in ["a", "b", "c"] {
             tx.send(pending(sink))
@@ -882,7 +949,8 @@ mod tests {
         assert_eq!(read_all(dir.path()).len(), 3);
 
         drop(tx);
-        assert_eq!(handle.join().unwrap(), 0);
+        let stopped = stopped_within(handle, Duration::from_secs(5));
+        assert_eq!((stopped.lost, stopped.aborted), (0, 0));
     }
 
     /// Records what it is asked to append and fails while `failing` is set.
@@ -942,7 +1010,7 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         let (durable_tx, durable_rx) = tokio::sync::watch::channel(0);
-        let handle = spawn_writer(journal.clone(), rx, durable_tx, fast_retry(100)).unwrap();
+        let handle = spawn_writer(journal.clone(), rx, durable_tx, fast_retry(100), CancellationToken::new()).unwrap();
 
         tx.send(pending("a")).unwrap();
         tx.send(pending("b")).unwrap();
@@ -958,7 +1026,7 @@ mod tests {
             .failing
             .store(false, Ordering::SeqCst);
         drop(tx);
-        assert_eq!(handle.join().unwrap(), 0);
+        assert_eq!(stopped_within(handle, Duration::from_secs(5)).lost, 0);
         assert_eq!(
             *journal
                 .written
@@ -977,7 +1045,7 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         let (durable_tx, _durable_rx) = tokio::sync::watch::channel(0);
-        let handle = spawn_writer(journal.clone(), rx, durable_tx, fast_retry(5)).unwrap();
+        let handle = spawn_writer(journal.clone(), rx, durable_tx, fast_retry(5), CancellationToken::new()).unwrap();
 
         let names: Vec<String> = (0..8)
             .map(|n| n.to_string())
@@ -1000,7 +1068,7 @@ mod tests {
             .failing
             .store(false, Ordering::SeqCst);
         drop(tx);
-        assert_eq!(handle.join().unwrap(), 3);
+        assert_eq!(stopped_within(handle, Duration::from_secs(5)).lost, 3);
         assert_eq!(
             *journal
                 .written
@@ -1018,7 +1086,7 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         let (durable_tx, _durable_rx) = tokio::sync::watch::channel(0);
-        let handle = spawn_writer(journal.clone(), rx, durable_tx, fast_retry(100)).unwrap();
+        let handle = spawn_writer(journal.clone(), rx, durable_tx, fast_retry(100), CancellationToken::new()).unwrap();
 
         let started = Instant::now();
         for _ in 0..20_000 {
@@ -1030,7 +1098,7 @@ mod tests {
             .failing
             .store(false, Ordering::SeqCst);
         drop(tx);
-        let lost = handle.join().unwrap();
+        let lost = stopped_within(handle, Duration::from_secs(5)).lost;
         let written = journal
             .written
             .lock()
@@ -1040,18 +1108,137 @@ mod tests {
         assert_eq!(lost + written, 20_000);
     }
 
+    /// What the writer hands back once it stops, failing when that takes
+    /// longer than `limit`.
+    fn stopped_within<W>(
+        mut stopped: tokio::sync::oneshot::Receiver<WriterStopped<W>>,
+        limit: Duration,
+    ) -> WriterStopped<W> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match stopped.try_recv() {
+                Ok(stopped) => return stopped,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "the writer did not stop in time");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!("the writer ended without handing back the journal")
+                }
+            }
+        }
+    }
+
+    fn aborted_records() -> u64 {
+        crate::metrics::backends::prometheus::AUDIT_RECORDS_LOST
+            .with_label_values(&["aborted"])
+            .get()
+    }
+
+    #[test]
+    fn a_cancelled_writer_stops_retrying_a_failing_journal_and_counts_what_it_discards() {
+        let journal = FlakyJournal::default();
+        journal
+            .failing
+            .store(true, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        let (durable_tx, durable_rx) = tokio::sync::watch::channel(0);
+        let cancel = CancellationToken::new();
+        let slow_retry = WriterConfig {
+            retry_initial: Duration::from_secs(60),
+            retry_max: Duration::from_secs(60),
+            ..WriterConfig::default()
+        };
+        let stopped = spawn_writer(journal.clone(), rx, durable_tx, slow_retry, cancel.clone()).unwrap();
+        let before = aborted_records();
+
+        for sink in ["a", "b", "c"] {
+            tx.send(pending(sink))
+                .unwrap();
+        }
+        wait_until(|| {
+            journal
+                .failures
+                .load(Ordering::SeqCst)
+                >= 1
+        });
+        cancel.cancel();
+        let stopped = stopped_within(stopped, Duration::from_secs(1));
+
+        assert_eq!(stopped.aborted, 3);
+        assert_eq!(stopped.lost, 0);
+        assert!(aborted_records() >= before + 3);
+        assert_eq!(
+            journal
+                .failures
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert!(
+            journal
+                .written
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(*durable_rx.borrow(), 0);
+        drop(tx);
+    }
+
+    #[test]
+    fn a_cancelled_idle_writer_stops_and_hands_back_the_journal_and_its_lock() {
+        let dir = TempDir::new().unwrap();
+        let writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+        let (tx, rx) = mpsc::channel::<Pending>();
+        let (durable_tx, _durable_rx) = tokio::sync::watch::channel(0);
+        let cancel = CancellationToken::new();
+        let stopped = spawn_writer(writer, rx, durable_tx, WriterConfig::default(), cancel.clone()).unwrap();
+
+        cancel.cancel();
+        let stopped = stopped_within(stopped, Duration::from_secs(1));
+
+        assert_eq!(stopped.aborted, 0);
+        assert_eq!(
+            JournalWriter::open(dir.path(), 1 << 20)
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        drop(stopped);
+        assert!(JournalWriter::open(dir.path(), 1 << 20).is_ok());
+        drop(tx);
+    }
+
     #[test]
     fn collecting_ends_once_every_sender_is_gone() {
         let (tx, rx) = mpsc::channel::<Pending>();
         tx.send(pending("a")).unwrap();
         drop(tx);
+        let cancel = CancellationToken::new();
         assert_eq!(
-            collect_batch(&rx, 256, Duration::from_millis(5))
+            collect_batch(&rx, 256, Duration::from_millis(5), &cancel)
                 .unwrap()
                 .len(),
             1
         );
-        assert!(collect_batch(&rx, 256, Duration::from_millis(5)).is_none());
+        assert!(collect_batch(&rx, 256, Duration::from_millis(5), &cancel).is_none());
+    }
+
+    #[test]
+    fn waiting_for_a_record_ends_once_cancelled() {
+        let (tx, rx) = mpsc::channel::<Pending>();
+        let cancel = CancellationToken::new();
+        let waiting = std::thread::spawn({
+            let cancel = cancel.clone();
+            move || collect_batch(&rx, 256, Duration::from_millis(5), &cancel).is_none()
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        cancel.cancel();
+        wait_until(|| waiting.is_finished());
+
+        assert!(waiting.join().unwrap());
+        drop(tx);
     }
 
     #[test]

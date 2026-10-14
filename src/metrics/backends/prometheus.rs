@@ -356,11 +356,12 @@ lazy_static! {
     /// Governance audit records the system itself lost, by reason. `journal_write` means
     /// the records could not be written to the audit journal and were discarded once the
     /// in-memory backlog was full; `journal_closed` that the journal writer had stopped;
-    /// `pipeline_not_running` that the audit pipeline was not running to take them.
+    /// `pipeline_not_running` that the audit pipeline was not running to take them;
+    /// `aborted` that the pipeline stopped before the journal writer had written them.
     pub static ref AUDIT_RECORDS_LOST: IntCounterVec = {
         let opts = Opts::new(
             names::AUDIT_RECORDS_LOST_TOTAL,
-            "Governance audit records the gateway lost before any sink received them (reason = journal_write|journal_closed|pipeline_not_running)",
+            "Governance audit records the gateway lost before any sink received them (reason = journal_write|journal_closed|pipeline_not_running|aborted)",
         );
         let counter = IntCounterVec::new(opts, &["reason"]).unwrap();
         REGISTRY.register(Box::new(counter.clone())).unwrap();

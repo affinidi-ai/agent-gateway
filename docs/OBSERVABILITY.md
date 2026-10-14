@@ -242,6 +242,9 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   backoff while holding up to 10,000 records in memory; beyond that the oldest are discarded and
   counted in `agent_gateway_audit_records_lost_total{reason="journal_write"}`. A failed batch
   is cut off again; if that fails too, the segment is re-read before the next batch, as on start.
+  When the pipeline stops before the writer has written records it was handed, the writer stops
+  between batches or during its backoff and discards them, counted in
+  `agent_gateway_audit_records_lost_total{reason="aborted"}`.
   The journal directory is owner-only (`0700`) and its files `0600`.
 - *One writer.* Only an Active node runs the pipeline (see
   [Server mode](CONFIGURATION_RELOAD.md#server-mode)); a Standby node keeps no audit records.
