@@ -247,9 +247,13 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   [Server mode](CONFIGURATION_RELOAD.md#server-mode)); a Standby node keeps no audit records.
   On stepping down a node journals what it was handed, stops delivering and releases the
   journal; on becoming Active it re-opens the journal and cursors from disk and continues after
-  the last record the previous Active node wrote. The writer holds an exclusive lock on
-  `journal/journal.lock`, so a second process sharing the directory cannot write to it; a node
-  that becomes Active while another still holds the lock tries again every 5 s.
+  the last record the previous Active node wrote. Before the pipeline starts, on start-up or on
+  becoming Active, the sinks are built from the current settings and integrations, so delivery
+  never starts from sinks that were never built or are stale; while the integrations cannot be
+  listed the pipeline does not start and is tried again every 5 s. The writer holds an
+  exclusive lock on `journal/journal.lock`, so a second process sharing the directory cannot
+  write to it; a node that becomes Active while another still holds the lock tries again every
+  5 s.
 - *Dispatch.* Each sink has its own reader and cursor (`journal/cursors.json`). A reader
   delivers the records addressed to its sink in journal order and saves its cursor after each
   batch, so it resumes there after a restart; a slow or unreachable destination only delays

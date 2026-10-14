@@ -704,9 +704,10 @@ pub async fn set_audit_pipeline_mode(mode: ServerMode) {
     }
 }
 
-/// Starts the pipeline. While another writer still has the journal open (a
-/// node that has not finished stepping down), keeps trying in the background
-/// until it is released or this node is no longer Active.
+/// Builds the audit sinks and starts the pipeline. While the sinks cannot be
+/// built, or another writer still has the journal open (a node that has not
+/// finished stepping down), keeps trying in the background until it starts
+/// or this node is no longer Active.
 async fn start_audit_pipeline(control: &'static PipelineControl) {
     match control.try_start().await {
         Ok(()) => audit_pipeline_started(),
@@ -715,7 +716,7 @@ async fn start_audit_pipeline(control: &'static PipelineControl) {
             warn!(
                 target: "credential_delegation",
                 error = %e,
-                "Audit journal is in use by another writer; starting the audit pipeline once it is released"
+                "Audit pipeline cannot start yet; starting it once it can"
             );
             tokio::spawn(async move {
                 match control

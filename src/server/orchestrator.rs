@@ -1744,6 +1744,34 @@ pub async fn run_axum_proxy(
             crate::proxy::server::init_transit_token_issuer(Arc::new(issuer));
         }
 
+        // Initialize integration storage. The audit pipeline builds its sinks
+        // from the integrations, so this comes before it starts.
+        let integration_storage: Arc<crate::storage::IntegrationStorage> = {
+            let storage = crate::storage::IntegrationStorage::new(PathBuf::from(
+                &bootstrap_config
+                    .storage_paths
+                    .integrations,
+            ))
+            .await
+            .expect("Failed to initialize integration storage");
+            info!("Notifier storage initialized");
+            let storage_arc = Arc::new(storage);
+
+            // Initialize global integration storage
+            crate::storage::init_integration_storage(storage_arc.clone()).await;
+            info!("✓ Global integration storage initialized");
+            crate::audit::sources::rebuild_sinks().await;
+
+            if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
+                spawn_x402_cleanup_worker(txn_store);
+            }
+
+            // Validate all active integrations
+            crate::integrations::validation::validate_all_integrations(&storage_arc).await;
+
+            storage_arc
+        };
+
         // Initialize delegation vault audit logger (started only on an Active node)
         crate::delegation_vault::audit::init_audit_logger(
             bootstrap_config
@@ -2288,32 +2316,6 @@ pub async fn run_axum_proxy(
             info!("✓ GW2 notification store initialized for integration triggers");
         }
 
-        // Initialize integration storage
-        let integration_storage: Arc<crate::storage::IntegrationStorage> = {
-            let storage = crate::storage::IntegrationStorage::new(PathBuf::from(
-                &bootstrap_config
-                    .storage_paths
-                    .integrations,
-            ))
-            .await
-            .expect("Failed to initialize integration storage");
-            info!("Notifier storage initialized");
-            let storage_arc = Arc::new(storage);
-
-            // Initialize global integration storage
-            crate::storage::init_integration_storage(storage_arc.clone()).await;
-            info!("✓ Global integration storage initialized");
-            crate::audit::sources::rebuild_sinks().await;
-
-            if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
-                spawn_x402_cleanup_worker(txn_store);
-            }
-
-            // Validate all active integrations
-            crate::integrations::validation::validate_all_integrations(&storage_arc).await;
-
-            storage_arc
-        };
         identity_state.integration_store = Some(integration_storage.clone());
 
         // Register appliance resource-limit counters now that every entity store

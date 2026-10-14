@@ -55,18 +55,18 @@ pub fn build_sinks(
 /// at a time. When the integrations cannot be listed the current sinks are
 /// kept, so no record addressed to an integration is lost, the failure is
 /// counted, and the rebuild is retried every [`REBUILD_RETRY`] until it
-/// succeeds.
-pub async fn rebuild_sinks() {
+/// succeeds. Returns whether this rebuild replaced the sinks.
+pub async fn rebuild_sinks() -> bool {
     if rebuild_current().await {
-        return;
+        return true;
     }
-    if RETRY_SCHEDULED.swap(true, Ordering::SeqCst) {
-        return;
+    if !RETRY_SCHEDULED.swap(true, Ordering::SeqCst) {
+        tokio::spawn(async {
+            retry_until_rebuilt(REBUILD_RETRY, rebuild_current).await;
+            RETRY_SCHEDULED.store(false, Ordering::SeqCst);
+        });
     }
-    tokio::spawn(async {
-        retry_until_rebuilt(REBUILD_RETRY, rebuild_current).await;
-        RETRY_SCHEDULED.store(false, Ordering::SeqCst);
-    });
+    false
 }
 
 async fn rebuild_current() -> bool {

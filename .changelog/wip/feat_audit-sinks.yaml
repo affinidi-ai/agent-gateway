@@ -63,6 +63,9 @@ changes:
     - timestamp: '2026-10-14T00:00:00.000Z'
       title: Re-read the audit journal after a failed append that could not be undone
       description: When appending to the audit journal failed and the partial batch could not be cut off again, the next batch was written after the partial line. The segment is now re-read before the next append, as on start, so no partial line is left behind and no sequence number is reused.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Build the audit sinks before the audit pipeline starts
+      description: The audit pipeline started before the Governance Audit integrations were loaded, and a node becoming Active kept the sinks it had built before, missing integration changes made on the other node. The sinks are now built from the current settings and integrations every time the pipeline starts, on start-up and on becoming Active; while the integrations cannot be listed the pipeline waits and tries again every 5 s.
   removed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Remove the unused Pre-Authorize Blocked governance audit event
