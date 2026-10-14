@@ -388,12 +388,14 @@ lazy_static! {
     };
 
     /// Governance audit records a sink skipped, by sink and reason:
-    /// `backlog_cap`, `expired`, `corrupt`, or `paused` for records addressed
-    /// to an integration it let go when it was paused.
+    /// `backlog_cap`, `expired`, `corrupt`, `paused` for records addressed
+    /// to an integration it let go when it was paused, or `rejected` for a
+    /// record that failed as many delivery attempts as the integration's
+    /// attempt limit.
     pub static ref AUDIT_SINK_SKIPPED: IntCounterVec = {
         let opts = Opts::new(
             names::AUDIT_SINK_SKIPPED_TOTAL,
-            "Governance audit records a sink skipped (reason = backlog_cap|expired|corrupt|paused; sink = audit_log or the integration id)",
+            "Governance audit records a sink skipped (reason = backlog_cap|expired|corrupt|paused|rejected; sink = audit_log or the integration id)",
         );
         let counter = IntCounterVec::new(opts, &["sink", "reason"]).unwrap();
         REGISTRY.register(Box::new(counter.clone())).unwrap();

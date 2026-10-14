@@ -6,6 +6,10 @@
 //! warning per batch naming the segments. Entries with a seq at or below the
 //! cursor are ignored, and entries are delivered in file order.
 //!
+//! A sink with an attempt limit skips a record that has failed that many
+//! delivery attempts, counts it with `reason="rejected"` and logs one warning
+//! with the last error; without a limit the record is retried until delivered.
+//!
 //! A sink that leaves the registry (a Governance Audit integration disabled,
 //! given a tenant, moved to another category or deleted) is paused: its
 //! cursor moves to the durable seq and is parked there, letting go of the
@@ -68,6 +72,10 @@ impl Default for ReaderConfig {
 /// The sink's current drop policy: records older than this are skipped.
 pub type MaxAge = Arc<dyn Fn() -> Option<Duration> + Send + Sync>;
 
+/// The sink's current attempt limit: a record it has failed to accept this
+/// many times is skipped.
+pub type MaxAttempts = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
+
 /// Where a sink reads from: the journal, its cursors and the last durable seq.
 #[derive(Clone)]
 pub struct JournalSource {
@@ -80,7 +88,8 @@ pub struct JournalSource {
 /// its saved cursor, or after its parked one when it resumes from a pause. A
 /// sink with neither starts at the start of the journal and saves that at
 /// once (see [`CursorStore::start`]). A failed delivery is retried with
-/// backoff and the cursor does not move past it. Runs until the journal
+/// backoff and the cursor does not move past it, until the record is older
+/// than `max_age` or has failed `max_attempts` times. Runs until the journal
 /// writer is gone or `cancel` fires; cancelling drops a delivery in flight,
 /// and its cursor stays before it.
 pub async fn run_reader<D: Deliver>(
@@ -89,10 +98,11 @@ pub async fn run_reader<D: Deliver>(
     source: JournalSource,
     config: ReaderConfig,
     max_age: MaxAge,
+    max_attempts: MaxAttempts,
     cancel: CancellationToken,
 ) {
     cancel
-        .run_until_cancelled(deliver_from_cursor(sink, deliver, source, config, max_age))
+        .run_until_cancelled(deliver_from_cursor(sink, deliver, source, config, max_age, max_attempts))
         .await;
 }
 
@@ -102,6 +112,7 @@ async fn deliver_from_cursor<D: Deliver>(
     source: JournalSource,
     config: ReaderConfig,
     max_age: MaxAge,
+    max_attempts: MaxAttempts,
 ) {
     let JournalSource { dir, cursors, mut durable } = source;
     let (store, owned) = (cursors.clone(), sink.clone());
@@ -146,11 +157,31 @@ async fn deliver_from_cursor<D: Deliver>(
                 .recipients
                 .contains(&sink);
             if addressed && !moved_past() {
-                let delivered = !expired()
-                    && deliver_until_accepted(&deliver, entry, &sink, &config, || moved_past() || expired()).await;
-                if !delivered && !moved_past() {
-                    track_audit_sink_skipped(sink.label(), "expired", 1);
-                    warn!(?sink, seq = entry.seq, "Audit record skipped: older than the sink's drop policy");
+                let delivery = if expired() {
+                    Delivery::Abandoned
+                } else {
+                    deliver_until_accepted(&deliver, entry, &sink, &config, || max_attempts(), || {
+                        moved_past() || expired()
+                    })
+                    .await
+                };
+                match delivery {
+                    Delivery::Accepted => {}
+                    _ if moved_past() => {}
+                    Delivery::Abandoned => {
+                        track_audit_sink_skipped(sink.label(), "expired", 1);
+                        warn!(?sink, seq = entry.seq, "Audit record skipped: older than the sink's drop policy");
+                    }
+                    Delivery::Rejected { attempts, error } => {
+                        track_audit_sink_skipped(sink.label(), "rejected", 1);
+                        warn!(
+                            ?sink,
+                            seq = entry.seq,
+                            attempts,
+                            error = format!("{error:#}"),
+                            "Audit record skipped: the sink did not accept it within its attempt limit"
+                        );
+                    }
                 }
             }
             cursor = entry
@@ -351,6 +382,12 @@ async fn reconcile<F: SinkFactory>(
                     .snapshot()
                     .drop_older_than(&owned)
             });
+            let owned = id.clone();
+            let max_attempts: MaxAttempts = Arc::new(move || {
+                sinks
+                    .snapshot()
+                    .max_attempts(&owned)
+            });
             let reader_cancel = cancel.child_token();
             let task = tokio::spawn(run_reader(
                 id.clone(),
@@ -358,6 +395,7 @@ async fn reconcile<F: SinkFactory>(
                 source.clone(),
                 config.clone(),
                 max_age,
+                max_attempts,
                 reader_cancel.clone(),
             ));
             readers.insert(
@@ -545,31 +583,47 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> std::io::Result<T> +
         .map_err(std::io::Error::other)?
 }
 
-/// Retries until the sink accepts the record (true) or `give_up` says to stop
-/// (false).
+/// How a record's delivery ended.
+enum Delivery {
+    Accepted,
+    /// `give_up` said to stop.
+    Abandoned,
+    /// It failed as many times as the sink's attempt limit; `error` is the
+    /// last failure.
+    Rejected { attempts: u32, error: anyhow::Error },
+}
+
+/// Retries until the sink accepts the record, it has failed `max_attempts`
+/// times (read after each failure), or `give_up` says to stop.
 async fn deliver_until_accepted<D: Deliver>(
     deliver: &D,
     entry: &JournalEntry,
     sink: &SinkId,
     config: &ReaderConfig,
+    max_attempts: impl Fn() -> Option<u32>,
     give_up: impl Fn() -> bool,
-) -> bool {
+) -> Delivery {
     let mut backoff = config.retry_initial;
-    while let Err(e) = deliver.deliver(entry).await {
+    let mut attempts: u32 = 0;
+    while let Err(error) = deliver.deliver(entry).await {
+        attempts = attempts.saturating_add(1);
+        if max_attempts().is_some_and(|limit| attempts >= limit) {
+            return Delivery::Rejected { attempts, error };
+        }
         warn!(
             ?sink,
             seq = entry.seq,
-            error = format!("{e:#}"),
+            error = format!("{error:#}"),
             retry_in_ms = backoff.as_millis() as u64,
             "Audit sink did not accept a record; retrying"
         );
         tokio::time::sleep(backoff).await;
         if give_up() {
-            return false;
+            return Delivery::Abandoned;
         }
         backoff = (backoff * 2).min(config.retry_max);
     }
-    true
+    Delivery::Accepted
 }
 
 async fn read(
@@ -617,6 +671,9 @@ mod tests {
         /// Refuses every entry from this seq on, like an integration that
         /// stopped receiving audit records; 0 refuses nothing.
         refuse_from: Arc<std::sync::atomic::AtomicU64>,
+        /// Refuses the entry with this seq every time, like a destination
+        /// that never accepts one record; 0 refuses nothing.
+        refuse_seq: Arc<std::sync::atomic::AtomicU64>,
         /// Never completes a delivery, like a destination that never answers.
         stalled: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -639,6 +696,13 @@ mod tests {
                 .load(Ordering::SeqCst);
             if refuse_from > 0 && entry.seq >= refuse_from {
                 anyhow::bail!("not receiving audit records");
+            }
+            if self
+                .refuse_seq
+                .load(Ordering::SeqCst)
+                == entry.seq
+            {
+                anyhow::bail!("record rejected");
             }
             if self
                 .failures_left
@@ -753,7 +817,35 @@ mod tests {
             max_age: Option<Duration>,
             cancel: CancellationToken,
         ) -> tokio::task::JoinHandle<()> {
-            tokio::spawn(run_reader(sink, deliver, self.source(), fast_retry(), Arc::new(move || max_age), cancel))
+            self.spawn_with(sink, deliver, max_age, None, cancel)
+        }
+
+        fn spawn_giving_up(
+            &self,
+            sink: SinkId,
+            deliver: RecordingSink,
+            max_attempts: u32,
+        ) -> tokio::task::JoinHandle<()> {
+            self.spawn_with(sink, deliver, None, Some(max_attempts), CancellationToken::new())
+        }
+
+        fn spawn_with(
+            &self,
+            sink: SinkId,
+            deliver: RecordingSink,
+            max_age: Option<Duration>,
+            max_attempts: Option<u32>,
+            cancel: CancellationToken,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(run_reader(
+                sink,
+                deliver,
+                self.source(),
+                fast_retry(),
+                Arc::new(move || max_age),
+                Arc::new(move || max_attempts),
+                cancel,
+            ))
         }
     }
 
@@ -1624,6 +1716,114 @@ mod tests {
                 >= 1
         );
         reader.abort();
+    }
+
+    fn rejected_skips(sink: &SinkId) -> u64 {
+        crate::metrics::backends::prometheus::AUDIT_SINK_SKIPPED
+            .with_label_values(&[sink.label(), "rejected"])
+            .get()
+    }
+
+    #[tokio::test]
+    async fn a_record_refused_as_often_as_the_attempt_limit_is_skipped_and_counted() {
+        let sink_id = SinkId::Integration("rejected-after-limit".to_string());
+        let mut f = Fixture::new();
+        f.cursors
+            .set(&sink_id, 0)
+            .unwrap();
+        let sink = RecordingSink::default();
+        sink.refuse_seq
+            .store(1, Ordering::SeqCst);
+        let before = rejected_skips(&sink_id);
+        let reader = f.spawn_giving_up(sink_id.clone(), sink.clone(), 3);
+
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed]);
+        wait_until(|| f.cursors.get(&sink_id) == Some(2)).await;
+
+        assert_eq!(*sink.delivered.lock(), vec![2]);
+        assert_eq!(
+            sink.attempts
+                .load(Ordering::SeqCst),
+            4
+        );
+        assert_eq!(rejected_skips(&sink_id), before + 1);
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn without_an_attempt_limit_a_refused_record_is_retried_and_never_skipped() {
+        let sink_id = SinkId::Integration("rejected-without-limit".to_string());
+        let mut f = Fixture::new();
+        f.cursors
+            .set(&sink_id, 0)
+            .unwrap();
+        let sink = RecordingSink::default();
+        sink.refuse_seq
+            .store(1, Ordering::SeqCst);
+        let reader = f.spawn(sink_id.clone(), sink.clone());
+
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed]);
+        wait_until(|| {
+            sink.attempts
+                .load(Ordering::SeqCst)
+                >= 10
+        })
+        .await;
+
+        assert_eq!(f.cursors.get(&sink_id), Some(0));
+        assert!(
+            sink.delivered
+                .lock()
+                .is_empty()
+        );
+        assert_eq!(rejected_skips(&sink_id), 0);
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_limit_set_in_the_registry_reaches_a_running_reader() {
+        let sink_id = SinkId::Integration("limit-set-while-retrying".to_string());
+        let mut f = Fixture::new();
+        let factory = RecordingFactory::default();
+        factory
+            .deliverer(&sink_id)
+            .refuse_seq
+            .store(1, Ordering::SeqCst);
+        let sinks = registry(std::slice::from_ref(&sink_id));
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed]);
+        wait_until(|| {
+            factory
+                .deliverer(&sink_id)
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 3
+        })
+        .await;
+        assert_eq!(f.cursors.get(&sink_id), Some(0));
+        let before = rejected_skips(&sink_id);
+
+        sinks.replace(
+            selecting_everything(addressed)
+                .into_iter()
+                .map(|sink| sink.giving_up_after(Some(2)))
+                .collect(),
+            Vec::new(),
+        );
+        wait_until(|| f.cursors.get(&sink_id) == Some(2)).await;
+
+        assert_eq!(factory.delivered(&sink_id), vec![2]);
+        assert_eq!(rejected_skips(&sink_id), before + 1);
+        manager.abort();
     }
 
     #[tokio::test]
