@@ -3070,7 +3070,7 @@ async fn enrich_and_evaluate_surface_policies(
                         vp_jwt: &vp_jwt,
                         trace_id: trace_id.as_deref(),
                         detail: "request_path_fabric_received".to_string(),
-                        caller: None,
+                        caller: crate::delegation_vault::audit::binding_caller_context(binding),
                         via_fabric: true,
                     },
                 ));

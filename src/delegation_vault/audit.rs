@@ -973,6 +973,46 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
     })
 }
 
+/// Build an `AuditCallerContext` from the caller a received identity binding
+/// discloses in `workloadBinding.caller`: the `sub`, `email` and `name` the
+/// sending gateway chose to include, with that gateway as the issuer. `None`
+/// unless a trust anchor vouched for the binding and it names a caller.
+pub fn binding_caller_context(binding: &crate::surface_context::IdentityBindingContext) -> Option<AuditCallerContext> {
+    if !binding.verified {
+        return None;
+    }
+    let fields = &binding
+        .caller
+        .as_ref()?
+        .fields;
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let (sub, email, name) = (field("sub"), field("email"), field("name"));
+    if sub.is_none() && email.is_none() && name.is_none() {
+        return None;
+    }
+    Some(AuditCallerContext {
+        auth_method: "workload_binding".to_string(),
+        iss: Some(binding.gateway_did.clone()),
+        aud: None,
+        sub,
+        token_id: None,
+        email,
+        name,
+        email_redacted: None,
+        name_redacted: None,
+        mtls_fingerprint: None,
+        mtls_subject_dn: None,
+        mtls_issuer_dn: None,
+        mtls_source: None,
+    })
+}
+
 /// Build an `AuditCallerContext` for a management-API caller (delegation-vault
 /// management routes). The caller is a console operator authenticated by the
 /// session/PAT middleware, so `sub` is the authenticated `user_id` and, when the
@@ -2084,6 +2124,51 @@ mod tests {
             transit_caller_context(&transit_claims(None, serde_json::json!({"email": 7}))).is_none(),
             "non-string claims are ignored"
         );
+    }
+
+    fn binding(
+        verified: bool,
+        caller_fields: Option<serde_json::Value>,
+    ) -> crate::surface_context::IdentityBindingContext {
+        crate::surface_context::IdentityBindingContext {
+            verified,
+            agent_did: "did:key:agent".to_string(),
+            gateway_did: "did:web:gw-1".to_string(),
+            identity_fields: std::collections::HashMap::new(),
+            caller: caller_fields.map(|fields| crate::surface_context::CallerBindingContext {
+                fields: serde_json::from_value(fields).unwrap(),
+                user_hash: Some("hash-1".to_string()),
+                assurance: "gateway_attested".to_string(),
+                identity_source: Some("jwt_bearer".to_string()),
+            }),
+            delegated: true,
+            target: None,
+            intent: None,
+            inbound_credentials: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_verified_binding_names_the_caller_its_gateway_disclosed() {
+        let caller = binding_caller_context(&binding(
+            true,
+            Some(serde_json::json!({"sub": "user-123", "email": "ada@example.com", "name": "Ada Lovelace"})),
+        ))
+        .unwrap();
+
+        assert_eq!(caller.auth_method, "workload_binding");
+        assert_eq!(caller.iss.as_deref(), Some("did:web:gw-1"), "the gateway that signed the binding");
+        assert_eq!(caller.sub.as_deref(), Some("user-123"));
+        assert_eq!(caller.email.as_deref(), Some("ada@example.com"));
+        assert_eq!(caller.name.as_deref(), Some("Ada Lovelace"));
+    }
+
+    #[test]
+    fn a_binding_names_no_caller_unless_verified_and_disclosed() {
+        let disclosed = Some(serde_json::json!({"email": "ada@example.com"}));
+        assert!(binding_caller_context(&binding(false, disclosed)).is_none(), "no trust anchor vouched for it");
+        assert!(binding_caller_context(&binding(true, None)).is_none());
+        assert!(binding_caller_context(&binding(true, Some(serde_json::json!({"email": ""})))).is_none());
     }
 
     fn injection<'a>(caller: Option<AuditCallerContext>) -> VpInjection<'a> {
