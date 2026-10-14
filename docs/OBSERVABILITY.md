@@ -263,13 +263,25 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   deduplicate on `event_id`. The VP Audit Log does this itself for the records at the end of
   its file.
 - *Sinks coming and going.* A new sink reads from the start of the journal; no record is
-  addressed to a sink before it exists, so it misses nothing. A removed or disabled sink's cursor
-  is parked, and the sink resumes from it if it comes back. An integration that is disabled, or
-  changed so it no longer receives audit records, refuses records until its reader is stopped,
-  so nothing addressed to it is passed over; each refusal is counted with
-  `result="not_receiving"`. The sinks are rebuilt from the settings and integrations one rebuild
-  at a time, so an older rebuild never replaces newer sinks. When the integrations cannot be
-  listed, including before integration storage is set up, the previous sinks are kept, the failure is counted in
+  addressed to a sink before it exists, so it misses nothing. A Governance Audit integration
+  that is disabled, given a tenant or moved to another category is paused: it keeps its
+  configuration but receives nothing, and records addressed to it while it is paused are not
+  kept. Pausing moves its cursor to the end of the journal, letting go of the records it had not
+  received; each one addressed to it is counted in
+  `agent_gateway_audit_sink_skipped_total{sink, reason="paused"}` (unreadable lines with
+  `reason="corrupt"`) and one warning per integration gives the count. An integration paused
+  while the gateway was stopped is paused the same way when the pipeline starts. Resuming
+  continues from where the pause left it, so it receives only records produced after the pause;
+  that position never holds back journal pruning, and once pruning has deleted everything up to
+  it the integration resumes from the oldest remaining record, all of them produced after the
+  pause. Deleting an integration lets go of its records in the same way and drops its cursor.
+  The VP Audit Log is never paused. Until its reader is stopped a paused integration refuses
+  records, counted with `result="not_receiving"`, so none is reported as delivered; those
+  records are counted as paused. Records produced at the moment of pausing, before the change
+  takes effect, may still be delivered after the integration resumes, or be counted as paused.
+  The sinks are rebuilt from the settings and integrations one rebuild at a time, so an older
+  rebuild never replaces newer sinks. When the integrations cannot be listed, including before
+  integration storage is set up, the previous sinks are kept, the failure is counted in
   `agent_gateway_audit_sink_rebuild_failed_total`, and the rebuild is retried every 5 s until it
   succeeds.
 - *Backlog.* Journal segments every active cursor has passed are deleted. The journal size is
@@ -290,7 +302,9 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
 
 Records produced are counted in `agent_gateway_audit_records_produced_total{event}`;
 integration deliveries in
-`agent_gateway_audit_forward_total{result="delivered"|"failed"|"not_receiving", integration_id}`.
+`agent_gateway_audit_forward_total{result="delivered"|"failed"|"not_receiving", integration_id}`;
+records a sink skipped in
+`agent_gateway_audit_sink_skipped_total{sink, reason="backlog_cap"|"expired"|"corrupt"|"paused"}`.
 
 `agent_gateway_audit_pipeline_started` is 1 while the pipeline runs and 0 when it could not start
 (the journal directory cannot be created or written, for example) or the node is in Standby.
