@@ -5965,7 +5965,7 @@ async fn process_forward_request_with_mcp_runtime(
                         gw2_identity_selector,
                         gw2_identity_rules,
                         channel_id,
-                        true,
+                        crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
                         None, // agent-card response has no inbound caller token
                     )
                     .await
@@ -6693,7 +6693,19 @@ async fn process_forward_request_with_mcp_runtime(
                     agent_did.starts_with("did:"),
                     identity_ext_rules.is_some()
                 );
-                if agent_did.starts_with("did:") && identity_ext_rules.is_some() {
+                let is_a2a_surface = matches!(
+                    resolved_surface.channel_protocol(),
+                    crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
+                );
+                let is_card_response = is_agent_card_request
+                    || (is_a2a_surface
+                        && (crate::a2a::url_rewriter::extended_agent_card_request_id(&body_bytes).is_some()
+                            || crate::proxy::paths::is_rest_extended_agent_card_request(
+                                method,
+                                &resolved_surface.target.endpoint,
+                                path,
+                            )));
+                if agent_did.starts_with("did:") && identity_ext_rules.is_some() && !is_card_response {
                     info!("GW2: Backend agent DID found, injecting VP into response for DID: {}", agent_did);
 
                     // Get the VC issuer
@@ -7839,7 +7851,7 @@ async fn spawn_mcp_proxy_trust_recorder(
         selector,
         rules,
         &surface.name,
-        false,
+        crate::proxy::backend_identity::IdentityResponseKind::Message,
         None,
     )
     .await

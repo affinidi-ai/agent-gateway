@@ -29,7 +29,7 @@ pub use errors::{
 
 pub use extensions::{
     inject_credential_into_agent_card, inject_custom_metadata_extension, inject_header_metadata_extension,
-    inject_identity_credential_into_response, upsert_credential_into_agent_card,
+    inject_identity_credential_into_response, replace_credential_in_agent_card, upsert_credential_into_agent_card,
 };
 
 #[cfg(feature = "didwebvh")]
@@ -39,7 +39,10 @@ pub use extensions::inject_didwebvh_identity_extension;
 pub use crate::protocols::{
     ExtensionInspectionContext, inspect_message_extensions, is_hop_by_hop_header, should_forward_request_header,
 };
-pub use url_rewriter::{build_target_url, rewrite_agent_card_urls};
+pub use url_rewriter::{
+    AgentCardKind, EXTENDED_AGENT_CARD_BATCH_REFUSAL, build_target_url, is_extended_agent_card_batch,
+    is_extended_agent_card_method, rewrap_extended_agent_card, rewrite_agent_card_urls, unwrap_extended_agent_card,
+};
 
 #[cfg(feature = "didwebvh")]
 pub use url_rewriter::inject_didwebvh_identity_into_agent_card;

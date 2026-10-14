@@ -149,6 +149,46 @@ impl IdentityResolutionError {
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
+/// What an upstream response body carries, for identity resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityResponseKind {
+    /// A protocol message or JSON-RPC result.
+    Message,
+    /// A public agent card served on discovery, which has no inbound caller.
+    PublicAgentCard,
+    /// An extended agent card, which is always fetched by an authenticated caller.
+    ExtendedAgentCard,
+}
+
+impl IdentityResponseKind {
+    /// Classify a response; an extended card wins when a response is flagged as both.
+    pub fn for_response(
+        is_extended_agent_card: bool,
+        is_well_known_agent_card: bool,
+    ) -> Self {
+        if is_extended_agent_card {
+            Self::ExtendedAgentCard
+        } else if is_well_known_agent_card {
+            Self::PublicAgentCard
+        } else {
+            Self::Message
+        }
+    }
+
+    /// Whether the response is a public or extended agent card.
+    pub fn is_agent_card(self) -> bool {
+        !matches!(self, Self::Message)
+    }
+
+    /// Whether an `agent-identity-credential/v1` extension already on the card
+    /// can stand in for the agent's identity. Only a public card trusts one: a
+    /// peer gateway never issues a credential on an extended card, so one there
+    /// was written by a Target, directly or behind a Fabric peer.
+    pub fn trusts_upstream_identity_credential(self) -> bool {
+        self != Self::ExtendedAgentCard
+    }
+}
+
 /// Resolve the protected agent's identity from a response.
 ///
 /// - Returns `Ok(Anonymous)` when `managed_identity` is **not** configured (identity management disabled).
@@ -163,7 +203,7 @@ pub async fn resolve_protected_agent_identity(
     identity_selector: Option<&Arc<crate::identity::IdentitySelector>>,
     identity_rules_engine: Option<&Arc<crate::proxy::RulesEngine>>,
     channel_name: &str,
-    is_agent_card: bool,
+    response_kind: IdentityResponseKind,
     source_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
     resolve_agent_identity_for_slot(
@@ -173,7 +213,7 @@ pub async fn resolve_protected_agent_identity(
         identity_selector,
         identity_rules_engine,
         channel_name,
-        is_agent_card,
+        response_kind,
         source_identity,
     )
     .await
@@ -192,7 +232,7 @@ pub async fn resolve_external_agent_identity(
     identity_selector: Option<&Arc<crate::identity::IdentitySelector>>,
     identity_rules_engine: Option<&Arc<crate::proxy::RulesEngine>>,
     channel_name: &str,
-    is_agent_card: bool,
+    response_kind: IdentityResponseKind,
     source_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
     resolve_agent_identity_for_slot(
@@ -202,7 +242,7 @@ pub async fn resolve_external_agent_identity(
         identity_selector,
         identity_rules_engine,
         channel_name,
-        is_agent_card,
+        response_kind,
         source_identity,
     )
     .await
@@ -246,9 +286,10 @@ pub async fn resolve_agent_identity_for_slot(
     identity_selector: Option<&Arc<crate::identity::IdentitySelector>>,
     identity_rules_engine: Option<&Arc<crate::proxy::RulesEngine>>,
     channel_name: &str,
-    is_agent_card: bool,
+    response_kind: IdentityResponseKind,
     source_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
+    let is_agent_card = response_kind.is_agent_card();
     if !is_agent_card
         && surface.channel_protocol() == crate::config::ChannelProtocol::Mcp
         && let Ok(body) = serde_json::from_slice::<JsonValue>(response_body)
@@ -295,10 +336,10 @@ pub async fn resolve_agent_identity_for_slot(
         let mode_label = "from_jwt_claim";
         let started = std::time::Instant::now();
         let Some(claims) = source_identity.and_then(|i| i.jwt_claims()) else {
-            // No validated token in scope. For agent-card fetches there is no
-            // inbound caller, so treat as anonymous; otherwise the surface is
+            // No validated token in scope. A public agent card has no inbound
+            // caller, so treat it as anonymous; otherwise the surface is
             // misconfigured (FromJwtClaim without jwt_bearer source auth).
-            if is_agent_card {
+            if response_kind == IdentityResponseKind::PublicAgentCard {
                 return Ok(ProtectedAgentIdentity::Anonymous);
             }
             crate::metrics::backends::prometheus::track_managed_identity_resolve(
@@ -568,6 +609,7 @@ pub async fn resolve_agent_identity_for_slot(
         }
         crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2 => {
             if is_agent_card {
+                let trusts_upstream_credential = response_kind.trusts_upstream_identity_credential();
                 // Short-circuit: when the card already carries an
                 // `agent-identity-credential/v1` extension (injected by an
                 // upstream gateway that has already resolved and DID-hashed the
@@ -589,7 +631,7 @@ pub async fn resolve_agent_identity_for_slot(
                     })
                     .cloned();
 
-                if let Some(ext) = cred_ext {
+                if let Some(ext) = cred_ext.filter(|_| trusts_upstream_credential) {
                     let params = ext.get("params");
                     let did = params
                         .and_then(|p| p.get("did"))
@@ -600,8 +642,9 @@ pub async fn resolve_agent_identity_for_slot(
                         // an attacker who controls the agent card's HTTP layer could set
                         // an arbitrary DID in params while the signed VP content remains
                         // unrelated, bypassing identity checks. The VP signature itself
-                        // is not re-verified here (that happens when GW2 issues it), but
-                        // the structural consistency check prevents trivial DID injection.
+                        // is not re-verified here, so the shortcut is skipped for extended
+                        // cards, on which a peer gateway never issues a credential; the
+                        // structural consistency check prevents trivial DID injection.
                         let vp_parsed = params
                             .and_then(|p| p.get("verifiablePresentation"))
                             .and_then(|v| v.as_str())
@@ -1053,6 +1096,140 @@ mod tests {
     use serde_json::json;
 
     const EXT_URI: &str = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
+
+    // ── from_jwt_claim without validated claims ──────────────────────────
+
+    fn from_jwt_claim_surface() -> crate::config::agent_surface::AgentSurface {
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim {
+            claim: "oid".to_string(),
+            namespace_claims: vec![],
+        });
+        surface
+    }
+
+    #[tokio::test]
+    async fn from_jwt_claim_without_claims_is_anonymous_for_public_agent_card() {
+        let resolved = resolve_protected_agent_identity(
+            br#"{"name":"agent"}"#,
+            &from_jwt_claim_surface(),
+            None,
+            None,
+            "test",
+            IdentityResponseKind::PublicAgentCard,
+            None,
+        )
+        .await;
+        assert!(matches!(resolved, Ok(ProtectedAgentIdentity::Anonymous)), "{resolved:?}");
+    }
+
+    #[tokio::test]
+    async fn from_jwt_claim_without_claims_fails_for_extended_card_and_messages() {
+        let expected = crate::identity::credential_identity::CredentialIdentityError::JwtClaimsUnavailable.to_string();
+        for kind in [IdentityResponseKind::ExtendedAgentCard, IdentityResponseKind::Message] {
+            let resolved = resolve_protected_agent_identity(
+                br#"{"name":"agent"}"#,
+                &from_jwt_claim_surface(),
+                None,
+                None,
+                "test",
+                kind,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(&resolved, Err(IdentityResolutionError::DidCreationFailed(message)) if *message == expected),
+                "{kind:?}: {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_response_kind_for_response_prefers_extended_card() {
+        assert_eq!(IdentityResponseKind::for_response(true, true), IdentityResponseKind::ExtendedAgentCard);
+        assert_eq!(IdentityResponseKind::for_response(true, false), IdentityResponseKind::ExtendedAgentCard);
+        assert_eq!(IdentityResponseKind::for_response(false, true), IdentityResponseKind::PublicAgentCard);
+        assert_eq!(IdentityResponseKind::for_response(false, false), IdentityResponseKind::Message);
+    }
+
+    #[test]
+    fn identity_response_kind_reports_agent_cards() {
+        assert!(!IdentityResponseKind::Message.is_agent_card());
+        assert!(IdentityResponseKind::PublicAgentCard.is_agent_card());
+        assert!(IdentityResponseKind::ExtendedAgentCard.is_agent_card());
+    }
+
+    fn self_asserted_credential_card() -> Vec<u8> {
+        let did = "did:key:z6MkSelfAsserted";
+        let vp = json!({"holder": did, "verifiableCredential": {"credentialSubject": {"id": did}}});
+        serde_json::to_vec(&json!({
+            "name": "agent",
+            "capabilities": {"extensions": [{
+                "uri": crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+                "params": {"did": did, "verifiablePresentation": vp.to_string()}
+            }]}
+        }))
+        .unwrap()
+    }
+
+    fn payload_extraction_surface(target_endpoint: &str) -> crate::config::agent_surface::AgentSurface {
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
+        surface.target.endpoint = target_endpoint.to_string();
+        surface
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                meta_field: "agentIdentity".to_string(),
+                ..Default::default()
+            },
+        ));
+        surface
+    }
+
+    async fn resolve_card(
+        target_endpoint: &str,
+        kind: IdentityResponseKind,
+    ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
+        resolve_protected_agent_identity(
+            &self_asserted_credential_card(),
+            &payload_extraction_surface(target_endpoint),
+            None,
+            None,
+            "test",
+            kind,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn extended_card_never_trusts_a_credential_its_sender_put_there() {
+        for target in ["https://agent.example", "fabric://peer/surface"] {
+            let resolved = resolve_card(target, IdentityResponseKind::ExtendedAgentCard).await;
+            assert!(
+                matches!(resolved, Err(IdentityResolutionError::IdentityExtensionMissing(_))),
+                "{target}: {resolved:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_card_keeps_an_upstream_gateway_credential() {
+        let resolved = resolve_card("fabric://peer/surface", IdentityResponseKind::PublicAgentCard).await;
+        assert!(
+            matches!(&resolved, Ok(ProtectedAgentIdentity::Managed { did, .. }) if did == "did:key:z6MkSelfAsserted"),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_public_card_trusts_an_upstream_identity_credential() {
+        assert!(IdentityResponseKind::PublicAgentCard.trusts_upstream_identity_credential());
+        assert!(!IdentityResponseKind::ExtendedAgentCard.trusts_upstream_identity_credential());
+    }
 
     // ── extract_a2a_identity_from_message ────────────────────────────────
 

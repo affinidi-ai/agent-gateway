@@ -1,0 +1,88 @@
+branch: feat/extended_agent_card_support
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-13T10:00:00.000Z'
+      title: Skip response extension inspection for extended agent cards
+      description: >-
+        Extended agent cards returned on inbound and fabric paths are now treated like the public
+        card and skip response extension inspection, so response validation rules no longer apply to
+        GetExtendedAgentCard and agent/getAuthenticatedExtendedCard responses.
+    - timestamp: '2026-10-13T12:00:00.000Z'
+      title: Request uncompressed extended agent cards from the Target
+      description: >-
+        Extended agent card fetches are forwarded with Accept-Encoding identity in place of the
+        caller's value, because the gateway cannot rewrite a compressed card and would otherwise
+        answer 502.
+    - timestamp: '2026-10-13T14:00:00.000Z'
+      title: Reject public agent cards that are not JSON objects
+      description: >-
+        A public agent card whose body is valid JSON but not an object is now answered with 502 on
+        inbound paths, as extended cards are, because its endpoint URLs cannot be rewritten.
+  fixed:
+    - timestamp: '2026-10-13T15:20:00.000Z'
+      title: Stop signing an identity VP for agent card responses
+      description: >-
+        Inbound and fabric receiving gateways no longer sign a backend agent VP for public or
+        extended agent card responses, which have nowhere to carry it, removing a wasted signing and
+        a misleading warning on every card fetch.
+  removed: []
+  security:
+    - timestamp: '2026-10-12T10:00:00.000Z'
+      title: Rewrite Target endpoint URLs in extended agent cards
+      description: >-
+        Extended agent cards on A2A and AP2 surfaces, returned by GetExtendedAgentCard and
+        agent/getAuthenticatedExtendedCard or fetched from extendedAgentCard (1.0, including
+        tenant-scoped paths) or v1/card (0.3), now have their endpoint URLs rewritten to the gateway
+        on inbound, fabric and outbound paths and get the same agent identity treatment as the public
+        card, so callers no longer learn the Target address from requests the gateway recognises.
+        The HTTP+JSON path is resolved against the Target's base path both as the forwarded URL is and
+        as lenient Target routers do, and a path that climbs out of the base or above the root (which
+        covers fabric targets, whose peer base path is unknown) or cannot be parsed is treated as a
+        card. An extended-card response the gateway cannot rewrite, including one with no
+        endpoint field, is answered with 502 (a JSON-RPC -32603 error echoing the request id on the
+        JSON-RPC binding), and an extended-card request inside a JSON-RPC batch is rejected with
+        -32600. Requests the gateway cannot parse or recognise, listed in docs/PROTOCOLS.md, are
+        forwarded unrewritten, and a Fabric caller is covered only once its own gateway is upgraded.
+    - timestamp: '2026-10-13T15:00:00.000Z'
+      title: Never trust an identity credential already on an extended agent card
+      description: >-
+        An agent-identity-credential/v1 extension already on an extended card no longer stands in for
+        the agent identity, directly or over Fabric, because a peer gateway never issues one there.
+        The Target must present agent-identity/v1, and when agent identity is configured every
+        credential extension on the card is removed before the gateway adds its own, so a Target
+        cannot assert a DID of its choosing.
+  breaking: []
+  internal:
+    - timestamp: '2026-10-12T10:30:00.000Z'
+      title: Share one well-known agent card path check across proxy handlers
+      description: >-
+        Adds is_well_known_agent_card_path in src/proxy/paths.rs and uses it in the inbound,
+        fabric and outbound handlers and in is_public_path, replacing duplicated suffix checks.
+    - timestamp: '2026-10-12T11:00:00.000Z'
+      title: Share extended agent card unwrap and rewrap between inbound and fabric
+      description: >-
+        Adds unwrap_extended_agent_card, rewrap_extended_agent_card and requests_extended_agent_card
+        so the inbound and fabric response pipelines use one implementation, and the fabric path only
+        parses the request method on A2A and AP2 surfaces.
+    - timestamp: '2026-10-12T12:00:00.000Z'
+      title: Pass an identity response kind instead of an agent card flag
+      description: >-
+        Replaces the is_agent_card flag on the identity resolvers with IdentityResponseKind
+        (Message, PublicAgentCard, ExtendedAgentCard), chosen by IdentityResponseKind::for_response
+        from separate extended and well-known card flags, so the anonymous short-circuit for
+        from_jwt_claim applies to public cards only and the inbound and fabric pipelines classify
+        responses the same way.
+    - timestamp: '2026-10-13T17:00:00.000Z'
+      title: Test the Fabric extended card path with a scripted peer gateway
+      description: >-
+        Adds a test-only send hook to the DIDComm client so handler tests can answer a Fabric
+        ForwardRequest, and uses it to cover rewrite, refusal and error-status handling of extended
+        cards on the Fabric caller path, plus component tests for Target base path climbs and the
+        JSON-RPC refusal body.
+    - timestamp: '2026-10-13T15:10:00.000Z'
+      title: Pass the agent card kind to the card URL rewriters
+      description: >-
+        Adds AgentCardKind (Public, Extended) to the inbound and outbound card rewriters so an
+        extended card with no endpoint field fails closed while a public card is still forwarded,
+        and drops the redundant percent-encoding dependency in favour of urlencoding.

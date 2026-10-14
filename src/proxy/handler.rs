@@ -923,7 +923,7 @@ pub async fn handle_agent_card(
             card_identity_selector,
             card_identity_rules,
             &channel_name,
-            true,
+            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
             None,
         )
         .await
@@ -962,7 +962,7 @@ pub async fn handle_agent_card(
                 .external_rules_engine
                 .as_ref(),
             &channel_name,
-            true,
+            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
             None, // agent-card fetch has no inbound caller token
         )
         .await
@@ -992,6 +992,7 @@ pub async fn handle_agent_card(
             &state.config,
             &state.network_config,
             &resolved_identity,
+            crate::a2a::AgentCardKind::Public,
         )
         .await
         .map_err(|e| {
@@ -1664,13 +1665,7 @@ async fn proxy_handler_with_mcp_runtime(
 
     channel_info!(config_id, "Proxying request: method={} path={}", method, uri.path());
 
-    if uri
-        .path()
-        .ends_with("/.well-known/agent-card.json")
-        || uri
-            .path()
-            .ends_with("/.well-known/agent.json")
-    {
+    if crate::proxy::paths::is_well_known_agent_card_path(uri.path()) {
         let response = match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone()).await {
             Ok(response) | Err(response) => response,
         };
@@ -2919,6 +2914,26 @@ async fn proxy_handler_with_mcp_runtime(
             .protocol,
         crate::config::agent_surface::SurfaceProtocol::A2a | crate::config::agent_surface::SurfaceProtocol::Ap2
     );
+    let extended_card_rpc_id = is_a2a_surface
+        .then(|| crate::a2a::url_rewriter::extended_agent_card_request_id(&body_bytes))
+        .flatten();
+    let is_rest_extended_card_request = is_a2a_surface
+        && crate::proxy::paths::is_rest_extended_agent_card_request(
+            method.as_str(),
+            &state.surface.target.endpoint,
+            uri.path(),
+        );
+    // A compressed extended card cannot be rewritten, so the Target is asked for
+    // an uncompressed one. The same headers are forwarded to fabric targets.
+    if is_rest_extended_card_request
+        || (is_a2a_surface
+            && a2a_context
+                .as_ref()
+                .and_then(|context| context.method.as_deref())
+                .is_some_and(crate::a2a::is_extended_agent_card_method))
+    {
+        headers.insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
+    }
     let is_a2a_proxy_target = is_a2a_surface
         && state
             .surface
@@ -3012,6 +3027,20 @@ async fn proxy_handler_with_mcp_runtime(
             .decrement()
             .await;
         return Err(create_jsonrpc_error_response(StatusCode::BAD_REQUEST, code, message));
+    }
+
+    // An extended agent card inside a JSON-RPC batch response cannot be
+    // rewritten, so such a batch is refused whatever `validate_messages` says.
+    if is_a2a_surface && crate::a2a::is_extended_agent_card_batch(&body_bytes) {
+        channel_warn!(config_id, "Rejected JSON-RPC batch containing an extended agent card request");
+        connection_guard
+            .decrement()
+            .await;
+        return Err(create_jsonrpc_error_response(
+            StatusCode::BAD_REQUEST,
+            -32600,
+            crate::a2a::EXTENDED_AGENT_CARD_BATCH_REFUSAL,
+        ));
     }
 
     // ── A2A request-shape validation ─────────────────────────────────────
@@ -7717,14 +7746,8 @@ async fn proxy_handler_with_mcp_runtime(
             "Request completed"
         );
 
-        // Determine if this is an agent card response (used by multiple steps below)
-        let is_agent_card_request = (uri
-            .path()
-            .ends_with("/.well-known/agent-card.json")
-            || uri
-                .path()
-                .ends_with("/.well-known/agent.json"))
-            && status.is_success();
+        let is_well_known_card_response =
+            crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status.is_success();
 
         // ── Step 12: Resolve Protected Agent Identity ───────────────────────────
         // Must happen FIRST, before any injection or rewriting.
@@ -7751,6 +7774,25 @@ async fn proxy_handler_with_mcp_runtime(
         } else {
             response_body
         };
+
+        // An extended agent card arrives as a JSON-RPC result: run the agent card
+        // steps below on the unwrapped card, then rewrap it after the didwebvh step.
+        let (response_body, extended_card_envelope) =
+            crate::a2a::unwrap_extended_agent_card(response_body, extended_card_rpc_id.is_some(), status).map_err(
+                |e| {
+                    error!(channel = channel_name, error = %e, "Extended agent card response cannot be rewritten");
+                    extended_agent_card_refusal(extended_card_rpc_id.as_ref())
+                },
+            )?;
+        let is_extended_card_response =
+            (is_rest_extended_card_request && status.is_success()) || extended_card_envelope.is_some();
+        // Determine if this is an agent card response (used by multiple steps below)
+        let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
+        let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
+            is_extended_card_response,
+            is_well_known_card_response,
+        );
+
         let resolved_identity = if status.is_success() && !response_body.is_empty() {
             match crate::proxy::backend_identity::resolve_protected_agent_identity(
                 &response_body,
@@ -7758,7 +7800,7 @@ async fn proxy_handler_with_mcp_runtime(
                 response_identity_selector,
                 response_identity_rules,
                 &channel_name,
-                is_agent_card_request,
+                identity_response_kind,
                 authenticated_identity.as_ref(),
             )
             .await
@@ -7816,7 +7858,7 @@ async fn proxy_handler_with_mcp_runtime(
                     .external_rules_engine
                     .as_ref(),
                 &channel_name,
-                is_agent_card_request,
+                identity_response_kind,
                 authenticated_identity.as_ref(),
             )
             .await
@@ -7844,12 +7886,17 @@ async fn proxy_handler_with_mcp_runtime(
                 &state.config,
                 &state.network_config,
                 &resolved_identity,
+                agent_card_kind(is_extended_card_response),
             )
             .await
             {
                 Ok(rewritten) => {
                     info!(channel = channel_name, "Rewrote agent card URLs to point to proxy");
                     rewritten
+                }
+                Err(e) if is_extended_card_response => {
+                    error!(channel = channel_name, error = %e, "Failed to rewrite extended agent card URLs");
+                    return Err(extended_agent_card_refusal(extended_card_rpc_id.as_ref()));
                 }
                 Err(e) => {
                     warn!(channel = channel_name, error = %e, "Failed to rewrite agent card URLs, returning original");
@@ -7873,7 +7920,13 @@ async fn proxy_handler_with_mcp_runtime(
                         &format!("Failed to parse agent card for credential injection: {}", e),
                     )
                 })?;
-                crate::a2a::inject_credential_into_agent_card(&mut card, &resolved_identity, &vc_issuer, &channel_name)
+                put_identity_credential_into_agent_card(
+                    &mut card,
+                    &resolved_identity,
+                    &vc_issuer,
+                    &channel_name,
+                    identity_response_kind,
+                )
                 .await
                 .map_err(|e| {
                     error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
@@ -7926,6 +7979,12 @@ async fn proxy_handler_with_mcp_runtime(
         } else {
             response_body
         };
+
+        let response_body =
+            crate::a2a::rewrap_extended_agent_card(extended_card_envelope, response_body).map_err(|e| {
+                error!(channel = channel_name, error = %e, "Failed to rewrap extended agent card");
+                extended_agent_card_refusal(extended_card_rpc_id.as_ref())
+            })?;
 
         // Inject custom metadata into MCP initialize responses
         let response_body = if state
@@ -8548,7 +8607,7 @@ async fn proxy_handler_with_mcp_runtime(
             .unwrap_or_default();
         let (response_body, injected_vp_jwt) = inject_backend_agent_vp(
             response_body,
-            client_supports_vp,
+            client_supports_vp && !is_agent_card_request,
             &resolved_identity,
             &state,
             &channel_name,
@@ -12615,6 +12674,22 @@ async fn handle_fabric_request(
                 });
             }
         });
+    let is_a2a_surface = matches!(
+        state
+            .surface
+            .channel_protocol(),
+        crate::config::ChannelProtocol::A2a | crate::config::ChannelProtocol::Ap2
+    );
+    let is_rest_extended_card_request = is_a2a_surface
+        && crate::proxy::paths::is_rest_extended_agent_card_request(
+            method.as_str(),
+            &state.surface.target.endpoint,
+            uri.path(),
+        );
+    let extended_card_rpc_id = is_a2a_surface
+        .then(|| crate::a2a::url_rewriter::extended_agent_card_request_id(&original_body_bytes))
+        .flatten();
+    let is_extended_card_rpc_request = extended_card_rpc_id.is_some();
     let mut process_response = async move |forward_result: Result<
         Option<crate::gateways::connection_points::messages::ReceivedMessage>,
         String,
@@ -12873,14 +12948,37 @@ async fn handle_fabric_request(
                     response_body
                 };
 
+                // An extended agent card arrives as a JSON-RPC result: run the agent card
+                // steps below on the unwrapped card, then rewrap it after the didwebvh step.
+                let (response_body, extended_card_envelope) = if is_extended_card_rpc_request {
+                    match crate::a2a::unwrap_extended_agent_card(
+                        bytes::Bytes::from(response_body),
+                        true,
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    ) {
+                        Ok((card, envelope)) => (String::from_utf8_lossy(&card).into_owned(), envelope),
+                        Err(e) => {
+                            channel_error!(config_id, "Extended agent card response cannot be rewritten: {}", e);
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(extended_agent_card_refusal(extended_card_rpc_id.as_ref()));
+                        }
+                    }
+                } else {
+                    (response_body, None)
+                };
+                let is_extended_card_response =
+                    extended_card_envelope.is_some() || (is_rest_extended_card_request && (200..300).contains(&status));
+                let is_well_known_card_response =
+                    crate::proxy::paths::is_well_known_agent_card_path(uri.path()) && status < 400;
+
                 // ── Step 12: Resolve Protected Agent Identity (fabric path) ─────
-                let is_agent_card_request = (uri
-                    .path()
-                    .ends_with("/.well-known/agent-card.json")
-                    || uri
-                        .path()
-                        .ends_with("/.well-known/agent.json"))
-                    && status < 400;
+                let is_agent_card_request = is_well_known_card_response || is_extended_card_response;
+                let identity_response_kind = crate::proxy::backend_identity::IdentityResponseKind::for_response(
+                    is_extended_card_response,
+                    is_well_known_card_response,
+                );
                 let fabric_response_identity_selector = state
                     .protected_selector
                     .as_ref()
@@ -12900,7 +12998,7 @@ async fn handle_fabric_request(
                         fabric_response_identity_selector,
                         fabric_response_identity_rules,
                         channel_name,
-                        is_agent_card_request,
+                        identity_response_kind,
                         authenticated_identity.as_ref(),
                     )
                     .await
@@ -12958,7 +13056,7 @@ async fn handle_fabric_request(
                             .external_rules_engine
                             .as_ref(),
                         channel_name,
-                        is_agent_card_request,
+                        identity_response_kind,
                         authenticated_identity.as_ref(),
                     )
                     .await
@@ -12992,12 +13090,20 @@ async fn handle_fabric_request(
                         &state.config,
                         &state.network_config,
                         &resolved_identity,
+                        agent_card_kind(is_extended_card_response),
                     )
                     .await
                     {
                         Ok(rewritten) => {
                             channel_info!(config_id, "Rewrote agent card URLs to point to proxy");
                             String::from_utf8_lossy(&rewritten).to_string()
+                        }
+                        Err(e) if is_extended_card_response => {
+                            channel_error!(config_id, "Failed to rewrite extended agent card URLs: {}", e);
+                            connection_guard
+                                .decrement()
+                                .await;
+                            return Err(extended_agent_card_refusal(extended_card_rpc_id.as_ref()));
                         }
                         Err(e) => {
                             channel_warn!(
@@ -13031,11 +13137,12 @@ async fn handle_fabric_request(
                                 ));
                             }
                         };
-                        if let Err(e) = crate::a2a::inject_credential_into_agent_card(
+                        if let Err(e) = put_identity_credential_into_agent_card(
                             &mut card,
                             &resolved_identity,
                             &vc_issuer,
                             channel_name,
+                            identity_response_kind,
                         )
                         .await
                         {
@@ -13080,6 +13187,23 @@ async fn handle_fabric_request(
                     }
                 } else {
                     response_body
+                };
+
+                let response_body = match extended_card_envelope {
+                    Some(envelope) => {
+                        match crate::a2a::rewrap_extended_agent_card(Some(envelope), bytes::Bytes::from(response_body))
+                        {
+                            Ok(rewrapped) => String::from_utf8_lossy(&rewrapped).into_owned(),
+                            Err(e) => {
+                                channel_error!(config_id, "Failed to rewrap extended agent card: {}", e);
+                                connection_guard
+                                    .decrement()
+                                    .await;
+                                return Err(extended_agent_card_refusal(extended_card_rpc_id.as_ref()));
+                            }
+                        }
+                    }
+                    None => response_body,
                 };
 
                 // Inject response custom metadata if enabled (fabric-to-fabric on GW1 side)
@@ -13550,14 +13674,10 @@ async fn handle_fabric_request(
                 // Skip validation for agent card requests (they're JSON config, not A2A messages)
                 let _inspect_span =
                     tracing::info_span!("fabric.inspect_response", otel.name = "Inspect Response Extensions");
-                let is_agent_card_request = uri
-                    .path()
-                    .ends_with("/.well-known/agent-card.json")
-                    || uri
-                        .path()
-                        .ends_with("/.well-known/agent.json");
+                let skips_extension_inspection =
+                    crate::proxy::paths::is_well_known_agent_card_path(uri.path()) || is_extended_card_response;
 
-                if is_agent_card_request {
+                if skips_extension_inspection {
                     debug!(
                         channel = channel_name,
                         "Skipping extension validation for agent card request in fabric path"
@@ -13574,7 +13694,7 @@ async fn handle_fabric_request(
                         && state
                             .identity_rules_engine
                             .is_some()
-                        && !is_agent_card_request
+                        && !skips_extension_inspection
                     {
                         // Dispatch to protocol-specific validator
                         let validation_result = if matches!(
@@ -14295,6 +14415,35 @@ fn record_agent_card_gateway_fault(
                 .await;
         });
     }
+}
+
+/// Put the gateway-issued identity credential on an agent card. A public card
+/// keeps a credential an upstream gateway already put there; an extended card
+/// has every credential its sender put there removed and gets the gateway's own.
+async fn put_identity_credential_into_agent_card(
+    card: &mut serde_json::Value,
+    resolved_identity: &crate::proxy::backend_identity::ProtectedAgentIdentity,
+    vc_issuer: &Arc<crate::identity::VCIssuer>,
+    channel_name: &str,
+    response_kind: crate::proxy::backend_identity::IdentityResponseKind,
+) -> anyhow::Result<()> {
+    if response_kind.trusts_upstream_identity_credential() {
+        crate::a2a::inject_credential_into_agent_card(card, resolved_identity, vc_issuer, channel_name).await
+    } else {
+        crate::a2a::replace_credential_in_agent_card(card, resolved_identity, vc_issuer, channel_name).await
+    }
+}
+
+fn agent_card_kind(is_extended_card_response: bool) -> crate::a2a::AgentCardKind {
+    if is_extended_card_response {
+        crate::a2a::AgentCardKind::Extended
+    } else {
+        crate::a2a::AgentCardKind::Public
+    }
+}
+
+fn extended_agent_card_refusal(rpc_request_id: Option<&serde_json::Value>) -> Response {
+    crate::a2a::url_rewriter::extended_agent_card_refusal(rpc_request_id)
 }
 
 async fn fetch_agent_card_from_surface_target(
@@ -15413,7 +15562,7 @@ async fn handle_mcp_proxy_request(
                         recorder_selector,
                         recorder_rules,
                         channel_name,
-                        false,
+                        crate::proxy::backend_identity::IdentityResponseKind::Message,
                         authenticated_identity,
                     )
                     .await
@@ -20225,5 +20374,244 @@ allow if {
                     .is_none()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fabric_extended_card_tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    const TARGET_URL: &str = "https://backend.internal/a2a";
+
+    struct FabricPeer {
+        state: crate::state::ProxyState,
+        peer_did: String,
+        _root: tempfile::TempDir,
+        _issuer_dir: tempfile::TempDir,
+    }
+
+    impl Drop for FabricPeer {
+        fn drop(&mut self) {
+            crate::comm::didcomm::client::test_send_hook::uninstall(&self.peer_did);
+        }
+    }
+
+    /// A gateway whose A2A surface targets a Fabric peer that answers every
+    /// ForwardRequest with `status` and `body`.
+    async fn fabric_peer_answering(
+        status: u16,
+        body: serde_json::Value,
+    ) -> FabricPeer {
+        let root = tempfile::tempdir().unwrap();
+        let peer_did = format!("did:example:peer-{}", uuid::Uuid::new_v4());
+        let peer = crate::gateways::types::Gateway::new(
+            "Peer".into(),
+            String::new(),
+            peer_did.clone(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                root.path().join("gateways"),
+                Some("did:web:gateway.example".into()),
+            )
+            .await
+            .unwrap(),
+        );
+        crate::gateways::GatewayStore::create(gateways.as_ref(), &peer)
+            .await
+            .unwrap();
+        let (manager, issuer_dir) = crate::gateways::test_helpers::test_listener_manager(root.path()).await;
+        let manager = manager.with_gateway_store(gateways);
+        let mut listener = crate::gateways::test_helpers::test_listener("fabric-extended-card").await;
+        listener.gateway_id = peer.id.clone();
+        manager
+            .register_test_listener(listener)
+            .await;
+
+        let responder_did = peer_did.clone();
+        let reply_body = body.to_string();
+        crate::comm::didcomm::client::test_send_hook::install(&peer_did, move |request| {
+            let reply = crate::gateways::connection_points::messages::ReceivedMessage::new(
+                "cp-1".into(),
+                "peer".into(),
+                crate::messages::MessageType::ForwardResponse
+                    .as_str()
+                    .into(),
+                uuid::Uuid::new_v4().to_string(),
+                Some(request.id.clone()),
+                Some(responder_did.clone()),
+                vec!["did:example:connection-point".into()],
+                None,
+                None,
+                json!({"status": status, "headers": {"content-type": "application/json"}, "body": reply_body}),
+                crate::gateways::connection_points::messages::MessageMetadata {
+                    encrypted: true,
+                    authenticated: true,
+                    from_key: None,
+                    extra: json!({}),
+                },
+            );
+            assert!(crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply));
+        });
+
+        let surface = serde_json::from_value(json!({
+            "surface_id": "fabric-a2a", "name": "Fabric A2A",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": format!("fabric://{}/remote-surface", peer.id)}
+        }))
+        .unwrap();
+        let network = serde_json::from_value(json!({
+            "did": {"domain": "gateway.example"},
+            "webauthn": {"rp_id": "gateway.example", "external_origin": "https://gateway.example"},
+            "integration": {"types": [], "categories": []},
+            "listeners": [{"id": "in", "name": "in", "bind_address": "127.0.0.1", "port": 8080,
+                "protocol": "http", "external_urls": ["https://gateway.example"]}],
+            "routes": {"identity": {"type": "identity_api", "prefix": "/api"}}
+        }))
+        .unwrap();
+        let config = serde_json::from_value(json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [], "categories": []}
+        }))
+        .unwrap();
+        let state = crate::state::ProxyState {
+            config: Arc::new(config),
+            network_config: Arc::new(network),
+            client: reqwest::Client::new(),
+            metrics_store: None,
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_monitor: None,
+            task_id: None,
+            ws_state: None,
+            listener_manager: Arc::new(tokio::sync::RwLock::new(Some(Arc::new(manager)))),
+            secrets_store: None,
+            certificates_store: None,
+            vc_issuer: None,
+            policy_manager: None,
+            gateway_policy_manager: None,
+            didauth_session_store: Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            transaction_store: None,
+            mpp_transaction_store: None,
+            trust_registry_listener_manager: None,
+            source_auth_middleware: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_identity_store: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_log_manager: None,
+            credential_provider_store: None,
+            delegation_vault_store: None,
+            gateway_base_url: Some("https://gateway.example".into()),
+            transit_token_issuer: None,
+            mcp_proxy_store: None,
+            a2a_proxy_store: None,
+            active_variant_alias: None,
+            active_variant_id: None,
+            variant_resolution_error: None,
+            surface: Arc::new(surface),
+        };
+        FabricPeer {
+            state,
+            peer_did,
+            _root: root,
+            _issuer_dir: issuer_dir,
+        }
+    }
+
+    async fn get_extended_card(peer: &FabricPeer) -> (axum::http::StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("https://gateway.example/a2a")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": "card-1", "method": "GetExtendedAgentCard", "params": {}}).to_string(),
+            ))
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::pin(super::proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                peer.state.clone(),
+                request,
+                crate::mcp::request_validation::McpVersionPolicy::new(
+                    &[crate::mcp::MCP_MODERN_VERSION],
+                    &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
+                ),
+                None,
+            )),
+        )
+        .await
+        .expect("the Fabric leg answers")
+        .unwrap_or_else(|response| response);
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("{status}: {}", String::from_utf8_lossy(&bytes)));
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn extended_card_from_a_fabric_peer_is_rewritten() {
+        let card = json!({"name": "agent", "supportedInterfaces": [{"url": TARGET_URL, "protocolBinding": "JSONRPC"}]});
+        let peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "card-1", "result": card})).await;
+
+        let (status, body) = get_extended_card(&peer).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["id"], "card-1", "{body}");
+        let url = body["result"]["supportedInterfaces"][0]["url"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(url.starts_with("https://gateway.example"), "{body}");
+        assert!(
+            !body
+                .to_string()
+                .contains("backend.internal"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrewritable_extended_card_from_a_fabric_peer_is_refused_with_a_jsonrpc_error() {
+        for result in [json!(TARGET_URL), json!({"agentCard": {"supportedInterfaces": [{"url": TARGET_URL}]}})] {
+            let peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "card-1", "result": result})).await;
+
+            let (status, body) = get_extended_card(&peer).await;
+
+            assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+            assert_eq!(body["jsonrpc"], "2.0", "{body}");
+            assert_eq!(body["id"], "card-1", "{body}");
+            assert_eq!(body["error"]["code"], -32603, "{body}");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("backend.internal"),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_card_from_a_fabric_peer_on_an_error_status_is_still_rewritten() {
+        let card = json!({"name": "agent", "url": TARGET_URL});
+        let peer = fabric_peer_answering(500, json!({"jsonrpc": "2.0", "id": "card-1", "result": card})).await;
+
+        let (_, body) = get_extended_card(&peer).await;
+
+        let url = body["result"]["url"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(url.starts_with("https://gateway.example"), "{body}");
     }
 }

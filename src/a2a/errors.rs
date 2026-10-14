@@ -105,9 +105,20 @@ pub fn create_jsonrpc_error_response(
     code: i32,
     message: &str,
 ) -> Response {
+    create_jsonrpc_error_response_with_id(status, serde_json::Value::Null, code, message)
+}
+
+/// Create a JSON-RPC 2.0 error response that echoes the request `id`, so the
+/// caller can correlate it with its call.
+pub fn create_jsonrpc_error_response_with_id(
+    status: StatusCode,
+    id: serde_json::Value,
+    code: i32,
+    message: &str,
+) -> Response {
     let error_body = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": null,
+        "id": id,
         "error": {
             "code": code,
             "message": message,

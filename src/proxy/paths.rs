@@ -20,13 +20,117 @@ pub fn is_public_path(path: &str) -> bool {
         .strip_suffix('/')
         .unwrap_or(path);
 
-    path.ends_with("/.well-known/agent-card.json")
-        || path.ends_with("/.well-known/agent.json")
+    is_well_known_agent_card_path(path)
         || path.ends_with("/agent-card.json")
         || path.ends_with("/agent.json")
         || path.ends_with("/.well-known/ucp")
         || path.ends_with("/.well-known/agent-card")
         || path.ends_with("/discovery")
+}
+
+/// Whether `path` requests a well-known agent card (`agent-card.json` or the
+/// legacy `agent.json`).
+pub fn is_well_known_agent_card_path(path: &str) -> bool {
+    path.ends_with("/.well-known/agent-card.json") || path.ends_with("/.well-known/agent.json")
+}
+
+/// Whether a request fetches the extended agent card over the A2A HTTP+JSON
+/// binding: `{route}/extendedAgentCard` (1.0, also tenant-scoped as
+/// `{route}/{tenant}/extendedAgentCard`) or `{route}/v1/card` (0.3).
+///
+/// The path is checked as the Target sees it: appended to the base path of
+/// `target_endpoint`, resolved the way the forwarded URL is resolved, and also
+/// the way lenient routers (Tomcat, Spring, JAX-RS) resolve it, which decode
+/// `%2e`, drop `;` path parameters and empty segments, and treat `\` as a
+/// separator. Matching ignores ASCII case. A path that climbs out of the base
+/// path, climbs above the root (which covers a peer gateway's unknown base path
+/// on `fabric://` targets), or cannot be parsed is treated as a card so the
+/// response is still rewritten. Every method except `HEAD` and `OPTIONS` is checked, because a
+/// Target may honour a method override header.
+pub fn is_rest_extended_agent_card_request(
+    method: &str,
+    target_endpoint: &str,
+    request_path: &str,
+) -> bool {
+    if method.eq_ignore_ascii_case("HEAD") || method.eq_ignore_ascii_case("OPTIONS") {
+        return false;
+    }
+    let base_path = target_base_path(target_endpoint);
+    let joined = format!("{}/{}", base_path.trim_end_matches('/'), request_path.trim_start_matches('/'));
+    let Ok(forwarded) = url::Url::parse(&format!("http://route.invalid{joined}")) else {
+        return true;
+    };
+    let base_segments = lenient_router_segments(&base_path).unwrap_or_default();
+    let resolved = percent_decode_lossy(forwarded.path());
+    [lenient_router_segments(&resolved), lenient_router_segments(&joined)]
+        .iter()
+        .any(|segments| {
+            match segments
+                .as_deref()
+                .and_then(|segments| strip_base_segments(segments, &base_segments))
+            {
+                Some(route_relative) => is_extended_agent_card_segments(route_relative),
+                None => true,
+            }
+        })
+}
+
+/// The path of an `http(s)` Target endpoint; other schemes, such as `fabric://`,
+/// forward the request path unchanged.
+fn target_base_path(target_endpoint: &str) -> String {
+    url::Url::parse(target_endpoint)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| "/".to_string())
+}
+
+fn strip_base_segments<'a>(
+    segments: &'a [String],
+    base_segments: &[String],
+) -> Option<&'a [String]> {
+    if segments.len() < base_segments.len() {
+        return None;
+    }
+    let (base, rest) = segments.split_at(base_segments.len());
+    base.iter()
+        .zip(base_segments)
+        .all(|(segment, base_segment)| segment.eq_ignore_ascii_case(base_segment))
+        .then_some(rest)
+}
+
+fn is_extended_agent_card_segments(segments: &[String]) -> bool {
+    match segments {
+        [.., last] if last.eq_ignore_ascii_case("extendedAgentCard") => true,
+        [version, card] => version.eq_ignore_ascii_case("v1") && card.eq_ignore_ascii_case("card"),
+        _ => false,
+    }
+}
+
+fn percent_decode_lossy(path: &str) -> String {
+    String::from_utf8_lossy(&urlencoding::decode_binary(path.as_bytes())).into_owned()
+}
+
+/// Decode percent-escapes, drop `;` path parameters, empty and `.` segments,
+/// and resolve `..`, treating `\` as a separator. `None` when a `..` climbs
+/// above the root.
+fn lenient_router_segments(path: &str) -> Option<Vec<String>> {
+    let decoded = percent_decode_lossy(path);
+    let mut segments: Vec<String> = Vec::new();
+    for segment in decoded.split(['/', '\\']) {
+        match segment
+            .split(';')
+            .next()
+            .unwrap_or_default()
+        {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            segment => segments.push(segment.to_string()),
+        }
+    }
+    Some(segments)
 }
 
 /// Whether a request is a public discovery read that bypasses the request
@@ -126,6 +230,146 @@ mod tests {
             );
         }
         assert!(!is_public_request("GET", "/surface/tools"));
+    }
+
+    const ROOT_TARGET: &str = "http://target.example";
+    const BASE_TARGET: &str = "http://target.example/base/";
+
+    fn is_card(path: &str) -> bool {
+        is_rest_extended_agent_card_request("GET", ROOT_TARGET, path)
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_matches_both_eras_for_any_method_but_head_and_options() {
+        for path in ["/extendedAgentCard", "/v1/card", "/extendedAgentCard/", "v1/card", "extendedAgentCard"] {
+            for method in ["GET", "get", "POST", "PUT", "DELETE"] {
+                assert!(is_rest_extended_agent_card_request(method, ROOT_TARGET, path), "{method} {path}");
+            }
+            for method in ["HEAD", "OPTIONS", "options"] {
+                assert!(!is_rest_extended_agent_card_request(method, ROOT_TARGET, path), "{method} {path}");
+            }
+        }
+        for path in [
+            "/extendedAgentCard/extra",
+            "/foo/v1/card",
+            "/payments/v1/card",
+            "/card",
+            "/v1/cards",
+            "/.well-known/agent-card.json",
+            "/rpc",
+            "/",
+        ] {
+            assert!(!is_card(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_matches_tenant_scoped_extended_card_paths() {
+        for path in [
+            "/acme/extendedAgentCard",
+            "/a/b/extendedAgentCard/",
+            "/x/./extendedAgentCard",
+            "/foo:bar/extendedAgentCard",
+        ] {
+            assert!(is_card(path), "{path}");
+        }
+        assert!(!is_card("/acme/v1/card"));
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_matches_non_canonical_spellings_of_the_card_path() {
+        for path in [
+            "/./extendedAgentCard",
+            "/x/../v1/card",
+            "/x/%2e%2e/extendedAgentCard",
+            "/%2E/v1/card",
+            "/../extendedAgentCard",
+            "/extended%41gentCard",
+            "/v1%2Fcard",
+            "//extendedAgentCard",
+            "/extendedagentcard",
+            "/EXTENDEDAGENTCARD",
+            "/V1/Card",
+            "/foo:bar/../extendedAgentCard",
+            "/x/foo:bar/../../v1/card",
+            "/extendedAgentCard;x=1",
+            "/v1;a=b/card",
+            "/v1/card;jsessionid=abc",
+            "/v1//card",
+            "/v1/%2F/card",
+            "/x/..;/extendedAgentCard",
+            "/x/y//../../v1/card",
+            "/v1//../card",
+            "/x\\..\\extendedAgentCard",
+        ] {
+            assert!(is_card(path), "{path}");
+        }
+        for path in ["/payments/%2e/v1/card", "/x/y/../v1/card", "/payments;x=1/v1/card", "/x//v1/card"] {
+            assert!(!is_card(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_resolves_against_the_target_base_path() {
+        for path in ["/v1/card", "/extendedAgentCard", "/x/../v1/card"] {
+            assert!(is_rest_extended_agent_card_request("GET", BASE_TARGET, path), "{path}");
+        }
+        for path in ["/rpc", "/", "/v1/cards", "/x/v1/card"] {
+            assert!(!is_rest_extended_agent_card_request("GET", BASE_TARGET, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_treats_a_climb_out_of_the_target_base_as_a_card() {
+        for path in [
+            "/../base/extendedAgentCard",
+            "/%2e%2e/base/extendedAgentCard",
+            "/../base/./extendedAgentCard",
+            "/x/../../base/v1/card",
+            "/..;/base/v1/card",
+            "/../other/rpc",
+        ] {
+            assert!(is_rest_extended_agent_card_request("GET", BASE_TARGET, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_ignores_the_base_of_non_http_targets() {
+        assert!(is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/v1/card"));
+        assert!(!is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/surface/rpc"));
+        assert!(!is_rest_extended_agent_card_request("GET", "fabric://peer/surface", "/x/../rpc"));
+    }
+
+    #[test]
+    fn rest_extended_agent_card_request_treats_a_climb_above_the_root_as_a_card() {
+        for target in ["fabric://peer/surface", ROOT_TARGET, BASE_TARGET] {
+            for path in [
+                "/../base/v1/card",
+                "/x/../../base/v1/card",
+                "/%2e%2e/base/v1/card",
+                "/..;/base/v1/card",
+                "/..\\base\\v1\\card",
+                "/../rpc",
+            ] {
+                assert!(is_rest_extended_agent_card_request("GET", target, path), "{target} {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn well_known_agent_card_path_matches_only_well_known_card_documents() {
+        assert!(is_well_known_agent_card_path("/surface/.well-known/agent-card.json"));
+        assert!(is_well_known_agent_card_path("/.well-known/agent.json"));
+        for path in [
+            "/surface/agent-card.json",
+            "/surface/agent.json",
+            "/surface/.well-known/agent-card",
+            "/surface/.well-known/ucp",
+            "/surface/discovery",
+            "/surface/rpc",
+        ] {
+            assert!(!is_well_known_agent_card_path(path), "{path}");
+        }
     }
 
     #[test]

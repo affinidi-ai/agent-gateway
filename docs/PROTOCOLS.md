@@ -291,8 +291,74 @@ URLs are rewritten to the gateway, and, when agent identity is configured, its
 (with the `didwebvh` feature, `agentDid` and `agentDNA` are added too). The URL rewrite covers
 `supportedInterfaces`, `supported_interfaces`, `additionalInterfaces` and `additional_interfaces`,
 in their original order, since in `1.0` order
-encodes preference. An extended card returned as a JSON-RPC result (`GetExtendedAgentCard` /
-`agent/getAuthenticatedExtendedCard`) is forwarded as the agent sent it, without URL rewriting.
+encodes preference.
+
+An extended card gets the same treatment on A2A and AP2 surfaces (on the outbound path, A2A and
+AP2 transit points), whether it is returned as a JSON-RPC result (`GetExtendedAgentCard` /
+`agent/getAuthenticatedExtendedCard`) or fetched over the HTTP+JSON binding
+(`{route}/extendedAgentCard` in `1.0`, `{route}/v1/card` in `0.3`). JSON-RPC method names match
+exactly as the A2A specification spells them. The HTTP+JSON path is checked as the Target sees it:
+appended to the base path of the target endpoint (or the transit point's destination), resolved
+the way the forwarded URL is resolved (dot segments, including `%2e`, and percent-escapes), and
+also the way lenient Target routers resolve it (dropping `;` path parameters and empty segments,
+and treating `\` as a separator), ignoring ASCII case. `extendedAgentCard` matches as the last
+segment at any depth, so a tenant-scoped `{route}/{tenant}/extendedAgentCard` is a card; `v1/card`
+matches only directly under the base path, so a deeper path such as `{route}/payments/v1/card` is
+not a card. A root-level `{route}/v1/card` is a card on every A2A and AP2 surface, including one
+whose Target serves its own `/v1/card` resource. A path that climbs out of the base path, or that
+the gateway cannot parse, is treated as a card. So is a path whose `..` segments climb above the
+root, which covers a `fabric://` target, where the peer gateway's Target base path is not known. Every method except `HEAD` and `OPTIONS` is
+checked, because a Target may honour a method override header. A Target whose HTTP+JSON base sits
+below its target endpoint is not covered. Its endpoint URLs are rewritten on inbound,
+fabric and outbound paths, and on inbound paths it gets the same identity treatment when agent
+identity is configured, with one difference: an `agent-identity-credential/v1` extension already on
+an extended card never stands in for the agent's identity, even over Fabric, because a peer gateway
+does not issue one on an extended card, so it can only come from a Target. The Target must present
+`agent-identity/v1`. When agent identity is configured, every credential extension on an extended
+card is removed and only the one the gateway issues is added, so none survives for an anonymous
+identity. When managed identity is on, an extended card with no
+`capabilities.extensions` array is answered with `502`. No identity VP is signed for an agent card
+response, public or extended. On inbound and fabric paths it skips response extension inspection, like
+the public card, so response validation rules do not apply to it; outbound transit points still
+validate response extensions on both kinds of card.
+
+For the JSON-RPC binding, error responses and empty bodies are forwarded unchanged; a JSON-RPC error
+is an object `error` with no `result`, and a `null` member counts as absent, so `"error": null` next
+to a card still has the card rewritten. A card `result` is rewritten whatever the HTTP status. The
+URL rewrite fails closed for an extended card: a successful response that is neither a JSON-RPC
+error (on the JSON-RPC binding) nor a card the gateway can rewrite is answered with `502` rather
+than forwarded. That covers an SSE stream, an empty HTTP+JSON body, a card or `result` that is not
+a JSON object, both `result` and `error`, and a card with no endpoint field (`url`, `endpoint`,
+`endpoints`, `supportedInterfaces` or `additionalInterfaces`) to rewrite, such as a wrapped card.
+On the JSON-RPC binding the refusal is a JSON-RPC `-32603` error that echoes the request `id`; on
+the HTTP+JSON binding it is a problem response. A non-success response that carries no card
+`result` is forwarded unchanged.
+A public card that cannot be rewritten is answered with `502` on the direct inbound path and
+forwarded as received on fabric and outbound paths.
+
+A JSON-RPC batch that contains an extended-card call is rejected with `-32600` before it is
+forwarded, whatever `validate_messages` is set to, because a card inside a batch response cannot be
+rewritten. A compressed card cannot be rewritten either, so an extended-card fetch is forwarded with
+`Accept-Encoding: identity` in place of the caller's value.
+
+Extended cards are detected the same way as the public card: from the request's JSON-RPC method or
+path. Some requests are not recognised, and are forwarded like any other request with their
+response not rewritten. These are accepted limits:
+
+- a body the gateway cannot parse but the Target can, such as JSON with a UTF-8 byte order mark,
+  when `validate_messages` is off, on `fabric://` targets and on outbound transit points;
+- a JSON-RPC body with duplicate `method` keys, sent to a Target that keeps the first key where the
+  gateway keeps the last;
+- a JSON-RPC method name in another letter case, sent to a Target that matches method names
+  case-insensitively;
+- an HTTP+JSON base path below the target endpoint.
+
+A Fabric caller's extended card is rewritten by the caller-side gateway only once that gateway
+runs a version that recognises extended cards.
+
+An extended card is always fetched by a caller, so with `from_jwt_claim` managed identity it needs
+the caller's validated JWT claims like any other response; without them the request fails with
+`JwtClaimsUnavailable`. Only the public card, which has no caller, resolves as anonymous.
 
 A surface's agent card (the synthesized A2A-proxy card or a Managed Agent's rewritten card) is
 served as `application/a2a+json` only when the caller's `A2A-Version` resolves to `1.0` or the

@@ -3529,7 +3529,11 @@ fn managed_agent_publishes_v1_card_with_interfaces(
     world
         .actors
         .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
-    let agent_card = serde_json::json!({
+    set_primary_target_response(world, v1_agent_card_with_interfaces());
+}
+
+fn v1_agent_card_with_interfaces() -> serde_json::Value {
+    serde_json::json!({
         "protocolVersion": "1.0",
         "name": "test-agent",
         "version": "1.0.0",
@@ -3542,8 +3546,34 @@ fn managed_agent_publishes_v1_card_with_interfaces(
         "additionalInterfaces": [
             { "url": "http://managed-agent.local/rest", "transport": "HTTP+JSON" }
         ]
-    });
-    set_primary_target_response(world, agent_card);
+    })
+}
+
+/// The same v1.0 card, returned as the JSON-RPC result of the extended-card method.
+#[given(expr = "managed agent {string} publishes a v1.0 extended agent card with multiple interfaces")]
+fn managed_agent_publishes_v1_extended_card(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let response = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": v1_agent_card_with_interfaces() });
+    set_primary_target_response(world, response);
+}
+
+/// A reply to the extended-card method whose `result` is not a card: a bare
+/// backend URL the gateway cannot rewrite.
+#[given(expr = "managed agent {string} publishes a non-card extended-card result")]
+fn managed_agent_answers_extended_card_with_non_card(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let response = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": "http://managed-agent.local/a2a" });
+    set_primary_target_response(world, response);
 }
 
 /// An upstream still publishing a **v0.3** card, used to prove the gateway keeps
