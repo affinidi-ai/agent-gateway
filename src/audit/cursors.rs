@@ -12,46 +12,178 @@ use serde::{Deserialize, Serialize};
 use crate::audit::journal::{JournalEntry, segment_first_seq, segment_paths};
 use crate::audit::registry::SinkId;
 
+/// What one read of the journal found after a sink's cursor.
+#[derive(Debug, Default)]
+pub struct JournalRead {
+    /// Readable entries, in file order.
+    pub entries: Vec<JournalEntry>,
+    /// Lines that do not parse between the cursor and `through`.
+    pub corrupt: u64,
+    /// The segments those lines are in.
+    pub corrupt_segments: Vec<PathBuf>,
+    /// Where the cursor moves once `entries` are handled: the last entry, or
+    /// the durable seq when only unreadable lines are left before it.
+    pub through: u64,
+}
+
+/// How many of `pending` unreadable lines, found between an entry with seq
+/// `prev` and one with seq `next` (exclusive), hold seqs after `cursor`.
+fn unpassed(
+    pending: u64,
+    prev: u64,
+    next: u64,
+    cursor: u64,
+) -> u64 {
+    pending.min(
+        next.saturating_sub(1)
+            .saturating_sub(prev.max(cursor)),
+    )
+}
+
+/// One line of a segment, without its newline.
+enum Line {
+    Entry(Box<JournalEntry>),
+    Unreadable,
+    /// The end of the segment, or of the journal when the newest segment
+    /// ends in a line still being written.
+    End,
+}
+
+fn next_line(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    newest: bool,
+) -> io::Result<Line> {
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', buf)? == 0 {
+            return Ok(Line::End);
+        }
+        if buf.pop() != Some(b'\n') {
+            return Ok(if newest {
+                Line::End
+            } else {
+                Line::Unreadable
+            });
+        }
+        if !buf.is_empty() {
+            return Ok(JournalEntry::parse(buf).map_or(Line::Unreadable, |entry| Line::Entry(Box::new(entry))));
+        }
+    }
+}
+
 /// Durable entries after `after`, up to and including `upto`, oldest first,
-/// at most `limit` of them. Lines past `upto` are never parsed, so a batch
-/// still being written is not read.
+/// at most `limit` of them. Lines that do not parse are skipped and counted;
+/// lines past `upto`, and a newest line without its newline, are never
+/// parsed, so a batch still being written is not read.
 pub fn read_entries(
     dir: &Path,
     after: u64,
     upto: u64,
     limit: usize,
-) -> io::Result<Vec<JournalEntry>> {
-    let mut entries = Vec::new();
+) -> io::Result<JournalRead> {
+    let mut read = JournalRead {
+        through: after,
+        ..JournalRead::default()
+    };
     if after >= upto || limit == 0 {
-        return Ok(entries);
+        return Ok(read);
     }
     let segments = segment_paths(dir)?;
     let start = segments
         .iter()
         .rposition(|path| segment_first_seq(path).is_some_and(|first| first <= after + 1))
         .unwrap_or(0);
-    for path in &segments[start..] {
-        for line in BufReader::new(File::open(path)?).lines() {
-            let line = line?;
-            if line.is_empty() {
-                continue;
-            }
-            let entry: JournalEntry =
-                serde_json::from_str(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if entry.seq <= after {
-                continue;
-            }
-            if entry.seq > upto {
-                return Ok(entries);
-            }
-            let reached = entry.seq == upto;
-            entries.push(entry);
-            if reached || entries.len() >= limit {
-                return Ok(entries);
+    let mut prev = 0;
+    let mut pending = PendingLines::default();
+    let mut buf = Vec::new();
+    for (index, path) in segments[start..]
+        .iter()
+        .enumerate()
+    {
+        let newest = start + index + 1 == segments.len();
+        let mut reader = BufReader::new(File::open(path)?);
+        loop {
+            match next_line(&mut reader, &mut buf, newest)? {
+                Line::End => break,
+                Line::Unreadable => pending.push(path),
+                Line::Entry(entry) => {
+                    let counted = pending.settle(&mut read, prev, entry.seq.min(upto + 1), after);
+                    prev = entry.seq;
+                    if entry.seq <= after {
+                        continue;
+                    }
+                    if entry.seq > upto {
+                        if counted > 0 {
+                            read.through = upto;
+                        }
+                        return Ok(read);
+                    }
+                    let reached = entry.seq == upto;
+                    read.through = entry.seq;
+                    read.entries.push(*entry);
+                    if reached || read.entries.len() >= limit {
+                        return Ok(read);
+                    }
+                }
             }
         }
     }
-    Ok(entries)
+    if pending.settle(&mut read, prev, upto + 1, after) > 0 {
+        read.through = upto;
+    }
+    Ok(read)
+}
+
+/// Unreadable lines seen since the last readable entry.
+#[derive(Default)]
+struct PendingLines {
+    count: u64,
+    segments: Vec<PathBuf>,
+}
+
+impl PendingLines {
+    fn push(
+        &mut self,
+        path: &Path,
+    ) {
+        self.count += 1;
+        if !self
+            .segments
+            .iter()
+            .any(|seen| seen == path)
+        {
+            self.segments
+                .push(path.to_path_buf());
+        }
+    }
+
+    /// Adds to `read` the pending lines that hold seqs after `cursor`, given
+    /// they lie between seqs `prev` and `next`, and starts counting afresh.
+    /// Returns how many were added.
+    fn settle(
+        &mut self,
+        read: &mut JournalRead,
+        prev: u64,
+        next: u64,
+        cursor: u64,
+    ) -> u64 {
+        let counted = unpassed(self.count, prev, next, cursor);
+        if counted > 0 {
+            read.corrupt += counted;
+            for path in self.segments.drain(..) {
+                if !read
+                    .corrupt_segments
+                    .contains(&path)
+                {
+                    read.corrupt_segments
+                        .push(path);
+                }
+            }
+        }
+        *self = Self::default();
+        counted
+    }
 }
 
 /// Deletes every segment whose entries all have a `seq` at or below
@@ -85,13 +217,22 @@ pub fn journal_bytes(dir: &Path) -> io::Result<u64> {
 pub struct BacklogSkip {
     /// The last `seq` of the oldest segment; each moved sink's new cursor.
     pub to: u64,
-    /// Each moved sink and how many entries addressed to it it skips.
-    pub sinks: Vec<(SinkId, u64)>,
+    pub sinks: Vec<MovedSink>,
+}
+
+/// A sink moved past the oldest segment.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MovedSink {
+    pub sink: SinkId,
+    /// Readable entries addressed to the sink that it skips.
+    pub skipped: u64,
+    /// Lines that do not parse, after the sink's cursor, that it skips.
+    pub corrupt: u64,
 }
 
 /// Which sinks must move past the oldest segment so it can be deleted, and
-/// how many entries addressed to each they skip. `None` while the journal
-/// has a single segment, which is never deleted.
+/// how many entries addressed to each, and unreadable lines, they skip.
+/// `None` while the journal has a single segment, which is never deleted.
 pub fn plan_backlog_skip(
     dir: &Path,
     cursors: &HashMap<SinkId, u64>,
@@ -103,36 +244,56 @@ pub fn plan_backlog_skip(
     let to = segment_first_seq(next)
         .unwrap_or(1)
         .saturating_sub(1);
-    let behind: Vec<(&SinkId, u64)> = cursors
+    let mut sinks: Vec<(MovedSink, u64)> = cursors
         .iter()
         .filter(|(_, cursor)| **cursor < to)
-        .map(|(sink, cursor)| (sink, *cursor))
+        .map(|(sink, cursor)| {
+            let moved = MovedSink {
+                sink: sink.clone(),
+                skipped: 0,
+                corrupt: 0,
+            };
+            (moved, *cursor)
+        })
         .collect();
-    let mut sinks: Vec<(SinkId, u64)> = behind
-        .iter()
-        .map(|(sink, _)| ((*sink).clone(), 0))
-        .collect();
-    for line in BufReader::new(File::open(oldest)?).lines() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
-        }
-        let entry: JournalEntry =
-            serde_json::from_str(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        for ((sink, cursor), (_, skipped)) in behind
-            .iter()
-            .zip(sinks.iter_mut())
-        {
-            if entry.seq > *cursor
-                && entry
-                    .recipients
-                    .contains(sink)
-            {
-                *skipped += 1;
+    let (mut prev, mut unreadable) = (0, 0);
+    let mut reader = BufReader::new(File::open(oldest)?);
+    let mut buf = Vec::new();
+    loop {
+        let next_seq = match next_line(&mut reader, &mut buf, false)? {
+            Line::End => to + 1,
+            Line::Unreadable => {
+                unreadable += 1;
+                continue;
             }
+            Line::Entry(entry) => {
+                for (moved, cursor) in &mut sinks {
+                    if entry.seq > *cursor
+                        && entry
+                            .recipients
+                            .contains(&moved.sink)
+                    {
+                        moved.skipped += 1;
+                    }
+                }
+                entry.seq
+            }
+        };
+        for (moved, cursor) in &mut sinks {
+            moved.corrupt += unpassed(unreadable, prev, next_seq, *cursor);
         }
+        if next_seq > to {
+            break;
+        }
+        (prev, unreadable) = (next_seq, 0);
     }
-    Ok(Some(BacklogSkip { to, sinks }))
+    Ok(Some(BacklogSkip {
+        to,
+        sinks: sinks
+            .into_iter()
+            .map(|(moved, _)| moved)
+            .collect(),
+    }))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,15 +321,38 @@ pub struct CursorStore {
 
 const CURSORS_FILE: &str = "cursors.json";
 
+/// Renames an unreadable cursors file out of the way, returning its new path.
+fn set_aside(path: &Path) -> io::Result<PathBuf> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let aside = path.with_file_name(format!("{CURSORS_FILE}.corrupt-{seconds}"));
+    fs::rename(path, &aside)?;
+    Ok(aside)
+}
+
 impl CursorStore {
+    /// Opens the cursors saved in `dir`. A cursors file that does not parse
+    /// is renamed to `cursors.json.corrupt-<unix seconds>`, kept for
+    /// inspection, and the store starts empty.
     pub fn open(dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let path = dir.join(CURSORS_FILE);
         let mut cursors = Cursors::default();
         match fs::read(&path) {
             Ok(bytes) => {
-                let stored: Vec<StoredCursor> =
-                    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let stored = match serde_json::from_slice::<Vec<StoredCursor>>(&bytes) {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        let aside = set_aside(&path)?;
+                        tracing::warn!(
+                            error = %e,
+                            moved_to = %aside.display(),
+                            "Audit sink cursors could not be read; set the file aside and starting without cursors"
+                        );
+                        Vec::new()
+                    }
+                };
                 for cursor in stored {
                     let map = if cursor.parked {
                         &mut cursors.parked
@@ -342,6 +526,34 @@ impl CursorStore {
     }
 }
 
+/// Replaces the journal line holding `seq` with bytes that do not parse.
+#[cfg(test)]
+pub(crate) fn garble(
+    dir: &Path,
+    seq: u64,
+) {
+    for path in segment_paths(dir).unwrap() {
+        let content = fs::read_to_string(&path).unwrap();
+        let mut garbled = false;
+        let lines: Vec<String> = content
+            .lines()
+            .map(|line| {
+                if JournalEntry::parse(line.as_bytes()).is_some_and(|entry| entry.seq == seq) {
+                    garbled = true;
+                    "{\"seq\":garbled".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        if garbled {
+            fs::write(&path, lines.join("\n") + "\n").unwrap();
+            return;
+        }
+    }
+    panic!("no journal line holds seq {seq}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,11 +583,150 @@ mod tests {
         dir
     }
 
-    fn seqs(entries: &[JournalEntry]) -> Vec<u64> {
-        entries
+    fn seqs(read: &JournalRead) -> Vec<u64> {
+        read.entries
             .iter()
             .map(|entry| entry.seq)
             .collect()
+    }
+
+    #[test]
+    fn a_garbled_line_is_skipped_and_counted_once() {
+        let dir = journal(1 << 20, &[3]);
+        garble(dir.path(), 2);
+
+        let read = read_entries(dir.path(), 0, 3, 100).unwrap();
+        assert_eq!(seqs(&read), vec![1, 3]);
+        assert_eq!(read.corrupt, 1);
+        assert_eq!(read.through, 3);
+        assert_eq!(read.corrupt_segments, segment_paths(dir.path()).unwrap());
+
+        let read = read_entries(dir.path(), 1, 3, 1).unwrap();
+        assert_eq!(seqs(&read), vec![3]);
+        assert_eq!(read.corrupt, 1);
+        let read = read_entries(dir.path(), 3, 3, 100).unwrap();
+        assert!(read.entries.is_empty());
+        assert_eq!(read.corrupt, 0);
+    }
+
+    #[test]
+    fn garbled_lines_up_to_the_durable_seq_let_the_cursor_move_to_it() {
+        let dir = journal(1 << 20, &[3]);
+        garble(dir.path(), 2);
+        garble(dir.path(), 3);
+
+        let read = read_entries(dir.path(), 1, 3, 100).unwrap();
+        assert!(read.entries.is_empty());
+        assert_eq!(read.corrupt, 2);
+        assert_eq!(read.through, 3);
+    }
+
+    #[test]
+    fn a_garbled_line_the_cursor_has_passed_is_not_counted_again() {
+        let dir = journal(1 << 20, &[4]);
+        garble(dir.path(), 3);
+
+        let read = read_entries(dir.path(), 3, 4, 100).unwrap();
+        assert_eq!(seqs(&read), vec![4]);
+        assert_eq!(read.corrupt, 0);
+    }
+
+    #[test]
+    fn a_batch_still_being_written_is_not_counted_as_garbled() {
+        let dir = journal(1 << 20, &[2]);
+        let segment = segment_paths(dir.path()).unwrap()[0].clone();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(segment)
+            .unwrap();
+        io::Write::write_all(&mut file, b"{\"seq\":3,\"rec").unwrap();
+
+        let read = read_entries(dir.path(), 1, 3, 100).unwrap();
+        assert_eq!(seqs(&read), vec![2]);
+        assert_eq!(read.corrupt, 0);
+        assert_eq!(read.through, 2);
+    }
+
+    #[test]
+    fn an_unterminated_line_in_an_older_segment_is_garbled() {
+        let dir = journal(1, &[1, 1, 1]);
+        let middle = segment_paths(dir.path()).unwrap()[1].clone();
+        let content = fs::read(&middle).unwrap();
+        fs::write(&middle, &content[..content.len() / 2]).unwrap();
+
+        let read = read_entries(dir.path(), 1, 3, 100).unwrap();
+        assert_eq!(seqs(&read), vec![3]);
+        assert_eq!(read.corrupt, 1);
+        assert_eq!(read.corrupt_segments, vec![middle]);
+    }
+
+    #[test]
+    fn a_corrupt_cursors_file_is_set_aside_and_the_store_starts_empty() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(CURSORS_FILE), b"[{\"sink\":").unwrap();
+
+        let store = CursorStore::open(dir.path()).unwrap();
+        assert!(store.snapshot().is_empty());
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with("cursors.json.corrupt-"), "{names:?}");
+        assert_eq!(fs::read(dir.path().join(&names[0])).unwrap(), b"[{\"sink\":");
+
+        assert_eq!(
+            store
+                .start(&SinkId::AuditLog)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            CursorStore::open(dir.path())
+                .unwrap()
+                .get(&SinkId::AuditLog),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_backlog_skip_counts_garbled_lines_each_moved_sink_had_not_passed() {
+        let siem = integration("siem");
+        let slack = integration("slack");
+        let dir = journal_for(&[
+            &[std::slice::from_ref(&siem), std::slice::from_ref(&siem), std::slice::from_ref(&siem)],
+            &[std::slice::from_ref(&siem)],
+        ]);
+        garble(dir.path(), 2);
+        let cursors = HashMap::from([(siem.clone(), 0), (slack.clone(), 2)]);
+
+        let skip = plan_backlog_skip(dir.path(), &cursors)
+            .unwrap()
+            .unwrap();
+        assert_eq!(skip.to, 3);
+        let mut moved = skip.sinks;
+        moved.sort_by_key(|moved| format!("{:?}", moved.sink));
+        assert_eq!(
+            moved,
+            vec![
+                MovedSink {
+                    sink: siem,
+                    skipped: 2,
+                    corrupt: 1
+                },
+                MovedSink {
+                    sink: slack,
+                    skipped: 0,
+                    corrupt: 0
+                },
+            ]
+        );
     }
 
     fn integration(id: &str) -> SinkId {
@@ -390,6 +741,7 @@ mod tests {
         assert!(
             read_entries(dir.path(), 5, 5, 100)
                 .unwrap()
+                .entries
                 .is_empty()
         );
     }
@@ -651,8 +1003,22 @@ mod tests {
             .unwrap();
         assert_eq!(skip.to, 3);
         let mut moved = skip.sinks;
-        moved.sort_by_key(|(sink, _)| format!("{sink:?}"));
-        assert_eq!(moved, vec![(siem, 2), (slack, 0)]);
+        moved.sort_by_key(|moved| format!("{:?}", moved.sink));
+        assert_eq!(
+            moved,
+            vec![
+                MovedSink {
+                    sink: siem,
+                    skipped: 2,
+                    corrupt: 0
+                },
+                MovedSink {
+                    sink: slack,
+                    skipped: 0,
+                    corrupt: 0
+                },
+            ]
+        );
     }
 
     #[test]

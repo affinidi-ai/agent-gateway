@@ -667,7 +667,9 @@ pub fn init_audit_logger(log_directory: Option<&str>) {
         warn!(target: "credential_delegation", "Audit pipeline already started");
         return;
     }
-    match crate::audit::pipeline::start(&dir, &audit_path) {
+    let started = crate::audit::pipeline::start(&dir, &audit_path);
+    crate::metrics::backends::prometheus::set_audit_pipeline_started(started.is_ok());
+    match started {
         Ok(()) => info!(target: "credential_delegation", path = %audit_path.display(), "Audit pipeline started"),
         Err(e) => error!(
             target: "credential_delegation",

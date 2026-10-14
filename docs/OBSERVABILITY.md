@@ -257,10 +257,21 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
 - *Drop policy.* A Governance Audit integration may set `audit_drop_after_secs`: records older
   than that are skipped for it, including one still being retried, and counted with
   `reason="expired"`. Without it nothing is skipped.
+- *Damage.* A damaged journal or cursors file never stops the pipeline. On start, everything
+  after the last readable line of the newest segment is cut off and logged with the number of
+  bytes discarded; a segment with no readable line is emptied. Files in `journal/` that are not
+  segments are logged and ignored. An unreadable `cursors.json` is renamed to
+  `cursors.json.corrupt-<unix seconds>` and every sink starts without a cursor. A reader moves
+  past a journal line that does not parse as it would past a delivered record, counts it with
+  `reason="corrupt"` and logs one warning per batch naming the segment.
 
 Records produced are counted in `agent_gateway_audit_records_produced_total{event}`;
 integration deliveries in
 `agent_gateway_audit_forward_total{result="delivered"|"failed", integration_id}`.
+
+`agent_gateway_audit_pipeline_started` is 1 once the pipeline has started and 0 when it could
+not start (the journal directory cannot be created or written, for example). While it is 0 the
+gateway keeps serving requests but keeps and forwards no audit records; alert on it.
 
 **Payload.** Audit templates may use `EVENT_TYPE`, `TIMESTAMP` (the record's own timestamp),
 `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,

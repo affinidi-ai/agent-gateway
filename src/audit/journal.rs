@@ -1,5 +1,13 @@
 //! The durable journal every produced audit record is appended to before any
 //! sink reads it.
+//!
+//! Damage to the journal never stops it. On open, the writer continues after
+//! the last line of the newest segment that parses: a partial line left by a
+//! crash, and any unreadable lines after the last good one, are cut off and
+//! logged, and a segment with no readable line is emptied and keeps its first
+//! seq. Files in the journal directory that are not segments are logged and
+//! ignored. Readers skip unreadable lines anywhere else (see
+//! [`crate::audit::cursors::read_entries`]).
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -21,6 +29,14 @@ pub struct JournalEntry {
     pub seq: u64,
     pub recipients: Vec<SinkId>,
     pub record: DelegationAuditEvent,
+}
+
+impl JournalEntry {
+    /// The entry on one journal line (without its newline), or `None` when
+    /// the line is not a whole entry.
+    pub fn parse(line: &[u8]) -> Option<JournalEntry> {
+        serde_json::from_slice(line).ok()
+    }
 }
 
 /// A produced record waiting to be journalled.
@@ -72,6 +88,42 @@ pub fn segment_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The newest whole line of `content` that parses, and the length of
+/// `content` up to the end of that line (0 when no line parses).
+fn last_readable_entry(content: &[u8]) -> (usize, Option<JournalEntry>) {
+    let mut end = content
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |newline| newline + 1);
+    while end > 0 {
+        let start = content[..end - 1]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |newline| newline + 1);
+        if let Some(entry) = JournalEntry::parse(&content[start..end - 1]) {
+            return (end, Some(entry));
+        }
+        end = start;
+    }
+    (0, None)
+}
+
+/// Logs files in the journal directory that are neither segments nor the
+/// cursors file, so a stray or misnamed file is noticed rather than read.
+fn warn_about_foreign_files(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let cursors = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("cursors.json"));
+        if segment_first_seq(&path).is_none() && !cursors {
+            tracing::warn!(path = %path.display(), "Ignoring a file in the audit journal directory that is not a segment");
+        }
+    }
+    Ok(())
+}
+
 /// Appends records to the journal segments in `dir`, one writer per journal.
 pub struct JournalWriter {
     dir: PathBuf,
@@ -81,7 +133,10 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
-    /// Opens the journal, cutting off a partial last line left by a crash.
+    /// Opens the journal and continues after the last readable entry of the
+    /// newest segment. Whatever follows that entry, a partial line left by a
+    /// crash or lines that do not parse, is cut off and logged. Files in `dir`
+    /// that are not segments are left in place and ignored.
     pub fn open(
         dir: &Path,
         segment_max_bytes: u64,
@@ -93,6 +148,7 @@ impl JournalWriter {
             next_seq: 1,
             segment: None,
         };
+        warn_about_foreign_files(dir)?;
         if let Some(last) = segment_paths(dir)?.pop() {
             writer.resume(&last)?;
         }
@@ -104,29 +160,24 @@ impl JournalWriter {
         path: &Path,
     ) -> io::Result<()> {
         let content = fs::read(path)?;
-        let complete = content
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(0, |newline| newline + 1);
+        let (keep, last) = last_readable_entry(&content);
         let file = OpenOptions::new()
             .append(true)
             .open(path)?;
-        if complete < content.len() {
-            file.set_len(complete as u64)?;
+        if keep < content.len() {
+            file.set_len(keep as u64)?;
             file.sync_data()?;
+            tracing::warn!(
+                segment = %path.display(),
+                discarded_bytes = content.len() - keep,
+                "Cut unreadable lines off the end of the audit journal"
+            );
         }
-        self.next_seq = match content[..complete]
-            .split(|b| *b == b'\n')
-            .rfind(|line| !line.is_empty())
-        {
-            Some(line) => {
-                let entry: JournalEntry =
-                    serde_json::from_slice(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                entry.seq + 1
-            }
+        self.next_seq = match last {
+            Some(entry) => entry.seq + 1,
             None => segment_first_seq(path).unwrap_or(1),
         };
-        self.segment = Some((file, complete as u64));
+        self.segment = Some((file, keep as u64));
         Ok(())
     }
 
@@ -461,6 +512,158 @@ mod tests {
             .map(|entry| entry.seq)
             .collect();
         assert_eq!(seqs, vec![1, 2]);
+    }
+
+    fn append_raw(
+        path: &Path,
+        bytes: &[u8],
+    ) {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap();
+        io::Write::write_all(&mut file, bytes).unwrap();
+    }
+
+    fn seqs_in(dir: &Path) -> Vec<u64> {
+        read_all(dir)
+            .iter()
+            .map(|entry| entry.seq)
+            .collect()
+    }
+
+    #[test]
+    fn a_garbled_last_line_is_cut_off_on_open_and_the_next_append_takes_its_place() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+            writer
+                .append(&[pending("a"), pending("b")])
+                .unwrap();
+        }
+        let segment = segment_paths(dir.path()).unwrap()[0].clone();
+        let good_len = fs::metadata(&segment)
+            .unwrap()
+            .len();
+        append_raw(&segment, b"{\"seq\":3,garbled}\n");
+
+        let mut writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(writer.next_seq(), 3);
+        assert_eq!(
+            fs::metadata(&segment)
+                .unwrap()
+                .len(),
+            good_len
+        );
+        assert_eq!(
+            writer
+                .append(&[pending("c")])
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(seqs_in(dir.path()), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_segment_with_no_readable_line_is_emptied_and_keeps_its_first_seq() {
+        let dir = TempDir::new().unwrap();
+        let segment = dir
+            .path()
+            .join(segment_name(5));
+        fs::write(&segment, b"garbage\nmore garbage\n").unwrap();
+
+        let mut writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(writer.next_seq(), 5);
+        assert_eq!(
+            fs::metadata(&segment)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            writer
+                .append(&[pending("a")])
+                .unwrap(),
+            Some(5)
+        );
+        assert_eq!(seqs_in(dir.path()), vec![5]);
+    }
+
+    #[test]
+    fn a_partial_line_after_a_garbled_line_are_both_cut_off_on_open() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+            writer
+                .append(&[pending("a")])
+                .unwrap();
+        }
+        let segment = segment_paths(dir.path()).unwrap()[0].clone();
+        let good_len = fs::metadata(&segment)
+            .unwrap()
+            .len();
+        append_raw(&segment, b"not json\n{\"seq\":3,\"recip");
+
+        let mut writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(writer.next_seq(), 2);
+        assert_eq!(
+            fs::metadata(&segment)
+                .unwrap()
+                .len(),
+            good_len
+        );
+        writer
+            .append(&[pending("b")])
+            .unwrap();
+        assert_eq!(seqs_in(dir.path()), vec![1, 2]);
+    }
+
+    #[test]
+    fn files_that_are_not_segments_do_not_stop_the_journal_opening() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+            writer
+                .append(&[pending("a")])
+                .unwrap();
+        }
+        fs::write(
+            dir.path()
+                .join("00000000000000000001.jsonl.bak"),
+            "garbage",
+        )
+        .unwrap();
+        fs::write(dir.path().join("notes.jsonl"), "garbage").unwrap();
+        // Twenty digits, but beyond u64: not a segment name.
+        fs::write(
+            dir.path()
+                .join("99999999999999999999.jsonl"),
+            "garbage\n",
+        )
+        .unwrap();
+        fs::create_dir(
+            dir.path()
+                .join("00000000000000000009.jsonl.d"),
+        )
+        .unwrap();
+
+        let writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(writer.next_seq(), 2);
+        assert_eq!(seqs_in(dir.path()), vec![1]);
+    }
+
+    #[test]
+    fn a_journal_line_parses_only_when_it_is_a_whole_entry() {
+        let mut line = serde_json::to_vec(&EntryRef {
+            seq: 7,
+            recipients: &[SinkId::AuditLog],
+            record: &pending("a").record,
+        })
+        .unwrap();
+        assert_eq!(JournalEntry::parse(&line).map(|entry| entry.seq), Some(7));
+        line.truncate(line.len() / 2);
+        assert!(JournalEntry::parse(&line).is_none());
+        assert!(JournalEntry::parse(b"").is_none());
     }
 
     #[test]

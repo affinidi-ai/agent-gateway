@@ -1,4 +1,10 @@
 //! Delivers journalled records to each sink, in order, from its own cursor.
+//!
+//! A journal line that does not parse never holds a sink back: the reader
+//! moves past it as it would past a delivered entry, counts it in
+//! `agent_gateway_audit_sink_skipped_total{reason="corrupt"}` and logs one
+//! warning per batch naming the segments. Entries with a seq at or below the
+//! cursor are ignored, and entries are delivered in file order.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -11,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
 
-use crate::audit::cursors::{CursorStore, journal_bytes, plan_backlog_skip, prune_segments, read_entries};
+use crate::audit::cursors::{CursorStore, JournalRead, journal_bytes, plan_backlog_skip, prune_segments, read_entries};
 use crate::audit::journal::{JournalEntry, segment_first_seq, segment_paths};
 use crate::audit::registry::{SinkId, Sinks};
 use crate::metrics::backends::prometheus::{set_audit_journal_bytes, track_audit_sink_skipped};
@@ -91,8 +97,8 @@ pub async fn run_reader<D: Deliver>(
             }
             continue;
         }
-        let entries = match read(dir.clone(), cursor, upto, config.batch).await {
-            Ok(entries) if !entries.is_empty() => entries,
+        let read = match read(dir.clone(), cursor, upto, config.batch).await {
+            Ok(read) if !read.entries.is_empty() || read.through > cursor => read,
             Ok(_) => {
                 warn!(?sink, cursor, upto, "Audit journal has no entries after the sink's cursor");
                 tokio::time::sleep(config.retry_initial).await;
@@ -105,7 +111,7 @@ pub async fn run_reader<D: Deliver>(
             }
         };
         let batch_start = cursor;
-        for entry in &entries {
+        for entry in &read.entries {
             let moved_past = || stored_cursor(&cursors, &sink) >= entry.seq;
             let expired = || is_older_than(entry, max_age());
             let addressed = entry
@@ -123,11 +129,21 @@ pub async fn run_reader<D: Deliver>(
                 .seq
                 .max(stored_cursor(&cursors, &sink));
         }
+        cursor = cursor.max(read.through);
         if let Err(e) = deliver.commit().await {
             warn!(?sink, error = %e, "Audit sink could not commit a batch; reading it again");
             cursor = batch_start;
             tokio::time::sleep(config.retry_initial).await;
             continue;
+        }
+        if read.corrupt > 0 {
+            track_audit_sink_skipped(sink.label(), "corrupt", read.corrupt);
+            warn!(
+                ?sink,
+                lines = read.corrupt,
+                segments = ?read.corrupt_segments,
+                "Audit journal lines could not be read; the sink moved past them"
+            );
         }
         save_cursor(&cursors, &sink, cursor).await;
     }
@@ -352,12 +368,16 @@ async fn enforce_journal_limits(
                 return;
             }
         };
-        for (sink, skipped) in &skip.sinks {
-            save_cursor(&source.cursors, sink, skip.to).await;
-            track_audit_sink_skipped(sink.label(), "backlog_cap", *skipped);
+        for moved in &skip.sinks {
+            save_cursor(&source.cursors, &moved.sink, skip.to).await;
+            track_audit_sink_skipped(moved.sink.label(), "backlog_cap", moved.skipped);
+            if moved.corrupt > 0 {
+                track_audit_sink_skipped(moved.sink.label(), "corrupt", moved.corrupt);
+            }
             error!(
-                ?sink,
-                skipped,
+                sink = ?moved.sink,
+                skipped = moved.skipped,
+                unreadable = moved.corrupt,
                 to = skip.to,
                 max_bytes = config.journal_max_bytes,
                 "Audit journal over its cap: sink moved past records it had not received"
@@ -401,7 +421,7 @@ async fn read(
     after: u64,
     upto: u64,
     limit: usize,
-) -> std::io::Result<Vec<JournalEntry>> {
+) -> std::io::Result<JournalRead> {
     tokio::task::spawn_blocking(move || read_entries(&dir, after, upto, limit))
         .await
         .map_err(std::io::Error::other)?
@@ -483,8 +503,12 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_segment_bytes(1 << 20)
+        }
+
+        fn with_segment_bytes(segment_max_bytes: u64) -> Self {
             let dir = TempDir::new().unwrap();
-            let writer = JournalWriter::open(dir.path(), 1 << 20).unwrap();
+            let writer = JournalWriter::open(dir.path(), segment_max_bytes).unwrap();
             let cursors = Arc::new(CursorStore::open(dir.path()).unwrap());
             let (durable, _) = watch::channel(0);
             Self { dir, writer, durable, cursors }
@@ -658,6 +682,62 @@ mod tests {
 
         assert_eq!(*first.delivered.lock(), vec![1, 2]);
         assert_eq!(*second.delivered.lock(), vec![3]);
+        reader.abort();
+    }
+
+    fn corrupt_skips(sink: &SinkId) -> u64 {
+        crate::metrics::backends::prometheus::AUDIT_SINK_SKIPPED
+            .with_label_values(&[sink.label(), "corrupt"])
+            .get()
+    }
+
+    #[tokio::test]
+    async fn a_garbled_line_is_skipped_counted_and_the_reader_carries_on() {
+        let sink_id = SinkId::Integration("garbled-mid-batch".to_string());
+        let mut f = Fixture::new();
+        f.cursors
+            .set(&sink_id, 0)
+            .unwrap();
+        f.append(&[&[sink_id.clone()], &[sink_id.clone()], &[sink_id.clone()]]);
+        crate::audit::cursors::garble(f.dir.path(), 2);
+        let before = corrupt_skips(&sink_id);
+
+        let sink = RecordingSink::default();
+        let reader = f.spawn(sink_id.clone(), sink.clone());
+        wait_until(|| f.cursors.get(&sink_id) == Some(3)).await;
+
+        assert_eq!(*sink.delivered.lock(), vec![1, 3]);
+        assert_eq!(corrupt_skips(&sink_id), before + 1);
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn a_garbled_line_in_the_newest_segment_does_not_stall_the_reader() {
+        let sink_id = SinkId::Integration("garbled-newest".to_string());
+        let mut f = Fixture::with_segment_bytes(1);
+        f.cursors
+            .set(&sink_id, 0)
+            .unwrap();
+        for _ in 0..3 {
+            f.append(&[&[sink_id.clone()]]);
+        }
+        assert_eq!(
+            segment_paths(f.dir.path())
+                .unwrap()
+                .len(),
+            3
+        );
+        crate::audit::cursors::garble(f.dir.path(), 3);
+        let before = corrupt_skips(&sink_id);
+
+        let sink = RecordingSink::default();
+        let reader = f.spawn(sink_id.clone(), sink.clone());
+        wait_until(|| f.cursors.get(&sink_id) == Some(3)).await;
+        f.append(&[&[sink_id.clone()]]);
+        wait_until(|| f.cursors.get(&sink_id) == Some(4)).await;
+
+        assert_eq!(*sink.delivered.lock(), vec![1, 2, 4]);
+        assert_eq!(corrupt_skips(&sink_id), before + 1);
         reader.abort();
     }
 

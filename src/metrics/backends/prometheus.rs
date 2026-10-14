@@ -388,11 +388,23 @@ lazy_static! {
     pub static ref AUDIT_SINK_SKIPPED: IntCounterVec = {
         let opts = Opts::new(
             names::AUDIT_SINK_SKIPPED_TOTAL,
-            "Governance audit records a sink skipped (reason = backlog_cap|expired; sink = audit_log or the integration id)",
+            "Governance audit records a sink skipped (reason = backlog_cap|expired|corrupt; sink = audit_log or the integration id)",
         );
         let counter = IntCounterVec::new(opts, &["sink", "reason"]).unwrap();
         REGISTRY.register(Box::new(counter.clone())).unwrap();
         counter
+    };
+
+    /// Whether the governance audit pipeline started: 1 when it did, 0 when it
+    /// failed to start and no audit records are kept or forwarded.
+    pub static ref AUDIT_PIPELINE_STARTED: IntGauge = {
+        let opts = Opts::new(
+            names::AUDIT_PIPELINE_STARTED,
+            "Whether the governance audit pipeline started (1) or failed to start, keeping and forwarding no audit records (0)",
+        );
+        let gauge = IntGauge::with_opts(opts).unwrap();
+        REGISTRY.register(Box::new(gauge.clone())).unwrap();
+        gauge
     };
 
     /// Consent epoch reads that failed, each closing every MCP subscription on the vault.
@@ -766,6 +778,10 @@ pub fn set_audit_journal_bytes(bytes: u64) {
     AUDIT_JOURNAL_BYTES.set(i64::try_from(bytes).unwrap_or(i64::MAX));
 }
 
+pub fn set_audit_pipeline_started(started: bool) {
+    AUDIT_PIPELINE_STARTED.set(i64::from(started));
+}
+
 pub fn track_audit_sink_skipped(
     sink: &str,
     reason: &str,
@@ -824,7 +840,20 @@ pub fn set_active_users(count: i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{A2A_PROTOCOL_VERSION, get_metrics, names, track_a2a_protocol_version, track_fabric_forward_received};
+    use super::{
+        A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, get_metrics, names, set_audit_pipeline_started,
+        track_a2a_protocol_version, track_fabric_forward_received,
+    };
+
+    #[test]
+    fn the_audit_pipeline_gauge_reports_whether_it_started() {
+        assert_eq!(names::AUDIT_PIPELINE_STARTED, "agent_gateway_audit_pipeline_started");
+        set_audit_pipeline_started(false);
+        assert_eq!(AUDIT_PIPELINE_STARTED.get(), 0);
+        set_audit_pipeline_started(true);
+        assert_eq!(AUDIT_PIPELINE_STARTED.get(), 1);
+        assert!(get_metrics().contains("agent_gateway_audit_pipeline_started 1"));
+    }
 
     #[test]
     fn track_fabric_forward_received_increments_labeled_counter() {

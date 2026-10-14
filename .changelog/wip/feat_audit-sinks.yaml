@@ -27,6 +27,9 @@ changes:
     - timestamp: '2026-10-13T00:00:00.000Z'
       title: Send Retry-After when an Access Point rate limit refuses a request
       description: A request refused with 429 by an Access Point rate limit now carries a Retry-After header; it was never set.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Keep the governance audit pipeline running when its journal or cursors are damaged
+      description: An unreadable line at the end of the audit journal, or an unreadable cursors.json, stopped the audit pipeline from starting, so the gateway kept serving with no audit records kept or forwarded until restarted with the file repaired. An unreadable line elsewhere in the journal stopped every sink behind it for good. On start the journal is now cut back to its last readable line and an unreadable cursors.json is renamed to cursors.json.corrupt-<unix seconds>; readers move past unreadable lines and count them in agent_gateway_audit_sink_skipped_total with reason corrupt. agent_gateway_audit_pipeline_started reports 0 when the pipeline could not start.
   removed:
     - timestamp: '2026-10-12T00:00:00.000Z'
       title: Remove the unused Pre-Authorize Blocked governance audit event

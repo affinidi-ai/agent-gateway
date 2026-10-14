@@ -67,8 +67,10 @@ pub mod prom {
     pub const AUDIT_RECORDS_PRODUCED_TOTAL: &str = "agent_gateway_audit_records_produced_total";
     // Size of the governance audit journal on disk.
     pub const AUDIT_JOURNAL_BYTES: &str = "agent_gateway_audit_journal_bytes";
-    // Governance audit records a sink skipped (backlog cap or its own drop policy).
+    // Governance audit records a sink skipped (backlog cap, its own drop policy, or unreadable journal lines).
     pub const AUDIT_SINK_SKIPPED_TOTAL: &str = "agent_gateway_audit_sink_skipped_total";
+    // Whether the governance audit pipeline started (1) or failed to start (0).
+    pub const AUDIT_PIPELINE_STARTED: &str = "agent_gateway_audit_pipeline_started";
 
     // Consent epoch reads that failed, each closing every MCP subscription on the vault.
     pub const MCP_SUBSCRIPTION_EPOCH_UNAVAILABLE_TOTAL: &str = "agent_gateway_mcp_subscription_epoch_unavailable_total";
