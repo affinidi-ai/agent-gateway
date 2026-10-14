@@ -1094,7 +1094,12 @@ mod tests {
         for _ in 0..3 {
             f.append(&[&[SinkId::AuditLog]]);
         }
-        wait_until(|| f.cursors.parked(&sink).is_none()).await;
+        wait_until(|| {
+            f.cursors
+                .parked(&sink)
+                .is_none()
+        })
+        .await;
         assert_eq!(
             segment_paths(f.dir.path())
                 .unwrap()
@@ -1153,7 +1158,8 @@ mod tests {
         let paused = SinkId::Integration("paused-at-start".to_string());
         let active = SinkId::Integration("active-at-start".to_string());
         let mut f = Fixture::new();
-        f.append(&[&[SinkId::AuditLog, active.clone(), paused.clone()], &[paused.clone()], &[paused.clone()]]);
+        let only_paused = std::slice::from_ref(&paused);
+        f.append(&[&[SinkId::AuditLog, active.clone(), paused.clone()], only_paused, only_paused]);
         for sink in [&SinkId::AuditLog, &active, &paused] {
             f.cursors
                 .set(sink, 0)
@@ -1183,9 +1189,17 @@ mod tests {
         .await;
 
         assert_eq!(paused_skips(&paused), before + 3);
-        assert_eq!(f.cursors.get(&SinkId::AuditLog), Some(0));
+        assert_eq!(
+            f.cursors
+                .get(&SinkId::AuditLog),
+            Some(0)
+        );
         assert_eq!(f.cursors.get(&active), Some(0));
-        assert_eq!(f.cursors.parked(&SinkId::AuditLog), None);
+        assert_eq!(
+            f.cursors
+                .parked(&SinkId::AuditLog),
+            None
+        );
         manager.abort();
     }
 
@@ -1214,10 +1228,19 @@ mod tests {
         assert_eq!(f.cursors.parked(&deleted), Some(0));
 
         rebuild(sinks, &[SinkId::AuditLog, siem()], std::slice::from_ref(&kept));
-        wait_until(|| f.cursors.parked(&deleted).is_none()).await;
+        wait_until(|| {
+            f.cursors
+                .parked(&deleted)
+                .is_none()
+        })
+        .await;
 
         assert_eq!(f.cursors.parked(&kept), Some(0));
-        assert_eq!(f.cursors.get(&SinkId::AuditLog), Some(0));
+        assert_eq!(
+            f.cursors
+                .get(&SinkId::AuditLog),
+            Some(0)
+        );
         manager.abort();
     }
 
@@ -1242,7 +1265,11 @@ mod tests {
         rebuild(sinks, &[siem()], &[]);
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        assert_eq!(f.cursors.parked(&SinkId::AuditLog), Some(0));
+        assert_eq!(
+            f.cursors
+                .parked(&SinkId::AuditLog),
+            Some(0)
+        );
         manager.abort();
     }
 

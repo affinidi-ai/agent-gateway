@@ -376,9 +376,10 @@ mod tests {
             })
             .await;
 
-        producer.sinks.replace(vec![
-            Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"])),
-            Sink::new(siem(), EventMask::from_categories(["consent_granted"])),
+        producer.sinks.replace(
+            vec![
+                Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"])),
+                Sink::new(siem(), EventMask::from_categories(["consent_granted"])),
             ],
             Vec::new(),
         );

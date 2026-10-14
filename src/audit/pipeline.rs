@@ -138,7 +138,8 @@ impl PipelineControl {
     /// another writer has the journal open.
     pub async fn try_start(&self) -> io::Result<()> {
         let mut running = self.running.lock().await;
-        self.start_into(&mut running).await
+        self.start_into(&mut running)
+            .await
     }
 
     /// Starts the pipeline, trying again every `retry` while the sinks cannot
@@ -157,7 +158,10 @@ impl PipelineControl {
                 if !wanted() {
                     return Ok(false);
                 }
-                match self.start_into(&mut running).await {
+                match self
+                    .start_into(&mut running)
+                    .await
+                {
                     Ok(()) => return Ok(true),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(e),
@@ -249,9 +253,10 @@ mod tests {
             .join("delegation-audit.jsonl");
         let sinks: &'static Sinks = Box::leak(Box::default());
         let producer: &'static Producer = Box::leak(Box::new(Producer::new(sinks)));
-        sinks.replace(vec![
-            Sink::new(SinkId::AuditLog, EventMask::default()),
-            Sink::new(SinkId::Integration("siem".to_string()), EventMask::from_categories(["consent_granted"])),
+        sinks.replace(
+            vec![
+                Sink::new(SinkId::AuditLog, EventMask::default()),
+                Sink::new(SinkId::Integration("siem".to_string()), EventMask::from_categories(["consent_granted"])),
             ],
             Vec::new(),
         );
@@ -344,7 +349,8 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (active_producer, active_sinks) = parts();
         let (standby_producer, standby_sinks) = parts();
-        let active = PipelineControl::new(active_producer, active_sinks, dir.path().to_path_buf(), log.clone(), built());
+        let active =
+            PipelineControl::new(active_producer, active_sinks, dir.path().to_path_buf(), log.clone(), built());
         let standby: &'static PipelineControl = Box::leak(Box::new(PipelineControl::new(
             standby_producer,
             standby_sinks,
@@ -386,7 +392,8 @@ mod tests {
             .join("delegation-audit.jsonl");
         let (active_producer, active_sinks) = parts();
         let (waiting_producer, waiting_sinks) = parts();
-        let active = PipelineControl::new(active_producer, active_sinks, dir.path().to_path_buf(), log.clone(), built());
+        let active =
+            PipelineControl::new(active_producer, active_sinks, dir.path().to_path_buf(), log.clone(), built());
         let waiting = PipelineControl::new(waiting_producer, waiting_sinks, dir.path().to_path_buf(), log, built());
         active
             .try_start()
@@ -465,7 +472,10 @@ mod tests {
         let seen = built_first.clone();
         let build: BuildSinks = Arc::new(move || {
             seen.store(!journal.exists(), std::sync::atomic::Ordering::SeqCst);
-            sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
+            sinks.replace(
+                vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))],
+                Vec::new(),
+            );
             Box::pin(async { true })
         });
         let control = PipelineControl::new(producer, sinks, dir.path().to_path_buf(), log.clone(), build);
