@@ -5,6 +5,7 @@ docs/development/RELEASING.md
 .github/workflows/publish-release.yml
   s_09d9fb08a24a2a::t_17087f0b9d4f5e 35,39
   s_09d9fb08a24a2a::t_150cc83d2516d4 20-34,36-38,40-48,51-52,64,75-76,88-89,126-139,143,148-149,158
+  s_09d9fb08a24a2a::t_c985f554d9c148 90-91
 ---
 {
   "schema_version": "authorship/3.0.0",
