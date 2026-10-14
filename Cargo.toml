@@ -119,7 +119,7 @@ hex = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
 affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = ["agent-names"] }
 affinidi-messaging-sdk = "0.30.1"
-trust-tasks-rs = "0.24.8"
+trust-tasks-rs = "0.28.0"
 
 # Cryptography for x402 payment signing
 alloy-signer = "1.7"

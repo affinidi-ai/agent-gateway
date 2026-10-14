@@ -498,7 +498,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "trust-tasks-proof",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.24.9",
  "uuid",
 ]
 
@@ -772,7 +772,7 @@ dependencies = [
  "tracing-appender",
  "tracing-opentelemetry 0.32.1",
  "tracing-subscriber",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.28.0",
  "ts-rs",
  "unicode-general-category",
  "url",
@@ -3644,7 +3644,7 @@ version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
 dependencies = [
- "darling 0.20.11",
+ "darling 0.23.0",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -4787,7 +4787,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -8366,7 +8366,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
@@ -8750,7 +8750,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.45.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10171,7 +10171,7 @@ dependencies = [
  "quinn",
  "rustls",
  "rustls-pki-types",
- "rustls-platform-verifier 0.6.2",
+ "rustls-platform-verifier 0.7.0",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -15596,14 +15596,29 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "trust-tasks-rs",
+ "trust-tasks-rs 0.24.9",
 ]
 
 [[package]]
 name = "trust-tasks-rs"
-version = "0.24.8"
+version = "0.24.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "716d9ae3ab8a655b6df4a736e35c0c8642427bb5f7bd076f3254aef530c8a036"
+checksum = "548f744bac340253cfb613145fc109d8d79a77d6149196edd800a4701352ffdd"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "regress",
+ "serde",
+ "serde_json",
+ "serde_with 3.21.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "trust-tasks-rs"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c98d3e0888d3b9be9b0f5d7ad35ea7a84f426514f68a11d2e6b4e3c207fa5b16"
 dependencies = [
  "async-trait",
  "chrono",
