@@ -21,7 +21,7 @@ Feature: Trust Check on the Access Point request edge
     And external agent "charlie" is unreachable
     And transit point "tr1" has a target-leg Trust Check for trust registry "alpha-registry" of type "recognition"
     And the surface has a policy that denies a target Trust Check reporting error code "AGENT_CARD_UNAVAILABLE"
-    And trust check audit is enabled
+    And the VP Audit Log keeps every audit event
     When managed agent "bravo" sends an A2A message/send request through Transit Point "tr1"
     Then the response status is 403
     And the target Trust Check reported error code "AGENT_CARD_UNAVAILABLE"
@@ -32,7 +32,7 @@ Feature: Trust Check on the Access Point request edge
     And external agent "charlie" publishes an agent card without an agent-identity-credential
     And transit point "tr1" has a target-leg Trust Check for trust registry "alpha-registry" of type "recognition"
     And the surface has a policy that denies a target Trust Check reporting error code "TARGET_AGENT_IDENTITY_UNAVAILABLE"
-    And trust check audit is enabled
+    And the VP Audit Log keeps every audit event
     When managed agent "bravo" sends an A2A message/send request through Transit Point "tr1"
     Then the response status is 403
     And the target Trust Check reported error code "TARGET_AGENT_IDENTITY_UNAVAILABLE"
@@ -43,7 +43,7 @@ Feature: Trust Check on the Access Point request edge
     And external agent "charlie" publishes an agent card with an unverifiable agent-identity-credential
     And transit point "tr1" has a target-leg Trust Check for trust registry "alpha-registry" of type "recognition"
     And the surface has a policy that denies a target Trust Check reporting error code "IDENTITY_VP_VERIFICATION_FAILED"
-    And trust check audit is enabled
+    And the VP Audit Log keeps every audit event
     When managed agent "bravo" sends an A2A message/send request through Transit Point "tr1"
     Then the response status is 403
     And the target Trust Check reported error code "IDENTITY_VP_VERIFICATION_FAILED"
@@ -54,7 +54,7 @@ Feature: Trust Check on the Access Point request edge
   Scenario: Trust Check surfaces TEMPLATE_RESOLUTION_FAILED when an entity template cannot be resolved from the request
     Given the surface has a caller-leg Trust Check for trust registry "alpha-registry" of type "recognition" with entity template "{{ input.nonexistent.field }}"
     And the surface has a policy that denies unless every caller Trust Check succeeded
-    And trust check audit is enabled
+    And the VP Audit Log keeps every audit event
     When the caller sends a request to the surface
     Then the response status is 403
     And managed agent "bravo" was not called

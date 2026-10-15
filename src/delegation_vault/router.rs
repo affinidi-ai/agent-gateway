@@ -58,12 +58,13 @@ pub fn create_delegation_vault_oauth_router(state: DelegationVaultState) -> Rout
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::producer::capture;
     use crate::auth::storage::{PasskeyStorage, UserData};
     use crate::auth::types::{UserRole, UserStatus};
     use crate::auth_manager::middleware::AuthGuardOk;
     use crate::auth_manager::pat::{PatContext, PatDelegationContext};
     use crate::credential_providers::CredentialProvider;
-    use crate::delegation_vault::audit::{AUDIT_DEFER_QUEUE, DelegationAuditAction, DelegationAuditEvent};
+    use crate::delegation_vault::audit::DelegationAuditAction;
     use crate::delegation_vault::storage::DelegationVaultStorage;
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
     use crate::rbac::RbacConfig;
@@ -420,13 +421,9 @@ mod tests {
         let app = create_delegation_vault_router(state_with(vec![seed_token("t1")]), Some(gate_for(storage)))
             .layer(Extension(AuthGuardOk("admin-1".to_string())));
 
-        let queue: Arc<Mutex<Vec<DelegationAuditEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = AUDIT_DEFER_QUEUE
-            .scope(queue.clone(), async { status_of(app, "DELETE", "/api/v1/delegation-vault/t1").await })
-            .await;
+        let (status, events) = capture(async { status_of(app, "DELETE", "/api/v1/delegation-vault/t1").await }).await;
         assert_eq!(status, StatusCode::NO_CONTENT.as_u16());
 
-        let events = queue.lock().unwrap();
         assert_eq!(events.len(), 1, "revoke must emit exactly one audit event");
         let evt = &events[0];
         assert!(matches!(evt.event, DelegationAuditAction::TokenRevoked));
@@ -452,15 +449,10 @@ mod tests {
             }))
             .layer(Extension(AuthGuardOk("admin-1".to_string())));
 
-        let queue: Arc<Mutex<Vec<DelegationAuditEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = AUDIT_DEFER_QUEUE
-            .scope(queue.clone(), async {
-                status_of(app, "DELETE", "/api/v1/delegation-vault/by-user/sha256:user-1").await
-            })
-            .await;
+        let (status, events) =
+            capture(async { status_of(app, "DELETE", "/api/v1/delegation-vault/by-user/sha256:user-1").await }).await;
         assert_eq!(status, StatusCode::OK.as_u16());
 
-        let events = queue.lock().unwrap();
         assert_eq!(events.len(), 1);
         let caller = events[0]
             .caller

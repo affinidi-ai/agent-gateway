@@ -46,13 +46,6 @@ changes:
         given as bare listen addresses are skipped by the Origin check; any other public endpoint
         that is not an HTTP(S) origin is skipped with a warning.
     - timestamp: '2026-10-07T02:15:14.000Z'
-      title: Send delegated access tokens to Fabric peers for every modern MCP request
-      description: >-
-        A modern MCP request on a `fabric://` route with `outbound_credentials` now sends the
-        caller's delegated access token to the peer inside the framed stream without the former
-        `dual` opt-in, so existing routes start sharing tokens on upgrade. Remove
-        `outbound_credentials` from any `fabric://` route whose peer must not receive them.
-    - timestamp: '2026-10-07T02:15:14.000Z'
       title: ⭐ Admit MCP 2026-07-28 on every MCP endpoint and retire mcp_protocol_mode
       description: >-
         Access Points, Transit Points, MCP Proxies and Fabric framed streams now admit MCP

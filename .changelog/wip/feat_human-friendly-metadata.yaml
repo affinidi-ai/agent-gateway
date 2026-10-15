@@ -74,6 +74,15 @@ changes:
     - timestamp: '2026-10-05T14:39:32.000Z'
       title: Document display names, reference fields and caller naming
       description: Updates SOURCE_AUTH.md, CONTEXT.md, ARCHITECTURE.md and the dashboard AGENTS.md.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Verify caller agent names through the resolver SDK
+      description: >-
+        The dashboard verifies up to four `host/@name` agent names from a caller's DID document
+        through the resolver SDK's agent-names feature. This path does not use the DID resolution
+        host policy or the gateway's egress guard: the resolver's own client refuses non-public
+        addresses and non-HTTPS URLs and follows at most five redirects, re-checking each hop,
+        but does not pin the connection, so it remains open to DNS rebinding. POLICY.md lists
+        this as a known limitation.
   fixed:
     - timestamp: '2026-10-05T14:39:32.000Z'
       title: Keep other Identities rows expanded when a row is expanded via its link
@@ -102,9 +111,4 @@ changes:
         zero-width spaces, bidirectional overrides and tag characters, as well as control
         characters. Names read from remote Agent Cards, signed into VCs or published to
         trust registries can no longer visually impersonate another agent's name.
-    - timestamp: '2026-10-05T14:39:32.000Z'
-      title: Apply host policy to caller-name DID resolution
-      description: >-
-        Caller-name resolution now uses the resolver SDK's agent-names feature, and its redirect
-        and DNS-rebinding limitations are documented in POLICY.md.
   breaking: []

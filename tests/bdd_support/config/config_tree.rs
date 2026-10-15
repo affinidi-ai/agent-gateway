@@ -153,6 +153,8 @@ pub struct GatewayBootstrapFixture {
     pub policy_opa_entry: Option<String>,
     pub terms_enabled: bool,
     pub affinidi_terms_url: Option<String>,
+    /// Dashboard settings the gateway starts with; defaults when absent.
+    pub settings: Option<serde_json::Value>,
 }
 
 impl GatewayBootstrapFixture {
@@ -181,6 +183,7 @@ impl GatewayBootstrapFixture {
             policy_opa_entry: None,
             terms_enabled: false,
             affinidi_terms_url: None,
+            settings: None,
         }
     }
 
@@ -348,6 +351,11 @@ pub fn write_gateway_config_tree(
     let a2a_proxies_dir = storage_dir.join("a2a_proxies");
     for proxy in fixture.a2a_proxies.values() {
         write_a2a_proxy_fixture(&a2a_proxies_dir, proxy);
+    }
+
+    if let Some(settings) = &fixture.settings {
+        std::fs::write(storage_dir.join("settings/settings.json"), serde_json::to_string_pretty(settings).unwrap())
+            .unwrap();
     }
     if with_toml {
         write_config_toml(base_dir, &storage_dir);

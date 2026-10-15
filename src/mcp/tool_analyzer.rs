@@ -169,6 +169,23 @@ impl BodyRefusal {
         })
     }
 
+    /// The HTTP status and JSON-RPC error code the caller receives, for the
+    /// audit record of the refusal.
+    pub fn caller_status_and_code(
+        &self,
+        modern: bool,
+    ) -> (u16, Option<i64>) {
+        let code = match self {
+            Self::NotJson(_) => super::error_codes::PARSE_ERROR,
+            Self::Batch | Self::NotObject | Self::AmbiguousKeys => super::error_codes::INVALID_REQUEST,
+        };
+        match (self, modern) {
+            (_, true) => (400, Some(i64::from(code))),
+            (Self::Batch, false) => (422, None),
+            (_, false) => (200, Some(i64::from(code))),
+        }
+    }
+
     /// The caller's response: the modern refusal for a modern request, else
     /// [`Self::into_response`].
     pub fn into_response_for(
@@ -703,6 +720,38 @@ mod tests {
         .unwrap();
         assert_eq!(json["error"]["code"], -32700);
         assert_eq!(json["error"]["message"], "Invalid JSON");
+    }
+
+    #[tokio::test]
+    async fn caller_status_and_code_match_the_refusal_response() {
+        let refusals = [
+            BodyRefusal::Batch,
+            BodyRefusal::NotJson("eof".into()),
+            BodyRefusal::NotObject,
+            BodyRefusal::AmbiguousKeys,
+        ];
+        for refusal in refusals {
+            for modern in [false, true] {
+                let response = if modern {
+                    (*refusal
+                        .clone()
+                        .into_modern_error(b"{}"))
+                    .into_response()
+                } else {
+                    refusal
+                        .clone()
+                        .into_response()
+                };
+                let status = response.status().as_u16();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let code = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|json| json["error"]["code"].as_i64());
+                assert_eq!(refusal.caller_status_and_code(modern), (status, code), "{refusal:?} modern={modern}");
+            }
+        }
     }
 
     #[test]

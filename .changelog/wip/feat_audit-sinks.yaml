@@ -1,0 +1,119 @@
+branch: feat/audit-sinks
+changes:
+  added:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Give every VP injection audit record the same fields
+      description: vp_injected records from every injection point (request path, response path, backend agent response, Fabric forward and receive, Transit Point) now carry the trace id, a detail naming the injection point, the VP fingerprint and the caller when known. The backend agent response record, which had no trace id or detail, now reads backend_response, and the Fabric forward record is marked as sent over Fabric.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Record the surface, trace and caller on trust check audit records
+      description: trust_check audit records now carry the surface id, the request's trace id and the authenticated caller on the Access Point, Fabric and MCP-proxy paths, so each outcome can be tied to the request and principal that triggered it.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Give every governance audit record a unique event_id
+      description: Each record written to the VP Audit Log and sent to Governance Audit integrations now carries event_id, a UUID v4. Receivers can use it to recognise a record delivered more than once. Records stored before this change have no event_id and still read.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Choose the audit events each Governance Audit integration receives
+      description: Governance Audit integrations carry audit_events, the audit event names they receive, accepted only with names from the audit event catalog; an update that leaves the field out keeps the current events. The integration add and edit pages show the events grouped by area, with a warning when none is selected. GET /v1/settings/audit-events lists every selectable event with its label, description and group (policies, trust, identity, trace, auth, delegation, payments or requests), the Governance Audit integration category lists the group with each event type, and Settings › VP Audit uses the same picker. A changed selection, in settings or on an integration, takes effect without a restart.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Record failed authentication, rate limits and refused requests
+      description: New audit events auth_failed (scheme and reason, never the credential), rate_limited (scope and retry delay) and request_rejected (stage, reason, HTTP status and JSON-RPC code) record requests the Access Point refused, including refusals before any surface matched, recorded against surface unknown. Fabric receive records the same refusals.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Record identity binding verification
+      description: New audit events identity_binding_verified and identity_binding_failed record whether a request's identity binding VP verified, with the agent DID, issuing gateway and, on failure, whether the presentation was absent, invalid or from an untrusted issuer.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Record the tools a tools/list filter removed
+      description: When MCP tool gating removes tools from a tools/list response, a policy_decision record with scope mcp_tool_list names the removed tools.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Skip audit records older than a set age for an integration
+      description: Governance Audit integrations accept audit_drop_after_secs. Records older than that are skipped for the integration instead of delivered, including a record still being retried, and counted in agent_gateway_audit_sink_skipped_total{reason="expired"}. An update that leaves the field out keeps it; null clears it. Without it nothing is skipped.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Skip an audit record an integration refuses after a set number of attempts
+      description: Governance Audit integrations accept audit_max_attempts. A record that fails that many delivery attempts, whatever the error, is skipped for the integration so the records after it are delivered, counted in agent_gateway_audit_sink_skipped_total with reason rejected and logged once with the last error. During an outage records are skipped once they reach the limit. An update that leaves the field out keeps it and null clears it. Without it a record is retried until delivered. The Governance Audit integration add and edit pages set this limit and the drop age (audit_drop_after_secs), which until now could only be set through the API.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Report governance audit delivery metrics
+      description: New metrics agent_gateway_audit_records_produced_total{event}, agent_gateway_audit_journal_bytes, agent_gateway_audit_sink_skipped_total{sink, reason=backlog_cap|expired|corrupt}, agent_gateway_audit_records_lost_total{reason=journal_write|journal_closed|pipeline_not_running} and agent_gateway_audit_pipeline_started (alert when 0). agent_gateway_audit_forward_total gains result not_receiving.
+  changed:
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Stop embedding policy decisions in minted VPs
+      description: The workloadBinding of a VP minted on the Transit Point, response, outbound and Fabric paths no longer carries policyDecisions. Whether it did depended on the VP Audit Log selection, so an audit setting changed what the gateway sent to another gateway. Policy decisions are still recorded as policy_decision audit records. VPs received from older gateways that still carry policyDecisions are read as before.
+  fixed:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Audit requests denied because a policy could not decide
+      description: When a gateway, access-point inbound, surface or MCP tool policy raised an evaluation error, had no policy engine, or was enabled without a compiled policy, the request was denied without a policy decision record. These denials are now recorded with decision error and deny_reason evaluation_error, no_policy_manager or policy_not_compiled, on the direct, Fabric and MCP-proxy paths.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Audit trust checks that failed on an unavailable A2A proxy agent card
+      description: When an A2A proxy target's agent card could not be synthesized, its target-leg trust checks failed with AGENT_CARD_UNAVAILABLE without a trust_check audit record or metric. They are now recorded like the same failure on the outbound path.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Keep delegation audit records when a request ends before its VP is minted
+      description: Credential delegation records held back until the request's identity VP was minted were lost when the request returned early, for example with 503 when delegated credentials were unavailable. They are now recorded without a VP on every path.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Send Retry-After when an Access Point rate limit refuses a request
+      description: A request refused with 429 by an Access Point rate limit now carries a Retry-After header; it was never set.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Keep the audit pipeline running when its journal or cursors are damaged
+      description: An unreadable line at the end of the audit journal, or an unreadable cursors.json, stopped the audit pipeline from starting, so the gateway kept serving with no audit records kept or forwarded until restarted with the file repaired. An unreadable line elsewhere in the journal stopped every sink behind it for good. On start the journal is now cut back to its last readable line and an unreadable cursors.json is renamed to cursors.json.corrupt-<unix seconds>; readers move past unreadable lines and count them in agent_gateway_audit_sink_skipped_total with reason corrupt. agent_gateway_audit_pipeline_started reports 0 when the pipeline could not start.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Pause a disabled Governance Audit integration without replaying old records
+      description: Records addressed to a Governance Audit integration that was disabled, given a tenant or moved to another category were passed over as delivered until its delivery stopped, and its undelivered records could later be deleted uncounted or replayed when it was re-enabled. A paused or deleted Governance Audit integration now receives nothing. Its undelivered records are let go and counted in agent_gateway_audit_sink_skipped_total with reason paused, with one warning per integration, and a deleted integration's position is dropped. Resuming continues from the pause, so only records produced after it are delivered. Until delivery stops, each record it refuses is counted in agent_gateway_audit_forward_total with result not_receiving rather than reported as delivered. Records produced at the moment of pausing may still be delivered after it resumes, or be counted as paused.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Record x402 settlements that fail immediately
+      description: An immediate x402 settlement that returned an error without marking itself failed left the transaction without a settlement failure. It is now marked failed and recorded once as a failed payment event.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Run the governance audit pipeline only on the Active node
+      description: A Standby node also started the audit pipeline, so in a failover pair sharing storage both nodes could open the same journal, write records with the same sequence numbers and overwrite each other's cursors, and a promoted node continued from a stale position. Only the Active node now runs the pipeline. Stepping down journals what was handed over, stops delivery and releases the journal; becoming Active re-opens the journal and cursors from disk and continues after the last record. The journal holds an exclusive lock, so a second writer cannot open it, and a node that becomes Active while another still holds it tries again every 5 s. agent_gateway_audit_pipeline_started is 0 on a Standby node.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Retry rebuilding the audit sinks when integrations cannot be listed
+      description: When the integrations could not be listed, the previous audit sinks were kept until the next settings or integration change, so a just-disabled integration could keep receiving records. The rebuild is now retried every 5 s until it succeeds and each failure is counted in agent_gateway_audit_sink_rebuild_failed_total. Rebuilds also run one at a time, so a slower rebuild can no longer replace newer sinks. A rebuild before integration storage is set up counts as a failed listing rather than as no integrations.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Re-read the audit journal after a failed append that could not be undone
+      description: When appending to the audit journal failed and the partial batch could not be cut off again, the next batch was written after the partial line. The segment is now re-read before the next append, as on start, so no partial line is left behind and no sequence number is reused.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Build the audit sinks before the audit pipeline starts
+      description: The audit pipeline started before the Governance Audit integrations were loaded, and a node becoming Active kept the sinks it had built before, missing integration changes made on the other node. The sinks are now built from the current settings and integrations every time the pipeline starts, on start-up and on becoming Active; while the integrations cannot be listed the pipeline waits and tries again every 5 s.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Stop every audit pipeline job when a node steps down
+      description: A node stepping down waited for the audit journal writer, which kept retrying a failing journal, then aborted the dispatcher while its readers kept delivering and saving cursors on their own. Stepping down now gives the writer up to 5 s to journal what it was handed, then cancels the writer, the dispatcher and every reader, dropping any delivery in flight; records still unwritten are counted in agent_gateway_audit_records_lost_total with reason aborted. No cursor is saved afterwards, and the journal lock is released only once every job has stopped. Waiting to take over the journal and retrying a failed sink rebuild also end on stepping down. A writer stuck inside a disk write keeps the lock and an error is logged; the node must then be rebooted.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Forward audit records with current settings after becoming Active
+      description: A node promoted to Active kept the dashboard settings it loaded at boot and its cached integrations, so it could keep the VP Audit Log selection or send to an integration as configured before the other node changed them. On becoming Active the node now re-reads the settings from disk and empties its integration cache before the audit pipeline starts, so the sinks and every delivery follow what is stored now. The node still admits traffic after one start attempt and keeps retrying a refused start in the background.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Count only Governance Audit integrations that receive events on the Audit Log
+      description: The Audit Log's "Forwarding to N integrations" counted every active appliance-wide Governance Audit integration, including ones that select no events and so receive nothing. It now counts only those that select at least one event, and shows a warning naming how many select none. With VP Auditing off it no longer adds "(VP Auditing off)" or says nothing is forwarded; its tooltip says the VP Audit Log keeps nothing while integrations still receive the events selected for them.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Describe how Governance Audit integrations receive audit records
+      description: The Audit Log's About panel said every entry is sent to Governance Audit integrations and that forwarding is best-effort. It now says the log keeps the events selected under Settings › Security › VP Audit while VP Auditing is enabled, that each integration receives the events selected for it independently of the log, and that delivery is at least once, so receivers deduplicate on event_id. The Governance Audit card on the integration pages, which said records are skipped only past the backlog cap, now also says that disabling an integration pauses it and lets go of what it has not received, and that once re-enabled it receives only new records.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Stop the BDD Gherkin linter rejecting valid Cucumber Expressions
+      description: scripts/bdd-gherkin.py only understood parameters in Cucumber Expressions, so valid bindings using optional text such as request(s) or an escaped slash were reported as unused and their steps as unmatched, failing the BDD Gherkin lint. It now understands escapes, optional text, alternation and the int, float, word and string parameter types as cucumber-rs does, and reports a binding whose expression cannot be parsed, or whose regex does not compile, with the reason.
+  removed:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Remove the unused Pre-Authorize Blocked governance audit event
+      description: The audit.pre_authorize_blocked event type is no longer offered for Governance Audit integrations, and the Audit page no longer has a label for it. Nothing in the gateway ever recorded this event, so no audit records are affected.
+  security:
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Deny Fabric requests to a surface with OPA enabled but no compiled policy
+      description: A Fabric request to a surface that has OPA enabled but no compiled policy is now denied, as the direct path already did; it was let through. Request-path tests of the Fabric surface-policy gate cover it.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Enforce the appliance-wide surface policy on every Fabric request
+      description: The appliance-wide surface policy now runs on every Fabric request; it ran only when the surface had its own compiled policy. Request-path tests of the Fabric surface-policy gate cover it.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Stop returning OPA engine error text to callers
+      description: When a policy cannot decide, callers get the generic denial and the OPA engine's error detail stays in the gateway log; the error text was returned to the caller.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Make the governance audit journal readable by its owner only
+      description: The audit journal holds caller identities, trace ids and delegation and payment details. Its directory is now created owner-only (0700) and its segments, lock file and cursors.json are 0600; they were created with the process umask.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Update rustls to 0.23.46
+      description: rustls 0.23.45 had four advisories, RUSTSEC-2026-0346 (Debug output of client session values exposed TLS secrets), RUSTSEC-2026-0347 (buffered data sent to the outer server after an ECH rejection), RUSTSEC-2026-0348 (Brotli certificate decompression could allocate up to 1 GiB before authentication) and RUSTSEC-2026-0349 (an unauthenticated ServerHello could downgrade later connections to classical key exchange). The gateway now uses 0.23.46, which fixes all four.
+  breaking:
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: ⭐ Record only the audit events each destination selects
+      description: The VP Audit Log and each Governance Audit integration now record only the audit events selected for them, and nothing is selected by default. After upgrade, the VP Audit Log keeps policy decisions, trust checks and VP injections only if they were enabled before; credential delegation, payment and trace-termination records, which were always written, stop until selected in Settings › VP Audit. Existing Governance Audit integrations receive nothing until events are listed in their audit_events.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Deliver governance audit records at least once from a durable journal
+      description: Audit records are journalled to disk before any destination receives them, and each destination reads the journal from its own position, so a slow or unreachable integration falls behind instead of losing records, and delivery resumes after a restart. A record may be delivered more than once; deduplicate on event_id. Integrations no longer depend on the VP Audit Log keeping a record. The journal lives in the audit log directory under journal/, and a crash loses at most the last batch not yet synced to disk. While the journal cannot be written up to 10,000 records wait in memory; beyond that the oldest are discarded and counted in agent_gateway_audit_records_lost_total with reason journal_write. The journal size is reported in agent_gateway_audit_journal_bytes and logged as a warning above 256 MiB; above 1 GiB the destinations still holding back its oldest part are moved past it, and what each skips is counted in agent_gateway_audit_sink_skipped_total with reason backlog_cap. The VP Audit Log never writes the same record twice. A record no destination selects is not built at all, so unselected events cost nothing, including the signed VP a consent-granted record may carry.
+    - timestamp: '2026-10-12T00:00:00.000Z'
+      title: Store VP Audit selections as audit_events instead of audit_categories
+      description: The settings API takes and returns audit_events, a list of event names such as policy_decision, and rejects names that are not audit events. A request that still sends audit_categories gets 200 and the field is ignored; send audit_events instead. Settings stored with audit_categories are read as the matching events (policies as policy_decision, trust_checks as trust_check, identity as vp_injected), so existing selections are kept.
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Remove the dropped result from agent_gateway_audit_forward_total
+      description: Records are no longer dropped from a full forwarding queue, so agent_gateway_audit_forward_total no longer reports result dropped, and integration_id is never empty. Alert rules on result dropped never fire; alert on agent_gateway_audit_sink_skipped_total and agent_gateway_audit_records_lost_total instead.

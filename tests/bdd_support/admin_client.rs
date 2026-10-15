@@ -10,6 +10,46 @@ use serde_json::Value;
 use crate::bdd_support::gateway_process::G2G_TEST_AUTH_TOKEN;
 use crate::bdd_support::http::collect_headers;
 
+/// The shipped gateway configuration. Its Governance Audit integration category
+/// lists every audit event as `audit.<event>`, and a product test keeps that
+/// list equal to the audit event catalog.
+const SHIPPED_GATEWAY_CONFIG: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config/examples/gateway.example.json"));
+
+/// Every audit event a gateway can record, read from the shipped audit catalog.
+pub fn every_audit_event() -> Vec<String> {
+    let config: Value = serde_json::from_str(SHIPPED_GATEWAY_CONFIG).expect("shipped gateway config is JSON");
+    let categories = config["integration"]["categories"]
+        .as_array()
+        .expect("shipped gateway config lists integration categories");
+    let audit = categories
+        .iter()
+        .find(|category| category["enum_value"] == "audit")
+        .expect("shipped gateway config offers the Governance Audit category");
+    let events: Vec<String> = audit["metadata"]["event_types"]
+        .as_array()
+        .expect("the Governance Audit category lists its event types")
+        .iter()
+        .map(|event| {
+            event["event_type"]
+                .as_str()
+                .and_then(|event_type| event_type.strip_prefix("audit."))
+                .expect("audit event types are named audit.<event>")
+                .to_string()
+        })
+        .collect();
+    assert!(!events.is_empty(), "the shipped audit catalog lists no events");
+    events
+}
+
+/// Settings that turn the VP Audit Log on and keep every audit event.
+pub fn audit_log_keeping_every_event() -> Value {
+    serde_json::json!({
+        "audit_enabled": true,
+        "audit_events": every_audit_event(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordedResponse {
     pub status: u16,
@@ -138,6 +178,53 @@ impl AdminApiClient {
 
         serde_json::from_str(&response_body)
             .with_context(|| format!("failed to decode JSON response from {url}: {response_body}"))
+    }
+
+    /// Turn the VP Audit Log on and keep every audit event on a running gateway.
+    pub async fn enable_every_audit_event(&self) -> Result<()> {
+        let response = self
+            .send_recorded_json(Method::POST, "/v1/settings", Some(&audit_log_keeping_every_event()))
+            .await?;
+        if !(200..300).contains(&response.status) {
+            bail!("keeping every audit event failed with status {}: {}", response.status, response.body);
+        }
+        Ok(())
+    }
+
+    /// The most recent VP Audit Log records (`GET /v1/audit?limit=200`), newest first.
+    pub async fn read_audit_events(&self) -> Result<Vec<Value>> {
+        let response = self
+            .send_recorded_json::<Value>(Method::GET, "/v1/audit?limit=200", None)
+            .await?;
+        if !(200..300).contains(&response.status) {
+            bail!("reading the VP Audit Log failed with status {}: {}", response.status, response.body);
+        }
+        Ok(response
+            .body
+            .get("events")
+            .and_then(|events| events.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Reads the VP Audit Log until a record satisfies `matches`, for up to
+    /// five seconds, since records reach the log shortly after the request that
+    /// produced them. Returns whether one matched and the events last read.
+    pub async fn wait_for_audit_event(
+        &self,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Result<(bool, Vec<Value>)> {
+        let mut events = Vec::new();
+        for _ in 0..50 {
+            events = self
+                .read_audit_events()
+                .await?;
+            if events.iter().any(&matches) {
+                return Ok((true, events));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok((false, events))
     }
 
     pub async fn send_recorded_json<B>(
@@ -504,30 +591,6 @@ impl GatewayAdminClient {
             .await
     }
 
-    /// Enable the audit log and the `trust_checks` category on this gateway so
-    /// per-element Trust Check outcomes are written to `/v1/audit`. Idempotent.
-    pub async fn enable_trust_check_audit(&self) -> Result<()> {
-        let response = self
-            .client
-            .send_recorded_json(
-                Method::POST,
-                "/v1/settings",
-                Some(&serde_json::json!({
-                    "audit_enabled": true,
-                    "audit_categories": {
-                        "policies": true,
-                        "trust_checks": true,
-                        "identity": true
-                    }
-                })),
-            )
-            .await?;
-        if !(200..300).contains(&response.status) {
-            bail!("enable trust-check audit failed with status {}: {}", response.status, response.body);
-        }
-        Ok(())
-    }
-
     /// Set system feature flags (`POST /v1/settings`), keeping the flags already
     /// set. The settings API replaces the whole map, so the current flags are
     /// read first; `terms` is left out because the API reports it from the
@@ -566,19 +629,26 @@ impl GatewayAdminClient {
     /// Read the most recent audit events (`GET /v1/audit?limit=200`), returning
     /// the raw `events` array (newest first).
     pub async fn read_audit_events(&self) -> Result<Vec<Value>> {
-        let response = self
-            .client
-            .send_recorded_json::<Value>(Method::GET, "/v1/audit?limit=200", None)
-            .await?;
-        if !(200..300).contains(&response.status) {
-            bail!("read audit events failed with status {}: {}", response.status, response.body);
-        }
-        Ok(response
-            .body
-            .get("events")
-            .and_then(|events| events.as_array())
-            .cloned()
-            .unwrap_or_default())
+        self.client
+            .read_audit_events()
+            .await
+    }
+
+    /// Turn the VP Audit Log on and keep every audit event on this gateway.
+    pub async fn enable_every_audit_event(&self) -> Result<()> {
+        self.client
+            .enable_every_audit_event()
+            .await
+    }
+
+    /// See [`AdminApiClient::wait_for_audit_event`].
+    pub async fn wait_for_audit_event(
+        &self,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Result<(bool, Vec<Value>)> {
+        self.client
+            .wait_for_audit_event(matches)
+            .await
     }
 
     pub async fn create_mediator(

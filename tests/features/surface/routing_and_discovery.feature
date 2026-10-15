@@ -42,10 +42,12 @@ Feature: Surface routing, variants, and discovery
 
   Scenario: A disabled surface variant alias is rejected before forwarding
     Given A2A surface "alpha" exists for route "/example" with managed agent "bravo" and a disabled dev variant
+    And the VP Audit Log keeps every audit event
     When the caller sends a request to the surface path "/example$dev/foo"
     Then the response status is 503
     And the response reports that variant "dev" is disabled
     And managed agent "bravo" was not called
+    And the VP Audit Log records a request refusal for "a disabled surface variant"
 
   Scenario: The DID document only publishes active discoverable surfaces
     Given surfaces targeting managed agent "bravo" exist with different DID document publication settings

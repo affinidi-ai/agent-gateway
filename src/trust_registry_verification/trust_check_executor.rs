@@ -405,6 +405,38 @@ fn resolved_failure(
 /// every error path. `query_resolved` is set to `false` since template
 /// substitution either failed or was never attempted by the time this
 /// function is reached.
+/// Fails every target-leg element with `code` when the target cannot be
+/// checked at all (e.g. its agent card is unavailable), recording each one
+/// like an executed check. The two "unavailable" codes omit `authority_id` /
+/// `entity_id`, whose raw template strings would be noise.
+pub fn synthesize_unavailable_target(
+    surface_id: &str,
+    elements: &[TrustCheckElement],
+    code: &'static str,
+    detail: &'static str,
+) -> Vec<TrustCheckResult> {
+    elements
+        .iter()
+        .map(|elem| {
+            record_trust_check(TrustCheckAuditEvent {
+                surface_id,
+                leg: TrustCheckLeg::Target,
+                element_id: &elem.id,
+                element_name: elem.name.as_deref(),
+                authority_id: None,
+                entity_id: None,
+                trust_registry_id: &elem.trust_registry_id,
+                query_type: elem.query_type,
+                ok: false,
+                error_code: Some(code),
+                error_detail: Some(detail),
+                latency_ms: 0,
+            });
+            synthesize_failure(elem, code, detail.to_string())
+        })
+        .collect()
+}
+
 pub fn synthesize_failure(
     elem: &TrustCheckElement,
     code: &'static str,
@@ -943,6 +975,41 @@ mod tests {
         );
         assert_eq!(results[0].action, "invoke");
         assert_eq!(results[0].resource, "tool:payments.transfer");
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_target_fails_and_records_every_element() {
+        let elements = [elem_with_action_resource("e1", "tr-a"), elem_with_action_resource("e2", "tr-b")];
+        let (results, events) = crate::audit::producer::capture(async {
+            synthesize_unavailable_target("surface-9", &elements, AGENT_CARD_UNAVAILABLE, "card unavailable")
+        })
+        .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|result| !result.ok)
+        );
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event.surface_id.as_deref(), Some("surface-9"));
+            match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::TrustCheck {
+                    leg,
+                    ok,
+                    error_code,
+                    authority_id,
+                    ..
+                } => {
+                    assert_eq!(leg, "target");
+                    assert!(!ok);
+                    assert_eq!(error_code.as_deref(), Some(AGENT_CARD_UNAVAILABLE));
+                    assert!(authority_id.is_none());
+                }
+                other => panic!("expected a trust check, got {other:?}"),
+            }
+        }
     }
 
     #[test]

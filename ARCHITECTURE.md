@@ -387,7 +387,8 @@ from.
 | [`agents_api/`](src/agents_api/) | Agent self-registration: `/agents-api/v1/onboard` mints a DID from identity fields, with `sign-jwt` and `verify-jwt` | Source only: [`src/agents_api/handlers/onboard.rs`](src/agents_api/handlers/onboard.rs). The onboarding capture endpoint is in `identity/`; see [`AGENT_ONBOARDING_CAPTURE.md`](docs/AGENT_ONBOARDING_CAPTURE.md). |
 | [`terms/`](src/terms/) | Terms versions, acceptance records, consent gating | [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md) |
 | [`credential_providers/`](src/credential_providers/) | OAuth credential provider records | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
-| [`delegation_vault/`](src/delegation_vault/) | Per-caller OAuth tokens, the consent flow, and the audit log. Tokens are encrypted only when encryption at rest is enabled. | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
+| [`delegation_vault/`](src/delegation_vault/) | Per-caller OAuth tokens, the consent flow, and the shape of governance audit records. Tokens are encrypted only when encryption at rest is enabled. | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
+| [`audit/`](src/audit/) | Governance audit pipeline: event catalog, per-sink selection, producer, durable journal, and per-sink delivery to the VP Audit Log and Governance Audit integrations | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md#governance-audit-forwarding) |
 | [`integrations/`](src/integrations/) | Webhooks, notifications, and outbound integrations | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md) |
 | [`secrets/`](src/secrets/) | Secret records and the loader schemes | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#secret-references) |
 

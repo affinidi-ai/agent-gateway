@@ -47,7 +47,7 @@ pub async fn invalidate_integration_cache(integration_id: &str) {
         .invalidate(integration_id)
         .await;
     crate::integrations::stream_publishers::invalidate_kafka_producer(integration_id).await;
-    crate::integrations::audit_integration_triggers::invalidate_subscribers();
+    crate::audit::sources::rebuild_sinks().await;
 }
 
 /// Clear all cached integrations
