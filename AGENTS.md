@@ -2,8 +2,9 @@
 
 This file is the canonical source of truth for project rules, architecture, and
 workflow — for both human contributors and AI agents. Agent tools that support the
-`AGENTS.md` convention (including Claude Code) read it automatically; there is no
-separate per-tool instruction file. [`CONTEXT.md`](CONTEXT.md) is the terminology
+`AGENTS.md` convention read it automatically. Claude Code reads [`CLAUDE.md`](CLAUDE.md)
+instead when both exist, so `CLAUDE.md` imports this file; keep rules, architecture and
+commands here. [`CONTEXT.md`](CONTEXT.md) is the terminology
 glossary, and [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the contribution workflow
 (local checks, tests, and changelog fragments). Source setup and development workflows live in
 [`docs/development/GETTING_STARTED.md`](docs/development/GETTING_STARTED.md) and
