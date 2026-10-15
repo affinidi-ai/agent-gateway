@@ -38,6 +38,15 @@ describe('AuditIntegrationCard', () => {
     expect(delivery).toHaveTextContent('agent_gateway_audit_sink_skipped_total');
   });
 
+  it('explains that pausing lets go of undelivered records and resuming sends only new ones', () => {
+    render(<AuditIntegrationCard type="stream" onUseTemplate={jest.fn()} />);
+
+    const delivery = screen.getByTestId('integration-audit-delivery-note');
+    expect(delivery).toHaveTextContent('Disabling the integration pauses it');
+    expect(delivery).toHaveTextContent('lets go of the records it has not received');
+    expect(delivery).toHaveTextContent('once re-enabled it receives only new records');
+  });
+
   it('warns that caller data and the signed VP leave the appliance', () => {
     render(<AuditIntegrationCard type="stream" onUseTemplate={jest.fn()} />);
 

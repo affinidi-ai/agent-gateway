@@ -2603,6 +2603,8 @@ fn fabric_surface_policies(
 /// then evaluates surface-level OPA policies. Returns the (potentially modified)
 /// body bytes on allow, or a deny `ProcessingResult`.
 async fn enrich_and_evaluate_surface_policies(
+    appliance_policy: Option<&crate::policies::GlobalPolicyManager>,
+    surface_policy: Option<&crate::policies::SurfacePolicyManager>,
     surface: &crate::config::agent_surface::AgentSurface,
     channel_id: &str,
     config_id: &str,
@@ -2898,12 +2900,8 @@ async fn enrich_and_evaluate_surface_policies(
     let policies = fabric_surface_policies(
         surface.opa_enabled(),
         is_agent_card_request,
-        GLOBAL_APPLIANCE_POLICY_MANAGER
-            .get()
-            .is_some_and(|pm| pm.has_global(crate::policies::global_policy::PLANE_AGENT_SURFACE)),
-        GLOBAL_POLICY_MANAGER
-            .get()
-            .map(Arc::as_ref),
+        appliance_policy.is_some_and(|pm| pm.has_global(crate::policies::global_policy::PLANE_AGENT_SURFACE)),
+        surface_policy,
         config_id,
         variant_alias,
     );
@@ -3070,7 +3068,7 @@ async fn enrich_and_evaluate_surface_policies(
                         vp_jwt: &vp_jwt,
                         trace_id: trace_id.as_deref(),
                         detail: "request_path_fabric_received".to_string(),
-                        caller: None,
+                        caller: crate::delegation_vault::audit::binding_caller_context(binding),
                         via_fabric: true,
                     },
                 ));
@@ -3137,7 +3135,7 @@ async fn enrich_and_evaluate_surface_policies(
         // of the per-surface policy, evaluated on every fabric request
         // regardless of the surface's own OPA configuration.
         if policies.global
-            && let Some(global_pm) = GLOBAL_APPLIANCE_POLICY_MANAGER.get()
+            && let Some(global_pm) = appliance_policy
         {
             let gd = global_pm.evaluate_global(crate::policies::global_policy::PLANE_AGENT_SURFACE, &input_value);
             let global_policy_name = gd.policy_name.as_deref();
@@ -3190,7 +3188,7 @@ async fn enrich_and_evaluate_surface_policies(
         }
 
         if policies.surface == Some(Ok(()))
-            && let Some(policy_manager) = GLOBAL_POLICY_MANAGER.get()
+            && let Some(policy_manager) = surface_policy
         {
             let channel_opa_def_id = surface.opa_policy_definition_id();
             let (channel_opa_name, channel_opa_version, channel_opa_hash) = policy_manager
@@ -3523,23 +3521,26 @@ fn build_surface_policy_denied_forward_body(
 /// claim another peer's DID.
 async fn active_sender_peer(message: &ReceivedMessage) -> Option<crate::gateways::types::Gateway> {
     let from_did = message.from_did.as_deref()?;
-    let Some(storage_root) = storage_root_from_context(message) else {
-        warn!("Refusing {} from {}: storage path not found in message context", message.message_type, from_did);
-        return None;
-    };
-    match crate::gateways::FileSystemGatewayStore::new(storage_root.join("gateways"), None).await {
-        Ok(store) => match store
-            .get_by_did(from_did)
+    match message_gateway_store(message).await {
+        Ok(store) => store
+            .get_active_by_did(from_did)
             .await
-        {
-            Ok(Some(gateway)) if gateway.status == crate::gateways::types::GatewayStatus::Active => Some(gateway),
-            _ => None,
-        },
+            .ok()
+            .flatten(),
         Err(e) => {
-            warn!("Refusing {} from {}: gateway store unavailable: {}", message.message_type, from_did, e);
+            warn!("Refusing {} from {}: {}", message.message_type, from_did, e);
             None
         }
     }
+}
+
+/// The gateway store under the message's storage root.
+async fn message_gateway_store(message: &ReceivedMessage) -> Result<crate::gateways::FileSystemGatewayStore, String> {
+    let storage_root =
+        storage_root_from_context(message).ok_or_else(|| "storage path not found in message context".to_string())?;
+    crate::gateways::FileSystemGatewayStore::new(storage_root.join("gateways"), None)
+        .await
+        .map_err(|e| format!("gateway store unavailable: {e}"))
 }
 
 /// Whether a Fabric peer may reach a surface. A tenant-owned peer reaches only
@@ -3579,21 +3580,20 @@ async fn authorize_fabric_sender(
             .get_by_did(from_did)
             .await
     } else {
-        let Some(storage_root) = storage_root_from_context(message) else {
-            warn!("Refusing forward-request from {}: storage path not found in message context", from_did);
-            return Err(refuse(UNREGISTERED));
-        };
-        match crate::gateways::FileSystemGatewayStore::new(storage_root.join("gateways"), None).await {
+        match message_gateway_store(message).await {
             Ok(store) => {
                 store
                     .get_by_did(from_did)
                     .await
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                warn!("Refusing forward-request from {}: {}", from_did, e);
+                return Err(refuse(UNREGISTERED));
+            }
         }
     };
     match lookup {
-        Ok(Some(gateway)) if gateway.status == crate::gateways::types::GatewayStatus::Active => {
+        Ok(Some(gateway)) if gateway.is_active() => {
             if !gateway.exposes_surface(channel_id) {
                 warn!(
                     "Refusing forward-request from gateway {} ({}): channel {} is not exposed to it",
@@ -4465,10 +4465,7 @@ async fn process_forward_request_with_mcp_runtime(
                 return axum_response_to_forward_result(error.into_response(&body_bytes, axum::http::StatusCode::BAD_REQUEST)).await;
             }
         };
-        if let Some(capped) = http_policy.cap_legacy_initialize(&body_bytes, &classification) {
-            channel_info!(config_id, "Forwarding MCP initialize with protocolVersion {} in place of unsupported {}", capped.offered, capped.requested);
-            body_bytes = capped.body;
-        }
+        body_bytes = http_policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
         mcp_verified_binding = match crate::protocols::extensions::verify_mcp_metadata_identity(
             &body_bytes, GLOBAL_VC_ISSUER.get(), &audit_facts, Some(&peer_issuers),
         ).await {
@@ -4742,6 +4739,12 @@ async fn process_forward_request_with_mcp_runtime(
     }
 
     let mut body_bytes = match Box::pin(enrich_and_evaluate_surface_policies(
+        GLOBAL_APPLIANCE_POLICY_MANAGER
+            .get()
+            .map(Arc::as_ref),
+        GLOBAL_POLICY_MANAGER
+            .get()
+            .map(Arc::as_ref),
         &surface,
         channel_id,
         config_id,
@@ -9523,6 +9526,172 @@ mod tests {
         assert_eq!(fabric_surface_policies(true, true, false, None, "surf-1", None).surface, None);
     }
 
+    const GATED_BODY: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"message/send"}"#;
+
+    fn gated_surface(surface_opa: bool) -> crate::config::agent_surface::AgentSurface {
+        let mut target = serde_json::json!({"endpoint": "a2a-proxy://gated"});
+        if surface_opa {
+            target["policy"] = serde_json::json!({"policy_definition_id": "gated-policy"});
+        }
+        serde_json::from_value(serde_json::json!({
+            "surface_id": "gated", "name": "gated",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/gated", "protocol": "a2a"},
+            "target": target
+        }))
+        .unwrap()
+    }
+
+    async fn appliance_surface_policy(rego: &str) -> crate::policies::GlobalPolicyManager {
+        use crate::policies::global_policy::tests::{gw_def, store_with};
+        use crate::policies::global_policy::{GlobalAssignment, GlobalPolicyAssignments, PLANE_AGENT_SURFACE};
+        let manager = crate::policies::GlobalPolicyManager::new();
+        manager.set_policy_definition_store(
+            store_with(vec![crate::policies::policy_definitions::PolicyDefinition {
+                policy_type: crate::policies::policy_definitions::PolicyType::AgentSurface,
+                ..gw_def("appliance-surface", rego)
+            }])
+            .await,
+        );
+        let mut assignments = GlobalPolicyAssignments::default();
+        assignments
+            .assignments
+            .insert(
+                PLANE_AGENT_SURFACE.to_string(),
+                vec![GlobalAssignment {
+                    policy_id: "appliance-surface".to_string(),
+                    monitor_only: false,
+                }],
+            );
+        manager
+            .refresh(&assignments)
+            .await;
+        manager
+    }
+
+    /// Drive the Fabric surface-policy gate and return its result with the
+    /// policy decisions it recorded.
+    async fn gate_fabric_request(
+        surface: &crate::config::agent_surface::AgentSurface,
+        appliance_policy: Option<&crate::policies::GlobalPolicyManager>,
+        surface_policy: Option<&crate::policies::SurfacePolicyManager>,
+    ) -> (Result<bytes::Bytes, ProcessingResult>, Vec<crate::delegation_vault::audit::DelegationAuditAction>) {
+        let peer_issuers = crate::gateways::types::PeerIssuers {
+            attested: None,
+            trusted: Vec::new(),
+        };
+        let (result, events) = crate::audit::producer::capture(Box::pin(enrich_and_evaluate_surface_policies(
+            appliance_policy,
+            surface_policy,
+            surface,
+            "gated",
+            "gated",
+            "POST",
+            "/rpc",
+            bytes::Bytes::from_static(GATED_BODY),
+            None,
+            Some("did:web:peer.example".into()),
+            None,
+            None,
+            crate::surface_context::IdentityVerification::Unverified,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &peer_issuers,
+            None,
+        )))
+        .await;
+        let decisions = events
+            .into_iter()
+            .map(|event| event.event)
+            .filter(|event| {
+                matches!(event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
+            })
+            .collect();
+        (result, decisions)
+    }
+
+    fn denied_status(result: &Result<bytes::Bytes, ProcessingResult>) -> serde_json::Value {
+        match result {
+            Err(ProcessingResult::RequiresResponse { response_body, .. }) => response_body["status"].clone(),
+            other => panic!("expected a deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fabric_gate_denies_a_surface_whose_opa_policy_is_not_compiled() {
+        let surface_policy = crate::policies::SurfacePolicyManager::new();
+        let (result, decisions) = gate_fabric_request(&gated_surface(true), None, Some(&surface_policy)).await;
+
+        assert_eq!(denied_status(&result), 403);
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        match &decisions[0] {
+            crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                scope,
+                flow,
+                decision,
+                deny_reason,
+                surface_id,
+                policy_definition_id,
+                ..
+            } => {
+                assert_eq!(scope, "surface");
+                assert_eq!(flow, "fabric");
+                assert_eq!(decision, "error");
+                assert_eq!(deny_reason.as_deref(), Some("policy_not_compiled"));
+                assert_eq!(surface_id.as_deref(), Some("gated"));
+                assert_eq!(policy_definition_id.as_deref(), Some("gated-policy"));
+            }
+            other => panic!("expected a policy decision, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fabric_gate_applies_the_appliance_wide_policy_to_a_surface_without_opa() {
+        let appliance_policy = appliance_surface_policy("package surface.policy\ndefault allow = false").await;
+        let surface_policy = crate::policies::SurfacePolicyManager::new();
+        let (result, decisions) =
+            gate_fabric_request(&gated_surface(false), Some(&appliance_policy), Some(&surface_policy)).await;
+
+        assert_eq!(denied_status(&result), 403);
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        match &decisions[0] {
+            crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                scope,
+                flow,
+                decision,
+                deny_reason,
+                surface_id,
+                policy_definition_id,
+                ..
+            } => {
+                assert_eq!(scope, "surface");
+                assert_eq!(flow, "fabric");
+                assert_eq!(decision, "deny");
+                assert_eq!(deny_reason.as_deref(), Some("Blocked by appliance-wide policy"));
+                assert_eq!(surface_id.as_deref(), Some("gated"));
+                assert_eq!(policy_definition_id.as_deref(), Some("appliance-surface"));
+            }
+            other => panic!("expected a policy decision, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fabric_gate_allows_when_no_surface_policy_applies() {
+        let appliance_policy = crate::policies::GlobalPolicyManager::new();
+        let surface_policy = crate::policies::SurfacePolicyManager::new();
+        let (result, decisions) =
+            gate_fabric_request(&gated_surface(false), Some(&appliance_policy), Some(&surface_policy)).await;
+
+        match result {
+            Ok(body) => assert_eq!(body.as_ref(), GATED_BODY),
+            Err(other) => panic!("expected the request to pass the gate, got {other:?}"),
+        }
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
     #[tokio::test]
     async fn fabric_mcp_tool_policy_error_records_the_reason_it_could_not_decide() {
         let (result, decisions) = collect_policy_decisions(|| {
@@ -9590,8 +9759,9 @@ mod tests {
 
     #[tokio::test]
     async fn fabric_mcp_headers_feed_legacy_only_version_rejection() {
+        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
         let headers = serde_json::json!({
-            "MCP-PROTOCOL-VERSION": "2026-07-28",
+            "MCP-PROTOCOL-VERSION": MCP_MODERN_VERSION,
             "MCP-METHOD": "tools/list"
         });
         let body = serde_json::to_vec(&serde_json::json!({
@@ -9600,7 +9770,7 @@ mod tests {
             "method": "tools/list",
             "params": {
                 "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/protocolVersion": MCP_MODERN_VERSION,
                     "io.modelcontextprotocol/clientCapabilities": {}
                 }
             }
@@ -9622,8 +9792,8 @@ mod tests {
         assert_eq!(
             error.data,
             Some(serde_json::json!({
-                "requested": "2026-07-28",
-                "supported": ["2024-11-05"]
+                "requested": MCP_MODERN_VERSION,
+                "supported": [MCP_LEGACY_VERSION]
             }))
         );
 

@@ -65,6 +65,9 @@ pub struct Sink {
     pub events: EventMask,
     /// Records older than this are skipped for this sink instead of delivered.
     pub drop_older_than: Option<Duration>,
+    /// A record this sink has failed to accept this many times is skipped
+    /// instead of retried.
+    pub max_attempts: Option<u32>,
 }
 
 impl Sink {
@@ -76,6 +79,7 @@ impl Sink {
             id,
             events,
             drop_older_than: None,
+            max_attempts: None,
         }
     }
 
@@ -86,15 +90,26 @@ impl Sink {
         self.drop_older_than = age;
         self
     }
+
+    pub fn giving_up_after(
+        mut self,
+        attempts: Option<u32>,
+    ) -> Self {
+        self.max_attempts = attempts;
+        self
+    }
 }
 
-/// The sinks that selected each event, and the union of every selection.
+/// The sinks that selected each event, the union of every selection, and the
+/// paused integrations.
 #[derive(Debug, Default)]
 pub struct SinkRegistry {
     union: EventMask,
     index: Vec<Vec<SinkId>>,
     ids: Vec<SinkId>,
     drop_older_than: HashMap<SinkId, Duration>,
+    max_attempts: HashMap<SinkId, u32>,
+    paused: Vec<SinkId>,
 }
 
 impl SinkRegistry {
@@ -103,10 +118,14 @@ impl SinkRegistry {
         let mut union = 0;
         let mut ids = Vec::with_capacity(sinks.len());
         let mut drop_older_than = HashMap::new();
+        let mut max_attempts = HashMap::new();
         for sink in sinks {
             union |= sink.events.0;
             if let Some(age) = sink.drop_older_than {
                 drop_older_than.insert(sink.id.clone(), age);
+            }
+            if let Some(attempts) = sink.max_attempts {
+                max_attempts.insert(sink.id.clone(), attempts);
             }
             for (bit, recipients) in (0..).zip(index.iter_mut()) {
                 if sink.events.contains(bit) {
@@ -120,6 +139,8 @@ impl SinkRegistry {
             index,
             ids,
             drop_older_than,
+            max_attempts,
+            paused: Vec::new(),
         }
     }
 
@@ -128,11 +149,27 @@ impl SinkRegistry {
         &self.ids
     }
 
+    /// Integrations that exist but do not receive audit records. They are not
+    /// sinks; the dispatcher keeps their parked cursors so they resume from
+    /// their pause, and drops the parked cursors of every other integration.
+    pub fn paused(&self) -> &[SinkId] {
+        &self.paused
+    }
+
     pub fn drop_older_than(
         &self,
         sink: &SinkId,
     ) -> Option<Duration> {
         self.drop_older_than
+            .get(sink)
+            .copied()
+    }
+
+    pub fn max_attempts(
+        &self,
+        sink: &SinkId,
+    ) -> Option<u32> {
+        self.max_attempts
             .get(sink)
             .copied()
     }
@@ -183,11 +220,17 @@ impl Default for Sinks {
 }
 
 impl Sinks {
+    /// Replaces the sinks, and the paused integrations (see
+    /// [`SinkRegistry::paused`]).
     pub fn replace(
         &self,
         sinks: Vec<Sink>,
+        paused: Vec<SinkId>,
     ) {
-        let registry = Arc::new(SinkRegistry::new(sinks));
+        let registry = Arc::new(SinkRegistry {
+            paused,
+            ..SinkRegistry::new(sinks)
+        });
         let union = registry.union.0;
         *self.registry.write() = registry;
         self.union
@@ -242,6 +285,17 @@ mod tests {
         assert_eq!(registry.drop_older_than(&SinkId::AuditLog), None);
         assert_eq!(registry.drop_older_than(&integration("slack")), Some(hour));
         assert_eq!(registry.drop_older_than(&integration("gone")), None);
+    }
+
+    #[test]
+    fn registry_keeps_each_sinks_attempt_limit() {
+        let registry = SinkRegistry::new(vec![
+            sink(SinkId::AuditLog, &[]),
+            sink(integration("slack"), &["auth_failed"]).giving_up_after(Some(10)),
+        ]);
+        assert_eq!(registry.max_attempts(&SinkId::AuditLog), None);
+        assert_eq!(registry.max_attempts(&integration("slack")), Some(10));
+        assert_eq!(registry.max_attempts(&integration("gone")), None);
     }
 
     fn integration(id: &str) -> SinkId {
@@ -334,7 +388,7 @@ mod tests {
         let sinks = Sinks::default();
         assert!(!sinks.wants(bit("auth_failed")));
 
-        sinks.replace(vec![sink(integration("siem"), &["auth_failed"])]);
+        sinks.replace(vec![sink(integration("siem"), &["auth_failed"])], Vec::new());
         assert!(sinks.wants(bit("auth_failed")));
         assert_eq!(
             sinks
@@ -343,7 +397,7 @@ mod tests {
             &[integration("siem")]
         );
 
-        sinks.replace(vec![sink(SinkId::AuditLog, &["trust_check"])]);
+        sinks.replace(vec![sink(SinkId::AuditLog, &["trust_check"])], Vec::new());
         assert!(!sinks.wants(bit("auth_failed")));
         assert!(sinks.wants(bit("trust_check")));
     }
@@ -356,24 +410,44 @@ mod tests {
     }
 
     #[test]
+    fn a_registry_keeps_the_paused_integrations_apart_from_its_sinks() {
+        let sinks = Sinks::default();
+        assert!(
+            sinks
+                .snapshot()
+                .paused()
+                .is_empty()
+        );
+
+        sinks.replace(
+            vec![sink(SinkId::AuditLog, &[]), sink(integration("siem"), &["auth_failed"])],
+            vec![integration("disabled")],
+        );
+        let registry = sinks.snapshot();
+        assert_eq!(registry.ids(), &[SinkId::AuditLog, integration("siem")]);
+        assert_eq!(registry.paused(), &[integration("disabled")]);
+        assert_eq!(registry.recipients(bit("auth_failed")), &[integration("siem")]);
+    }
+
+    #[test]
     fn replacing_the_sinks_notifies_subscribers() {
         let sinks = Sinks::default();
         let mut changes = sinks.subscribe();
         assert!(!changes.has_changed().unwrap());
-        sinks.replace(vec![sink(SinkId::AuditLog, &[])]);
+        sinks.replace(vec![sink(SinkId::AuditLog, &[])], Vec::new());
         assert!(changes.has_changed().unwrap());
         changes.mark_unchanged();
-        sinks.replace(Vec::new());
+        sinks.replace(Vec::new(), Vec::new());
         assert!(changes.has_changed().unwrap());
     }
 
     #[test]
     fn a_snapshot_is_unchanged_by_a_later_replace() {
         let sinks = Sinks::default();
-        sinks.replace(vec![sink(integration("siem"), &["auth_failed"])]);
+        sinks.replace(vec![sink(integration("siem"), &["auth_failed"])], Vec::new());
         let before = sinks.snapshot();
 
-        sinks.replace(Vec::new());
+        sinks.replace(Vec::new(), Vec::new());
         assert_eq!(before.recipients(bit("auth_failed")), &[integration("siem")]);
         assert!(
             sinks

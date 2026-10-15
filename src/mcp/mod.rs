@@ -139,7 +139,7 @@ pub fn build_validated_mcp_context(
 #[cfg(test)]
 mod tests {
     use super::request_validation::{
-        LEGACY_ONLY_POLICY, LegacySessionEvidence, McpRequestClassification, McpVersionPolicy, validate_mcp_post,
+        LEGACY_ONLY_POLICY, LegacySessionEvidence, McpRequestClassification, validate_mcp_post,
     };
     use super::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION, build_mcp_context, build_validated_mcp_context};
     use axum::http::HeaderMap;
@@ -187,7 +187,7 @@ mod tests {
             &headers,
             &bytes,
             LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]),
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )
         .unwrap()
     }

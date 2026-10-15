@@ -1744,13 +1744,42 @@ pub async fn run_axum_proxy(
             crate::proxy::server::init_transit_token_issuer(Arc::new(issuer));
         }
 
-        // Initialize delegation vault audit logger
+        // Initialize integration storage. The audit pipeline builds its sinks
+        // from the integrations, so this comes before it starts.
+        let integration_storage: Arc<crate::storage::IntegrationStorage> = {
+            let storage = crate::storage::IntegrationStorage::new(PathBuf::from(
+                &bootstrap_config
+                    .storage_paths
+                    .integrations,
+            ))
+            .await
+            .expect("Failed to initialize integration storage");
+            info!("Notifier storage initialized");
+            let storage_arc = Arc::new(storage);
+
+            // Initialize global integration storage
+            crate::storage::init_integration_storage(storage_arc.clone()).await;
+            info!("✓ Global integration storage initialized");
+            crate::audit::sources::rebuild_sinks().await;
+
+            if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
+                spawn_x402_cleanup_worker(txn_store);
+            }
+
+            // Validate all active integrations
+            crate::integrations::validation::validate_all_integrations(&storage_arc).await;
+
+            storage_arc
+        };
+
+        // Initialize delegation vault audit logger (started only on an Active node)
         crate::delegation_vault::audit::init_audit_logger(
             bootstrap_config
                 .logging
                 .log_directory
                 .as_deref(),
-        );
+        )
+        .await;
 
         let trust_registry_store: Option<Arc<crate::trust_registries::FileSystemTrustRegistryStore>> =
             match crate::trust_registries::FileSystemTrustRegistryStore::new(PathBuf::from(
@@ -2287,32 +2316,6 @@ pub async fn run_axum_proxy(
             info!("✓ GW2 notification store initialized for integration triggers");
         }
 
-        // Initialize integration storage
-        let integration_storage: Arc<crate::storage::IntegrationStorage> = {
-            let storage = crate::storage::IntegrationStorage::new(PathBuf::from(
-                &bootstrap_config
-                    .storage_paths
-                    .integrations,
-            ))
-            .await
-            .expect("Failed to initialize integration storage");
-            info!("Notifier storage initialized");
-            let storage_arc = Arc::new(storage);
-
-            // Initialize global integration storage
-            crate::storage::init_integration_storage(storage_arc.clone()).await;
-            info!("✓ Global integration storage initialized");
-            crate::audit::sources::rebuild_sinks().await;
-
-            if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
-                spawn_x402_cleanup_worker(txn_store);
-            }
-
-            // Validate all active integrations
-            crate::integrations::validation::validate_all_integrations(&storage_arc).await;
-
-            storage_arc
-        };
         identity_state.integration_store = Some(integration_storage.clone());
 
         // Register appliance resource-limit counters now that every entity store
@@ -4045,6 +4048,13 @@ pub async fn run_axum_proxy(
                             // gateway/surface OPA, MCP gating, or global policy.
                             rederive_planes_on_activation(&identity_state_for_mode, &gateway_store_for_mode).await;
 
+                            // Take over the audit journal before admitting traffic,
+                            // continuing from what the previous Active node wrote.
+                            crate::delegation_vault::audit::set_audit_pipeline_mode(
+                                crate::server::mode::ServerMode::Active,
+                            )
+                            .await;
+
                             // Config + policy planes are now fresh: admit direct
                             // traffic (health → 200) without waiting on fabric
                             // listener reconnection below, and replay any surface
@@ -4131,6 +4141,10 @@ pub async fn run_axum_proxy(
                                 }
                             };
                             tokio::join!(g2g_fut, tr_fut);
+                            crate::delegation_vault::audit::set_audit_pipeline_mode(
+                                crate::server::mode::ServerMode::Standby,
+                            )
+                            .await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

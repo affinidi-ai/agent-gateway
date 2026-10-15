@@ -10,10 +10,10 @@ use tokio::time::{Duration, timeout};
 use crate::bdd_support::caller::post_json;
 use crate::bdd_support::http::{collect_headers, parse_json_or_sse_body};
 use crate::bdd_support::json_rpc::{
-    attach_agent_identity_payload, attach_identity_proof, build_a2a_request_body, build_mcp_echo_request_bodies,
-    build_mcp_initialize_body, build_mcp_initialized_notification_body, build_mcp_list_tools_body,
-    build_mcp_request_without_method_body, build_mcp_tool_call_body, build_modern_mcp_list_tools_body,
-    modern_mcp_request_headers,
+    McpVersion, attach_agent_identity_payload, attach_identity_proof, build_a2a_request_body,
+    build_mcp_echo_request_bodies, build_mcp_initialize_body, build_mcp_initialized_notification_body,
+    build_mcp_list_tools_body, build_mcp_request_without_method_body, build_mcp_tool_call_body,
+    build_modern_mcp_list_tools_body, modern_mcp_request_headers,
 };
 use crate::bdd_support::mcp_consent::build_consent_capable_tool_call_body;
 use crate::bdd_support::mediator::Mediator as _;
@@ -162,7 +162,7 @@ pub async fn a2a_method_request_sent_to_surface(
     send_rpc(world, gw_index, &surface_name, body, &[]).await;
 }
 
-#[when(regex = r#"^the caller asks gateway (\d+) surface "([^"]+)" for available MCP tools$"#)]
+#[when(regex = r#"^the caller asks gateway (\d+) MCP surface "([^"]+)" for available tools$"#)]
 pub async fn mcp_list_tools_sent_to_surface(
     world: &mut G2gWorld,
     gw_index: usize,
@@ -174,7 +174,7 @@ pub async fn mcp_list_tools_sent_to_surface(
 
 /// The caller's own `Authorization` is for the gateway it calls, never for
 /// the remote Target.
-#[when(expr = "the caller asks gateway {int} surface {string} for available MCP tools with bearer token {string}")]
+#[when(expr = "the caller asks gateway {int} MCP surface {string} for available tools with bearer token {string}")]
 pub async fn mcp_list_tools_sent_with_caller_bearer(
     world: &mut G2gWorld,
     gw_index: usize,
@@ -186,7 +186,7 @@ pub async fn mcp_list_tools_sent_with_caller_bearer(
     send_rpc(world, gw_index, &surface_name, build_mcp_list_tools_body(), &headers).await;
 }
 
-#[when(expr = "the caller asks gateway {int} surface {string} for available MCP tools using protocol version {string}")]
+#[when(expr = "the caller asks gateway {int} MCP surface {string} for available tools using protocol version {string}")]
 pub async fn modern_mcp_list_tools_sent_to_surface(
     world: &mut G2gWorld,
     gw_index: usize,
@@ -194,6 +194,7 @@ pub async fn modern_mcp_list_tools_sent_to_surface(
     protocol_version: String,
 ) {
     world.start().await;
+    let protocol_version = McpVersion::from(protocol_version.as_str());
     let body = build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-tools-list"), &protocol_version, true);
     let headers = modern_mcp_request_headers(&protocol_version, "tools/list");
     send_rpc(world, gw_index, &surface_name, body, &headers).await;
@@ -207,7 +208,7 @@ pub(crate) async fn caller_invokes_modern_mcp_tool(
     tool: &str,
     gw_index: usize,
     surface_name: &str,
-    protocol_version: &str,
+    protocol_version: &McpVersion,
 ) {
     world.start().await;
     let body = build_consent_capable_tool_call_body(serde_json::json!("modern-mcp-tool-call"), tool, protocol_version);
@@ -222,10 +223,11 @@ async fn send_caller_tool_call(
     surface_name: &str,
     body: Value,
 ) {
-    let protocol_version = body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
-        .as_str()
-        .expect("modern request declares its protocol version")
-        .to_string();
+    let protocol_version = McpVersion::from(
+        body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+            .as_str()
+            .expect("setup failed: a modern MCP request declares its protocol version"),
+    );
     let mut headers = modern_mcp_request_headers(&protocol_version, "tools/call");
     headers.push(("Mcp-Name".to_string(), tool.to_string()));
     headers.push(("authorization".to_string(), format!("Bearer {}", world.caller_access_token(caller))));
@@ -243,6 +245,7 @@ async fn caller_invokes_modern_mcp_tool_through_surface(
     surface_name: String,
     protocol_version: String,
 ) {
+    let protocol_version = McpVersion::from(protocol_version.as_str());
     caller_invokes_modern_mcp_tool(world, &caller, &tool, gw_index, &surface_name, &protocol_version).await;
 }
 
@@ -269,13 +272,17 @@ pub(crate) async fn caller_retries_mcp_tool(
     let (consent, original) = world
         .consent_request
         .clone()
-        .expect("caller was asked for consent");
-    assert_eq!(original["params"]["name"], tool, "the retry must repeat the tool call that needed consent");
-    send_caller_tool_call(world, caller, tool, gw_index, surface_name, consent.retry_body(&original)).await;
+        .expect("setup failed: caller was not asked for consent");
+    assert_eq!(
+        original["params"]["name"], tool,
+        "setup failed: the caller was asked for consent on a different MCP tool"
+    );
+    let retry = consent.retry_body(&original);
+    send_caller_tool_call(world, caller, tool, gw_index, surface_name, retry).await;
 }
 
 #[when(
-    expr = "the caller asks gateway {int} surface {string} for available MCP tools with top-level metadata key {string} value {string}"
+    expr = "the caller asks gateway {int} MCP surface {string} for available tools with top-level metadata key {string} value {string}"
 )]
 async fn caller_sends_historical_metadata_over_fabric(
     world: &mut G2gWorld,
@@ -421,7 +428,7 @@ pub async fn gateway_accepts_invitation_using_unknown_mediator(
     accept_pending_oob(world, gateway, Some(unknown_id.as_str())).await;
 }
 
-#[when(regex = r#"^the caller asks gateway (\d+) surface "([^"]+)" for available MCP tools with a valid API key$"#)]
+#[when(regex = r#"^the caller asks gateway (\d+) MCP surface "([^"]+)" for available tools with a valid API key$"#)]
 pub async fn mcp_list_tools_sent_with_api_key(
     world: &mut G2gWorld,
     gw_index: usize,
@@ -433,7 +440,7 @@ pub async fn mcp_list_tools_sent_with_api_key(
     send_rpc(world, gw_index, &surface_name, build_mcp_list_tools_body(), &[(header, api_key)]).await;
 }
 
-#[when(regex = r#"^the caller asks gateway (\d+) surface "([^"]+)" for available MCP tools without an API key$"#)]
+#[when(regex = r#"^the caller asks gateway (\d+) MCP surface "([^"]+)" for available tools without an API key$"#)]
 pub async fn mcp_list_tools_sent_without_credentials(
     world: &mut G2gWorld,
     gw_index: usize,
@@ -443,10 +450,11 @@ pub async fn mcp_list_tools_sent_without_credentials(
     send_rpc(world, gw_index, &surface_name, build_mcp_list_tools_body(), &[]).await;
 }
 
-/// MCP Streamable HTTP: caller advertises `Accept: text/event-stream`, so the
-/// gateway wraps the JSON-RPC response as a single SSE `message` event.
-#[when(regex = r#"^the caller asks gateway (\d+) surface "([^"]+)" for available MCP tools over SSE$"#)]
-pub async fn mcp_list_tools_sent_over_sse(
+/// MCP Streamable HTTP with the caller advertising `Accept: text/event-stream`.
+#[when(
+    regex = r#"^the caller asks gateway (\d+) MCP surface "([^"]+)" for available tools accepting an event stream$"#
+)]
+pub async fn mcp_list_tools_accepting_an_event_stream(
     world: &mut G2gWorld,
     gw_index: usize,
     surface_name: String,
@@ -464,10 +472,9 @@ pub async fn mcp_list_tools_sent_over_sse(
 
 /// Two `tools/list` calls, with distinct ids, over one session of the deprecated HTTP+SSE
 /// transport (`GET {route}/sse`, then POSTs to the announced session URL).
-/// Each POST must be accepted with `202` and answered by an SSE `message`
-/// event. Each request is recorded with its reply.
+/// Each request is recorded with the SSE `message` event reply it got, if any.
 #[when(
-    expr = "the caller asks gateway {int} surface {string} for available MCP tools twice over one Legacy SSE session"
+    expr = "the caller asks gateway {int} MCP surface {string} for available tools twice over one Legacy SSE session"
 )]
 pub async fn mcp_list_tools_twice_over_legacy_sse(
     world: &mut G2gWorld,
@@ -494,16 +501,30 @@ pub async fn mcp_list_tools_twice_over_legacy_sse(
         body
     });
     world.sent_body = bodies.last().cloned();
-    let replies =
-        crate::bdd_support::sse_client::legacy_sse_session_calls(&format!("http://127.0.0.1:{port}"), &route, &bodies)
+    let exchange =
+        crate::bdd_support::sse_client::legacy_sse_session(&format!("http://127.0.0.1:{port}"), &route, &bodies)
             .await
             .unwrap_or_else(|error| {
-                panic!("Legacy SSE session on gateway {gw_index} surface {surface_name}: {error:#}")
+                panic!(
+                    "the caller could not reach gateway {gw_index} surface {surface_name} over Legacy SSE: {error:#}"
+                )
             });
-    world.response_body = replies.last().cloned();
+    if let Some(error) = &exchange.stream_error {
+        eprintln!("Legacy SSE stream on gateway {gw_index} surface {surface_name} ended early: {error:#}");
+    }
+    world.response_status = Some(exchange.status());
+    world.response_content_type = exchange
+        .stream_headers
+        .get("content-type")
+        .cloned();
+    world.response_body = exchange
+        .replies
+        .last()
+        .cloned();
+    let mut replies = exchange.replies.into_iter();
     world.legacy_sse_exchange = bodies
         .into_iter()
-        .zip(replies)
+        .map(|request| (request, replies.next()))
         .collect();
 }
 

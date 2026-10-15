@@ -680,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn modern_result_metadata_marks_the_result_private() {
-        use crate::mcp::request_validation::{LegacySessionEvidence, McpVersionPolicy, validate_mcp_post};
+        use crate::mcp::request_validation::{LegacySessionEvidence, validate_mcp_post};
 
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -698,7 +698,7 @@ mod tests {
             &headers,
             request.to_string().as_bytes(),
             LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(&[crate::mcp::MCP_MODERN_VERSION], &[crate::mcp::MCP_MODERN_VERSION]),
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
         )
         .unwrap();
         let upstream = Bytes::from(

@@ -152,19 +152,34 @@ fn validate_audit_events(
     Ok(())
 }
 
-/// A drop policy belongs only to Governance Audit integrations and must be a
-/// positive number of seconds.
-fn validate_audit_drop_after(
+/// A delivery limit (`audit_drop_after_secs`, `audit_max_attempts`) belongs
+/// only to Governance Audit integrations and must be at least 1.
+fn validate_audit_limit(
     category: Option<&str>,
-    seconds: Option<u64>,
+    field: &str,
+    value: Option<u64>,
 ) -> Result<(), (StatusCode, String)> {
-    match seconds {
+    match value {
         None => Ok(()),
         Some(_) if category != Some(AUDIT_CATEGORY) => {
-            Err((StatusCode::BAD_REQUEST, "Only Governance Audit integrations have an audit drop policy".to_string()))
+            Err((StatusCode::BAD_REQUEST, format!("Only Governance Audit integrations accept {field}")))
         }
-        Some(0) => Err((StatusCode::BAD_REQUEST, "audit_drop_after_secs must be at least 1".to_string())),
+        Some(0) => Err((StatusCode::BAD_REQUEST, format!("{field} must be at least 1"))),
         Some(_) => Ok(()),
+    }
+}
+
+/// An update's delivery limit: the value sent (`null` clears it), else the
+/// current one while the integration stays a Governance Audit integration.
+fn updated_audit_limit<T>(
+    sent: Option<Option<T>>,
+    category: Option<&str>,
+    current: Option<T>,
+) -> Option<T> {
+    match sent {
+        Some(value) => value,
+        None if category == Some(AUDIT_CATEGORY) => current,
+        None => None,
     }
 }
 
@@ -185,6 +200,8 @@ pub struct CreateIntegrationRequest {
     pub audit_events: Vec<String>,
     #[serde(default)]
     pub audit_drop_after_secs: Option<u64>,
+    #[serde(default)]
+    pub audit_max_attempts: Option<u32>,
 }
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
@@ -254,6 +271,9 @@ pub struct UpdateIntegrationRequest {
     /// Omitted keeps an audit integration's current drop policy; `null` clears it.
     #[serde(default, deserialize_with = "present")]
     pub audit_drop_after_secs: Option<Option<u64>>,
+    /// Omitted keeps an audit integration's current attempt limit; `null` clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub audit_max_attempts: Option<Option<u32>>,
 }
 
 /// Distinguishes a field sent as `null` (`Some(None)`) from one left out (`None`).
@@ -341,7 +361,13 @@ pub async fn create_notifier(
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     ensure_audit_integration_is_global(req.category.as_deref(), req.tenant_id.as_deref())?;
     validate_audit_events(req.category.as_deref(), &req.audit_events)?;
-    validate_audit_drop_after(req.category.as_deref(), req.audit_drop_after_secs)?;
+    validate_audit_limit(req.category.as_deref(), "audit_drop_after_secs", req.audit_drop_after_secs)?;
+    validate_audit_limit(
+        req.category.as_deref(),
+        "audit_max_attempts",
+        req.audit_max_attempts
+            .map(u64::from),
+    )?;
     // Validate name
     if req.name.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Integration name is required".to_string()));
@@ -416,6 +442,7 @@ pub async fn create_notifier(
     integration.tenant_id = req.tenant_id;
     integration.audit_events = req.audit_events;
     integration.audit_drop_after_secs = req.audit_drop_after_secs;
+    integration.audit_max_attempts = req.audit_max_attempts;
     if !integration_writable(&integration, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Integration is outside this token's permitted scope".into()));
     }
@@ -526,12 +553,12 @@ pub async fn update_notifier(
         None => Vec::new(),
     };
     validate_audit_events(req.category.as_deref(), &audit_events)?;
-    let audit_drop_after_secs = match req.audit_drop_after_secs {
-        Some(seconds) => seconds,
-        None if req.category.as_deref() == Some(AUDIT_CATEGORY) => existing.audit_drop_after_secs,
-        None => None,
-    };
-    validate_audit_drop_after(req.category.as_deref(), audit_drop_after_secs)?;
+    let audit_drop_after_secs =
+        updated_audit_limit(req.audit_drop_after_secs, req.category.as_deref(), existing.audit_drop_after_secs);
+    validate_audit_limit(req.category.as_deref(), "audit_drop_after_secs", audit_drop_after_secs)?;
+    let audit_max_attempts =
+        updated_audit_limit(req.audit_max_attempts, req.category.as_deref(), existing.audit_max_attempts);
+    validate_audit_limit(req.category.as_deref(), "audit_max_attempts", audit_max_attempts.map(u64::from))?;
 
     // Create updated integration
     let now = chrono::Utc::now().to_rfc3339();
@@ -547,6 +574,7 @@ pub async fn update_notifier(
         status: req.status,
         audit_events,
         audit_drop_after_secs,
+        audit_max_attempts,
         created_at: existing.created_at,
         updated_at: now,
     };
@@ -893,6 +921,7 @@ mod tests {
                             .collect()
                     }),
                     audit_drop_after_secs: None,
+                    audit_max_attempts: None,
                 }),
             )
             .await
@@ -900,6 +929,46 @@ mod tests {
                 Ok(_) => StatusCode::OK,
                 Err((status, _)) => status,
             }
+        }
+
+        /// Updates `existing` as an audit integration with `fields` added to
+        /// the request body, as the dashboard sends it.
+        async fn update_audit_fields(
+            &self,
+            existing: &Integration,
+            fields: serde_json::Value,
+        ) -> Result<Integration, StatusCode> {
+            let mut body = serde_json::json!({
+                "name": existing.name,
+                "description": "",
+                "type": existing.integration_type,
+                "category": AUDIT_CATEGORY,
+                "configuration": existing.configuration,
+                "content": {"type": "${EVENT_TYPE}"},
+                "status": "active",
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(
+                    fields
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            update_notifier(
+                Extension(self.integrations.clone()),
+                Extension(self.config.clone()),
+                Path(existing.id.clone()),
+                None,
+                None,
+                self.guard(),
+                caller(Some(ADMIN)),
+                None,
+                Json(serde_json::from_value(body).unwrap()),
+            )
+            .await
+            .map(|Json(integration)| integration)
+            .map_err(|(status, _)| status)
         }
 
         async fn delete(
@@ -962,6 +1031,7 @@ mod tests {
             status: "active".to_string(),
             audit_events: Vec::new(),
             audit_drop_after_secs: None,
+            audit_max_attempts: None,
         }
     }
 
@@ -1161,6 +1231,118 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cleared.audit_drop_after_secs, Some(None));
+    }
+
+    #[tokio::test]
+    async fn audit_integration_keeps_its_attempt_limit() {
+        let f = fixture().await;
+        let mut audit = request("audit", None);
+        audit.audit_max_attempts = Some(10);
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), audit)
+            .await
+            .unwrap();
+        assert_eq!(created.audit_max_attempts, Some(10));
+        assert_eq!(f.stored().await[0].audit_max_attempts, Some(10));
+    }
+
+    #[tokio::test]
+    async fn an_attempt_limit_must_be_positive_and_only_on_audit_integrations() {
+        let f = fixture().await;
+        let mut zero = request("audit", None);
+        zero.audit_max_attempts = Some(0);
+        assert_eq!(
+            f.create(Some(ADMIN), None, f.guard(), zero)
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut general = request("general", None);
+        general.content = serde_json::json!({"type": "${EVENT_TYPE}"});
+        general.audit_max_attempts = Some(10);
+        assert_eq!(
+            f.create(Some(ADMIN), None, f.guard(), general)
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(f.stored().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_update_keeps_the_attempt_limit_unless_it_names_one() {
+        let f = fixture().await;
+        let mut audit = request("audit", None);
+        audit.audit_max_attempts = Some(10);
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), audit)
+            .await
+            .unwrap();
+
+        let kept = f
+            .update_audit_fields(&created, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(kept.audit_max_attempts, Some(10));
+
+        let changed = f
+            .update_audit_fields(&created, serde_json::json!({"audit_max_attempts": 20}))
+            .await
+            .unwrap();
+        assert_eq!(changed.audit_max_attempts, Some(20));
+        assert_eq!(f.stored().await[0].audit_max_attempts, Some(20));
+
+        assert_eq!(
+            f.update_audit_fields(&created, serde_json::json!({"audit_max_attempts": 0}))
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(f.stored().await[0].audit_max_attempts, Some(20));
+
+        let cleared = f
+            .update_audit_fields(&created, serde_json::json!({"audit_max_attempts": null}))
+            .await
+            .unwrap();
+        assert_eq!(cleared.audit_max_attempts, None);
+        assert_eq!(f.stored().await[0].audit_max_attempts, None);
+    }
+
+    #[tokio::test]
+    async fn moving_out_of_the_audit_category_clears_the_attempt_limit() {
+        let f = fixture().await;
+        let mut audit = request("audit", None);
+        audit.audit_max_attempts = Some(10);
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), audit)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.update(ADMIN, &created, "general")
+                .await,
+            StatusCode::OK
+        );
+        assert_eq!(f.stored().await[0].audit_max_attempts, None);
+    }
+
+    #[tokio::test]
+    async fn an_update_clears_the_drop_policy_with_null() {
+        let f = fixture().await;
+        let mut audit = request("audit", None);
+        audit.audit_drop_after_secs = Some(3600);
+        let created = f
+            .create(Some(ADMIN), None, f.guard(), audit)
+            .await
+            .unwrap();
+
+        let cleared = f
+            .update_audit_fields(&created, serde_json::json!({"audit_drop_after_secs": null}))
+            .await
+            .unwrap();
+        assert_eq!(cleared.audit_drop_after_secs, None);
+        assert_eq!(f.stored().await[0].audit_drop_after_secs, None);
     }
 
     #[tokio::test]
@@ -1788,6 +1970,7 @@ mod tests {
                 status: existing.status.clone(),
                 audit_events: None,
                 audit_drop_after_secs: None,
+                audit_max_attempts: None,
             }),
         )
         .await

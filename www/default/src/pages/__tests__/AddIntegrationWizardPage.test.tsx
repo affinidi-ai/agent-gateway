@@ -205,6 +205,80 @@ describe('AddIntegrationWizardPage category samples', () => {
     expect(screen.queryByTestId('integration-audit-events')).not.toBeInTheDocument();
   });
 
+  async function fillAuditStream() {
+    await categorySelect('audit');
+    fireEvent.change(screen.getByPlaceholderText('e.g., Email integration'), {
+      target: { value: 'Audit to Kafka' },
+    });
+    fireEvent.change(screen.getByTestId('stream-topic-input'), {
+      target: { value: 'governance-audit' },
+    });
+    fireEvent.change(screen.getByTestId('stream-brokers-input'), {
+      target: { value: 'kafka-1:9092' },
+    });
+  }
+
+  async function submitWizard() {
+    const createButton = screen.getByRole('button', { name: /Create integration/ });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    fireEvent.submit(screen.getByTestId('integration-form'));
+  }
+
+  it('creates a Governance Audit integration with the delivery limits set', async () => {
+    renderWizard();
+    await fillAuditStream();
+    fireEvent.change(screen.getByTestId('integration-audit-max-attempts-input'), {
+      target: { value: '10' },
+    });
+    fireEvent.change(screen.getByTestId('integration-audit-drop-after-input'), {
+      target: { value: '3600' },
+    });
+    await submitWizard();
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPost.mock.calls[0][1]).toMatchObject({
+      category: 'audit',
+      audit_max_attempts: 10,
+      audit_drop_after_secs: 3600,
+    });
+  });
+
+  it('leaves out the delivery limits left empty', async () => {
+    renderWizard();
+    await fillAuditStream();
+    expect(screen.getByTestId('integration-audit-max-attempts-input')).toHaveValue(null);
+    await submitWizard();
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+    expect(mockPost.mock.calls[0][1]).not.toHaveProperty('audit_max_attempts');
+    expect(mockPost.mock.calls[0][1]).not.toHaveProperty('audit_drop_after_secs');
+  });
+
+  it('refuses a delivery limit that is not a whole number of 1 or more', async () => {
+    renderWizard();
+    await fillAuditStream();
+    fireEvent.change(screen.getByTestId('integration-audit-max-attempts-input'), {
+      target: { value: '0' },
+    });
+    await submitWizard();
+
+    expect(
+      await screen.findByText(
+        'Give up on a record after N attempts: enter a whole number of 1 or more, or leave it empty.'
+      )
+    ).toBeInTheDocument();
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
+  it('offers the delivery limits only for the Governance Audit category', async () => {
+    renderWizard('?category=general&type=webhook');
+    const select = await categorySelect('general');
+    expect(screen.queryByTestId('integration-audit-limits')).not.toBeInTheDocument();
+
+    fireEvent.change(select, { target: { value: 'audit' } });
+    expect(await screen.findByTestId('integration-audit-limits')).toBeInTheDocument();
+  });
+
   it('sends no event list for other categories', async () => {
     renderWizard('?category=general&type=webhook');
     await categorySelect('general');
@@ -221,6 +295,8 @@ describe('AddIntegrationWizardPage category samples', () => {
 
     await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
     expect(mockPost.mock.calls[0][1]).not.toHaveProperty('audit_events');
+    expect(mockPost.mock.calls[0][1]).not.toHaveProperty('audit_max_attempts');
+    expect(mockPost.mock.calls[0][1]).not.toHaveProperty('audit_drop_after_secs');
   });
 
   it('opens on a Kafka audit stream seeded with the full-record template and creates it', async () => {

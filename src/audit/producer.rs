@@ -1,9 +1,9 @@
 //! The one place an audit record is finalised and handed to the journal.
 
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tracing::{debug, error, warn};
 
 use crate::audit::catalog::event_bit;
@@ -14,7 +14,7 @@ use crate::metrics::backends::prometheus::{track_audit_record_produced, track_au
 
 pub struct Producer {
     sinks: &'static Sinks,
-    journal: OnceLock<Sender<Pending>>,
+    journal: RwLock<Option<Sender<Pending>>>,
 }
 
 static PRODUCER: LazyLock<Producer> = LazyLock::new(|| Producer::new(sinks()));
@@ -28,23 +28,29 @@ impl Producer {
     pub fn new(sinks: &'static Sinks) -> Self {
         Self {
             sinks,
-            journal: OnceLock::new(),
+            journal: RwLock::new(None),
         }
     }
 
-    /// Connects the producer to the journal writer. Records produced before
-    /// this are dropped.
+    /// Connects the producer to the journal writer. Selected records produced
+    /// while it is not connected are dropped and counted as
+    /// `pipeline_not_running`.
     pub fn connect(
         &self,
         journal: Sender<Pending>,
     ) {
-        if self
-            .journal
-            .set(journal)
-            .is_err()
-        {
+        let mut connected = self.journal.write();
+        if connected.is_some() {
             warn!("Audit producer is already connected to a journal");
+            return;
         }
+        *connected = Some(journal);
+    }
+
+    /// Disconnects the producer. The writer journals what it was already
+    /// handed, then stops once it has no other sender.
+    pub fn disconnect(&self) {
+        self.journal.write().take();
     }
 
     /// Whether any sink selects the event. One atomic read.
@@ -105,8 +111,10 @@ impl Producer {
         if event.event_id.is_none() {
             event.event_id = new_event_id();
         }
-        let Some(journal) = self.journal.get() else {
-            debug!(category, "Audit journal not started; record dropped");
+        let connected = self.journal.read();
+        let Some(journal) = connected.as_ref() else {
+            track_audit_records_lost("pipeline_not_running", 1);
+            debug!(category, "Audit journal not running; record dropped");
             return;
         };
         track_audit_record_produced(category);
@@ -215,6 +223,7 @@ mod tests {
                 .iter()
                 .map(|(id, events)| Sink::new(id.clone(), EventMask::from_categories(events.iter().copied())))
                 .collect(),
+            Vec::new(),
         );
         let producer: &'static Producer = Box::leak(Box::new(Producer::new(sinks)));
         let (tx, rx) = mpsc::channel();
@@ -277,11 +286,45 @@ mod tests {
     }
 
     #[test]
-    fn a_record_submitted_before_the_journal_is_connected_is_dropped() {
+    fn a_selected_record_with_no_journal_connected_is_dropped_and_counted() {
+        let lost = || {
+            crate::metrics::backends::prometheus::AUDIT_RECORDS_LOST
+                .with_label_values(&["pipeline_not_running"])
+                .get()
+        };
         let sinks: &'static Sinks = Box::leak(Box::default());
-        sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))]);
+        sinks.replace(vec![Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"]))], Vec::new());
         let producer = Producer::new(sinks);
+        let before = lost();
+
         producer.submit(consent());
+
+        assert!(lost() > before, "the dropped record is counted");
+    }
+
+    #[test]
+    fn records_go_to_the_journal_connected_now_and_none_while_disconnected() {
+        let (producer, first) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+        producer.disconnect();
+        producer.submit(consent());
+        assert!(received(&first).is_empty());
+
+        let (tx, second) = mpsc::channel();
+        producer.connect(tx);
+        producer.submit(consent());
+        assert_eq!(received(&second).len(), 1);
+        assert!(received(&first).is_empty());
+    }
+
+    #[test]
+    fn connecting_twice_keeps_the_first_journal() {
+        let (producer, first) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+        let (tx, second) = mpsc::channel();
+        producer.connect(tx);
+
+        producer.submit(consent());
+        assert_eq!(received(&first).len(), 1);
+        assert!(received(&second).is_empty());
     }
 
     #[tokio::test]
@@ -333,10 +376,13 @@ mod tests {
             })
             .await;
 
-        producer.sinks.replace(vec![
-            Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"])),
-            Sink::new(siem(), EventMask::from_categories(["consent_granted"])),
-        ]);
+        producer.sinks.replace(
+            vec![
+                Sink::new(SinkId::AuditLog, EventMask::from_categories(["consent_granted"])),
+                Sink::new(siem(), EventMask::from_categories(["consent_granted"])),
+            ],
+            Vec::new(),
+        );
         deferred.flush_with_vp("vp");
 
         assert_eq!(received(&rx)[0].recipients, vec![SinkId::AuditLog, siem()]);

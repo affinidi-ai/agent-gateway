@@ -9,11 +9,22 @@ import { useAuditForwarding } from './useAuditForwarding';
 
 const NEW_AUDIT_STREAM = `${ROUTES.INTEGRATION_WIZARD}?category=${AUDIT_INTEGRATION_CATEGORY}&type=stream`;
 
+const AUDITING_OFF_NOTE =
+  'VP Auditing is off in Settings › Security, so the VP Audit Log keeps nothing; ' +
+  'Governance Audit integrations still receive the events selected for them.';
+
+function noEventsNote(count: number): string {
+  return count === 1
+    ? '1 Governance Audit integration selects no events and receives nothing.'
+    : `${count} Governance Audit integrations select no events and receive nothing.`;
+}
+
 /**
- * Shows how many integrations receive the audit records and opens them, or
- * starts a new Governance Audit stream when none do. Hidden when the gateway
- * does not offer the Governance Audit category; says so when VP Auditing is
- * off, because nothing is then written or forwarded.
+ * Shows how many Governance Audit integrations receive audit records and opens
+ * them, or starts a new Governance Audit stream when none do. Hidden when the
+ * gateway does not offer the Governance Audit category. Warns when active
+ * integrations select no events, and says when VP Auditing is off that only the
+ * VP Audit Log keeps nothing, since integrations receive their own events.
  */
 const AuditForwardButton: React.FC = () => {
   const navigate = useNavigate();
@@ -31,11 +42,15 @@ const AuditForwardButton: React.FC = () => {
     return null;
   }
 
-  const { integrations } = forwarding;
+  const { integrations, integrationsWithoutEvents } = forwarding;
   const label =
     integrations > 0
       ? `Forwarding to ${integrations} integration${integrations === 1 ? '' : 's'}`
       : 'Forward records';
+  const notes = [
+    integrationsWithoutEvents > 0 ? noEventsNote(integrationsWithoutEvents) : null,
+    auditingOff ? AUDITING_OFF_NOTE : null,
+  ].filter((note): note is string => note !== null);
 
   return (
     <AppButton
@@ -43,14 +58,19 @@ const AuditForwardButton: React.FC = () => {
       size="md"
       onClick={() => navigate(integrations > 0 ? ROUTES.INTEGRATIONS : NEW_AUDIT_STREAM)}
       data-testid="audit-forward-button"
-      title={
-        auditingOff
-          ? 'VP Auditing is off in Settings › Security, so no records are written or forwarded'
-          : undefined
-      }
+      title={notes.length > 0 ? notes.join(' ') : undefined}
       iconStart={<i className="fas fa-share-square me-1" aria-hidden="true" />}
+      iconEnd={
+        integrationsWithoutEvents > 0 ? (
+          <i
+            className="fas fa-exclamation-triangle text-warning ms-1"
+            aria-hidden="true"
+            data-testid="audit-forward-no-events-warning"
+          />
+        ) : undefined
+      }
     >
-      {auditingOff && integrations > 0 ? `${label} (VP Auditing off)` : label}
+      {label}
     </AppButton>
   );
 };

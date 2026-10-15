@@ -8,6 +8,12 @@ changes:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Send no-store on access token create and rotate responses
       description: Responses that return a token secret now carry Cache-Control no-store so caches never keep them.
+    - timestamp: '2026-10-06T00:00:00.000Z'
+      title: Document access token rotation behavior
+      description: Updates the access token reference with the rotation endpoint and its authorization, lifecycle, and audit behavior.
+  fixed: []
+  removed: []
+  breaking: []
   security:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Write access token files atomically with owner-only permissions
@@ -15,7 +21,3 @@ changes:
     - timestamp: '2026-10-06T00:00:00.000Z'
       title: Stop returning storage error details from access token endpoints
       description: Create, update and revoke no longer include the underlying IO error text in 500 responses; the error is logged instead.
-  internal:
-    - timestamp: '2026-10-06T00:00:00.000Z'
-      title: Add tests and docs for access token rotation
-      description: Adds unit and component tests for rotation and updates the access token reference.

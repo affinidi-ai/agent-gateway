@@ -15,7 +15,7 @@ make mcp-conformance-legacy             # legacy compatibility checks only
 ./scripts/mcp-conformance/run.sh --help
 ```
 
-Requires Node >= 20.18.1 with npm, git and openssl. Cargo is needed for builds,
+Requires Node >= 22 with npm, git and openssl. Cargo is needed for builds,
 for `--unit-tests` and for the `fabric` target, not for a run whose binaries are
 all passed in or, with `--skip-build`, already built. The `fabric` target also
 needs a running Docker daemon. The first run needs the npm registry and GitHub;
@@ -26,14 +26,13 @@ not drop the suite or `tsx`.
 A run that uses Cargo refuses to start while `RUSTFLAGS` or
 `CARGO_ENCODED_RUSTFLAGS` is set. Cargo would use either in place of the
 rustflags in `.cargo/config.toml`. The harness does not clear them itself,
-because that would drop flags you set on purpose: unset them, or pass prebuilt
-binaries without `--unit-tests`.
+because that would drop flags you set on purpose: unset them, or pass a
+prebuilt binary without `--unit-tests`.
 
 | Option | Effect |
 | --- | --- |
 | `--skip-build` | Use the existing binary instead of building it; a missing one stops the run in preflight |
-| `--binary PATH` | Gateway binary for the modern phase; the `fabric` target builds its own through Cargo |
-| `--legacy-binary PATH` | Gateway binary for the legacy phase (CI passes the `build:rust` artifact) |
+| `--binary PATH` | Gateway binary for the modern and legacy phases; the `fabric` target builds its own through Cargo |
 | `--only LIST` | Comma-separated, non-empty subset of `direct,access-point,transit,owned-proxy,proxy-surface,fabric,legacy` |
 | `--unit-tests` | Run the full binary test suite before the suite; when `--only` selects no modern target the tests do not run and the summary shows a `WARN` line |
 
@@ -77,8 +76,9 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    is a `RequestId` equal to the request's id. The shim re-frames that one
    response as SSE, one `message` event per line, restores the tag to the
    request's typed id, and passes everything else through unchanged, so the
-   subscription checks reach the gateway. The `direct` target still talks to
-   the reference server itself.
+   subscription checks reach the gateway. The shim's own tests
+   (`shim.test.mjs`, `npm test` in this directory) run before it starts. The
+   `direct` target still talks to the reference server itself.
 4. **Modern phase.** Builds the gateway (`cargo build`, target dir `target/`),
    writes a fresh env with `env.mjs`, starts the gateway and probes it: a
    `-32022` answer means the binary does not admit `2026-07-28`. Then runs the

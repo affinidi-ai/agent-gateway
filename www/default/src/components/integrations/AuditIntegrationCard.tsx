@@ -51,9 +51,10 @@ const AuditIntegrationCard: React.FC<AuditIntegrationCardProps> = ({
       <p className="mb-0" data-testid="integration-audit-delivery-note">
         Records are delivered at least once, so a record may arrive again after a restart;
         deduplicate on <code>event_id</code>. If the destination stops accepting records, it falls
-        behind and catches up in order once it recovers. Only when the backlog grows past its cap
-        are its oldest records skipped (counted by{' '}
-        <code>agent_gateway_audit_sink_skipped_total</code>).
+        behind and catches up in order once it recovers; its oldest records are skipped only when
+        the backlog grows past its cap. Disabling the integration pauses it: it lets go of the
+        records it has not received, and once re-enabled it receives only new records. Skipped
+        records are counted by <code>agent_gateway_audit_sink_skipped_total</code>.
       </p>
       {AUDIT_PAYLOAD_TYPES.includes(type) && (
         <AppButton

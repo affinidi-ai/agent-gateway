@@ -61,6 +61,28 @@ changes:
         now show the authority by name instead of only its DID. Only Authorities and
         Issuers that are global or in the surface's tenant are named, so one tenant's
         names are never published from another tenant's surface.
+    - timestamp: '2026-10-07T12:00:00.000Z'
+      title: Document shared reference field ownership
+      description: >-
+        SOURCE_AUTH.md now explains that a trust-registry reference field is shared by every writer
+        for its type and id, so gateways naming the same Authority differently overwrite each other.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Record identity origin on identity records
+      description: >-
+        AgentIdentityRecord gains an optional origin (managed or external_caller), stamped at DID
+        issuance from the identity slot the DID came from. Records without one deserialise unchanged.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Document display names, reference fields and caller naming
+      description: Updates SOURCE_AUTH.md, CONTEXT.md, ARCHITECTURE.md and the dashboard AGENTS.md.
+    - timestamp: '2026-10-05T14:39:32.000Z'
+      title: Verify caller agent names through the resolver SDK
+      description: >-
+        The dashboard verifies up to four `host/@name` agent names from a caller's DID document
+        through the resolver SDK's agent-names feature. This path does not use the DID resolution
+        host policy or the gateway's egress guard: the resolver's own client refuses non-public
+        addresses and non-HTTPS URLs and follows at most five redirects, re-checking each hop,
+        but does not pin the connection, so it remains open to DNS rebinding. POLICY.md lists
+        this as a known limitation.
   fixed:
     - timestamp: '2026-10-05T14:39:32.000Z'
       title: Keep other Identities rows expanded when a row is expanded via its link
@@ -90,36 +112,3 @@ changes:
         characters. Names read from remote Agent Cards, signed into VCs or published to
         trust registries can no longer visually impersonate another agent's name.
   breaking: []
-  internal:
-    - timestamp: '2026-10-07T12:00:00.000Z'
-      title: Document that shared reference fields are last-writer-wins
-      description: >-
-        SOURCE_AUTH.md now states that a trust-registry reference field is shared by
-        every writer for its type and id, so gateways naming the same Authority
-        differently overwrite each other. Fields stay create-then-update so an operator
-        can still rename their own Authority or Issuer in registries that already hold it.
-    - timestamp: '2026-10-07T00:00:00.000Z'
-      title: Share one background refresh cache between caller and target card names
-      description: >-
-        Caller names and target Agent Card names now use a single RefreshCache for TTL
-        checks, one in-flight refresh per key, bounded concurrency and change tracking,
-        instead of two copies of that logic. Each service keeps its own value type and
-        change rule; behaviour is unchanged.
-    - timestamp: '2026-10-05T14:39:32.000Z'
-      title: Enable the agent-names feature of the DID resolver SDK
-      description: >-
-        Turns on the affinidi-did-resolver-cache-sdk agent-names feature (agent-names
-        0.1.3), which caller-name verification needs. Its resolver follows redirects
-        with its own HTTP client, outside allow_private_hosts and src/egress.rs, so
-        POLICY.md now documents that egress path and its DNS-rebinding gap.
-    - timestamp: '2026-10-05T14:39:32.000Z'
-      title: Record identity origin on identity records
-      description: >-
-        AgentIdentityRecord gains an optional origin (managed or external_caller),
-        stamped at DID issuance from the identity slot the DID came from. An inbound
-        request on a surface with no inbound slot derives the DID from the protected
-        slot, so it is stamped managed. Records without one deserialise unchanged.
-    - timestamp: '2026-10-05T14:39:32.000Z'
-      title: Document display names, reference fields and caller naming
-      description: >-
-        Updates SOURCE_AUTH.md, CONTEXT.md, ARCHITECTURE.md and the dashboard AGENTS.md.

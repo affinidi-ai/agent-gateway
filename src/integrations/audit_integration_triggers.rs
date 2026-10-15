@@ -193,8 +193,9 @@ pub(crate) struct NotReceiving(String);
 /// Publishes one rendered record to a Governance Audit integration, counted in
 /// `agent_gateway_audit_forward_total`. An integration that no longer
 /// receives audit records refuses it with [`NotReceiving`], counted as
-/// `not_receiving`: its reader retries until the dispatcher parks the sink,
-/// and the record is delivered once the integration receives records again.
+/// `not_receiving`, so it is never reported as delivered: its reader retries
+/// until the dispatcher pauses the sink, which lets the record go and counts
+/// it as paused.
 pub(crate) fn publish_audit_delivery(
     integration_id: String,
     delivery: AuditDelivery,
@@ -643,14 +644,17 @@ mod tests {
     }
 
     #[test]
-    fn audit_category_lists_every_audit_record_category() {
+    fn audit_category_lists_every_audit_record_category_the_gateway_produces() {
+        let unproduced = ["delegation_failed", "request_failed", "request_completed"];
         let actions = every_action();
         actions
             .iter()
             .for_each(listed);
         let produced: HashSet<String> = actions
             .iter()
-            .map(|action| format!("audit.{}", action_category(action)))
+            .map(action_category)
+            .filter(|category| !unproduced.contains(category))
+            .map(|category| format!("audit.{category}"))
             .collect();
 
         let category = audit_integration_category();

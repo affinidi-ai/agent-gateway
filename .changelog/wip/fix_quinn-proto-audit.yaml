@@ -1,0 +1,16 @@
+---
+branch: fix/quinn-proto-audit
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+  - timestamp: '2026-10-13T16:57:06.000Z'
+    title: Update quinn-proto to 0.11.19 to fix QUIC denial-of-service advisories
+    description: Bumps the transitive quinn-proto dependency from 0.11.15 to 0.11.19,
+      which fixes five advisories where a remote QUIC peer could exhaust memory (stream
+      reassembly, connection ID retirements, zero-length DATAGRAM frames) or panic
+      the stack (ACK_FREQUENCY minimum ACK delay, zero-length STREAM frames during
+      unordered reads). Restores a passing cargo audit.
+  breaking: []

@@ -1,21 +1,27 @@
+---
 branch: fix/ux-networking-config-from-payload
 changes:
   added: []
   changed: []
   fixed:
-    - timestamp: '2026-10-11T00:00:00.000Z'
-      title: Show the Networking settings of a surface configured through the API
-      description: The surface builder's Networking element converted its panel settings to the stored shape on save but could not read the stored shape back, so a surface whose `target.networking` was set through the API (or by another tool) showed Networking as unconfigured with empty fields, although the timeouts, retries and circuit breaker were in force. The element now reads the stored timeout, retry (including retryable status codes), circuit breaker and mirror settings into the panel, on the surface and on each transit point. Settings that are not stored stay off; no defaults are filled in.
-    - timestamp: '2026-10-12T10:40:00.000Z'
-      title: Keep a surface's Target Networking settings when saving it after a reload
-      description: After a surface was reloaded in the dashboard, its Target Networking element sat ahead of the Target on the canvas, and saving the surface left out `target.networking`, so the timeouts, retries, circuit breaker and mirror stopped applying. This happened whether Networking was set in the dashboard or through the API. The element is now saved wherever it sits on the Access Point to Target edge.
+  - timestamp: '2026-10-11T00:00:00.000Z'
+    title: Show the Networking settings of a surface configured through the API
+    description: The surface builder's Networking element converted its panel settings
+      to the stored shape on save but could not read the stored shape back, so a surface
+      whose `target.networking` was set through the API (or by another tool) showed
+      Networking as unconfigured with empty fields, although the timeouts, retries
+      and circuit breaker were in force. The element now reads the stored timeout,
+      retry (including retryable status codes), circuit breaker and mirror settings
+      into the panel, on the surface and on each transit point. Settings that are
+      not stored stay off; no defaults are filled in.
+  - timestamp: '2026-10-12T10:40:00.000Z'
+    title: Keep a surface's Target Networking settings when saving it after a reload
+    description: After a surface was reloaded in the dashboard, its Target Networking
+      element sat ahead of the Target on the canvas, and saving the surface left out
+      `target.networking`, so the timeouts, retries, circuit breaker and mirror stopped
+      applying. This happened whether Networking was set in the dashboard or through
+      the API. The element is now saved wherever it sits on the Access Point to Target
+      edge.
   removed: []
   security: []
   breaking: []
-  internal:
-    - timestamp: '2026-10-11T00:00:01.000Z'
-      title: Test reading the Networking element back from its stored shape
-      description: Adds round-trip tests (panel settings to stored shape and back, and stored shape to panel settings and back), a test that a payload in the shape an AI agent writes through the management API is not reported incomplete, empty-payload and malformed-block cases, and canvas tests that Networking set through the API on the Target and on a Transit Point is shown configured and saved unchanged, including after a save and a reload. Corrects the element round-trip test, which asserted the unconverted stored shape.
-    - timestamp: '2026-10-12T11:00:00.000Z'
-      title: Test the caller-scoped tool gate on the fabric send leg
-      description: The fabric send leg's tools/list filter and tools/call gate now build their condition input in one function, so they cannot drift apart again. Unit tests show that a gate condition on the caller's source authentication lists and admits a granted tool, hides it from other callers and from an unauthenticated request, and that the input carries the identity binding but no credential headers.

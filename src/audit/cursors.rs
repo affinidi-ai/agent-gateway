@@ -2,14 +2,16 @@
 //! sink has passed.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::audit::journal::{JournalEntry, segment_first_seq, segment_paths};
+use crate::audit::journal::{JournalEntry, OWNER_ONLY_FILE, create_owner_only_dir, segment_first_seq, segment_paths};
 use crate::audit::registry::SinkId;
 
 /// What one read of the journal found after a sink's cursor.
@@ -212,6 +214,44 @@ pub fn journal_bytes(dir: &Path) -> io::Result<u64> {
         .try_fold(0u64, |total, path| Ok(total.saturating_add(fs::metadata(path)?.len())))
 }
 
+/// Entries [`skipped_between`] reads at a time.
+const SKIP_SCAN_BATCH: usize = 1024;
+
+/// What `sink` skips when its cursor moves from `after` to `upto`: the
+/// entries addressed to it, and the unreadable lines, after `after` up to and
+/// including `upto`.
+pub fn skipped_between(
+    dir: &Path,
+    sink: &SinkId,
+    after: u64,
+    upto: u64,
+) -> io::Result<MovedSink> {
+    let mut moved = MovedSink {
+        sink: sink.clone(),
+        skipped: 0,
+        corrupt: 0,
+    };
+    let mut cursor = after;
+    while cursor < upto {
+        let read = read_entries(dir, cursor, upto, SKIP_SCAN_BATCH)?;
+        moved.skipped += read
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .recipients
+                    .contains(sink)
+            })
+            .count() as u64;
+        moved.corrupt += read.corrupt;
+        if read.through <= cursor {
+            break;
+        }
+        cursor = read.through;
+    }
+    Ok(moved)
+}
+
 /// Sinks moved past the oldest segment so it can be deleted.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BacklogSkip {
@@ -220,7 +260,7 @@ pub struct BacklogSkip {
     pub sinks: Vec<MovedSink>,
 }
 
-/// A sink moved past the oldest segment.
+/// A sink moved past records it had not received.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MovedSink {
     pub sink: SinkId,
@@ -308,9 +348,12 @@ struct StoredCursor {
 struct Cursors {
     /// Sinks being delivered to.
     active: HashMap<SinkId, u64>,
-    /// Removed sinks, kept so one that comes back resumes where it stopped.
-    /// They do not hold back pruning, and writes to them are ignored.
+    /// Paused sinks, parked at the durable seq when they were paused, so one
+    /// that resumes receives only records written after the pause. They do
+    /// not hold back pruning, and writes to them are ignored.
     parked: HashMap<SinkId, u64>,
+    /// Set by [`CursorStore::close`]: nothing is written to disk after it.
+    closed: bool,
 }
 
 /// Each sink's cursor: the `seq` of the last entry it has finished with.
@@ -336,7 +379,7 @@ impl CursorStore {
     /// is renamed to `cursors.json.corrupt-<unix seconds>`, kept for
     /// inspection, and the store starts empty.
     pub fn open(dir: &Path) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        create_owner_only_dir(dir)?;
         let path = dir.join(CURSORS_FILE);
         let mut cursors = Cursors::default();
         match fs::read(&path) {
@@ -407,24 +450,29 @@ impl CursorStore {
         self.persist(&cursors)
     }
 
-    /// Stops delivering to the sink, keeping its cursor for when it returns.
-    pub fn park(
+    /// Stops delivering to the sink and parks its cursor at `seq`, or where
+    /// it is when that is further on. A sink without an active cursor is left
+    /// as it is.
+    pub fn park_at(
         &self,
         sink: &SinkId,
+        seq: u64,
     ) -> io::Result<()> {
         let mut cursors = self.cursors.lock();
-        let Some(seq) = cursors.active.remove(sink) else {
+        let Some(cursor) = cursors.active.remove(sink) else {
             return Ok(());
         };
         cursors
             .parked
-            .insert(sink.clone(), seq);
+            .insert(sink.clone(), cursor.max(seq));
         self.persist(&cursors)
     }
 
-    /// The sink's cursor: its active one, its parked one when it returns, or
-    /// the start of the journal for a sink never seen. No entry is addressed
-    /// to a sink before it exists, so a new sink misses nothing.
+    /// The sink's cursor: its active one, its parked one when it resumes, or
+    /// the start of the journal for a sink without one. No entry is addressed
+    /// to a sink before it exists, so a new sink misses nothing; a parked
+    /// cursor is dropped only once every entry up to it is gone, so a resumed
+    /// sink without one still receives nothing from before its pause.
     pub fn start(
         &self,
         sink: &SinkId,
@@ -460,6 +508,34 @@ impl CursorStore {
         self.persist(&cursors)
     }
 
+    /// Forgets the parked cursors of sinks `keep` returns false for.
+    pub fn retain_parked(
+        &self,
+        keep: impl Fn(&SinkId) -> bool,
+    ) -> io::Result<()> {
+        let mut cursors = self.cursors.lock();
+        let before = cursors.parked.len();
+        cursors
+            .parked
+            .retain(|sink, _| keep(sink));
+        if cursors.parked.len() == before {
+            return Ok(());
+        }
+        self.persist(&cursors)
+    }
+
+    #[cfg(test)]
+    pub fn parked(
+        &self,
+        sink: &SinkId,
+    ) -> Option<u64> {
+        self.cursors
+            .lock()
+            .parked
+            .get(sink)
+            .copied()
+    }
+
     pub fn snapshot(&self) -> HashMap<SinkId, u64> {
         self.cursors
             .lock()
@@ -487,12 +563,23 @@ impl CursorStore {
             .copied()
     }
 
-    /// Writes a temporary file, syncs it and renames it over the cursors file,
-    /// so a crash leaves either the old or the new cursors.
+    /// Stops writing the cursors to disk. Every write runs under the same
+    /// lock, so once this returns no write is in flight and none follows, and
+    /// another store can open the cursors file safely.
+    pub fn close(&self) {
+        self.cursors.lock().closed = true;
+    }
+
+    /// Writes an owner-only temporary file, syncs it and renames it over the
+    /// cursors file, so a crash leaves either the old or the new cursors.
+    /// Writes nothing once the store is closed.
     fn persist(
         &self,
         cursors: &Cursors,
     ) -> io::Result<()> {
+        if cursors.closed {
+            return Ok(());
+        }
         let stored: Vec<StoredCursor> = cursors
             .active
             .iter()
@@ -514,7 +601,13 @@ impl CursorStore {
             .path
             .with_extension("json.tmp");
         {
-            let mut file = File::create(&temp)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(OWNER_ONLY_FILE)
+                .open(&temp)?;
+            file.set_permissions(fs::Permissions::from_mode(OWNER_ONLY_FILE))?;
             io::Write::write_all(&mut file, &bytes)?;
             file.sync_all()?;
         }
@@ -828,7 +921,7 @@ mod tests {
             .set(&integration("siem"), 3)
             .unwrap();
         store
-            .park(&integration("siem"))
+            .park_at(&integration("siem"), 0)
             .unwrap();
         assert_eq!(store.min(), Some(7));
         assert_eq!(store.get(&integration("siem")), None);
@@ -843,7 +936,7 @@ mod tests {
             .set(&integration("siem"), 3)
             .unwrap();
         store
-            .park(&integration("siem"))
+            .park_at(&integration("siem"), 0)
             .unwrap();
         store
             .set(&integration("siem"), 5)
@@ -871,7 +964,7 @@ mod tests {
                 .set(&integration("siem"), 3)
                 .unwrap();
             store
-                .park(&integration("siem"))
+                .park_at(&integration("siem"), 0)
                 .unwrap();
         }
         let store = CursorStore::open(dir.path()).unwrap();
@@ -923,7 +1016,7 @@ mod tests {
                 .set(&integration(sink), seq)
                 .unwrap();
             store
-                .park(&integration(sink))
+                .park_at(&integration(sink), 0)
                 .unwrap();
         }
         store
@@ -941,6 +1034,32 @@ mod tests {
                 .unwrap(),
             9
         );
+    }
+
+    #[test]
+    fn only_the_parked_cursors_kept_survive_and_active_ones_are_untouched() {
+        let dir = TempDir::new().unwrap();
+        let store = CursorStore::open(dir.path()).unwrap();
+        for (sink, seq) in [("deleted", 2), ("paused", 5)] {
+            store
+                .set(&integration(sink), seq)
+                .unwrap();
+            store
+                .park_at(&integration(sink), seq)
+                .unwrap();
+        }
+        store
+            .set(&integration("active"), 7)
+            .unwrap();
+
+        store
+            .retain_parked(|sink| *sink == integration("paused"))
+            .unwrap();
+
+        let reopened = CursorStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.parked(&integration("deleted")), None);
+        assert_eq!(reopened.parked(&integration("paused")), Some(5));
+        assert_eq!(reopened.get(&integration("active")), Some(7));
     }
 
     #[test]
@@ -1022,6 +1141,118 @@ mod tests {
     }
 
     #[test]
+    fn skipping_ahead_counts_the_entries_addressed_to_the_sink_and_unreadable_lines() {
+        let siem = integration("siem");
+        let dir = journal_for(&[
+            &[std::slice::from_ref(&siem), &[SinkId::AuditLog], std::slice::from_ref(&siem)],
+            &[&[SinkId::AuditLog, siem.clone()], std::slice::from_ref(&siem), &[SinkId::AuditLog]],
+            &[std::slice::from_ref(&siem)],
+        ]);
+        garble(dir.path(), 5);
+
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 1, 6).unwrap(),
+            MovedSink {
+                sink: siem.clone(),
+                skipped: 2,
+                corrupt: 1
+            }
+        );
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 0, 7).unwrap(),
+            MovedSink {
+                sink: siem.clone(),
+                skipped: 4,
+                corrupt: 1
+            }
+        );
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 5, 6).unwrap(),
+            MovedSink {
+                sink: siem.clone(),
+                skipped: 0,
+                corrupt: 0
+            }
+        );
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 7, 7).unwrap(),
+            MovedSink {
+                sink: siem,
+                skipped: 0,
+                corrupt: 0
+            }
+        );
+    }
+
+    #[test]
+    fn skipping_ahead_reads_past_one_batch() {
+        let siem = integration("siem");
+        let addressed = std::slice::from_ref(&siem);
+        let many: Vec<&[SinkId]> = std::iter::repeat_n(addressed, SKIP_SCAN_BATCH + 3).collect();
+        let dir = journal_for(&[&many]);
+
+        assert_eq!(
+            skipped_between(dir.path(), &siem, 0, (SKIP_SCAN_BATCH + 3) as u64)
+                .unwrap()
+                .skipped,
+            (SKIP_SCAN_BATCH + 3) as u64
+        );
+    }
+
+    #[test]
+    fn a_sink_parked_at_a_later_seq_resumes_from_it() {
+        let dir = TempDir::new().unwrap();
+        let store = CursorStore::open(dir.path()).unwrap();
+        store
+            .set(&SinkId::AuditLog, 4)
+            .unwrap();
+        store
+            .set(&integration("siem"), 2)
+            .unwrap();
+
+        store
+            .park_at(&integration("siem"), 9)
+            .unwrap();
+        assert_eq!(store.get(&integration("siem")), None);
+        assert_eq!(store.min(), Some(4));
+        assert_eq!(
+            CursorStore::open(dir.path())
+                .unwrap()
+                .start(&integration("siem"))
+                .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn parking_at_an_earlier_seq_keeps_the_cursor() {
+        let dir = TempDir::new().unwrap();
+        let store = CursorStore::open(dir.path()).unwrap();
+        store
+            .set(&integration("siem"), 6)
+            .unwrap();
+
+        store
+            .park_at(&integration("siem"), 3)
+            .unwrap();
+        store
+            .park_at(&integration("never-started"), 3)
+            .unwrap();
+        assert_eq!(
+            store
+                .start(&integration("siem"))
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            store
+                .start(&integration("never-started"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn no_backlog_skip_with_a_single_segment() {
         let dir = journal_for(&[&[&[SinkId::AuditLog]]]);
         let cursors = HashMap::from([(SinkId::AuditLog, 0)]);
@@ -1050,5 +1281,45 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["cursors.json".to_string()]);
+    }
+
+    #[test]
+    fn the_cursors_file_is_owner_only_even_over_a_wider_one() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(CURSORS_FILE);
+        fs::write(&path, b"[]").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = CursorStore::open(dir.path()).unwrap();
+        store
+            .set(&SinkId::AuditLog, 7)
+            .unwrap();
+
+        let mode = fs::metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn a_closed_store_writes_nothing_more() {
+        let dir = TempDir::new().unwrap();
+        let store = CursorStore::open(dir.path()).unwrap();
+        store
+            .set(&SinkId::AuditLog, 3)
+            .unwrap();
+        store.close();
+
+        store
+            .set(&SinkId::AuditLog, 9)
+            .unwrap();
+        store
+            .park_at(&SinkId::AuditLog, 9)
+            .unwrap();
+
+        let reopened = CursorStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(&SinkId::AuditLog), Some(3));
     }
 }

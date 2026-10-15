@@ -191,15 +191,75 @@ describe('EditIntegrationPage governance audit', () => {
     expect(body.audit_events).toEqual(['auth_failed']);
   });
 
-  it('sends no event list for other categories', async () => {
+  it('sends no event list or delivery limits for other categories', async () => {
     renderEditor();
 
     const select = (await screen.findByTestId('integration-category-select')) as HTMLSelectElement;
     await waitFor(() => expect(select.value).toBe('general'));
     expect(screen.queryByTestId('integration-audit-events')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('integration-audit-limits')).not.toBeInTheDocument();
     const body = await renameAndSave('Events to Kafka (renamed)');
 
     expect(body).not.toHaveProperty('audit_events');
+    expect(body).not.toHaveProperty('audit_max_attempts');
+    expect(body).not.toHaveProperty('audit_drop_after_secs');
+  });
+
+  const LIMITED_AUDIT_INTEGRATION = {
+    ...AUDIT_INTEGRATION,
+    audit_max_attempts: 10,
+    audit_drop_after_secs: 3600,
+  };
+
+  async function storedLimitsShown() {
+    const maxAttempts = await screen.findByTestId('integration-audit-max-attempts-input');
+    await waitFor(() => expect(maxAttempts).toHaveValue(10));
+    expect(screen.getByTestId('integration-audit-drop-after-input')).toHaveValue(3600);
+  }
+
+  it('shows the stored delivery limits and keeps them when untouched', async () => {
+    renderEditor(LIMITED_AUDIT_INTEGRATION);
+    await storedLimitsShown();
+
+    const body = await renameAndSave('Audit to Kafka (renamed)');
+
+    expect(body).toMatchObject({ audit_max_attempts: 10, audit_drop_after_secs: 3600 });
+  });
+
+  it('saves changed delivery limits and clears emptied ones with null', async () => {
+    renderEditor(LIMITED_AUDIT_INTEGRATION);
+    await storedLimitsShown();
+
+    fireEvent.change(screen.getByTestId('integration-audit-max-attempts-input'), {
+      target: { value: '20' },
+    });
+    fireEvent.change(screen.getByTestId('integration-audit-drop-after-input'), {
+      target: { value: '' },
+    });
+    const body = await renameAndSave('Audit to Kafka (renamed)');
+
+    expect(body.audit_max_attempts).toBe(20);
+    expect(body.audit_drop_after_secs).toBeNull();
+  });
+
+  it('refuses a negative delivery limit', async () => {
+    renderEditor(LIMITED_AUDIT_INTEGRATION);
+    await storedLimitsShown();
+
+    fireEvent.change(screen.getByTestId('integration-audit-drop-after-input'), {
+      target: { value: '-1' },
+    });
+    expect(screen.getByTestId('integration-audit-drop-after-error')).toBeInTheDocument();
+    const saveButton = screen.getByRole('button', { name: /Save Changes/ });
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    fireEvent.submit(screen.getByTestId('integration-form'));
+
+    expect(
+      await screen.findByText(
+        'Skip records older than N seconds: enter a whole number of 1 or more, or leave it empty.'
+      )
+    ).toBeInTheDocument();
+    expect(mockPut).not.toHaveBeenCalled();
   });
 
   it('moves an existing stream into the audit category with the audit record template', async () => {

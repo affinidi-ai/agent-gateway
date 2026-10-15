@@ -3226,10 +3226,7 @@ mod tests {
             &headers,
             &serde_json::to_vec(&body).unwrap(),
             crate::mcp::request_validation::LegacySessionEvidence::Absent,
-            crate::mcp::request_validation::McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_MODERN_VERSION],
-            ),
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
         )
         .unwrap();
         let crate::mcp::request_validation::McpRequestClassification::Modern(request) = classification else {
@@ -3286,10 +3283,7 @@ mod tests {
             .params
             .as_mut()
             .unwrap()["arguments"] = json!({});
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let result = super::process_modern_mcp_request(&proxy, &manager, &request, versions).await;
         assert_eq!(
             destination
@@ -3367,10 +3361,7 @@ mod tests {
             .create_server(&proxy)
             .await
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let catalog =
             super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("tools/list"), versions)
                 .await
@@ -3444,10 +3435,7 @@ mod tests {
             .create_server(&proxy)
             .await
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let catalog =
             super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("tools/list"), versions)
                 .await
@@ -3522,10 +3510,7 @@ mod tests {
             .create_server(&proxy)
             .await
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let catalog =
             super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("tools/list"), versions)
                 .await
@@ -3611,10 +3596,7 @@ mod tests {
                 .await
                 .is_none()
         );
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let discovery =
             super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("server/discover"), versions)
                 .await
@@ -3732,10 +3714,7 @@ mod tests {
                 .create_server(&proxy)
                 .await
                 .unwrap();
-            let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_MODERN_VERSION],
-            );
+            let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
             let catalog =
                 super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("tools/list"), versions)
                     .await
@@ -3809,10 +3788,7 @@ mod tests {
             }
         }
         drop(server);
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let catalog =
             super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("tools/list"), versions)
                 .await
@@ -3935,10 +3911,7 @@ mod tests {
             .create_server(&proxy)
             .await
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let catalog =
             super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("tools/list"), versions)
                 .await
@@ -4085,10 +4058,7 @@ mod tests {
                 .build()
                 .unwrap()
         };
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let response = super::handle_modern_surface_request(&proxy, &surface, &request, prepared(), &client, versions)
             .await
             .unwrap();
@@ -4155,10 +4125,7 @@ mod tests {
                 .build()
                 .unwrap(),
             &client,
-            crate::mcp::request_validation::McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_MODERN_VERSION],
-            ),
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
         )
         .await
         .unwrap();
@@ -4225,10 +4192,7 @@ mod tests {
             .params
             .as_mut()
             .unwrap()["notifications"] = json!({"toolsListChanged": true, "resourcesListChanged": true});
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         let mut body =
             super::owned_modern_http_response(&proxy, &manager, &request, versions, &axum::http::HeaderMap::new())
                 .await
@@ -4277,10 +4241,7 @@ mod tests {
             .create_server(&proxy)
             .await
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         for (method, expected_status, expected_code) in [
             ("server/discover", StatusCode::OK, None),
             ("tools/list", StatusCode::OK, None),
@@ -4369,10 +4330,7 @@ mod tests {
             .get_tool_names()
             .pop()
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
         for (tool, arguments) in
             [(&name, json!([])), (&name, json!({})), (&"missing".to_string(), json!({"query": "valid"}))]
         {
@@ -4417,10 +4375,7 @@ mod tests {
                     &proxy,
                     &manager,
                     &request,
-                    crate::mcp::request_validation::McpVersionPolicy::new(
-                        &[crate::mcp::MCP_MODERN_VERSION],
-                        &[crate::mcp::MCP_MODERN_VERSION],
-                    ),
+                    crate::mcp::request_validation::MODERN_ONLY_POLICY,
                 )
                 .await
             }
@@ -4476,10 +4431,7 @@ mod tests {
             .create_server(&proxy)
             .await
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let discovery =
             super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("server/discover"), versions)
                 .await
@@ -4631,7 +4583,7 @@ mod tests {
                     axum::http::Request::builder()
                         .method(method.clone())
                         .uri("/mcp/owned")
-                        .header("mcp-protocol-version", "2026-07-28")
+                        .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
                         .header("mcp-session-id", "legacy-session")
                         .body(axum::body::Body::empty())
                         .unwrap(),
@@ -4839,7 +4791,7 @@ mod tests {
                 .unwrap();
             if expected_status == StatusCode::OK {
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+                assert_eq!(body["result"]["protocolVersion"], crate::mcp::MCP_LEGACY_VERSION);
                 assert!(
                     body["result"]
                         .get("resultType")

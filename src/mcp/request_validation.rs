@@ -99,8 +99,13 @@ const LEGACY_SUPPORTED_VERSIONS: &[&str] = &[MCP_LEGACY_VERSION];
 pub const LEGACY_ONLY_POLICY: McpVersionPolicy<'static> = McpVersionPolicy::new(&[], LEGACY_SUPPORTED_VERSIONS);
 
 /// Admits `2026-07-28` alongside `2024-11-05`.
-const MODERN_CAPABLE_POLICY: McpVersionPolicy<'static> =
+pub(crate) const MODERN_CAPABLE_POLICY: McpVersionPolicy<'static> =
     McpVersionPolicy::new(&[super::MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, super::MCP_MODERN_VERSION]);
+
+/// Admits only `2026-07-28`.
+#[cfg(test)]
+pub(crate) const MODERN_ONLY_POLICY: McpVersionPolicy<'static> =
+    McpVersionPolicy::new(&[super::MCP_MODERN_VERSION], &[super::MCP_MODERN_VERSION]);
 
 // One policy per path, so a path can be returned to legacy-only without
 // affecting the others. The Fabric legs carry modern MCP only as framed streams.
@@ -824,9 +829,6 @@ mod tests {
     use super::*;
     use crate::mcp::MCP_MODERN_VERSION;
 
-    const TEST_POLICY: McpVersionPolicy<'static> =
-        McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
-
     #[test]
     fn every_transport_path_admits_modern_alongside_legacy() {
         for path in McpPathKind::ALL {
@@ -918,12 +920,12 @@ mod tests {
         const ADVERTISED_ONLY: McpVersionPolicy<'static> =
             McpVersionPolicy::new(&[], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
         for (policy, limit, expected) in [
-            (TEST_POLICY, LEGACY_ONLY_POLICY, LEGACY_ONLY_POLICY),
-            (LEGACY_ONLY_POLICY, TEST_POLICY, LEGACY_ONLY_POLICY),
+            (MODERN_CAPABLE_POLICY, LEGACY_ONLY_POLICY, LEGACY_ONLY_POLICY),
+            (LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY, LEGACY_ONLY_POLICY),
             (LEGACY_ONLY_POLICY, LEGACY_ONLY_POLICY, LEGACY_ONLY_POLICY),
-            (TEST_POLICY, TEST_POLICY, TEST_POLICY),
-            (TEST_POLICY, ADVERTISED_ONLY, ADVERTISED_ONLY),
-            (ADVERTISED_ONLY, TEST_POLICY, ADVERTISED_ONLY),
+            (MODERN_CAPABLE_POLICY, MODERN_CAPABLE_POLICY, MODERN_CAPABLE_POLICY),
+            (MODERN_CAPABLE_POLICY, ADVERTISED_ONLY, ADVERTISED_ONLY),
+            (ADVERTISED_ONLY, MODERN_CAPABLE_POLICY, ADVERTISED_ONLY),
             (ADVERTISED_ONLY, LEGACY_ONLY_POLICY, LEGACY_ONLY_POLICY),
         ] {
             assert_eq!(version_sets(policy.within(limit)), version_sets(expected), "{policy:?} within {limit:?}");
@@ -935,7 +937,7 @@ mod tests {
         let fabric_send = runtime_policy_for(McpPathKind::FabricSend);
         for target in ["fabric://gateway/channel", "fabric://gateway/channel$variant"] {
             assert_eq!(
-                version_sets(admission_policy_for_target(TEST_POLICY, target)),
+                version_sets(admission_policy_for_target(MODERN_CAPABLE_POLICY, target)),
                 version_sets(fabric_send),
                 "{target}"
             );
@@ -946,7 +948,7 @@ mod tests {
             );
         }
         for target in ["https://agent.example/mcp", "http://127.0.0.1:9/mcp", "proxy://owned-tools"] {
-            for policy in [TEST_POLICY, LEGACY_ONLY_POLICY] {
+            for policy in [MODERN_CAPABLE_POLICY, LEGACY_ONLY_POLICY] {
                 assert_eq!(version_sets(admission_policy_for_target(policy, target)), version_sets(policy), "{target}");
             }
         }
@@ -1028,12 +1030,11 @@ mod tests {
 
     #[test]
     fn initialize_never_settles_on_a_modern_revision() {
-        let dual = McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
         for requested in [MCP_MODERN_VERSION, "2025-11-25"] {
-            let capped = cap(&initialize_body(json!(requested)), dual).expect("capped");
+            let capped = cap(&initialize_body(json!(requested)), MODERN_CAPABLE_POLICY).expect("capped");
             assert_eq!(capped.offered, MCP_LEGACY_VERSION, "{requested}");
         }
-        assert_eq!(cap(&initialize_body(json!(MCP_LEGACY_VERSION)), dual), None);
+        assert_eq!(cap(&initialize_body(json!(MCP_LEGACY_VERSION)), MODERN_CAPABLE_POLICY), None);
     }
 
     #[test]
@@ -1087,7 +1088,7 @@ mod tests {
         body["params"]["_meta"]["com.example/opaque"] = json!({"preserve": true});
         let expected_params = body["params"].clone();
 
-        let result = validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap();
+        let result = validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap();
         let McpRequestClassification::Modern(message) = result else {
             panic!("expected modern request");
         };
@@ -1158,7 +1159,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove(CLIENT_CAPABILITIES_META);
-        let error = validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap_err();
+        let error = validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::INVALID_PARAMS);
         assert_eq!(error.id, Some(json!("request-1")));
     }
@@ -1169,7 +1170,7 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
         ] {
-            let error = validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap_err();
+            let error = validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap_err();
             assert_eq!(error.code, error_codes::INVALID_PARAMS);
             assert_eq!(error.id, Some(json!(1)));
         }
@@ -1183,7 +1184,7 @@ mod tests {
         invalid_capabilities["params"]["_meta"][CLIENT_CAPABILITIES_META] = json!([]);
 
         for body in [invalid_version, invalid_capabilities] {
-            let error = validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap_err();
+            let error = validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap_err();
             assert_eq!(error.code, error_codes::INVALID_PARAMS);
         }
     }
@@ -1197,7 +1198,7 @@ mod tests {
             for value in values {
                 let mut body = modern_body();
                 body["params"]["_meta"][field] = value;
-                for policy in [TEST_POLICY, LEGACY_ONLY_POLICY] {
+                for policy in [MODERN_CAPABLE_POLICY, LEGACY_ONLY_POLICY] {
                     let error = validate(&body, &modern_headers("tools/list"), policy).unwrap_err();
                     assert_eq!(error.code, error_codes::INVALID_PARAMS, "{body}");
                     assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -1211,7 +1212,7 @@ mod tests {
                 body["params"]["_meta"][LOG_LEVEL_META] = json!(level);
                 body["params"]["_meta"]["progressToken"] = token;
                 let McpRequestClassification::Modern(message) =
-                    validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap()
+                    validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap()
                 else {
                     panic!("expected modern classification");
                 };
@@ -1228,7 +1229,7 @@ mod tests {
 
     #[test]
     fn mismatched_method_header_is_header_mismatch() {
-        let error = validate(&modern_body(), &modern_headers("tools/call"), TEST_POLICY).unwrap_err();
+        let error = validate(&modern_body(), &modern_headers("tools/call"), MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
         assert_eq!(error.id, Some(json!("request-1")));
     }
@@ -1273,7 +1274,7 @@ mod tests {
                 CLIENT_CAPABILITIES_META: {}
             }
         });
-        let error = validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap_err();
+        let error = validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::INVALID_PARAMS);
     }
 
@@ -1284,7 +1285,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove(PROTOCOL_VERSION_META);
-        let error = validate(&body, &HeaderMap::new(), TEST_POLICY).unwrap_err();
+        let error = validate(&body, &HeaderMap::new(), MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::INVALID_PARAMS);
     }
 
@@ -1292,7 +1293,7 @@ mod tests {
     fn invalid_client_info_is_invalid_params() {
         let mut body = modern_body();
         body["params"]["_meta"][CLIENT_INFO_META] = json!({"name": "client"});
-        let error = validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap_err();
+        let error = validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::INVALID_PARAMS);
     }
 
@@ -1300,7 +1301,7 @@ mod tests {
     fn missing_method_header_is_header_mismatch() {
         let mut headers = HeaderMap::new();
         headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(MCP_MODERN_VERSION));
-        let error = validate(&modern_body(), &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&modern_body(), &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1308,7 +1309,7 @@ mod tests {
     fn missing_protocol_version_header_is_header_mismatch() {
         let mut headers = HeaderMap::new();
         headers.insert(METHOD_HEADER, HeaderValue::from_static("tools/list"));
-        let error = validate(&modern_body(), &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&modern_body(), &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1316,7 +1317,7 @@ mod tests {
     fn duplicate_method_header_is_header_mismatch() {
         let mut headers = modern_headers("tools/list");
         headers.append(METHOD_HEADER, HeaderValue::from_static("tools/list"));
-        let error = validate(&modern_body(), &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&modern_body(), &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1324,7 +1325,7 @@ mod tests {
     fn duplicate_protocol_version_header_is_header_mismatch() {
         let mut headers = modern_headers("tools/list");
         headers.append(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(MCP_MODERN_VERSION));
-        let error = validate(&modern_body(), &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&modern_body(), &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1332,7 +1333,7 @@ mod tests {
     fn malformed_standard_header_is_header_mismatch() {
         let mut headers = modern_headers("tools/list");
         headers.insert(METHOD_HEADER, HeaderValue::from_bytes(&[0xff]).unwrap());
-        let error = validate(&modern_body(), &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&modern_body(), &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1345,10 +1346,13 @@ mod tests {
         );
         headers
             .insert(axum::http::HeaderName::from_bytes(b"MCP-METHOD").unwrap(), HeaderValue::from_static("tools/list"));
-        assert!(matches!(validate(&modern_body(), &headers, TEST_POLICY), Ok(McpRequestClassification::Modern(_))));
+        assert!(matches!(
+            validate(&modern_body(), &headers, MODERN_CAPABLE_POLICY),
+            Ok(McpRequestClassification::Modern(_))
+        ));
 
         headers.insert(METHOD_HEADER, HeaderValue::from_static("TOOLS/LIST"));
-        let error = validate(&modern_body(), &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&modern_body(), &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1387,7 +1391,7 @@ mod tests {
             }
             let mut headers = modern_headers(method);
             headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(MCP_LEGACY_VERSION));
-            for policy in [LEGACY_ONLY_POLICY, TEST_POLICY] {
+            for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
                 let error = validate(&body, &headers, policy).unwrap_err();
                 assert_eq!(error.status, StatusCode::BAD_REQUEST);
                 assert_eq!(error.code, error_codes::INVALID_PARAMS);
@@ -1405,7 +1409,7 @@ mod tests {
     fn unknown_extension_method_is_preserved_without_name_header() {
         let mut body = modern_body();
         body["method"] = json!("example.vendor/do-work");
-        let result = validate(&body, &modern_headers("example.vendor/do-work"), TEST_POLICY).unwrap();
+        let result = validate(&body, &modern_headers("example.vendor/do-work"), MODERN_CAPABLE_POLICY).unwrap();
         let McpRequestClassification::Modern(message) = result else {
             panic!("expected modern request");
         };
@@ -1420,7 +1424,7 @@ mod tests {
         let mut headers = modern_headers("example.vendor/do-work");
         headers.insert(NAME_HEADER, HeaderValue::from_static("extension-operation"));
 
-        let result = validate(&body, &headers, TEST_POLICY).unwrap();
+        let result = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap();
         let McpRequestClassification::Modern(message) = result else {
             panic!("expected modern request");
         };
@@ -1442,7 +1446,7 @@ mod tests {
             for name in ["=?base64?=", "=?base64?%%%?=", "=?base64?/w==?=", " padded "] {
                 let mut headers = modern_headers(method);
                 headers.insert(NAME_HEADER, HeaderValue::from_static(name));
-                for policy in [LEGACY_ONLY_POLICY, TEST_POLICY] {
+                for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
                     let error = validate(&body, &headers, policy).unwrap_err();
                     assert_eq!(error.status, StatusCode::BAD_REQUEST, "{method}: {name}");
                     assert_eq!(error.code, error_codes::HEADER_MISMATCH, "{method}: {name}");
@@ -1458,7 +1462,7 @@ mod tests {
         for name in ["extra-name", "=?base64?prefix-only", "suffix?=", "=?base64?c2VhcmNo?="] {
             let mut headers = modern_headers("tools/list");
             headers.insert(NAME_HEADER, HeaderValue::from_static(name));
-            let result = validate(&body, &headers, TEST_POLICY).unwrap();
+            let result = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap();
             let McpRequestClassification::Modern(message) = result else {
                 panic!("expected modern request");
             };
@@ -1495,12 +1499,12 @@ mod tests {
             "method": "notifications/example",
             "params": {"_meta": {PROTOCOL_VERSION_META: MCP_MODERN_VERSION}}
         });
-        let result = validate(&body, &HeaderMap::new(), TEST_POLICY);
+        let result = validate(&body, &HeaderMap::new(), MODERN_CAPABLE_POLICY);
         assert!(matches!(result, Ok(McpRequestClassification::Modern(_))));
 
         let mut headers = HeaderMap::new();
         headers.insert(METHOD_HEADER, HeaderValue::from_static("notifications/other"));
-        let error = validate(&body, &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1524,7 +1528,7 @@ mod tests {
         let mut headers = modern_headers("tools/call");
         headers
             .insert(NAME_HEADER, HeaderValue::from_str(&format!("{BASE64_PREFIX}{encoded}{BASE64_SUFFIX}")).unwrap());
-        let result = validate(&body, &headers, TEST_POLICY);
+        let result = validate(&body, &headers, MODERN_CAPABLE_POLICY);
         assert!(matches!(result, Ok(McpRequestClassification::Modern(_))));
     }
 
@@ -1549,7 +1553,10 @@ mod tests {
             });
             let mut headers = modern_headers(method);
             headers.insert(NAME_HEADER, HeaderValue::from_str(value).unwrap());
-            assert!(matches!(validate(&body, &headers, TEST_POLICY), Ok(McpRequestClassification::Modern(_))));
+            assert!(matches!(
+                validate(&body, &headers, MODERN_CAPABLE_POLICY),
+                Ok(McpRequestClassification::Modern(_))
+            ));
         }
     }
 
@@ -1567,7 +1574,7 @@ mod tests {
                 }
             }
         });
-        let error = validate(&body, &modern_headers("tools/call"), TEST_POLICY).unwrap_err();
+        let error = validate(&body, &modern_headers("tools/call"), MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1587,7 +1594,7 @@ mod tests {
         });
         let mut headers = modern_headers("resources/read");
         headers.insert(NAME_HEADER, HeaderValue::from_static("file:///other"));
-        let error = validate(&body, &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1607,7 +1614,7 @@ mod tests {
         });
         let mut headers = modern_headers("tools/call");
         headers.insert(NAME_HEADER, HeaderValue::from_static("=?base64?%%%?="));
-        let error = validate(&body, &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1629,7 +1636,7 @@ mod tests {
         let mut headers = modern_headers("tools/call");
         headers
             .insert(NAME_HEADER, HeaderValue::from_str(&format!("{BASE64_PREFIX}{encoded}{BASE64_SUFFIX}")).unwrap());
-        let error = validate(&body, &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1652,7 +1659,10 @@ mod tests {
             let mut body = body.clone();
             body["params"]["name"] = json!(name);
             headers.insert(NAME_HEADER, HeaderValue::from_str(name).unwrap());
-            assert!(matches!(validate(&body, &headers, TEST_POLICY), Ok(McpRequestClassification::Modern(_))));
+            assert!(matches!(
+                validate(&body, &headers, MODERN_CAPABLE_POLICY),
+                Ok(McpRequestClassification::Modern(_))
+            ));
         }
     }
 
@@ -1673,7 +1683,7 @@ mod tests {
         let mut headers = modern_headers("tools/call");
         headers.append(NAME_HEADER, HeaderValue::from_static("search"));
         headers.append(NAME_HEADER, HeaderValue::from_static("search"));
-        let error = validate(&body, &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
@@ -1758,14 +1768,14 @@ mod tests {
         });
         let mut headers = modern_headers("tools/call");
         headers.insert(NAME_HEADER, HeaderValue::from_static(" padded "));
-        let error = validate(&body, &headers, TEST_POLICY).unwrap_err();
+        let error = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::HEADER_MISMATCH);
     }
 
     #[test]
     fn modern_client_response_post_is_invalid_request() {
         let body = json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete"}});
-        let error = validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap_err();
+        let error = validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::INVALID_REQUEST);
         assert_eq!(error.id, Some(json!(1)));
     }
@@ -1775,7 +1785,7 @@ mod tests {
         for invalid_id in [JsonValue::Null, json!(true), json!({"nested": "id"})] {
             let mut body = modern_body();
             body["id"] = invalid_id;
-            let error = validate(&body, &modern_headers("tools/list"), TEST_POLICY).unwrap_err();
+            let error = validate(&body, &modern_headers("tools/list"), MODERN_CAPABLE_POLICY).unwrap_err();
             assert_eq!(error.code, error_codes::INVALID_REQUEST);
             assert_eq!(error.id, None);
         }
@@ -1787,7 +1797,7 @@ mod tests {
             &modern_headers("tools/list"),
             br#"{"jsonrpc":"#,
             LegacySessionEvidence::Absent,
-            TEST_POLICY,
+            MODERN_CAPABLE_POLICY,
         )
         .unwrap_err();
         assert_eq!(error.code, error_codes::PARSE_ERROR);
@@ -1804,16 +1814,21 @@ mod tests {
     #[test]
     fn modern_batch_is_invalid_request() {
         let body = serde_json::to_vec(&json!([modern_body()])).unwrap();
-        let error = validate_mcp_post(&modern_headers("tools/list"), &body, LegacySessionEvidence::Absent, TEST_POLICY)
-            .unwrap_err();
+        let error = validate_mcp_post(
+            &modern_headers("tools/list"),
+            &body,
+            LegacySessionEvidence::Absent,
+            MODERN_CAPABLE_POLICY,
+        )
+        .unwrap_err();
         assert_eq!(error.code, error_codes::INVALID_REQUEST);
     }
 
     #[test]
     fn body_signaled_modern_batch_is_invalid_without_headers() {
         let body = serde_json::to_vec(&json!([modern_body()])).unwrap();
-        let error =
-            validate_mcp_post(&HeaderMap::new(), &body, LegacySessionEvidence::Absent, TEST_POLICY).unwrap_err();
+        let error = validate_mcp_post(&HeaderMap::new(), &body, LegacySessionEvidence::Absent, MODERN_CAPABLE_POLICY)
+            .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(error.code, error_codes::INVALID_REQUEST);
     }

@@ -5,6 +5,19 @@
 //! `agent_gateway_audit_sink_skipped_total{reason="corrupt"}` and logs one
 //! warning per batch naming the segments. Entries with a seq at or below the
 //! cursor are ignored, and entries are delivered in file order.
+//!
+//! A sink with an attempt limit skips a record that has failed that many
+//! delivery attempts, counts it with `reason="rejected"` and logs one warning
+//! with the last error; without a limit the record is retried until delivered.
+//!
+//! A sink that leaves the registry (a Governance Audit integration disabled,
+//! given a tenant, moved to another category or deleted) is paused: its
+//! cursor moves to the durable seq and is parked there, letting go of the
+//! records it had not received, counted in
+//! `agent_gateway_audit_sink_skipped_total{reason="paused"}`. A sink that
+//! resumes continues from its parked cursor. Records produced while the
+//! registry change takes effect may still be delivered after the sink resumes,
+//! or be counted as paused. The VP Audit Log is never paused.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -15,11 +28,14 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{error, warn};
 
-use crate::audit::cursors::{CursorStore, JournalRead, journal_bytes, plan_backlog_skip, prune_segments, read_entries};
+use crate::audit::cursors::{
+    CursorStore, JournalRead, journal_bytes, plan_backlog_skip, prune_segments, read_entries, skipped_between,
+};
 use crate::audit::journal::{JournalEntry, segment_first_seq, segment_paths};
-use crate::audit::registry::{SinkId, Sinks};
+use crate::audit::registry::{SinkId, SinkRegistry, Sinks};
 use crate::metrics::backends::prometheus::{set_audit_journal_bytes, track_audit_sink_skipped};
 
 /// Hands one journalled record to a sink.
@@ -56,6 +72,10 @@ impl Default for ReaderConfig {
 /// The sink's current drop policy: records older than this are skipped.
 pub type MaxAge = Arc<dyn Fn() -> Option<Duration> + Send + Sync>;
 
+/// The sink's current attempt limit: a record it has failed to accept this
+/// many times is skipped.
+pub type MaxAttempts = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
+
 /// Where a sink reads from: the journal, its cursors and the last durable seq.
 #[derive(Clone)]
 pub struct JournalSource {
@@ -65,15 +85,34 @@ pub struct JournalSource {
 }
 
 /// Delivers every durable entry addressed to `sink`, in order, starting after
-/// its saved cursor. A sink without a cursor starts at the current durable
-/// seq and saves it at once. A failed delivery is retried with backoff and
-/// the cursor does not move past it. Runs until the journal writer is gone.
+/// its saved cursor, or after its parked one when it resumes from a pause. A
+/// sink with neither starts at the start of the journal and saves that at
+/// once (see [`CursorStore::start`]). A failed delivery is retried with
+/// backoff and the cursor does not move past it, until the record is older
+/// than `max_age` or has failed `max_attempts` times. Runs until the journal
+/// writer is gone or `cancel` fires; cancelling drops a delivery in flight,
+/// and its cursor stays before it.
 pub async fn run_reader<D: Deliver>(
     sink: SinkId,
     deliver: D,
     source: JournalSource,
     config: ReaderConfig,
     max_age: MaxAge,
+    max_attempts: MaxAttempts,
+    cancel: CancellationToken,
+) {
+    cancel
+        .run_until_cancelled(deliver_from_cursor(sink, deliver, source, config, max_age, max_attempts))
+        .await;
+}
+
+async fn deliver_from_cursor<D: Deliver>(
+    sink: SinkId,
+    deliver: D,
+    source: JournalSource,
+    config: ReaderConfig,
+    max_age: MaxAge,
+    max_attempts: MaxAttempts,
 ) {
     let JournalSource { dir, cursors, mut durable } = source;
     let (store, owned) = (cursors.clone(), sink.clone());
@@ -118,11 +157,36 @@ pub async fn run_reader<D: Deliver>(
                 .recipients
                 .contains(&sink);
             if addressed && !moved_past() {
-                let delivered = !expired()
-                    && deliver_until_accepted(&deliver, entry, &sink, &config, || moved_past() || expired()).await;
-                if !delivered && !moved_past() {
-                    track_audit_sink_skipped(sink.label(), "expired", 1);
-                    warn!(?sink, seq = entry.seq, "Audit record skipped: older than the sink's drop policy");
+                let delivery = if expired() {
+                    Delivery::Abandoned
+                } else {
+                    deliver_until_accepted(
+                        &deliver,
+                        entry,
+                        &sink,
+                        &config,
+                        || max_attempts(),
+                        || moved_past() || expired(),
+                    )
+                    .await
+                };
+                match delivery {
+                    Delivery::Accepted => {}
+                    _ if moved_past() => {}
+                    Delivery::Abandoned => {
+                        track_audit_sink_skipped(sink.label(), "expired", 1);
+                        warn!(?sink, seq = entry.seq, "Audit record skipped: older than the sink's drop policy");
+                    }
+                    Delivery::Rejected { attempts, error } => {
+                        track_audit_sink_skipped(sink.label(), "rejected", 1);
+                        warn!(
+                            ?sink,
+                            seq = entry.seq,
+                            attempts,
+                            error = format!("{error:#}"),
+                            "Audit record skipped: the sink did not accept it within its attempt limit"
+                        );
+                    }
                 }
             }
             cursor = entry
@@ -205,66 +269,116 @@ impl Default for DispatcherConfig {
 }
 
 /// Keeps one reader running per sink in `sinks`: starts readers for new
-/// sinks, stops removed sinks' readers and drops their cursors, drops cursors
-/// of sinks that no longer exist, and deletes segments every cursor has
-/// passed. Start it after the sinks have been built; it runs until aborted.
+/// sinks, pauses removed sinks and sinks with a cursor that are not in
+/// `sinks`, and deletes segments every active cursor has passed. Start it
+/// after the sinks have been built: a sink missing from them is paused. It runs until the
+/// journal writer is gone (`source.durable` closes) or `cancel` fires, then
+/// stops its readers and closes the cursor store, so nothing is delivered or
+/// saved after it returns. Each reader runs under a child of `cancel`, and a
+/// dispatcher dropped before it returns cancels its readers too.
 pub async fn run_dispatcher<F: SinkFactory>(
     factory: F,
     sinks: &'static Sinks,
     source: JournalSource,
     config: DispatcherConfig,
+    cancel: CancellationToken,
+) {
+    let mut readers = Readers::new();
+    cancel
+        .run_until_cancelled(dispatch(&factory, sinks, &source, &config, &cancel, &mut readers))
+        .await;
+    cancel.cancel();
+    for reader in readers.into_values() {
+        reader.stop().await;
+    }
+    source.cursors.close();
+}
+
+/// A running reader. Dropping it cancels the reader, so no reader outlives the
+/// dispatcher that started it.
+struct Reader {
+    cancel: DropGuard,
+    task: JoinHandle<()>,
+}
+
+impl Reader {
+    /// Cancels the reader and waits for it to end.
+    async fn stop(self) {
+        let Self { cancel, task } = self;
+        drop(cancel);
+        if let Err(e) = task.await {
+            warn!(error = %e, "An audit sink reader ended abnormally");
+        }
+    }
+}
+
+type Readers = HashMap<SinkId, Reader>;
+
+async fn dispatch<F: SinkFactory>(
+    factory: &F,
+    sinks: &'static Sinks,
+    source: &JournalSource,
+    config: &DispatcherConfig,
+    cancel: &CancellationToken,
+    readers: &mut Readers,
 ) {
     let mut changes = sinks.subscribe();
-    let mut readers: HashMap<SinkId, JoinHandle<()>> = HashMap::new();
+    let mut written = source.durable.clone();
     let mut prune = tokio::time::interval(config.prune_interval);
     prune.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut over_warning = false;
 
     let current = sinks.snapshot();
-    park_unknown_cursors(&source.cursors, current.ids(), &readers).await;
-    reconcile(&factory, sinks, &mut readers, &source, &config.reader).await;
+    park_unknown_cursors(source, current.ids(), readers).await;
+    reconcile(factory, sinks, readers, source, &config.reader, cancel).await;
     loop {
         tokio::select! {
             changed = changes.changed() => {
                 if changed.is_err() {
-                    break;
+                    return;
                 }
-                reconcile(&factory, sinks, &mut readers, &source, &config.reader).await;
+                reconcile(factory, sinks, readers, source, &config.reader, cancel).await;
+            }
+            writer = written.changed() => {
+                if writer.is_err() {
+                    return;
+                }
             }
             _ = prune.tick() => {
                 let current = sinks.snapshot();
-                park_unknown_cursors(&source.cursors, current.ids(), &readers).await;
-                prune_passed_segments(&source).await;
-                enforce_journal_limits(&source, &config, &mut over_warning).await;
+                park_unknown_cursors(source, current.ids(), readers).await;
+                prune_passed_segments(source).await;
+                enforce_journal_limits(source, config, &mut over_warning).await;
             }
         }
     }
-    readers
-        .values()
-        .for_each(JoinHandle::abort);
 }
 
+/// Starts readers for new sinks and pauses removed ones: a removed sink's
+/// reader is stopped, then the sink is paused (see [`pause`]). Then drops the
+/// parked cursors of deleted integrations: those neither a sink nor paused.
 async fn reconcile<F: SinkFactory>(
     factory: &F,
     sinks: &'static Sinks,
-    readers: &mut HashMap<SinkId, JoinHandle<()>>,
+    readers: &mut Readers,
     source: &JournalSource,
     config: &ReaderConfig,
+    cancel: &CancellationToken,
 ) {
     let current = sinks.snapshot();
     let ids = current.ids();
     let removed: Vec<SinkId> = readers
         .keys()
-        .filter(|id| !ids.contains(id))
+        .filter(|id| !ids.contains(id) && **id != SinkId::AuditLog)
         .cloned()
         .collect();
     for id in removed {
         if let Some(reader) = readers.remove(&id) {
-            reader.abort();
-            let _ = reader.await;
+            reader.stop().await;
         }
-        park_cursor(&source.cursors, &id).await;
+        pause(source, &id).await;
     }
+    drop_deleted_cursors(&source.cursors, &current).await;
     for id in ids {
         if !readers.contains_key(id) {
             let (sinks, owned) = (sinks, id.clone());
@@ -273,40 +387,119 @@ async fn reconcile<F: SinkFactory>(
                     .snapshot()
                     .drop_older_than(&owned)
             });
-            let reader =
-                tokio::spawn(run_reader(id.clone(), factory.deliverer(id), source.clone(), config.clone(), max_age));
-            readers.insert(id.clone(), reader);
+            let owned = id.clone();
+            let max_attempts: MaxAttempts = Arc::new(move || {
+                sinks
+                    .snapshot()
+                    .max_attempts(&owned)
+            });
+            let reader_cancel = cancel.child_token();
+            let task = tokio::spawn(run_reader(
+                id.clone(),
+                factory.deliverer(id),
+                source.clone(),
+                config.clone(),
+                max_age,
+                max_attempts,
+                reader_cancel.clone(),
+            ));
+            readers.insert(
+                id.clone(),
+                Reader {
+                    cancel: reader_cancel.drop_guard(),
+                    task,
+                },
+            );
         }
     }
 }
 
-/// Parks cursors of sinks that are neither configured nor being read. A sink
-/// that still has a reader is left to [`reconcile`], which stops the reader
-/// before parking, so a parked sink is never delivered to.
-async fn park_unknown_cursors(
+/// Forgets the parked cursors of sinks that are neither in `registry` nor
+/// paused in it. The VP Audit Log's cursor is never dropped.
+async fn drop_deleted_cursors(
     cursors: &Arc<CursorStore>,
-    ids: &[SinkId],
-    readers: &HashMap<SinkId, JoinHandle<()>>,
+    registry: &SinkRegistry,
 ) {
-    for sink in cursors.sinks() {
-        if !ids.contains(&sink) && !readers.contains_key(&sink) {
-            park_cursor(cursors, &sink).await;
+    let known: Vec<SinkId> = registry
+        .ids()
+        .iter()
+        .chain(registry.paused())
+        .cloned()
+        .collect();
+    let cursors = cursors.clone();
+    let dropped = blocking(move || cursors.retain_parked(|sink| *sink == SinkId::AuditLog || known.contains(sink)));
+    if let Err(e) = dropped.await {
+        warn!(error = %e, "Failed to drop the cursors of deleted audit integrations");
+    }
+}
+
+/// Pauses sinks with an active cursor that are neither configured nor being
+/// read, such as an integration paused while the gateway was stopped. A sink
+/// that still has a reader is left to [`reconcile`], which stops the reader
+/// before pausing, so a paused sink is never delivered to. The VP Audit Log
+/// is never paused.
+async fn park_unknown_cursors(
+    source: &JournalSource,
+    ids: &[SinkId],
+    readers: &Readers,
+) {
+    for sink in source.cursors.sinks() {
+        if !ids.contains(&sink) && !readers.contains_key(&sink) && sink != SinkId::AuditLog {
+            pause(source, &sink).await;
         }
     }
 }
 
-async fn park_cursor(
-    cursors: &Arc<CursorStore>,
+/// Pauses a sink with an active cursor: its cursor moves to the durable seq
+/// and is parked there, so the sink lets go of the records it had not
+/// received and, if it resumes, receives only records written after the
+/// pause. The entries addressed to it that it lets go are counted with
+/// `reason="paused"`, the unreadable lines with `reason="corrupt"`, and one
+/// warning gives both counts.
+async fn pause(
+    source: &JournalSource,
     sink: &SinkId,
 ) {
-    let (cursors, owned) = (cursors.clone(), sink.clone());
-    if let Err(e) = blocking(move || cursors.park(&owned)).await {
+    let Some(cursor) = source.cursors.get(sink) else {
+        return;
+    };
+    let upto = *source.durable.borrow();
+    let (dir, owned) = (source.dir.clone(), sink.clone());
+    match blocking(move || skipped_between(&dir, &owned, cursor, upto)).await {
+        Ok(moved) => {
+            track_audit_sink_skipped(sink.label(), "paused", moved.skipped);
+            if moved.corrupt > 0 {
+                track_audit_sink_skipped(sink.label(), "corrupt", moved.corrupt);
+            }
+            warn!(
+                ?sink,
+                skipped = moved.skipped,
+                unreadable = moved.corrupt,
+                from = cursor,
+                to = upto,
+                "Audit sink paused: it lets go of the records it had not received"
+            );
+        }
+        Err(e) => {
+            warn!(
+                ?sink,
+                from = cursor,
+                to = upto,
+                error = %e,
+                "Audit sink paused: it lets go of the records it had not received, which could not be counted"
+            );
+        }
+    }
+    let (cursors, owned) = (source.cursors.clone(), sink.clone());
+    if let Err(e) = blocking(move || cursors.park_at(&owned, upto)).await {
         warn!(?sink, error = %e, "Failed to park an audit sink cursor");
     }
 }
 
 /// Deletes segments every active cursor has passed and forgets parked
-/// cursors whose entries are gone. Returns how many segments were deleted.
+/// cursors whose entries are gone; a paused sink without a cursor that
+/// resumes reads what is left, all of it written after its pause. Returns how
+/// many segments were deleted.
 async fn prune_passed_segments(source: &JournalSource) -> usize {
     let Some(passed) = source.cursors.min() else {
         return 0;
@@ -395,31 +588,50 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> std::io::Result<T> +
         .map_err(std::io::Error::other)?
 }
 
-/// Retries until the sink accepts the record (true) or `give_up` says to stop
-/// (false).
+/// How a record's delivery ended.
+enum Delivery {
+    Accepted,
+    /// `give_up` said to stop.
+    Abandoned,
+    /// It failed as many times as the sink's attempt limit; `error` is the
+    /// last failure.
+    Rejected {
+        attempts: u32,
+        error: anyhow::Error,
+    },
+}
+
+/// Retries until the sink accepts the record, it has failed `max_attempts`
+/// times (read after each failure), or `give_up` says to stop.
 async fn deliver_until_accepted<D: Deliver>(
     deliver: &D,
     entry: &JournalEntry,
     sink: &SinkId,
     config: &ReaderConfig,
+    max_attempts: impl Fn() -> Option<u32>,
     give_up: impl Fn() -> bool,
-) -> bool {
+) -> Delivery {
     let mut backoff = config.retry_initial;
-    while let Err(e) = deliver.deliver(entry).await {
+    let mut attempts: u32 = 0;
+    while let Err(error) = deliver.deliver(entry).await {
+        attempts = attempts.saturating_add(1);
+        if max_attempts().is_some_and(|limit| attempts >= limit) {
+            return Delivery::Rejected { attempts, error };
+        }
         warn!(
             ?sink,
             seq = entry.seq,
-            error = format!("{e:#}"),
+            error = format!("{error:#}"),
             retry_in_ms = backoff.as_millis() as u64,
             "Audit sink did not accept a record; retrying"
         );
         tokio::time::sleep(backoff).await;
         if give_up() {
-            return false;
+            return Delivery::Abandoned;
         }
         backoff = (backoff * 2).min(config.retry_max);
     }
-    true
+    Delivery::Accepted
 }
 
 async fn read(
@@ -467,6 +679,11 @@ mod tests {
         /// Refuses every entry from this seq on, like an integration that
         /// stopped receiving audit records; 0 refuses nothing.
         refuse_from: Arc<std::sync::atomic::AtomicU64>,
+        /// Refuses the entry with this seq every time, like a destination
+        /// that never accepts one record; 0 refuses nothing.
+        refuse_seq: Arc<std::sync::atomic::AtomicU64>,
+        /// Never completes a delivery, like a destination that never answers.
+        stalled: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Deliver for RecordingSink {
@@ -476,11 +693,24 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.attempts
                 .fetch_add(1, Ordering::SeqCst);
+            if self
+                .stalled
+                .load(Ordering::SeqCst)
+            {
+                std::future::pending::<()>().await;
+            }
             let refuse_from = self
                 .refuse_from
                 .load(Ordering::SeqCst);
             if refuse_from > 0 && entry.seq >= refuse_from {
                 anyhow::bail!("not receiving audit records");
+            }
+            if self
+                .refuse_seq
+                .load(Ordering::SeqCst)
+                == entry.seq
+            {
+                anyhow::bail!("record rejected");
             }
             if self
                 .failures_left
@@ -585,7 +815,45 @@ mod tests {
             deliver: RecordingSink,
             max_age: Option<Duration>,
         ) -> tokio::task::JoinHandle<()> {
-            tokio::spawn(run_reader(sink, deliver, self.source(), fast_retry(), Arc::new(move || max_age)))
+            self.spawn_cancellable(sink, deliver, max_age, CancellationToken::new())
+        }
+
+        fn spawn_cancellable(
+            &self,
+            sink: SinkId,
+            deliver: RecordingSink,
+            max_age: Option<Duration>,
+            cancel: CancellationToken,
+        ) -> tokio::task::JoinHandle<()> {
+            self.spawn_with(sink, deliver, max_age, None, cancel)
+        }
+
+        fn spawn_giving_up(
+            &self,
+            sink: SinkId,
+            deliver: RecordingSink,
+            max_attempts: u32,
+        ) -> tokio::task::JoinHandle<()> {
+            self.spawn_with(sink, deliver, None, Some(max_attempts), CancellationToken::new())
+        }
+
+        fn spawn_with(
+            &self,
+            sink: SinkId,
+            deliver: RecordingSink,
+            max_age: Option<Duration>,
+            max_attempts: Option<u32>,
+            cancel: CancellationToken,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(run_reader(
+                sink,
+                deliver,
+                self.source(),
+                fast_retry(),
+                Arc::new(move || max_age),
+                Arc::new(move || max_attempts),
+                cancel,
+            ))
         }
     }
 
@@ -720,7 +988,8 @@ mod tests {
         f.cursors
             .set(&sink_id, 0)
             .unwrap();
-        f.append(&[&[sink_id.clone()], &[sink_id.clone()], &[sink_id.clone()]]);
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed, addressed]);
         crate::audit::cursors::garble(f.dir.path(), 2);
         let before = corrupt_skips(&sink_id);
 
@@ -741,7 +1010,7 @@ mod tests {
             .set(&sink_id, 0)
             .unwrap();
         for _ in 0..3 {
-            f.append(&[&[sink_id.clone()]]);
+            f.append(&[std::slice::from_ref(&sink_id)]);
         }
         assert_eq!(
             segment_paths(f.dir.path())
@@ -755,7 +1024,7 @@ mod tests {
         let sink = RecordingSink::default();
         let reader = f.spawn(sink_id.clone(), sink.clone());
         wait_until(|| f.cursors.get(&sink_id) == Some(3)).await;
-        f.append(&[&[sink_id.clone()]]);
+        f.append(&[std::slice::from_ref(&sink_id)]);
         wait_until(|| f.cursors.get(&sink_id) == Some(4)).await;
 
         assert_eq!(*sink.delivered.lock(), vec![1, 2, 4]);
@@ -817,8 +1086,18 @@ mod tests {
 
     fn registry(ids: &[SinkId]) -> &'static Sinks {
         let sinks: &'static Sinks = Box::leak(Box::default());
-        sinks.replace(selecting_everything(ids));
+        sinks.replace(selecting_everything(ids), Vec::new());
         sinks
+    }
+
+    /// Replaces the sinks with `ids`, `paused` being integrations that exist
+    /// but do not receive audit records.
+    fn rebuild(
+        sinks: &Sinks,
+        ids: &[SinkId],
+        paused: &[SinkId],
+    ) {
+        sinks.replace(selecting_everything(ids), paused.to_vec());
     }
 
     fn selecting_everything(ids: &[SinkId]) -> Vec<crate::audit::registry::Sink> {
@@ -845,8 +1124,13 @@ mod tests {
         let mut f = Fixture::new();
         let factory = RecordingFactory::default();
         let sinks = registry(&[SinkId::AuditLog, siem()]);
-        let manager =
-            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
         wait_until(|| {
             f.cursors
                 .get(&SinkId::AuditLog)
@@ -876,8 +1160,13 @@ mod tests {
         let mut f = Fixture::new();
         let factory = RecordingFactory::default();
         let sinks = registry(&[SinkId::AuditLog]);
-        let manager =
-            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
         f.append(&[&[SinkId::AuditLog]]);
         wait_until(|| {
             f.cursors
@@ -886,7 +1175,7 @@ mod tests {
         })
         .await;
 
-        sinks.replace(selecting_everything(&[SinkId::AuditLog, siem()]));
+        rebuild(sinks, &[SinkId::AuditLog, siem()], &[]);
         f.append(&[&[SinkId::AuditLog, siem()]]);
         wait_until(|| f.cursors.get(&siem()) == Some(2)).await;
 
@@ -894,78 +1183,141 @@ mod tests {
         manager.abort();
     }
 
+    fn paused_skips(sink: &SinkId) -> u64 {
+        crate::metrics::backends::prometheus::AUDIT_SINK_SKIPPED
+            .with_label_values(&[sink.label(), "paused"])
+            .get()
+    }
+
     #[tokio::test]
-    async fn a_re_enabled_sink_resumes_where_it_stopped() {
+    async fn a_paused_sink_skips_to_the_durable_seq_and_counts_its_backlog() {
+        let paused = SinkId::Integration("paused-with-backlog".to_string());
         let mut f = Fixture::new();
         let factory = RecordingFactory::default();
-        let sinks = registry(&[SinkId::AuditLog, siem()]);
-        let manager =
-            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
-        f.append(&[&[SinkId::AuditLog, siem()]]);
-        wait_until(|| f.cursors.get(&siem()) == Some(1)).await;
-
-        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        factory
+            .deliverer(&paused)
+            .failures_left
+            .store(usize::MAX, Ordering::SeqCst);
+        let sinks = registry(&[SinkId::AuditLog, paused.clone()]);
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
+        let addressed = std::slice::from_ref(&paused);
+        f.append(&[addressed, &[SinkId::AuditLog], addressed, &[SinkId::AuditLog, paused.clone()]]);
         wait_until(|| {
-            f.cursors
-                .get(&siem())
-                .is_none()
+            factory
+                .deliverer(&paused)
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 2
         })
         .await;
-        f.append(&[&[SinkId::AuditLog]]);
-        sinks.replace(selecting_everything(&[SinkId::AuditLog, siem()]));
-        f.append(&[&[SinkId::AuditLog, siem()]]);
-        wait_until(|| f.cursors.get(&siem()) == Some(3)).await;
+        let before = paused_skips(&paused);
 
-        assert_eq!(factory.delivered(&siem()), vec![1, 3]);
+        rebuild(sinks, &[SinkId::AuditLog], std::slice::from_ref(&paused));
+        wait_until(|| f.cursors.parked(&paused) == Some(4)).await;
+        manager.abort();
+        let _ = manager.await;
+
+        assert_eq!(f.cursors.get(&paused), None);
+        assert_eq!(paused_skips(&paused), before + 3);
+        assert!(
+            factory
+                .delivered(&paused)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_sink_receives_only_records_produced_after_the_pause() {
+        let sink = SinkId::Integration("resumed-after-pause".to_string());
+        let mut f = Fixture::new();
+        let factory = RecordingFactory::default();
+        let sinks = registry(&[SinkId::AuditLog, sink.clone()]);
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
+        f.append(&[&[SinkId::AuditLog, sink.clone()]]);
+        wait_until(|| f.cursors.get(&sink) == Some(1)).await;
+        factory
+            .deliverer(&sink)
+            .refuse_from
+            .store(2, Ordering::SeqCst);
+        f.append(&[std::slice::from_ref(&sink), std::slice::from_ref(&sink)]);
+        wait_until(|| {
+            factory
+                .deliverer(&sink)
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 2
+        })
+        .await;
+        let before = paused_skips(&sink);
+
+        rebuild(sinks, &[SinkId::AuditLog], std::slice::from_ref(&sink));
+        wait_until(|| f.cursors.parked(&sink) == Some(3)).await;
+        f.append(&[&[SinkId::AuditLog]]);
+        factory
+            .deliverer(&sink)
+            .refuse_from
+            .store(0, Ordering::SeqCst);
+        rebuild(sinks, &[SinkId::AuditLog, sink.clone()], &[]);
+        f.append(&[&[SinkId::AuditLog, sink.clone()]]);
+        wait_until(|| f.cursors.get(&sink) == Some(5)).await;
+
+        assert_eq!(factory.delivered(&sink), vec![1, 5]);
+        assert_eq!(paused_skips(&sink), before + 2);
         manager.abort();
     }
 
     #[tokio::test]
-    async fn a_sink_disabled_mid_batch_keeps_every_record_it_refused() {
-        let mut f = Fixture::new();
+    async fn a_resumed_sink_whose_parked_cursor_was_pruned_receives_only_newer_records() {
+        let sink = SinkId::Integration("resumed-after-prune".to_string());
+        let mut f = Fixture::with_segment_bytes(1);
         let factory = RecordingFactory::default();
-        factory
-            .deliverer(&siem())
-            .refuse_from
-            .store(2, Ordering::SeqCst);
-        let sinks = registry(&[SinkId::AuditLog, siem()]);
-        let manager =
-            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
+        let sinks = registry(&[SinkId::AuditLog, sink.clone()]);
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_millis(5)),
+            CancellationToken::new(),
+        ));
+        f.append(&[std::slice::from_ref(&sink)]);
+        f.append(&[std::slice::from_ref(&sink)]);
+        wait_until(|| f.cursors.get(&sink) == Some(2)).await;
+
+        rebuild(sinks, &[SinkId::AuditLog], std::slice::from_ref(&sink));
+        wait_until(|| f.cursors.parked(&sink) == Some(2)).await;
+        for _ in 0..3 {
+            f.append(&[&[SinkId::AuditLog]]);
+        }
         wait_until(|| {
             f.cursors
-                .get(&siem())
-                .is_some()
-        })
-        .await;
-
-        f.append(&[&[siem()], &[siem()], &[siem()]]);
-        wait_until(|| {
-            factory
-                .deliverer(&siem())
-                .attempts
-                .load(Ordering::SeqCst)
-                >= 3
-        })
-        .await;
-        assert!(f.cursors.get(&siem()) < Some(2));
-
-        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
-        wait_until(|| {
-            f.cursors
-                .get(&siem())
+                .parked(&sink)
                 .is_none()
         })
         .await;
-        factory
-            .deliverer(&siem())
-            .refuse_from
-            .store(0, Ordering::SeqCst);
-        sinks.replace(selecting_everything(&[SinkId::AuditLog, siem()]));
-        wait_until(|| f.cursors.get(&siem()) == Some(3)).await;
+        assert_eq!(
+            segment_paths(f.dir.path())
+                .unwrap()
+                .len(),
+            1
+        );
 
-        let delivered = factory.delivered(&siem());
-        assert_eq!(delivered.first(), Some(&1));
-        assert_eq!(delivered[delivered.len() - 2..], [2, 3]);
+        rebuild(sinks, &[SinkId::AuditLog, sink.clone()], &[]);
+        f.append(&[&[SinkId::AuditLog, sink.clone()]]);
+        wait_until(|| f.cursors.get(&sink) == Some(6)).await;
+
+        assert_eq!(factory.delivered(&sink), vec![1, 2, 6]);
         manager.abort();
     }
 
@@ -974,8 +1326,13 @@ mod tests {
         let mut f = Fixture::new();
         let factory = RecordingFactory::default();
         let sinks = registry(&[SinkId::AuditLog, siem()]);
-        let manager =
-            tokio::spawn(run_dispatcher(factory.clone(), sinks, f.source(), manager_config(Duration::from_secs(60))));
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
         wait_until(|| {
             f.cursors
                 .get(&siem())
@@ -983,7 +1340,7 @@ mod tests {
         })
         .await;
 
-        sinks.replace(selecting_everything(&[SinkId::AuditLog]));
+        rebuild(sinks, &[SinkId::AuditLog], &[siem()]);
         wait_until(|| {
             f.cursors
                 .get(&siem())
@@ -1008,26 +1365,167 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursors_of_sinks_that_no_longer_exist_are_parked_at_start() {
+    async fn a_sink_paused_when_the_dispatcher_starts_skips_to_the_durable_seq() {
+        let paused = SinkId::Integration("paused-at-start".to_string());
+        let active = SinkId::Integration("active-at-start".to_string());
+        let mut f = Fixture::new();
+        let only_paused = std::slice::from_ref(&paused);
+        f.append(&[&[SinkId::AuditLog, active.clone(), paused.clone()], only_paused, only_paused]);
+        for sink in [&SinkId::AuditLog, &active, &paused] {
+            f.cursors
+                .set(sink, 0)
+                .unwrap();
+        }
+        let factory = RecordingFactory::default();
+        for sink in [&SinkId::AuditLog, &active] {
+            factory
+                .deliverer(sink)
+                .failures_left
+                .store(usize::MAX, Ordering::SeqCst);
+        }
+        let before = paused_skips(&paused);
+        let sinks = registry(&[]);
+        rebuild(sinks, &[SinkId::AuditLog, active.clone()], std::slice::from_ref(&paused));
+
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
+        wait_until(|| f.cursors.parked(&paused) == Some(3)).await;
+        wait_until(|| {
+            factory
+                .deliverer(&active)
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 1
+        })
+        .await;
+
+        assert_eq!(paused_skips(&paused), before + 3);
+        assert_eq!(
+            f.cursors
+                .get(&SinkId::AuditLog),
+            Some(0)
+        );
+        assert_eq!(f.cursors.get(&active), Some(0));
+        assert_eq!(
+            f.cursors
+                .parked(&SinkId::AuditLog),
+            None
+        );
+        manager.abort();
+    }
+
+    #[tokio::test]
+    async fn a_deleted_integrations_parked_cursor_is_dropped_on_rebuild() {
+        let deleted = SinkId::Integration("deleted-on-rebuild".to_string());
+        let kept = SinkId::Integration("still-paused-on-rebuild".to_string());
+        let f = Fixture::new();
+        for sink in [&deleted, &kept] {
+            f.cursors
+                .set(sink, 0)
+                .unwrap();
+            f.cursors
+                .park_at(sink, 0)
+                .unwrap();
+        }
+        let sinks = registry(&[]);
+        rebuild(sinks, &[SinkId::AuditLog, siem()], &[deleted.clone(), kept.clone()]);
+        let manager = tokio::spawn(run_dispatcher(
+            RecordingFactory::default(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
+        wait_until(|| f.cursors.get(&siem()) == Some(0)).await;
+        assert_eq!(f.cursors.parked(&deleted), Some(0));
+
+        rebuild(sinks, &[SinkId::AuditLog, siem()], std::slice::from_ref(&kept));
+        wait_until(|| {
+            f.cursors
+                .parked(&deleted)
+                .is_none()
+        })
+        .await;
+
+        assert_eq!(f.cursors.parked(&kept), Some(0));
+        assert_eq!(
+            f.cursors
+                .get(&SinkId::AuditLog),
+            Some(0)
+        );
+        manager.abort();
+    }
+
+    #[tokio::test]
+    async fn the_vp_audit_logs_cursor_is_never_dropped() {
         let f = Fixture::new();
         f.cursors
-            .set(&SinkId::Integration("deleted".to_string()), 0)
+            .set(&SinkId::AuditLog, 0)
             .unwrap();
+        f.cursors
+            .park_at(&SinkId::AuditLog, 0)
+            .unwrap();
+        let sinks = registry(&[siem()]);
+        let manager = tokio::spawn(run_dispatcher(
+            RecordingFactory::default(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
+        wait_until(|| f.cursors.get(&siem()) == Some(0)).await;
+
+        rebuild(sinks, &[siem()], &[]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            f.cursors
+                .parked(&SinkId::AuditLog),
+            Some(0)
+        );
+        manager.abort();
+    }
+
+    #[tokio::test]
+    async fn the_dispatcher_ends_and_saves_no_more_cursors_once_the_journal_writer_is_gone() {
+        let mut f = Fixture::new();
         let sinks = registry(&[SinkId::AuditLog]);
         let manager = tokio::spawn(run_dispatcher(
             RecordingFactory::default(),
             sinks,
             f.source(),
             manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
         ));
-
+        f.append(&[&[SinkId::AuditLog]]);
         wait_until(|| {
             f.cursors
-                .get(&SinkId::Integration("deleted".to_string()))
-                .is_none()
+                .get(&SinkId::AuditLog)
+                == Some(1)
         })
         .await;
-        manager.abort();
+
+        let Fixture { dir, cursors, durable, .. } = f;
+        drop(durable);
+        tokio::time::timeout(Duration::from_secs(5), manager)
+            .await
+            .expect("the dispatcher ends once the writer is gone")
+            .unwrap();
+
+        cursors
+            .set(&SinkId::AuditLog, 9)
+            .unwrap();
+        assert_eq!(
+            CursorStore::open(dir.path())
+                .unwrap()
+                .get(&SinkId::AuditLog),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -1066,6 +1564,7 @@ mod tests {
             registry(&[SinkId::AuditLog]),
             source,
             manager_config(Duration::from_millis(5)),
+            CancellationToken::new(),
         ));
         wait_until(|| {
             crate::audit::journal::segment_paths(dir.path())
@@ -1139,6 +1638,7 @@ mod tests {
                 journal_warn_bytes: 1,
                 journal_max_bytes: 1,
             },
+            CancellationToken::new(),
         ));
         for _ in 0..4 {
             let last = writer
@@ -1226,6 +1726,114 @@ mod tests {
         reader.abort();
     }
 
+    fn rejected_skips(sink: &SinkId) -> u64 {
+        crate::metrics::backends::prometheus::AUDIT_SINK_SKIPPED
+            .with_label_values(&[sink.label(), "rejected"])
+            .get()
+    }
+
+    #[tokio::test]
+    async fn a_record_refused_as_often_as_the_attempt_limit_is_skipped_and_counted() {
+        let sink_id = SinkId::Integration("rejected-after-limit".to_string());
+        let mut f = Fixture::new();
+        f.cursors
+            .set(&sink_id, 0)
+            .unwrap();
+        let sink = RecordingSink::default();
+        sink.refuse_seq
+            .store(1, Ordering::SeqCst);
+        let before = rejected_skips(&sink_id);
+        let reader = f.spawn_giving_up(sink_id.clone(), sink.clone(), 3);
+
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed]);
+        wait_until(|| f.cursors.get(&sink_id) == Some(2)).await;
+
+        assert_eq!(*sink.delivered.lock(), vec![2]);
+        assert_eq!(
+            sink.attempts
+                .load(Ordering::SeqCst),
+            4
+        );
+        assert_eq!(rejected_skips(&sink_id), before + 1);
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn without_an_attempt_limit_a_refused_record_is_retried_and_never_skipped() {
+        let sink_id = SinkId::Integration("rejected-without-limit".to_string());
+        let mut f = Fixture::new();
+        f.cursors
+            .set(&sink_id, 0)
+            .unwrap();
+        let sink = RecordingSink::default();
+        sink.refuse_seq
+            .store(1, Ordering::SeqCst);
+        let reader = f.spawn(sink_id.clone(), sink.clone());
+
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed]);
+        wait_until(|| {
+            sink.attempts
+                .load(Ordering::SeqCst)
+                >= 10
+        })
+        .await;
+
+        assert_eq!(f.cursors.get(&sink_id), Some(0));
+        assert!(
+            sink.delivered
+                .lock()
+                .is_empty()
+        );
+        assert_eq!(rejected_skips(&sink_id), 0);
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_limit_set_in_the_registry_reaches_a_running_reader() {
+        let sink_id = SinkId::Integration("limit-set-while-retrying".to_string());
+        let mut f = Fixture::new();
+        let factory = RecordingFactory::default();
+        factory
+            .deliverer(&sink_id)
+            .refuse_seq
+            .store(1, Ordering::SeqCst);
+        let sinks = registry(std::slice::from_ref(&sink_id));
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
+        let addressed = std::slice::from_ref(&sink_id);
+        f.append(&[addressed, addressed]);
+        wait_until(|| {
+            factory
+                .deliverer(&sink_id)
+                .attempts
+                .load(Ordering::SeqCst)
+                >= 3
+        })
+        .await;
+        assert_eq!(f.cursors.get(&sink_id), Some(0));
+        let before = rejected_skips(&sink_id);
+
+        sinks.replace(
+            selecting_everything(addressed)
+                .into_iter()
+                .map(|sink| sink.giving_up_after(Some(2)))
+                .collect(),
+            Vec::new(),
+        );
+        wait_until(|| f.cursors.get(&sink_id) == Some(2)).await;
+
+        assert_eq!(factory.delivered(&sink_id), vec![2]);
+        assert_eq!(rejected_skips(&sink_id), before + 1);
+        manager.abort();
+    }
+
     #[tokio::test]
     async fn a_failed_commit_keeps_the_cursor_and_reads_the_batch_again() {
         let mut f = Fixture::new();
@@ -1261,5 +1869,132 @@ mod tests {
             .await
             .expect("reader ended")
             .unwrap();
+    }
+
+    fn saved_cursor(
+        dir: &std::path::Path,
+        sink: &SinkId,
+    ) -> Option<u64> {
+        CursorStore::open(dir)
+            .unwrap()
+            .get(sink)
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_reader_ends_and_drops_the_delivery_in_flight() {
+        let mut f = Fixture::new();
+        f.cursors
+            .set(&siem(), 0)
+            .unwrap();
+        let sink = RecordingSink::default();
+        sink.stalled
+            .store(true, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let reader = f.spawn_cancellable(siem(), sink.clone(), None, cancel.clone());
+        f.append(&[&[siem()]]);
+        wait_until(|| {
+            sink.attempts
+                .load(Ordering::SeqCst)
+                == 1
+        })
+        .await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the reader ends once cancelled")
+            .unwrap();
+
+        assert!(
+            sink.delivered
+                .lock()
+                .is_empty()
+        );
+        assert_eq!(saved_cursor(f.dir.path(), &siem()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_dispatcher_stops_every_reader_before_it_returns() {
+        let mut f = Fixture::new();
+        let factory = RecordingFactory::default();
+        factory
+            .deliverer(&siem())
+            .stalled
+            .store(true, Ordering::SeqCst);
+        let sinks = registry(&[SinkId::AuditLog, siem()]);
+        let cancel = CancellationToken::new();
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            cancel.clone(),
+        ));
+        f.append(&[&[SinkId::AuditLog, siem()]]);
+        wait_until(|| {
+            f.cursors
+                .get(&SinkId::AuditLog)
+                == Some(1)
+                && factory
+                    .deliverer(&siem())
+                    .attempts
+                    .load(Ordering::SeqCst)
+                    == 1
+        })
+        .await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), manager)
+            .await
+            .expect("the dispatcher ends once cancelled")
+            .unwrap();
+        f.append(&[&[SinkId::AuditLog, siem()]]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(factory.delivered(&SinkId::AuditLog), vec![1]);
+        assert!(
+            factory
+                .delivered(&siem())
+                .is_empty()
+        );
+        assert_eq!(saved_cursor(f.dir.path(), &SinkId::AuditLog), Some(1));
+        assert_eq!(saved_cursor(f.dir.path(), &siem()), Some(0));
+        f.cursors
+            .set(&SinkId::AuditLog, 9)
+            .unwrap();
+        assert_eq!(saved_cursor(f.dir.path(), &SinkId::AuditLog), Some(1));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_dispatcher_stops_every_reader() {
+        let mut f = Fixture::new();
+        let factory = RecordingFactory::default();
+        let sinks = registry(&[SinkId::AuditLog, siem()]);
+        let manager = tokio::spawn(run_dispatcher(
+            factory.clone(),
+            sinks,
+            f.source(),
+            manager_config(Duration::from_secs(60)),
+            CancellationToken::new(),
+        ));
+        f.append(&[&[SinkId::AuditLog, siem()]]);
+        wait_until(|| {
+            f.cursors
+                .get(&SinkId::AuditLog)
+                == Some(1)
+                && f.cursors.get(&siem()) == Some(1)
+        })
+        .await;
+
+        manager.abort();
+        let _ = manager.await;
+        tokio::task::yield_now().await;
+        f.append(&[&[SinkId::AuditLog, siem()]]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(factory.delivered(&SinkId::AuditLog), vec![1]);
+        assert_eq!(factory.delivered(&siem()), vec![1]);
+        assert_eq!(saved_cursor(f.dir.path(), &SinkId::AuditLog), Some(1));
+        assert_eq!(saved_cursor(f.dir.path(), &siem()), Some(1));
     }
 }

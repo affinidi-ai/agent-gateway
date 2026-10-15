@@ -355,11 +355,13 @@ lazy_static! {
 
     /// Governance audit records the system itself lost, by reason. `journal_write` means
     /// the records could not be written to the audit journal and were discarded once the
-    /// in-memory backlog was full.
+    /// in-memory backlog was full; `journal_closed` that the journal writer had stopped;
+    /// `pipeline_not_running` that the audit pipeline was not running to take them;
+    /// `aborted` that the pipeline stopped before the journal writer had written them.
     pub static ref AUDIT_RECORDS_LOST: IntCounterVec = {
         let opts = Opts::new(
             names::AUDIT_RECORDS_LOST_TOTAL,
-            "Governance audit records the gateway lost before any sink received them (reason = journal_write)",
+            "Governance audit records the gateway lost before any sink received them (reason = journal_write|journal_closed|pipeline_not_running|aborted)",
         );
         let counter = IntCounterVec::new(opts, &["reason"]).unwrap();
         REGISTRY.register(Box::new(counter.clone())).unwrap();
@@ -385,27 +387,44 @@ lazy_static! {
         gauge
     };
 
-    /// Governance audit records a sink skipped, by sink and reason.
+    /// Governance audit records a sink skipped, by sink and reason:
+    /// `backlog_cap`, `expired`, `corrupt`, `paused` for records addressed
+    /// to an integration it let go when it was paused, or `rejected` for a
+    /// record that failed as many delivery attempts as the integration's
+    /// attempt limit.
     pub static ref AUDIT_SINK_SKIPPED: IntCounterVec = {
         let opts = Opts::new(
             names::AUDIT_SINK_SKIPPED_TOTAL,
-            "Governance audit records a sink skipped (reason = backlog_cap|expired|corrupt; sink = audit_log or the integration id)",
+            "Governance audit records a sink skipped (reason = backlog_cap|expired|corrupt|paused|rejected; sink = audit_log or the integration id)",
         );
         let counter = IntCounterVec::new(opts, &["sink", "reason"]).unwrap();
         REGISTRY.register(Box::new(counter.clone())).unwrap();
         counter
     };
 
-    /// Whether the governance audit pipeline started: 1 when it did, 0 when it
-    /// failed to start and no audit records are kept or forwarded.
+    /// Whether the governance audit pipeline is running: 1 when it is, 0 when
+    /// it failed to start or the node is in Standby, keeping and forwarding no
+    /// audit records.
     pub static ref AUDIT_PIPELINE_STARTED: IntGauge = {
         let opts = Opts::new(
             names::AUDIT_PIPELINE_STARTED,
-            "Whether the governance audit pipeline started (1) or failed to start, keeping and forwarding no audit records (0)",
+            "Whether the governance audit pipeline is running (1) or not, keeping and forwarding no audit records (0: failed to start, or the node is in Standby)",
         );
         let gauge = IntGauge::with_opts(opts).unwrap();
         REGISTRY.register(Box::new(gauge.clone())).unwrap();
         gauge
+    };
+
+    /// Governance audit sink rebuilds that could not list the integrations and
+    /// kept the previous sinks until a retry succeeds.
+    pub static ref AUDIT_SINK_REBUILD_FAILED: IntCounter = {
+        let opts = Opts::new(
+            names::AUDIT_SINK_REBUILD_FAILED_TOTAL,
+            "Governance audit sink rebuilds that failed to list integrations, keeping the previous sinks until a retry succeeds",
+        );
+        let counter = IntCounter::with_opts(opts).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
     };
 
     /// Consent epoch reads that failed, each closing every MCP subscription on the vault.
@@ -782,6 +801,10 @@ pub fn set_audit_pipeline_started(started: bool) {
     AUDIT_PIPELINE_STARTED.set(i64::from(started));
 }
 
+pub fn track_audit_sink_rebuild_failed() {
+    AUDIT_SINK_REBUILD_FAILED.inc();
+}
+
 pub fn track_audit_sink_skipped(
     sink: &str,
     reason: &str,
@@ -841,8 +864,9 @@ pub fn set_active_users(count: i64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, get_metrics, names, set_audit_pipeline_started,
-        track_a2a_protocol_version, track_fabric_forward_received,
+        A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, AUDIT_SINK_REBUILD_FAILED, get_metrics, names,
+        set_audit_pipeline_started, track_a2a_protocol_version, track_audit_sink_rebuild_failed,
+        track_fabric_forward_received,
     };
 
     #[test]
@@ -853,6 +877,15 @@ mod tests {
         set_audit_pipeline_started(true);
         assert_eq!(AUDIT_PIPELINE_STARTED.get(), 1);
         assert!(get_metrics().contains("agent_gateway_audit_pipeline_started 1"));
+    }
+
+    #[test]
+    fn a_failed_audit_sink_rebuild_is_counted() {
+        assert_eq!(names::AUDIT_SINK_REBUILD_FAILED_TOTAL, "agent_gateway_audit_sink_rebuild_failed_total");
+        let before = AUDIT_SINK_REBUILD_FAILED.get();
+        track_audit_sink_rebuild_failed();
+        assert!(AUDIT_SINK_REBUILD_FAILED.get() > before);
+        assert!(get_metrics().contains("agent_gateway_audit_sink_rebuild_failed_total"));
     }
 
     #[test]

@@ -16,6 +16,7 @@ adds procedures for deploying and operating an appliance, operator guides, and F
 | [Build From Source](development/GETTING_STARTED.md) | Build and run this source tree locally                                    |
 | [Development Guide](development/DEVELOPMENT.md)     | Debugging, Docker-from-source, tests, and development workflows           |
 | [Making Changes](development/MAKING_CHANGES.md)     | Recipes for the recurring change shapes, organised by what you want to do |
+| [Releasing](development/RELEASING.md)               | The Prepare/Publish release workflows, required secrets, and version rules |
 | [Testing](development/TESTING.md)                   | The four test layers, what belongs in each, and how to run them           |
 | [Contributing](../CONTRIBUTING.md)                  | Contribution process and required checks                                  |
 | [Project glossary](../CONTEXT.md)                   | Canonical terminology for source, tests, and repository documentation     |

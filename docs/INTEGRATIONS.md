@@ -48,9 +48,9 @@ configured destination.
 An integration with the category `general` serves every resource type. An integration with
 the category `audit` is a Governance Audit integration: it receives the audit events listed
 in its `audit_events` (none when the list is empty), may skip records older than
-`audit_drop_after_secs`, may be of any type (Email and Slack send one message per record),
-cannot belong to a tenant, and never receives resource events. Both fields are rejected on
-other categories. See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
+`audit_drop_after_secs` and records that failed `audit_max_attempts` delivery attempts, may be
+of any type (Email and Slack send one message per record), cannot belong to a tenant, and never
+receives resource events. These fields are rejected on other categories. See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
 ## Publishers
 
