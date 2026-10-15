@@ -402,6 +402,11 @@ pub fn variable(name: &str) -> Option<&'static VariableSpec> {
         .find(|variable| variable.name == name)
 }
 
+/// Every template variable any event fills.
+pub fn variables() -> &'static [VariableSpec] {
+    VARIABLES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

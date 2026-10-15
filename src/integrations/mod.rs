@@ -1,3 +1,4 @@
+pub mod api;
 pub mod async_triggers;
 pub mod audit_integration_triggers;
 pub mod background_tasks;
