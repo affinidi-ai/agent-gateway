@@ -73,8 +73,6 @@ const ApproveGatewayWizardPage = lazy(() => import('./ApproveGatewayWizardPage')
 const AddMcpProxyWizardPage = lazy(() => import('./AddMcpProxyWizardPage'));
 const AddMediatorWizardPage = lazy(() => import('./AddMediatorWizardPage'));
 const AddTrustRegistryWizardPage = lazy(() => import('./AddTrustRegistryWizardPage'));
-const UserIntegrationsPage = lazy(() => import('./UserIntegrationsPage'));
-const IdentityIntegrationsPage = lazy(() => import('./IdentityIntegrationsPage'));
 const EditJwtVerificationStrategyPage = lazy(() => import('./EditJwtVerificationStrategyPage'));
 const EditStsClientPage = lazy(() => import('./EditStsClientPage'));
 const EditAccessTokenPage = lazy(() => import('./EditAccessTokenPage'));
@@ -287,7 +285,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 />
                 <Route path="/identities" element={<IdentitiesPage />} />
                 <Route path="/identities/:did" element={<IdentitiesPage />} />
-                <Route path="/identities/integrations" element={<IdentityIntegrationsPage />} />
                 <Route
                   path="/surfaces"
                   element={
@@ -723,14 +720,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   }
                 />
                 <Route path="/users" element={<Navigate to="/settings?tab=users" replace />} />
-                <Route
-                  path="/users/integrations"
-                  element={
-                    <ProtectedRoute permission="users.edit">
-                      <UserIntegrationsPage />
-                    </ProtectedRoute>
-                  }
-                />
                 <Route
                   path="/users/:userId"
                   element={

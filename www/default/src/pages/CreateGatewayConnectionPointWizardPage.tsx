@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../api';
 import './OnboardWizard.css';
@@ -6,28 +6,23 @@ import './OnboardWizard.css';
 // Import step components
 import SelectMediatorStep from '../components/gateway-create-connection-point/SelectMediatorStep';
 import EnterDetailsStep from '../components/gateway-create-connection-point/EnterDetailsStep';
-import {
-  integrationIntegration,
-  IntegrationsStep,
-} from '../components/connection-points/IntegrationsStep';
 import CompleteStep from '../components/gateway-create-connection-point/CompleteStep';
-import { getRuntimeVariablesForCategories } from '../utils/runtimeVariables';
-import { AppButton } from '../components/shared/AppButton';
-import { Link } from '../components/shared/Link';
 
 // Define wizard steps
-type WizardStep = 'select-mediator' | 'enter-details' | 'integrations' | 'complete';
+type WizardStep = 'select-mediator' | 'enter-details' | 'complete';
 
-interface WizardState {
-  currentStep: WizardStep;
-  mediatorId: string | null;
+interface ConnectionPointDetails {
   gatewayId: string | null;
   name: string;
   description: string;
   secret: string;
   expirySeconds?: number;
   didMethod: string;
-  integrations: integrationIntegration[];
+}
+
+interface WizardState extends ConnectionPointDetails {
+  currentStep: WizardStep;
+  mediatorId: string | null;
   connectionPoint: any;
 }
 
@@ -42,46 +37,15 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
     description: '',
     secret: '',
     didMethod: 'web',
-    integrations: [] as any[],
     connectionPoint: null,
   });
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const [integrations, setIntegrations] = useState<any[]>([]);
-  const [integrationValidationErrors, setIntegrationValidationErrors] = useState(false);
-  const [runtimeVariables, setRuntimeVariables] = useState<
-    Record<string, { label: string; example: string; description?: string }>
-  >({});
-
-  // Fetch integrations and runtime variables for integrations step
-  useEffect(() => {
-    const fetchIntegrations = async () => {
-      try {
-        const response = await apiClient.get('/integrations');
-        setIntegrations(response.data || []);
-      } catch (err) {
-        console.error('Failed to fetch integrations:', err);
-      }
-    };
-
-    const fetchRuntimeVars = async () => {
-      try {
-        const vars = await getRuntimeVariablesForCategories(['general', 'connection_point']);
-        setRuntimeVariables(vars);
-      } catch (err) {
-        console.error('Failed to fetch runtime variables:', err);
-      }
-    };
-
-    fetchIntegrations();
-    fetchRuntimeVars();
-  }, []);
 
   const steps: { key: WizardStep; label: string }[] = [
     { key: 'select-mediator', label: 'Select Mediator' },
     { key: 'enter-details', label: 'Enter Details' },
-    { key: 'integrations', label: 'Integrations' },
     { key: 'complete', label: 'Complete' },
   ];
 
@@ -110,7 +74,8 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
     nextStep();
   };
 
-  const handleDetailsSubmit = (
+  /** Keeps the details, so a failed creation can be retried, and creates the connection point. */
+  const handleDetailsSubmit = async (
     gatewayId: string,
     name: string,
     description: string,
@@ -118,46 +83,34 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
     expirySeconds?: number,
     didMethod?: string
   ) => {
-    setWizardState(prev => ({
-      ...prev,
+    const details: ConnectionPointDetails = {
       gatewayId,
       name,
       description,
       secret,
       expirySeconds,
       didMethod: didMethod || 'web',
-    }));
-    nextStep();
-  };
-
-  const handleIntegrationsSubmit = () => {
-    nextStep();
-  };
-
-  const handleCreate = async () => {
+    };
+    setWizardState(prev => ({ ...prev, ...details }));
     try {
       setSaving(true);
       setError('');
 
-      // Create the connection point via the API
-      const payload: any = {
-        gateway_id: wizardState.gatewayId,
+      const response = await apiClient.post('/connection-points', {
+        gateway_id: details.gatewayId,
         mediator_id: wizardState.mediatorId,
-        name: wizardState.name,
-        description: wizardState.description,
-        secret: wizardState.secret,
-        expiry_seconds: wizardState.expirySeconds,
-        integrations: wizardState.integrations,
-        did_method: wizardState.didMethod,
-      };
-
-      const response = await apiClient.post('/connection-points', payload);
+        name: details.name,
+        description: details.description,
+        secret: details.secret,
+        expiry_seconds: details.expirySeconds,
+        did_method: details.didMethod,
+      });
 
       setWizardState(prev => ({
         ...prev,
         connectionPoint: response.data.connection_point,
+        currentStep: 'complete',
       }));
-      nextStep();
     } catch (err: any) {
       console.error('Failed to create connection point:', err);
       setError(err.message || 'Failed to create connection point. Please try again.');
@@ -211,71 +164,6 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
             initialExpirySeconds={wizardState.expirySeconds}
             initialDidMethod={wizardState.didMethod}
           />
-        );
-      case 'integrations':
-        return (
-          <div className="card shadow">
-            <div className="card-header py-3">
-              <h6 className="m-0 font-weight-bold text-primary">
-                <i className="fas fa-plug me-2"></i>
-                Integrations
-              </h6>
-            </div>
-            <div className="card-body">
-              <p className="text-muted mb-4">
-                Integrations let this connection point forward events, such as notifications, to
-                external services like email or Slack. As this step is optional, you can add or
-                change integrations later from the{' '}
-                <Link href="/integrations" variant="inline" external>
-                  Integrations page
-                </Link>
-                .
-              </p>
-              <IntegrationsStep
-                integrations={wizardState.integrations}
-                onChange={integrations => setWizardState(prev => ({ ...prev, integrations }))}
-                availableIntegrations={integrations}
-                onValidationChange={setIntegrationValidationErrors}
-                runtimeVariables={runtimeVariables}
-                category="connection_point"
-                bareSelector
-              />
-              <div className="mt-4 d-flex justify-content-between">
-                <AppButton
-                  variant="secondary"
-                  size="md"
-                  onClick={handleCancel}
-                  iconStart={<i className="fas fa-times"></i>}
-                >
-                  Cancel
-                </AppButton>
-                <div className="d-flex gap-2">
-                  <AppButton
-                    variant="secondary"
-                    size="md"
-                    onClick={prevStep}
-                    iconStart={<i className="fas fa-arrow-left"></i>}
-                  >
-                    Back
-                  </AppButton>
-                  <AppButton
-                    variant="primary"
-                    size="md"
-                    onClick={handleCreate}
-                    disabled={integrationValidationErrors}
-                    title={
-                      integrationValidationErrors
-                        ? 'Please fill in all integration variable values'
-                        : ''
-                    }
-                    iconStart={<i className="fas fa-check"></i>}
-                  >
-                    Create
-                  </AppButton>
-                </div>
-              </div>
-            </div>
-          </div>
         );
       case 'complete':
         return (
