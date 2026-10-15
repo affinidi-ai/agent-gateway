@@ -31,6 +31,26 @@ impl IntegrationPublisher for WebhookPublisher {
             .ok_or_else(|| anyhow::anyhow!("Missing url in webhook configuration"))?;
         crate::url_validation::validate_resolved_webhook_url(url)
             .map_err(|e| anyhow::anyhow!("Invalid webhook URL: {}", e))?;
+        if let Some(method) = config
+            .get("method")
+            .and_then(Value::as_str)
+            && !SUPPORTED_METHODS.contains(&method.to_uppercase().as_str())
+        {
+            anyhow::bail!("Unsupported HTTP method: {method}; use POST, PUT or PATCH");
+        }
+        if let Some(headers) = config.get("headers")
+            && !headers
+                .as_object()
+                .is_some_and(|headers| {
+                    headers
+                        .values()
+                        .all(Value::is_string)
+                })
+        {
+            anyhow::bail!(
+                "The headers must be an object of header names to string values; a value may be $SECRET:<secret_id>"
+            );
+        }
         Ok(())
     }
 
@@ -109,6 +129,8 @@ impl IntegrationPublisher for WebhookPublisher {
     }
 }
 
+const SUPPORTED_METHODS: &[&str] = &["POST", "PUT", "PATCH"];
+
 /// The `X-Webhook-Signature-256` value: `sha256=` and the hex HMAC-SHA256 of
 /// `timestamp.body` keyed with the signing secret.
 fn signature(
@@ -151,6 +173,56 @@ mod tests {
 
         assert_eq!(WebhookPublisher.complete_template(&template), template);
         assert_eq!(WebhookPublisher.escaping(&template), Escaping::None);
+    }
+
+    /// A public address as an IP literal, so validation needs no DNS.
+    const URL: &str = "https://93.184.215.14/hook";
+
+    #[test]
+    fn headers_are_an_object_of_strings_whose_values_may_reference_secrets() {
+        let valid = json!({"url": URL, "headers": {"Authorization": "$SECRET:hook-token", "X-Team": "ops"}});
+
+        assert!(
+            WebhookPublisher
+                .validate_config(&valid)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn refuses_headers_that_would_not_be_sent() {
+        // A reference resolves to a string, and only an object's string values are sent.
+        for headers in [json!("$SECRET:hook-headers"), json!(["Authorization"]), json!({"X-Count": 3})] {
+            let error = WebhookPublisher
+                .validate_config(&json!({"url": URL, "headers": headers}))
+                .expect_err("refused");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("headers"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_method_it_cannot_send_with() {
+        let error = WebhookPublisher
+            .validate_config(&json!({"url": URL, "method": "DELETE"}))
+            .expect_err("refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("DELETE"),
+            "{error}"
+        );
+        assert!(
+            WebhookPublisher
+                .validate_config(&json!({"url": URL, "method": "patch"}))
+                .is_ok()
+        );
     }
 
     #[test]

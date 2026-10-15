@@ -30,7 +30,8 @@ responses leave them out of `configuration` and name the ones set in `secrets`. 
 leaves a secret out keeps it, and one that sends it as `null` clears it. A secret field may
 instead hold `$SECRET:<secret_id>`, a reference to an appliance-wide secret in the secrets
 store, resolved at each delivery and shown in responses as written; a reference that does not
-resolve fails the delivery. An endpoint's `type` cannot change. Its configuration is checked by
+resolve fails the delivery. Webhook `headers` must be an object of header names to strings, and
+each header value may be such a reference; the field as a whole cannot be one. An endpoint's `type` cannot change. Its configuration is checked by
 its publisher when saved, so a webhook or Slack URL that fails the checks under _Outbound
 requests_ is refused with `400`.
 
