@@ -35,6 +35,7 @@ import { showToast } from '../utils/toaster';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
+const GENERATED_NAME_SIGNATURE = '\u0000generated-name';
 
 interface CreateBuilderState {
   nodes: CanvasNode[];
@@ -103,7 +104,8 @@ const AddSurfacePage: React.FC = () => {
   // `null` keeps the generated `<protocol>_surface_<n>` default, which
   // follows the protocol until the user types their own name.
   const [customName, setName] = useState<string | null>(null);
-  const name = customName ?? defaultSurfaceName(protocol, existingSurfaces ?? []);
+  const generatedName = defaultSurfaceName(protocol, existingSurfaces ?? []);
+  const name = customName ?? generatedName;
   const [publishToDid, setPublishToDid] = useState(false);
   const [terminateTraceId, setTerminateTraceId] = useState(false);
   const [issuerId, setIssuerId] = useState('');
@@ -482,9 +484,11 @@ const AddSurfacePage: React.FC = () => {
   // Compute the live dirty signature on every render. Cheap (a single
   // JSON.stringify of the canvas + meta state) and reused for both the
   // baseline-capture effect and the unsaved-changes prompt.
+  // The generated name changes when the surface list loads, so it is left
+  // out of the signature; only a name the user set counts as an edit.
   const currentSignature = serializeDirtySignature({
     nodes: builder.state.nodes,
-    name,
+    name: customName ?? GENERATED_NAME_SIGNATURE,
     description,
     tagsCsv,
     status,
@@ -502,11 +506,10 @@ const AddSurfacePage: React.FC = () => {
   // an unsaved-changes prompt without ever touching the form.
   useEffect(() => {
     if (baselineRef.current !== null) return;
-    if (existingSurfaces === null) return;
     const apNode = builder.state.nodes.find(n => n.id === 'access-point');
     if (!apNode?.config?.route) return;
     baselineRef.current = currentSignature;
-  }, [builder.state.nodes, currentSignature, existingSurfaces]);
+  }, [builder.state.nodes, currentSignature]);
 
   const isDirty =
     !saving &&
@@ -564,9 +567,12 @@ const AddSurfacePage: React.FC = () => {
         const tags = Array.isArray(payload.tags) ? payload.tags : [];
         // Only touch `name` when the payload actually carries the key.
         // Full-template apply deletes it so we preserve whatever the
-        // user has already typed (or the generated default).
+        // user has already typed (or the generated default). The Config
+        // tab always carries `name`; an unchanged generated default stays
+        // generated so it keeps following the protocol.
         if ('name' in payload) {
-          setName(typeof payload.name === 'string' ? payload.name : '');
+          const payloadName = typeof payload.name === 'string' ? payload.name : '';
+          setName(customName === null && payloadName === generatedName ? null : payloadName);
         }
         setDescription(typeof payload.description === 'string' ? payload.description : '');
         setTagsCsv(tags.join(', '));
@@ -592,7 +598,7 @@ const AddSurfacePage: React.FC = () => {
       }
       return null;
     },
-    [builder]
+    [builder, customName, generatedName]
   );
 
   const handleApplyStarterTemplate = useCallback(
