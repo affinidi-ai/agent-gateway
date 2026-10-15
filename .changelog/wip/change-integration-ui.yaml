@@ -16,7 +16,8 @@ changes:
     - timestamp: '2026-10-14T09:10:57.000Z'
       title: Store endpoints, event sets and integrations as separate definitions
       description: >-
-        Adds the endpoint definition (transport, destination and credentials), the event set
+        Adds the endpoint definition (transport, destination and credentials, whose secret
+        fields are kept when an update leaves them out and are never read back), the event set
         (events picked from the catalog, refused when empty or unknown), the integration that
         joins one endpoint and one event set through its template, and a shared store that
         keeps one JSON file per definition and lists them newest first.
