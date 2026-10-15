@@ -14,8 +14,7 @@ jest.mock('../../context/PermissionsContext', () => ({
 }));
 
 jest.mock('../IntegrationsPage', () => () => <div>integrations list</div>);
-jest.mock('../AddIntegrationWizardPage', () => () => <div>new integration</div>);
-jest.mock('../EditIntegrationPage', () => () => <div>integration editor</div>);
+jest.mock('../IntegrationEditorPage', () => () => <div>integration editor</div>);
 jest.mock('../EndpointEditorPage', () => () => <div>endpoint editor</div>);
 jest.mock('../EventSetEditorPage', () => () => <div>event set editor</div>);
 
@@ -54,7 +53,7 @@ test('MCP proxy permissions no longer open the integrations page', async () => {
 });
 
 test.each([
-  ['a new integration', ROUTES.INTEGRATION_NEW, 'new integration'],
+  ['a new integration', ROUTES.INTEGRATION_NEW, 'integration editor'],
   ['an integration', integrationPath('int-1'), 'integration editor'],
   ['a new endpoint', ROUTES.ENDPOINT_NEW, 'endpoint editor'],
   ['an endpoint', endpointPath('e1'), 'endpoint editor'],

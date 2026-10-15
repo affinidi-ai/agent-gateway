@@ -4,8 +4,7 @@ import ProtectedRoute from '../components/ProtectedRoute';
 import { ROUTES } from '../routes';
 
 const IntegrationsPage = lazy(() => import('./IntegrationsPage'));
-const AddIntegrationWizardPage = lazy(() => import('./AddIntegrationWizardPage'));
-const EditIntegrationPage = lazy(() => import('./EditIntegrationPage'));
+const IntegrationEditorPage = lazy(() => import('./IntegrationEditorPage'));
 const EndpointEditorPage = lazy(() => import('./EndpointEditorPage'));
 const EventSetEditorPage = lazy(() => import('./EventSetEditorPage'));
 
@@ -29,7 +28,7 @@ export function integrationRoutes(): React.ReactElement[] {
       path={ROUTES.INTEGRATION_NEW}
       element={
         <ProtectedRoute permission="integrations.edit">
-          <AddIntegrationWizardPage />
+          <IntegrationEditorPage />
         </ProtectedRoute>
       }
     />,
@@ -38,7 +37,7 @@ export function integrationRoutes(): React.ReactElement[] {
       path={`${ROUTES.INTEGRATIONS}/:id`}
       element={
         <ProtectedRoute permission="integrations.edit">
-          <EditIntegrationPage />
+          <IntegrationEditorPage />
         </ProtectedRoute>
       }
     />,
