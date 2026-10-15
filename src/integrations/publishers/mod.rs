@@ -16,6 +16,49 @@ pub use slack::SlackPublisher;
 pub use stream::StreamPublisher;
 pub use webhook::WebhookPublisher;
 
+use crate::integrations::delivery::render::Escaping;
+
+/// One integration's message, rendered and ready to send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    pub integration_id: String,
+    pub integration_name: String,
+    pub content: Value,
+}
+
+/// Whether an integration left its template empty.
+fn is_empty_template(template: &Value) -> bool {
+    template
+        .as_object()
+        .is_none_or(|fields| fields.is_empty())
+}
+
+/// What a webhook or stream integration sends when its template is empty.
+fn event_envelope() -> Value {
+    serde_json::json!({
+        "event_type": "${EVENT_TYPE}",
+        "event_name": "${EVENT_NAME}",
+        "timestamp": "${TIMESTAMP}",
+        "appliance_id": "${APPLIANCE_ID}",
+        "summary": "${EVENT_SUMMARY}",
+        "data": "${EVENT_DATA}"
+    })
+}
+
+/// `template` with each field of `defaults` it leaves out.
+fn with_defaults(
+    template: &Value,
+    defaults: Value,
+) -> Value {
+    let mut completed = defaults;
+    if let (Some(completed), Some(fields)) = (completed.as_object_mut(), template.as_object()) {
+        for (name, value) in fields {
+            completed.insert(name.clone(), value.clone());
+        }
+    }
+    completed
+}
+
 /// Trait for integration publishing implementations
 #[async_trait]
 pub trait IntegrationPublisher: Send + Sync {
@@ -50,6 +93,28 @@ pub trait IntegrationPublisher: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// The template an integration sends with: its own, completed with whatever the
+    /// transport needs that it leaves out.
+    fn complete_template(
+        &self,
+        template: &Value,
+    ) -> Value;
+
+    /// How values are escaped when `template` is rendered.
+    fn escaping(
+        &self,
+        _template: &Value,
+    ) -> Escaping {
+        Escaping::None
+    }
+
+    /// Sends a rendered message with an endpoint's configuration.
+    async fn send(
+        &self,
+        configuration: &Value,
+        message: &Message,
+    ) -> Result<()>;
 
     /// Publish a notification through the integration
     async fn publish(

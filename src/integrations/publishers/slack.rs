@@ -4,7 +4,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use super::IntegrationPublisher;
+use super::{IntegrationPublisher, Message, with_defaults};
+use crate::integrations::delivery::render::Escaping;
 use crate::integrations::runtime_variables::substitute_variables;
 use crate::storage::Integration;
 
@@ -50,6 +51,62 @@ impl IntegrationPublisher for SlackPublisher {
             .ok_or_else(|| anyhow::anyhow!("Missing webhook_url in Slack configuration"))?;
         crate::url_validation::validate_webhook_url(url).map_err(|e| anyhow::anyhow!("webhook_url rejected: {}", e))?;
         Ok(())
+    }
+
+    fn complete_template(
+        &self,
+        template: &Value,
+    ) -> Value {
+        with_defaults(template, serde_json::json!({"text": "*${EVENT_NAME}*\n${EVENT_SUMMARY}"}))
+    }
+
+    fn escaping(
+        &self,
+        _template: &Value,
+    ) -> Escaping {
+        Escaping::SlackMrkdwn
+    }
+
+    async fn send(
+        &self,
+        configuration: &Value,
+        message: &Message,
+    ) -> Result<()> {
+        let webhook_url = configuration
+            .get("webhook_url")
+            .and_then(Value::as_str)
+            .context("Missing webhook_url in Slack configuration")?;
+        crate::url_validation::validate_resolved_webhook_url(webhook_url)
+            .map_err(|e| anyhow::anyhow!("webhook_url rejected: {}", e))?;
+        let setting = |name: &str, default: &'static str| {
+            configuration
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or(default)
+                .to_string()
+        };
+        let payload = serde_json::json!({
+            "text": message.content.get("text").and_then(Value::as_str).unwrap_or_default(),
+            "username": setting("bot_name", "Agent Gateway"),
+            "icon_emoji": setting("icon_emoji", ":robot_face:"),
+        });
+        let response = crate::http_client::external()?
+            .post(webhook_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("Failed to send Slack webhook")?;
+        if response.status().is_success() {
+            info!(integration_id = %message.integration_id, "Slack message delivered");
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_default();
+        Err(anyhow::anyhow!("Slack webhook failed: {} - {}", status, body))
     }
 
     async fn publish(
@@ -168,6 +225,23 @@ mod tests {
 
     fn publisher() -> SlackPublisher {
         SlackPublisher
+    }
+
+    #[test]
+    fn an_empty_template_posts_the_event_name_and_summary() {
+        assert_eq!(
+            publisher().complete_template(&serde_json::json!({})),
+            serde_json::json!({"text": "*${EVENT_NAME}*\n${EVENT_SUMMARY}"})
+        );
+        assert_eq!(
+            publisher().complete_template(&serde_json::json!({"text": "${GATEWAY_NAME} changed"})),
+            serde_json::json!({"text": "${GATEWAY_NAME} changed"})
+        );
+    }
+
+    #[test]
+    fn values_are_escaped_for_mrkdwn() {
+        assert_eq!(publisher().escaping(&serde_json::json!({})), Escaping::SlackMrkdwn);
     }
 
     // ── validate_config SSRF checks ───────────────────────────────────────
