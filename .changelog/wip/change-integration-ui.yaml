@@ -1,9 +1,41 @@
 branch: change-integration-ui
 changes:
-  added: []
-  changed: []
+  added:
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Send test messages through an endpoint or an integration, saved or not
+      description: >-
+        POST /v1/integrations/endpoints/{id}/test sends the endpoint's default message,
+        POST /v1/integrations/{id}/test sends a saved integration's message for the first event
+        of its event set with sample values, and POST /v1/integrations/test does the same for an
+        integration not saved yet. A failed send answers 502 with the reason.
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Give every integration message the event's name, summary and data
+      description: >-
+        Templates can use EVENT_NAME, EVENT_SUMMARY (one line on what happened) and EVENT_DATA
+        (the event's values, or the audit record, as JSON). A template that leaves fields out
+        gets the endpoint type's defaults, so an empty template sends a complete message.
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Reference stored secrets from integration endpoints
+      description: >-
+        An endpoint secret field may hold $SECRET:<secret_id>, resolved from the appliance-wide
+        secrets store at each delivery, so one credential can serve several endpoints.
+  changed:
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Deliver every event to the integrations whose event set holds it
+      description: >-
+        Gateway, user, connection point, x402 and MPP events go to every active integration
+        with an active endpoint whose event set holds the event, from every resource, and
+        Governance Audit records go to every integration whose event set holds their audit
+        event. A placeholder with no value now renders empty instead of staying in the message.
   fixed: []
   removed:
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Remove integration categories and custom variables from gateway.json
+      description: >-
+        The integration section keeps only variable_pattern and variable_pattern_description;
+        categories, their variable lists and custom_variable_prefix are gone, and
+        storage_paths.integrations and storage_paths.integration_triggers are replaced by
+        integration_endpoints, integration_event_sets and integration_definitions.
     - timestamp: '2026-10-15T10:35:00.000Z'
       title: Stop reassigning integrations to tenants
       description: >-
@@ -17,13 +49,20 @@ changes:
         integrations. An integration receives every event its event set holds, from every
         resource, and custom _ variables are gone with the attachments that held their values.
     - timestamp: '2026-10-15T08:16:21.000Z'
-      title: Remove the integration test, trigger, config and runtime-variables routes
+      title: Remove the integration trigger, config and runtime-variables routes
       description: >-
-        POST /v1/integrations/test, /v1/integrations/{id}/trigger and
-        /v1/integrations/trigger-multiple, GET /v1/integrations/config and
-        /v1/integrations/runtime-variables are gone; GET /v1/integrations/catalog lists the
-        events, template variables and endpoint types instead.
+        /v1/integrations/{id}/trigger and /v1/integrations/trigger-multiple,
+        GET /v1/integrations/config and /v1/integrations/runtime-variables are gone; GET
+        /v1/integrations/catalog lists the events, template variables and endpoint types
+        instead. POST /v1/integrations/test now takes an integration that joins an endpoint and
+        an event set.
   security:
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Escape event values in HTML integration emails
+      description: >-
+        Values filled into an HTML email body have &, <, >, " and ' escaped, so caller-supplied
+        text such as a user name cannot add markup or links to the message. The template itself
+        is not escaped.
     - timestamp: '2026-10-15T08:16:21.000Z'
       title: Never return integration endpoint credentials from the API
       description: >-
@@ -48,7 +87,7 @@ changes:
     - timestamp: '2026-10-14T09:03:25.000Z'
       title: Add one catalog of every event the gateway delivers to integrations
       description: >-
-        Lists every delivered gateway, user, connection point message, x402, MPP and governance
+        Lists every delivered gateway, user, connection point, x402, MPP and governance
         audit event with its family, audit group and the template variables each delivery
         fills, so integrations can pick events without categories.
     - timestamp: '2026-10-14T09:10:57.000Z'
