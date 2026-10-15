@@ -102,10 +102,14 @@ const AddSurfacePage: React.FC = () => {
   const [surfaceId] = useState<string>(() => crypto.randomUUID());
   const [existingSurfaces, setExistingSurfaces] = useState<AgentSurface[] | null>(null);
   // `null` keeps the generated `<protocol>_surface_<n>` default, which
-  // follows the protocol until the user types their own name.
+  // follows the protocol until the user types a different name.
   const [customName, setName] = useState<string | null>(null);
   const generatedName = defaultSurfaceName(protocol, existingSurfaces ?? []);
   const name = customName ?? generatedName;
+  const setTypedName = useCallback(
+    (value: string) => setName(value === generatedName ? null : value),
+    [generatedName]
+  );
   const [publishToDid, setPublishToDid] = useState(false);
   const [terminateTraceId, setTerminateTraceId] = useState(false);
   const [issuerId, setIssuerId] = useState('');
@@ -567,12 +571,9 @@ const AddSurfacePage: React.FC = () => {
         const tags = Array.isArray(payload.tags) ? payload.tags : [];
         // Only touch `name` when the payload actually carries the key.
         // Full-template apply deletes it so we preserve whatever the
-        // user has already typed (or the generated default). The Config
-        // tab always carries `name`; an unchanged generated default stays
-        // generated so it keeps following the protocol.
+        // user has already typed (or the generated default).
         if ('name' in payload) {
-          const payloadName = typeof payload.name === 'string' ? payload.name : '';
-          setName(customName === null && payloadName === generatedName ? null : payloadName);
+          setTypedName(typeof payload.name === 'string' ? payload.name : '');
         }
         setDescription(typeof payload.description === 'string' ? payload.description : '');
         setTagsCsv(tags.join(', '));
@@ -598,7 +599,7 @@ const AddSurfacePage: React.FC = () => {
       }
       return null;
     },
-    [builder, customName, generatedName]
+    [builder, setTypedName]
   );
 
   const handleApplyStarterTemplate = useCallback(
@@ -797,7 +798,7 @@ const AddSurfacePage: React.FC = () => {
           didwebvh,
         }}
         setMeta={{
-          setName,
+          setName: setTypedName,
           setDescription,
           setTagsCsv,
           setStatus,

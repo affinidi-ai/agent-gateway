@@ -103,8 +103,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   `transit-point-listener-url`.
 - A new surface is named `<protocol>_surface_<n>` (`surfaceNaming.ts`), where `n` is one more
   than the existing surfaces of that protocol, skipping names already taken. The name follows
-  the protocol until the user types their own; it never derives from the route. Applying the
-  Config tab JSON with the generated name unchanged keeps it following the protocol. The
+  the protocol until the user types a different name, from the Name field or the Config tab
+  JSON; typing the generated name back keeps it generated. It never derives from the route. The
   unsaved-changes check ignores the generated name, so the surface list arriving never marks
   the page dirty and edits made while it loads still do.
 - **Networking** retryable status codes: an empty field means the gateway default and
