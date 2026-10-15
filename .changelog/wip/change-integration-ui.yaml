@@ -1,6 +1,15 @@
 branch: change-integration-ui
 changes:
   added:
+    - timestamp: '2026-10-15T16:00:00.000Z'
+      title: ⭐ Manage integrations, endpoints and event sets from one Integrations page
+      description: >-
+        The Integrations page has three tabs. Endpoints show the fields of their type, keep
+        stored secrets hidden and can point a secret field at a stored secret. Event sets pick
+        events from the whole catalog with search. The integration editor joins an endpoint
+        and an event set, writes the template with the event set's variables, sets the audit
+        delivery limits when audit events are picked, and sends a test as it stands. Endpoints
+        and event sets in use name their integrations instead of being deleted.
     - timestamp: '2026-10-15T13:20:00.000Z'
       title: Send test messages through an endpoint or an integration, saved or not
       description: >-
@@ -27,8 +36,27 @@ changes:
         with an active endpoint whose event set holds the event, from every resource, and
         Governance Audit records go to every integration whose event set holds their audit
         event. A placeholder with no value now renders empty instead of staying in the message.
-  fixed: []
+    - timestamp: '2026-10-15T16:00:00.000Z'
+      title: Guard the Integrations pages with the integrations permissions
+      description: >-
+        The Integrations sidebar item and pages need integrations.view, the editors and test
+        sends integrations.edit and deleting integrations.delete, instead of the MCP proxy
+        permissions. The editors move to /integrations/new and /integrations/{id}, and the
+        Audit page's Forward records starts an event set of every audit event.
+  fixed:
+    - timestamp: '2026-10-15T16:00:00.000Z'
+      title: Refuse webhook headers and methods an endpoint cannot send
+      description: >-
+        Webhook headers that are not an object of strings, including a $SECRET: reference as
+        the whole field, and methods other than POST, PUT and PATCH are refused when the
+        endpoint is saved, instead of being stored and silently not sent.
   removed:
+    - timestamp: '2026-10-15T16:00:00.000Z'
+      title: Remove integration tabs from gateway, connection point, user and identity pages
+      description: >-
+        An integration receives every event of its event set from every resource, so the
+        dashboard no longer attaches integrations to gateways, connection points, users or
+        identities, and the connection point wizard has no integrations step.
     - timestamp: '2026-10-15T13:20:00.000Z'
       title: Remove integration categories and custom variables from gateway.json
       description: >-
