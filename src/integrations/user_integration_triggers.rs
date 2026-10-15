@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
-use tracing::{error, info};
 
+use super::delivery::dispatch::dispatch;
 use super::filesystem::FileSystemNotificationStore;
 use crate::auth::storage::UserData;
 use crate::auth::types::{UserRole, UserStatus};
@@ -14,65 +14,47 @@ pub const USER_MAPPING_RULES: MappingRules = MappingRules {
     event_types: &["user.created", "user.approved", "user.updated", "user.deleted", "user.login", "user.accessed"],
 };
 
-/// Trigger user integrations for user.created event
 pub async fn trigger_user_created(
-    integration_store: &FileSystemNotificationStore,
+    _notifications: &FileSystemNotificationStore,
     user: &UserData,
 ) {
-    info!("Triggering user.created integrations for user: {}", user.user_id);
-    let runtime_values = user_runtime_values("user.created", None, Some(user));
-    trigger_user_integrations(integration_store, &runtime_values, "user.created").await;
+    dispatch("user.created", user_runtime_values("user.created", None, Some(user)));
 }
 
-/// Trigger user integrations for user.approved event
 pub async fn trigger_user_approved(
-    integration_store: &FileSystemNotificationStore,
+    _notifications: &FileSystemNotificationStore,
     user: &UserData,
 ) {
-    info!("Triggering user.approved integrations for user: {}", user.user_id);
-    let runtime_values = user_runtime_values("user.approved", None, Some(user));
-    trigger_user_integrations(integration_store, &runtime_values, "user.approved").await;
+    dispatch("user.approved", user_runtime_values("user.approved", None, Some(user)));
 }
 
-/// Trigger user integrations for user.updated event
 pub async fn trigger_user_updated(
-    integration_store: &FileSystemNotificationStore,
+    _notifications: &FileSystemNotificationStore,
     old_user: &UserData,
     new_user: &UserData,
 ) {
-    info!("Triggering user.updated integrations for user: {}", new_user.user_id);
-    let runtime_values = user_runtime_values("user.updated", Some(old_user), Some(new_user));
-    trigger_user_integrations(integration_store, &runtime_values, "user.updated").await;
+    dispatch("user.updated", user_runtime_values("user.updated", Some(old_user), Some(new_user)));
 }
 
-/// Trigger user integrations for user.deleted event
 pub async fn trigger_user_deleted(
-    integration_store: &FileSystemNotificationStore,
+    _notifications: &FileSystemNotificationStore,
     user: &UserData,
 ) {
-    info!("Triggering user.deleted integrations for user: {}", user.user_id);
-    let runtime_values = user_runtime_values("user.deleted", Some(user), None);
-    trigger_user_integrations(integration_store, &runtime_values, "user.deleted").await;
+    dispatch("user.deleted", user_runtime_values("user.deleted", Some(user), None));
 }
 
-/// Trigger user integrations for user.login event
 pub async fn trigger_user_login(
-    integration_store: &FileSystemNotificationStore,
+    _notifications: &FileSystemNotificationStore,
     user: &UserData,
 ) {
-    info!("Triggering user.login integrations for user: {}", user.user_id);
-    let runtime_values = user_runtime_values("user.login", None, Some(user));
-    trigger_user_integrations(integration_store, &runtime_values, "user.login").await;
+    dispatch("user.login", user_runtime_values("user.login", None, Some(user)));
 }
 
-/// Trigger user integrations for user.accessed event
 pub async fn trigger_user_accessed(
-    integration_store: &FileSystemNotificationStore,
+    _notifications: &FileSystemNotificationStore,
     user: &UserData,
 ) {
-    info!("Triggering user.accessed integrations for user: {}", user.user_id);
-    let runtime_values = user_runtime_values("user.accessed", None, Some(user));
-    trigger_user_integrations(integration_store, &runtime_values, "user.accessed").await;
+    dispatch("user.accessed", user_runtime_values("user.accessed", None, Some(user)));
 }
 
 /// The user fields an integration may receive in `OLD_STATE` and `NEW_STATE`. Passkeys, the
@@ -98,22 +80,6 @@ impl<'a> From<&'a UserData> for UserEventState<'a> {
             updated_at: user.updated_at,
         }
     }
-}
-
-/// Active `user` and `general` integrations without a tenant owner receive user events, which
-/// describe users across the whole appliance.
-fn receives_user_events(integration: &crate::storage::Integration) -> bool {
-    let matches_category = matches!(
-        integration
-            .category
-            .as_deref(),
-        Some("user" | "general")
-    );
-    matches_category
-        && integration.status == "active"
-        && integration
-            .tenant_id
-            .is_none()
 }
 
 /// Runtime variables for one user event: `old` is the user before it and `new` after it.
@@ -150,180 +116,9 @@ fn user_runtime_values(
     values
 }
 
-/// Internal helper to trigger integrations with the 'user' category
-async fn trigger_user_integrations(
-    _integration_store: &FileSystemNotificationStore,
-    runtime_values: &HashMap<String, String>,
-    event_type: &str,
-) {
-    // Get integration storage to list all integrations
-    let storage = match crate::storage::get_integration_storage() {
-        Some(storage) => storage,
-        None => {
-            error!("Notifier storage not initialized for {}", event_type);
-            return;
-        }
-    };
-
-    // Get all integrations
-    let integrations = match storage.list().await {
-        Ok(integrations) => integrations,
-        Err(e) => {
-            error!("Failed to list integrations for {}: {}", event_type, e);
-            return;
-        }
-    };
-
-    let user_integrations: Vec<_> = integrations
-        .into_iter()
-        .filter(receives_user_events)
-        .collect();
-
-    if user_integrations.is_empty() {
-        info!("No active user integrations configured for {}", event_type);
-        return;
-    }
-
-    info!("Found {} active user integrations to trigger for {}", user_integrations.len(), event_type);
-
-    // Load user integrations configuration to get custom variable values
-    // Get integration triggers storage path from global config
-    let triggers_path = match crate::storage::get_integration_triggers_storage_path() {
-        Some(path) => path,
-        None => {
-            error!("Integration triggers storage path not initialized for {}", event_type);
-            return;
-        }
-    };
-
-    let user_integrations_storage =
-        match crate::integrations::UserIntegrationsStorage::new(std::path::PathBuf::from(&triggers_path).join("users"))
-            .await
-        {
-            Ok(storage) => storage,
-            Err(e) => {
-                error!("Failed to create user integrations storage: {}", e);
-                return;
-            }
-        };
-
-    // Load configured integrations from trigger mappings
-    let configured_integrations = match user_integrations_storage
-        .load()
-        .await
-    {
-        Ok(config) => config.integration_integrations,
-        Err(e) => {
-            error!("Failed to load user integrations config: {}", e);
-            return;
-        }
-    };
-
-    // Trigger each integration
-    for integration in user_integrations {
-        // Check if this integration is configured in the trigger mappings
-        let integration_config = configured_integrations
-            .iter()
-            .find(|c| c.integration_id == integration.id);
-
-        if integration_config.is_none() {
-            info!(
-                "Skipping integration {} for event {} - not configured in user trigger mappings",
-                integration.name, event_type
-            );
-            continue;
-        }
-
-        let integration_config = integration_config.unwrap();
-
-        // Check if this event type should trigger this integration
-        // If event_types is empty, the integration is connected but will trigger for all events
-        if !integration_config
-            .event_types
-            .is_empty()
-            && !integration_config
-                .event_types
-                .contains(&event_type.to_string())
-        {
-            info!(
-                "Skipping integration {} for event {} - not in allowed event types: {:?}",
-                integration.name, event_type, integration_config.event_types
-            );
-            continue;
-        }
-
-        info!(
-            "Triggering user integration: {} (type: {}) for {}",
-            integration.name, integration.integration_type, event_type
-        );
-
-        // Build subject and message from event
-        let subject = format!("User Event: {}", event_type);
-        let message = format!("User event '{}' occurred", event_type);
-
-        // Use custom variables from the integration config
-        let mut merged_variables = integration_config
-            .variables
-            .clone();
-        merged_variables.extend(runtime_values.clone());
-
-        // Use the integration trigger service with merged variables
-        if let Err(e) = crate::integrations::integration_service::trigger_integration_with_variables(
-            &integration.id,
-            &subject,
-            &message,
-            &merged_variables,
-        )
-        .await
-        {
-            error!("Failed to trigger integration {} for {}: {}", integration.name, event_type, e);
-        } else {
-            info!("Successfully triggered user integration: {}", integration.name);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{receives_user_events, user_runtime_values};
-    use crate::storage::Integration;
-
-    fn integration(
-        category: &str,
-        status: &str,
-        tenant_id: Option<&str>,
-    ) -> Integration {
-        let mut integration = Integration::new(
-            "Sink".to_string(),
-            String::new(),
-            "webhook".to_string(),
-            serde_json::json!({}),
-            serde_json::json!({}),
-            status.to_string(),
-            Some(category.to_string()),
-        );
-        integration.tenant_id = tenant_id.map(str::to_string);
-        integration
-    }
-
-    #[test]
-    fn active_user_and_general_integrations_receive_user_events() {
-        assert!(receives_user_events(&integration("user", "active", None)));
-        assert!(receives_user_events(&integration("general", "active", None)));
-    }
-
-    #[test]
-    fn inactive_or_other_category_integrations_receive_no_user_events() {
-        assert!(!receives_user_events(&integration("user", "inactive", None)));
-        assert!(!receives_user_events(&integration("gateway", "active", None)));
-        assert!(!receives_user_events(&integration("audit", "active", None)));
-    }
-
-    #[test]
-    fn a_tenant_owned_integration_receives_no_appliance_wide_user_events() {
-        assert!(!receives_user_events(&integration("general", "active", Some("tenant-a"))));
-        assert!(!receives_user_events(&integration("user", "active", Some("tenant-a"))));
-    }
+    use super::user_runtime_values;
     use crate::auth::storage::UserData;
     use crate::auth::types::{UserRole, UserStatus};
     use std::collections::BTreeSet;
