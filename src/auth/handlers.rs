@@ -262,15 +262,15 @@ pub async fn register_finish(
         .notification_store
         .read()
         .await;
-    if notif_store_guard.is_some() {
-        if let Some(metrics_store) = metrics_store {
-            let user_role = user.role.clone();
-            tokio::spawn(async move {
-                metrics_store
-                    .record_user_event("created", user_role.to_string().as_str())
-                    .await;
-            });
-        }
+    if notif_store_guard.is_some()
+        && let Some(metrics_store) = metrics_store
+    {
+        let user_role = user.role.clone();
+        tokio::spawn(async move {
+            metrics_store
+                .record_user_event("created", user_role.to_string().as_str())
+                .await;
+        });
     }
     drop(notif_store_guard);
 
@@ -486,15 +486,15 @@ pub async fn login_finish(
         .notification_store
         .read()
         .await;
-    if notif_store_guard.is_some() {
-        if let Some(metrics_store) = metrics_store {
-            let user_role = user.role.clone();
-            tokio::spawn(async move {
-                metrics_store
-                    .record_user_login(user_role.to_string().as_str())
-                    .await;
-            });
-        }
+    if notif_store_guard.is_some()
+        && let Some(metrics_store) = metrics_store
+    {
+        let user_role = user.role.clone();
+        tokio::spawn(async move {
+            metrics_store
+                .record_user_login(user_role.to_string().as_str())
+                .await;
+        });
     }
     drop(notif_store_guard);
 

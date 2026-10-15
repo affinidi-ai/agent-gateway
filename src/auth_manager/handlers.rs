@@ -236,10 +236,10 @@ pub async fn get_user(
         .clone();
 
     crate::integrations::trigger_user_accessed(&user_data);
-    if notif_store.is_some() {
-        if let Some(metrics_store) = metrics_store {
-            spawn_record_user_event(metrics_store, "accessed".to_string(), user_data.role.clone());
-        }
+    if notif_store.is_some()
+        && let Some(metrics_store) = metrics_store
+    {
+        spawn_record_user_event(metrics_store, "accessed".to_string(), user_data.role.clone());
     }
 
     Ok(Json(User {
@@ -431,10 +431,10 @@ pub async fn update_user(
     }
 
     crate::integrations::trigger_user_updated(&user_before, &user_data);
-    if notification_store.is_some() {
-        if let Some(metrics_store) = metrics_store {
-            spawn_record_user_event(metrics_store, "updated".to_string(), user_data.role.clone());
-        }
+    if notification_store.is_some()
+        && let Some(metrics_store) = metrics_store
+    {
+        spawn_record_user_event(metrics_store, "updated".to_string(), user_data.role.clone());
     }
 
     Ok(Json(User {
