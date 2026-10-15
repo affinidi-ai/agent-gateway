@@ -12,6 +12,9 @@ use crate::audit::catalog::AUDIT_EVENTS;
 use crate::delegation_vault::audit::{
     AuditCallerContext, DelegationAuditAction, DelegationAuditEvent, action_category,
 };
+use crate::integrations::delivery::dispatch::{AuditReceiver, current_routes, deliver};
+use crate::integrations::delivery::values::event_values;
+use crate::integrations::events::find_event;
 use crate::storage::Integration;
 
 /// Integration category whose integrations receive governance audit records.
@@ -153,83 +156,74 @@ fn principal(caller: &AuditCallerContext) -> String {
         .unwrap_or_default()
 }
 
-/// One audit record, rendered once and shared by every subscribed integration.
+/// One audit record's delivery values, computed once and shared by every subscribed
+/// integration.
 #[derive(Debug, Clone)]
 pub(crate) struct AuditDelivery {
-    subject: String,
-    message: String,
-    variables: HashMap<String, String>,
+    values: HashMap<String, String>,
 }
 
 impl AuditDelivery {
-    pub(crate) fn subject(&self) -> &str {
-        &self.subject
-    }
-
-    pub(crate) fn message(&self) -> &str {
-        &self.message
-    }
-
-    pub(crate) fn variables(&self) -> &HashMap<String, String> {
-        &self.variables
+    pub(crate) fn values(&self) -> &HashMap<String, String> {
+        &self.values
     }
 
     pub(crate) fn from_event(event: &DelegationAuditEvent) -> Self {
-        let event_type = audit_event_type(event);
-        Self {
-            subject: format!("Governance Audit: {}", event_type),
-            message: format!("Governance audit record '{}' written", event_type),
-            variables: audit_variables(event),
-        }
+        let variables = audit_variables(event);
+        let values = match find_event(&audit_event_type(event)) {
+            Some(catalog_event) => {
+                event_values(catalog_event, variables, crate::storage::settings_store::global_appliance_id_override())
+            }
+            None => variables,
+        };
+        Self { values }
     }
 }
 
-/// The integration no longer receives audit records: it was disabled, given a
-/// tenant or moved out of the Governance Audit category.
+/// The integration no longer receives audit records: it was disabled, its endpoint was
+/// disabled, or its event set no longer holds audit events.
 #[derive(Debug, thiserror::Error)]
 #[error("integration {0} no longer receives audit records")]
 pub(crate) struct NotReceiving(String);
 
-/// Publishes one rendered record to a Governance Audit integration, counted in
-/// `agent_gateway_audit_forward_total`. An integration that no longer
-/// receives audit records refuses it with [`NotReceiving`], counted as
-/// `not_receiving`, so it is never reported as delivered: its reader retries
-/// until the dispatcher pauses the sink, which lets the record go and counts
-/// it as paused.
+/// Publishes one record to an integration that receives audit records, counted in
+/// `agent_gateway_audit_forward_total`. An integration that no longer receives them refuses
+/// it with [`NotReceiving`], counted as `not_receiving`, so it is never reported as
+/// delivered: its reader retries until the dispatcher pauses the sink, which lets the record
+/// go and counts it as paused.
 pub(crate) fn publish_audit_delivery(
     integration_id: String,
     delivery: AuditDelivery,
 ) -> BoxFuture<'static, anyhow::Result<()>> {
-    use crate::integrations::integration_service::load_integration;
-
     Box::pin(async move {
-        let integration = load_integration(&integration_id)
+        let routes = current_routes()
             .await
             .with_context(|| format!("loading audit integration {integration_id}"))?;
-        publish_audit_record(&integration, &delivery).await
+        publish_audit_record(routes.audit_receiver(&integration_id), &integration_id, &delivery).await
     })
 }
 
-/// [`publish_audit_delivery`] for an integration already loaded.
+/// [`publish_audit_delivery`] for the integration's audit route, `None` when it no longer
+/// receives audit records.
 async fn publish_audit_record(
-    integration: &Integration,
+    receiver: Option<AuditReceiver>,
+    integration_id: &str,
     delivery: &AuditDelivery,
 ) -> anyhow::Result<()> {
-    use crate::integrations::integration_service::publish_to_integration;
     use crate::metrics::backends::prometheus::track_audit_forward;
 
-    if !receives_audit_records(integration) {
-        track_audit_forward("not_receiving", Some(&integration.id));
-        return Err(NotReceiving(integration.id.clone()).into());
-    }
-    match publish_to_integration(integration, delivery.subject(), delivery.message(), delivery.variables()).await {
+    let Some(receiver) = receiver else {
+        track_audit_forward("not_receiving", Some(integration_id));
+        return Err(NotReceiving(integration_id.to_string()).into());
+    };
+    match deliver(&receiver.route, delivery.values()).await {
         Ok(()) => {
-            track_audit_forward("delivered", Some(&integration.id));
+            track_audit_forward("delivered", Some(integration_id));
             Ok(())
         }
         Err(e) => {
-            track_audit_forward("failed", Some(&integration.id));
-            Err(anyhow::Error::from(e).context(format!("publishing to audit integration {}", integration.id)))
+            track_audit_forward("failed", Some(integration_id));
+            Err(e.context(format!("publishing to audit integration {integration_id}")))
         }
     }
 }
@@ -325,20 +319,33 @@ mod tests {
     #[tokio::test]
     async fn an_integration_that_no_longer_receives_audit_records_refuses_the_record() {
         let delivery = AuditDelivery::from_event(&policy_decision("allow"));
-        for stopped in [
-            integration(Some(AUDIT_CATEGORY), "disabled", None),
-            integration(Some(AUDIT_CATEGORY), "active", Some("tenant-a")),
-            integration(Some("general"), "active", None),
-        ] {
-            let error = publish_audit_record(&stopped, &delivery)
-                .await
-                .unwrap_err();
+        let stopped = uuid::Uuid::new_v4().to_string();
 
-            assert!(error.is::<NotReceiving>(), "{error:#}");
-            assert_eq!(forwards("not_receiving", &stopped.id), 1);
-            assert_eq!(forwards("failed", &stopped.id), 0);
-            assert_eq!(forwards("delivered", &stopped.id), 0);
-        }
+        let error = publish_audit_record(None, &stopped, &delivery)
+            .await
+            .unwrap_err();
+
+        assert!(error.is::<NotReceiving>(), "{error:#}");
+        assert_eq!(forwards("not_receiving", &stopped), 1);
+        assert_eq!(forwards("failed", &stopped), 0);
+        assert_eq!(forwards("delivered", &stopped), 0);
+    }
+
+    #[test]
+    fn a_delivery_carries_the_record_and_the_event_name_summary_and_data() {
+        let event = policy_decision("deny");
+
+        let delivery = AuditDelivery::from_event(&event);
+
+        let values = delivery.values();
+        assert_eq!(values["EVENT_TYPE"], "audit.policy_decision");
+        assert_eq!(values["EVENT_NAME"], "Policy Decision");
+        assert_eq!(
+            values["EVENT_SUMMARY"],
+            "Policy Decision on surface Billing agent: deny by policy Deny unknown callers (caller not recognised) for ada@example.com"
+        );
+        assert_eq!(values["EVENT_DATA"], values["AUDIT_RECORD"]);
+        assert_eq!(values["AUDIT_DECISION"], "deny");
     }
 
     #[test]

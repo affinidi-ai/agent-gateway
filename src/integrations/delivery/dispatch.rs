@@ -204,6 +204,12 @@ const ROUTES_LIFETIME: Duration = Duration::from_secs(5);
 
 static ROUTES: Lazy<RoutesCache> = Lazy::new(|| RoutesCache::new(ROUTES_LIFETIME));
 
+/// The definitions as delivery sees them now: the cached snapshot of the shared stores.
+pub async fn current_routes() -> Result<Arc<Routes>> {
+    let stores = definition_stores().context("integration storage is not set up yet")?;
+    ROUTES.get(&stores).await
+}
+
 /// Makes the next event read the definitions again, after the API changed one.
 pub async fn invalidate_routes() {
     ROUTES.invalidate().await;
@@ -285,10 +291,7 @@ pub fn dispatch(
     };
     let values = event_values(event, trigger, crate::storage::settings_store::global_appliance_id_override());
     crate::integrations::background_tasks::spawn_background_task(event_id, async move {
-        let Some(stores) = definition_stores() else {
-            return;
-        };
-        let routes = match ROUTES.get(&stores).await {
+        let routes = match current_routes().await {
             Ok(routes) => routes,
             Err(error) => {
                 error!(event_id = %event.id, error = %error, "Failed to load integrations");
