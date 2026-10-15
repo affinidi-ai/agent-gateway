@@ -91,6 +91,22 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
+  access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
+  and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
+  (`_shared/RouteListenerSection.tsx`) with the shared `CopyButton`; a failed copy shows an
+  error toast. The canvas banner sits in the `.surface-canvas-topbar` flex row between the
+  variants widget and the toolbar, so it shrinks instead of sliding under either; only its
+  URL text truncates, and it leaves out the info icon. The Managed Agent panel does not
+  repeat the URL. Test ids: `access-point-entry-point-url` and `surface-entry-point-url`,
+  each with `-help` and `-copy-button`; the Transit Point's **Listener URL** banner is
+  `transit-point-listener-url`.
+- A new surface is named `<protocol>_surface_<n>` (`surfaceNaming.ts`), where `n` is one more
+  than the existing surfaces of that protocol, skipping names already taken. The name follows
+  the protocol until the user types a different name, from the Name field or the Config tab
+  JSON; typing the generated name back keeps it generated. It never derives from the route. The
+  unsaved-changes check ignores the generated name, so the surface list arriving never marks
+  the page dirty and edits made while it loads still do.
 - **Networking** retryable status codes: an empty field means the gateway default and
   saves no `retryable_status_codes`, and its placeholder says so. The **Retry on
   connection errors only** switch saves an empty list and disables the field. A field
