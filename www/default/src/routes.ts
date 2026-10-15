@@ -5,8 +5,13 @@ export const ROUTES = {
   ACCESS_TOKEN_NEW: '/access-tokens/new',
   INTEGRATIONS: '/integrations',
   INTEGRATION_NEW: '/integrations/new',
+  ENDPOINT_NEW: '/integrations/endpoints/new',
 } as const;
 
 /** The editor of one integration. */
 export const integrationPath = (id: string): string =>
   `${ROUTES.INTEGRATIONS}/${encodeURIComponent(id)}`;
+
+/** The editor of one integration endpoint. */
+export const endpointPath = (id: string): string =>
+  `${ROUTES.INTEGRATIONS}/endpoints/${encodeURIComponent(id)}`;

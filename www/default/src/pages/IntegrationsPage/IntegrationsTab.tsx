@@ -11,17 +11,13 @@ import { deleteIntegration, Integration, testIntegration } from '../../integrati
 import { integrationPath, ROUTES } from '../../routes';
 import { getErrorMessage } from '../../utils/apiError';
 import { showToast } from '../../utils/toaster';
+import { matches, STICKY_ERROR } from './listHelpers';
 import { IntegrationDefinitions } from './useIntegrationDefinitions';
-
-const STICKY_ERROR = { autoRemove: false };
 
 interface IntegrationsTabProps extends IntegrationDefinitions {
   searchTerm: string;
   onChanged: () => void;
 }
-
-const matches = (term: string, ...texts: (string | undefined)[]) =>
-  texts.some(text => text?.toLowerCase().includes(term));
 
 const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
   integrations,

@@ -2,11 +2,12 @@ import React, { useState } from 'react';
 import { Tab, Tabs } from 'react-bootstrap';
 import { useSearchParams } from 'react-router-dom';
 import SearchInput from '../../components/shared/SearchInput';
+import EndpointsTab from './EndpointsTab';
 import IntegrationsTab from './IntegrationsTab';
 import { useIntegrationDefinitions } from './useIntegrationDefinitions';
 
-type TabKey = 'integrations';
-const VALID_TABS: TabKey[] = ['integrations'];
+type TabKey = 'integrations' | 'endpoints';
+const VALID_TABS: TabKey[] = ['integrations', 'endpoints'];
 
 /** Integrations, and the endpoints and event sets they join. */
 const IntegrationsPage: React.FC = () => {
@@ -55,6 +56,8 @@ const IntegrationsPage: React.FC = () => {
             setSearchParams({ tab: next }, { replace: true });
           }}
           className="mb-3 custom-channel-tabs"
+          mountOnEnter
+          unmountOnExit
         >
           <Tab
             eventKey="integrations"
@@ -65,6 +68,16 @@ const IntegrationsPage: React.FC = () => {
             }
           >
             <IntegrationsTab {...definitions} searchTerm={searchTerm} onChanged={reload} />
+          </Tab>
+          <Tab
+            eventKey="endpoints"
+            title={
+              <>
+                <i className="fas fa-plug" aria-hidden="true"></i> Endpoints
+              </>
+            }
+          >
+            <EndpointsTab {...definitions} searchTerm={searchTerm} onChanged={reload} />
           </Tab>
         </Tabs>
       )}
