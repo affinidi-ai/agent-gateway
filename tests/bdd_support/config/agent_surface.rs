@@ -27,6 +27,7 @@ pub struct AccessPointFixture {
     pub agent_card_path: Option<String>,
     pub didwebvh_identity_id: Option<String>,
     pub caller_trust_check_list: Vec<Value>,
+    pub rate_limit: Option<Value>,
 }
 impl Default for AccessPointFixture {
     fn default() -> Self {
@@ -39,6 +40,7 @@ impl Default for AccessPointFixture {
             agent_card_path: None,
             didwebvh_identity_id: None,
             caller_trust_check_list: Vec::new(),
+            rate_limit: None,
         }
     }
 }
@@ -127,6 +129,7 @@ impl AgentSurfaceFixture {
                 agent_card_path: None,
                 didwebvh_identity_id: None,
                 caller_trust_check_list: Vec::new(),
+                rate_limit: None,
             },
             target: TargetFixture {
                 endpoint: target_endpoint.into(),
@@ -176,6 +179,15 @@ impl AgentSurfaceFixture {
     ) -> Self {
         self.access_point
             .agent_card_path = Some(agent_card_path.into());
+        self
+    }
+
+    pub fn with_rate_limit(
+        mut self,
+        requests: u32,
+        window_secs: u64,
+    ) -> Self {
+        self.access_point.rate_limit = Some(json!({ "requests": requests, "window_secs": window_secs }));
         self
     }
 
@@ -345,6 +357,9 @@ impl AgentSurfaceFixture {
             .agent_card_path
         {
             access_point["agent_card_path"] = json!(agent_card_path);
+        }
+        if let Some(rate_limit) = &self.access_point.rate_limit {
+            access_point["rate_limit"] = rate_limit.clone();
         }
         if let Some(identity_id) = &self
             .access_point
@@ -522,6 +537,7 @@ impl Default for AgentSurfaceFixture {
                 agent_card_path: None,
                 didwebvh_identity_id: None,
                 caller_trust_check_list: Vec::new(),
+                rate_limit: None,
             },
             target: TargetFixture {
                 endpoint: "".to_string(),

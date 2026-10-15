@@ -772,12 +772,18 @@ export interface Settings {
   prometheus_auth_enabled?: boolean;
   prometheus_auth_username?: string;
   audit_enabled?: boolean;
-  audit_categories?: {
-    policies?: boolean;
-    trust_checks?: boolean;
-    identity?: boolean;
-  };
+  audit_events?: string[]; // Audit event catalog names the VP Audit Log keeps
   appliance_id?: string; // Fills ${APPLIANCE_ID}; empty leaves it unfilled
+}
+
+/** One selectable audit event, from `GET /v1/settings/audit-events`. */
+export interface AuditEventCatalogEntry {
+  /** Name stored in `audit_events`. */
+  event: string;
+  label: string;
+  description: string;
+  group: string;
+  group_label: string;
 }
 
 /** Per-user settings overrides (display preferences only) */

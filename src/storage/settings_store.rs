@@ -6,6 +6,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use tokio::fs;
 use tracing::{info, warn};
 
+use crate::audit::catalog::event_bit;
+
 /// Process-global settings store, registered once at boot by the orchestrator.
 static GLOBAL_SETTINGS: OnceLock<Arc<SettingsStore>> = OnceLock::new();
 
@@ -14,26 +16,20 @@ pub fn set_global_settings_store(store: Arc<SettingsStore>) {
     let _ = GLOBAL_SETTINGS.set(store);
 }
 
+/// The global settings store, or `None` before `set_global_settings_store`
+/// has been called.
+pub fn global_settings_store() -> Option<&'static SettingsStore> {
+    GLOBAL_SETTINGS
+        .get()
+        .map(Arc::as_ref)
+}
+
 /// Read the current system-level settings from the global store.
 /// Returns `None` only before `set_global_settings_store` has been called.
 pub fn global_settings() -> Option<DashboardSettings> {
     GLOBAL_SETTINGS
         .get()
         .map(|s| s.get())
-}
-
-/// Which event categories write to the VP audit log.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct AuditCategories {
-    /// OPA allow/deny decisions (gateway + surface + MCP tool)
-    #[serde(default)]
-    pub policies: bool,
-    /// TRQP trust-check query outcomes
-    #[serde(default)]
-    pub trust_checks: bool,
-    /// Managed identity VP injections
-    #[serde(default)]
-    pub identity: bool,
 }
 
 /// Dashboard and system settings that can be configured by users
@@ -96,13 +92,13 @@ pub struct DashboardSettings {
     #[serde(default)]
     pub prometheus_auth_password_hash: String,
 
-    /// Whether VP audit logging is enabled
+    /// Whether the VP Audit Log keeps records. Off keeps `audit_events`.
     #[serde(default)]
     pub audit_enabled: bool,
 
-    /// Which event categories are written to the VP audit log
+    /// Catalog names of the events the VP Audit Log keeps
     #[serde(default)]
-    pub audit_categories: AuditCategories,
+    pub audit_events: Vec<String>,
 
     /// Operator-set id that fills `${APPLIANCE_ID}` in integration templates,
     /// e.g. the appliance's id in Agent Watch. Empty leaves the variable unfilled.
@@ -190,31 +186,41 @@ impl Default for DashboardSettings {
             prometheus_auth_username: String::new(),
             prometheus_auth_password_hash: String::new(),
             audit_enabled: false,
-            audit_categories: AuditCategories::default(),
+            audit_events: Vec::new(),
             appliance_id: String::new(),
         }
     }
 }
 
-impl DashboardSettings {
-    /// Returns true if the given audit category is enabled.
-    pub fn audit_category_enabled(
-        &self,
-        category: &str,
-    ) -> bool {
-        if !self.audit_enabled {
-            return false;
-        }
-        match category {
-            "policies" => self.audit_categories.policies,
-            "trust_checks" => {
-                self.audit_categories
-                    .trust_checks
-            }
-            "identity" => self.audit_categories.identity,
-            _ => false,
-        }
+/// Audit settings stored before per-event selection kept three booleans in
+/// `audit_categories`; each maps to one event.
+const STORED_AUDIT_CATEGORY_EVENTS: [(&str, &str); 3] =
+    [("policies", "policy_decision"), ("trust_checks", "trust_check"), ("identity", "vp_injected")];
+
+/// Moves stored `audit_categories` booleans into `audit_events` when the file
+/// has no `audit_events` yet.
+fn migrate_stored_settings(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let Some(categories) = object.remove("audit_categories") else {
+        return;
+    };
+    if object.contains_key("audit_events") {
+        return;
     }
+    let events: Vec<serde_json::Value> = STORED_AUDIT_CATEGORY_EVENTS
+        .iter()
+        .filter(|(category, _)| categories[*category].as_bool() == Some(true))
+        .map(|(_, event)| serde_json::Value::from(*event))
+        .collect();
+    object.insert("audit_events".to_string(), events.into());
+}
+
+fn parse_stored_settings(content: &str) -> serde_json::Result<DashboardSettings> {
+    let mut value: serde_json::Value = serde_json::from_str(content)?;
+    migrate_stored_settings(&mut value);
+    serde_json::from_value(value)
 }
 
 /// Settings store that manages persistent dashboard settings
@@ -250,7 +256,7 @@ impl SettingsStore {
         if self.storage_path.exists() {
             match fs::read_to_string(&self.storage_path).await {
                 Ok(content) => {
-                    match serde_json::from_str::<DashboardSettings>(&content) {
+                    match parse_stored_settings(&content) {
                         Ok(settings) => {
                             info!("Loaded settings from {:?}", self.storage_path);
                             info!("  Badge threshold: {} minutes", settings.badge_threshold_minutes);
@@ -295,7 +301,7 @@ impl SettingsStore {
         if self.storage_path.exists() {
             match std::fs::read_to_string(&self.storage_path) {
                 Ok(content) => {
-                    match serde_json::from_str::<DashboardSettings>(&content) {
+                    match parse_stored_settings(&content) {
                         Ok(settings) => {
                             info!("Loaded settings from {:?}", self.storage_path);
                             info!("  Badge threshold: {} minutes", settings.badge_threshold_minutes);
@@ -408,6 +414,14 @@ impl SettingsStore {
 
         if new_settings.metrics_retention_minutes < 1 || new_settings.metrics_retention_minutes > 10080 {
             anyhow::bail!("Metrics retention must be between 1 and 10,080 minutes (7 days)");
+        }
+
+        if new_settings
+            .audit_events
+            .iter()
+            .any(|event| event_bit(event).is_none())
+        {
+            anyhow::bail!("Audit events must be names from the audit event catalog");
         }
 
         // Update in-memory settings
@@ -626,9 +640,7 @@ impl UserSettingsStore {
                 .clone(),
             // Audit settings are system-level only
             audit_enabled: system.audit_enabled,
-            audit_categories: system
-                .audit_categories
-                .clone(),
+            audit_events: system.audit_events.clone(),
             appliance_id: system.appliance_id.clone(),
         }
     }
@@ -716,6 +728,105 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.appliance_id_override(), Some("aw-appliance-42".to_string()));
+    }
+
+    fn store_with_file(contents: &serde_json::Value) -> (TempDir, SettingsStore) {
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("settings.json"),
+            contents.to_string(),
+        )
+        .unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        (temp_dir, store)
+    }
+
+    #[test]
+    fn default_settings_audit_nothing() {
+        let settings = DashboardSettings::default();
+        assert!(!settings.audit_enabled);
+        assert!(
+            settings
+                .audit_events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stored_audit_categories_become_audit_events_on_load() {
+        let (_dir, store) = store_with_file(&serde_json::json!({
+            "audit_enabled": true,
+            "audit_categories": { "policies": true, "trust_checks": false, "identity": true }
+        }));
+        store.load_sync().unwrap();
+        let settings = store.get();
+        assert!(settings.audit_enabled);
+        assert_eq!(settings.audit_events, vec!["policy_decision".to_string(), "vp_injected".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stored_audit_categories_become_audit_events_on_async_load() {
+        let (_dir, store) = store_with_file(&serde_json::json!({
+            "audit_categories": { "trust_checks": true }
+        }));
+        store.load().await.unwrap();
+        assert_eq!(store.get().audit_events, vec!["trust_check".to_string()]);
+    }
+
+    #[test]
+    fn stored_audit_events_win_over_stored_audit_categories() {
+        let (_dir, store) = store_with_file(&serde_json::json!({
+            "audit_events": ["auth_failed"],
+            "audit_categories": { "policies": true }
+        }));
+        store.load_sync().unwrap();
+        assert_eq!(store.get().audit_events, vec!["auth_failed".to_string()]);
+    }
+
+    #[test]
+    fn saved_settings_carry_audit_events_and_not_audit_categories() {
+        let (dir, store) = store_with_file(&serde_json::json!({
+            "audit_categories": { "policies": true }
+        }));
+        store.load_sync().unwrap();
+        store.save_sync().unwrap();
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                dir.path()
+                    .join("settings.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["audit_events"], serde_json::json!(["policy_decision"]));
+        assert!(
+            saved
+                .get("audit_categories")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn update_rejects_an_unknown_audit_event() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        let settings = DashboardSettings {
+            audit_events: vec!["policy_decision".to_string(), "no_such_event".to_string()],
+            ..DashboardSettings::default()
+        };
+        assert!(
+            store
+                .update(settings)
+                .is_err()
+        );
+        assert!(
+            store
+                .get()
+                .audit_events
+                .is_empty()
+        );
     }
 
     #[test]

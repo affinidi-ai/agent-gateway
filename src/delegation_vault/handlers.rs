@@ -157,11 +157,18 @@ pub async fn revoke_token(
                 action = "revoke",
                 "Delegation token revoked via API"
             );
-            let mut evt =
-                super::audit::audit_event(super::audit::DelegationAuditAction::TokenRevoked, None, None, None, None);
-            evt.token_id = Some(id.to_string());
-            evt.caller = Some(caller_ctx);
-            super::audit::audit(evt);
+            super::audit::emit("token_revoked", || {
+                let mut evt = super::audit::audit_event(
+                    super::audit::DelegationAuditAction::TokenRevoked,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                evt.token_id = Some(id.to_string());
+                evt.caller = Some(caller_ctx);
+                evt
+            });
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => {
@@ -210,16 +217,18 @@ pub async fn revoke_user_tokens(
                 action = "revoke_all",
                 "All delegation tokens revoked for user via API"
             );
-            let mut evt = super::audit::audit_event(
-                super::audit::DelegationAuditAction::UserTokensRevoked,
-                None,
-                Some(&user_hash),
-                None,
-                None,
-            );
-            evt.detail = Some(format!("{} tokens revoked", count));
-            evt.caller = Some(caller_ctx);
-            super::audit::audit(evt);
+            super::audit::emit("user_tokens_revoked", || {
+                let mut evt = super::audit::audit_event(
+                    super::audit::DelegationAuditAction::UserTokensRevoked,
+                    None,
+                    Some(&user_hash),
+                    None,
+                    None,
+                );
+                evt.detail = Some(format!("{} tokens revoked", count));
+                evt.caller = Some(caller_ctx);
+                evt
+            });
             (StatusCode::OK, Json(serde_json::json!({"revoked": count}))).into_response()
         }
         Err(e) => {
@@ -539,109 +548,112 @@ pub async fn oauth_callback(
                 "OAuth consent complete — tokens stored in vault"
             );
 
-            // Audit: consent granted
-            let mut evt = super::audit::audit_event(
-                super::audit::DelegationAuditAction::ConsentGranted,
-                Some(&oauth_state.agent_did),
-                Some(&oauth_state.user_identity_hash),
-                Some(&provider_id),
-                Some(&oauth_state.surface_id),
-            );
-            evt.scopes = Some(granted_scopes.clone());
-            evt.provider_name = Some(provider.name.clone());
-            evt.token_id = Some(delegation_token_id_for_audit.clone());
-            evt.agent_identity_did = Some(oauth_state.agent_did.clone());
-            let surface = if let Some(ref cs) = state.agent_surface_store {
-                match cs
-                    .get(&oauth_state.surface_id)
-                    .await
-                {
-                    Ok(surface) => surface,
-                    Err(e) => {
-                        warn!(
-                            target: "credential_delegation",
-                            surface_id = %oauth_state.surface_id,
-                            error = %e,
-                            "Failed to load surface for consent_granted audit enrichment"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some(ch) = surface.as_ref() {
-                evt.channel_name = Some(ch.name.clone());
-            }
-
-            let workload_binding_enabled = surface
-                .as_ref()
-                .and_then(|ch| ch.transit.as_ref())
-                .map(|transit| {
-                    transit
-                        .points
-                        .iter()
-                        .any(|tp| {
-                            tp.workload_binding
-                                .as_ref()
-                                .is_some_and(|wb| wb.enabled)
-                        })
-                })
-                .unwrap_or(false);
-
-            // Mint the signed workload-binding VP only when workload-binding
-            // attestation is explicitly enabled for the surface. The callback
-            // response is just a static success page; any VP lives only in the
-            // operator audit trail.
-            if workload_binding_enabled {
-                if let Some(ref vc_issuer) = state.vc_issuer {
-                    let delegation_action = serde_json::json!({
-                        "providerId": provider.provider_id,
-                        "providerName": provider.name,
-                        "outcome": "consent_granted",
-                        "scopes": granted_scopes,
-                        "expiresAt": expires_at.map(|t| t.to_rfc3339()),
-                        "tokenId": delegation_token_id_for_audit.clone(),
-                    });
-                    let workload_binding = serde_json::json!({
-                        "agentIdentity": { "id": oauth_state.agent_did },
-                        "userIdentity": { "userIdentityHash": oauth_state.user_identity_hash },
-                        "delegationAction": delegation_action,
-                    });
-                    let identity_fields: std::collections::HashMap<String, serde_json::Value> =
-                        std::collections::HashMap::new();
-                    match vc_issuer
-                        .create_agent_identity_presentation_with_binding(
-                            &oauth_state.agent_did,
-                            &identity_fields,
-                            Some(workload_binding),
-                            None,
-                            None,
-                        )
+            // Audit: consent granted. Built only when a sink selects it, since
+            // it may mint a signed VP.
+            if super::audit::wants("consent_granted") {
+                let mut evt = super::audit::audit_event(
+                    super::audit::DelegationAuditAction::ConsentGranted,
+                    Some(&oauth_state.agent_did),
+                    Some(&oauth_state.user_identity_hash),
+                    Some(&provider_id),
+                    Some(&oauth_state.surface_id),
+                );
+                evt.scopes = Some(granted_scopes.clone());
+                evt.provider_name = Some(provider.name.clone());
+                evt.token_id = Some(delegation_token_id_for_audit.clone());
+                evt.agent_identity_did = Some(oauth_state.agent_did.clone());
+                let surface = if let Some(ref cs) = state.agent_surface_store {
+                    match cs
+                        .get(&oauth_state.surface_id)
                         .await
                     {
-                        Ok(jwt) => {
-                            evt.vp_jwt = Some(jwt);
-                        }
+                        Ok(surface) => surface,
                         Err(e) => {
                             warn!(
                                 target: "credential_delegation",
-                                agent_did = %oauth_state.agent_did,
-                                provider_id = %provider_id,
+                                surface_id = %oauth_state.surface_id,
                                 error = %e,
-                                "Failed to mint consent_granted workload-binding VP for audit log"
+                                "Failed to load surface for consent_granted audit enrichment"
                             );
+                            None
                         }
                     }
                 } else {
-                    warn!(
-                        target: "credential_delegation",
-                        "No VC issuer available — consent_granted workload-binding audit event will be unsigned"
-                    );
+                    None
+                };
+                if let Some(ch) = surface.as_ref() {
+                    evt.channel_name = Some(ch.name.clone());
                 }
-            }
 
-            super::audit::audit(evt);
+                let workload_binding_enabled = surface
+                    .as_ref()
+                    .and_then(|ch| ch.transit.as_ref())
+                    .map(|transit| {
+                        transit
+                            .points
+                            .iter()
+                            .any(|tp| {
+                                tp.workload_binding
+                                    .as_ref()
+                                    .is_some_and(|wb| wb.enabled)
+                            })
+                    })
+                    .unwrap_or(false);
+
+                // Mint the signed workload-binding VP only when workload-binding
+                // attestation is explicitly enabled for the surface. The callback
+                // response is just a static success page; any VP lives only in the
+                // operator audit trail.
+                if workload_binding_enabled {
+                    if let Some(ref vc_issuer) = state.vc_issuer {
+                        let delegation_action = serde_json::json!({
+                            "providerId": provider.provider_id,
+                            "providerName": provider.name,
+                            "outcome": "consent_granted",
+                            "scopes": granted_scopes,
+                            "expiresAt": expires_at.map(|t| t.to_rfc3339()),
+                            "tokenId": delegation_token_id_for_audit.clone(),
+                        });
+                        let workload_binding = serde_json::json!({
+                            "agentIdentity": { "id": oauth_state.agent_did },
+                            "userIdentity": { "userIdentityHash": oauth_state.user_identity_hash },
+                            "delegationAction": delegation_action,
+                        });
+                        let identity_fields: std::collections::HashMap<String, serde_json::Value> =
+                            std::collections::HashMap::new();
+                        match vc_issuer
+                            .create_agent_identity_presentation_with_binding(
+                                &oauth_state.agent_did,
+                                &identity_fields,
+                                Some(workload_binding),
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(jwt) => {
+                                evt.vp_jwt = Some(jwt);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "credential_delegation",
+                                    agent_did = %oauth_state.agent_did,
+                                    provider_id = %provider_id,
+                                    error = %e,
+                                    "Failed to mint consent_granted workload-binding VP for audit log"
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(
+                            target: "credential_delegation",
+                            "No VC issuer available — consent_granted workload-binding audit event will be unsigned"
+                        );
+                    }
+                }
+
+                super::audit::submit(evt);
+            }
 
             // Wake any parked tool-call tasks waiting for this vault key to
             // be populated by the MCP elicitation flow.

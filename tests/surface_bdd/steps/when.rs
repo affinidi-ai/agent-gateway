@@ -53,6 +53,19 @@ pub(crate) async fn record_replacement_mock_observation(world: &mut SurfaceWorld
 }
 
 pub(crate) async fn ensure_gateway_running(world: &mut SurfaceWorld) {
+    start_gateway_if_needed(world).await;
+}
+
+/// Whether a scenario gateway has been started, on either setup path.
+pub(crate) fn gateway_is_running(world: &SurfaceWorld) -> bool {
+    world.infra.is_some()
+        || !world
+            .runtimes
+            .gateway_instances
+            .is_empty()
+}
+
+async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     let need_gateway_setup_with_actors = world
         .actors
         .gateway_instances()
@@ -319,6 +332,15 @@ pub(crate) async fn ensure_gateway_running(world: &mut SurfaceWorld) {
     };
     if world.terms_enabled {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
+    }
+    // The A2A proxy dial refuses loopback targets unless the gateway's
+    // dev/test hatch is on; the non-A2A managed agent is a loopback mock.
+    if world
+        .surface_config
+        .a2a_proxy_target
+        .is_some()
+    {
+        gateway_env.insert("AG_ALLOW_LOCAL_A2A_PROXY".to_string(), "true".to_string());
     }
     let mut gateway = GatewayProcess::start_surface_with_env(&config_path, temp_dir.path(), &gateway_env);
     gateway = gateway
@@ -976,7 +998,7 @@ async fn operator_attempts_create_a2a_surface_with_header_metadata_mapping(
     create_surface(world, payload).await;
 }
 
-#[when(expr = "the caller sends an A2A message/send request to surface {string} with text {string}")]
+#[when(expr = "the caller sends an A2A message\\/send request to surface {string} with text {string}")]
 async fn caller_sends_a2a_message_send_with_text(
     world: &mut SurfaceWorld,
     surface_name: String,
@@ -993,7 +1015,9 @@ async fn caller_sends_a2a_message_send_with_text(
     send_a2a_proxy_request_and_record(world, body, Vec::new()).await;
 }
 
-#[when(expr = "the caller sends an A2A message/send request to surface {string} with text parts {string} and {string}")]
+#[when(
+    expr = "the caller sends an A2A message\\/send request to surface {string} with text parts {string} and {string}"
+)]
 async fn caller_sends_a2a_message_send_with_text_parts(
     world: &mut SurfaceWorld,
     surface_name: String,
@@ -1014,7 +1038,7 @@ async fn caller_sends_a2a_message_send_with_text_parts(
     send_a2a_proxy_request_and_record(world, body, Vec::new()).await;
 }
 
-#[when(expr = "the caller sends an A2A message/send request to surface {string} with a non-text part")]
+#[when(expr = "the caller sends an A2A message\\/send request to surface {string} with a non-text part")]
 async fn caller_sends_a2a_message_send_with_non_text_part(
     world: &mut SurfaceWorld,
     surface_name: String,
@@ -1069,7 +1093,7 @@ async fn caller_sends_a2a_method_to_surface(
 }
 
 #[when(
-    expr = "the caller sends an A2A message/send request to surface {string} with text {string} and header {string} set to {string}"
+    expr = "the caller sends an A2A message\\/send request to surface {string} with text {string} and header {string} set to {string}"
 )]
 async fn caller_sends_a2a_message_send_with_text_and_header(
     world: &mut SurfaceWorld,
@@ -1166,7 +1190,7 @@ async fn send_raw_request_and_record(
     record_replacement_mock_observation(world).await;
 }
 
-async fn send_request_and_record(
+pub(crate) async fn send_request_and_record(
     world: &mut SurfaceWorld,
     headers: Vec<(String, String)>,
 ) {
@@ -1369,7 +1393,7 @@ async fn read_audit_log_as_operator(
     record_admin_response(world, response);
 }
 
-async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
+pub(crate) async fn read_delegation_audit_trail(world: &mut SurfaceWorld) {
     record_delegation_audit_trail(world).await;
     let response = world
         .delegation_audit_trail
@@ -3114,6 +3138,15 @@ async fn start_gateways(world: &mut SurfaceWorld) {
                 .as_ref()
                 .unwrap_or_else(|| panic!("target '{}' fixture must be present", key))
                 .clone()
+        })
+        .map(|mut fixture| {
+            if world
+                .surface_config
+                .audit_log_keeps_every_event
+            {
+                fixture.settings = Some(crate::bdd_support::admin_client::audit_log_keeping_every_event());
+            }
+            fixture
         })
         .collect::<Vec<_>>();
     let fixtures_to_start = fixtures

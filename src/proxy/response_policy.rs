@@ -79,6 +79,9 @@ pub struct ResponsePolicyDecision {
     pub allow: bool,
     /// Reason for denial (if denied).
     pub reason: Option<String>,
+    /// Set when the policy could not decide; the response is denied and the
+    /// decision is recorded as `error`.
+    pub error: Option<crate::observability::PolicyEvaluationError>,
 }
 
 /// Evaluate a response policy using the policy manager.
@@ -98,7 +101,11 @@ pub fn evaluate_response_policy(
                 error = %e,
                 "Failed to serialize response policy input, allowing response"
             );
-            return ResponsePolicyDecision { allow: true, reason: None };
+            return ResponsePolicyDecision {
+                allow: true,
+                reason: None,
+                error: None,
+            };
         }
     };
 
@@ -116,9 +123,12 @@ pub fn evaluate_response_policy(
                         .reason
                         .or_else(|| Some("Response blocked by policy".to_string()))
                 },
+                error: None,
             }
         }
         Err(e) => {
+            // The engine error stays in this log line; callers and audit
+            // records only see the `evaluation_error` reason.
             warn!(
                 policy_key = %policy_key,
                 error = %e,
@@ -126,7 +136,8 @@ pub fn evaluate_response_policy(
             );
             ResponsePolicyDecision {
                 allow: false,
-                reason: Some(format!("Policy evaluation error: {}", e)),
+                reason: None,
+                error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
             }
         }
     }
@@ -174,6 +185,60 @@ mod tests {
         assert_eq!(json["response"]["status_code"], 200);
         assert_eq!(json["caller"]["did"], "did:example:caller");
         assert_eq!(json["surface"]["protocol"], "mcp");
+    }
+
+    fn minimal_input() -> ResponsePolicyInput {
+        ResponsePolicyInput {
+            response: ResponseContext {
+                status_code: 200,
+                body: None,
+                content_type: None,
+                is_error: false,
+                method: None,
+            },
+            caller: CallerContext {
+                did: None,
+                identity_source: None,
+                dna_uai: None,
+            },
+            surface: SurfaceContext {
+                id: "surf-001".to_string(),
+                name: "research-agent".to_string(),
+                protocol: "mcp".to_string(),
+            },
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn evaluation_error_is_an_error_decision_without_engine_detail() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        // Compiles, but `allow` gets two values for every input.
+        manager
+            .load_policy_text(
+                "response:surf-001",
+                "package surface.policy\n\nallow := true if {\n    true\n}\n\nallow := false if {\n    true\n}\n",
+            )
+            .unwrap();
+
+        let decision = evaluate_response_policy(&manager, "response:surf-001", minimal_input());
+
+        assert!(!decision.allow, "an evaluation error fails closed");
+        assert_eq!(decision.error, Some(crate::observability::PolicyEvaluationError::EvaluationError));
+        assert_eq!(decision.reason, None, "engine error text must not reach audit records or callers");
+    }
+
+    #[test]
+    fn a_denial_is_not_an_error() {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text("response:surf-001", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+
+        let decision = evaluate_response_policy(&manager, "response:surf-001", minimal_input());
+
+        assert!(!decision.allow);
+        assert_eq!(decision.error, None);
     }
 
     #[test]

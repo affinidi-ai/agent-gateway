@@ -85,7 +85,7 @@ pub struct TrustCheckAuditEvent<'a> {
     /// `None` on the target-leg "unavailable" pre-check paths
     /// (`AGENT_CARD_UNAVAILABLE`, `TRUST_REGISTRY_METADATA_UNAVAILABLE`)
     /// where the raw template strings would be noise, matching the
-    /// wire shape of [`crate::trust_registry_verification::TrustCheckResult`].
+    /// wire shape of [`crate::trust_registry_verification::trust_check_element::TrustCheckResult`].
     pub authority_id: Option<&'a str>,
     /// Resolved (or, on a pre-dispatch failure, templated) TRQP entity id.
     /// Same `None` semantics as `authority_id`.
@@ -176,12 +176,11 @@ pub fn record_trust_check(event: TrustCheckAuditEvent<'_>) {
     // element config) pass through unchanged. `None` (the target-leg
     // "unavailable" pre-check paths) is forwarded verbatim so the JSONL
     // omits the field, matching the wire shape.
-    if crate::storage::settings_store::global_settings()
-        .map(|s| s.audit_category_enabled("trust_checks"))
-        .unwrap_or(false)
-    {
+    if crate::audit::producer::producer().wants("trust_check") {
         let (authority_display, entity_display) = redacted_ids_for_audit(authority_id, entity_id);
         crate::delegation_vault::audit::audit_trust_check(
+            Some(surface_id),
+            crate::observability::policy_audit::current_span_trace_id().as_deref(),
             leg_str,
             authority_display.as_deref(),
             entity_display.as_deref(),
@@ -230,6 +229,60 @@ mod tests {
         assert_eq!(result_label(false, Some(NOT_AUTHORIZED)), RESULT_DENIED);
         assert_eq!(result_label(false, Some("TRUST_REGISTRY_UNREACHABLE")), RESULT_ERROR);
         assert_eq!(result_label(false, Some("TRUST_REGISTRY_PARSE_ERROR")), RESULT_ERROR);
+    }
+
+    fn caller_check(surface_id: &'static str) -> TrustCheckAuditEvent<'static> {
+        TrustCheckAuditEvent {
+            surface_id,
+            leg: TrustCheckLeg::Caller,
+            element_id: "tc-1",
+            element_name: None,
+            authority_id: Some("did:authority:a"),
+            entity_id: Some("did:entity:a"),
+            trust_registry_id: "tr-a",
+            query_type: TrqpQueryType::Recognition,
+            ok: false,
+            error_code: Some(NOT_RECOGNIZED),
+            error_detail: None,
+            latency_ms: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_record_carries_the_surface_and_the_caller() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "user-1".to_string(),
+            claims: serde_json::json!({"email": "ada@example.com"}),
+        };
+        let caller = crate::delegation_vault::audit::build_caller_context(&identity);
+        let ((), events) = crate::audit::producer::capture(crate::audit::context::with_caller(Some(caller), async {
+            record_trust_check(caller_check("surface-7"));
+        }))
+        .await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some("surface-7")
+        );
+        let caller = events[0]
+            .caller
+            .as_ref()
+            .expect("the trust check names its caller");
+        assert_eq!(caller.sub.as_deref(), Some("user-1"));
+        assert_eq!(caller.email.as_deref(), Some("ada@example.com"));
+    }
+
+    #[tokio::test]
+    async fn a_trust_check_outside_a_request_has_no_caller() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_trust_check(caller_check("surface-7"));
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].caller.is_none());
     }
 
     #[test]

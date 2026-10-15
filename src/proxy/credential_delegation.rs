@@ -331,17 +331,19 @@ pub async fn resolve_delegation_credentials(
                             provider_id = %binding.credential_provider_id,
                             "API key resolved — injecting into upstream request"
                         );
-                        let mut evt = audit::audit_event(
-                            DelegationAuditAction::TokenInjected,
-                            Some(agent_did),
-                            Some(user_identity_hash),
-                            Some(&binding.credential_provider_id),
-                            Some(channel_id),
-                        );
-                        evt.via_fabric = via_fabric;
-                        evt.detail = Some("api_key".to_string());
-                        enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                        audit::audit(evt);
+                        audit::emit("token_injected", || {
+                            let mut evt = audit::audit_event(
+                                DelegationAuditAction::TokenInjected,
+                                Some(agent_did),
+                                Some(user_identity_hash),
+                                Some(&binding.credential_provider_id),
+                                Some(channel_id),
+                            );
+                            evt.via_fabric = via_fabric;
+                            evt.detail = Some("api_key".to_string());
+                            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                            evt
+                        });
                         let headers = build_injection_headers(&binding.inject_as, &api_key);
                         results.push(DelegationResolution::new(
                             binding,
@@ -395,18 +397,20 @@ pub async fn resolve_delegation_credentials(
                                 "Failed to mark client_credentials token as used"
                             );
                         }
-                        let mut evt = audit::audit_event(
-                            DelegationAuditAction::TokenInjected,
-                            Some(agent_did),
-                            Some(m2m_user_hash),
-                            Some(&binding.credential_provider_id),
-                            Some(channel_id),
-                        );
-                        evt.token_id = Some(token.id.clone());
-                        evt.via_fabric = via_fabric;
-                        evt.detail = Some("client_credentials_cached".to_string());
-                        enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                        audit::audit(evt);
+                        audit::emit("token_injected", || {
+                            let mut evt = audit::audit_event(
+                                DelegationAuditAction::TokenInjected,
+                                Some(agent_did),
+                                Some(m2m_user_hash),
+                                Some(&binding.credential_provider_id),
+                                Some(channel_id),
+                            );
+                            evt.token_id = Some(token.id.clone());
+                            evt.via_fabric = via_fabric;
+                            evt.detail = Some("client_credentials_cached".to_string());
+                            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                            evt
+                        });
                         let headers = build_injection_headers(&binding.inject_as, &token.access_token);
                         results.push(DelegationResolution::new(
                             binding,
@@ -493,18 +497,20 @@ pub async fn resolve_delegation_credentials(
                             }
                         };
 
-                        let mut evt = audit::audit_event(
-                            DelegationAuditAction::TokenInjected,
-                            Some(agent_did),
-                            Some(m2m_user_hash),
-                            Some(&binding.credential_provider_id),
-                            Some(channel_id),
-                        );
-                        evt.token_id = Some(stored.id);
-                        evt.via_fabric = via_fabric;
-                        evt.detail = Some("client_credentials_fresh".to_string());
-                        enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                        audit::audit(evt);
+                        audit::emit("token_injected", || {
+                            let mut evt = audit::audit_event(
+                                DelegationAuditAction::TokenInjected,
+                                Some(agent_did),
+                                Some(m2m_user_hash),
+                                Some(&binding.credential_provider_id),
+                                Some(channel_id),
+                            );
+                            evt.token_id = Some(stored.id);
+                            evt.via_fabric = via_fabric;
+                            evt.detail = Some("client_credentials_fresh".to_string());
+                            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                            evt
+                        });
 
                         let headers = build_injection_headers(&binding.inject_as, &stored.access_token);
                         results.push(DelegationResolution::new(
@@ -523,17 +529,19 @@ pub async fn resolve_delegation_credentials(
                             error = %e,
                             "Client credentials token fetch failed"
                         );
-                        let mut evt = audit::audit_event(
-                            DelegationAuditAction::TokenNotFound,
-                            Some(agent_did),
-                            Some(m2m_user_hash),
-                            Some(&binding.credential_provider_id),
-                            Some(channel_id),
-                        );
-                        evt.via_fabric = via_fabric;
-                        evt.detail = Some(e.to_string());
-                        enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                        audit::audit(evt);
+                        audit::emit("token_not_found", || {
+                            let mut evt = audit::audit_event(
+                                DelegationAuditAction::TokenNotFound,
+                                Some(agent_did),
+                                Some(m2m_user_hash),
+                                Some(&binding.credential_provider_id),
+                                Some(channel_id),
+                            );
+                            evt.via_fabric = via_fabric;
+                            evt.detail = Some(e.to_string());
+                            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                            evt
+                        });
                         results.push(DelegationResolution::new(
                             binding,
                             Some(&provider.name),
@@ -610,17 +618,19 @@ pub async fn resolve_delegation_credentials(
                 }
 
                 // Audit: token injected
-                let mut evt = audit::audit_event(
-                    DelegationAuditAction::TokenInjected,
-                    Some(agent_did),
-                    Some(user_identity_hash),
-                    Some(&binding.credential_provider_id),
-                    Some(channel_id),
-                );
-                evt.token_id = Some(token.id.clone());
-                evt.via_fabric = via_fabric;
-                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                audit::audit(evt);
+                audit::emit("token_injected", || {
+                    let mut evt = audit::audit_event(
+                        DelegationAuditAction::TokenInjected,
+                        Some(agent_did),
+                        Some(user_identity_hash),
+                        Some(&binding.credential_provider_id),
+                        Some(channel_id),
+                    );
+                    evt.token_id = Some(token.id.clone());
+                    evt.via_fabric = via_fabric;
+                    enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                    evt
+                });
 
                 let headers = build_injection_headers(&binding.inject_as, &token.access_token);
                 results.push(DelegationResolution::new(
@@ -648,17 +658,19 @@ pub async fn resolve_delegation_credentials(
                         Ok(refreshed) => {
                             for action in [DelegationAuditAction::TokenRefreshed, DelegationAuditAction::TokenInjected]
                             {
-                                let mut event = audit::audit_event(
-                                    action,
-                                    Some(agent_did),
-                                    Some(user_identity_hash),
-                                    Some(&binding.credential_provider_id),
-                                    Some(channel_id),
-                                );
-                                event.token_id = Some(refreshed.id.clone());
-                                event.via_fabric = via_fabric;
-                                enrich_audit_event(&mut event, audit_ctx, binding, Some(&provider.name));
-                                audit::audit(event);
+                                audit::emit(audit::action_category(&action), || {
+                                    let mut event = audit::audit_event(
+                                        action,
+                                        Some(agent_did),
+                                        Some(user_identity_hash),
+                                        Some(&binding.credential_provider_id),
+                                        Some(channel_id),
+                                    );
+                                    event.token_id = Some(refreshed.id.clone());
+                                    event.via_fabric = via_fabric;
+                                    enrich_audit_event(&mut event, audit_ctx, binding, Some(&provider.name));
+                                    event
+                                });
                             }
                             results.push(DelegationResolution::new(
                                 binding,
@@ -742,30 +754,34 @@ pub async fn resolve_delegation_credentials(
                                 );
 
                                 // Audit: token refreshed
-                                let mut evt = audit::audit_event(
-                                    DelegationAuditAction::TokenRefreshed,
-                                    Some(agent_did),
-                                    Some(user_identity_hash),
-                                    Some(&binding.credential_provider_id),
-                                    Some(channel_id),
-                                );
-                                evt.token_id = Some(token.id.clone());
-                                evt.via_fabric = via_fabric;
-                                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                                audit::audit(evt);
+                                audit::emit("token_refreshed", || {
+                                    let mut evt = audit::audit_event(
+                                        DelegationAuditAction::TokenRefreshed,
+                                        Some(agent_did),
+                                        Some(user_identity_hash),
+                                        Some(&binding.credential_provider_id),
+                                        Some(channel_id),
+                                    );
+                                    evt.token_id = Some(token.id.clone());
+                                    evt.via_fabric = via_fabric;
+                                    enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                                    evt
+                                });
 
-                                let mut evt = audit::audit_event(
-                                    DelegationAuditAction::TokenInjected,
-                                    Some(agent_did),
-                                    Some(user_identity_hash),
-                                    Some(&binding.credential_provider_id),
-                                    Some(channel_id),
-                                );
-                                evt.token_id = Some(token.id.clone());
-                                evt.via_fabric = via_fabric;
-                                evt.detail = Some("after_refresh".to_string());
-                                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                                audit::audit(evt);
+                                audit::emit("token_injected", || {
+                                    let mut evt = audit::audit_event(
+                                        DelegationAuditAction::TokenInjected,
+                                        Some(agent_did),
+                                        Some(user_identity_hash),
+                                        Some(&binding.credential_provider_id),
+                                        Some(channel_id),
+                                    );
+                                    evt.token_id = Some(token.id.clone());
+                                    evt.via_fabric = via_fabric;
+                                    evt.detail = Some("after_refresh".to_string());
+                                    enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                                    evt
+                                });
 
                                 let headers = build_injection_headers(&binding.inject_as, &token.access_token);
                                 results.push(DelegationResolution::new(
@@ -785,17 +801,19 @@ pub async fn resolve_delegation_credentials(
                                     "Token refresh failed — requesting new consent"
                                 );
                                 // Audit: refresh failed
-                                let mut evt = audit::audit_event(
-                                    DelegationAuditAction::RefreshFailed,
-                                    Some(agent_did),
-                                    Some(user_identity_hash),
-                                    Some(&binding.credential_provider_id),
-                                    Some(channel_id),
-                                );
-                                evt.via_fabric = via_fabric;
-                                evt.detail = Some(e.to_string());
-                                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                                audit::audit(evt);
+                                audit::emit("refresh_failed", || {
+                                    let mut evt = audit::audit_event(
+                                        DelegationAuditAction::RefreshFailed,
+                                        Some(agent_did),
+                                        Some(user_identity_hash),
+                                        Some(&binding.credential_provider_id),
+                                        Some(channel_id),
+                                    );
+                                    evt.via_fabric = via_fabric;
+                                    evt.detail = Some(e.to_string());
+                                    enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                                    evt
+                                });
                                 // Fall through to consent_required
                                 let cr = build_consent_required(
                                     binding,
@@ -915,17 +933,19 @@ pub async fn resolve_delegation_credentials(
                     "Vault lookup failed"
                 );
                 // Audit: token not found (vault error)
-                let mut evt = audit::audit_event(
-                    DelegationAuditAction::TokenNotFound,
-                    Some(agent_did),
-                    Some(user_identity_hash),
-                    Some(&binding.credential_provider_id),
-                    Some(channel_id),
-                );
-                evt.via_fabric = via_fabric;
-                evt.detail = Some(e.to_string());
-                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                audit::audit(evt);
+                audit::emit("token_not_found", || {
+                    let mut evt = audit::audit_event(
+                        DelegationAuditAction::TokenNotFound,
+                        Some(agent_did),
+                        Some(user_identity_hash),
+                        Some(&binding.credential_provider_id),
+                        Some(channel_id),
+                    );
+                    evt.via_fabric = via_fabric;
+                    evt.detail = Some(e.to_string());
+                    enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                    evt
+                });
                 results.push(DelegationResolution::new(
                     binding,
                     Some(&provider.name),
@@ -1177,17 +1197,8 @@ async fn try_elicit_flow(
         match binding.elicit_fallback {
             ElicitFallback::OnDemand => return None, // fall through to legacy consent_required
             ElicitFallback::Fail => {
-                let mut evt = audit::audit_event(
-                    DelegationAuditAction::ElicitationDeclined,
-                    Some(agent_did),
-                    Some(user_identity_hash),
-                    Some(&binding.credential_provider_id),
-                    Some(channel_id),
-                );
-                evt.via_fabric = via_fabric;
-                evt.detail = Some("client does not advertise elicitation capability and fallback=fail".to_string());
-                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-                audit::audit(evt);
+                // The client was never asked, so this is not an
+                // `elicitation_declined`.
                 return Some((
                     DelegationActionOutcome::ElicitationUnsupported,
                     Some("client_capability_missing".to_string()),
@@ -1279,17 +1290,19 @@ async fn try_elicit_flow(
         }
     }
 
-    let mut sent_evt = audit::audit_event(
-        DelegationAuditAction::ElicitationSent,
-        Some(agent_did),
-        Some(user_identity_hash),
-        Some(&binding.credential_provider_id),
-        Some(channel_id),
-    );
-    sent_evt.via_fabric = via_fabric;
-    sent_evt.detail = Some(format!("elicit_id={}", elicit_id));
-    enrich_audit_event(&mut sent_evt, audit_ctx, binding, Some(&provider.name));
-    audit::audit(sent_evt);
+    audit::emit("elicitation_sent", || {
+        let mut sent_evt = audit::audit_event(
+            DelegationAuditAction::ElicitationSent,
+            Some(agent_did),
+            Some(user_identity_hash),
+            Some(&binding.credential_provider_id),
+            Some(channel_id),
+        );
+        sent_evt.via_fabric = via_fabric;
+        sent_evt.detail = Some(format!("elicit_id={}", elicit_id));
+        enrich_audit_event(&mut sent_evt, audit_ctx, binding, Some(&provider.name));
+        sent_evt
+    });
 
     // Park on the elicitation response with a timeout. We deliberately do
     // NOT race the vault notifier here: per spec we must wait for the
@@ -1299,17 +1312,19 @@ async fn try_elicit_flow(
 
     let result = match elicit_outcome {
         Ok(Ok(crate::mcp::elicitation::ElicitationResult::Accept { .. })) => {
-            let mut evt = audit::audit_event(
-                DelegationAuditAction::ElicitationAccepted,
-                Some(agent_did),
-                Some(user_identity_hash),
-                Some(&binding.credential_provider_id),
-                Some(channel_id),
-            );
-            evt.via_fabric = via_fabric;
-            evt.detail = Some(format!("elicit_id={}", elicit_id));
-            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-            audit::audit(evt);
+            audit::emit("elicitation_accepted", || {
+                let mut evt = audit::audit_event(
+                    DelegationAuditAction::ElicitationAccepted,
+                    Some(agent_did),
+                    Some(user_identity_hash),
+                    Some(&binding.credential_provider_id),
+                    Some(channel_id),
+                );
+                evt.via_fabric = via_fabric;
+                evt.detail = Some(format!("elicit_id={}", elicit_id));
+                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                evt
+            });
 
             // Race the OAuth completion (vault notifier) against the
             // remaining elicit budget. If we wake, re-run vault lookup;
@@ -1328,17 +1343,19 @@ async fn try_elicit_flow(
                 {
                     Ok(VaultLookupResult::Found(token)) => {
                         let headers = build_injection_headers(&binding.inject_as, &token.access_token);
-                        let mut inj = audit::audit_event(
-                            DelegationAuditAction::TokenInjected,
-                            Some(agent_did),
-                            Some(user_identity_hash),
-                            Some(&binding.credential_provider_id),
-                            Some(channel_id),
-                        );
-                        inj.via_fabric = via_fabric;
-                        inj.detail = Some("post_elicitation".to_string());
-                        enrich_audit_event(&mut inj, audit_ctx, binding, Some(&provider.name));
-                        audit::audit(inj);
+                        audit::emit("token_injected", || {
+                            let mut inj = audit::audit_event(
+                                DelegationAuditAction::TokenInjected,
+                                Some(agent_did),
+                                Some(user_identity_hash),
+                                Some(&binding.credential_provider_id),
+                                Some(channel_id),
+                            );
+                            inj.via_fabric = via_fabric;
+                            inj.detail = Some("post_elicitation".to_string());
+                            enrich_audit_event(&mut inj, audit_ctx, binding, Some(&provider.name));
+                            inj
+                        });
                         Some((
                             DelegationActionOutcome::TokenInjected,
                             Some(format!("post_elicitation elicit_id={}", elicit_id)),
@@ -1368,17 +1385,19 @@ async fn try_elicit_flow(
             }
         }
         Ok(Ok(crate::mcp::elicitation::ElicitationResult::Decline)) => {
-            let mut evt = audit::audit_event(
-                DelegationAuditAction::ElicitationDeclined,
-                Some(agent_did),
-                Some(user_identity_hash),
-                Some(&binding.credential_provider_id),
-                Some(channel_id),
-            );
-            evt.via_fabric = via_fabric;
-            evt.detail = Some(format!("elicit_id={}", elicit_id));
-            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-            audit::audit(evt);
+            audit::emit("elicitation_declined", || {
+                let mut evt = audit::audit_event(
+                    DelegationAuditAction::ElicitationDeclined,
+                    Some(agent_did),
+                    Some(user_identity_hash),
+                    Some(&binding.credential_provider_id),
+                    Some(channel_id),
+                );
+                evt.via_fabric = via_fabric;
+                evt.detail = Some(format!("elicit_id={}", elicit_id));
+                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                evt
+            });
             Some((
                 DelegationActionOutcome::ElicitationDeclined,
                 Some(format!("elicit_id={}", elicit_id)),
@@ -1386,17 +1405,19 @@ async fn try_elicit_flow(
             ))
         }
         Ok(Ok(crate::mcp::elicitation::ElicitationResult::Cancel)) => {
-            let mut evt = audit::audit_event(
-                DelegationAuditAction::ElicitationCancelled,
-                Some(agent_did),
-                Some(user_identity_hash),
-                Some(&binding.credential_provider_id),
-                Some(channel_id),
-            );
-            evt.via_fabric = via_fabric;
-            evt.detail = Some(format!("elicit_id={}", elicit_id));
-            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-            audit::audit(evt);
+            audit::emit("elicitation_cancelled", || {
+                let mut evt = audit::audit_event(
+                    DelegationAuditAction::ElicitationCancelled,
+                    Some(agent_did),
+                    Some(user_identity_hash),
+                    Some(&binding.credential_provider_id),
+                    Some(channel_id),
+                );
+                evt.via_fabric = via_fabric;
+                evt.detail = Some(format!("elicit_id={}", elicit_id));
+                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                evt
+            });
             Some((
                 DelegationActionOutcome::ElicitationCancelled,
                 Some(format!("elicit_id={}", elicit_id)),
@@ -1412,17 +1433,19 @@ async fn try_elicit_flow(
             ))
         }
         Err(_elapsed) => {
-            let mut evt = audit::audit_event(
-                DelegationAuditAction::ElicitationTimedOut,
-                Some(agent_did),
-                Some(user_identity_hash),
-                Some(&binding.credential_provider_id),
-                Some(channel_id),
-            );
-            evt.via_fabric = via_fabric;
-            evt.detail = Some(format!("elicit_id={} timeout_secs={}", elicit_id, binding.elicit_timeout_secs));
-            enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
-            audit::audit(evt);
+            audit::emit("elicitation_timed_out", || {
+                let mut evt = audit::audit_event(
+                    DelegationAuditAction::ElicitationTimedOut,
+                    Some(agent_did),
+                    Some(user_identity_hash),
+                    Some(&binding.credential_provider_id),
+                    Some(channel_id),
+                );
+                evt.via_fabric = via_fabric;
+                evt.detail = Some(format!("elicit_id={} timeout_secs={}", elicit_id, binding.elicit_timeout_secs));
+                enrich_audit_event(&mut evt, audit_ctx, binding, Some(&provider.name));
+                evt
+            });
             Some((
                 DelegationActionOutcome::ElicitationTimedOut,
                 Some(format!("elicit_id={} timeout_secs={}", elicit_id, binding.elicit_timeout_secs)),
@@ -2445,7 +2468,7 @@ mod tests {
             ..Default::default()
         };
 
-        let results = resolve_delegation_credentials(
+        let (results, events) = crate::audit::producer::capture(resolve_delegation_credentials(
             &bindings,
             "sha256:user1",
             "did:web:agent.example",
@@ -2458,12 +2481,19 @@ mod tests {
             false,
             Some(&ctx),
             None,
-        )
+        ))
         .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(result_tag(&results[0].result), "NotApplicable");
         assert_eq!(results[0].action.outcome, DelegationActionOutcome::ElicitationUnsupported);
+        // The client was never asked, so nothing was declined.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.event, DelegationAuditAction::ElicitationDeclined)),
+            "a client without the elicitation capability did not decline: {events:?}"
+        );
     }
 
     #[tokio::test]

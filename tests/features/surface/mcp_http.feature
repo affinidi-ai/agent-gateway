@@ -64,10 +64,12 @@ Feature: HTTP MCP surface forwarding
     And the MCP response id matches the request id
 
   Scenario: Malformed MCP request bodies are rejected as parse errors before reaching the MCP server
+    Given the VP Audit Log keeps every audit event
     When the caller sends a malformed MCP request
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32700
     And MCP server "bravo" was not called
+    And the VP Audit Log records a request refusal for "a malformed request"
 
   Scenario: MCP requests without a method are rejected as invalid before reaching the MCP server
     When the caller sends an MCP request without a method
@@ -82,19 +84,23 @@ Feature: HTTP MCP surface forwarding
     And MCP server "bravo" was not called
 
   Scenario: Unsupported modern MCP requests do not enter legacy processing
+    Given the VP Audit Log keeps every audit event
     When the caller asks the MCP surface for available tools using protocol version "2025-11-25"
     Then the response status is 400
     And the MCP response is a JSON-RPC error with code -32022
     And the MCP response id matches the request id
     And the MCP unsupported-version error requests "2025-11-25" and supports only "2024-11-05, 2026-07-28"
     And MCP server "bravo" was not called
+    And the VP Audit Log records a request refusal for "an unsupported protocol version"
 
   Scenario: Mismatched modern MCP method metadata is rejected
+    Given the VP Audit Log keeps every audit event
     When the caller sends a modern MCP tool catalog request with mirrored method "tools/call"
     Then the response status is 400
     And the MCP response is a JSON-RPC error with code -32020
     And the MCP response id matches the request id
     And MCP server "bravo" was not called
+    And the VP Audit Log records a request refusal for "a request that fails MCP admission"
 
   Scenario: Modern MCP requests require per-request capabilities
     When the caller asks the MCP surface for available tools using protocol version "2026-07-28" without per-request capabilities
@@ -136,10 +142,12 @@ Feature: HTTP MCP surface forwarding
 
   Scenario: MCP tool policy denies an unlisted tool before reaching the MCP server
     Given the MCP surface enforces a tool policy allowing only tool "get_news"
+    And the VP Audit Log keeps every audit event
     When the caller invokes MCP tool "delete_everything"
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32000
     And MCP server "bravo" was not called
+    And the VP Audit Log's MCP tool policy decisions name the surface by its id
 
   Scenario: MCP tool policy forwards an allowed tool to the MCP server
     Given the MCP surface enforces a tool policy allowing only tool "get_news"

@@ -22,9 +22,9 @@ const AuditIntegrationCard: React.FC<AuditIntegrationCardProps> = ({
       </h6>
     </div>
     <div className="card-body" style={{ fontSize: '0.9em' }}>
-      <p className="mb-2">
-        Every record written to the VP Audit Log is sent here once it is stored: policy decisions,
-        trust checks, VP injections, credential delegation and payment events.
+      <p className="mb-2" data-testid="integration-audit-scope-note">
+        Only the events selected under &ldquo;Events to send&rdquo; are sent here, whether or not
+        the VP Audit Log keeps them.
       </p>
       <p className="mb-2">
         Use{' '}
@@ -48,10 +48,13 @@ const AuditIntegrationCard: React.FC<AuditIntegrationCardProps> = ({
         signed VP (<code>AUDIT_RECORD</code>, <code>AUDIT_VP_JWT</code>). Send them only to a
         destination cleared for that data.
       </p>
-      <p className="mb-0">
-        If the destination stops accepting records, its queue fills and newer records are skipped
-        for it (counted by <code>agent_gateway_audit_forward_total</code>). The VP Audit Log keeps
-        every record.
+      <p className="mb-0" data-testid="integration-audit-delivery-note">
+        Records are delivered at least once, so a record may arrive again after a restart;
+        deduplicate on <code>event_id</code>. If the destination stops accepting records, it falls
+        behind and catches up in order once it recovers; its oldest records are skipped only when
+        the backlog grows past its cap. Disabling the integration pauses it: it lets go of the
+        records it has not received, and once re-enabled it receives only new records. Skipped
+        records are counted by <code>agent_gateway_audit_sink_skipped_total</code>.
       </p>
       {AUDIT_PAYLOAD_TYPES.includes(type) && (
         <AppButton

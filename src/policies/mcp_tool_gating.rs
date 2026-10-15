@@ -335,29 +335,44 @@ impl CompiledMcpToolGating {
         &self,
         json: &mut Value,
         input: &Value,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<FilteredToolsList> {
         let tools = json
             .get_mut("result")?
             .get_mut("tools")?
             .as_array_mut()?;
-        let before = tools.len();
-        let names: Vec<String> = tools
-            .iter()
-            .filter_map(|t| {
-                t.get("name")
-                    .and_then(|n| n.as_str())
-                    .map(str::to_string)
-            })
-            .collect();
-        let allowed = self.filter_tools(names, input);
+        let names = |tools: &[Value]| -> Vec<String> {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    t.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        let listed = names(tools);
+        let allowed = self.filter_tools(listed.clone(), input);
         tools.retain(|t| {
             t.get("name")
                 .and_then(|n| n.as_str())
                 .map(|n| allowed.contains(&n.to_string()))
                 .unwrap_or(false)
         });
-        let after = tools.len();
-        Some((before, after))
+        let kept = names(tools);
+        Some(FilteredToolsList { listed, kept })
+    }
+}
+
+/// The tool names in a `tools/list` result before and after filtering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilteredToolsList {
+    pub listed: Vec<String>,
+    pub kept: Vec<String>,
+}
+
+impl FilteredToolsList {
+    pub fn removed_any(&self) -> bool {
+        self.kept.len() < self.listed.len()
     }
 }
 
@@ -605,8 +620,11 @@ mod tests {
                 ]
             }
         });
-        let counts = compiled.filter_tools_list_value(&mut response, &Value::Null);
-        assert_eq!(counts, Some((2, 0)));
+        let filtered = compiled
+            .filter_tools_list_value(&mut response, &Value::Null)
+            .unwrap();
+        assert_eq!(filtered.listed, vec!["read_file".to_string(), "write_file".to_string()]);
+        assert!(filtered.kept.is_empty());
         assert_eq!(
             response["result"]["tools"]
                 .as_array()
@@ -623,7 +641,11 @@ mod tests {
         };
         let compiled = compile(&cfg);
         let mut not_a_list = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": {} });
-        assert_eq!(compiled.filter_tools_list_value(&mut not_a_list, &Value::Null), None);
+        assert!(
+            compiled
+                .filter_tools_list_value(&mut not_a_list, &Value::Null)
+                .is_none()
+        );
     }
 
     #[test]

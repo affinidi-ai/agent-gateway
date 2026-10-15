@@ -792,6 +792,21 @@ pub async fn surface_requires_caller_identity_issued_by_gateway(
         .unwrap_or_else(|error| panic!("attach identity issuer policy to surface '{surface_id}': {error:#}"));
 }
 
+#[given(expr = "the VP Audit Log of gateway {int} keeps every audit event")]
+async fn vp_audit_log_of_gateway_keeps_every_audit_event(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    world.start().await;
+    world
+        .harness()
+        .gw(gateway)
+        .admin
+        .enable_every_audit_event()
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must keep every audit event: {error:#}"));
+}
+
 #[given(expr = "gateway {int} surface {string} has managed identity enabled")]
 pub async fn surface_has_managed_identity_enabled(
     world: &mut G2gWorld,

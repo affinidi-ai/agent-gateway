@@ -48,6 +48,7 @@ Feature: A2A v1.0 adoption on an A2A surface
     And managed agent "bravo" received the forwarded request
 
   Scenario: An unsupported A2A-Version is rejected before the Target is called
+    Given the VP Audit Log keeps every audit event
     When the caller sends a request to the surface with header "A2A-Version" set to "2.0" and body
       """
       {"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"user","parts":[{"kind":"text","text":"probe"}],"messageId":"bdd-message"}}}
@@ -57,6 +58,7 @@ Feature: A2A v1.0 adoption on an A2A surface
     And the response error lists supported version "1.0"
     And the response error lists supported version "0.3"
     And managed agent "bravo" was not called
+    And the VP Audit Log records a request refusal for "an unsupported protocol version"
 
   Scenario: A pre-1.0 version outside the accepted set is rejected
     When the caller sends a request to the surface with header "A2A-Version" set to "0.2" and body

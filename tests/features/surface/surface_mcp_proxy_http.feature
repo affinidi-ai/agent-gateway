@@ -42,10 +42,12 @@ Feature: Routing through a proxy:// MCP target
 
   Scenario: A configured tool policy denies an unlisted tool on a proxy:// MCP target
     Given the MCP surface enforces a tool policy allowing only tool "get_forecast"
+    And the VP Audit Log keeps every audit event
     When the caller invokes the MCP tool "get_weather" for city "Paris"
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32000
     And REST API "bravo" was not called
+    And the VP Audit Log's MCP tool policy decisions name the surface by its id
 
   Scenario: A configured tool policy forwards an allowed tool on a proxy:// MCP target
     Given the MCP surface enforces a tool policy allowing only tool "get_weather"

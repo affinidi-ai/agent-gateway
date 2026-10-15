@@ -47,17 +47,45 @@ pub async fn settle_payment(
         X402SettlementMode::Immediate => {
             // Immediate settlement uses verification_mode to determine HOW to settle
             // IMPORTANT: Write pending record FIRST before attempting settlement
-            settle_immediate_with_mode(
+            let result = settle_immediate_with_mode(
                 payload,
                 config,
                 channel_name,
                 channel_id,
                 transaction_store,
                 confirmations,
-                correlation_id,
+                correlation_id.clone(),
             )
-            .await
+            .await;
+            if let (Err(error), Some(corr_id), Some(txn_store)) = (&result, &correlation_id, transaction_store) {
+                fail_unrecorded_settlement(txn_store, corr_id, channel_id, error).await;
+            }
+            result
         }
+    }
+}
+
+/// Mark the settlement failed when an immediate settlement returned an error
+/// without doing so itself, so every such failure is recorded once.
+async fn fail_unrecorded_settlement(
+    txn_store: &TransactionStore,
+    correlation_id: &str,
+    channel_id: &str,
+    error: &str,
+) {
+    let already_failed = txn_store
+        .get(correlation_id)
+        .await
+        .and_then(|txn| txn.settlement)
+        .is_some_and(|settlement| settlement.status == super::transaction_store::SettlementStatus::Failed);
+    if already_failed {
+        return;
+    }
+    if let Err(e) = txn_store
+        .fail_settlement(correlation_id, error.to_string())
+        .await
+    {
+        channel_warn!(channel_id, "Failed to record settlement failure: {}", e);
     }
 }
 
@@ -920,6 +948,72 @@ mod tests {
             error,
             "Transaction recorded before payment requirement binding: Payment does not match any payment requirement issued for this resource"
         );
+    }
+
+    #[tokio::test]
+    async fn an_immediate_settlement_that_errors_out_is_recorded_as_settlement_failed() {
+        use crate::delegation_vault::audit::{DelegationAuditAction, PaymentStage};
+        use crate::x402::transaction_store::SettlementStatus;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            TransactionStore::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let payload = PaymentPayload {
+            x402_version: 2,
+            resource: None,
+            accepted: requirement("0xmerchant"),
+            payload: serde_json::json!({"signature": "0xsig"}),
+            extensions: None,
+        };
+        store
+            .create_transaction(
+                "correlation-1".to_string(),
+                "surface-1".to_string(),
+                "Surface".to_string(),
+                "/".to_string(),
+                payload.clone(),
+                "ExternalFacilitator".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        // External facilitator settlement with no facilitator URL configured.
+        let config = X402Config {
+            settlement_mode: X402SettlementMode::Immediate,
+            verification_mode: X402VerificationMode::ExternalFacilitator,
+            facilitator_url: None,
+            ..surface_config()
+        };
+
+        let (result, events) = crate::audit::producer::capture(settle_payment(
+            &payload,
+            &config,
+            "Surface",
+            "surface-1",
+            Some(&store),
+            None,
+            Some("correlation-1".to_string()),
+        ))
+        .await;
+
+        assert!(result.is_err());
+        let settlement = store
+            .get("correlation-1")
+            .await
+            .and_then(|txn| txn.settlement)
+            .expect("settlement stage initialised");
+        assert_eq!(settlement.status, SettlementStatus::Failed);
+        let failed = events
+            .iter()
+            .filter(|event| {
+                matches!(&event.event, DelegationAuditAction::PaymentEvent(details)
+                    if details.stage == PaymentStage::SettlementFailed)
+            })
+            .count();
+        assert_eq!(failed, 1, "exactly one settlement_failed record: {events:?}");
     }
 
     #[tokio::test]
