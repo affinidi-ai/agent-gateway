@@ -328,13 +328,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_first_stores_set_are_the_ones_shared() {
-        let first = Fixture::new().await.stores;
-        let second = Fixture::new().await.stores;
+    async fn stores_set_later_do_not_replace_the_shared_ones() {
+        init_definition_stores(Fixture::new().await.stores);
+        let shared = definition_stores().expect("set");
 
-        init_definition_stores(first.clone());
-        init_definition_stores(second);
+        init_definition_stores(Fixture::new().await.stores);
 
-        assert!(Arc::ptr_eq(&definition_stores().expect("set"), &first));
+        assert!(Arc::ptr_eq(&definition_stores().expect("set"), &shared));
     }
 }
