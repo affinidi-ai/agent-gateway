@@ -171,12 +171,17 @@ struct Catalog {
     events: &'static [IntegrationEvent],
     variables: &'static [VariableSpec],
     endpoint_types: Vec<EndpointTypeInfo>,
+    /// The placeholder syntax as a regular expression whose first group is the variable name.
+    variable_pattern: &'static str,
 }
 
 async fn get_catalog() -> Json<Catalog> {
     Json(Catalog {
         events: catalog(),
         variables: variables(),
+        variable_pattern: crate::integrations::runtime_variables::patterns()
+            .regex
+            .as_str(),
         endpoint_types: [EndpointType::Email, EndpointType::Slack, EndpointType::Webhook, EndpointType::Stream]
             .into_iter()
             .map(|endpoint_type| EndpointTypeInfo {
@@ -231,6 +236,39 @@ mod tests {
             .find(|info| info["type"] == "webhook")
             .expect("webhook");
         assert_eq!(webhook["secret_fields"], serde_json::json!(["signing_secret", "headers"]));
+    }
+
+    #[tokio::test]
+    async fn the_catalog_gives_the_placeholder_syntax_templates_use() {
+        let f = Fixture::new().await;
+
+        let (_, catalog) = f
+            .call(VIEWER, "GET", "/v1/integrations/catalog", None)
+            .await;
+
+        assert_eq!(
+            catalog["variable_pattern"],
+            crate::integrations::runtime_variables::patterns()
+                .regex
+                .as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_stream_credential_is_a_secret_field() {
+        let f = Fixture::new().await;
+
+        let (_, catalog) = f
+            .call(VIEWER, "GET", "/v1/integrations/catalog", None)
+            .await;
+
+        let stream = catalog["endpoint_types"]
+            .as_array()
+            .expect("endpoint types")
+            .iter()
+            .find(|info| info["type"] == "stream")
+            .expect("stream");
+        assert_eq!(stream["secret_fields"], serde_json::json!(["sasl_password", "redis_url", "auth_token"]));
     }
 
     #[tokio::test]

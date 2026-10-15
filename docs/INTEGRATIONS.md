@@ -79,8 +79,9 @@ pipeline, with its own retries and drop policy. See
 
 `GET /v1/integrations/catalog` lists every event the gateway delivers, with its name,
 description, family, its audit group for audit events, and the template variables its delivery
-fills; every template variable with its description; and each endpoint type with its secret
-fields ([`events.rs`](../src/integrations/events.rs)).
+fills; every template variable with its description; each endpoint type with its secret
+fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
+([`events.rs`](../src/integrations/events.rs)).
 
 | Family | Events |
 | --- | --- |
