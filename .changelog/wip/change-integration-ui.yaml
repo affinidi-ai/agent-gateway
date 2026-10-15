@@ -4,6 +4,11 @@ changes:
   changed: []
   fixed: []
   removed:
+    - timestamp: '2026-10-15T10:35:00.000Z'
+      title: Stop reassigning integrations to tenants
+      description: >-
+        Integrations belong to the whole appliance, so the tenant ownership API refuses the
+        integrations kind with 400 instead of moving one to a tenant.
     - timestamp: '2026-10-15T09:55:00.000Z'
       title: Remove integration attachments from gateways, users, identities and connection points
       description: >-

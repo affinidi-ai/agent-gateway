@@ -396,12 +396,6 @@ pub fn find_event(id: &str) -> Option<&'static IntegrationEvent> {
         .find(|event| event.id == id)
 }
 
-pub fn variable(name: &str) -> Option<&'static VariableSpec> {
-    VARIABLES
-        .iter()
-        .find(|variable| variable.name == name)
-}
-
 /// Every template variable any event fills.
 pub fn variables() -> &'static [VariableSpec] {
     VARIABLES
@@ -488,7 +482,10 @@ mod tests {
         );
         for event in catalog() {
             for name in &event.variables {
-                let spec = variable(name).unwrap_or_else(|| panic!("{name} of {} is not described", event.id));
+                let spec = variables()
+                    .iter()
+                    .find(|variable| variable.name == *name)
+                    .unwrap_or_else(|| panic!("{name} of {} is not described", event.id));
                 assert!(!spec.label.is_empty() && !spec.description.is_empty(), "{name}");
             }
             assert_eq!(

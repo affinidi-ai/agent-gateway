@@ -104,6 +104,7 @@ pub async fn delete_integration(
         return Err(not_found());
     }
     definitions_changed().await;
+    crate::integrations::stream_publishers::invalidate_kafka_producer(&id).await;
     info!(event = "integrations.integration.deleted", integration_id = %id, caller = caller_id(&caller));
     Ok(StatusCode::NO_CONTENT)
 }

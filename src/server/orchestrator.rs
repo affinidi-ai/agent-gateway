@@ -96,7 +96,7 @@ fn register_resource_limit_counters(
     delegation_vault_store: &Option<Arc<crate::delegation_vault::storage::FileSystemDelegationVaultStore>>,
     mcp_proxy_store: &Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
     a2a_proxy_store: &Option<Arc<crate::a2a_proxies::FileSystemA2aProxyStore>>,
-    integration_storage: &Arc<crate::storage::IntegrationStorage>,
+    definition_stores: &Arc<crate::integrations::definitions::DefinitionStores>,
 ) {
     use crate::config::register_counter;
     use crate::credential_providers::storage::CredentialProviderStorage as _;
@@ -287,12 +287,12 @@ fn register_resource_limit_counters(
         });
     }
 
-    // integrations — notifier definitions.
-    let s = integration_storage.clone();
+    let s = definition_stores.clone();
     register_counter("integrations", move || {
         let s = s.clone();
         async move {
-            s.list()
+            s.integrations
+                .list()
                 .await
                 .map(|v| v.len())
                 .unwrap_or(0)
@@ -646,14 +646,6 @@ pub async fn run_axum_proxy(
     );
     // Register the settings store globally so the audit vault can read categories.
     crate::storage::settings_store::set_global_settings_store(settings_store.clone());
-
-    // Store integration triggers storage path globally for user/gateway integrations
-    crate::storage::init_integration_triggers_storage_path(
-        bootstrap_config
-            .storage_paths
-            .integration_triggers
-            .clone(),
-    );
 
     // Store gateways storage path globally for x402 gateway facilitator resolution
     crate::storage::init_gateways_storage_path(
@@ -1344,7 +1336,6 @@ pub async fn run_axum_proxy(
             issuer_store: None,
             trust_registry_store: None,
             authority_store: None,
-            integration_store: None,
             mcp_proxy_store: None,
             a2a_proxy_store: None,
             secrets_store: None,
@@ -1746,36 +1737,16 @@ pub async fn run_axum_proxy(
 
         // The audit pipeline builds its sinks from the integrations, so their
         // stores are opened before the sinks are first built.
-        crate::integrations::definitions::init_definition_stores(Arc::new(
+        let definition_stores = Arc::new(
             crate::integrations::definitions::DefinitionStores::open_configured(&bootstrap_config.storage_paths)
                 .await
                 .expect("Failed to initialize integration endpoint, event set and integration storage"),
-        ));
-        let integration_storage: Arc<crate::storage::IntegrationStorage> = {
-            let storage = crate::storage::IntegrationStorage::new(PathBuf::from(
-                &bootstrap_config
-                    .storage_paths
-                    .integrations,
-            ))
-            .await
-            .expect("Failed to initialize integration storage");
-            info!("Notifier storage initialized");
-            let storage_arc = Arc::new(storage);
-
-            // Initialize global integration storage
-            crate::storage::init_integration_storage(storage_arc.clone()).await;
-            info!("✓ Global integration storage initialized");
-            crate::audit::sources::rebuild_sinks().await;
-
-            if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
-                spawn_x402_cleanup_worker(txn_store);
-            }
-
-            // Validate all active integrations
-            crate::integrations::validation::validate_all_integrations(&storage_arc).await;
-
-            storage_arc
-        };
+        );
+        crate::integrations::definitions::init_definition_stores(definition_stores.clone());
+        crate::audit::sources::rebuild_sinks().await;
+        if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
+            spawn_x402_cleanup_worker(txn_store);
+        }
 
         // Initialize delegation vault audit logger (started only on an Active node)
         crate::delegation_vault::audit::init_audit_logger(
@@ -2321,8 +2292,6 @@ pub async fn run_axum_proxy(
             info!("✓ GW2 notification store initialized for integration triggers");
         }
 
-        identity_state.integration_store = Some(integration_storage.clone());
-
         // Register appliance resource-limit counters now that every entity store
         // has been constructed. `credentials.jwt`, `secrets.apikeys`, and
         // `secrets.certificates` are registered at their own construction sites.
@@ -2338,7 +2307,7 @@ pub async fn run_axum_proxy(
             &delegation_vault_store,
             &mcp_proxy_store,
             &a2a_proxy_store,
-            &integration_storage,
+            &definition_stores,
         );
 
         // users — resolved from the passkey/SAML auth storage (no dedicated

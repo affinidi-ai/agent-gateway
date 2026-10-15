@@ -4,8 +4,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::storage::Integration;
-
 mod email;
 mod slack;
 mod stream;
@@ -86,14 +84,6 @@ pub trait IntegrationPublisher: Send + Sync {
         Ok(())
     }
 
-    /// Validate content template
-    fn validate_content(
-        &self,
-        _content: &Value,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     /// The template an integration sends with: its own, completed with whatever the
     /// transport needs that it leaves out.
     fn complete_template(
@@ -115,32 +105,6 @@ pub trait IntegrationPublisher: Send + Sync {
         configuration: &Value,
         message: &Message,
     ) -> Result<()>;
-
-    /// Publish a notification through the integration
-    async fn publish(
-        &self,
-        integration: &Integration,
-        subject: &str,
-        message: &str,
-        variables: &HashMap<String, String>,
-    ) -> Result<()>;
-
-    /// Publish multiple notifications in batch (default: sequential)
-    #[allow(dead_code)]
-    async fn publish_batch(
-        &self,
-        integration: &Integration,
-        items: Vec<(&str, &str, &HashMap<String, String>)>,
-    ) -> Result<Vec<Result<()>>> {
-        let mut results = Vec::new();
-        for (subject, message, variables) in items {
-            results.push(
-                self.publish(integration, subject, message, variables)
-                    .await,
-            );
-        }
-        Ok(results)
-    }
 }
 
 /// Registry for managing integration publishers

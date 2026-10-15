@@ -231,6 +231,9 @@ fn parse_owned_kind(raw: &str) -> Result<ResourceKind, OwnershipApiError> {
             kind
         )));
     }
+    if kind == ResourceKind::Integrations {
+        return Err(appliance_wide(kind));
+    }
     Ok(kind)
 }
 
@@ -271,17 +274,7 @@ async fn load_owned_resource(
             .await
             .map_err(internal)?
             .map(|resource| owned(kind, resource.id, resource.name, resource.tenant_id)),
-        ResourceKind::Integrations => match state
-            .integration_store
-            .as_ref()
-        {
-            Some(store) => store
-                .load(id)
-                .await
-                .ok()
-                .map(|resource| owned(kind, resource.id, resource.name, resource.tenant_id)),
-            None => return Err(unavailable(kind)),
-        },
+        ResourceKind::Integrations => return Err(appliance_wide(kind)),
         ResourceKind::Mediators => state
             .mediator_store
             .as_ref()
@@ -844,23 +837,7 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?;
         }
-        ResourceKind::Integrations => {
-            let store = state
-                .integration_store
-                .as_ref()
-                .ok_or_else(|| unavailable(kind))?;
-            let mut resource = store
-                .load(id)
-                .await
-                .map_err(internal)?;
-            ensure_integration_may_be_owned(&resource, tenant_id.as_deref())?;
-            resource.tenant_id = tenant_id;
-            resource.updated_at = chrono::Utc::now().to_rfc3339();
-            store
-                .update(id, &resource)
-                .await
-                .map_err(internal)?;
-        }
+        ResourceKind::Integrations => return Err(appliance_wide(kind)),
         ResourceKind::Mediators => {
             let store = state
                 .mediator_store
@@ -1116,18 +1093,9 @@ fn conflict_response(
     })
 }
 
-/// Governance audit integrations receive appliance-wide audit evidence, so they
-/// stay appliance-global.
-fn ensure_integration_may_be_owned(
-    integration: &crate::storage::Integration,
-    tenant_id: Option<&str>,
-) -> Result<(), OwnershipApiError> {
-    if tenant_id.is_some() && crate::integrations::audit_integration_triggers::is_audit_integration(integration) {
-        return Err(OwnershipApiError::BadRequest(
-            "Governance audit integrations are appliance-wide and cannot belong to a tenant".to_string(),
-        ));
-    }
-    Ok(())
+/// Integrations, their endpoints and event sets belong to the whole appliance.
+fn appliance_wide(kind: ResourceKind) -> OwnershipApiError {
+    OwnershipApiError::BadRequest(format!("{kind} belong to the whole appliance and cannot be reassigned"))
 }
 
 fn unavailable(kind: ResourceKind) -> OwnershipApiError {
@@ -1186,25 +1154,11 @@ mod tests {
     }
 
     #[test]
-    fn audit_integrations_stay_appliance_global() {
-        let integration = |category: &str| {
-            crate::storage::Integration::new(
-                "Integration".to_string(),
-                String::new(),
-                "stream".to_string(),
-                serde_json::json!({}),
-                serde_json::json!({}),
-                "active".to_string(),
-                Some(category.to_string()),
-            )
-        };
-
+    fn integrations_belong_to_the_whole_appliance() {
         assert!(matches!(
-            ensure_integration_may_be_owned(&integration("audit"), Some("tenant-a")),
-            Err(OwnershipApiError::BadRequest(_))
+            parse_owned_kind("integrations"),
+            Err(OwnershipApiError::BadRequest(message)) if message.contains("appliance")
         ));
-        assert!(ensure_integration_may_be_owned(&integration("audit"), None).is_ok());
-        assert!(ensure_integration_may_be_owned(&integration("gateway"), Some("tenant-a")).is_ok());
     }
 
     #[test]

@@ -1,14 +1,11 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
 use tracing::info;
 
 use super::{IntegrationPublisher, Message, with_defaults};
 use crate::integrations::delivery::render::Escaping;
-use crate::integrations::email_service::{SmtpConfig, send_email, send_email_batch};
-use crate::integrations::runtime_variables::substitute_variables;
-use crate::storage::Integration;
+use crate::integrations::email_service::{SmtpConfig, send_email};
 
 pub struct EmailPublisher;
 
@@ -101,124 +98,19 @@ impl IntegrationPublisher for EmailPublisher {
         info!(integration_id = %message.integration_id, "Email delivered");
         Ok(())
     }
-
-    async fn publish(
-        &self,
-        integration: &Integration,
-        subject: &str,
-        message: &str,
-        variables: &HashMap<String, String>,
-    ) -> Result<()> {
-        info!("Triggering email integration: {}", integration.name);
-
-        // Parse SMTP config from integration configuration
-        let smtp_config =
-            SmtpConfig::from_json(&integration.configuration).context("Failed to parse SMTP configuration")?;
-
-        // Use content template if provided, otherwise use passed message
-        let subject_template = integration
-            .content
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .unwrap_or(subject);
-
-        let body_template = integration
-            .content
-            .get("body")
-            .and_then(|v| v.as_str())
-            .unwrap_or(message);
-
-        // Perform template variable substitution
-        let actual_subject = substitute_variables(
-            subject_template,
-            integration
-                .category
-                .as_deref(),
-            variables,
-        );
-        let actual_body = substitute_variables(
-            body_template,
-            integration
-                .category
-                .as_deref(),
-            variables,
-        );
-
-        let is_html = is_html_template(&integration.content, body_template);
-
-        // Send the email
-        send_email(&smtp_config, &actual_subject, &actual_body, is_html)
-            .await
-            .context("Failed to send email")?;
-
-        info!("Email notification sent successfully via integration: {}", integration.name);
-        Ok(())
-    }
-
-    async fn publish_batch(
-        &self,
-        integration: &Integration,
-        items: Vec<(&str, &str, &HashMap<String, String>)>,
-    ) -> Result<Vec<Result<()>>> {
-        info!("Triggering email batch integration: {} with {} items", integration.name, items.len());
-
-        // Parse SMTP config once for the batch
-        let smtp_config =
-            SmtpConfig::from_json(&integration.configuration).context("Failed to parse SMTP configuration")?;
-
-        // Prepare all email messages
-        let mut messages = Vec::new();
-        for (subject, message, variables) in items {
-            let subject_template = integration
-                .content
-                .get("subject")
-                .and_then(|v| v.as_str())
-                .unwrap_or(subject);
-
-            let body_template = integration
-                .content
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or(message);
-
-            let actual_subject = substitute_variables(
-                subject_template,
-                integration
-                    .category
-                    .as_deref(),
-                variables,
-            );
-            let actual_body = substitute_variables(
-                body_template,
-                integration
-                    .category
-                    .as_deref(),
-                variables,
-            );
-
-            let is_html = is_html_template(&integration.content, body_template);
-
-            messages.push((actual_subject, actual_body, is_html));
-        }
-
-        // Send all emails using a single SMTP connection
-        let results = send_email_batch(&smtp_config, messages).await?;
-
-        info!("Email batch notification sent successfully via integration: {}", integration.name);
-        Ok(results)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_html_template;
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn html_comes_from_the_format_or_the_template() {
-        assert!(is_html_template(&serde_json::json!({ "format": "html" }), "Hello ${NAME}"));
-        assert!(is_html_template(&serde_json::json!({}), "<html><body>${NAME}</body></html>"));
-        assert!(!is_html_template(&serde_json::json!({ "format": "plain" }), "Hello ${NAME}"));
-        assert!(!is_html_template(&serde_json::json!({}), "Hello ${NAME}"));
+        assert!(is_html_template(&json!({ "format": "html" }), "Hello ${NAME}"));
+        assert!(is_html_template(&json!({}), "<html><body>${NAME}</body></html>"));
+        assert!(!is_html_template(&json!({ "format": "plain" }), "Hello ${NAME}"));
+        assert!(!is_html_template(&json!({}), "Hello ${NAME}"));
     }
 
     #[test]
@@ -226,11 +118,8 @@ mod tests {
         let template = "Caller: ${AUDIT_PRINCIPAL_NAME}";
         let substituted = template.replace("${AUDIT_PRINCIPAL_NAME}", "<html><a href=\"https://evil\">x</a>");
         assert!(substituted.contains("<html"));
-        assert!(!is_html_template(&serde_json::json!({ "format": "plain" }), template));
+        assert!(!is_html_template(&json!({ "format": "plain" }), template));
     }
-
-    use super::*;
-    use serde_json::json;
 
     #[test]
     fn an_empty_template_mails_the_event_name_and_summary_as_plain_text() {
