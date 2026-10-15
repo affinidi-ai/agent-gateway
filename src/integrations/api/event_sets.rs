@@ -7,8 +7,8 @@ use serde::Deserialize;
 use tracing::info;
 
 use super::{
-    ApiError, DefinitionStores, caller_id, integrations_using, internal_error, not_found, refuse_while_used,
-    require_known_id, validate_text,
+    ApiError, DefinitionStores, caller_id, definitions_changed, integrations_using, internal_error, not_found,
+    refuse_while_used, require_known_id, validate_text,
 };
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::integrations::definitions::event_set::validate_events;
@@ -114,6 +114,7 @@ pub async fn delete_event_set(
     if !deleted {
         return Err(not_found());
     }
+    definitions_changed().await;
     info!(event = "integrations.event_set.deleted", event_set_id = %id, caller = caller_id(&caller));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -143,7 +144,9 @@ async fn save(
         .event_sets
         .save(event_set)
         .await
-        .map_err(|error| internal_error("save the event set", error))
+        .map_err(|error| internal_error("save the event set", error))?;
+    definitions_changed().await;
+    Ok(())
 }
 
 #[cfg(test)]

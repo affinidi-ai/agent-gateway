@@ -7,7 +7,10 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tracing::info;
 
-use super::{ApiError, DefinitionStores, caller_id, internal_error, not_found, require_known_id, validate_text};
+use super::{
+    ApiError, DefinitionStores, caller_id, definitions_changed, internal_error, not_found, require_known_id,
+    validate_text,
+};
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::integrations::definitions::{Integration, Status};
 
@@ -100,6 +103,7 @@ pub async fn delete_integration(
     if !deleted {
         return Err(not_found());
     }
+    definitions_changed().await;
     info!(event = "integrations.integration.deleted", integration_id = %id, caller = caller_id(&caller));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -165,7 +169,9 @@ async fn save(
         .integrations
         .save(integration)
         .await
-        .map_err(|error| internal_error("save the integration", error))
+        .map_err(|error| internal_error("save the integration", error))?;
+    definitions_changed().await;
+    Ok(())
 }
 
 #[cfg(test)]

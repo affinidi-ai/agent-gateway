@@ -8,8 +8,8 @@ use serde_json::Value as JsonValue;
 use tracing::info;
 
 use super::{
-    ApiError, DefinitionStores, caller_id, internal_error, not_found, refuse_while_used, require_known_id,
-    validate_text,
+    ApiError, DefinitionStores, caller_id, definitions_changed, internal_error, not_found, refuse_while_used,
+    require_known_id, validate_text,
 };
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::gateways::connection_points::message_processor::get_secrets_store;
@@ -136,6 +136,7 @@ pub async fn delete_endpoint(
     if !deleted {
         return Err(not_found());
     }
+    definitions_changed().await;
     info!(event = "integrations.endpoint.deleted", endpoint_id = %id, caller = caller_id(&caller));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -174,7 +175,9 @@ async fn save(
         .endpoints
         .save(endpoint)
         .await
-        .map_err(|error| internal_error("save the endpoint", error))
+        .map_err(|error| internal_error("save the endpoint", error))?;
+    definitions_changed().await;
+    Ok(())
 }
 
 #[cfg(test)]
