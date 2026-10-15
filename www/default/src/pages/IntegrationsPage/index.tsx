@@ -3,11 +3,12 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { useSearchParams } from 'react-router-dom';
 import SearchInput from '../../components/shared/SearchInput';
 import EndpointsTab from './EndpointsTab';
+import EventSetsTab from './EventSetsTab';
 import IntegrationsTab from './IntegrationsTab';
 import { useIntegrationDefinitions } from './useIntegrationDefinitions';
 
-type TabKey = 'integrations' | 'endpoints';
-const VALID_TABS: TabKey[] = ['integrations', 'endpoints'];
+type TabKey = 'integrations' | 'endpoints' | 'event-sets';
+const VALID_TABS: TabKey[] = ['integrations', 'endpoints', 'event-sets'];
 
 /** Integrations, and the endpoints and event sets they join. */
 const IntegrationsPage: React.FC = () => {
@@ -78,6 +79,16 @@ const IntegrationsPage: React.FC = () => {
             }
           >
             <EndpointsTab {...definitions} searchTerm={searchTerm} onChanged={reload} />
+          </Tab>
+          <Tab
+            eventKey="event-sets"
+            title={
+              <>
+                <i className="fas fa-list-check" aria-hidden="true"></i> Event Sets
+              </>
+            }
+          >
+            <EventSetsTab {...definitions} searchTerm={searchTerm} onChanged={reload} />
           </Tab>
         </Tabs>
       )}
