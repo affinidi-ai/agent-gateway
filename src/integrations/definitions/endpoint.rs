@@ -32,7 +32,7 @@ impl EndpointType {
             Self::Email => &["smtp_password"],
             Self::Slack => &["webhook_url"],
             Self::Webhook => &["signing_secret", "headers"],
-            Self::Stream => &["sasl_password", "redis_url"],
+            Self::Stream => &["sasl_password", "redis_url", "auth_token"],
         }
     }
 }
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(EndpointType::Email.secret_fields(), ["smtp_password"]);
         assert_eq!(EndpointType::Slack.secret_fields(), ["webhook_url"]);
         assert_eq!(EndpointType::Webhook.secret_fields(), ["signing_secret", "headers"]);
-        assert_eq!(EndpointType::Stream.secret_fields(), ["sasl_password", "redis_url"]);
+        assert_eq!(EndpointType::Stream.secret_fields(), ["sasl_password", "redis_url", "auth_token"]);
     }
 
     #[test]

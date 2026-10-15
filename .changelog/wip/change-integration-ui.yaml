@@ -67,7 +67,7 @@ changes:
       title: Never return integration endpoint credentials from the API
       description: >-
         SMTP passwords, Slack webhook URLs, webhook signing secrets and headers, and stream SASL
-        passwords and Redis URLs are write-only: responses name the secrets set but never their
+        passwords, Redis URLs and Pulsar auth tokens are write-only: responses name the secrets set but never their
         values, so the user role's integrations.view no longer reveals credentials.
     - timestamp: '2026-10-15T08:16:21.000Z'
       title: Refuse tenant and resource-scoped tokens on the integrations API

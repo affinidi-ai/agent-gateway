@@ -24,7 +24,8 @@ Integrations belong to the whole appliance: none has a tenant owner, and a tenan
 resource-scoped PAT is refused with `403` on every route under `/v1/integrations`.
 
 **Endpoints.** `smtp_password` (email), `webhook_url` (Slack), `signing_secret` and `headers`
-(webhook), and `sasl_password` and `redis_url` (stream) are written but never read back:
+(webhook), and `sasl_password`, `redis_url` and `auth_token` (stream) are written but never
+read back:
 responses leave them out of `configuration` and name the ones set in `secrets`. An update that
 leaves a secret out keeps it, and one that sends it as `null` clears it. A secret field may
 instead hold `$SECRET:<secret_id>`, a reference to an appliance-wide secret in the secrets
