@@ -277,7 +277,6 @@ pub async fn list_gateways<S: GatewayStore>(
 /// Get a gateway by ID
 pub async fn get_gateway<S: GatewayStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
-    Extension(notif_store): Extension<Option<Arc<crate::integrations::FileSystemNotificationStore>>>,
     Extension(listener_manager): Extension<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>,
     Extension(cp_store): Extension<Option<Arc<crate::gateways::FileSystemConnectionPointStore>>>,
     Path(id): Path<String>,
@@ -293,14 +292,7 @@ pub async fn get_gateway<S: GatewayStore>(
         return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
     }
 
-    // Trigger gateway.accessed integration (async, non-blocking)
-    if let Some(notif) = notif_store.as_ref() {
-        let notif = notif.clone();
-        let gateway_clone = gateway.clone();
-        crate::observability::spawn_traced_task("integration.gateway_accessed", async move {
-            crate::integrations::trigger_gateway_accessed(notif.as_ref(), &gateway_clone).await;
-        });
-    }
+    crate::integrations::trigger_gateway_accessed(&gateway);
 
     // Derive runtime health from the gateway's connection points (including the
     // hidden OOB/system ones), mirroring the list endpoint.
@@ -330,7 +322,6 @@ pub async fn get_gateway<S: GatewayStore>(
 /// Create a new gateway
 pub async fn create_gateway<S: GatewayStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
-    Extension(notif_store): Extension<Option<Arc<crate::integrations::FileSystemNotificationStore>>>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -352,14 +343,7 @@ pub async fn create_gateway<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to store gateway: {}", e)))?;
 
-    // Trigger gateway.created integration (async, non-blocking)
-    if let Some(notif) = notif_store.as_ref() {
-        let notif = notif.clone();
-        let gateway_clone = gateway.clone();
-        crate::observability::spawn_traced_task("integration.gateway_created", async move {
-            crate::integrations::trigger_gateway_created(notif.as_ref(), &gateway_clone).await;
-        });
-    }
+    crate::integrations::trigger_gateway_created(&gateway);
 
     Ok(Json(gateway))
 }
@@ -367,7 +351,6 @@ pub async fn create_gateway<S: GatewayStore>(
 /// Update a gateway
 pub async fn update_gateway<S: GatewayStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
-    Extension(notif_store): Extension<Option<Arc<crate::integrations::FileSystemNotificationStore>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -406,10 +389,7 @@ pub async fn update_gateway<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update gateway: {}", e)))?;
 
-    // Trigger gateway.updated integration
-    if let Some(notif) = notif_store.as_ref() {
-        crate::integrations::trigger_gateway_updated(notif.as_ref(), &old_gateway, &gateway).await;
-    }
+    crate::integrations::trigger_gateway_updated(&old_gateway, &gateway);
 
     Ok(Json(gateway))
 }
@@ -667,7 +647,6 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
     Extension(connection_point_store): Extension<std::sync::Arc<P>>,
     Extension(listener_manager): Extension<std::sync::Arc<ConnectionPointListenerManager>>,
-    Extension(notif_store): Extension<Option<Arc<crate::integrations::FileSystemNotificationStore>>>,
     Extension(caller_user_id): Extension<String>,
     Extension(user_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
@@ -742,14 +721,7 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
 
     info!("Deleted gateway {} and stopped all associated listeners", id);
 
-    // Trigger gateway.deleted integration (async, non-blocking)
-    if let Some(notif) = notif_store.as_ref() {
-        let notif = notif.clone();
-        let gateway_clone = gateway_for_trigger.clone();
-        crate::observability::spawn_traced_task("integration.gateway_deleted", async move {
-            crate::integrations::trigger_gateway_deleted(notif.as_ref(), &gateway_clone).await;
-        });
-    }
+    crate::integrations::trigger_gateway_deleted(&gateway_for_trigger);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1132,7 +1104,7 @@ mod tests {
         id: &str,
         req: UpdateGatewayRequest,
     ) -> Result<Gateway, (StatusCode, String)> {
-        update_gateway(Extension(Arc::clone(store)), Extension(None), Path(id.to_string()), None, None, Json(req))
+        update_gateway(Extension(Arc::clone(store)), Path(id.to_string()), None, None, Json(req))
             .await
             .map(|Json(gateway)| gateway)
     }

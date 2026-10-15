@@ -4413,9 +4413,6 @@ async fn initialize_saml_state(
             .context("Failed to create SAML session manager")?,
     );
 
-    // Notification store will be set later (similar to passkey auth)
-    let notification_store = Arc::new(tokio::sync::RwLock::new(None));
-
     info!("Initialized SAML authentication with entity ID: {}", saml_config.sp_entity_id);
 
     Ok(crate::auth::saml::SamlState {
@@ -4423,7 +4420,6 @@ async fn initialize_saml_state(
         storage,
         session_manager,
         avatars_storage_path: avatars_path,
-        notification_store,
         terms_manager,
         login_throttle: Arc::new(crate::sts::throttle::TokenEndpointThrottle::per_client_ip(
             &saml_config.login_throttle,

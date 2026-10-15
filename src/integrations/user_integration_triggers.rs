@@ -3,50 +3,33 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 use super::delivery::dispatch::dispatch;
-use super::filesystem::FileSystemNotificationStore;
 use crate::auth::storage::UserData;
 use crate::auth::types::{UserRole, UserStatus};
 
-pub async fn trigger_user_created(
-    _notifications: &FileSystemNotificationStore,
-    user: &UserData,
-) {
+pub fn trigger_user_created(user: &UserData) {
     dispatch("user.created", user_runtime_values("user.created", None, Some(user)));
 }
 
-pub async fn trigger_user_approved(
-    _notifications: &FileSystemNotificationStore,
-    user: &UserData,
-) {
+pub fn trigger_user_approved(user: &UserData) {
     dispatch("user.approved", user_runtime_values("user.approved", None, Some(user)));
 }
 
-pub async fn trigger_user_updated(
-    _notifications: &FileSystemNotificationStore,
+pub fn trigger_user_updated(
     old_user: &UserData,
     new_user: &UserData,
 ) {
     dispatch("user.updated", user_runtime_values("user.updated", Some(old_user), Some(new_user)));
 }
 
-pub async fn trigger_user_deleted(
-    _notifications: &FileSystemNotificationStore,
-    user: &UserData,
-) {
+pub fn trigger_user_deleted(user: &UserData) {
     dispatch("user.deleted", user_runtime_values("user.deleted", Some(user), None));
 }
 
-pub async fn trigger_user_login(
-    _notifications: &FileSystemNotificationStore,
-    user: &UserData,
-) {
+pub fn trigger_user_login(user: &UserData) {
     dispatch("user.login", user_runtime_values("user.login", None, Some(user)));
 }
 
-pub async fn trigger_user_accessed(
-    _notifications: &FileSystemNotificationStore,
-    user: &UserData,
-) {
+pub fn trigger_user_accessed(user: &UserData) {
     dispatch("user.accessed", user_runtime_values("user.accessed", None, Some(user)));
 }
 

@@ -257,18 +257,12 @@ pub async fn register_finish(
 
     info!("User registration complete - role: {:?}, status: {:?}, user_id: {}", user.role, user.status, user.user_id);
 
-    // Trigger user.created integration (async, non-blocking)
+    crate::integrations::trigger_user_created(&user);
     let notif_store_guard = auth_state
         .notification_store
         .read()
         .await;
-    if let Some(notif_store) = notif_store_guard.as_ref() {
-        let notif = notif_store.clone();
-        let user_clone = user.clone();
-        tokio::spawn(async move {
-            crate::integrations::trigger_user_created(notif.as_ref(), &user_clone).await;
-        });
-
+    if notif_store_guard.is_some() {
         if let Some(metrics_store) = metrics_store {
             let user_role = user.role.clone();
             tokio::spawn(async move {
@@ -487,18 +481,12 @@ pub async fn login_finish(
     .finalize_session(AuthenticatedPrincipal::new(username.clone(), user.user_id.clone()))
     .await?;
 
-    // Trigger user.login integration (async, non-blocking)
+    crate::integrations::trigger_user_login(&user);
     let notif_store_guard = auth_state
         .notification_store
         .read()
         .await;
-    if let Some(notif_store) = notif_store_guard.as_ref() {
-        let notif = notif_store.clone();
-        let user_clone = user.clone();
-        tokio::spawn(async move {
-            crate::integrations::trigger_user_login(notif.as_ref(), &user_clone).await;
-        });
-
+    if notif_store_guard.is_some() {
         if let Some(metrics_store) = metrics_store {
             let user_role = user.role.clone();
             tokio::spawn(async move {

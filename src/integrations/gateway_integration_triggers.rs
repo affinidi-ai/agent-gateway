@@ -1,19 +1,14 @@
 use std::collections::HashMap;
 
 use super::delivery::dispatch::dispatch;
-use super::filesystem::FileSystemNotificationStore;
 use crate::gateways::types::Gateway;
 
-pub async fn trigger_gateway_created(
-    _notifications: &FileSystemNotificationStore,
-    gateway: &Gateway,
-) {
+pub fn trigger_gateway_created(gateway: &Gateway) {
     dispatch("gateway.created", gateway_values(None, Some(gateway)));
 }
 
 /// Also raises `gateway.status_changed` when the status changed.
-pub async fn trigger_gateway_updated(
-    _notifications: &FileSystemNotificationStore,
+pub fn trigger_gateway_updated(
     old_gateway: &Gateway,
     new_gateway: &Gateway,
 ) {
@@ -23,17 +18,11 @@ pub async fn trigger_gateway_updated(
     }
 }
 
-pub async fn trigger_gateway_deleted(
-    _notifications: &FileSystemNotificationStore,
-    gateway: &Gateway,
-) {
+pub fn trigger_gateway_deleted(gateway: &Gateway) {
     dispatch("gateway.deleted", gateway_values(Some(gateway), None));
 }
 
-pub async fn trigger_gateway_accessed(
-    _notifications: &FileSystemNotificationStore,
-    gateway: &Gateway,
-) {
+pub fn trigger_gateway_accessed(gateway: &Gateway) {
     dispatch("gateway.accessed", gateway_values(None, Some(gateway)));
 }
 
