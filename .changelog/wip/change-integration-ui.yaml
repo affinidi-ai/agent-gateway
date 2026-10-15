@@ -10,8 +10,8 @@ changes:
     - timestamp: '2026-10-14T09:03:25.000Z'
       title: Add one catalog of every event the gateway delivers to integrations
       description: >-
-        Lists the 45 delivered gateway, user, connection point message, x402, MPP and governance
-        audit events with their family, audit group and the template variables each delivery
+        Lists every delivered gateway, user, connection point message, x402, MPP and governance
+        audit event with its family, audit group and the template variables each delivery
         fills, so integrations can pick events without categories.
     - timestamp: '2026-10-14T09:10:57.000Z'
       title: Store endpoints, event sets and integrations as separate definitions

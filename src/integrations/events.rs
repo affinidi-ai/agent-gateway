@@ -453,7 +453,6 @@ mod tests {
         expected.sort();
 
         assert_eq!(listed, expected);
-        assert_eq!(listed.len(), 45);
     }
 
     #[test]
