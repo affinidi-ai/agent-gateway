@@ -171,6 +171,19 @@ impl BootstrapConfig {
                     .storage_paths
                     .integration_triggers,
             );
+            for path in [
+                &mut config
+                    .storage_paths
+                    .integration_endpoints,
+                &mut config
+                    .storage_paths
+                    .integration_event_sets,
+                &mut config
+                    .storage_paths
+                    .integration_definitions,
+            ] {
+                *path = resolve_storage_path(path);
+            }
             config.storage_paths.webhooks = resolve_storage_path(&config.storage_paths.webhooks);
             config.storage_paths.vc_keys = resolve_storage_path(&config.storage_paths.vc_keys);
             config.storage_paths.metrics = resolve_storage_path(&config.storage_paths.metrics);

@@ -2834,6 +2834,18 @@ pub struct StoragePaths {
     #[serde(default = "default_integration_triggers_storage_path")]
     pub integration_triggers: String,
 
+    /// Path to store integration endpoints (transport, destination and credentials)
+    #[serde(default = "default_integration_endpoints_storage_path")]
+    pub integration_endpoints: String,
+
+    /// Path to store integration event sets
+    #[serde(default = "default_integration_event_sets_storage_path")]
+    pub integration_event_sets: String,
+
+    /// Path to store integrations, each joining one endpoint and one event set
+    #[serde(default = "default_integration_definitions_storage_path")]
+    pub integration_definitions: String,
+
     /// Path to store Webhook configurations
     #[serde(default = "default_webhooks_storage_path")]
     pub webhooks: String,
@@ -2949,6 +2961,9 @@ impl Default for StoragePaths {
             a2a_proxies: default_a2a_proxies_storage_path(),
             integrations: default_integrations_storage_path(),
             integration_triggers: default_integration_triggers_storage_path(),
+            integration_endpoints: default_integration_endpoints_storage_path(),
+            integration_event_sets: default_integration_event_sets_storage_path(),
+            integration_definitions: default_integration_definitions_storage_path(),
             webhooks: default_webhooks_storage_path(),
             vc_keys: default_vc_keys_path(),
             metrics: default_metrics_storage_path(),
@@ -3368,6 +3383,18 @@ fn default_integration_triggers_storage_path() -> String {
     "_storage/integrations/triggers".to_string()
 }
 
+fn default_integration_endpoints_storage_path() -> String {
+    "_storage/integrations/endpoints".to_string()
+}
+
+fn default_integration_event_sets_storage_path() -> String {
+    "_storage/integrations/event_sets".to_string()
+}
+
+fn default_integration_definitions_storage_path() -> String {
+    "_storage/integrations/integrations".to_string()
+}
+
 fn default_webhooks_storage_path() -> String {
     "_storage/webhooks".to_string()
 }
@@ -3566,6 +3593,43 @@ pub struct DidWebVhIdentityConfig {
     /// How to inject the DID identity into outgoing requests
     #[serde(default)]
     pub injection_mode: DidInjectionMode,
+}
+
+#[cfg(test)]
+mod storage_paths_tests {
+    use super::StoragePaths;
+
+    #[test]
+    fn integration_definitions_default_to_their_own_folders() {
+        let paths = StoragePaths::default();
+
+        assert_eq!(paths.integration_endpoints, "_storage/integrations/endpoints");
+        assert_eq!(paths.integration_event_sets, "_storage/integrations/event_sets");
+        assert_eq!(paths.integration_definitions, "_storage/integrations/integrations");
+    }
+
+    #[test]
+    fn integration_definition_paths_can_be_configured() {
+        let paths: StoragePaths = toml::from_str(
+            "integration_endpoints = \"/data/endpoints\"\nintegration_event_sets = \"/data/event_sets\"\nintegration_definitions = \"/data/integrations\"",
+        )
+        .expect("parses");
+
+        assert_eq!(
+            (
+                paths
+                    .integration_endpoints
+                    .as_str(),
+                paths
+                    .integration_event_sets
+                    .as_str(),
+                paths
+                    .integration_definitions
+                    .as_str()
+            ),
+            ("/data/endpoints", "/data/event_sets", "/data/integrations")
+        );
+    }
 }
 
 #[cfg(test)]

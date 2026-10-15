@@ -772,6 +772,18 @@ fn build_bootstrap_config(
                 .join("integrations/triggers")
                 .to_string_lossy()
                 .into_owned(),
+            integration_endpoints: base
+                .join("integrations/endpoints")
+                .to_string_lossy()
+                .into_owned(),
+            integration_event_sets: base
+                .join("integrations/event_sets")
+                .to_string_lossy()
+                .into_owned(),
+            integration_definitions: base
+                .join("integrations/integrations")
+                .to_string_lossy()
+                .into_owned(),
             webhooks: base
                 .join("webhooks")
                 .to_string_lossy()
