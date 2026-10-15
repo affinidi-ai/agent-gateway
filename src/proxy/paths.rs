@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn collision_ignores_non_reserved_prefix() {
-        assert!(check_spa_route_collisions(["/payments", "/cats", "/foo"]).is_empty());
+        assert!(check_spa_route_collisions(["/payments", "/helpdesk", "/foo"]).is_empty());
     }
 
     #[test]

@@ -2,8 +2,9 @@
 
 This file is the canonical source of truth for project rules, architecture, and
 workflow — for both human contributors and AI agents. Agent tools that support the
-`AGENTS.md` convention (including Claude Code) read it automatically; there is no
-separate per-tool instruction file. [`CONTEXT.md`](CONTEXT.md) is the terminology
+`AGENTS.md` convention read it automatically. Claude Code reads [`CLAUDE.md`](CLAUDE.md)
+instead when both exist, so `CLAUDE.md` imports this file; keep rules, architecture and
+commands here. [`CONTEXT.md`](CONTEXT.md) is the terminology
 glossary, and [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the contribution workflow
 (local checks, tests, and changelog fragments). Source setup and development workflows live in
 [`docs/development/GETTING_STARTED.md`](docs/development/GETTING_STARTED.md) and
@@ -78,6 +79,10 @@ The Surface Builder's **Send delegated credentials over Fabric** switch is per r
 (Managed Agent or Transit Point), off by default, and shown only for a `fabric://` route on
 a surface with credential bindings; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
+Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 

@@ -3,7 +3,11 @@ import SurfaceCanvas from './SurfaceCanvas';
 import NodeConfigPanel from './NodeConfigPanel';
 import MultiSelectionPanel from './MultiSelectionPanel';
 import SurfaceVariantsWidget from './SurfaceVariantsWidget';
-import { RouteListenerBanner } from './elements/_shared/RouteListenerSection';
+import {
+  ENTRY_POINT_URL_HELP,
+  ENTRY_POINT_URL_LABEL,
+  RouteListenerBanner,
+} from './elements/_shared/RouteListenerSection';
 import type { UseSurfaceBuilderReturn, SurfaceBuilderState } from './hooks/useSurfaceBuilder';
 import {
   synthesizeFabricCanvasNodes,
@@ -253,90 +257,97 @@ export function SurfaceBuilder<T extends SurfaceBuilderState>({
         exportPngRef={exportPngRef}
         resetViewRef={resetViewRef}
       />
-      <SurfaceVariantsWidget
-        nodes={state.nodes}
-        selected={state.selectedNodeId === 'target-variant'}
-        onOpen={() => handleNodeClick('target-variant')}
-        activeVariantId={activeVariantId}
-        onSwitchVariant={onSwitchVariant}
-        onAddVariant={onAddVariant}
-      />
-      {accessPointUrl && (
-        <div className="surface-access-point-url-widget">
-          <RouteListenerBanner label="Access Point" url={accessPointUrl} />
+      <div className="surface-canvas-topbar">
+        <SurfaceVariantsWidget
+          nodes={state.nodes}
+          selected={state.selectedNodeId === 'target-variant'}
+          onOpen={() => handleNodeClick('target-variant')}
+          activeVariantId={activeVariantId}
+          onSwitchVariant={onSwitchVariant}
+          onAddVariant={onAddVariant}
+        />
+        {accessPointUrl && (
+          <div className="surface-access-point-url-widget">
+            <RouteListenerBanner
+              label={ENTRY_POINT_URL_LABEL}
+              help={ENTRY_POINT_URL_HELP}
+              testId="surface-entry-point-url"
+              url={accessPointUrl}
+            />
+          </div>
+        )}
+        <div className="surface-toolbar-widget">
+          <button
+            type="button"
+            className="surface-toolbar-btn"
+            onClick={handleUndo}
+            disabled={!canUndo}
+            title="Undo (⌘Z / Ctrl+Z)"
+            aria-label="Undo"
+          >
+            <i className="fas fa-undo" />
+          </button>
+          <button
+            type="button"
+            className="surface-toolbar-btn"
+            onClick={handleRedo}
+            disabled={!canRedo}
+            title="Redo (⇧⌘Z / Ctrl+Shift+Z / Ctrl+Y)"
+            aria-label="Redo"
+          >
+            <i className="fas fa-redo" />
+          </button>
+          <button
+            type="button"
+            className={`surface-toolbar-btn${gridSnap ? ' active' : ''}`}
+            onClick={() => setGridSnap(g => !g)}
+            title={
+              gridSnap
+                ? 'Snap to grid: on (hold Shift to move freely)'
+                : 'Snap to grid: off (hold Shift to snap)'
+            }
+            aria-label="Toggle snap to grid"
+            aria-pressed={gridSnap}
+          >
+            <i className="fas fa-border-all" />
+          </button>
+          <button
+            type="button"
+            className="surface-toolbar-btn"
+            onClick={() => exportPngRef.current?.()}
+            title="Download canvas as PNG"
+            aria-label="Download canvas as PNG"
+          >
+            <i className="fas fa-camera" />
+          </button>
+          <button
+            type="button"
+            className="surface-toolbar-btn"
+            onClick={handleAutoLayout}
+            title="Auto-layout (⌘L / Ctrl+L)"
+            aria-label="Auto-layout"
+          >
+            <i className="fas fa-up-down-left-right" />
+          </button>
+          <button
+            type="button"
+            className="surface-toolbar-btn"
+            onClick={() => resetViewRef.current?.()}
+            title="Reset pan & zoom"
+            aria-label="Reset pan and zoom"
+          >
+            <i className="fas fa-crosshairs" />
+          </button>
+          <button
+            type="button"
+            className="surface-toolbar-btn"
+            onClick={() => handleNodeClick('__surface__')}
+            title="Surface properties"
+            aria-label="Surface properties"
+          >
+            <i className="fas fa-cog" />
+          </button>
         </div>
-      )}
-      <div className="surface-toolbar-widget">
-        <button
-          type="button"
-          className="surface-toolbar-btn"
-          onClick={handleUndo}
-          disabled={!canUndo}
-          title="Undo (⌘Z / Ctrl+Z)"
-          aria-label="Undo"
-        >
-          <i className="fas fa-undo" />
-        </button>
-        <button
-          type="button"
-          className="surface-toolbar-btn"
-          onClick={handleRedo}
-          disabled={!canRedo}
-          title="Redo (⇧⌘Z / Ctrl+Shift+Z / Ctrl+Y)"
-          aria-label="Redo"
-        >
-          <i className="fas fa-redo" />
-        </button>
-        <button
-          type="button"
-          className={`surface-toolbar-btn${gridSnap ? ' active' : ''}`}
-          onClick={() => setGridSnap(g => !g)}
-          title={
-            gridSnap
-              ? 'Snap to grid: on (hold Shift to move freely)'
-              : 'Snap to grid: off (hold Shift to snap)'
-          }
-          aria-label="Toggle snap to grid"
-          aria-pressed={gridSnap}
-        >
-          <i className="fas fa-border-all" />
-        </button>
-        <button
-          type="button"
-          className="surface-toolbar-btn"
-          onClick={() => exportPngRef.current?.()}
-          title="Download canvas as PNG"
-          aria-label="Download canvas as PNG"
-        >
-          <i className="fas fa-camera" />
-        </button>
-        <button
-          type="button"
-          className="surface-toolbar-btn"
-          onClick={handleAutoLayout}
-          title="Auto-layout (⌘L / Ctrl+L)"
-          aria-label="Auto-layout"
-        >
-          <i className="fas fa-up-down-left-right" />
-        </button>
-        <button
-          type="button"
-          className="surface-toolbar-btn"
-          onClick={() => resetViewRef.current?.()}
-          title="Reset pan & zoom"
-          aria-label="Reset pan and zoom"
-        >
-          <i className="fas fa-crosshairs" />
-        </button>
-        <button
-          type="button"
-          className="surface-toolbar-btn"
-          onClick={() => handleNodeClick('__surface__')}
-          title="Surface properties"
-          aria-label="Surface properties"
-        >
-          <i className="fas fa-cog" />
-        </button>
       </div>
       <div onBlur={commit}>
         {multiSelectedIds.length >= 2 ? (

@@ -135,7 +135,7 @@ pub struct ChannelPrefix {
     /// Human-readable name (displayed in UI dropdown)
     pub name: String,
 
-    /// Route prefix (e.g., "/channels", "/cats")
+    /// Route prefix (e.g., "/agents", "/payments")
     pub prefix: String,
 }
 
