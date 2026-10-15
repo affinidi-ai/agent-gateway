@@ -6,6 +6,7 @@ import { ROUTES } from '../routes';
 const IntegrationsPage = lazy(() => import('./IntegrationsPage'));
 const AddIntegrationWizardPage = lazy(() => import('./AddIntegrationWizardPage'));
 const EditIntegrationPage = lazy(() => import('./EditIntegrationPage'));
+const EndpointEditorPage = lazy(() => import('./EndpointEditorPage'));
 
 /**
  * The Integrations area, guarded by the `integrations.*` permissions. MCP proxies keep their
@@ -37,6 +38,24 @@ export function integrationRoutes(): React.ReactElement[] {
       element={
         <ProtectedRoute permission="integrations.edit">
           <EditIntegrationPage />
+        </ProtectedRoute>
+      }
+    />,
+    <Route
+      key="endpoint-new"
+      path={ROUTES.ENDPOINT_NEW}
+      element={
+        <ProtectedRoute permission="integrations.edit">
+          <EndpointEditorPage />
+        </ProtectedRoute>
+      }
+    />,
+    <Route
+      key="endpoint"
+      path={`${ROUTES.INTEGRATIONS}/endpoints/:id`}
+      element={
+        <ProtectedRoute permission="integrations.edit">
+          <EndpointEditorPage />
         </ProtectedRoute>
       }
     />,
