@@ -29,6 +29,7 @@ pub fn router(
     use integrations::{
         create_integration, delete_integration, get_integration, list_integrations, update_integration,
     };
+    use send_test::{test_draft, test_endpoint, test_integration};
 
     let gate = |route: MethodRouter, feature: Feature| -> MethodRouter { maybe_gate(guard.as_ref(), route, feature) };
     Router::new()
@@ -37,6 +38,9 @@ pub fn router(
         .route("/v1/integrations/{id}", gate(get(get_integration), Feature::IntegrationsView))
         .route("/v1/integrations/{id}", gate(put(update_integration), Feature::IntegrationsEdit))
         .route("/v1/integrations/{id}", gate(delete(delete_integration), Feature::IntegrationsDelete))
+        .route("/v1/integrations/{id}/test", gate(post(test_integration), Feature::IntegrationsEdit))
+        .route("/v1/integrations/test", gate(post(test_draft), Feature::IntegrationsEdit))
+        .route("/v1/integrations/endpoints/{id}/test", gate(post(test_endpoint), Feature::IntegrationsEdit))
         .route("/v1/integrations/catalog", gate(get(get_catalog), Feature::IntegrationsView))
         .route("/v1/integrations/endpoints", gate(get(list_endpoints), Feature::IntegrationsView))
         .route("/v1/integrations/endpoints", gate(post(create_endpoint), Feature::IntegrationsEdit))
@@ -186,6 +190,7 @@ async fn get_catalog() -> Json<Catalog> {
 pub mod endpoints;
 pub mod event_sets;
 pub mod integrations;
+pub mod send_test;
 
 #[cfg(test)]
 pub(crate) mod test_support;

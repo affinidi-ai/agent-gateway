@@ -109,7 +109,7 @@ pub async fn delete_integration(
 }
 
 /// Sets `integration` from `request` once its endpoint and event set exist and it fits the set.
-async fn apply(
+pub(super) async fn apply(
     stores: &DefinitionStores,
     integration: &mut Integration,
     request: IntegrationRequest,

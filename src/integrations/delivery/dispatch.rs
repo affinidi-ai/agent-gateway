@@ -250,6 +250,25 @@ pub async fn prepare(
     ))
 }
 
+/// Sends `route` its message for `values` once, as a test message is.
+pub async fn send_once(
+    route: &Route,
+    values: &HashMap<String, String>,
+) -> Result<()> {
+    let secrets = crate::gateways::connection_points::message_processor::get_secrets_store();
+    let (configuration, message) = prepare(route, values, secrets.as_deref()).await?;
+    INTEGRATION_REGISTRY
+        .get(
+            route
+                .endpoint
+                .endpoint_type
+                .as_str(),
+        )
+        .context("No publisher for the endpoint type")?
+        .send(&configuration, &message)
+        .await
+}
+
 /// Sends `route` its message for `values`, retrying transient failures.
 pub async fn deliver(
     route: &Route,

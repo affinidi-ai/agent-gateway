@@ -35,6 +35,24 @@ pub fn event_values(
     values
 }
 
+/// Stand-in values for each of `event`'s own variables, for test messages: `{}` for JSON
+/// ones, `sample-<name>` for the rest.
+pub fn sample_trigger_values(event: &IntegrationEvent) -> HashMap<String, String> {
+    event
+        .variables
+        .iter()
+        .filter(|name| !COMMON_VARIABLES.contains(name))
+        .map(|name| {
+            let value = if JSON_TEXT_VARIABLES.contains(name) || *name == "AUDIT_RECORD" {
+                "{}".to_string()
+            } else {
+                format!("sample-{}", name.to_lowercase())
+            };
+            (name.to_string(), value)
+        })
+        .collect()
+}
+
 /// Values every delivery computes, never taken from a trigger.
 const COMPUTED: &[&str] = &["EVENT_TYPE", "EVENT_NAME", "EVENT_SUMMARY", "EVENT_DATA", "APPLIANCE_ID"];
 
@@ -281,5 +299,21 @@ mod tests {
                 values["EVENT_SUMMARY"]
             );
         }
+    }
+
+    #[test]
+    fn sample_values_fill_each_of_the_events_own_variables() {
+        let sample = sample_trigger_values(event("gateway.status_changed"));
+
+        assert_eq!(sample["GATEWAY_NAME"], "sample-gateway_name");
+        assert_eq!(sample["GATEWAY_OLD_STATUS"], "sample-gateway_old_status");
+        assert_eq!(sample["NEW_STATE"], "{}");
+        assert_eq!(sample["OLD_STATE"], "{}");
+        assert!(!sample.contains_key("EVENT_SUMMARY"));
+        assert!(!sample.contains_key("TIMESTAMP"));
+
+        let audit = sample_trigger_values(event("audit.policy_decision"));
+        assert_eq!(audit["AUDIT_RECORD"], "{}");
+        assert_eq!(audit["AUDIT_DECISION"], "sample-audit_decision");
     }
 }
