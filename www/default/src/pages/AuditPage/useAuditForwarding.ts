@@ -1,33 +1,11 @@
 import { useEffect, useState } from 'react';
-import { apiClient } from '../../api';
-import { AUDIT_INTEGRATION_CATEGORY } from '../../utils/auditIntegrations';
-
-interface IntegrationSummary {
-  category?: string;
-  status?: string;
-  tenant_id?: string | null;
-  audit_events?: string[];
-}
+import { listEndpoints, listEventSets, listIntegrations } from '../../integrationsApi';
 
 export interface AuditForwarding {
-  /** Active, appliance-wide Governance Audit integrations that select at least one event. */
+  /** Active integrations, with an active endpoint, whose event set holds audit events. */
   integrations: number;
-  /** Active, appliance-wide Governance Audit integrations that select no events and receive nothing. */
-  integrationsWithoutEvents: number;
-  /** Whether `/integrations/config` offers the Governance Audit category at all. */
-  categoryConfigured: boolean;
-}
-
-function isForwardedTo(integration: IntegrationSummary): boolean {
-  return (
-    integration.category === AUDIT_INTEGRATION_CATEGORY &&
-    integration.status === 'active' &&
-    !integration.tenant_id
-  );
-}
-
-function selectsEvents(integration: IntegrationSummary): boolean {
-  return Array.isArray(integration.audit_events) && integration.audit_events.length > 0;
+  /** Integrations whose event set holds audit events but that, or whose endpoint, is disabled. */
+  pausedIntegrations: number;
 }
 
 /** Where audit records are forwarded, or `null` when it cannot be shown. */
@@ -40,23 +18,29 @@ export function useAuditForwarding(canViewIntegrations: boolean): AuditForwardin
       return;
     }
     let cancelled = false;
-    Promise.all([apiClient.get('/integrations'), apiClient.get('/integrations/config')])
-      .then(([integrationsResponse, configResponse]) => {
+    Promise.all([listIntegrations(), listEndpoints(), listEventSets()])
+      .then(([integrations, endpoints, eventSets]) => {
         if (cancelled) {
           return;
         }
-        const integrations: IntegrationSummary[] = Array.isArray(integrationsResponse.data)
-          ? integrationsResponse.data
-          : [];
-        const categories: { enum_value?: string }[] = configResponse.data?.categories ?? [];
-        const forwardedTo = integrations.filter(isForwardedTo);
-        const receiving = forwardedTo.filter(selectsEvents).length;
+        const auditSets = new Set(
+          eventSets
+            .filter(eventSet => eventSet.events.some(event => event.startsWith('audit.')))
+            .map(eventSet => eventSet.id)
+        );
+        const activeEndpoints = new Set(
+          endpoints.filter(endpoint => endpoint.status === 'active').map(endpoint => endpoint.id)
+        );
+        const withAudit = integrations.filter(integration =>
+          auditSets.has(integration.event_set_id)
+        );
+        const receiving = withAudit.filter(
+          integration =>
+            integration.status === 'active' && activeEndpoints.has(integration.endpoint_id)
+        ).length;
         setForwarding({
           integrations: receiving,
-          integrationsWithoutEvents: forwardedTo.length - receiving,
-          categoryConfigured: categories.some(
-            category => category.enum_value === AUDIT_INTEGRATION_CATEGORY
-          ),
+          pausedIntegrations: withAudit.length - receiving,
         });
       })
       .catch(() => {

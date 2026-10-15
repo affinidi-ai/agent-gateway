@@ -7,6 +7,7 @@ import path from 'path';
  * identities, and the old config and runtime variable routes are gone.
  */
 const REMOVED = [
+  { what: 'GET /v1/integrations/config', pattern: /integrations\/config\b/ },
   { what: 'per-gateway integrations', pattern: /gateways\/\$\{[^}]+\}\/integrations/ },
   { what: 'user integrations', pattern: /users\/integrations/ },
   { what: 'identity integrations', pattern: /identities\/integrations/ },

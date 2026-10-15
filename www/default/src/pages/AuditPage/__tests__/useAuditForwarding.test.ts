@@ -10,80 +10,85 @@ jest.mock('../../../api', () => ({
 
 const mockGet = apiClient.get as jest.Mock;
 
-interface IntegrationFixture {
-  category?: string;
-  status: string;
-  tenant_id?: string;
-  audit_events?: string[];
+interface Definitions {
+  integrations: { status: string; endpoint_id: string; event_set_id: string }[];
+  endpoints?: { id: string; status: string }[];
+  eventSets?: { id: string; events: string[] }[];
 }
 
-function withIntegrations(integrations: IntegrationFixture[], categories = ['general', 'audit']) {
-  mockGet.mockImplementation((url: string) =>
-    Promise.resolve({
-      data:
-        url === '/integrations'
-          ? integrations
-          : { categories: categories.map(enum_value => ({ enum_value })) },
-    })
-  );
+const AUDIT_SET = { id: 'audit-set', events: ['gateway.created', 'audit.policy_decision'] };
+const GATEWAY_SET = { id: 'gateway-set', events: ['gateway.created'] };
+
+function withDefinitions({
+  integrations,
+  endpoints = [{ id: 'on', status: 'active' }],
+  eventSets = [AUDIT_SET, GATEWAY_SET],
+}: Definitions) {
+  const byPath: Record<string, unknown> = {
+    '/integrations': integrations,
+    '/integrations/endpoints': endpoints,
+    '/integrations/event-sets': eventSets,
+  };
+  mockGet.mockImplementation((path: string) => Promise.resolve({ data: byPath[path] }));
 }
+
+const integration = (status: string, endpointId: string, eventSetId: string) => ({
+  status,
+  endpoint_id: endpointId,
+  event_set_id: eventSetId,
+});
 
 describe('useAuditForwarding', () => {
   beforeEach(() => {
     mockGet.mockReset();
   });
 
-  it('counts only active appliance-wide Governance Audit integrations that select events', async () => {
-    withIntegrations([
-      { category: 'audit', status: 'active', audit_events: ['policy_decision'] },
-      { category: 'audit', status: 'active', audit_events: ['trust_check', 'vp_injected'] },
-      { category: 'audit', status: 'disabled', audit_events: ['policy_decision'] },
-      {
-        category: 'audit',
-        status: 'active',
-        tenant_id: 'tenant-a',
-        audit_events: ['policy_decision'],
-      },
-      { category: 'gateway', status: 'active', audit_events: ['policy_decision'] },
-    ]);
-
-    const { result } = renderHook(() => useAuditForwarding(true));
-
-    await waitFor(() => expect(result.current).not.toBeNull());
-    expect(result.current).toEqual({
-      integrations: 2,
-      integrationsWithoutEvents: 0,
-      categoryConfigured: true,
+  it('counts active integrations with an active endpoint whose event set holds audit events', async () => {
+    withDefinitions({
+      integrations: [
+        integration('active', 'on', 'audit-set'),
+        integration('active', 'on', 'audit-set'),
+        integration('active', 'on', 'gateway-set'),
+      ],
     });
-  });
-
-  it('reports active appliance-wide Governance Audit integrations that select no events', async () => {
-    withIntegrations([
-      { category: 'audit', status: 'active', audit_events: ['policy_decision'] },
-      { category: 'audit', status: 'active', audit_events: [] },
-      { category: 'audit', status: 'active' },
-      { category: 'audit', status: 'disabled' },
-      { category: 'audit', status: 'active', tenant_id: 'tenant-a' },
-    ]);
 
     const { result } = renderHook(() => useAuditForwarding(true));
 
     await waitFor(() => expect(result.current).not.toBeNull());
-    expect(result.current?.integrations).toBe(1);
-    expect(result.current?.integrationsWithoutEvents).toBe(2);
+    expect(result.current).toEqual({ integrations: 2, pausedIntegrations: 0 });
   });
 
-  it('reports whether the gateway offers the Governance Audit category', async () => {
-    withIntegrations([], ['general', 'gateway']);
+  it('reports integrations with audit events that are disabled or whose endpoint is', async () => {
+    withDefinitions({
+      integrations: [
+        integration('active', 'on', 'audit-set'),
+        integration('disabled', 'on', 'audit-set'),
+        integration('active', 'off', 'audit-set'),
+        integration('disabled', 'on', 'gateway-set'),
+      ],
+      endpoints: [
+        { id: 'on', status: 'active' },
+        { id: 'off', status: 'disabled' },
+      ],
+    });
 
     const { result } = renderHook(() => useAuditForwarding(true));
 
     await waitFor(() => expect(result.current).not.toBeNull());
-    expect(result.current?.categoryConfigured).toBe(false);
+    expect(result.current).toEqual({ integrations: 1, pausedIntegrations: 2 });
+  });
+
+  it('shows nothing when the definitions cannot be loaded', async () => {
+    mockGet.mockRejectedValue(new Error('Forbidden (403)'));
+
+    const { result } = renderHook(() => useAuditForwarding(true));
+
+    await waitFor(() => expect(mockGet).toHaveBeenCalled());
+    expect(result.current).toBeNull();
   });
 
   it('looks nothing up without permission to view integrations', () => {
-    withIntegrations([{ category: 'audit', status: 'active', audit_events: ['policy_decision'] }]);
+    withDefinitions({ integrations: [integration('active', 'on', 'audit-set')] });
 
     const { result } = renderHook(() => useAuditForwarding(false));
 
