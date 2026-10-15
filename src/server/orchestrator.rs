@@ -1744,8 +1744,13 @@ pub async fn run_axum_proxy(
             crate::proxy::server::init_transit_token_issuer(Arc::new(issuer));
         }
 
-        // Initialize integration storage. The audit pipeline builds its sinks
-        // from the integrations, so this comes before it starts.
+        // The audit pipeline builds its sinks from the integrations, so their
+        // stores are opened before the sinks are first built.
+        crate::integrations::definitions::init_definition_stores(Arc::new(
+            crate::integrations::definitions::DefinitionStores::open_configured(&bootstrap_config.storage_paths)
+                .await
+                .expect("Failed to initialize integration endpoint, event set and integration storage"),
+        ));
         let integration_storage: Arc<crate::storage::IntegrationStorage> = {
             let storage = crate::storage::IntegrationStorage::new(PathBuf::from(
                 &bootstrap_config
@@ -1771,11 +1776,6 @@ pub async fn run_axum_proxy(
 
             storage_arc
         };
-        crate::integrations::definitions::init_definition_stores(Arc::new(
-            crate::integrations::definitions::DefinitionStores::open_configured(&bootstrap_config.storage_paths)
-                .await
-                .expect("Failed to initialize integration endpoint, event set and integration storage"),
-        ));
 
         // Initialize delegation vault audit logger (started only on an Active node)
         crate::delegation_vault::audit::init_audit_logger(

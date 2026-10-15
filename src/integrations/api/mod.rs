@@ -125,9 +125,10 @@ async fn refuse_while_used(
     Err((StatusCode::CONFLICT, format!("The {definition} is used by these integrations: {}", names.join(", "))))
 }
 
-/// Makes event delivery use the definitions as they are now.
+/// Makes event delivery and the audit sinks use the definitions as they are now.
 async fn definitions_changed() {
     crate::integrations::delivery::dispatch::invalidate_routes().await;
+    crate::audit::sources::rebuild_sinks().await;
 }
 
 fn caller_id(caller: &Option<Extension<AuthGuardOk>>) -> &str {
