@@ -48,9 +48,17 @@ pub fn router(
     use axum::routing::{MethodRouter, delete, get, post, put};
     use endpoints::{create_endpoint, delete_endpoint, get_endpoint, list_endpoints, update_endpoint};
     use event_sets::{create_event_set, delete_event_set, get_event_set, list_event_sets, update_event_set};
+    use integrations::{
+        create_integration, delete_integration, get_integration, list_integrations, update_integration,
+    };
 
     let gate = |route: MethodRouter, feature: Feature| -> MethodRouter { maybe_gate(guard.as_ref(), route, feature) };
     Router::new()
+        .route("/v1/integrations", gate(get(list_integrations), Feature::IntegrationsView))
+        .route("/v1/integrations", gate(post(create_integration), Feature::IntegrationsEdit))
+        .route("/v1/integrations/{id}", gate(get(get_integration), Feature::IntegrationsView))
+        .route("/v1/integrations/{id}", gate(put(update_integration), Feature::IntegrationsEdit))
+        .route("/v1/integrations/{id}", gate(delete(delete_integration), Feature::IntegrationsDelete))
         .route("/v1/integrations/catalog", gate(get(get_catalog), Feature::IntegrationsView))
         .route("/v1/integrations/endpoints", gate(get(list_endpoints), Feature::IntegrationsView))
         .route("/v1/integrations/endpoints", gate(post(create_endpoint), Feature::IntegrationsEdit))
@@ -193,6 +201,7 @@ async fn get_catalog() -> Json<Catalog> {
 
 pub mod endpoints;
 pub mod event_sets;
+pub mod integrations;
 
 #[cfg(test)]
 pub(crate) mod test_support;
