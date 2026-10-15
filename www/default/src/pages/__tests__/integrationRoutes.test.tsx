@@ -2,7 +2,7 @@ import React, { Suspense } from 'react';
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { integrationRoutes } from '../integrationRoutes';
-import { endpointPath, integrationPath, ROUTES } from '../../routes';
+import { endpointPath, eventSetPath, integrationPath, ROUTES } from '../../routes';
 
 let mockPermissions: Record<string, boolean> = {};
 
@@ -17,6 +17,7 @@ jest.mock('../IntegrationsPage', () => () => <div>integrations list</div>);
 jest.mock('../AddIntegrationWizardPage', () => () => <div>new integration</div>);
 jest.mock('../EditIntegrationPage', () => () => <div>integration editor</div>);
 jest.mock('../EndpointEditorPage', () => () => <div>endpoint editor</div>);
+jest.mock('../EventSetEditorPage', () => () => <div>event set editor</div>);
 
 async function visit(path: string) {
   render(
@@ -57,6 +58,8 @@ test.each([
   ['an integration', integrationPath('int-1'), 'integration editor'],
   ['a new endpoint', ROUTES.ENDPOINT_NEW, 'endpoint editor'],
   ['an endpoint', endpointPath('e1'), 'endpoint editor'],
+  ['a new event set', ROUTES.EVENT_SET_NEW, 'event set editor'],
+  ['an event set', eventSetPath('s1'), 'event set editor'],
 ])('integrations.edit opens %s', async (_, path, page) => {
   mockPermissions = { 'integrations.view': true, 'integrations.edit': true };
 
@@ -70,6 +73,8 @@ test.each([
   integrationPath('int-1'),
   ROUTES.ENDPOINT_NEW,
   endpointPath('e1'),
+  ROUTES.EVENT_SET_NEW,
+  eventSetPath('s1'),
 ])('a viewer is sent to the dashboard from %s', async path => {
   mockPermissions = { 'integrations.view': true };
 
