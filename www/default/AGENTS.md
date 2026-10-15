@@ -115,12 +115,16 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
   a signed-out visitor sees the login page at that URL, and `loginNextTarget` re-encodes the
   query and returns to the form after passkey or SAML login (the gateway's SAML return-target
   allowlist accepts `/access-tokens/new`).
-- In create mode the form footer has a **Copy creation link** button
-  (`access-token-copy-permalink-button`) that copies an absolute `/access-tokens/new` URL
-  encoding the current name, description, scopes, expiry, resource pattern and headers
-  in the parameters above. It is disabled until the configuration would pass Create's
-  validation (name, scopes, resource pattern, headers, expiry), and it is not shown in edit
-  mode.
+- The form footer always has a **Copy creation link** button
+  (`access-token-copy-permalink-button`), in create and edit mode, that copies an absolute
+  `/access-tokens/new` URL encoding the current name, description, scopes, expiry, resource
+  pattern and headers in the parameters above. It is always enabled, even for an incomplete
+  or invalid configuration; the opened form validates on Create. When the settings are
+  invalid (a resource pattern or required header the form rejects, or a refused expiry) the
+  copy still happens and a `warning` toast says the opened form will not create a token until
+  they are fixed; missing fields and scopes the operator cannot grant do not warn. The toast
+  text never repeats what was typed (toasts render HTML). In edit mode it sits beside
+  **Revoke token** and the link carries no expiry.
 - A successful create replaces the editor with the secret page. The secret isn't rendered:
   the field shows a masked placeholder and **Copy** puts the real value on the clipboard.
   If copying fails (clipboard denied, or no clipboard API on a plain-HTTP origin), the
