@@ -12,7 +12,8 @@ use super::{
     validate_text,
 };
 use crate::auth_manager::middleware::AuthGuardOk;
-use crate::integrations::definitions::endpoint::keep_unsent_secrets;
+use crate::gateways::connection_points::message_processor::get_secrets_store;
+use crate::integrations::definitions::endpoint::{keep_unsent_secrets, resolve_secret_references};
 use crate::integrations::definitions::{Endpoint, EndpointType, Status};
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +86,7 @@ pub async fn create_endpoint(
     let (name, description) = validate_text(&request.name, &request.description)?;
     let mut endpoint = Endpoint::new(name, description, request.endpoint_type, request.configuration);
     endpoint.status = request.status;
-    validate(&endpoint)?;
+    validate(&endpoint).await?;
     save(&stores, &endpoint).await?;
     info!(
         event = "integrations.endpoint.created",
@@ -110,7 +111,7 @@ pub async fn update_endpoint(
     endpoint.description = description;
     endpoint.status = request.status;
     endpoint.updated_at = chrono::Utc::now().to_rfc3339();
-    validate(&endpoint)?;
+    validate(&endpoint).await?;
     save(&stores, &endpoint).await?;
     info!(
         event = "integrations.endpoint.updated",
@@ -152,8 +153,15 @@ async fn load(
         .ok_or_else(not_found)
 }
 
-fn validate(endpoint: &Endpoint) -> Result<(), ApiError> {
-    endpoint
+/// Checks the configuration the endpoint would send with, its secret references resolved.
+async fn validate(endpoint: &Endpoint) -> Result<(), ApiError> {
+    let store = get_secrets_store();
+    let mut resolved = endpoint.clone();
+    resolved.configuration =
+        resolve_secret_references(endpoint.endpoint_type, &endpoint.configuration, store.as_deref())
+            .await
+            .map_err(|reason| (StatusCode::BAD_REQUEST, reason))?;
+    resolved
         .validate_configuration()
         .map_err(|reason| (StatusCode::BAD_REQUEST, reason))
 }
@@ -262,6 +270,24 @@ mod tests {
             .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_secret_reference_it_cannot_resolve() {
+        let f = Fixture::new().await;
+        let mut unresolved = webhook_body();
+        unresolved["configuration"]["signing_secret"] = json!("$SECRET:never-stored");
+
+        let (status, body) = f
+            .call(ADMIN, "POST", "/v1/integrations/endpoints", Some(unresolved))
+            .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.as_str()
+                .is_some_and(|message| message.contains("never-stored")),
+            "{body}"
+        );
     }
 
     #[tokio::test]

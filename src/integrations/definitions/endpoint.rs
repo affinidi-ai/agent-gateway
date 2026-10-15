@@ -3,7 +3,9 @@ use serde_json::Value as JsonValue;
 
 use super::{Definition, Status, now};
 use crate::integrations::publishers::INTEGRATION_REGISTRY;
+use crate::secrets::SecretsStore;
 use crate::storage::filesystem::StorableEntity;
+use crate::tenancy::can_reference;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +84,13 @@ impl Endpoint {
                 .endpoint_type
                 .secret_fields()
             {
+                let is_reference = configuration
+                    .get(*field)
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|value| value.starts_with(SECRET_REFERENCE_PREFIX));
+                if is_reference {
+                    continue;
+                }
                 if configuration
                     .remove(*field)
                     .is_some_and(|value| !value.is_null())
@@ -105,6 +114,57 @@ impl Endpoint {
             .validate_config(&self.configuration)
             .map_err(|error| error.to_string())
     }
+}
+
+/// Marks a secret field value, or a webhook header value, that names a secret in the secrets
+/// store instead of holding it.
+pub const SECRET_REFERENCE_PREFIX: &str = "$SECRET:";
+
+/// `configuration` with every `$SECRET:<secret_id>` secret field and webhook header value
+/// replaced by the stored secret. Fails when a named secret, or the store, is missing.
+pub async fn resolve_secret_references(
+    endpoint_type: EndpointType,
+    configuration: &JsonValue,
+    store: Option<&dyn SecretsStore>,
+) -> Result<JsonValue, String> {
+    let mut resolved = configuration.clone();
+    let Some(fields) = resolved.as_object_mut() else {
+        return Ok(resolved);
+    };
+    for field in endpoint_type.secret_fields() {
+        match fields.get_mut(*field) {
+            Some(JsonValue::String(value)) => resolve_reference(value, store).await?,
+            Some(JsonValue::Object(headers)) => {
+                for header in headers.values_mut() {
+                    if let JsonValue::String(value) = header {
+                        resolve_reference(value, store).await?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(resolved)
+}
+
+/// Replaces a `$SECRET:<secret_id>` `value` with the appliance-wide secret it names.
+async fn resolve_reference(
+    value: &mut String,
+    store: Option<&dyn SecretsStore>,
+) -> Result<(), String> {
+    let Some(secret_id) = value.strip_prefix(SECRET_REFERENCE_PREFIX) else {
+        return Ok(());
+    };
+    let store =
+        store.ok_or_else(|| format!("Secret '{secret_id}' is referenced but no secrets store is configured"))?;
+    let secret = store
+        .get_by_secret_id(secret_id)
+        .await
+        .map_err(|error| format!("Failed to read secret '{secret_id}': {error}"))?
+        .filter(|secret| can_reference(None, secret.tenant_id.as_deref()))
+        .ok_or_else(|| format!("Secret '{secret_id}' not found"))?;
+    *value = secret.value;
+    Ok(())
 }
 
 /// `incoming` with each secret it leaves out kept from `existing`. A secret sent as `null`
@@ -304,5 +364,140 @@ mod tests {
                 .validate_configuration()
                 .is_err()
         );
+    }
+
+    struct Secrets(Vec<(&'static str, Option<&'static str>, &'static str)>);
+
+    #[async_trait::async_trait]
+    impl SecretsStore for Secrets {
+        async fn create(
+            &self,
+            _request: crate::secrets::CreateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            unimplemented!()
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            unimplemented!()
+        }
+
+        async fn get_by_secret_id(
+            &self,
+            secret_id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            let now = chrono::Utc::now();
+            Ok(self
+                .0
+                .iter()
+                .find(|(id, _, _)| *id == secret_id)
+                .map(|(id, tenant, value)| crate::secrets::Secret {
+                    id: format!("internal-{id}"),
+                    tenant_id: tenant.map(str::to_string),
+                    name: id.to_string(),
+                    secret_id: id.to_string(),
+                    description: None,
+                    value: value.to_string(),
+                    secret_type: "General".to_string(),
+                    tags: Vec::new(),
+                    created_at: now,
+                    updated_at: now,
+                }))
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            _request: crate::secrets::UpdateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        async fn find_by_tag(
+            &self,
+            _tag: &str,
+        ) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_secret_references_in_secret_fields_and_headers() {
+        let store = Secrets(vec![("hook-signing", None, "s3cr3t"), ("ops-token", None, "Bearer abc")]);
+        let configuration = json!({
+            "url": "https://93.184.215.14/hook",
+            "signing_secret": "$SECRET:hook-signing",
+            "headers": {"Authorization": "$SECRET:ops-token", "X-Team": "ops"}
+        });
+
+        let resolved = resolve_secret_references(EndpointType::Webhook, &configuration, Some(&store))
+            .await
+            .expect("resolves");
+
+        assert_eq!(
+            resolved,
+            json!({
+                "url": "https://93.184.215.14/hook",
+                "signing_secret": "s3cr3t",
+                "headers": {"Authorization": "Bearer abc", "X-Team": "ops"}
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_only_secret_fields_and_leaves_literals_alone() {
+        let store = Secrets(vec![("smtp", None, "pw")]);
+        let configuration = json!({"smtp_host": "$SECRET:smtp", "smtp_password": "literal"});
+
+        let resolved = resolve_secret_references(EndpointType::Email, &configuration, Some(&store))
+            .await
+            .expect("resolves");
+
+        assert_eq!(resolved, configuration);
+    }
+
+    #[tokio::test]
+    async fn fails_closed_without_the_secret_the_store_or_an_appliance_wide_owner() {
+        let configuration = json!({"smtp_password": "$SECRET:smtp"});
+        let missing = Secrets(Vec::new());
+        let tenant_owned = Secrets(vec![("smtp", Some("team-a"), "pw")]);
+
+        for (store, reason) in [
+            (Some(&missing as &dyn SecretsStore), "not found"),
+            (Some(&tenant_owned as &dyn SecretsStore), "not found"),
+            (None, "no secrets store"),
+        ] {
+            let error = resolve_secret_references(EndpointType::Email, &configuration, store)
+                .await
+                .expect_err("fails");
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn redaction_shows_secret_references_but_not_secrets() {
+        let mut endpoint = webhook();
+        endpoint.configuration = json!({
+            "url": "https://ops.example.com/hook",
+            "signing_secret": "$SECRET:hook-signing"
+        });
+
+        let (redacted, secrets) = endpoint.redacted();
+
+        assert_eq!(redacted.configuration["signing_secret"], "$SECRET:hook-signing");
+        assert!(secrets.is_empty());
     }
 }
