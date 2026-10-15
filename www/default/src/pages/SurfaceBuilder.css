@@ -120,7 +120,7 @@ body.dark-theme .canvas-grid-dot {
 }
 
 /* Floating controls along the top of the canvas: the variants widget
-   on the left, the toolbar on the right, and the Entry point URL banner
+   on the left, the toolbar on the right, and the Access Point URL banner
    filling the space between them. A flex row, so the banner shrinks
    instead of sliding under either neighbour. The row itself lets canvas
    clicks through; only the controls take them. */
@@ -260,7 +260,7 @@ body.dark-theme .surface-variants-widget .widget-title {
   position: static;
 }
 
-/* Entry point URL banner reused from the Access Point panel, centred in
+/* Access Point URL banner reused from the Access Point panel, centred in
    the top bar's free space for quick discovery and one-click copy. Only
    the URL text truncates; the label, help icon and copy button keep their
    size so copy stays reachable. The decorative info icon is left out to

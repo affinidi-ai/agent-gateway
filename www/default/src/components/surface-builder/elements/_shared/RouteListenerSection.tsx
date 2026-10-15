@@ -13,8 +13,8 @@ import InfoBanner from '../../../shared/InfoBanner';
 import FieldHelp from '../../../shared/FieldHelp';
 import { CopyButton } from '../../../shared/CopyButton';
 
-export const ENTRY_POINT_URL_LABEL = 'Entry point URL';
-export const ENTRY_POINT_URL_HELP = 'The URL used to access this gateway';
+export const ACCESS_POINT_URL_LABEL = 'Access Point URL';
+export const ACCESS_POINT_URL_HELP = 'The URL other agents use to reach this surface';
 
 export interface RouteListenerSectionProps {
   config: any;
@@ -31,7 +31,7 @@ export interface RouteListenerSectionProps {
    * APs write `route`; TPs write `listen_path`.
    */
   routeFieldName: 'route' | 'listen_path';
-  /** Banner heading, e.g. "Entry point URL" or "Listener URL". */
+  /** Banner heading, e.g. "Access Point URL" or "Listener URL". */
   bannerLabel: string;
   /** Tooltip explaining the banner URL, shown behind a help icon beside the heading. */
   bannerHelp?: React.ReactNode;
@@ -522,7 +522,7 @@ export interface RouteListenerBannerProps {
 
 /**
  * Read-only banner used by `RouteListenerSection` and by the canvas
- * Entry point URL widget, with a copy-to-clipboard button once a URL
+ * Access Point URL widget, with a copy-to-clipboard button once a URL
  * is composed.
  */
 export const RouteListenerBanner: React.FC<RouteListenerBannerProps> = ({
