@@ -3,50 +3,25 @@
  * Supports formats: ${VARIABLE} or ${VARIABLE:Label}
  */
 
-import { apiClient } from '../api';
-
 export interface TemplateVariable {
   name: string;
   label?: string;
 }
 
-// Global variable patterns loaded from config
+// The placeholder syntax; the integrations catalog replaces it with the gateway's own.
 let VARIABLE_PATTERN = /\$\{([^:}]+)(?::([^}]+))?\}/g;
-let CUSTOM_VARIABLE_PREFIX = '_';
-
-// Flag to track if patterns have been loaded
-let patternsLoaded = false;
+// Removed with the old integration editor (step 4.14).
+const CUSTOM_VARIABLE_PREFIX = '_';
 
 /**
- * Load variable patterns from the backend config
- * This should be called once during app initialization
+ * Use the placeholder syntax the integrations catalog gives, a regular expression whose first
+ * group is the variable name.
  */
-export async function loadVariablePatterns(): Promise<void> {
-  if (patternsLoaded) return;
-
+export function setVariablePattern(pattern: string): void {
   try {
-    const response = await apiClient.fetch('/api/v1/integrations/config');
-    if (response.ok) {
-      const config = await response.json();
-      if (config.variable_pattern) {
-        // Convert regex string from backend to JavaScript RegExp
-        // Backend sends escaped pattern like "\\$\\{([^:}]+)(?::([^}]+))?\\}"
-        // We need to unescape it for JavaScript
-        const patternStr = config.variable_pattern.replace(/\\\\/g, '\\');
-        VARIABLE_PATTERN = new RegExp(patternStr, 'g');
-      }
-      if (config.custom_variable_prefix) {
-        CUSTOM_VARIABLE_PREFIX = config.custom_variable_prefix;
-      }
-      patternsLoaded = true;
-    }
+    VARIABLE_PATTERN = new RegExp(pattern, 'g');
   } catch (error) {
-    console.warn(
-      '[templateVariables] Failed to load variable patterns from config, using defaults:',
-      error
-    );
-    // Keep using defaults
-    patternsLoaded = true;
+    console.warn('[templateVariables] Invalid variable pattern, keeping the current one:', error);
   }
 }
 

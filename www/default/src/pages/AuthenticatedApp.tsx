@@ -3,7 +3,6 @@ import { Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { AppProvider, useApp } from '../context/AppContext';
 import { PermissionsProvider, usePermissions } from '../context/PermissionsContext';
 import { PageTitleProvider } from '../context/PageTitleContext';
-import { loadVariablePatterns } from '../utils/templateVariables';
 
 // Load dashboard components - only when authenticated
 import Sidebar from '../components/Sidebar';
@@ -141,13 +140,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
   const hasRefreshedCache = useRef<boolean>(false);
   const [version, setVersion] = useState('-.-.-');
   const [isInitializing, setIsInitializing] = useState(true);
-
-  // Load variable patterns from config on mount
-  useEffect(() => {
-    loadVariablePatterns().catch(err => {
-      console.warn('Failed to load variable patterns:', err);
-    });
-  }, []);
 
   // Add dashboard class
   useEffect(() => {
