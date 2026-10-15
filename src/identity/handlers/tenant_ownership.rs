@@ -501,7 +501,6 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                 )
                 .await?;
             }
-            collect_gateway_integrations(state, &mut references, &gateway, source.clone()).await?;
         }
     }
 
@@ -542,31 +541,6 @@ async fn collect_connection_point_references(
             &format!("{} mediator", prefix),
         )
         .await?;
-        if let Some(id) = connection_point
-            .integration_id
-            .as_deref()
-        {
-            add_reference(
-                state,
-                references,
-                source.clone(),
-                ResourceKind::Integrations,
-                id,
-                &format!("{} integration", prefix),
-            )
-            .await?;
-        }
-        for integration in &connection_point.integrations {
-            add_reference(
-                state,
-                references,
-                source.clone(),
-                ResourceKind::Integrations,
-                &integration.integration_id,
-                &format!("{} integration", prefix),
-            )
-            .await?;
-        }
         for id in &connection_point.exposed_channels {
             add_reference(
                 state,
@@ -578,42 +552,6 @@ async fn collect_connection_point_references(
             )
             .await?;
         }
-    }
-    Ok(())
-}
-
-async fn collect_gateway_integrations(
-    state: &IdentityApiState,
-    references: &mut Vec<OwnershipReference>,
-    gateway: &crate::gateways::types::Gateway,
-    source: OwnershipEndpoint,
-) -> Result<(), OwnershipApiError> {
-    let path = std::path::PathBuf::from(
-        &state
-            .bootstrap_config
-            .storage_paths
-            .integration_triggers,
-    )
-    .join("gateways")
-    .join(&gateway.id);
-    let storage = crate::integrations::GatewayIntegrationsStorage::new(path)
-        .await
-        .map_err(internal)?;
-    for assignment in storage
-        .load()
-        .await
-        .map_err(internal)?
-        .integration_integrations
-    {
-        add_reference(
-            state,
-            references,
-            source.clone(),
-            ResourceKind::Integrations,
-            &assignment.integration_id,
-            "gateway integration assignment",
-        )
-        .await?;
     }
     Ok(())
 }
@@ -735,50 +673,6 @@ async fn collect_global_references(
         }
     }
 
-    let root = std::path::PathBuf::from(
-        &state
-            .bootstrap_config
-            .storage_paths
-            .integration_triggers,
-    );
-    let users = crate::integrations::UserIntegrationsStorage::new(root.join("users"))
-        .await
-        .map_err(internal)?;
-    for assignment in users
-        .load()
-        .await
-        .map_err(internal)?
-        .integration_integrations
-    {
-        add_reference(
-            state,
-            references,
-            appliance.clone(),
-            ResourceKind::Integrations,
-            &assignment.integration_id,
-            "global user integration assignment",
-        )
-        .await?;
-    }
-    let identities = crate::integrations::IdentityIntegrationsStorage::new(root.join("identities"))
-        .await
-        .map_err(internal)?;
-    for assignment in identities
-        .load()
-        .await
-        .map_err(internal)?
-        .integration_integrations
-    {
-        add_reference(
-            state,
-            references,
-            appliance.clone(),
-            ResourceKind::Integrations,
-            &assignment.integration_id,
-            "global identity integration assignment",
-        )
-        .await?;
-    }
     Ok(())
 }
 

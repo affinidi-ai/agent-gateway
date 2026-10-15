@@ -122,7 +122,6 @@ pub fn create_identity_api_router(
     listener_manager: Option<std::sync::Arc<crate::gateways::ConnectionPointListenerManager>>,
     message_store: Option<std::sync::Arc<crate::gateways::MessageStore>>,
     pending_connection_store: std::sync::Arc<crate::gateways::PendingConnectionStore>,
-    integration_storage: std::sync::Arc<crate::storage::IntegrationStorage>,
     jwt_verification_strategy_store: Option<std::sync::Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     jwks_client: Option<std::sync::Arc<crate::jwt_bearer::JwksClient>>,
     issuer_store: Option<std::sync::Arc<crate::issuers::FileSystemIssuerStore>>,
@@ -929,8 +928,6 @@ pub fn create_identity_api_router(
         Router::new()
     };
 
-    let integration_storage_for_gateways = Some(integration_storage.clone());
-
     // Create gateway routes if store is provided
     let gateway_router = if let Some(ref store) = gateway_store {
         // H2 / H8 — RBAC gate for mutating gateway routes.
@@ -995,20 +992,6 @@ pub fn create_identity_api_router(
                 ),
             )
             .route(
-                "/v1/gateways/{id}/integrations",
-                gate(
-                    get(crate::integrations::gateway_integrations_handlers::get_gateway_integrations),
-                    Feature::GatewaysView,
-                ),
-            )
-            .route(
-                "/v1/gateways/{id}/integrations",
-                gate(
-                    put(crate::integrations::gateway_integrations_handlers::update_gateway_integrations),
-                    Feature::GatewaysEdit,
-                ),
-            )
-            .route(
                 "/v1/gateways/{id}/policy",
                 gate(
                     get(crate::gateways::handlers::get_gateway_policy::<crate::gateways::FileSystemGatewayStore>),
@@ -1042,8 +1025,7 @@ pub fn create_identity_api_router(
                 state
                     .agent_surface_store
                     .clone(),
-            ))
-            .layer(Extension(integration_storage_for_gateways));
+            ));
 
         // Add listener manager + surface cache for gateway discovery routes
         if let Some(ref listener_mgr) = listener_manager {
@@ -1270,7 +1252,6 @@ pub fn create_identity_api_router(
     // These clones will be used for the mediator router layers
     let connection_point_store_for_mediator = connection_point_store.clone();
     let listener_manager_for_mediator = listener_manager.clone();
-    let integration_storage_for_connection_points = Some(integration_storage.clone());
     let surface_store_for_connection_points = state
         .agent_surface_store
         .clone();
@@ -1466,7 +1447,6 @@ pub fn create_identity_api_router(
                 .layer(Extension(state.network_config.clone()))
                 .layer(Extension(listener_mgr))
                 .layer(Extension(msg_store))
-                .layer(Extension(integration_storage_for_connection_points))
                 .layer(Extension(surface_store_for_connection_points))
                 .layer(Extension(notification_store.clone()));
 
@@ -1832,17 +1812,9 @@ pub fn create_identity_api_router(
     let integration_guard = passkey_storage_for_manager
         .as_ref()
         .map(|auth_storage| crate::auth_manager::middleware::RbacGuard::new(auth_storage.clone(), rbac_config.clone()));
-    let integration_router = crate::storage::integration_handlers::integration_router(
-        integration_storage,
-        integration_guard.clone(),
-        state.config.clone(),
-        state.bootstrap_config.clone(),
-    )
-    .merge(
-        crate::integrations::definitions::definition_stores()
-            .map(|stores| crate::integrations::api::router(stores, integration_guard))
-            .unwrap_or_default(),
-    );
+    let integration_router = crate::integrations::definitions::definition_stores()
+        .map(|stores| crate::integrations::api::router(stores, integration_guard))
+        .unwrap_or_default();
 
     // Create trust registry routes if store is provided
     let trust_registry_router = if let Some(store) = trust_registry_store {

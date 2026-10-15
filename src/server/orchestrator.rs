@@ -3249,7 +3249,6 @@ pub async fn run_axum_proxy(
             listener_manager.clone(),
             message_store.clone(),
             pending_connection_store.clone(),
-            integration_storage,
             // Re-use the same store that backs the middleware so hot-reloads are consistent.
             Some(source_auth_middleware.provider_store()),
             // Pass the JwksClient so the validate-jwks-uri endpoint can probe URIs.

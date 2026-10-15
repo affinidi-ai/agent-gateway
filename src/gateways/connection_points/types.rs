@@ -12,19 +12,6 @@ pub enum ConnectionPointDidMethod {
     Peer,
 }
 
-/// Integration configuration for a single integration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntegrationIntegration {
-    /// ID of the integration to use
-    pub integration_id: String,
-
-    /// Template variable values for this integration
-    /// Maps variable names (without $ prefix) to their runtime values
-    /// Example: {"RECIPIENT": "user@example.com", "TIMESTAMP": "2024-01-15T10:30:00Z"}
-    #[serde(default)]
-    pub variables: serde_json::Value,
-}
-
 /// Type of connection point
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -89,21 +76,6 @@ pub struct GatewayConnectionPoint {
 
     /// Timestamp when this connection point was last used
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
-
-    /// Optional integration ID to reference a configured integration (deprecated - use integrations array instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub integration_id: Option<String>,
-
-    /// Template variable values for integration configuration (deprecated - use integrations array instead)
-    /// Maps variable names (without $ prefix) to their runtime values
-    /// Example: {"RECIPIENT": "user@example.com", "TIMESTAMP": "2024-01-15T10:30:00Z"}
-    #[serde(default)]
-    pub integration_variables: serde_json::Value,
-
-    /// List of integrations (email, Slack, etc.)
-    /// Supports multiple integrations per connection point
-    #[serde(default)]
-    pub integrations: Vec<IntegrationIntegration>,
 
     /// Type of connection point (User or System)
     #[serde(default = "default_cp_type")]
@@ -175,9 +147,6 @@ impl GatewayConnectionPoint {
             expires_at,
             created_at: now,
             last_used_at: None,
-            integration_id: None,
-            integration_variables: serde_json::json!({}),
-            integrations: Vec::new(),
             cp_type,
             secret,
             exposed_channels: Vec::new(),

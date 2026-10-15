@@ -16,7 +16,6 @@ pub mod did_logs_file;
 pub mod dynamodb_generic_repository;
 pub mod dynamodb_store;
 pub mod filesystem;
-pub mod integration_handlers;
 pub mod integrations;
 pub mod settings_store;
 

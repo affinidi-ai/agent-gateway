@@ -4,6 +4,13 @@ changes:
   changed: []
   fixed: []
   removed:
+    - timestamp: '2026-10-15T09:55:00.000Z'
+      title: Remove integration attachments from gateways, users, identities and connection points
+      description: >-
+        /v1/gateways/{id}/integrations, /v1/users/integrations and /v1/identities/integrations
+        are gone, and connection points no longer take integration_id, integration_variables or
+        integrations. An integration receives every event its event set holds, from every
+        resource, and custom _ variables are gone with the attachments that held their values.
     - timestamp: '2026-10-15T08:16:21.000Z'
       title: Remove the integration test, trigger, config and runtime-variables routes
       description: >-

@@ -6,13 +6,6 @@ use super::delivery::dispatch::dispatch;
 use super::filesystem::FileSystemNotificationStore;
 use crate::auth::storage::UserData;
 use crate::auth::types::{UserRole, UserStatus};
-use crate::integrations::trigger_mappings::MappingRules;
-
-/// What a user integration mapping may name: the events this module raises.
-pub const USER_MAPPING_RULES: MappingRules = MappingRules {
-    category: "user",
-    event_types: &["user.created", "user.approved", "user.updated", "user.deleted", "user.login", "user.accessed"],
-};
 
 pub async fn trigger_user_created(
     _notifications: &FileSystemNotificationStore,
