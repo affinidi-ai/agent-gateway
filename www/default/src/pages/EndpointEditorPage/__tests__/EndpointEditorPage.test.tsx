@@ -7,6 +7,10 @@ import { showToast } from '../../../utils/toaster';
 
 jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
 
+jest.mock('../../../hooks/useApplianceSecrets', () => ({
+  useApplianceSecrets: () => [{ id: 'slack-hook', name: 'Slack hook' }],
+}));
+
 jest.mock('../../../integrationsApi', () => ({
   getEndpoint: jest.fn(),
   createEndpoint: jest.fn(),
@@ -102,6 +106,27 @@ describe('a new endpoint', () => {
       expect(screen.getByTestId('location')).toHaveTextContent('/integrations?tab=endpoints')
     );
     expect(showToast).toHaveBeenCalledWith('success', 'Endpoint Ops Slack saved');
+  });
+
+  test('a secret field can reference a stored secret', async () => {
+    renderEditor('/integrations/endpoints/new?type=slack');
+
+    type(/^name/i, 'Ops Slack');
+    type(/use a stored secret/i, 'slack-hook');
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() =>
+      expect(mocked.createEndpoint).toHaveBeenCalledWith(
+        expect.objectContaining({ configuration: { webhook_url: '$SECRET:slack-hook' } })
+      )
+    );
+  });
+
+  test('webhook headers offer no stored secret picker, since only header values resolve', () => {
+    renderEditor('/integrations/endpoints/new?type=webhook');
+
+    expect(screen.getAllByLabelText(/use a stored secret/i)).toHaveLength(1);
+    expect(screen.getByLabelText(/headers/i).tagName).toBe('TEXTAREA');
   });
 
   test('changing the type shows that type’s fields', () => {

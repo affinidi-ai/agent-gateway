@@ -1,5 +1,6 @@
 import React from 'react';
 import { AppButton } from '../shared/AppButton';
+import { SecretOption } from '../../hooks/useApplianceSecrets';
 import { SecretEdit } from '../../pages/EndpointEditorPage/endpointFields';
 
 const REFERENCE_PREFIX = '$SECRET:';
@@ -15,6 +16,8 @@ interface SecretInputProps {
   placeholder?: string;
   help?: string;
   disabled?: boolean;
+  /** Stored secrets the field may reference instead of holding a value; no picker without. */
+  secretOptions?: SecretOption[];
   onChange: (edit: SecretEdit) => void;
 }
 
@@ -32,6 +35,7 @@ const SecretInput: React.FC<SecretInputProps> = ({
   placeholder,
   help,
   disabled = false,
+  secretOptions,
   onChange,
 }) => {
   const heading = (
@@ -99,6 +103,7 @@ const SecretInput: React.FC<SecretInputProps> = ({
   const reference = edit.value.startsWith(REFERENCE_PREFIX)
     ? edit.value.slice(REFERENCE_PREFIX.length)
     : null;
+  const referenced = secretOptions?.find(option => option.id === reference);
   const inputProps = {
     id,
     className: 'form-control',
@@ -133,8 +138,39 @@ const SecretInput: React.FC<SecretInputProps> = ({
           </AppButton>
         )}
       </div>
+      {secretOptions && (
+        <div className="mt-2">
+          <label htmlFor={`${id}-stored-secret`} className="form-label small mb-1">
+            Use a stored secret
+          </label>
+          <select
+            id={`${id}-stored-secret`}
+            className="form-select form-select-sm"
+            value={reference ?? ''}
+            disabled={disabled}
+            onChange={event =>
+              onChange({
+                state: 'set',
+                value: event.target.value ? `${REFERENCE_PREFIX}${event.target.value}` : '',
+              })
+            }
+          >
+            <option value="">None, type a value</option>
+            {reference && !referenced && (
+              <option value={reference}>{`${reference} (not listed)`}</option>
+            )}
+            {secretOptions.map(option => (
+              <option key={option.id} value={option.id}>
+                {option.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       {reference !== null && (
-        <div className="form-text">Uses the stored secret {reference} from Secrets.</div>
+        <div className="form-text">
+          Uses the stored secret {referenced?.name ?? reference} from Secrets.
+        </div>
       )}
       {help && <div className="form-text">{help}</div>}
     </div>

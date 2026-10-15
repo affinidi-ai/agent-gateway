@@ -10,6 +10,7 @@ import {
   testEndpoint,
   updateEndpoint,
 } from '../../integrationsApi';
+import { useApplianceSecrets } from '../../hooks/useApplianceSecrets';
 import { getErrorMessage } from '../../utils/apiError';
 import { showToast } from '../../utils/toaster';
 import EndpointConfigFields from './EndpointConfigFields';
@@ -33,6 +34,7 @@ const EndpointEditorPage: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const requestedType = searchParams.get('type');
+  const secretOptions = useApplianceSecrets();
 
   const [stored, setStored] = useState<Endpoint | null>(null);
   const [loading, setLoading] = useState(Boolean(id));
@@ -266,6 +268,7 @@ const EndpointEditorPage: React.FC = () => {
               type={type}
               form={form}
               storedSecrets={stored?.secrets ?? []}
+              secretOptions={secretOptions}
               onValue={(field, value) => {
                 setForm(current => ({ ...current, values: { ...current.values, [field]: value } }));
                 changed();

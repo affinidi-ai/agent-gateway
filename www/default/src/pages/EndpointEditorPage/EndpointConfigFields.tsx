@@ -1,5 +1,6 @@
 import React from 'react';
 import SecretInput from '../../components/integrations/SecretInput';
+import { SecretOption } from '../../hooks/useApplianceSecrets';
 import { EndpointType } from '../../integrationsApi';
 import { EndpointForm, FieldSpec, SecretEdit, visibleFields } from './endpointFields';
 
@@ -8,6 +9,8 @@ interface EndpointConfigFieldsProps {
   form: EndpointForm;
   /** The secret fields the gateway holds a value for. */
   storedSecrets: string[];
+  /** Stored secrets a secret field may reference. */
+  secretOptions: SecretOption[];
   disabled?: boolean;
   onValue: (name: string, value: string | boolean) => void;
   onSecret: (name: string, edit: SecretEdit) => void;
@@ -20,6 +23,7 @@ const EndpointConfigFields: React.FC<EndpointConfigFieldsProps> = ({
   type,
   form,
   storedSecrets,
+  secretOptions,
   disabled = false,
   onValue,
   onSecret,
@@ -40,6 +44,8 @@ const EndpointConfigFields: React.FC<EndpointConfigFieldsProps> = ({
             placeholder={field.placeholder}
             help={field.help}
             disabled={disabled}
+            // A reference resolves as a whole value; header values are referenced one by one.
+            secretOptions={field.kind === 'secret' ? secretOptions : undefined}
             onChange={edit => onSecret(field.name, edit)}
           />
         );

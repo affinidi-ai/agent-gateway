@@ -8,11 +8,13 @@ function Harness({
   stored,
   required = false,
   multiline = false,
+  secretOptions,
 }: {
   initial: SecretEdit;
   stored: boolean;
   required?: boolean;
   multiline?: boolean;
+  secretOptions?: { id: string; name: string }[];
 }) {
   const [edit, setEdit] = useState<SecretEdit>(initial);
   return (
@@ -24,6 +26,7 @@ function Harness({
         stored={stored}
         required={required}
         multiline={multiline}
+        secretOptions={secretOptions}
         onChange={setEdit}
       />
       <output data-testid="edit">{JSON.stringify(edit)}</output>
@@ -91,4 +94,54 @@ test('a multi-line secret is a text area', () => {
   render(<Harness initial={{ state: 'set', value: '' }} stored={false} multiline />);
 
   expect(screen.getByLabelText('SMTP password').tagName).toBe('TEXTAREA');
+});
+
+const SECRETS = [
+  { id: 'smtp', name: 'SMTP password' },
+  { id: 'relay', name: 'Relay password' },
+];
+
+test('a stored secret can be picked instead of typing a value', () => {
+  render(<Harness initial={{ state: 'set', value: '' }} stored={false} secretOptions={SECRETS} />);
+
+  fireEvent.change(screen.getByLabelText(/use a stored secret/i), { target: { value: 'relay' } });
+
+  expect(edit()).toEqual({ state: 'set', value: '$SECRET:relay' });
+  expect(screen.getByText(/uses the stored secret relay password/i)).toBeInTheDocument();
+});
+
+test('picking no stored secret goes back to typing a value', () => {
+  render(
+    <Harness
+      initial={{ state: 'set', value: '$SECRET:smtp' }}
+      stored={false}
+      secretOptions={SECRETS}
+    />
+  );
+  const picker = screen.getByLabelText(/use a stored secret/i);
+  expect(picker).toHaveValue('smtp');
+
+  fireEvent.change(picker, { target: { value: '' } });
+
+  expect(edit()).toEqual({ state: 'set', value: '' });
+  expect(screen.getByLabelText('SMTP password')).toHaveAttribute('type', 'password');
+});
+
+test('a reference to a secret that is not listed stays selectable', () => {
+  render(
+    <Harness
+      initial={{ state: 'set', value: '$SECRET:retired' }}
+      stored={false}
+      secretOptions={SECRETS}
+    />
+  );
+
+  expect(screen.getByLabelText(/use a stored secret/i)).toHaveValue('retired');
+  expect(screen.getByRole('option', { name: 'retired (not listed)' })).toBeInTheDocument();
+});
+
+test('without secret options there is no picker', () => {
+  render(<Harness initial={{ state: 'set', value: '' }} stored={false} />);
+
+  expect(screen.queryByLabelText(/use a stored secret/i)).not.toBeInTheDocument();
 });
