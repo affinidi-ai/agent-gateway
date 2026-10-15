@@ -1,0 +1,17 @@
+---
+branch: fix/release-1.0.0-blockers
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+  - timestamp: '2026-10-14T00:00:00.000Z'
+    title: Update rustls to 0.23.46 to fix TLS advisories
+    description: Bumps rustls from 0.23.45 to 0.23.46, which fixes four advisories
+      where buffered application data could be sent to the outer server after an
+      ECH rejection, Brotli certificate decompression could allocate up to 1 GiB
+      before authentication, an unauthenticated ServerHello could downgrade later
+      connections to classical key exchange, and Debug output of client session
+      values could expose TLS secrets. Restores a passing cargo audit.
+  breaking: []

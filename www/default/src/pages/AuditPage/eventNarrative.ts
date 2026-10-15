@@ -25,7 +25,6 @@ const DENY_EVENTS = new Set([
   'token_revoked',
   'user_tokens_revoked',
   'token_not_found',
-  'pre_authorize_blocked',
 ]);
 
 const ALLOW_EVENTS = new Set([
@@ -219,12 +218,6 @@ export function describeEntry(entry: AuditEntry): EventNarrative {
         title: 'Token not found',
         tone,
         summary: provider ? `No stored ${provider} token was found.` : 'No stored token was found.',
-      };
-    case 'pre_authorize_blocked':
-      return {
-        title: 'Pre-authorization blocked',
-        tone,
-        summary: 'The request was blocked before authorization completed.',
       };
     default:
       return {

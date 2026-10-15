@@ -36,7 +36,7 @@ pub use opentelemetry::{
     set_reload_redactor, shutdown as shutdown_otel,
 };
 pub use payload_capture::broadcast_payload_capture_async;
-pub use policy_audit::{PolicyDecisionEvent, PolicyFlow, PolicyScope, record_policy_decision};
+pub use policy_audit::{PolicyDecisionEvent, PolicyEvaluationError, PolicyFlow, PolicyScope, record_policy_decision};
 pub use simple_format::SimpleFormat;
 pub use span_filter::FilteringSpanExporter;
 pub use system_metrics::{

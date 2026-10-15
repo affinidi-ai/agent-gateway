@@ -160,7 +160,7 @@ description that exists today.
 ## `gateway.json`
 
 Network topology and the surfaces served. The largest configuration file; the example is
-1,271 lines.
+1,314 lines.
 
 | Key | Controls |
 | --- | --- |

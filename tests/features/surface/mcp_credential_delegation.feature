@@ -6,6 +6,7 @@ Feature: MCP credential delegation
     Given MCP surface "alpha" targets MCP server "bravo"
     And MCP server "bravo" supports tool invocation
     And the surface requires "JWT Bearer" source authentication
+    And the VP Audit Log keeps every audit event
 
   Scenario: Missing delegated credentials ask the caller for consent before the MCP server is reached
     Given the surface requires delegated credentials from OAuth provider "calendar"

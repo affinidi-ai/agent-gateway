@@ -11,6 +11,7 @@ jest.mock('../../api', () => ({
     put: jest.fn(),
     post: jest.fn(),
     delete: jest.fn(),
+    getAuditEventCatalog: jest.fn(),
   },
 }));
 
@@ -28,6 +29,24 @@ jest.mock('../../context/PermissionsContext', () => ({
 
 const mockGet = apiClient.get as jest.Mock;
 const mockPut = apiClient.put as jest.Mock;
+const mockGetAuditEventCatalog = apiClient.getAuditEventCatalog as jest.Mock;
+
+const AUDIT_EVENT_CATALOG = [
+  {
+    event: 'policy_decision',
+    label: 'Policy Decision',
+    description: 'An OPA policy allowed or denied a request',
+    group: 'policies',
+    group_label: 'Policies',
+  },
+  {
+    event: 'auth_failed',
+    label: 'Auth Failed',
+    description: 'A caller failed authentication',
+    group: 'auth',
+    group_label: 'Auth',
+  },
+];
 
 const INTEGRATION_CONFIG = {
   types: [
@@ -39,7 +58,7 @@ const INTEGRATION_CONFIG = {
     {
       enum_value: 'audit',
       name: 'Governance Audit',
-      description: 'Forwards every record written to the VP Audit Log',
+      description: 'Sends the audit events you select',
       metadata: {},
     },
   ],
@@ -115,12 +134,132 @@ function payloadTemplate(type = 'stream'): Record<string, unknown> {
   return JSON.parse((screen.getByTestId(`${type}-payload-template`) as HTMLTextAreaElement).value);
 }
 
+const AUDIT_INTEGRATION = {
+  ...STREAM_INTEGRATION,
+  name: 'Audit to Kafka',
+  category: 'audit',
+  content: { record: '${AUDIT_RECORD}' }, // eslint-disable-line no-template-curly-in-string
+  audit_events: ['auth_failed'],
+};
+
+async function renameAndSave(name: string) {
+  const nameInput = (await screen.findByLabelText(/Name/)) as HTMLInputElement;
+  await waitFor(() => expect(nameInput.value).not.toBe(''));
+  fireEvent.change(nameInput, { target: { value: name } });
+  const saveButton = screen.getByRole('button', { name: /Save Changes/ });
+  await waitFor(() => expect(saveButton).toBeEnabled());
+  fireEvent.submit(screen.getByTestId('integration-form'));
+  await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1));
+  return mockPut.mock.calls[0][1];
+}
+
 describe('EditIntegrationPage governance audit', () => {
   beforeEach(() => {
     mockPermissions = { 'audit.view': true };
     mockGet.mockReset();
     mockPut.mockReset();
     mockPut.mockResolvedValue({ data: {} });
+    mockGetAuditEventCatalog.mockReset();
+    mockGetAuditEventCatalog.mockResolvedValue(AUDIT_EVENT_CATALOG);
+  });
+
+  it('shows the events a Governance Audit integration sends and saves the changed selection', async () => {
+    renderEditor(AUDIT_INTEGRATION);
+
+    expect(await screen.findByTestId('integration-audit-event-auth_failed')).toBeChecked();
+    expect(screen.getByTestId('integration-audit-event-policy_decision')).not.toBeChecked();
+
+    fireEvent.click(screen.getByTestId('integration-audit-event-policy_decision'));
+    const saveButton = screen.getByRole('button', { name: /Save Changes/ });
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    fireEvent.submit(screen.getByTestId('integration-form'));
+
+    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1));
+    expect(mockPut.mock.calls[0][1]).toMatchObject({
+      category: 'audit',
+      audit_events: ['auth_failed', 'policy_decision'],
+    });
+  });
+
+  it('keeps the stored events when the event list cannot be loaded', async () => {
+    mockGetAuditEventCatalog.mockRejectedValue(new Error('offline'));
+    renderEditor(AUDIT_INTEGRATION);
+
+    expect(await screen.findByTestId('integration-audit-events-error')).toBeInTheDocument();
+    const body = await renameAndSave('Audit to Kafka (renamed)');
+
+    expect(body.audit_events).toEqual(['auth_failed']);
+  });
+
+  it('sends no event list or delivery limits for other categories', async () => {
+    renderEditor();
+
+    const select = (await screen.findByTestId('integration-category-select')) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('general'));
+    expect(screen.queryByTestId('integration-audit-events')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('integration-audit-limits')).not.toBeInTheDocument();
+    const body = await renameAndSave('Events to Kafka (renamed)');
+
+    expect(body).not.toHaveProperty('audit_events');
+    expect(body).not.toHaveProperty('audit_max_attempts');
+    expect(body).not.toHaveProperty('audit_drop_after_secs');
+  });
+
+  const LIMITED_AUDIT_INTEGRATION = {
+    ...AUDIT_INTEGRATION,
+    audit_max_attempts: 10,
+    audit_drop_after_secs: 3600,
+  };
+
+  async function storedLimitsShown() {
+    const maxAttempts = await screen.findByTestId('integration-audit-max-attempts-input');
+    await waitFor(() => expect(maxAttempts).toHaveValue(10));
+    expect(screen.getByTestId('integration-audit-drop-after-input')).toHaveValue(3600);
+  }
+
+  it('shows the stored delivery limits and keeps them when untouched', async () => {
+    renderEditor(LIMITED_AUDIT_INTEGRATION);
+    await storedLimitsShown();
+
+    const body = await renameAndSave('Audit to Kafka (renamed)');
+
+    expect(body).toMatchObject({ audit_max_attempts: 10, audit_drop_after_secs: 3600 });
+  });
+
+  it('saves changed delivery limits and clears emptied ones with null', async () => {
+    renderEditor(LIMITED_AUDIT_INTEGRATION);
+    await storedLimitsShown();
+
+    fireEvent.change(screen.getByTestId('integration-audit-max-attempts-input'), {
+      target: { value: '20' },
+    });
+    fireEvent.change(screen.getByTestId('integration-audit-drop-after-input'), {
+      target: { value: '' },
+    });
+    const body = await renameAndSave('Audit to Kafka (renamed)');
+
+    expect(body.audit_max_attempts).toBe(20);
+    expect(body.audit_drop_after_secs).toBeNull();
+  });
+
+  it('refuses a negative delivery limit', async () => {
+    renderEditor(LIMITED_AUDIT_INTEGRATION);
+    await storedLimitsShown();
+
+    fireEvent.change(screen.getByTestId('integration-audit-drop-after-input'), {
+      target: { value: '-1' },
+    });
+    expect(screen.getByTestId('integration-audit-drop-after-error')).toBeInTheDocument();
+    const saveButton = screen.getByRole('button', { name: /Save Changes/ });
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    fireEvent.submit(screen.getByTestId('integration-form'));
+
+    expect(
+      await screen.findByText(
+        'Skip records older than N seconds: enter a whole number of 1 or more, or leave it empty.'
+      )
+    ).toBeInTheDocument();
+    expect(mockPut).not.toHaveBeenCalled();
   });
 
   it('moves an existing stream into the audit category with the audit record template', async () => {

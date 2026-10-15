@@ -345,6 +345,43 @@ The hidden file input is `data-testid="restore-file-input"`.
   template** action (`integration-audit-template-button`) replaces the payload with the
   audit template (routing fields plus `record: ${AUDIT_RECORD}`), which is the `audit`
   category's Stream/Webhook sample (see [Starting content](#starting-content)).
+- The card states that only the selected events are sent, whether or not the VP Audit Log
+  keeps them (`integration-audit-scope-note`), and that delivery is at least once, so
+  receivers deduplicate on `event_id`, with a stuck destination catching up in order, and
+  that disabling the integration pauses it, letting go of what it has not received, so once
+  re-enabled it receives only new records (`integration-audit-delivery-note`).
+
+### Events to send
+
+- The Add wizard and Edit page show **Events to send**
+  (`components/integrations/AuditEventsSection.tsx`, `integration-audit-events`) in the main
+  form, above the action buttons, only for the `audit` category. It is bound to the
+  integration's `audit_events`, and `audit_events` is sent only for that category.
+- It renders `components/integrations/AuditEventPicker.tsx` with the test id prefix
+  `integration-audit`: `integration-audit-picker`, one group toggle per group
+  (`integration-audit-group-<group>`, checked, unchecked or indeterminate) and one toggle
+  per event (`integration-audit-event-<event>`). Groups, labels and descriptions come from
+  `GET /v1/settings/audit-events` (`apiClient.getAuditEventCatalog`), never a hard-coded
+  list. Selected names the catalogue does not list are kept.
+- With nothing selected, saving is allowed and `integration-audit-events-empty` warns that
+  the integration will receive nothing. When the catalogue cannot be loaded,
+  `integration-audit-events-error` says so, no toggles are shown and saving keeps the stored
+  selection.
+- Below it, **Delivery limits**
+  (`components/integrations/AuditDeliveryLimitsSection.tsx`, `integration-audit-limits`), also
+  only for the `audit` category, has two optional number fields with the placeholder
+  **Never**: **Give up on a record after … attempts** (`integration-audit-max-attempts-input`,
+  bound to `audit_max_attempts`) and **Skip records older than … seconds**
+  (`integration-audit-drop-after-input`, bound to `audit_drop_after_secs`). Empty means no
+  limit. A value that is not a whole number of 1 or more is marked invalid
+  (`integration-audit-max-attempts-error`, `integration-audit-drop-after-error`) and blocks
+  saving with a message naming the field. Both are sent only for the `audit` category: the
+  Add wizard leaves an empty one out, and the Edit page loads the stored values and sends an
+  emptied one as `null`, which clears it. The helpers live in `utils/auditIntegrations.ts`.
+- Settings › Security › VP Audit uses the same picker with the prefix `vp-audit` under
+  **Events to keep**, bound to the settings' `audit_events`. Its `vp-audit-scope-note` says
+  those settings control the VP Audit Log only, and `vp-audit-catalog-error` replaces the
+  picker when the catalogue cannot be loaded.
 
 ### Query parameters
 
@@ -357,11 +394,21 @@ shows the `integration-category-unavailable` warning instead of silently falling
 The Audit Log header shows `audit-forward-button` beside Refresh for users with
 `integrations.view`, only when `/integrations/config` offers the `audit` category.
 
-- **Forwarding to N integration(s)** counts active integrations without a `tenant_id`,
-  the ones the gateway forwards to, and opens the Integrations list. It adds
-  "(VP Auditing off)" and a tooltip when VP Auditing is disabled in Settings › Security.
-- With none, users with `integrations.edit` get **Forward records**, which opens the wizard
-  at `?category=audit&type=stream`.
+- **Forwarding to N integration(s)** counts active `audit` integrations without a
+  `tenant_id` whose `audit_events` is not empty, the ones that receive records, and opens
+  the Integrations list (`useAuditForwarding`).
+- When active appliance-wide `audit` integrations select no events, the button shows a
+  warning icon (`audit-forward-no-events-warning`) and its tooltip says how many select no
+  events and receive nothing.
+- When VP Auditing is disabled in Settings › Security, the label is unchanged and the
+  tooltip says the VP Audit Log keeps nothing while integrations still receive the events
+  selected for them.
+- With none receiving, users with `integrations.edit` get **Forward records**, which opens
+  the wizard at `?category=audit&type=stream`.
+- The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says the log keeps the events
+  selected under Settings › Security › VP Audit while VP Auditing is enabled, and that each
+  Governance Audit integration receives its own selected events independently of the log,
+  at least once, so receivers deduplicate on `event_id`.
 
 ### Starting content
 

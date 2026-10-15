@@ -207,15 +207,15 @@ pub struct WorkloadBindingInputs<'a> {
     pub delegation_actions: Option<Value>,
     /// Proxied target endpoint, embedded as `target` for provenance.
     pub target: Option<&'a str>,
-    /// Policy decisions collected during the request.
-    pub policy_decisions: Option<Value>,
 }
 
 /// Build the `credentialSubject.workloadBinding` object for a configured
 /// Transit Point. Emits the nested caller-context vocabulary
 /// (`agentIdentity`, `caller.{fields,user_hash,assurance,credential}`,
-/// `traceId`, `intent`, `delegationAction`, `target`, `policyDecisions`,
-/// `delegated`) while preserving the `AgentIdentityCredential` wire shape.
+/// `traceId`, `intent`, `delegationAction`, `target`, `delegated`) while
+/// preserving the `AgentIdentityCredential` wire shape. Policy decisions are
+/// audited, never embedded: what the VP carries does not depend on audit
+/// configuration.
 pub fn build_workload_binding_subject(
     config: &WorkloadBindingConfig,
     inputs: WorkloadBindingInputs<'_>,
@@ -295,9 +295,6 @@ pub fn build_workload_binding_subject(
     }
     if let Some(actions) = inputs.delegation_actions {
         binding.insert("delegationAction".to_string(), actions);
-    }
-    if let Some(decisions) = inputs.policy_decisions {
-        binding.insert("policyDecisions".to_string(), decisions);
     }
     if let Some(target) = inputs.target
         && !target.is_empty()
@@ -639,7 +636,6 @@ mod tests {
                 intent: Some(serde_json::json!({ "action": "schedule" })),
                 delegation_actions: Some(serde_json::json!(["read"])),
                 target: Some("fabric://gw2/alpha"),
-                policy_decisions: Some(serde_json::json!([{ "scope": "surface", "allow": true }])),
                 ..Default::default()
             },
         );
@@ -647,7 +643,11 @@ mod tests {
         assert_eq!(out["intent"], serde_json::json!({ "action": "schedule" }));
         assert_eq!(out["delegationAction"], serde_json::json!(["read"]));
         assert_eq!(out["target"], serde_json::json!("fabric://gw2/alpha"));
-        assert_eq!(out["policyDecisions"], serde_json::json!([{ "scope": "surface", "allow": true }]));
+        assert!(
+            out.get("policyDecisions")
+                .is_none(),
+            "policy decisions are audited, never embedded in the binding"
+        );
     }
 
     #[test]

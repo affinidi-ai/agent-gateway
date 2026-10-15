@@ -132,8 +132,20 @@ converges through its periodic `DashboardDelta` stream or an explicit refetch. T
 
 A node runs in one of two modes, set by `server_mode` in the bootstrap config (default `active`):
 
-- **Active** serves traffic and runs the fabric and trust listeners.
-- **Standby** keeps the fabric and trust listeners inactive and reports not ready.
+- **Active** serves traffic, runs the fabric and trust listeners, and writes the governance audit
+  journal.
+- **Standby** keeps the fabric and trust listeners inactive, keeps no audit records, and reports not
+  ready. It takes over the audit journal when it becomes Active (see
+  [Governance audit delivery](OBSERVABILITY.md)).
+
+On becoming Active, before the audit pipeline starts, a node re-reads the dashboard settings
+(`settings.json`) from disk and empties its integration cache. The audit sinks are then built from
+those settings and the integrations listed from disk, and deliveries load each integration as it is
+stored now, so a promoted node never forwards with the VP Audit Log selection or integration
+configuration it loaded before the other node changed them. Readiness does not wait for the
+pipeline: the node admits traffic after one start attempt and, if that start is refused (the
+integrations cannot be listed, or the other node still holds the journal), keeps trying in the
+background.
 
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see

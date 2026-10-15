@@ -381,6 +381,59 @@ pub async fn managed_agent_received_forwarded_request_with_identity_field(
     );
 }
 
+#[then(expr = "the VP Audit Log of gateway {int} records a verified identity binding issued by gateway {int}")]
+async fn vp_audit_log_of_gateway_records_verified_identity_binding(
+    world: &mut G2gWorld,
+    gateway: usize,
+    issuer_gw: usize,
+) {
+    let expected_issuer = world
+        .harness()
+        .self_gateway_did(issuer_gw)
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| {
+            event["event"]["identity_binding_verified"]["issuer_gateway"] == expected_issuer.as_str()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        found,
+        "expected gateway {gateway} to record a verified identity binding issued by gateway {issuer_gw} ({expected_issuer}), got {events:?}"
+    );
+}
+
+/// The audit outcome for a failed identity binding, as the step names it.
+fn audited_identity_binding_failure(reason: &str) -> &'static str {
+    match reason {
+        "no identity presentation was sent" => "absent",
+        "its identity presentation failed verification" => "invalid",
+        "its issuer is not trusted on that connection" => "untrusted",
+        other => panic!("no audited outcome for the identity binding failure '{other}'"),
+    }
+}
+
+#[then(expr = "the VP Audit Log of gateway {int} records a failed identity binding because {string}")]
+async fn vp_audit_log_of_gateway_records_failed_identity_binding(
+    world: &mut G2gWorld,
+    gateway: usize,
+    reason: String,
+) {
+    let outcome = audited_identity_binding_failure(&reason);
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| event["event"]["identity_binding_failed"]["outcome"] == outcome)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(found, "expected gateway {gateway} to record a failed identity binding because {reason}, got {events:?}");
+}
+
 #[then(
     expr = "managed agent {string} received the forwarded request carrying an identity presentation issued by gateway {int}"
 )]

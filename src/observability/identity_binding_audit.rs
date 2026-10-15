@@ -134,12 +134,38 @@ pub fn record_identity_binding(event: IdentityBindingAuditEvent<'_>) {
 
 /// Emit the audit event for an [`crate::protocols::extensions::extract_identity_binding_vp`]
 /// result. `Ok(Some)` → verified, `Ok(None)` → absent, `Err` → invalid (the
-/// error string is a short diagnostic, never the signed VP).
+/// error string is a short diagnostic, never the signed VP). It is also a
+/// governance record: `identity_binding_verified` for a binding a trust anchor
+/// vouches for, otherwise `identity_binding_failed` with why.
 pub fn audit_extraction(
-    surface_id: &str,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
     transit_point: Option<&str>,
     result: &Result<Option<crate::surface_context::IdentityBindingContext>, String>,
 ) {
+    use crate::audit::events::IdentityBindingFailure;
+    use crate::audit::request_events::{identity_binding_failed, identity_binding_verified};
+    match result {
+        Ok(Some(binding)) if binding.verified => identity_binding_verified(
+            facts,
+            &binding.agent_did,
+            Some(&binding.gateway_did),
+            binding
+                .caller
+                .as_ref()
+                .map(|caller| caller.assurance.as_str()),
+        ),
+        Ok(Some(binding)) => identity_binding_failed(
+            facts,
+            IdentityBindingFailure::Untrusted,
+            Some(&binding.agent_did),
+            Some(&binding.gateway_did),
+            None,
+        ),
+        Ok(None) => identity_binding_failed(facts, IdentityBindingFailure::Absent, None, None, None),
+        Err(error) => identity_binding_failed(facts, IdentityBindingFailure::Invalid, None, None, Some(error)),
+    }
+
+    let surface_id = facts.surface_id;
     match result {
         Ok(Some(binding)) => {
             let caller_field_names: Vec<String> = binding
@@ -208,6 +234,104 @@ mod tests {
     use tracing::field::{Field, Visit};
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::{Context, SubscriberExt};
+
+    fn facts() -> crate::audit::request_events::RequestFacts<'static> {
+        crate::audit::request_events::RequestFacts {
+            surface_id: "surf-1",
+            channel_name: "Alpha",
+            trace_id: Some("trace-1"),
+            via_fabric: true,
+        }
+    }
+
+    fn binding(issuer_trusted: bool) -> crate::surface_context::IdentityBindingContext {
+        let mut identity_fields = std::collections::HashMap::new();
+        identity_fields
+            .insert("workloadBinding".to_string(), serde_json::json!({"caller": {"assurance": "gateway_attested"}}));
+        crate::surface_context::IdentityBindingContext::from_verified_parts(
+            "did:web:agent.example".to_string(),
+            "did:web:gw1.example".to_string(),
+            identity_fields,
+            Vec::new(),
+            issuer_trusted,
+        )
+    }
+
+    async fn recorded(
+        result: Result<Option<crate::surface_context::IdentityBindingContext>, String>
+    ) -> Vec<crate::delegation_vault::audit::DelegationAuditEvent> {
+        let ((), events) = crate::audit::producer::capture(async {
+            audit_extraction(&facts(), None, &result);
+        })
+        .await;
+        events
+    }
+
+    #[tokio::test]
+    async fn a_verified_binding_is_recorded_as_identity_binding_verified() {
+        let events = recorded(Ok(Some(binding(true)))).await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some("surf-1")
+        );
+        assert!(events[0].via_fabric);
+        match &events[0].event {
+            crate::delegation_vault::audit::DelegationAuditAction::IdentityBindingVerified {
+                agent_did,
+                issuer_gateway,
+                assurance,
+            } => {
+                assert_eq!(agent_did, "did:web:agent.example");
+                assert_eq!(issuer_gateway.as_deref(), Some("did:web:gw1.example"));
+                assert_eq!(assurance.as_deref(), Some("gateway_attested"));
+            }
+            other => panic!("expected IdentityBindingVerified, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_binding_that_does_not_verify_is_recorded_as_failed_with_its_reason() {
+        use crate::audit::events::IdentityBindingFailure;
+        let cases = [
+            (Ok(None), IdentityBindingFailure::Absent, None, None, None),
+            (
+                Err("VP signature verification failed".to_string()),
+                IdentityBindingFailure::Invalid,
+                None,
+                None,
+                Some("VP signature verification failed"),
+            ),
+            (
+                Ok(Some(binding(false))),
+                IdentityBindingFailure::Untrusted,
+                Some("did:web:agent.example"),
+                Some("did:web:gw1.example"),
+                None,
+            ),
+        ];
+        for (result, expected_outcome, expected_agent, expected_issuer, expected_detail) in cases {
+            let events = recorded(result).await;
+            assert_eq!(events.len(), 1, "{expected_outcome:?}");
+            match &events[0].event {
+                crate::delegation_vault::audit::DelegationAuditAction::IdentityBindingFailed {
+                    outcome,
+                    agent_did,
+                    issuer_gateway,
+                    error_detail,
+                } => {
+                    assert_eq!(*outcome, expected_outcome);
+                    assert_eq!(agent_did.as_deref(), expected_agent, "{expected_outcome:?}");
+                    assert_eq!(issuer_gateway.as_deref(), expected_issuer, "{expected_outcome:?}");
+                    assert_eq!(error_detail.as_deref(), expected_detail, "{expected_outcome:?}");
+                }
+                other => panic!("expected IdentityBindingFailed, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn outcome_labels_are_stable() {

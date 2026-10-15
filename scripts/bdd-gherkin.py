@@ -496,26 +496,138 @@ def normalize_step_text(text: str) -> str:
     return value.strip()
 
 
-def cucumber_expr_to_regex(expression: str) -> str:
-    pieces: list[str] = []
-    cursor = 0
-    for match in re.finditer(r"\{([A-Za-z_][A-Za-z0-9_]*)?\}", expression):
-        pieces.append(re.escape(expression[cursor : match.start()]))
-        name = match.group(1) or "anonymous"
-        if name == "string":
-            pieces.append(r'"[^"]*"')
-        elif name in {"int", "float"}:
-            pieces.append(r"-?\d+(?:\.\d+)?")
-        elif name == "word":
-            pieces.append(r"\S+")
+class BindingExpressionError(ValueError):
+    """A step binding expression the linter cannot turn into a pattern."""
+
+
+PARAMETER_PATTERNS = {
+    "int": r"-?\d+",
+    "float": r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?",
+    "word": r"[^\s]+",
+    "string": r"""(?:"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*')""",
+    "": r".*",
+}
+CUSTOM_PARAMETER_PATTERN = r".+"
+PARAMETER_NAME_RE = re.compile(r"[A-Za-z0-9_]*")
+
+
+def tokenize_cucumber_expression(expression: str) -> list[tuple[str, str]]:
+    """The tokens of a Cucumber Expression, each `(kind, value)`: `text` and
+    `space` are literal, `parameter` is a parameter type name, `optional` is
+    literal text that may be absent, and `alternation` separates alternatives
+    within a word. A backslash escapes the next character."""
+    tokens: list[tuple[str, str]] = []
+    text: list[str] = []
+
+    def flush_text() -> None:
+        if text:
+            tokens.append(("text", "".join(text)))
+            text.clear()
+
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        column = index + 1
+        if char == "\\":
+            if index + 1 == len(expression):
+                raise BindingExpressionError(f"escape at the end of the expression at column {column}")
+            text.append(expression[index + 1])
+            index += 2
+        elif char.isspace():
+            flush_text()
+            tokens.append(("space", char))
+            index += 1
+        elif char == "{":
+            end = expression.find("}", index + 1)
+            if end == -1:
+                raise BindingExpressionError(f"parameter at column {column} is not closed")
+            name = expression[index + 1 : end]
+            if not PARAMETER_NAME_RE.fullmatch(name):
+                raise BindingExpressionError(f"parameter at column {column} has an invalid name {name!r}")
+            flush_text()
+            tokens.append(("parameter", name))
+            index = end + 1
+        elif char == "(":
+            optional: list[str] = []
+            index += 1
+            while index < len(expression) and expression[index] != ")":
+                inner = expression[index]
+                if inner == "\\" and index + 1 < len(expression):
+                    optional.append(expression[index + 1])
+                    index += 2
+                    continue
+                if inner in "({/":
+                    raise BindingExpressionError(f"optional text at column {column} contains {inner!r}")
+                optional.append(inner)
+                index += 1
+            if index == len(expression):
+                raise BindingExpressionError(f"optional text at column {column} is not closed")
+            if not optional:
+                raise BindingExpressionError(f"optional text at column {column} is empty")
+            flush_text()
+            tokens.append(("optional", "".join(optional)))
+            index += 1
+        elif char == "/":
+            flush_text()
+            tokens.append(("alternation", char))
+            index += 1
+        elif char in ")}":
+            raise BindingExpressionError(f"{char!r} at column {column} has no opening bracket")
         else:
-            pieces.append(r".+")
-        cursor = match.end()
-    pieces.append(re.escape(expression[cursor:]))
+            text.append(char)
+            index += 1
+    flush_text()
+    return tokens
+
+
+def cucumber_token_regex(kind: str, value: str) -> str:
+    if kind == "parameter":
+        return PARAMETER_PATTERNS.get(value, CUSTOM_PARAMETER_PATTERN)
+    if kind == "optional":
+        return f"(?:{re.escape(value)})?"
+    return re.escape(value)
+
+
+def cucumber_word_regex(word: list[tuple[str, str]]) -> str:
+    """The pattern of one whitespace-free run of tokens. A run with
+    alternation matches one of its alternatives, each of which must contain
+    text and no parameter."""
+    if not any(kind == "alternation" for kind, _ in word):
+        return "".join(cucumber_token_regex(kind, value) for kind, value in word)
+    alternatives: list[list[tuple[str, str]]] = [[]]
+    for token in word:
+        if token[0] == "alternation":
+            alternatives.append([])
+        else:
+            alternatives[-1].append(token)
+    for alternative in alternatives:
+        if any(kind == "parameter" for kind, _ in alternative):
+            raise BindingExpressionError("an alternative contains a parameter")
+        if not any(kind == "text" for kind, _ in alternative):
+            raise BindingExpressionError("an alternative is empty or only optional text")
+    return "(?:" + "|".join("".join(cucumber_token_regex(kind, value) for kind, value in alternative) for alternative in alternatives) + ")"
+
+
+def cucumber_expr_to_regex(expression: str) -> str:
+    """The anchored regex a Cucumber Expression matches, following the
+    Cucumber Expressions rules for parameters, optional text, alternation and
+    escapes. Raises `BindingExpressionError` for an invalid expression."""
+    pieces: list[str] = []
+    word: list[tuple[str, str]] = []
+    for kind, value in tokenize_cucumber_expression(expression):
+        if kind == "space":
+            pieces.append(cucumber_word_regex(word))
+            word = []
+            pieces.append(re.escape(value))
+        else:
+            word.append((kind, value))
+    pieces.append(cucumber_word_regex(word))
     return "^" + "".join(pieces) + "$"
 
 
-def binding_pattern(binding: StepBinding) -> re.Pattern[str] | None:
+def binding_pattern(binding: StepBinding) -> re.Pattern[str]:
+    """The pattern a binding matches step text with. Raises
+    `BindingExpressionError` when its expression cannot be turned into one."""
     if binding.matcher == "regex":
         pattern = binding.expression
     elif binding.matcher == "expr":
@@ -524,16 +636,26 @@ def binding_pattern(binding: StepBinding) -> re.Pattern[str] | None:
         pattern = "^" + re.escape(binding.expression) + "$"
     try:
         return re.compile(pattern)
-    except re.error:
-        return None
+    except re.error as error:
+        raise BindingExpressionError(f"invalid regex: {error}") from error
+
+
+def binding_parse_error(binding: StepBinding) -> str | None:
+    """Why the binding's expression cannot be parsed, or None when it can."""
+    try:
+        binding_pattern(binding)
+    except BindingExpressionError as error:
+        return str(error)
+    return None
 
 
 def match_feature_steps(bindings: list[StepBinding], feature_steps: list[FeatureStep]) -> list[StepMatch]:
     compiled: list[tuple[StepBinding, re.Pattern[str]]] = []
     for binding in bindings:
-        pattern = binding_pattern(binding)
-        if pattern is not None:
-            compiled.append((binding, pattern))
+        try:
+            compiled.append((binding, binding_pattern(binding)))
+        except BindingExpressionError:
+            continue
     results: list[StepMatch] = []
     for step in feature_steps:
         matches = []
@@ -855,8 +977,16 @@ def render_lint(data: InventoryData, *, verbose: bool = False, color: bool = Fal
     unmatched_known_bug = unmatched_known_bug_steps(data.matches)
     ambiguous = [match for match in data.matches if match.match_count > 1]
     unmatched_wip = unmatched_wip_steps(data.matches)
+    unparsed_bindings = {
+        f"{binding.file}:{binding.line}": (binding, reason)
+        for binding in data.bindings
+        if (reason := binding_parse_error(binding)) is not None
+    }
     unused_bindings = [
-        binding for binding in data.bindings if data.binding_counts.get(f"{binding.file}:{binding.line}", 0) == 0
+        binding
+        for binding in data.bindings
+        if data.binding_counts.get(f"{binding.file}:{binding.line}", 0) == 0
+        and f"{binding.file}:{binding.line}" not in unparsed_bindings
     ]
     errors: list[str] = []
     warnings: list[str] = []
@@ -952,6 +1082,10 @@ def render_lint(data: InventoryData, *, verbose: bool = False, color: bool = Fal
         if "@wip" in scenario.tags and matches_for_scenario and all(match.match_count > 0 for match in matches_for_scenario):
             warnings.append(f"fully bound @wip scenario: {scenario_ref(scenario)}")
 
+    for ref, (binding, reason) in unparsed_bindings.items():
+        errors.append(
+            f"binding expression could not be parsed: {ref} {render_keyword(binding.kind, color=color)} {render_expression(binding.expression, color=color)} ({reason})"
+        )
     for binding in unused_bindings:
         ref = f"{binding.file}:{binding.line}"
         internal_refs = data.function_refs.get(ref, 0)
@@ -1288,6 +1422,96 @@ def self_test() -> None:
         assert "\033[35mGiven\033[0m" in color_output, color_output
         verbose_output, _ = render_lint(data, verbose=True)
         assert "regex step binding could be Cucumber expression" in verbose_output, verbose_output
+
+    self_test_binding_expressions()
+
+
+def self_test_binding_expressions() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        steps_dir = root / "tests" / "surface_bdd" / "steps"
+        features_dir = root / "tests" / "features" / "surface"
+        steps_dir.mkdir(parents=True)
+        features_dir.mkdir(parents=True)
+        (steps_dir / "then.rs").write_text(
+            '\n'.join(
+                [
+                    'use cucumber::{then, when};',
+                    '#[when(expr = "the caller sends an A2A message\\\\/send request to surface {string}")]',
+                    'fn caller_sends() {}',
+                    '',
+                    '#[then(expr = "managed agent {string} received exactly {int} request(s)")]',
+                    'fn agent_received() {}',
+                    '',
+                    '#[then(regex = "^the broken (binding$")]',
+                    'fn broken() {}',
+                    '',
+                    '#[then(expr = "the {word} is shown in red/blue/green")]',
+                    'fn shown_in() {}',
+                    '',
+                    '#[then(expr = "the total is {float} \\\\(rounded\\\\)")]',
+                    'fn total_rounded() {}',
+                    '',
+                    '#[then(expr = "the label is {string}")]',
+                    'fn label_is() {}',
+                    '',
+                    '#[then(expr = "the count is {int}")]',
+                    'fn count_is() {}',
+                    '',
+                    '#[then(expr = "the unterminated {int")]',
+                    'fn unterminated() {}',
+                    '',
+                    '#[then(expr = "the empty alternative is a//b")]',
+                    'fn empty_alternative() {}',
+                    '',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (features_dir / "expressions.feature").write_text(
+            '\n'.join(
+                [
+                    'Feature: binding expressions',
+                    '',
+                    '  Scenario: one request',
+                    '    When the caller sends an A2A message/send request to surface "alpha"',
+                    '    Then managed agent "bravo" received exactly 1 request',
+                    '',
+                    '  Scenario: several requests',
+                    '    When the caller sends an A2A message/send request to surface "alpha"',
+                    '    Then managed agent "bravo" received exactly 3 requests',
+                    '    And the banner is shown in blue',
+                    '    And the total is 2.5 (rounded)',
+                    "    And the label is 'ok'",
+                    '    And the count is 2',
+                    '    And the count is 2.5',
+                    '',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        bindings = parse_step_bindings(root, steps_dir.glob("*.rs"))
+        matches = match_feature_steps(bindings, parse_feature_steps(root, features_dir.glob("*.feature")))
+        match_counts = {match.step_text: match.match_count for match in matches}
+        for step in [
+            'the caller sends an A2A message/send request to surface "alpha"',
+            'managed agent "bravo" received exactly 1 request',
+            'managed agent "bravo" received exactly 3 requests',
+            "the banner is shown in blue",
+            "the total is 2.5 (rounded)",
+            "the label is 'ok'",
+            "the count is 2",
+        ]:
+            assert match_counts.get(step) == 1, (step, matches)
+        assert match_counts.get("the count is 2.5") == 0, matches
+
+        output, _ = render_lint(collect_inventory(root))
+        parse_errors = [line for line in output.splitlines() if "binding expression could not be parsed" in line]
+        assert len(parse_errors) == 3, output
+        assert any("tests/surface_bdd/steps/then.rs:8" in line and "invalid regex" in line for line in parse_errors), output
+        assert any("tests/surface_bdd/steps/then.rs:23" in line for line in parse_errors), output
+        assert any("tests/surface_bdd/steps/then.rs:26" in line for line in parse_errors), output
+        assert "unused step binding" not in output, output
 
 
 def display_path(path: Path, root: Path) -> Path:
