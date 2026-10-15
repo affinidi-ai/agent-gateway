@@ -1,3 +1,4 @@
+/* eslint-disable no-template-curly-in-string -- ${NAME} is the gateway's placeholder syntax */
 import { apiClient } from './api';
 import {
   createEndpoint,
