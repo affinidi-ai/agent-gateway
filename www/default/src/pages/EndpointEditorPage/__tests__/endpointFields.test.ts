@@ -93,15 +93,15 @@ describe('initialForm', () => {
         configuration: {
           url: 'https://ops.example.com/hook',
           method: 'PUT',
-          headers: '$SECRET:hook-headers',
+          signing_secret: '$SECRET:hook-signing',
         },
-        secrets: ['signing_secret'],
+        secrets: ['headers'],
       })
     );
 
     expect(form.values).toMatchObject({ url: 'https://ops.example.com/hook', method: 'PUT' });
-    expect(form.secrets.signing_secret).toEqual({ state: 'keep' });
-    expect(form.secrets.headers).toEqual({ state: 'set', value: '$SECRET:hook-headers' });
+    expect(form.secrets.headers).toEqual({ state: 'keep' });
+    expect(form.secrets.signing_secret).toEqual({ state: 'set', value: '$SECRET:hook-signing' });
   });
 
   test('lists are shown one per line', () => {
@@ -208,13 +208,29 @@ describe('missingRequired', () => {
     expect(missingRequired('slack', form)).toEqual([]);
   });
 
-  test('webhook headers must be a JSON object of strings', () => {
+  test.each([
+    ['an array', '["not", "an object"]'],
+    // The gateway resolves references inside header values only; a reference as the whole
+    // field would resolve to a string, and no headers would be sent.
+    ['a reference to a secret', '$SECRET:hook-headers'],
+  ])('webhook headers must be a JSON object of strings, not %s', (_, headers) => {
     const form = initialForm('webhook');
     form.values.url = 'https://ops.example.com/hook';
-    form.secrets.headers = { state: 'set', value: '["not", "an object"]' };
+    form.secrets.headers = { state: 'set', value: headers };
 
     expect(missingRequired('webhook', form)).toEqual([
       'Headers must be a JSON object of header names to values',
     ]);
+  });
+
+  test('webhook header values may reference secrets', () => {
+    const form = initialForm('webhook');
+    form.values.url = 'https://ops.example.com/hook';
+    form.secrets.headers = { state: 'set', value: '{"Authorization": "$SECRET:hook-token"}' };
+
+    expect(missingRequired('webhook', form)).toEqual([]);
+    expect(buildConfiguration('webhook', form, false)).toMatchObject({
+      headers: { Authorization: '$SECRET:hook-token' },
+    });
   });
 });

@@ -111,7 +111,7 @@ export const ENDPOINT_FIELDS: Record<EndpointType, FieldSpec[]> = {
       kind: 'secret-json',
       secret: true,
       placeholder: '{"Authorization": "Bearer ..."}',
-      help: 'Extra request headers as a JSON object. Kept like a password, since they often carry credentials.',
+      help: 'Extra request headers as a JSON object; a value may be $SECRET:<secret_id> to use a stored secret. Kept like a password, since headers often carry credentials.',
     },
   ],
   stream: [
@@ -249,8 +249,6 @@ function parseHeaders(text: string): Record<string, string> | null {
   }
 }
 
-const isReference = (text: string) => text.startsWith('$SECRET:');
-
 /**
  * The configuration to send. Hidden and empty optional fields are left out; a kept secret is
  * left out so the gateway keeps it, and a cleared one is sent as null when `updating`.
@@ -268,8 +266,7 @@ export function buildConfiguration(
         configuration[field.name] = null;
       } else if (edit?.state === 'set' && edit.value.trim()) {
         const text = edit.value.trim();
-        configuration[field.name] =
-          field.kind === 'secret-json' && !isReference(text) ? parseHeaders(text) : text;
+        configuration[field.name] = field.kind === 'secret-json' ? parseHeaders(text) : text;
       }
       continue;
     }
@@ -302,7 +299,6 @@ export function missingRequired(type: EndpointType, form: EndpointForm): string[
         field.kind === 'secret-json' &&
         edit?.state === 'set' &&
         edit.value.trim() &&
-        !isReference(edit.value.trim()) &&
         !parseHeaders(edit.value)
       ) {
         problems.push(`${field.label} must be a JSON object of header names to values`);
