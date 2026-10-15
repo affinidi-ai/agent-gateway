@@ -2589,14 +2589,6 @@ pub struct StoragePaths {
     #[serde(default = "default_a2a_proxies_storage_path")]
     pub a2a_proxies: String,
 
-    /// Path to store Integration definitions (notifiers)
-    #[serde(default = "default_integrations_storage_path")]
-    pub integrations: String,
-
-    /// Path to store Integration triggers (user and gateway integrations)
-    #[serde(default = "default_integration_triggers_storage_path")]
-    pub integration_triggers: String,
-
     /// Path to store integration endpoints (transport, destination and credentials)
     #[serde(default = "default_integration_endpoints_storage_path")]
     pub integration_endpoints: String,
@@ -2722,8 +2714,6 @@ impl Default for StoragePaths {
             certificates: default_certificates_storage_path(),
             mcp_proxies: default_mcp_proxies_storage_path(),
             a2a_proxies: default_a2a_proxies_storage_path(),
-            integrations: default_integrations_storage_path(),
-            integration_triggers: default_integration_triggers_storage_path(),
             integration_endpoints: default_integration_endpoints_storage_path(),
             integration_event_sets: default_integration_event_sets_storage_path(),
             integration_definitions: default_integration_definitions_storage_path(),
@@ -3138,14 +3128,6 @@ fn default_a2a_proxies_storage_path() -> String {
     "_storage/a2a_proxies".to_string()
 }
 
-fn default_integrations_storage_path() -> String {
-    "_storage/integrations/definitions".to_string()
-}
-
-fn default_integration_triggers_storage_path() -> String {
-    "_storage/integrations/triggers".to_string()
-}
-
 fn default_integration_endpoints_storage_path() -> String {
     "_storage/integrations/endpoints".to_string()
 }
@@ -3392,6 +3374,19 @@ mod storage_paths_tests {
             ),
             ("/data/endpoints", "/data/event_sets", "/data/integrations")
         );
+    }
+
+    #[test]
+    fn retired_integration_paths_are_ignored() {
+        let paths: StoragePaths = toml::from_str(
+            "integrations = \"/data/definitions\"\nintegration_triggers = \"/data/triggers\"\nintegration_definitions = \"/data/integrations\"",
+        )
+        .expect("parses");
+
+        assert_eq!(paths.integration_definitions, "/data/integrations");
+        let written = toml::to_string(&paths).expect("serializes");
+        assert!(!written.contains("/data/definitions"), "{written}");
+        assert!(!written.contains("integration_triggers"), "{written}");
     }
 }
 

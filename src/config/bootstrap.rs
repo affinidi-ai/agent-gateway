@@ -157,20 +157,6 @@ impl BootstrapConfig {
                     .storage_paths
                     .a2a_proxies,
             );
-            config
-                .storage_paths
-                .integrations = resolve_storage_path(
-                &config
-                    .storage_paths
-                    .integrations,
-            );
-            config
-                .storage_paths
-                .integration_triggers = resolve_storage_path(
-                &config
-                    .storage_paths
-                    .integration_triggers,
-            );
             for path in [
                 &mut config
                     .storage_paths

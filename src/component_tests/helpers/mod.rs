@@ -764,14 +764,6 @@ fn build_bootstrap_config(
                 .join("a2a_proxies")
                 .to_string_lossy()
                 .into_owned(),
-            integrations: base
-                .join("integrations/definitions")
-                .to_string_lossy()
-                .into_owned(),
-            integration_triggers: base
-                .join("integrations/triggers")
-                .to_string_lossy()
-                .into_owned(),
             integration_endpoints: base
                 .join("integrations/endpoints")
                 .to_string_lossy()
