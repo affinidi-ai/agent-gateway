@@ -4,8 +4,8 @@ import NodeConfigPanel from './NodeConfigPanel';
 import MultiSelectionPanel from './MultiSelectionPanel';
 import SurfaceVariantsWidget from './SurfaceVariantsWidget';
 import {
-  ACCESS_POINT_URL_HELP,
-  ACCESS_POINT_URL_LABEL,
+  ENTRY_POINT_URL_HELP,
+  ENTRY_POINT_URL_LABEL,
   RouteListenerBanner,
 } from './elements/_shared/RouteListenerSection';
 import type { UseSurfaceBuilderReturn, SurfaceBuilderState } from './hooks/useSurfaceBuilder';
@@ -269,9 +269,9 @@ export function SurfaceBuilder<T extends SurfaceBuilderState>({
         {accessPointUrl && (
           <div className="surface-access-point-url-widget">
             <RouteListenerBanner
-              label={ACCESS_POINT_URL_LABEL}
-              help={ACCESS_POINT_URL_HELP}
-              testId="surface-access-point-url"
+              label={ENTRY_POINT_URL_LABEL}
+              help={ENTRY_POINT_URL_HELP}
+              testId="surface-entry-point-url"
               url={accessPointUrl}
             />
           </div>

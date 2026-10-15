@@ -2,8 +2,8 @@ import React from 'react';
 import { Form } from 'react-bootstrap';
 import type { ConfigPanelProps } from '../types';
 import RouteListenerSection, {
-  ACCESS_POINT_URL_HELP,
-  ACCESS_POINT_URL_LABEL,
+  ENTRY_POINT_URL_HELP,
+  ENTRY_POINT_URL_LABEL,
 } from '../_shared/RouteListenerSection';
 import { AgentCardLocationHelp, AGENT_CARD_EXPLAINER } from '../_shared/AgentCardLocationHelp';
 import FieldHelp from '../../../shared/FieldHelp';
@@ -27,9 +27,9 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
         updateFields={updateFields}
         addressSource="inbound"
         routeFieldName="route"
-        bannerLabel={ACCESS_POINT_URL_LABEL}
-        bannerHelp={ACCESS_POINT_URL_HELP}
-        bannerTestId="access-point-url"
+        bannerLabel={ENTRY_POINT_URL_LABEL}
+        bannerHelp={ENTRY_POINT_URL_HELP}
+        bannerTestId="access-point-entry-point-url"
         replaceCommit={replaceCommit}
         hasAttemptedSave={hasAttemptedSave}
       />

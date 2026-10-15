@@ -156,6 +156,21 @@ describe('AddSurfacePage default name and unsaved changes', () => {
     expect(screen.getByTestId('name')).toHaveTextContent(/^payments$/);
   });
 
+  it('treats a typed name equal to the generated one as the default', async () => {
+    renderPage();
+    await routeSeeded();
+    await act(async () => list.resolve(existing));
+
+    const nameInput = screen.getByLabelText('Name');
+    fireEvent.change(nameInput, { target: { value: 'a2a_surface_2x' } });
+    expect(isDirty()).toBe(true);
+    fireEvent.change(nameInput, { target: { value: 'a2a_surface_2' } });
+
+    expect(isDirty()).toBe(false);
+    fireEvent.click(screen.getByText('Switch to MCP'));
+    expect(screen.getByTestId('name')).toHaveTextContent(/^mcp_surface_1$/);
+  });
+
   it('marks the page dirty when an edit lands before the list loads', async () => {
     renderPage();
     await routeSeeded();

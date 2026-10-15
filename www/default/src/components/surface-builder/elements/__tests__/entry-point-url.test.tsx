@@ -61,8 +61,8 @@ describe('RouteListenerBanner', () => {
   const renderBanner = (props: Partial<React.ComponentProps<typeof RouteListenerBanner>> = {}) =>
     render(
       <RouteListenerBanner
-        label="Access Point URL"
-        help="The URL other agents use to reach this surface"
+        label="Entry point URL"
+        help="The URL used to access this gateway"
         testId="banner"
         url={ENTRY_URL}
         {...props}
@@ -72,15 +72,15 @@ describe('RouteListenerBanner', () => {
   it('shows the label, the URL and a help icon', () => {
     renderBanner();
     const banner = screen.getByTestId('banner');
-    expect(banner).toHaveTextContent(`Access Point URL: ${ENTRY_URL}`);
-    expect(screen.getByTestId('banner-help')).toHaveAccessibleName('About Access Point URL');
+    expect(banner).toHaveTextContent(`Entry point URL: ${ENTRY_URL}`);
+    expect(screen.getByTestId('banner-help')).toHaveAccessibleName('About Entry point URL');
   });
 
   it('copies the URL and confirms it', async () => {
     renderBanner();
     const button = screen.getByTestId('banner-copy-button');
     expect(button).toBeEnabled();
-    expect(button).toHaveAccessibleName('Copy Access Point URL');
+    expect(button).toHaveAccessibleName('Copy Entry point URL');
 
     fireEvent.click(button);
 
@@ -98,7 +98,7 @@ describe('RouteListenerBanner', () => {
     await waitFor(() =>
       expect(showToast).toHaveBeenCalledWith(
         'error',
-        'Could not copy the Access Point URL: select it and copy it by hand.'
+        'Could not copy the Entry point URL: select it and copy it by hand.'
       )
     );
   });
@@ -134,14 +134,14 @@ describe('RouteListenerBanner', () => {
 });
 
 describe('Access Point panel', () => {
-  it('labels the composed URL as the Access Point URL and lets it be copied', async () => {
+  it('labels the composed URL Entry point URL and lets it be copied', async () => {
     render(<AccessPointPanel {...panelProps('access-point', AP_CONFIG)} />);
 
-    const banner = await screen.findByTestId('access-point-url');
-    await waitFor(() => expect(banner).toHaveTextContent(`Access Point URL: ${ENTRY_URL}`));
+    const banner = await screen.findByTestId('access-point-entry-point-url');
+    await waitFor(() => expect(banner).toHaveTextContent(`Entry point URL: ${ENTRY_URL}`));
     expect(screen.queryByText(/Channel Route/)).not.toBeInTheDocument();
 
-    fireEvent.click(within(banner).getByTestId('access-point-url-copy-button'));
+    fireEvent.click(within(banner).getByTestId('access-point-entry-point-url-copy-button'));
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith(ENTRY_URL);
   });
 
@@ -171,6 +171,6 @@ describe('Managed Agent panel', () => {
     expect(await screen.findByText('Endpoint')).toBeInTheDocument();
     expect(screen.queryByText(/Reached at/)).not.toBeInTheDocument();
     expect(screen.queryByText(ENTRY_URL)).not.toBeInTheDocument();
-    expect(screen.queryByTestId(/access-point-url/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(/entry-point-url/)).not.toBeInTheDocument();
   });
 });
