@@ -1,7 +1,11 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use super::{Definition, now};
 use crate::integrations::events::find_event;
+use crate::integrations::runtime_variables::patterns;
 use crate::storage::filesystem::StorableEntity;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -48,6 +52,58 @@ impl EventSet {
         self.events
             .iter()
             .any(|event| event == event_id)
+    }
+
+    pub fn has_audit_events(&self) -> bool {
+        self.events
+            .iter()
+            .any(|event| event.starts_with(AUDIT_EVENT_PREFIX))
+    }
+
+    /// Template variables in `content` that no event of the set fills, sorted.
+    pub fn unknown_template_variables(
+        &self,
+        content: &JsonValue,
+    ) -> Vec<String> {
+        let filled: BTreeSet<&str> = self
+            .events
+            .iter()
+            .filter_map(|event| find_event(event))
+            .flat_map(|event| {
+                event
+                    .variables
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let mut used = BTreeSet::new();
+        collect_template_variables(content, &mut used);
+        used.into_iter()
+            .filter(|name| !filled.contains(name.as_str()))
+            .collect()
+    }
+}
+
+const AUDIT_EVENT_PREFIX: &str = "audit.";
+
+fn collect_template_variables(
+    value: &JsonValue,
+    used: &mut BTreeSet<String>,
+) {
+    match value {
+        JsonValue::String(text) => used.extend(
+            patterns()
+                .regex
+                .captures_iter(text)
+                .map(|capture| capture[1].trim().to_string()),
+        ),
+        JsonValue::Array(items) => items
+            .iter()
+            .for_each(|item| collect_template_variables(item, used)),
+        JsonValue::Object(fields) => fields
+            .values()
+            .for_each(|field| collect_template_variables(field, used)),
+        _ => {}
     }
 }
 
@@ -136,5 +192,43 @@ mod tests {
 
         assert!(set.contains("gateway.created"));
         assert!(!set.contains("gateway.deleted"));
+    }
+
+    fn set(ids: &[&str]) -> EventSet {
+        EventSet::new("Set".to_string(), String::new(), events(ids)).expect("valid set")
+    }
+
+    #[test]
+    fn knows_whether_it_holds_audit_events() {
+        assert!(set(&["gateway.created", "audit.trust_check"]).has_audit_events());
+        assert!(!set(&["gateway.created", "user.login"]).has_audit_events());
+    }
+
+    #[test]
+    fn a_template_may_use_any_variable_some_event_of_the_set_fills() {
+        let mixed = set(&["gateway.created", "audit.policy_decision"]);
+        let content = serde_json::json!({
+            "text": "${EVENT_SUMMARY} on ${GATEWAY_NAME}",
+            "decision": "${AUDIT_DECISION:Decision}",
+            "data": "${EVENT_DATA}"
+        });
+
+        assert!(
+            mixed
+                .unknown_template_variables(&content)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reports_each_variable_no_event_of_the_set_fills_once() {
+        let gateways = set(&["gateway.created"]);
+        let content = serde_json::json!({
+            "subject": "${USERNAME} ${GATEWAY_NAME}",
+            "lines": ["${_TEAM}", {"nested": "${USERNAME} ${AMOUNT}"}],
+            "count": 3
+        });
+
+        assert_eq!(gateways.unknown_template_variables(&content), ["AMOUNT", "USERNAME", "_TEAM"]);
     }
 }
