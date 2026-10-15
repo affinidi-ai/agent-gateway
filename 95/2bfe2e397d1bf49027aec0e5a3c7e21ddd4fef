@@ -1,0 +1,14 @@
+.changelog/wip/feat_github_actions_followup.yaml
+  h_218db94655109c 1-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "952bfe2e397d1bf49027aec0e5a3c7e21ddd4fef",
+  "prompts": {},
+  "humans": {
+    "h_218db94655109c": {
+      "author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
