@@ -1232,9 +1232,6 @@ fn build_gateway_config(bootstrap: &BootstrapConfig) -> GatewayConfig {
         integration: IntegrationConfig {
             variable_pattern: r"\$\{([^:}]+)(?::([^}]+))?\}".to_string(),
             variable_pattern_description: None,
-            custom_variable_prefix: "_".to_string(),
-            types: vec![],
-            categories: vec![],
         },
         facilitator_mode: FacilitatorMode::default(),
         x402_headers: X402Headers::default(),

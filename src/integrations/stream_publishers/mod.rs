@@ -45,14 +45,6 @@ pub trait StreamPublisher: Send + Sync {
         }
         Ok(results)
     }
-
-    /// Test the connection and configuration
-    async fn test_connection(
-        &self,
-        topic: &str,
-        event: &Value,
-        config: &Value,
-    ) -> Result<String>;
 }
 
 /// Registry for managing stream publishers

@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use anyhow::Context;
 use futures::future::BoxFuture;
 
-use crate::audit::catalog::AUDIT_EVENTS;
 use crate::delegation_vault::audit::{
     AuditCallerContext, DelegationAuditAction, DelegationAuditEvent, action_category,
 };
@@ -15,33 +14,9 @@ use crate::integrations::delivery::dispatch::{AuditReceiver, current_routes, del
 use crate::integrations::delivery::values::event_values;
 use crate::integrations::events::find_event;
 
-/// Integration category whose integrations receive governance audit records.
-pub const AUDIT_CATEGORY: &str = "audit";
-
-/// The `audit` integration category offered in the integration configuration.
-/// Each event type is `audit.<category>`.
-pub fn audit_integration_category() -> crate::config::IntegrationCategory {
-    crate::config::IntegrationCategory {
-        enum_value: AUDIT_CATEGORY.to_string(),
-        name: "Governance Audit".to_string(),
-        description: "Sends the audit events you select, such as policy decisions, refused requests, trust checks, credential delegation and payment events, whether or not the VP Audit Log keeps them. Requires the audit.view permission.".to_string(),
-        metadata: serde_json::json!({
-            "event_types": AUDIT_EVENTS
-                .iter()
-                .map(|event| serde_json::json!({
-                    "event_type": format!("{}.{}", AUDIT_CATEGORY, event.category),
-                    "name": event.name,
-                    "description": event.description,
-                    "group": event.group,
-                }))
-                .collect::<Vec<_>>(),
-        }),
-    }
-}
-
-/// `audit.<category>`, e.g. `audit.policy_decision`.
+/// The catalog event of an audit record: `audit.<category>`, e.g. `audit.policy_decision`.
 pub fn audit_event_type(event: &DelegationAuditEvent) -> String {
-    format!("{}.{}", AUDIT_CATEGORY, action_category(&event.event))
+    format!("audit.{}", action_category(&event.event))
 }
 
 /// Runtime variables describing one audit record.
@@ -431,10 +406,12 @@ mod tests {
         let produced: HashSet<String> = audit_variables(&policy_decision("deny"))
             .into_keys()
             .collect();
-        let offered: HashSet<String> =
-            crate::integrations::runtime_variables::get_variable_names_for_category(AUDIT_CATEGORY)
-                .into_iter()
-                .collect();
+        let offered: HashSet<String> = find_event("audit.policy_decision")
+            .expect("catalog event")
+            .variables
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
 
         let unregistered: Vec<_> = produced
             .difference(&offered)
@@ -608,34 +585,6 @@ mod tests {
                 .iter()
                 .filter(|event| event.family == "audit")
                 .all(|event| event.group.is_some())
-        );
-    }
-
-    #[test]
-    fn example_gateway_config_carries_the_built_in_audit_category() {
-        let example: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/config/examples/gateway.example.json"
-        )))
-        .unwrap();
-        let shipped = example["integration"]["categories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|category| category["enum_value"] == AUDIT_CATEGORY)
-            .expect("gateway.example.json offers the audit category");
-
-        assert_eq!(*shipped, serde_json::to_value(audit_integration_category()).unwrap());
-    }
-
-    #[test]
-    fn default_integration_config_offers_the_audit_category() {
-        let config = crate::config::IntegrationConfig::default_config();
-        assert!(
-            config
-                .categories
-                .iter()
-                .any(|category| category.enum_value == AUDIT_CATEGORY)
         );
     }
 }

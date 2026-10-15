@@ -45,37 +45,4 @@ impl StreamPublisher for RedisPublisher {
         info!("Successfully published event to Redis Stream '{}'", topic);
         Ok(())
     }
-
-    async fn test_connection(
-        &self,
-        topic: &str,
-        event: &Value,
-        config: &Value,
-    ) -> Result<String> {
-        let redis_url = config
-            .get("redis_url")
-            .and_then(|v| v.as_str())
-            .context("Redis URL is required")?;
-
-        info!("Testing Redis Streams connection for stream '{}'", topic);
-
-        use redis::AsyncCommands;
-
-        let client = redis::Client::open(redis_url).context("Failed to create Redis client")?;
-
-        let mut con = client
-            .get_multiplexed_async_connection()
-            .await
-            .context("Failed to connect to Redis")?;
-
-        let event_json = serde_json::to_string(event).context("Failed to serialize event")?;
-
-        let _stream_id: String = con
-            .xadd(topic, "*", &[("data", event_json.as_str())])
-            .await
-            .context("Failed to add test event to Redis Stream")?;
-
-        info!("Test event sent to Redis Stream '{}' successfully", topic);
-        Ok(format!("Test event sent to Redis Stream '{}' successfully", topic))
-    }
 }

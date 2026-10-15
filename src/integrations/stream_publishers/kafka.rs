@@ -6,7 +6,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde_json::Value;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::StreamPublisher;
 
@@ -142,38 +142,6 @@ impl StreamPublisher for KafkaPublisher {
 
         debug!("Successfully published event to Kafka topic '{}'", topic);
         Ok(())
-    }
-
-    async fn test_connection(
-        &self,
-        topic: &str,
-        event: &Value,
-        config: &Value,
-    ) -> Result<String> {
-        let brokers = config
-            .get("brokers")
-            .and_then(|v| v.as_str())
-            .context("Kafka brokers are required")?;
-
-        info!("Testing Kafka connection to brokers: {}", brokers);
-
-        let producer: FutureProducer = client_config(brokers, config)
-            .create()
-            .context("Failed to create Kafka producer")?;
-
-        let event_json = serde_json::to_string(event).context("Failed to serialize event")?;
-
-        let record = FutureRecord::to(topic)
-            .payload(&event_json)
-            .key("test-key");
-
-        producer
-            .send(record, Duration::from_secs(30))
-            .await
-            .map_err(|(e, _)| anyhow::anyhow!("Failed to send test event to Kafka: {:?}", e))?;
-
-        info!("Test event sent to Kafka topic '{}' successfully", topic);
-        Ok(format!("Test event sent to Kafka topic '{}' successfully", topic))
     }
 }
 

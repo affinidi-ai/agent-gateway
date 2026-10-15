@@ -105,56 +105,8 @@ fn default_true() -> bool {
     true
 }
 
-/// integration type definition with metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntegrationType {
-    /// Unique identifier for this integration type (e.g., "email", "slack")
-    pub enum_value: String,
-
-    /// Human-readable name
-    pub name: String,
-
-    /// Description of this integration type
-    pub description: String,
-
-    /// Metadata specific to this integration type (field definitions, etc.)
-    #[serde(default)]
-    pub metadata: serde_json::Value,
-}
-
-/// integration category definition with metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntegrationCategory {
-    /// Unique identifier for this category (e.g., "general", "connection_point")
-    #[serde(deserialize_with = "deserialize_integration_category_value")]
-    pub enum_value: String,
-
-    /// Human-readable name
-    pub name: String,
-
-    /// Description of this category
-    pub description: String,
-
-    /// Metadata specific to this category
-    #[serde(default)]
-    pub metadata: serde_json::Value,
-}
-
-/// The `channel` integration category was renamed to `surface`; a
-/// `gateway.json` written before the rename still carries the old value.
-fn deserialize_integration_category_value<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    Ok(if value == "channel" {
-        "surface".to_string()
-    } else {
-        value
-    })
-}
-
-/// integration configuration
+/// The `integration` section of `gateway.json`: the template placeholder syntax. Events,
+/// variables and endpoint types come from the integration event catalog instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrationConfig {
     /// Regex pattern for matching template variables in ${VARIABLE} or ${VARIABLE:Label} format
@@ -164,166 +116,20 @@ pub struct IntegrationConfig {
     /// Description of the variable pattern
     #[serde(default)]
     pub variable_pattern_description: Option<String>,
-
-    /// Prefix for custom variables (default: "_")
-    #[serde(default = "default_custom_variable_prefix")]
-    pub custom_variable_prefix: String,
-
-    /// Valid integration types with metadata
-    pub types: Vec<IntegrationType>,
-
-    /// Valid integration categories with metadata
-    pub categories: Vec<IntegrationCategory>,
 }
 
 fn default_variable_pattern() -> String {
     r"\$\{([^:}]+)(?::([^}]+))?\}".to_string()
 }
 
-fn default_custom_variable_prefix() -> String {
-    "_".to_string()
-}
-
-/// Built-in integration categories a `gateway.json` written before they
-/// shipped still lacks. They are added at load so an upgrade offers them
-/// without an edit; other categories stay as the operator configured them.
-const CATEGORIES_ADDED_ON_LOAD: [&str; 1] = ["audit"];
-
 impl IntegrationConfig {
-    /// Add each [`CATEGORIES_ADDED_ON_LOAD`] category the configuration lacks,
-    /// taken from [`Self::default_config`]. Returns the categories added.
-    pub fn add_missing_built_in_categories(&mut self) -> Vec<String> {
-        let built_in = Self::default_config().categories;
-        let mut added = Vec::new();
-        for value in CATEGORIES_ADDED_ON_LOAD {
-            if self
-                .categories
-                .iter()
-                .any(|c| c.enum_value == value)
-            {
-                continue;
-            }
-            if let Some(category) = built_in
-                .iter()
-                .find(|c| c.enum_value == value)
-            {
-                self.categories
-                    .push(category.clone());
-                added.push(value.to_string());
-            }
-        }
-        added
-    }
-
-    /// Create a default integration configuration with standard types and categories
-    /// This is used as a fallback when constructing configs programmatically
     pub fn default_config() -> Self {
         Self {
             variable_pattern: default_variable_pattern(),
-            variable_pattern_description: Some("Matches ${VARIABLE} or ${VARIABLE:Label} format. Variable name can contain any characters except : and }".to_string()),
-            custom_variable_prefix: default_custom_variable_prefix(),
-            types: vec![
-                IntegrationType {
-                    enum_value: "email".to_string(),
-                    name: "Email".to_string(),
-                    description: "Send notifications via SMTP email".to_string(),
-                    metadata: serde_json::json!({
-                        "fields": [
-                            {"name": "subject", "label": "Subject", "type": "string", "required": true},
-                            {"name": "body", "label": "Body", "type": "text", "required": true},
-                            {"name": "from_address", "label": "From Address", "type": "string", "required": true},
-                            {"name": "to_addresses", "label": "To Addresses", "type": "string", "required": true},
-                            {"name": "smtp_host", "label": "SMTP Host", "type": "string", "required": true},
-                            {"name": "smtp_port", "label": "SMTP Port", "type": "number", "required": true},
-                            {"name": "smtp_username", "label": "SMTP Username", "type": "string", "required": false},
-                            {"name": "smtp_password", "label": "SMTP Password", "type": "password", "required": false}
-                        ]
-                    }),
-                },
-                IntegrationType {
-                    enum_value: "slack".to_string(),
-                    name: "Slack".to_string(),
-                    description: "Send notifications to Slack channels via webhook".to_string(),
-                    metadata: serde_json::json!({
-                        "fields": [
-                            {"name": "webhook_url", "label": "Webhook URL", "type": "string", "required": true},
-                            {"name": "message", "label": "Message", "type": "text", "required": true},
-                            {"name": "channel", "label": "Channel", "type": "string", "required": false}
-                        ]
-                    }),
-                },
-                IntegrationType {
-                    enum_value: "webhook".to_string(),
-                    name: "Webhook".to_string(),
-                    description: "Send HTTP POST requests to custom endpoints".to_string(),
-                    metadata: serde_json::json!({
-                        "fields": [
-                            {"name": "url", "label": "Webhook URL", "type": "string", "required": true},
-                            {"name": "payload", "label": "Payload Template", "type": "text", "required": true},
-                            {"name": "headers", "label": "Custom Headers (JSON)", "type": "text", "required": false}
-                        ]
-                    }),
-                },
-                IntegrationType {
-                    enum_value: "stream".to_string(),
-                    name: "Stream".to_string(),
-                    description: "Stream events to Kafka, Kinesis, Pulsar, or Redis Streams".to_string(),
-                    metadata: serde_json::json!({
-                        "fields": [
-                            {"name": "phone_number", "label": "To Phone Number", "type": "string", "required": true},
-                            {"name": "message", "label": "Message", "type": "text", "required": true},
-                            {"name": "from_number", "label": "From Number", "type": "string", "required": true},
-                            {"name": "provider_api_key", "label": "Provider API Key", "type": "password", "required": true}
-                        ]
-                    }),
-                },
-            ],
-            categories: vec![
-                IntegrationCategory {
-                    enum_value: "general".to_string(),
-                    name: "General".to_string(),
-                    description: "General purpose notifications".to_string(),
-                    metadata: serde_json::json!({}),
-                },
-                IntegrationCategory {
-                    enum_value: "connection_point".to_string(),
-                    name: "Connection Point".to_string(),
-                    description: "Notifications related to connection point events".to_string(),
-                    metadata: serde_json::json!({}),
-                },
-                IntegrationCategory {
-                    enum_value: "user".to_string(),
-                    name: "User".to_string(),
-                    description: "User-specific notifications".to_string(),
-                    metadata: serde_json::json!({}),
-                },
-                IntegrationCategory {
-                    enum_value: "gateway".to_string(),
-                    name: "Gateway".to_string(),
-                    description: "Gateway system notifications".to_string(),
-                    metadata: serde_json::json!({}),
-                },
-                IntegrationCategory {
-                    enum_value: "surface".to_string(),
-                    name: "Surface".to_string(),
-                    description: "Agent Surface notifications".to_string(),
-                    metadata: serde_json::json!({}),
-                },
-                IntegrationCategory {
-                    enum_value: "x402".to_string(),
-                    name: "X402 Payments".to_string(),
-                    description: "X402 payment transaction and monitoring notifications (transaction failures, settlement errors)".to_string(),
-                    metadata: serde_json::json!({
-                        "event_types": [
-                            {"event": "x402.verification.failed", "description": "Payment verification failed"},
-                            {"event": "x402.settlement.failed", "description": "Payment settlement failed"},
-                            {"event": "x402.transaction.completed", "description": "Payment transaction completed successfully"},
-                            {"event": "x402.cleanup.completed", "description": "Transaction cleanup completed"}
-                        ]
-                    }),
-                },
-                crate::integrations::audit_integration_triggers::audit_integration_category(),
-            ],
+            variable_pattern_description: Some(
+                "Matches ${VARIABLE} or ${VARIABLE:Label} format. Variable name can contain any characters except : and }"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -2122,70 +1928,27 @@ fn any_pattern_matches(
 }
 
 #[cfg(test)]
-mod integration_category_tests {
-    use super::IntegrationCategory;
+mod integration_config_tests {
+    use super::IntegrationConfig;
 
-    fn category(enum_value: &str) -> IntegrationCategory {
-        serde_json::from_value(serde_json::json!({
-            "enum_value": enum_value,
-            "name": "Name",
-            "description": "Description"
+    #[test]
+    fn an_integration_section_with_types_and_categories_still_loads() {
+        let config: IntegrationConfig = serde_json::from_value(serde_json::json!({
+            "variable_pattern": "\\$\\{([^}]+)\\}",
+            "custom_variable_prefix": "_",
+            "types": [{"enum_value": "email", "name": "Email", "description": ""}],
+            "categories": [{"enum_value": "audit", "name": "Audit", "description": ""}]
         }))
-        .unwrap()
+        .expect("loads");
+
+        assert_eq!(config.variable_pattern, "\\$\\{([^}]+)\\}");
     }
 
     #[test]
-    fn a_legacy_channel_category_loads_as_surface() {
-        assert_eq!(category("channel").enum_value, "surface");
-    }
+    fn an_empty_integration_section_uses_the_default_pattern() {
+        let config: IntegrationConfig = serde_json::from_value(serde_json::json!({})).expect("loads");
 
-    #[test]
-    fn other_category_values_load_unchanged() {
-        for value in ["surface", "general", "connection_point", "audit"] {
-            assert_eq!(category(value).enum_value, value);
-        }
-    }
-
-    fn categories(config: &super::IntegrationConfig) -> Vec<&str> {
-        config
-            .categories
-            .iter()
-            .map(|c| c.enum_value.as_str())
-            .collect()
-    }
-
-    #[test]
-    fn a_config_without_the_audit_category_gains_the_built_in_one() {
-        let mut config = super::IntegrationConfig::default_config();
-        config
-            .categories
-            .retain(|c| c.enum_value == "general" || c.enum_value == "gateway");
-
-        assert_eq!(config.add_missing_built_in_categories(), vec!["audit".to_string()]);
-        assert_eq!(categories(&config), vec!["general", "gateway", "audit"]);
-        assert!(
-            config
-                .add_missing_built_in_categories()
-                .is_empty(),
-            "adding is idempotent"
-        );
-    }
-
-    #[test]
-    fn an_operator_audit_category_is_kept_and_other_categories_are_not_added() {
-        let mut config = super::IntegrationConfig::default_config();
-        config
-            .categories
-            .retain(|c| c.enum_value == "audit");
-        config.categories[0].name = "Compliance feed".to_string();
-
-        assert!(
-            config
-                .add_missing_built_in_categories()
-                .is_empty()
-        );
-        assert_eq!(categories(&config), vec!["audit"]);
-        assert_eq!(config.categories[0].name, "Compliance feed");
+        assert_eq!(config.variable_pattern, IntegrationConfig::default_config().variable_pattern);
     }
 }
 

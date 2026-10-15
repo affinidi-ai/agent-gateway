@@ -411,10 +411,6 @@ async fn async_main() -> Result<()> {
             .integration
             .variable_pattern
             .clone(),
-        config
-            .integration
-            .custom_variable_prefix
-            .clone(),
     )?;
 
     info!("Initialized variable patterns from config");
