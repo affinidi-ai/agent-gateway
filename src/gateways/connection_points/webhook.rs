@@ -1,4 +1,5 @@
-//! Raises `connection_point.message_received` for each message a connection point receives.
+//! Raises `connection_point.connected` when someone connects through a connection point with
+//! its secret.
 
 use std::collections::HashMap;
 
@@ -6,7 +7,7 @@ use super::messages::ReceivedMessage;
 use super::types::GatewayConnectionPoint;
 use crate::integrations::delivery::dispatch::dispatch;
 
-const MESSAGE_RECEIVED: &str = "connection_point.message_received";
+const CONNECTED: &str = "connection_point.connected";
 
 #[derive(Clone)]
 pub struct WebhookClient {}
@@ -16,14 +17,14 @@ impl WebhookClient {
         Self {}
     }
 
-    /// Delivers the message to every integration whose event set holds
-    /// `connection_point.message_received`, in the background.
+    /// Delivers the connection, described by its connection-setup `message`, to every
+    /// integration whose event set holds `connection_point.connected`, in the background.
     pub async fn trigger_integration(
         &self,
         connection_point: &GatewayConnectionPoint,
         message: &ReceivedMessage,
     ) -> Result<(), String> {
-        dispatch(MESSAGE_RECEIVED, message_values(connection_point, message));
+        dispatch(CONNECTED, message_values(connection_point, message));
         Ok(())
     }
 }
@@ -34,7 +35,7 @@ impl Default for WebhookClient {
     }
 }
 
-/// The connection point, the message and when it was received.
+/// The connection point, the connection-setup message and when it was received.
 fn message_values(
     connection_point: &GatewayConnectionPoint,
     message: &ReceivedMessage,

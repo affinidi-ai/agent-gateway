@@ -73,11 +73,11 @@ const VARIABLES: &[VariableSpec] = &[
     var("CP_DESCRIPTION", "Connection Point Description", "Description of the connection point"),
     var("GATEWAY", "Gateway", "ID of the connection point's gateway"),
     var("MEDIATOR_ID", "Mediator ID", "ID of the mediator the message arrived through"),
-    var("MESSAGE_ID", "Message ID", "ID of the received message"),
-    var("MESSAGE_TYPE", "Message Type", "DIDComm type of the received message"),
-    var("FROM_DID", "Sender DID", "DID of the message sender"),
-    var("MESSAGE_BODY", "Message Body", "Body of the received message, as JSON"),
-    var("RECEIVED_AT", "Received At", "RFC 3339 time the message was received"),
+    var("MESSAGE_ID", "Message ID", "ID of the connection-setup message"),
+    var("MESSAGE_TYPE", "Message Type", "DIDComm type of the connection-setup message"),
+    var("FROM_DID", "Connecting DID", "DID of whoever connected"),
+    var("MESSAGE_BODY", "Message Body", "Body of the connection-setup message, as JSON"),
+    var("RECEIVED_AT", "Received At", "RFC 3339 time the connection-setup message was received"),
     var("DATE", "Date", "Delivery date, YYYY-MM-DD"),
     var("TIME", "Time", "Delivery time, HH:MM:SS"),
     var("DATETIME", "Date and Time", "Delivery date and time, YYYY-MM-DD HH:MM:SS"),
@@ -289,9 +289,9 @@ const EVENTS: &[EventSpec] = &[
     spec(USER, "user.accessed", "User Profile Accessed", "A user's profile was viewed", &[USER_VARIABLES]),
     spec(
         CONNECTION_POINT,
-        "connection_point.message_received",
-        "Message Received",
-        "A connection point received a message",
+        "connection_point.connected",
+        "Connection Point Connected",
+        "Someone connected through a connection point with its secret",
         &[MESSAGE_VARIABLES],
     ),
     spec(
@@ -427,7 +427,7 @@ mod tests {
             "user.deleted",
             "user.login",
             "user.accessed",
-            "connection_point.message_received",
+            "connection_point.connected",
             "x402.verification.failed",
             "x402.settlement.failed",
             "x402.transaction.completed",
@@ -564,9 +564,11 @@ mod tests {
     }
 
     #[test]
-    fn a_received_message_offers_its_body_and_connection_point() {
-        let received = find_event("connection_point.message_received").expect("message_received");
+    fn a_connection_offers_its_connection_point_and_setup_message() {
+        let received = find_event("connection_point.connected").expect("connected");
         assert_eq!(received.family, "connection_point");
+        assert_eq!(received.name, "Connection Point Connected");
+        assert_eq!(find_event("connection_point.message_received"), None);
         for name in ["CP_ID", "CP_NAME", "MESSAGE_BODY", "FROM_DID", "GATEWAY_ID"] {
             assert!(
                 received

@@ -113,9 +113,7 @@ fn summary(
         "user.deleted" => "User ${USERNAME} was deleted",
         "user.login" => "User ${USERNAME} logged in",
         "user.accessed" => "User ${USERNAME}'s profile was viewed",
-        "connection_point.message_received" => {
-            "Connection point ${CP_NAME} received a ${MESSAGE_TYPE} message from ${FROM_DID}"
-        }
+        "connection_point.connected" => "${FROM_DID} connected through connection point ${CP_NAME}",
         "x402.verification.failed" => {
             "x402 payment ${TX_HASH} on surface ${SURFACE_ID} failed verification: ${ERROR_MESSAGE}"
         }
@@ -274,6 +272,17 @@ mod tests {
             values["EVENT_SUMMARY"],
             "Policy Decision on surface Payments: deny by policy no-external-tools (tool not allowed) for jane@example.com"
         );
+    }
+
+    #[test]
+    fn a_connection_summary_names_who_connected_and_where() {
+        let values = event_values(
+            event("connection_point.connected"),
+            trigger(&[("CP_NAME", "Orders"), ("FROM_DID", "did:peer:partner")]),
+            None,
+        );
+
+        assert_eq!(values["EVENT_SUMMARY"], "did:peer:partner connected through connection point Orders");
     }
 
     #[test]
