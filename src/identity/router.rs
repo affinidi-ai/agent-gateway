@@ -1839,7 +1839,7 @@ pub fn create_identity_api_router(
         state.bootstrap_config.clone(),
     )
     .merge(
-        crate::integrations::api::definition_stores()
+        crate::integrations::definitions::definition_stores()
             .map(|stores| crate::integrations::api::router(stores, integration_guard))
             .unwrap_or_default(),
     );

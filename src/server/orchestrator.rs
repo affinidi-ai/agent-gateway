@@ -1771,8 +1771,8 @@ pub async fn run_axum_proxy(
 
             storage_arc
         };
-        crate::integrations::api::init_definition_stores(Arc::new(
-            crate::integrations::api::DefinitionStores::open_configured(&bootstrap_config.storage_paths)
+        crate::integrations::definitions::init_definition_stores(Arc::new(
+            crate::integrations::definitions::DefinitionStores::open_configured(&bootstrap_config.storage_paths)
                 .await
                 .expect("Failed to initialize integration endpoint, event set and integration storage"),
         ));

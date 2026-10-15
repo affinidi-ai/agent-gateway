@@ -4,11 +4,13 @@ pub mod endpoint;
 pub mod event_set;
 pub mod integration;
 pub mod store;
+pub mod stores;
 
 pub use endpoint::{Endpoint, EndpointType};
 pub use event_set::{EventSet, EventSetError};
 pub use integration::Integration;
 pub use store::{Definition, DefinitionStore};
+pub use stores::{DefinitionStores, definition_stores, init_definition_stores};
 
 use serde::{Deserialize, Serialize};
 
