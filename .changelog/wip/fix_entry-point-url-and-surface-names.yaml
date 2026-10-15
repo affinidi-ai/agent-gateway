@@ -3,8 +3,8 @@ changes:
   added: []
   changed:
     - timestamp: '2026-10-14T00:00:00.000Z'
-      title: Label the Access Point URL and explain it in the Surface Builder
-      description: The Access Point panel and the floating banner on the canvas now call the surface's URL Access Point URL, replacing Channel Route and Access Point, with "The URL other agents use to reach this surface" behind a help icon. The routing help in the Access Point panel is reworded to say how other agents connect and that the generated path can be customised before sharing. The Managed Agent panel no longer repeats the URL as Reached at.
+      title: Label an Access Point's URL Entry point URL in the Surface Builder
+      description: The Access Point panel and the floating banner on the canvas now call the surface's URL Entry point URL, replacing Channel Route and Access Point, with "The URL used to access this gateway" behind a help icon. The routing help in the Access Point panel is reworded to say how other agents connect and that the generated path can be customised before sharing. The Managed Agent panel no longer repeats the URL as Reached at.
     - timestamp: '2026-10-14T00:00:00.000Z'
       title: Name new surfaces <protocol>_surface_<n> instead of after their route
       description: A new surface is named after its protocol and a number, such as a2a_surface_1 then a2a_surface_2, counting the existing surfaces of that protocol and skipping names already taken. It used to be named after its randomly generated route, such as "A2A Surface - /payments/candle/city", which suggested a meaning the surface did not have. The name follows the protocol until the user types their own, including after applying the Config tab JSON with the generated name unchanged. Loading the surface list does not mark a new surface as having unsaved changes, and edits made while it loads still do.
@@ -13,7 +13,7 @@ changes:
       description: The example gateway.json, copied into a new environment's gateway.json, now offers agents, customer-support, payments, order-status, product-catalog, helpdesk, inventory and routes as route prefixes instead of payments, cats, agents and routes. agents is listed first, so it is the Surface Prefix preselected for a new surface instead of payments. Existing environments keep the prefixes in their own gateway.json.
   fixed:
     - timestamp: '2026-10-14T00:00:00.000Z'
-      title: Keep the canvas Access Point URL copy button visible and clickable
+      title: Keep the canvas Entry point URL copy button visible and clickable
       description: With a long URL on a canvas that was not wide enough, the URL banner at the top of the Surface Builder slid under the canvas toolbar, so its copy button sat beneath the disabled Undo button and could not be clicked, or was pushed out of the banner. The variants widget, the banner and the toolbar now share one row along the top of the canvas, so the banner shrinks to the space between them and only its URL text is truncated. Copying uses the shared copy button, and a refused copy, for example on a plain-HTTP origin, now shows an error toast instead of failing silently.
   removed: []
   security: []

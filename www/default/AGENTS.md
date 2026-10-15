@@ -91,14 +91,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
-- **Access Point URL** is the label for an Access Point's composed URL, with "The URL other
-  agents use to reach this surface" behind its `FieldHelp`. It shows at the top of the Access Point panel
+- **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
+  access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
   (`_shared/RouteListenerSection.tsx`) with the shared `CopyButton`; a failed copy shows an
   error toast. The canvas banner sits in the `.surface-canvas-topbar` flex row between the
   variants widget and the toolbar, so it shrinks instead of sliding under either; only its
   URL text truncates, and it leaves out the info icon. The Managed Agent panel does not
-  repeat the URL. Test ids: `access-point-url` and `surface-access-point-url`,
+  repeat the URL. Test ids: `access-point-entry-point-url` and `surface-entry-point-url`,
   each with `-help` and `-copy-button`; the Transit Point's **Listener URL** banner is
   `transit-point-listener-url`.
 - A new surface is named `<protocol>_surface_<n>` (`surfaceNaming.ts`), where `n` is one more
