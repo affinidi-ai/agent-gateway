@@ -1,20 +1,52 @@
 # Integrations
 
 How the gateway tells other systems that something happened: an email when a user
-registers, a Slack message when a remote gateway goes offline, an event on a Kafka topic
-for every failed payment. Implemented in [`src/integrations/`](../src/integrations/),
-with definitions persisted by [`src/storage/integrations.rs`](../src/storage/integrations.rs).
+registers, a Slack message when a gateway goes offline, an event on a Kafka topic for every
+failed payment. Implemented in [`src/integrations/`](../src/integrations/).
 
 In-dashboard notifications, the bell in the top bar, are a separate feature and are
 covered at the end.
+
+## Endpoints, event sets and integrations
+
+An integration is one **endpoint**, one **event set** and a **template**. Each is its own
+definition, kept as one JSON file
+([`src/integrations/definitions/`](../src/integrations/definitions/)), so one endpoint or event
+set can serve several integrations.
+
+| Definition | Holds | Stored in |
+| --- | --- | --- |
+| Endpoint | `type` (`email`, `slack`, `webhook`, `stream`), `configuration`: the transport, destination and credentials, and `status` | `storage_paths.integration_endpoints` |
+| Event set | `events`: event ids from the catalog, such as `gateway.created` or `audit.policy_decision`, audit and other events mixed freely | `storage_paths.integration_event_sets` |
+| Integration | `endpoint_id`, `event_set_id`, `content` (the template), `status`, and for audit events `audit_drop_after_secs` and `audit_max_attempts` | `storage_paths.integration_definitions` |
+
+Integrations belong to the whole appliance: none has a tenant owner, and a tenant or
+resource-scoped PAT is refused with `403` on every route under `/v1/integrations`.
+
+**Endpoints.** `smtp_password` (email), `webhook_url` (Slack), `signing_secret` and `headers`
+(webhook), and `sasl_password` and `redis_url` (stream) are written but never read back:
+responses leave them out of `configuration` and name the ones set in `secrets`. An update that
+leaves a secret out keeps it, and one that sends it as `null` clears it. A secret field may
+instead hold `$SECRET:<secret_id>`, a reference to an appliance-wide secret in the secrets
+store, resolved at each delivery and shown in responses as written; a reference that does not
+resolve fails the delivery. An endpoint's `type` cannot change. Its configuration is checked by
+its publisher when saved, so a webhook or Slack URL that fails the checks under _Outbound
+requests_ is refused with `400`.
+
+**Event sets** need at least one event, every one from the catalog; repeats are dropped.
+
+**Integrations** need an existing endpoint and event set. Their template must be a JSON object
+whose variables some event of the event set fills, and the audit delivery limits are accepted
+only when the event set holds audit events, and must be at least 1. Changing an event set is
+refused with `409` while one of its integrations would no longer fit it, and an endpoint or
+event set is not deleted (`409`) while an integration uses it.
 
 ## How an event becomes a message
 
 ```mermaid
 flowchart LR
-    E["Event, such as<br/>gateway.status_changed"] --> S["Active integrations whose<br/>category matches, or general"]
-    S --> R["The resource's trigger configuration:<br/>subscribed event types, custom variables"]
-    R --> T["Render the template,<br/>replacing ${VARIABLE}"]
+    E["Event, such as<br/>gateway.status_changed"] --> S["Active integrations whose event set<br/>holds it, with an active endpoint"]
+    S --> T["Render the template,<br/>replacing ${VARIABLE}"]
     T --> P{Publisher}
     P --> EM[Email]
     P --> SL[Slack]
@@ -22,70 +54,41 @@ flowchart LR
     P --> ST["Stream: Kafka, Kinesis,<br/>Pulsar, Redis"]
 ```
 
-Delivery runs in a spawned task, with a semaphore bounding how many run at once. It never
-blocks or fails the operation that raised the event.
+An enabled event is delivered for every resource that raises it; there is no filter by
+gateway, user or surface. Delivery reads a snapshot of the definitions
+([`delivery/dispatch.rs`](../src/integrations/delivery/dispatch.rs)), taken again after any
+change through the API and at most 5 seconds old otherwise, so definitions written by another
+node are picked up too.
+
+Delivery runs in a spawned task and never blocks or fails the operation that raised the event.
+At most 100 such tasks run at once; an event raised while all are busy is not delivered, and a
+warning is logged.
 
 A transient failure (a connection error, timeout, or request error, or an HTTP 429 or 5xx
 response) is retried up to five times, after 1, 2, 4, 8, and 16 seconds plus jitter
-([`integration_service.rs`](../src/integrations/integration_service.rs)). Any other failure,
-such as an HTTP 4xx, is logged and dropped. A retried delivery can arrive more than once, so
-a receiver that is not idempotent should expect duplicates.
+([`delivery/retry.rs`](../src/integrations/delivery/retry.rs)). Any other failure, such as an
+HTTP 4xx, is logged and dropped. A retried delivery can arrive more than once, so a receiver
+that is not idempotent should expect duplicates.
 
-## Integration definitions
-
-An `Integration` ([`src/storage/integrations.rs`](../src/storage/integrations.rs)) is one
-configured destination.
-
-| Field | Holds |
-| --- | --- |
-| `integration_type` | `email`, `slack`, `webhook`, or `stream` |
-| `category` | Which resource's events it serves, and so which variables it can use |
-| `configuration` | Connection details: SMTP settings, a webhook URL, a stream platform and topic |
-| `content` | The message template, such as a subject and body, with `${VARIABLE}` placeholders |
-| `status` | Only `active` integrations fire |
-| `tenant_id` | Optional tenant owner. See [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#tenant-ownership). |
-
-An integration with the category `general` serves every resource type. An integration with
-the category `audit` is a Governance Audit integration: it receives the audit events listed
-in its `audit_events` (none when the list is empty), may skip records older than
-`audit_drop_after_secs` and records that failed `audit_max_attempts` delivery attempts, may be
-of any type (Email and Slack send one message per record), cannot belong to a tenant, and never
-receives resource events. These fields are rejected on other categories. See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
-
-## Publishers
-
-| Type | Sends to | Configuration |
-| --- | --- | --- |
-| `email` | An SMTP server | `smtp_host`, `smtp_port`, `smtp_username`, `smtp_password`, `from`, `to`, optional `cc` and `bcc`, `use_tls`, `use_starttls` |
-| `slack` | A Slack incoming webhook | `webhook_url` |
-| `webhook` | Any HTTPS endpoint | The URL |
-| `stream` | Kafka, Amazon Kinesis, Apache Pulsar, or Redis Streams | The platform and its connection settings |
-
-All four stream platforms are compiled into the binary; which one is used is a matter of
-configuration.
-
-Slack messages are sent as mrkdwn. Variable values have `&`, `<`, and `>` escaped before
-substitution, so caller-supplied text such as a JWT `name` claim cannot produce mentions
-(`<!channel>`) or links. The admin-written template is not escaped.
+Audit events (`audit.*`) take another path: they are journaled and forwarded by the audit
+pipeline, with its own retries and drop policy. See
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
 ## Events
 
-Each resource type raises its own events. The event type is always
-`<resource>.<action>`, such as `gateway.created`.
+`GET /v1/integrations/catalog` lists every event the gateway delivers, with its name,
+description, family, its audit group for audit events, and the template variables its delivery
+fills; every template variable with its description; and each endpoint type with its secret
+fields ([`events.rs`](../src/integrations/events.rs)).
 
-| Resource | Events |
+| Family | Events |
 | --- | --- |
-| Surface | `created`, `updated`, `deleted`, `accessed`, `error` |
-| Connection point | `created`, `updated`, `deleted`, `connected`, `error` |
-| Gateway | `created`, `updated`, `deleted`, `status_changed`, `accessed` |
-| Identity | `created`, `updated`, `deleted`, `appeared`, `accessed` |
-| User | `created`, `approved`, `updated`, `deleted`, `login`, `accessed` |
-| Secret | `created`, `updated`, `deleted` |
-| Trust registry | `created`, `updated`, `deleted`, `status_changed` |
-| MCP proxy | `created`, `updated`, `deleted`, `status_changed` |
-| Mediator | `created`, `updated`, `deleted`, `status_changed` |
-| x402 | transaction verification failed, settlement failed, completed; cleanup completed |
-| MPP | verification failed, payment verified, challenge issued |
+| Gateway | `gateway.created`, `updated`, `deleted`, `status_changed`, `accessed` |
+| User | `user.created`, `approved`, `updated`, `deleted`, `login`, `accessed` |
+| Connection point | `connection_point.connected`: someone connected through a connection point with its secret |
+| x402 | `x402.verification.failed`, `x402.settlement.failed`, `x402.transaction.completed`, `x402.cleanup.completed` |
+| MPP | `mpp.verification.failed`, `mpp.payment.verified`, `mpp.challenge.issued` |
+| Audit | `audit.<event>` for every event of the audit catalog ([`src/audit/catalog.rs`](../src/audit/catalog.rs)) |
 
 A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
 SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
@@ -93,65 +96,35 @@ so no `user.approved` follows. A later SAML sign-in that changes the user's role
 primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
 
-Surface events and the `surface` category were named `channel` in earlier builds. A stored
-integration with the `channel` category, or a `gateway.json` that still uses it, is moved
-to `surface` at load, and `${CHANNEL_*}` template variables become `${SURFACE_*}`.
+## Templates
 
-## Attaching an integration to a resource
+An integration's `content` is a JSON object whose string values may hold `${VARIABLE}`
+placeholders. Fields the template leaves out take the endpoint type's default, so an empty
+template sends a complete message:
 
-A definition says *where* and *what*. A **trigger configuration** says *when*, per
-resource. For a gateway it is stored under `integration_triggers/gateways/<gateway_id>/`
-and lists, for each attached integration:
+| Type | Default |
+| --- | --- |
+| `email` | `subject` `${EVENT_NAME}`, `body` `${EVENT_SUMMARY}`, `format` `plain` (or `html` when the body is HTML) |
+| `slack` | `text` `*${EVENT_NAME}*` and `${EVENT_SUMMARY}` on the next line |
+| `webhook`, `stream` | `event_type`, `event_name`, `timestamp`, `appliance_id`, `summary` and `data` (`${EVENT_DATA}`) |
 
-- `event_types`: which of that resource's events it fires on.
-- `variables`: custom values substituted into the template alongside the built-in ones.
-
-So one Slack integration can be attached to three gateways, fire on `status_changed` for
-two of them, and on every event for the third.
-
-Saving a trigger configuration loads every integration it names
-([`trigger_mappings.rs`](../src/integrations/trigger_mappings.rs)). An unknown or malformed
-id is refused with `400` "Integration reference is not accessible". A record the store
-cannot read, decrypt, or parse is a server failure: `500` "Failed to load integrations",
-logged with the integration id, and nothing is saved.
-
-### User and identity events
-
-User and identity events describe the whole appliance, so their trigger configurations
-(`/v1/users/integrations`, `/v1/identities/integrations`) can be read and changed only by an
-appliance-wide caller: a tenant or resource-scoped PAT gets `403` on `GET` and `PUT`, before
-any storage is touched. A `PUT` (validated in
-[`trigger_mappings.rs`](../src/integrations/trigger_mappings.rs)) accepts only:
-
-- Integrations that exist, have no tenant owner, are not `audit`, and are in the
-  resource's category (`user` or `identity`) or `general`.
-- Event types the resource raises, at least one per integration. An integration already
-  stored with no event types keeps firing on every event and may be saved again unchanged.
-- Each integration once, at most 50 integrations, and only custom (`_`-prefixed) variables:
-  at most 32, names up to 64 characters, values up to 2048.
-- No unknown fields.
-
-Any refusal leaves the stored configuration unchanged. Each accepted change is logged as
-`integrations.mappings.updated` with the caller, the integration ids, and their event types;
-variable values are not logged.
-When an event is sent, tenant-owned integrations are skipped as well.
-
-## Template variables
-
-Every event provides four variables, plus the resource's own. `APPLIANCE_ID` is available
-to every category too.
+Every event fills these variables, plus its own:
 
 | Variable | Value |
 | --- | --- |
-| `APPLIANCE_ID` | The **Appliance ID** set in Settings › System Settings (`appliance_id` in `settings.json`), such as the appliance's id in Agent Watch. It never comes from event or trigger values, is never the appliance DID, and is unrelated to any Kafka topic name. While unset, `${APPLIANCE_ID}` is left unfilled. |
-| `EVENT_TYPE` | For example `gateway.created` |
+| `EVENT_TYPE` | The event id, such as `gateway.created` |
+| `EVENT_NAME` | Its name, such as `Gateway Created` |
+| `EVENT_SUMMARY` | One line on what happened, such as `Gateway edge was created` |
+| `EVENT_DATA` | The event's own variables as a JSON object with lower-case keys; for an audit event, the audit record |
 | `TIMESTAMP` | RFC 3339 |
-| `NEW_STATE` | The resource after the change, as JSON. Empty for a delete. |
-| `OLD_STATE` | The resource before the change, as JSON. Empty for a create. |
+| `APPLIANCE_ID` | The **Appliance ID** set in Settings › System Settings (`appliance_id` in `settings.json`), such as the appliance's id in Agent Watch. It never comes from event values, is never the appliance DID, and is unrelated to any Kafka topic name. Empty while unset. |
 
-Resource variables follow a prefix, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`,
-and `GATEWAY_STATUS` for a gateway. `GET /v1/integrations/runtime-variables` lists every
-variable available to each category.
+The computed variables (`EVENT_TYPE`, `EVENT_NAME`, `EVENT_SUMMARY`, `EVENT_DATA`,
+`APPLIANCE_ID`) are always set by the gateway, never by the code that raised the event. Each
+event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`, and
+`GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events also
+carry `OLD_STATE` and `NEW_STATE`: the resource before and after the change as JSON, empty for a
+create or a delete respectively.
 
 A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is_primary`,
 `created_at`, and `updated_at`
@@ -160,13 +133,37 @@ the SAML subject, and profile details (names, department, job title, avatar) nev
 appliance through an integration. `USERNAME` and `USER_EMAIL` remain available as separate
 variables for a template that needs them.
 
-Placeholders are filled in one pass: a substituted value is never scanned for placeholders
-again, so a value such as a username of `${_TOKEN}` stays literal.
+Placeholders are filled in one pass
+([`delivery/render.rs`](../src/integrations/delivery/render.rs)): a placeholder with no value
+becomes empty, and a substituted value is never scanned for placeholders again, so a username
+of `${SECRET}` stays literal. A string that is exactly `${EVENT_DATA}` or `${AUDIT_RECORD}` is
+embedded as a JSON value; inside other text it is inserted as JSON text.
 
-The placeholder syntax is `integration.variable_pattern` in `gateway.json`, and custom
-variables start with `integration.custom_variable_prefix` (default `_`). Both are fixed once at
-startup ([`runtime_variables.rs`](../src/integrations/runtime_variables.rs)); a pattern that
-is not a valid regular expression stops the gateway from starting.
+Values, never the template, are escaped for the transport. Slack messages are sent as mrkdwn,
+with `&`, `<`, and `>` escaped, so caller-supplied text such as a JWT `name` claim cannot
+produce mentions (`<!channel>`) or links. HTML email bodies have `&`, `<`, `>`, `"`, and `'`
+escaped.
+
+The placeholder syntax is `integration.variable_pattern` in `gateway.json`, fixed at startup
+([`runtime_variables.rs`](../src/integrations/runtime_variables.rs)); a pattern that is not a
+valid regular expression stops the gateway from starting.
+
+## Publishers
+
+| Type | Sends to | Configuration |
+| --- | --- | --- |
+| `email` | An SMTP server | `smtp_host`, `smtp_port`, `smtp_username`, `smtp_password`, `from`, `to`, optional `cc` and `bcc`, `use_tls`, `use_starttls` |
+| `slack` | A Slack incoming webhook | `webhook_url` |
+| `webhook` | Any HTTPS endpoint | `url`, optional `method` (`POST`, `PUT`, `PATCH`), `signing_secret`, `headers` |
+| `stream` | Kafka, Amazon Kinesis, Apache Pulsar, or Redis Streams | `platform`, `topic`, and the platform's connection settings |
+
+All four stream platforms are compiled into the binary; which one is used is a matter of
+configuration.
+
+A webhook request carries `X-Webhook-Timestamp`, the Unix time in seconds. With a
+`signing_secret` it also carries `X-Webhook-Signature-256`: `sha256=` and the hex
+HMAC-SHA256 of `<timestamp>.<body>` keyed with the secret, so a receiver can check the sender
+and reject replays.
 
 ## Outbound requests
 
@@ -184,64 +181,34 @@ the forward legs use. The client resolves the host again when it connects, so th
 address and the connected address are not bound together. See
 [`POLICY.md`](POLICY.md#egress-and-ssrf-controls) for the sinks that are pinned.
 
-## Endpoints, event sets and integrations
-
-The management API keeps three kinds of definition, one JSON file each
-([`src/integrations/definitions/`](../src/integrations/definitions/)):
-
-| Definition | Holds | Stored in |
-| --- | --- | --- |
-| Endpoint | `type` (`email`, `slack`, `webhook`, `stream`), `configuration`: the transport, destination and credentials | `storage_paths.integration_endpoints` |
-| Event set | `events`: event ids from the catalog, such as `gateway.created` or `audit.policy_decision`, audit and other events mixed freely | `storage_paths.integration_event_sets` |
-| Integration | `endpoint_id`, `event_set_id`, `content` (the template), `status`, and for audit events `audit_drop_after_secs` and `audit_max_attempts` | `storage_paths.integration_definitions` |
-
-Integrations belong to the whole appliance: none has a tenant owner, and a tenant or
-resource-scoped PAT is refused with `403` on every route below.
-
-**Event catalog.** `GET /v1/integrations/catalog` lists every event the gateway delivers, with
-its family (`gateway`, `user`, `connection_point`, `x402`, `mpp`, `audit`), its audit group for
-audit events, and the template variables its delivery fills; every template variable with its
-description; and each endpoint type with its secret fields
-([`events.rs`](../src/integrations/events.rs)).
-
-**Endpoint secrets.** `smtp_password` (email), `webhook_url` (Slack), `signing_secret` and
-`headers` (webhook), and `sasl_password` and `redis_url` (stream) are written but never read
-back: responses leave them out of `configuration` and name the ones set in `secrets`. An update
-that leaves a secret out keeps it, and one that sends it as `null` clears it. An endpoint's
-`type` cannot change. Its configuration is checked by its publisher when saved, so a webhook or
-Slack URL that fails the checks under _Outbound requests_ is refused with `400`.
-
-**Event sets** need at least one event, every one from the catalog; repeats are dropped.
-
-**Integrations** need an existing endpoint and event set. Their template must be a JSON object
-whose variables some event of the event set fills, and the audit delivery limits are accepted
-only when the event set holds audit events, and must be at least 1. Changing an event set is
-refused with `409` while one of its integrations would no longer fit it, and an endpoint or
-event set is not deleted (`409`) while an integration uses it.
-
-Event delivery reads the definitions described in _Integration definitions_ above, from
-`storage_paths.integrations`; integrations kept by this API are not delivered.
-
 ## Management API
 
 | Route | Purpose |
 | --- | --- |
 | `GET`, `POST /v1/integrations` | List and create integrations |
 | `GET`, `PUT`, `DELETE /v1/integrations/{id}` | Read, change, and remove one |
+| `POST /v1/integrations/{id}/test` | Send a saved integration's message once |
+| `POST /v1/integrations/test` | Send an unsaved integration's message once |
 | `GET`, `POST /v1/integrations/endpoints` | List and create endpoints |
 | `GET`, `PUT`, `DELETE /v1/integrations/endpoints/{id}` | Read, change, and remove one |
+| `POST /v1/integrations/endpoints/{id}/test` | Send the endpoint's default message once |
 | `GET`, `POST /v1/integrations/event-sets` | List and create event sets |
 | `GET`, `PUT`, `DELETE /v1/integrations/event-sets/{id}` | Read, change, and remove one |
 | `GET /v1/integrations/catalog` | Events, template variables and endpoint types |
-| `/v1/gateways/{id}/integrations` | A gateway's trigger configuration |
-| `/v1/users/integrations`, `/v1/identities/integrations` | User and identity trigger configuration |
 
-Each route needs `integrations.view`, `integrations.edit`, or `integrations.delete`, checked
-by the RBAC guard ([`api/mod.rs`](../src/integrations/api/mod.rs),
-[`integration_handlers.rs`](../src/storage/integration_handlers.rs)). Mounted without a guard,
-every route above refuses the request with `403`. Each create, change and delete is logged as
-`integrations.<endpoint|event_set|integration>.<created|updated|deleted>` with its id and the
-caller; secret values are never logged.
+A test sends one message without retries
+([`api/send_test.rs`](../src/integrations/api/send_test.rs)). An integration test renders its
+template for the first event of its event set, filled with sample values; an unsaved one is
+checked as a save would be first. An endpoint test sends the endpoint type's default message
+for the event `integration.test`. A test that reaches the destination returns
+`{"delivered": true, "event_type": ...}`; one that fails returns `502` with the reason.
+
+Each route needs `integrations.view`, `integrations.edit` (including the tests), or
+`integrations.delete`, checked by the RBAC guard ([`api/mod.rs`](../src/integrations/api/mod.rs)).
+Mounted without a guard, every route above refuses the request with `403`. Each create, change
+and delete is logged as `integrations.<endpoint|event_set|integration>.<created|updated|deleted>`
+with its id and the caller, and each test as `integrations.test_sent`; secret values are never
+logged.
 
 ## In-dashboard notifications
 
@@ -264,4 +231,4 @@ Welcome messages for administrators and users start from the templates
 
 - [`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway): integrations from a user's point of view.
 - [`POLICY.md`](POLICY.md#egress-and-ssrf-controls): how outbound requests are controlled.
-- [`OBSERVABILITY.md`](OBSERVABILITY.md): metrics and traces, which are separate from integrations.
+- [`OBSERVABILITY.md`](OBSERVABILITY.md): metrics and traces, and Governance Audit forwarding.

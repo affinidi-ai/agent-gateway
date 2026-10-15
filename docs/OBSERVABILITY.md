@@ -138,21 +138,20 @@ match, or Terms the token owner has not accepted.
 ## Governance audit forwarding
 
 Governance audit records go to **sinks**: the VP Audit Log (`delegation-audit.jsonl`, read by
-`/v1/audit`) and each Governance Audit integration (category `audit`). Every sink selects the
-audit events it wants, and the selections are independent: an integration can receive an event
-the VP Audit Log does not keep, and the reverse. Nothing is selected on a fresh install, and a
-record nobody selects is never built.
+`/v1/audit`) and each Governance Audit integration: an integration whose event set holds audit
+events (see [`INTEGRATIONS.md`](INTEGRATIONS.md)). Every sink selects the audit events it wants,
+and the selections are independent: an integration can receive an event the VP Audit Log does
+not keep, and the reverse. Nothing is selected on a fresh install, and a record nobody selects
+is never built.
 
 **Selection.** The VP Audit Log keeps the events in the settings field `audit_events` while
 `audit_enabled` is on (Settings › VP Audit); turning it off pauses the log without losing the
-selection. Each Governance Audit integration receives the events in its own `audit_events` list;
-an empty list receives nothing. Both take event names from the audit event catalog
+selection. An integration receives the audit events its event set holds, as `audit.<event>`
+next to any other events. Both take event names from the audit event catalog
 (`src/audit/catalog.rs`), for example `policy_decision`, `auth_failed`, `token_injected`; an
-unknown name is rejected (400). An integration update that leaves `audit_events` out keeps the
-integration's current list. `GET /v1/settings/audit-events` lists the catalog in order, each entry
-with its `event` name, `label`, `description`, `group` and `group_label`; the dashboard builds its
-event pickers from it. The catalog is also listed in the category's
-`metadata.event_types` as `audit.<event>` with the event's `group`.
+unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalog in order, each
+entry with its `event` name, `label`, `description`, `group` and `group_label`, and
+`GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
 Reasons are fixed codes; no record carries a credential, token or validator message.
@@ -205,8 +204,8 @@ so an unauthenticated or unroutable client produces one record per request it se
 integration sends one message per record. They also count towards the journal size and its
 1 GiB backlog cap (see _Backlog_ below), so a flood can make a slow sink skip records.
 
-**Recipients.** Every integration with category `audit`, status `active` and no tenant owner,
-whatever its type. Every record is one delivery, so Email and Slack send one message per record;
+**Recipients.** Every active integration with an active endpoint whose event set holds the
+record's event, whatever the endpoint's type. Every record is one delivery, so Email and Slack send one message per record;
 Stream (Kafka, Kinesis, Pulsar or Redis Streams) and Webhook suit busy appliances. The records
 hold administrator-only evidence: the caller's email and name, request details and the signed VP
 leave the appliance with each record, so point audit integrations only at destinations cleared
@@ -217,13 +216,12 @@ permissions alone, whatever events they deliver; `audit.view` guards `/v1/audit`
 integrations that forward records. Changing integrations is administrator-only by default
 (see [`INTEGRATIONS.md`](INTEGRATIONS.md#management-api)).
 
-- They cannot belong to a tenant. `PUT /v1/tenant-ownership/integrations/{id}` with a tenant
-  returns 400, and a tenant-owned integration never receives records even if its category is
-  edited on disk.
-- Only the dispatcher publishes to them. A connection point or gateway cannot link one (400),
-  and every event trigger (connection point, gateway, user, identity, surface, x402, MPP)
-  refuses one, so values those triggers carry, some of them caller-supplied, never reach the
-  audit stream.
+- Integrations belong to the whole appliance. `PUT /v1/tenant-ownership/integrations/{id}`
+  returns 400, and a tenant or resource-scoped PAT is refused on every integration route.
+- Audit events reach integrations only through the journal. The event dispatcher refuses
+  `audit.*` events, so no other code path can deliver an audit event, and an integration whose
+  event set mixes audit and other events gets each event as its own message, never values of
+  one inside the other.
 
 **Delivery.** No record is lost by the gateway except in the counted cases below.
 
@@ -277,9 +275,9 @@ integrations that forward records. Changing integrations is administrator-only b
   deduplicate on `event_id`. The VP Audit Log does this itself for the records at the end of
   its file.
 - *Sinks coming and going.* A new sink reads from the start of the journal; no record is
-  addressed to a sink before it exists, so it misses nothing. A Governance Audit integration
-  that is disabled, given a tenant or moved to another category is paused: it keeps its
-  configuration but receives nothing, and records addressed to it while it is paused are not
+  addressed to a sink before it exists, so it misses nothing. An integration that is disabled,
+  whose endpoint is disabled, or whose event set no longer holds audit events is paused: it
+  keeps its configuration but receives no records, and records addressed to it while it is paused are not
   kept. Pausing moves its cursor to the end of the journal, letting go of the records it had not
   received; each one addressed to it is counted in
   `agent_gateway_audit_sink_skipped_total{sink, reason="paused"}` (unreadable lines with
@@ -345,8 +343,10 @@ the Active node, or `agent_gateway_audit_records_lost_total{reason="pipeline_not
 increases; if the stuck-writer error was logged on the node that stepped down, reboot that node to
 release the lock.
 
-**Payload.** Audit templates may use `EVENT_TYPE`, `TIMESTAMP` (the record's own timestamp),
-`AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
+**Payload.** Audit templates may use `EVENT_TYPE` (`audit.<event>`), `EVENT_NAME`,
+`EVENT_SUMMARY` (the event's name, then whichever of the surface, decision, policy, reason and
+caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_ID`,
+`TIMESTAMP` (the record's own timestamp), `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
 `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCIPAL`,
 `AUDIT_PRINCIPAL_EMAIL`, `AUDIT_PRINCIPAL_NAME`, `AUDIT_AUTH_METHOD`, `AUDIT_DECISION`,
 `AUDIT_DENY_REASON`, `AUDIT_POLICY_NAME`, `AUDIT_POLICY_VERSION`, `AUDIT_POLICY_CONTENT_HASH`,
@@ -358,30 +358,26 @@ carries), and all four are empty when the request had no caller context (no sour
 Transit Point whose token carries no caller). The policy variables describe the policy that made
 a `policy_decision` (`AUDIT_POLICY_NAME` falls back to the Rego package when the policy has no
 stored definition) and are empty for other records; see
-[`POLICY.md`](POLICY.md#versioned-policy-definitions) for which decisions carry a revision. In a JSON template (Stream, Webhook), a string value that is exactly
-`${AUDIT_RECORD}` is embedded as a JSON object; inside other text it is inserted as JSON text.
-Other state variables such as `OLD_STATE` keep their string form. The dashboard seeds Stream
-and Webhook audit integrations with:
+[`POLICY.md`](POLICY.md#versioned-policy-definitions) for which decisions carry a revision. A
+string value that is exactly `${AUDIT_RECORD}` or `${EVENT_DATA}` is embedded as a JSON object;
+inside other text it is inserted as JSON text. A Stream or Webhook integration with an empty
+template sends the default event envelope, whose `data` is the record:
 
 ```json
 {
   "event_type": "${EVENT_TYPE}",
-  "category": "${AUDIT_CATEGORY}",
+  "event_name": "${EVENT_NAME}",
   "timestamp": "${TIMESTAMP}",
-  "trace_id": "${AUDIT_TRACE_ID}",
-  "surface_id": "${AUDIT_SURFACE_ID}",
-  "record": "${AUDIT_RECORD}"
+  "appliance_id": "${APPLIANCE_ID}",
+  "summary": "${EVENT_SUMMARY}",
+  "data": "${EVENT_DATA}"
 }
 ```
 
 Kafka producers are reused per integration, rebuilt when its brokers or SASL settings change,
-and dropped when the integration is saved or deleted; the Kinesis, Pulsar and Redis Streams
-publishers still open a client per record.
+and dropped when the integration is deleted; the Kinesis, Pulsar and Redis Streams publishers
+still open a client per record.
 
-**Configuration.** `config/examples/gateway.example.json` carries the canonical `audit`
-category entry. A `gateway.json` that lacks it, such as one created before the category
-existed, is given the built-in entry at load with a WARN, so an upgrade offers Governance Audit
-without an edit; an operator's own `audit` entry is kept. Settings saved with the older
-`audit_categories` booleans are read as the events `policy_decision`, `trust_check` and
-`vp_injected`; nothing else is selected on upgrade, and existing Governance Audit integrations
-start with no events. See `src/audit/` and `src/integrations/audit_integration_triggers.rs`.
+**Configuration.** Settings saved with the older `audit_categories` booleans are read as the
+events `policy_decision`, `trust_check` and `vp_injected`; nothing else is selected on upgrade.
+See `src/audit/` and `src/integrations/audit_integration_triggers.rs`.

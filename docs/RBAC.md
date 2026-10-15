@@ -93,8 +93,8 @@ both routers deny every request instead of serving unauthenticated. The built-in
 The integration routes require `integrations.view` / `integrations.edit` / `integrations.delete`
 at the route, whichever events an integration delivers, and refuse every request without an RBAC
 guard. `audit.view` is not needed to manage integrations that forward audit records.
-`gateways.edit` alone cannot reach one: connection points and gateways cannot link an audit
-integration, and event triggers refuse to publish to one.
+`gateways.edit` alone cannot reach one: integrations are not linked from gateways or connection
+points, and audit events reach them only through the audit journal.
 See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
 ## Frontend use
