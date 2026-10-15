@@ -6,7 +6,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { UI_COLORS } from './uiPalette';
 import { AppButton } from '../components/shared/AppButton';
 
-export type ToastType = 'success' | 'error' | 'loading';
+export type ToastType = 'success' | 'warning' | 'error' | 'loading';
 
 export interface ToastAction {
   label: string;
@@ -46,6 +46,11 @@ export const showToast = (
     borderColor = UI_COLORS.success;
     icon = 'fa-check-circle';
     label = 'Success!';
+  } else if (type === 'warning') {
+    alertClass = 'alert-warning';
+    borderColor = UI_COLORS.warning;
+    icon = 'fa-exclamation-triangle';
+    label = 'Warning';
   } else if (type === 'error') {
     alertClass = 'alert-danger';
     borderColor = UI_COLORS.danger;
@@ -124,7 +129,8 @@ export const showToast = (
 
   // Auto-remove with different timers based on type and options
   if (options.autoRemove && type !== 'loading') {
-    const duration = type === 'error' ? options.duration || 5000 : options.duration || 3000;
+    const duration =
+      type === 'error' || type === 'warning' ? options.duration || 5000 : options.duration || 3000;
     setTimeout(() => {
       document.getElementById('app-toast')?.remove();
     }, duration);

@@ -167,33 +167,35 @@ const AccessTokenFormCard: React.FC<AccessTokenFormCardProps> = ({
 
           <hr />
           <div className="d-flex justify-content-between align-items-center gap-3">
-            {editor.isEditMode && canRevoke && !editor.revoked ? (
-              <DeleteButton
-                variant="danger"
-                onDelete={editor.revoke}
-                title="Revoke this token"
-                data-testid="access-token-revoke-button"
-              >
-                Revoke token
-              </DeleteButton>
-            ) : !editor.isEditMode ? (
+            <div className="d-flex align-items-center gap-2">
+              {editor.isEditMode && canRevoke && !editor.revoked && (
+                <DeleteButton
+                  variant="danger"
+                  onDelete={editor.revoke}
+                  title="Revoke this token"
+                  data-testid="access-token-revoke-button"
+                >
+                  Revoke token
+                </DeleteButton>
+              )}
               <CopyButton
                 text={`${window.location.origin}${ACCESS_TOKEN_NEW_ROUTE}${accessTokenFormQuery(editor.form)}`}
                 variant="outline-primary"
                 size="md"
                 label="Copy creation link"
-                title={
-                  editor.canSave
-                    ? 'Copy a link that opens this form with the current settings'
-                    : 'Fix the token settings before copying a creation link'
-                }
-                disabled={!editor.canSave}
+                title="Copy a link that opens a new token form with the current settings"
+                onCopied={() => {
+                  if (editor.hasInvalidSettings) {
+                    showToast(
+                      'warning',
+                      'Link copied, but some settings are invalid: the form it opens will not create a token until they are fixed.'
+                    );
+                  }
+                }}
                 onCopyError={() => showToast('error', 'Could not copy the link.')}
                 data-testid="access-token-copy-permalink-button"
               />
-            ) : (
-              <span />
-            )}
+            </div>
             <AppButton
               variant="primary"
               type="submit"

@@ -168,32 +168,53 @@ describe('EditAccessTokenPage', () => {
     expect(screen.getByTestId('access-token-header-pattern-0')).toHaveValue('tenant-a');
   });
 
-  it('allows copying the creation link only for a valid token configuration', async () => {
+  it('allows copying the creation link for an incomplete token configuration', async () => {
     renderPage();
     const copy = screen.getByTestId('access-token-copy-permalink-button');
-    expect(copy).toBeDisabled();
-
-    await userEvent.type(screen.getByTestId('access-token-name'), 'Valid token');
     expect(copy).toBeEnabled();
 
-    await userEvent.click(screen.getByTestId('access-token-never-expires'));
-    fireEvent.change(screen.getByTestId('access-token-expiry-date-time'), {
-      target: { value: toLocalDateTimeInput(new Date(Date.now() - 60 * 60 * 1000)) },
-    });
-    expect(copy).toBeDisabled();
     await userEvent.click(copy);
-    expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+    const link = new URL((navigator.clipboard.writeText as jest.Mock).mock.calls[0][0]);
+    expect(link.pathname).toBe('/access-tokens/new');
+    expect(link.search).toBe('');
+    expect(showToast).not.toHaveBeenCalledWith('warning', expect.anything());
   });
 
-  it('disables the creation link for preset scopes the operator cannot grant', () => {
+  it('warns when the copied creation link carries invalid settings', async () => {
+    renderPage();
+    await userEvent.click(screen.getByTestId('access-token-resource-scope-toggle'));
+    fireEvent.change(screen.getByTestId('access-token-resource-pattern'), {
+      target: { value: 'TENANT:${missing}:gateways:.*' },
+    });
+
+    await userEvent.click(screen.getByTestId('access-token-copy-permalink-button'));
+    const link = new URL((navigator.clipboard.writeText as jest.Mock).mock.calls[0][0]);
+    expect(link.searchParams.get('resource_pattern')).toBe('TENANT:${missing}:gateways:.*');
+    expect(showToast).toHaveBeenCalledWith(
+      'warning',
+      expect.stringContaining('settings are invalid')
+    );
+  });
+
+  it('keeps preset scopes the operator cannot grant in the creation link', async () => {
     renderPage('/access-tokens/new?name=Linked&scope=departments.view');
-    expect(screen.getByTestId('access-token-copy-permalink-button')).toBeDisabled();
+    const copy = screen.getByTestId('access-token-copy-permalink-button');
+    expect(copy).toBeEnabled();
+
+    await userEvent.click(copy);
+    const link = new URL((navigator.clipboard.writeText as jest.Mock).mock.calls[0][0]);
+    expect(link.searchParams.get('scopes')).toBe('departments.view');
   });
 
-  it('offers the permalink only while creating', async () => {
+  it('offers a creation link with the token settings while editing', async () => {
     renderPage('/access-tokens/agat_token1');
-    await screen.findByTestId('access-token-name');
-    expect(screen.queryByTestId('access-token-copy-permalink-button')).not.toBeInTheDocument();
+    expect(await screen.findByTestId('access-token-name')).toHaveValue('Automation');
+
+    await userEvent.click(screen.getByTestId('access-token-copy-permalink-button'));
+    const link = new URL((navigator.clipboard.writeText as jest.Mock).mock.calls[0][0]);
+    expect(link.pathname).toBe('/access-tokens/new');
+    expect(link.searchParams.get('scopes')).toBe('gateways.view');
+    expect(link.searchParams.has('expires_at')).toBe(false);
   });
 
   it('flags preset scopes the operator cannot grant', async () => {
