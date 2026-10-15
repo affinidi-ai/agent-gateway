@@ -8,6 +8,7 @@ import path from 'path';
  */
 const REMOVED = [
   { what: 'GET /v1/integrations/config', pattern: /integrations\/config\b/ },
+  { what: 'GET /v1/integrations/runtime-variables', pattern: /integrations\/runtime-variables/ },
   { what: 'per-gateway integrations', pattern: /gateways\/\$\{[^}]+\}\/integrations/ },
   { what: 'user integrations', pattern: /users\/integrations/ },
   { what: 'identity integrations', pattern: /identities\/integrations/ },
