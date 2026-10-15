@@ -340,7 +340,7 @@ describe('AuditPage forwarding', () => {
     expect(button).toHaveTextContent('Forward records');
     fireEvent.click(button);
     expect(screen.getByTestId('location')).toHaveTextContent(
-      '/integrations/integrations/wizard?category=audit&type=stream'
+      '/integrations/new?category=audit&type=stream'
     );
   });
 

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useLimitGuard } from '../hooks/useLimitGuard';
 import { usePermissions } from '../context/PermissionsContext';
 import { apiClient } from '../api';
+import { integrationPath, ROUTES } from '../routes';
 import { formatDateTime } from '../utils/stringUtils';
 import { AppButton } from '../components/shared/AppButton';
 import { DeleteButton } from '../components/shared/DeleteButton';
@@ -151,15 +152,13 @@ const IntegrationsPage: React.FC = () => {
             </span>
           )}
         </h6>
-        {hasPermission('mcp_proxies.edit') && (
+        {hasPermission('integrations.edit') && (
           <>
             <AppButton
               variant="primary"
               size="md"
               className="shadow-sm"
-              onClick={e =>
-                guard('integrations', () => navigate('/integrations/integrations/wizard'), e)
-              }
+              onClick={e => guard('integrations', () => navigate(ROUTES.INTEGRATION_NEW), e)}
               iconStart={<i className="fas fa-plus fa-sm me-2" aria-hidden="true" />}
             >
               Add Integration
@@ -206,7 +205,7 @@ const IntegrationsPage: React.FC = () => {
                 {filteredIntegrations.map(integration => (
                   <tr
                     key={integration.id}
-                    onClick={() => navigate(`/integrations/integrations/${integration.id}`)}
+                    onClick={() => navigate(integrationPath(integration.id))}
                     style={{ cursor: 'pointer' }}
                   >
                     <td>
@@ -272,7 +271,7 @@ const IntegrationsPage: React.FC = () => {
                         size="sm"
                         onClick={e => {
                           e.stopPropagation();
-                          navigate(`/integrations/integrations/${integration.id}`);
+                          navigate(integrationPath(integration.id));
                         }}
                         title="Edit"
                         aria-label={`Edit integration ${integration.name}`}

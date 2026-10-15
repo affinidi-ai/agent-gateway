@@ -7,7 +7,7 @@ import { ROUTES } from '../../routes';
 import { AUDIT_INTEGRATION_CATEGORY } from '../../utils/auditIntegrations';
 import { useAuditForwarding } from './useAuditForwarding';
 
-const NEW_AUDIT_STREAM = `${ROUTES.INTEGRATION_WIZARD}?category=${AUDIT_INTEGRATION_CATEGORY}&type=stream`;
+const NEW_AUDIT_STREAM = `${ROUTES.INTEGRATION_NEW}?category=${AUDIT_INTEGRATION_CATEGORY}&type=stream`;
 
 const AUDITING_OFF_NOTE =
   'VP Auditing is off in Settings › Security, so the VP Audit Log keeps nothing; ' +

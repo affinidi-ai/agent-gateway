@@ -15,6 +15,7 @@ import Dashboard from './Dashboard';
 import '../dashboard.css';
 import { apiClient, sessionManager } from '../api';
 import { ROUTES } from '../routes';
+import { integrationRoutes } from './integrationRoutes';
 
 // Loading fallback component
 const PageLoader: React.FC = () => (
@@ -37,7 +38,6 @@ const IdentitiesPage = lazy(() => import('./IdentitiesPage'));
 const SurfacesPage = lazy(() => import('./SurfacesPage'));
 const GatewaysPage = lazy(() => import('./GatewaysPage'));
 const ConnectionsPage = lazy(() => import('./ConnectionsPage'));
-const IntegrationsPage = lazy(() => import('./IntegrationsPage'));
 const MediatorsPage = lazy(() => import('./MediatorsPage'));
 const TrustRegistriesPage = lazy(() => import('./TrustRegistriesPage'));
 const ProxiesPage = lazy(() => import('./ProxiesPage'));
@@ -61,7 +61,6 @@ const EditMcpProxyPage = lazy(() => import('./EditMcpProxyPage'));
 const EditA2aProxyPage = lazy(() => import('./EditA2aProxyPage'));
 const EditTrustRegistryPage = lazy(() => import('./EditTrustRegistryPage'));
 const EditNotificationPage = lazy(() => import('./EditNotificationPage'));
-const EditIntegrationPage = lazy(() => import('./EditIntegrationPage'));
 const EditSecretPage = lazy(() => import('./EditSecretPage'));
 const EditApiKeyPage = lazy(() => import('./EditApiKeyPage'));
 const ApiKeyDetailPage = lazy(() => import('./ApiKeyDetailPage'));
@@ -74,7 +73,6 @@ const ApproveGatewayWizardPage = lazy(() => import('./ApproveGatewayWizardPage')
 const AddMcpProxyWizardPage = lazy(() => import('./AddMcpProxyWizardPage'));
 const AddMediatorWizardPage = lazy(() => import('./AddMediatorWizardPage'));
 const AddTrustRegistryWizardPage = lazy(() => import('./AddTrustRegistryWizardPage'));
-const AddIntegrationWizardPage = lazy(() => import('./AddIntegrationWizardPage'));
 const UserIntegrationsPage = lazy(() => import('./UserIntegrationsPage'));
 const IdentityIntegrationsPage = lazy(() => import('./IdentityIntegrationsPage'));
 const EditJwtVerificationStrategyPage = lazy(() => import('./EditJwtVerificationStrategyPage'));
@@ -426,14 +424,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                     </ProtectedRoute>
                   }
                 />
-                <Route
-                  path="/integrations"
-                  element={
-                    <ProtectedRoute permission="mcp_proxies.view">
-                      <IntegrationsPage />
-                    </ProtectedRoute>
-                  }
-                />
+                {integrationRoutes()}
                 <Route
                   path="/integrations/mcp-proxies/wizard"
                   element={
@@ -447,22 +438,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   element={
                     <ProtectedRoute permission="mcp_proxies.edit">
                       <EditMcpProxyPage />
-                    </ProtectedRoute>
-                  }
-                />
-                <Route
-                  path={ROUTES.INTEGRATION_WIZARD}
-                  element={
-                    <ProtectedRoute permission="mcp_proxies.edit">
-                      <AddIntegrationWizardPage />
-                    </ProtectedRoute>
-                  }
-                />
-                <Route
-                  path="/integrations/integrations/:id"
-                  element={
-                    <ProtectedRoute permission="mcp_proxies.edit">
-                      <EditIntegrationPage />
                     </ProtectedRoute>
                   }
                 />
