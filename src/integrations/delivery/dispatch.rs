@@ -29,6 +29,14 @@ pub struct Route {
     pub endpoint: Endpoint,
 }
 
+/// An integration that receives audit records, and the audit events (catalog names without
+/// the `audit.` prefix) its event set selects.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditReceiver {
+    pub route: Route,
+    pub audit_events: Vec<String>,
+}
+
 /// A snapshot of the definitions, for routing events without reading them from disk.
 pub struct Routes {
     integrations: Vec<Integration>,
@@ -37,24 +45,95 @@ pub struct Routes {
 }
 
 impl Routes {
+    pub fn new(
+        integrations: Vec<Integration>,
+        event_sets: Vec<EventSet>,
+        endpoints: Vec<Endpoint>,
+    ) -> Self {
+        Self {
+            integrations,
+            event_sets: by_id(event_sets),
+            endpoints: by_id(endpoints),
+        }
+    }
+
     pub async fn load(stores: &DefinitionStores) -> Result<Self> {
-        Ok(Self {
-            integrations: stores
+        Ok(Self::new(
+            stores
                 .integrations
                 .list()
                 .await?,
-            event_sets: by_id(
-                stores
-                    .event_sets
-                    .list()
-                    .await?,
-            ),
-            endpoints: by_id(
-                stores
-                    .endpoints
-                    .list()
-                    .await?,
-            ),
+            stores
+                .event_sets
+                .list()
+                .await?,
+            stores
+                .endpoints
+                .list()
+                .await?,
+        ))
+    }
+
+    pub fn integration_ids(&self) -> impl Iterator<Item = &str> {
+        self.integrations
+            .iter()
+            .map(|integration| integration.id.as_str())
+    }
+
+    /// Each active integration with an active endpoint whose event set holds audit events.
+    pub fn audit_receivers(&self) -> Vec<AuditReceiver> {
+        self.integrations
+            .iter()
+            .filter_map(|integration| self.receiver(integration))
+            .collect()
+    }
+
+    pub fn audit_receiver(
+        &self,
+        integration_id: &str,
+    ) -> Option<AuditReceiver> {
+        self.integrations
+            .iter()
+            .find(|integration| integration.id == integration_id)
+            .and_then(|integration| self.receiver(integration))
+    }
+
+    fn receiver(
+        &self,
+        integration: &Integration,
+    ) -> Option<AuditReceiver> {
+        let audit_events: Vec<String> = self
+            .event_sets
+            .get(&integration.event_set_id)?
+            .events
+            .iter()
+            .filter_map(|event| event.strip_prefix("audit."))
+            .map(str::to_string)
+            .collect();
+        if audit_events.is_empty() {
+            return None;
+        }
+        Some(AuditReceiver {
+            route: self.active_route(integration)?,
+            audit_events,
+        })
+    }
+
+    /// `integration` and its endpoint, when both are active.
+    fn active_route(
+        &self,
+        integration: &Integration,
+    ) -> Option<Route> {
+        if integration.status != Status::Active {
+            return None;
+        }
+        let endpoint = self
+            .endpoints
+            .get(&integration.endpoint_id)
+            .filter(|endpoint| endpoint.status == Status::Active)?;
+        Some(Route {
+            integration: integration.clone(),
+            endpoint: endpoint.clone(),
         })
     }
 
@@ -65,22 +144,12 @@ impl Routes {
     ) -> Vec<Route> {
         self.integrations
             .iter()
-            .filter(|integration| integration.status == Status::Active)
             .filter(|integration| {
                 self.event_sets
                     .get(&integration.event_set_id)
                     .is_some_and(|event_set| event_set.contains(event_id))
             })
-            .filter_map(|integration| {
-                let endpoint = self
-                    .endpoints
-                    .get(&integration.endpoint_id)
-                    .filter(|endpoint| endpoint.status == Status::Active)?;
-                Some(Route {
-                    integration: integration.clone(),
-                    endpoint: endpoint.clone(),
-                })
-            })
+            .filter_map(|integration| self.active_route(integration))
             .collect()
     }
 }
@@ -498,6 +567,67 @@ mod tests {
                 .to_string()
                 .contains("slack-hook"),
             "{error}"
+        );
+    }
+
+    fn integration_for(
+        name: &str,
+        endpoint: &Endpoint,
+        event_set: &EventSet,
+    ) -> Integration {
+        Integration::new(name.to_string(), String::new(), endpoint.id.clone(), event_set.id.clone(), json!({}))
+    }
+
+    fn set(events: &[&str]) -> EventSet {
+        EventSet::new(
+            "Set".to_string(),
+            String::new(),
+            events
+                .iter()
+                .map(|event| event.to_string())
+                .collect(),
+        )
+        .expect("set")
+    }
+
+    #[test]
+    fn integrations_whose_event_set_holds_audit_events_receive_audit_records() {
+        let endpoint = Endpoint::new("SIEM".to_string(), String::new(), EndpointType::Stream, json!({}));
+        let mut disabled_endpoint = endpoint.clone();
+        disabled_endpoint.id = "disabled-endpoint".to_string();
+        disabled_endpoint.status = Status::Disabled;
+        let mixed = set(&["gateway.created", "audit.policy_decision", "audit.trust_check"]);
+        let gateways = set(&["gateway.created"]);
+        let siem = integration_for("siem", &endpoint, &mixed);
+        let mut disabled = integration_for("disabled", &endpoint, &mixed);
+        disabled.status = Status::Disabled;
+        let no_audit = integration_for("no audit", &endpoint, &gateways);
+        let endpoint_off = integration_for("endpoint off", &disabled_endpoint, &mixed);
+        let routes = Routes::new(
+            vec![siem.clone(), disabled.clone(), no_audit, endpoint_off],
+            vec![mixed, gateways],
+            vec![endpoint.clone(), disabled_endpoint],
+        );
+
+        let receivers = routes.audit_receivers();
+
+        assert_eq!(
+            receivers,
+            vec![AuditReceiver {
+                route: Route {
+                    integration: siem.clone(),
+                    endpoint,
+                },
+                audit_events: vec!["policy_decision".to_string(), "trust_check".to_string()],
+            }]
+        );
+        assert_eq!(routes.audit_receiver(&siem.id), Some(receivers[0].clone()));
+        assert_eq!(routes.audit_receiver(&disabled.id), None);
+        assert_eq!(
+            routes
+                .integration_ids()
+                .count(),
+            4
         );
     }
 }
