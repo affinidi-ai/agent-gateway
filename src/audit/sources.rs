@@ -9,11 +9,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::audit::registry::{EventMask, Sink, SinkId, Sinks, sinks};
-use crate::integrations::audit_integration_triggers::receives_audit_records;
-use crate::integrations::cache::INTEGRATION_CACHE;
+use crate::integrations::definitions::{DefinitionStores, definition_stores};
+use crate::integrations::delivery::dispatch::{Routes, invalidate_routes};
 use crate::metrics::backends::prometheus::track_audit_sink_rebuild_failed;
 use crate::storage::settings_store::{DashboardSettings, SettingsStore, global_settings, global_settings_store};
-use crate::storage::{Integration, IntegrationStorage, get_integration_storage};
 
 /// Held for a whole rebuild, so rebuilds apply in the order they start.
 static REBUILDING: Mutex<()> = Mutex::const_new(());
@@ -23,16 +22,18 @@ static RETRY: parking_lot::Mutex<Option<CancellationToken>> = parking_lot::const
 static RETRY_SCOPE: LazyLock<parking_lot::Mutex<CancellationToken>> = LazyLock::new(Default::default);
 const REBUILD_RETRY: Duration = Duration::from_secs(5);
 
-/// Each active, appliance-wide Governance Audit integration as a sink.
-pub fn integration_sinks(integrations: &[Integration]) -> Vec<Sink> {
-    integrations
-        .iter()
-        .filter(|integration| receives_audit_records(integration))
-        .map(|integration| {
+/// Each integration that receives audit records as a sink selecting its event set's audit
+/// events.
+pub fn integration_sinks(routes: &Routes) -> Vec<Sink> {
+    routes
+        .audit_receivers()
+        .into_iter()
+        .map(|receiver| {
+            let integration = &receiver.route.integration;
             Sink::new(
                 SinkId::Integration(integration.id.clone()),
                 EventMask::from_categories(
-                    integration
+                    receiver
                         .audit_events
                         .iter()
                         .map(String::as_str),
@@ -48,23 +49,26 @@ pub fn integration_sinks(integrations: &[Integration]) -> Vec<Sink> {
         .collect()
 }
 
-/// Each integration that exists but does not receive audit records: a
-/// Governance Audit integration disabled, given a tenant or moved to another
-/// category, or one never in that category.
-fn paused_integrations(integrations: &[Integration]) -> Vec<SinkId> {
-    integrations
-        .iter()
-        .filter(|integration| !receives_audit_records(integration))
-        .map(|integration| SinkId::Integration(integration.id.clone()))
+/// Each integration that exists but does not receive audit records: disabled, its endpoint
+/// disabled, or its event set holding no audit events.
+fn paused_integrations(routes: &Routes) -> Vec<SinkId> {
+    routes
+        .integration_ids()
+        .filter(|id| {
+            routes
+                .audit_receiver(id)
+                .is_none()
+        })
+        .map(|id| SinkId::Integration(id.to_string()))
         .collect()
 }
 
 pub fn build_sinks(
     settings: &DashboardSettings,
-    integrations: &[Integration],
+    routes: &Routes,
 ) -> Vec<Sink> {
     std::iter::once(audit_log_sink(settings))
-        .chain(integration_sinks(integrations))
+        .chain(integration_sinks(routes))
         .collect()
 }
 
@@ -117,15 +121,15 @@ async fn rebuild_current() -> bool {
     rebuild(&REBUILDING, sinks(), || global_settings().unwrap_or_default(), list_integrations).await
 }
 
-async fn list_integrations() -> anyhow::Result<Vec<Integration>> {
-    list_from(get_integration_storage()).await
+async fn list_integrations() -> anyhow::Result<Routes> {
+    list_from(definition_stores()).await
 }
 
-/// The integrations in `storage`. Without storage they cannot be listed: an
-/// empty list would read as every integration deleted.
-async fn list_from(storage: Option<Arc<IntegrationStorage>>) -> anyhow::Result<Vec<Integration>> {
-    match storage {
-        Some(storage) => storage.list().await,
+/// The definitions in `stores`. Without stores they cannot be listed: an empty list would
+/// read as every integration deleted.
+async fn list_from(stores: Option<Arc<DefinitionStores>>) -> anyhow::Result<Routes> {
+    match stores {
+        Some(stores) => Routes::load(&stores).await,
         None => anyhow::bail!("integration storage is not set up yet"),
     }
 }
@@ -142,13 +146,13 @@ async fn rebuild<L, F>(
 ) -> bool
 where
     L: FnOnce() -> F,
-    F: Future<Output = anyhow::Result<Vec<Integration>>>,
+    F: Future<Output = anyhow::Result<Routes>>,
 {
     let _serial = serial.lock().await;
     let settings = settings();
     match list().await {
-        Ok(integrations) => {
-            registry.replace(build_sinks(&settings, &integrations), paused_integrations(&integrations));
+        Ok(routes) => {
+            registry.replace(build_sinks(&settings, &routes), paused_integrations(&routes));
             true
         }
         Err(e) => {
@@ -159,30 +163,24 @@ where
     }
 }
 
-/// The integrations deliveries load, by id.
-type IntegrationCache = moka::future::Cache<String, Arc<Integration>>;
-
-/// Re-reads the dashboard settings from disk and forgets every cached
-/// integration, so the sinks built next, and the deliveries to them, follow
-/// what is stored now rather than what this node loaded before. A node
-/// becoming Active calls it before the audit pipeline starts: the node that
-/// was Active may have changed both.
+/// Re-reads the dashboard settings from disk and forgets the cached
+/// integration definitions, so the sinks built next, and the deliveries to
+/// them, follow what is stored now rather than what this node loaded before.
+/// A node becoming Active calls it before the audit pipeline starts: the node
+/// that was Active may have changed both.
 pub async fn reload_sources() {
-    reload(global_settings_store(), &INTEGRATION_CACHE).await;
+    reload(global_settings_store()).await;
+    invalidate_routes().await;
 }
 
 /// Reloads `settings` from disk, keeping the settings already loaded when
-/// that fails, and empties `integrations`.
-async fn reload(
-    settings: Option<&SettingsStore>,
-    integrations: &IntegrationCache,
-) {
+/// that fails.
+async fn reload(settings: Option<&SettingsStore>) {
     if let Some(settings) = settings
         && let Err(e) = settings.load().await
     {
         warn!(error = %e, "Failed to reload the dashboard settings; building the audit sinks from those already loaded");
     }
-    integrations.invalidate_all();
 }
 
 /// Attempts the rebuild every `delay` until an attempt succeeds or `cancel`
@@ -254,96 +252,119 @@ mod tests {
         assert_eq!(events.categories(), vec!["policy_decision"]);
     }
 
-    fn audit_integration(
-        status: &str,
-        tenant_id: Option<&str>,
+    use crate::integrations::definitions::{Endpoint, EndpointType, EventSet, Integration, Status};
+
+    fn endpoint() -> Endpoint {
+        let mut endpoint =
+            Endpoint::new("SIEM".to_string(), String::new(), EndpointType::Stream, serde_json::json!({}));
+        endpoint.id = "siem-endpoint".to_string();
+        endpoint
+    }
+
+    /// An integration whose event set holds `events`, audit events named without their
+    /// `audit.` prefix.
+    fn integration(
+        status: Status,
         events: &[&str],
-    ) -> Integration {
+    ) -> (Integration, EventSet) {
+        let event_set = EventSet::new(
+            "Set".to_string(),
+            String::new(),
+            events
+                .iter()
+                .map(|event| match *event {
+                    "gateway.created" => event.to_string(),
+                    audit => format!("audit.{audit}"),
+                })
+                .collect(),
+        )
+        .expect("event set");
         let mut integration = Integration::new(
             "siem".to_string(),
             String::new(),
-            "stream".to_string(),
+            endpoint().id,
+            event_set.id.clone(),
             serde_json::json!({}),
-            serde_json::json!({}),
-            status.to_string(),
-            Some("audit".to_string()),
         );
-        integration.tenant_id = tenant_id.map(str::to_string);
-        integration.audit_events = events
-            .iter()
-            .map(|event| event.to_string())
-            .collect();
-        integration
+        integration.status = status;
+        (integration, event_set)
+    }
+
+    fn routes(definitions: Vec<(Integration, EventSet)>) -> Routes {
+        let (integrations, event_sets) = definitions
+            .into_iter()
+            .unzip();
+        Routes::new(integrations, event_sets, vec![endpoint()])
     }
 
     #[test]
-    fn active_appliance_wide_audit_integrations_are_sinks() {
-        let integration = audit_integration("active", None, &["auth_failed"]);
-        let sinks = integration_sinks(std::slice::from_ref(&integration));
+    fn integrations_receiving_audit_records_are_sinks() {
+        let (siem, events) = integration(Status::Active, &["gateway.created", "auth_failed"]);
+        let sinks = integration_sinks(&routes(vec![(siem.clone(), events)]));
         assert_eq!(sinks.len(), 1);
-        assert_eq!(sinks[0].id, SinkId::Integration(integration.id.clone()));
+        assert_eq!(sinks[0].id, SinkId::Integration(siem.id));
         assert_eq!(sinks[0].events.categories(), vec!["auth_failed"]);
     }
 
     #[test]
-    fn an_integrations_drop_policy_carries_into_its_sink() {
-        let mut integration = audit_integration("active", None, &["auth_failed"]);
-        integration.audit_drop_after_secs = Some(3600);
-        let without = audit_integration("active", None, &["auth_failed"]);
-        let sinks = integration_sinks(&[integration, without]);
-        assert_eq!(sinks[0].drop_older_than, Some(std::time::Duration::from_secs(3600)));
-        assert_eq!(sinks[1].drop_older_than, None);
+    fn an_integrations_drop_policy_and_attempt_limit_carry_into_its_sink() {
+        let (mut limited, limited_events) = integration(Status::Active, &["auth_failed"]);
+        limited.audit_drop_after_secs = Some(3600);
+        limited.audit_max_attempts = Some(10);
+        let (without, without_events) = integration(Status::Active, &["auth_failed"]);
+
+        let sinks = integration_sinks(&routes(vec![(limited.clone(), limited_events), (without, without_events)]));
+
+        let sink = |id: &str| {
+            sinks
+                .iter()
+                .find(|sink| sink.id == SinkId::Integration(id.to_string()))
+                .expect("sink")
+        };
+        assert_eq!(sink(&limited.id).drop_older_than, Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(sink(&limited.id).max_attempts, Some(10));
+        assert_eq!(
+            sinks
+                .iter()
+                .filter(|sink| sink.drop_older_than.is_none() && sink.max_attempts.is_none())
+                .count(),
+            1
+        );
     }
 
     #[test]
-    fn an_integrations_attempt_limit_carries_into_its_sink() {
-        let mut integration = audit_integration("active", None, &["auth_failed"]);
-        integration.audit_max_attempts = Some(10);
-        let without = audit_integration("active", None, &["auth_failed"]);
-        let sinks = integration_sinks(&[integration, without]);
-        assert_eq!(sinks[0].max_attempts, Some(10));
-        assert_eq!(sinks[1].max_attempts, None);
-    }
+    fn integrations_that_do_not_receive_audit_records_are_paused_not_sinks() {
+        let (receiving, receiving_events) = integration(Status::Active, &["auth_failed"]);
+        let (disabled, disabled_events) = integration(Status::Disabled, &["auth_failed"]);
+        let (gateways, gateway_events) = integration(Status::Active, &["gateway.created"]);
+        let routes = routes(vec![
+            (receiving.clone(), receiving_events),
+            (disabled.clone(), disabled_events),
+            (gateways.clone(), gateway_events),
+        ]);
 
-    #[test]
-    fn disabled_tenant_owned_and_other_integrations_are_not_sinks() {
-        let mut general = audit_integration("active", None, &["auth_failed"]);
-        general.category = Some("general".to_string());
-        let integrations = [
-            audit_integration("disabled", None, &["auth_failed"]),
-            audit_integration("active", Some("tenant-a"), &["auth_failed"]),
-            general,
-        ];
-        assert!(integration_sinks(&integrations).is_empty());
-    }
-
-    #[test]
-    fn integrations_that_do_not_receive_audit_records_are_paused() {
-        let receiving = audit_integration("active", None, &["auth_failed"]);
-        let disabled = audit_integration("disabled", None, &["auth_failed"]);
-        let tenant_owned = audit_integration("active", Some("tenant-a"), &["auth_failed"]);
-        let mut general = audit_integration("active", None, &["auth_failed"]);
-        general.category = Some("general".to_string());
-
-        let paused = paused_integrations(&[receiving, disabled.clone(), tenant_owned.clone(), general.clone()]);
+        let mut paused = paused_integrations(&routes);
+        paused.sort_by_key(|sink| format!("{sink:?}"));
+        let mut expected = vec![SinkId::Integration(disabled.id), SinkId::Integration(gateways.id)];
+        expected.sort_by_key(|sink| format!("{sink:?}"));
 
         assert_eq!(
-            paused,
-            vec![
-                SinkId::Integration(disabled.id),
-                SinkId::Integration(tenant_owned.id),
-                SinkId::Integration(general.id)
-            ]
+            integration_sinks(&routes)
+                .iter()
+                .map(|sink| sink.id.clone())
+                .collect::<Vec<_>>(),
+            vec![SinkId::Integration(receiving.id)]
         );
+        assert_eq!(paused, expected);
     }
 
     #[tokio::test]
     async fn a_rebuild_keeps_the_paused_integrations() {
         let serial = Mutex::new(());
         let registry: &'static Sinks = Box::leak(Box::default());
-        let receiving = audit_integration("active", None, &["auth_failed"]);
-        let disabled = audit_integration("disabled", None, &["auth_failed"]);
-        let listed = vec![receiving.clone(), disabled.clone()];
+        let (receiving, receiving_events) = integration(Status::Active, &["auth_failed"]);
+        let (disabled, disabled_events) = integration(Status::Disabled, &["auth_failed"]);
+        let listed = routes(vec![(receiving.clone(), receiving_events), (disabled.clone(), disabled_events)]);
 
         let rebuilt = rebuild(&serial, registry, || selecting("policy_decision"), || async move { Ok(listed) }).await;
 
@@ -360,20 +381,19 @@ mod tests {
             audit_events: vec!["policy_decision".to_string()],
             ..DashboardSettings::default()
         };
-        let integration = audit_integration("active", None, &["policy_decision", "trust_check"]);
-        let registry = SinkRegistry::new(build_sinks(&settings, std::slice::from_ref(&integration)));
+        let (siem, events) = integration(Status::Active, &["policy_decision", "trust_check"]);
+        let registry = SinkRegistry::new(build_sinks(&settings, &routes(vec![(siem.clone(), events)])));
 
         let policy = event_bit("policy_decision").unwrap();
         let trust = event_bit("trust_check").unwrap();
-        assert_eq!(registry.recipients(policy), &[SinkId::AuditLog, SinkId::Integration(integration.id.clone())]);
-        assert_eq!(registry.recipients(trust), &[SinkId::Integration(integration.id.clone())]);
+        assert_eq!(registry.recipients(policy), &[SinkId::AuditLog, SinkId::Integration(siem.id.clone())]);
+        assert_eq!(registry.recipients(trust), &[SinkId::Integration(siem.id.clone())]);
     }
 
     #[test]
     fn integrations_receive_events_the_audit_log_does_not_keep() {
-        let settings = DashboardSettings::default();
-        let integration = audit_integration("active", None, &["auth_failed"]);
-        let registry = SinkRegistry::new(build_sinks(&settings, std::slice::from_ref(&integration)));
+        let (siem, events) = integration(Status::Active, &["auth_failed"]);
+        let registry = SinkRegistry::new(build_sinks(&DashboardSettings::default(), &routes(vec![(siem, events)])));
         assert!(registry.wants(event_bit("auth_failed").unwrap()));
     }
 
@@ -410,10 +430,9 @@ mod tests {
     async fn a_rebuild_replaces_the_sinks() {
         let serial = Mutex::new(());
         let registry: &'static Sinks = Box::leak(Box::default());
-        let integration = audit_integration("active", None, &["auth_failed"]);
+        let listed = routes(vec![integration(Status::Active, &["auth_failed"])]);
 
-        let rebuilt =
-            rebuild(&serial, registry, || selecting("policy_decision"), || async move { Ok(vec![integration]) }).await;
+        let rebuilt = rebuild(&serial, registry, || selecting("policy_decision"), || async move { Ok(listed) }).await;
 
         assert!(rebuilt);
         assert!(log_selects(registry, "policy_decision"));
@@ -430,13 +449,13 @@ mod tests {
     async fn a_failed_listing_keeps_the_current_sinks_and_reports_the_failure() {
         let serial = Mutex::new(());
         let registry: &'static Sinks = Box::leak(Box::default());
-        registry.replace(build_sinks(&selecting("policy_decision"), &[]), Vec::new());
+        registry.replace(build_sinks(&selecting("policy_decision"), &routes(Vec::new())), Vec::new());
 
         let rebuilt = rebuild(
             &serial,
             registry,
             || selecting("trust_check"),
-            || async { Err::<Vec<Integration>, _>(anyhow::anyhow!("storage unavailable")) },
+            || async { Err::<Routes, _>(anyhow::anyhow!("storage unavailable")) },
         )
         .await;
 
@@ -457,10 +476,10 @@ mod tests {
             || selecting("policy_decision"),
             || async move {
                 let _ = held.await;
-                Ok(Vec::new())
+                Ok(routes(Vec::new()))
             },
         );
-        let newer = rebuild(&serial, registry, || selecting("trust_check"), || async { Ok(Vec::new()) });
+        let newer = rebuild(&serial, registry, || selecting("trust_check"), || async { Ok(routes(Vec::new())) });
         let (older, newer, ()) = tokio::join!(older, newer, async {
             tokio::task::yield_now().await;
             let _ = release.send(());
@@ -475,7 +494,7 @@ mod tests {
     async fn listing_without_integration_storage_fails_so_the_sinks_are_kept() {
         let serial = Mutex::new(());
         let registry: &'static Sinks = Box::leak(Box::default());
-        registry.replace(build_sinks(&selecting("policy_decision"), &[]), Vec::new());
+        registry.replace(build_sinks(&selecting("policy_decision"), &routes(Vec::new())), Vec::new());
 
         let rebuilt = rebuild(&serial, registry, || selecting("trust_check"), || list_from(None)).await;
 
@@ -490,24 +509,35 @@ mod tests {
         let settings_dir = dir.path().join("settings");
         let settings = SettingsStore::new(&settings_dir);
         settings.load().await.unwrap();
-        let storage = IntegrationStorage::new(
-            dir.path()
-                .join("integrations"),
-        )
-        .await
-        .unwrap();
-        let integration = audit_integration("active", None, &["auth_failed"]);
-        storage
-            .save(&integration)
+        let stores = Arc::new(
+            DefinitionStores::open(
+                &dir.path().join("endpoints"),
+                &dir.path().join("event_sets"),
+                &dir.path()
+                    .join("integrations"),
+            )
+            .await
+            .unwrap(),
+        );
+        let (siem, mut events) = integration(Status::Active, &["auth_failed"]);
+        stores
+            .endpoints
+            .save(&endpoint())
             .await
             .unwrap();
-        let cache = IntegrationCache::builder().build();
-        cache
-            .insert(integration.id.clone(), Arc::new(integration.clone()))
-            .await;
+        stores
+            .event_sets
+            .save(&events)
+            .await
+            .unwrap();
+        stores
+            .integrations
+            .save(&siem)
+            .await
+            .unwrap();
         let serial = Mutex::new(());
         let registry: &'static Sinks = Box::leak(Box::default());
-        assert!(rebuild(&serial, registry, || settings.get(), || storage.list()).await);
+        assert!(rebuild(&serial, registry, || settings.get(), || list_from(Some(stores.clone()))).await);
 
         let other_node = SettingsStore::new(&settings_dir);
         other_node
@@ -517,49 +547,25 @@ mod tests {
             .save()
             .await
             .unwrap();
-        let mut changed = integration.clone();
-        changed.audit_events = vec!["trust_check".to_string()];
-        storage
-            .save(&changed)
+        events.events = vec!["audit.trust_check".to_string()];
+        stores
+            .event_sets
+            .save(&events)
             .await
             .unwrap();
         assert!(!settings.get().audit_enabled);
 
-        reload(Some(&settings), &cache).await;
-        assert!(rebuild(&serial, registry, || settings.get(), || storage.list()).await);
+        reload(Some(&settings)).await;
+        assert!(rebuild(&serial, registry, || settings.get(), || list_from(Some(stores.clone()))).await);
 
-        let siem = SinkId::Integration(integration.id.clone());
+        let sink = SinkId::Integration(siem.id.clone());
         let snapshot = registry.snapshot();
         assert!(log_selects(registry, "policy_decision"));
-        assert_eq!(snapshot.recipients(event_bit("trust_check").unwrap()), std::slice::from_ref(&siem));
+        assert_eq!(snapshot.recipients(event_bit("trust_check").unwrap()), std::slice::from_ref(&sink));
         assert!(
             snapshot
                 .recipients(event_bit("auth_failed").unwrap())
                 .is_empty()
-        );
-        assert!(
-            cache
-                .get(&integration.id)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_reload_without_a_settings_store_still_forgets_the_cached_integrations() {
-        let cache = IntegrationCache::builder().build();
-        let integration = audit_integration("active", None, &["auth_failed"]);
-        cache
-            .insert(integration.id.clone(), Arc::new(integration.clone()))
-            .await;
-
-        reload(None, &cache).await;
-
-        assert!(
-            cache
-                .get(&integration.id)
-                .await
-                .is_none()
         );
     }
 
