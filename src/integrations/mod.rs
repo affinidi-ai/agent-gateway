@@ -5,6 +5,7 @@ pub mod background_tasks;
 pub mod cache;
 pub mod connection_point_integration_triggers;
 pub mod definitions;
+pub mod delivery;
 pub mod email_service;
 pub mod errors;
 pub mod events;
