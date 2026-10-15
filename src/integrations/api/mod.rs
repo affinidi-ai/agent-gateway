@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json, Router};
 use serde::Serialize;
 
-use crate::auth_manager::middleware::RbacGuard;
+use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard};
 use crate::auth_manager::pat::PatResourceScope;
 use crate::integrations::definitions::{DefinitionStore, Endpoint, EndpointType, EventSet, Integration};
 use crate::integrations::events::{IntegrationEvent, VariableSpec, catalog, variables};
@@ -45,13 +45,67 @@ pub fn router(
 ) -> Router {
     use crate::auth_manager::middleware::maybe_gate;
     use crate::rbac::Feature;
-    use axum::routing::{MethodRouter, get};
+    use axum::routing::{MethodRouter, delete, get, post, put};
+    use endpoints::{create_endpoint, delete_endpoint, get_endpoint, list_endpoints, update_endpoint};
 
     let gate = |route: MethodRouter, feature: Feature| -> MethodRouter { maybe_gate(guard.as_ref(), route, feature) };
     Router::new()
         .route("/v1/integrations/catalog", gate(get(get_catalog), Feature::IntegrationsView))
+        .route("/v1/integrations/endpoints", gate(get(list_endpoints), Feature::IntegrationsView))
+        .route("/v1/integrations/endpoints", gate(post(create_endpoint), Feature::IntegrationsEdit))
+        .route("/v1/integrations/endpoints/{id}", gate(get(get_endpoint), Feature::IntegrationsView))
+        .route("/v1/integrations/endpoints/{id}", gate(put(update_endpoint), Feature::IntegrationsEdit))
+        .route("/v1/integrations/endpoints/{id}", gate(delete(delete_endpoint), Feature::IntegrationsDelete))
         .layer(axum::middleware::from_fn(appliance_wide_only))
         .layer(Extension(stores))
+}
+
+pub type ApiError = (StatusCode, String);
+
+const MAX_NAME_LEN: usize = 200;
+const MAX_DESCRIPTION_LEN: usize = 2000;
+
+/// The trimmed name and description, when the name is set and both fit their limits.
+fn validate_text(
+    name: &str,
+    description: &str,
+) -> Result<(String, String), ApiError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > MAX_NAME_LEN {
+        return Err((StatusCode::BAD_REQUEST, format!("The name must be 1 to {MAX_NAME_LEN} characters")));
+    }
+    if description.len() > MAX_DESCRIPTION_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("The description must be at most {MAX_DESCRIPTION_LEN} characters"),
+        ));
+    }
+    Ok((name.to_string(), description.trim().to_string()))
+}
+
+/// Definitions are named by UUID, so anything else names none.
+fn require_known_id(id: &str) -> Result<(), ApiError> {
+    uuid::Uuid::parse_str(id)
+        .map(|_| ())
+        .map_err(|_| not_found())
+}
+
+fn not_found() -> ApiError {
+    (StatusCode::NOT_FOUND, "Not found".to_string())
+}
+
+fn internal_error(
+    action: &str,
+    error: anyhow::Error,
+) -> ApiError {
+    tracing::error!(action, error = %error, "integrations API storage failure");
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to {action}"))
+}
+
+fn caller_id(caller: &Option<Extension<AuthGuardOk>>) -> &str {
+    caller
+        .as_ref()
+        .map_or("unknown", |Extension(AuthGuardOk(id))| id.as_str())
 }
 
 async fn appliance_wide_only(
@@ -99,6 +153,8 @@ async fn get_catalog() -> Json<Catalog> {
             .collect(),
     })
 }
+
+pub mod endpoints;
 
 #[cfg(test)]
 pub(crate) mod test_support;
