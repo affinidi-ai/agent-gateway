@@ -47,6 +47,7 @@ pub fn router(
     use crate::rbac::Feature;
     use axum::routing::{MethodRouter, delete, get, post, put};
     use endpoints::{create_endpoint, delete_endpoint, get_endpoint, list_endpoints, update_endpoint};
+    use event_sets::{create_event_set, delete_event_set, get_event_set, list_event_sets, update_event_set};
 
     let gate = |route: MethodRouter, feature: Feature| -> MethodRouter { maybe_gate(guard.as_ref(), route, feature) };
     Router::new()
@@ -56,6 +57,11 @@ pub fn router(
         .route("/v1/integrations/endpoints/{id}", gate(get(get_endpoint), Feature::IntegrationsView))
         .route("/v1/integrations/endpoints/{id}", gate(put(update_endpoint), Feature::IntegrationsEdit))
         .route("/v1/integrations/endpoints/{id}", gate(delete(delete_endpoint), Feature::IntegrationsDelete))
+        .route("/v1/integrations/event-sets", gate(get(list_event_sets), Feature::IntegrationsView))
+        .route("/v1/integrations/event-sets", gate(post(create_event_set), Feature::IntegrationsEdit))
+        .route("/v1/integrations/event-sets/{id}", gate(get(get_event_set), Feature::IntegrationsView))
+        .route("/v1/integrations/event-sets/{id}", gate(put(update_event_set), Feature::IntegrationsEdit))
+        .route("/v1/integrations/event-sets/{id}", gate(delete(delete_event_set), Feature::IntegrationsDelete))
         .layer(axum::middleware::from_fn(appliance_wide_only))
         .layer(Extension(stores))
 }
@@ -100,6 +106,37 @@ fn internal_error(
 ) -> ApiError {
     tracing::error!(action, error = %error, "integrations API storage failure");
     (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to {action}"))
+}
+
+async fn integrations_using(
+    stores: &DefinitionStores,
+    uses: impl Fn(&Integration) -> bool,
+) -> Result<Vec<Integration>, ApiError> {
+    Ok(stores
+        .integrations
+        .list()
+        .await
+        .map_err(|error| internal_error("list integrations", error))?
+        .into_iter()
+        .filter(|integration| uses(integration))
+        .collect())
+}
+
+/// Refuses with 409, naming them, while integrations use a definition.
+async fn refuse_while_used(
+    stores: &DefinitionStores,
+    definition: &str,
+    uses: impl Fn(&Integration) -> bool,
+) -> Result<(), ApiError> {
+    let names: Vec<String> = integrations_using(stores, uses)
+        .await?
+        .into_iter()
+        .map(|integration| integration.name)
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    Err((StatusCode::CONFLICT, format!("The {definition} is used by these integrations: {}", names.join(", "))))
 }
 
 fn caller_id(caller: &Option<Extension<AuthGuardOk>>) -> &str {
@@ -155,6 +192,7 @@ async fn get_catalog() -> Json<Catalog> {
 }
 
 pub mod endpoints;
+pub mod event_sets;
 
 #[cfg(test)]
 pub(crate) mod test_support;

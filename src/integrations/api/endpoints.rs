@@ -5,10 +5,12 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-
 use tracing::info;
 
-use super::{ApiError, DefinitionStores, caller_id, internal_error, not_found, require_known_id, validate_text};
+use super::{
+    ApiError, DefinitionStores, caller_id, internal_error, not_found, refuse_while_used, require_known_id,
+    validate_text,
+};
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::integrations::definitions::endpoint::keep_unsent_secrets;
 use crate::integrations::definitions::{Endpoint, EndpointType, Status};
@@ -124,21 +126,7 @@ pub async fn delete_endpoint(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_known_id(&id)?;
-    let users: Vec<String> = stores
-        .integrations
-        .list()
-        .await
-        .map_err(|error| internal_error("list integrations", error))?
-        .into_iter()
-        .filter(|integration| integration.endpoint_id == id)
-        .map(|integration| integration.name)
-        .collect();
-    if !users.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("The endpoint is used by these integrations: {}", users.join(", ")),
-        ));
-    }
+    refuse_while_used(&stores, "endpoint", |integration| integration.endpoint_id == id).await?;
     let deleted = stores
         .endpoints
         .delete(&id)
