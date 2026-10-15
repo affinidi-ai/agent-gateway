@@ -3,7 +3,7 @@
 //! whole appliance, so tenant and resource-scoped tokens are refused.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use axum::extract::Request;
@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard};
 use crate::auth_manager::pat::PatResourceScope;
+use crate::config::StoragePaths;
 use crate::integrations::definitions::{DefinitionStore, Endpoint, EndpointType, EventSet, Integration};
 use crate::integrations::events::{IntegrationEvent, VariableSpec, catalog, variables};
 use crate::tenancy::PatTenantContext;
@@ -37,6 +38,28 @@ impl DefinitionStores {
             integrations: DefinitionStore::new(integrations.to_path_buf(), "integration").await?,
         })
     }
+
+    pub async fn open_configured(paths: &StoragePaths) -> Result<Self> {
+        Self::open(
+            Path::new(&paths.integration_endpoints),
+            Path::new(&paths.integration_event_sets),
+            Path::new(&paths.integration_definitions),
+        )
+        .await
+    }
+}
+
+static DEFINITION_STORES: OnceLock<Arc<DefinitionStores>> = OnceLock::new();
+
+/// Sets the stores the API and event delivery share. Only the first call takes effect.
+pub fn init_definition_stores(stores: Arc<DefinitionStores>) {
+    let _ = DEFINITION_STORES.set(stores);
+}
+
+pub fn definition_stores() -> Option<Arc<DefinitionStores>> {
+    DEFINITION_STORES
+        .get()
+        .cloned()
 }
 
 pub fn router(
@@ -268,5 +291,50 @@ mod tests {
             .await;
 
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn opens_each_store_in_its_configured_folder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = |name: &str| {
+            dir.path()
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let paths = StoragePaths {
+            integration_endpoints: folder("endpoints"),
+            integration_event_sets: folder("event_sets"),
+            integration_definitions: folder("integrations"),
+            ..StoragePaths::default()
+        };
+        let stores = DefinitionStores::open_configured(&paths)
+            .await
+            .expect("stores");
+        let event_set = EventSet::new("Set".to_string(), String::new(), vec!["user.login".to_string()]).expect("set");
+
+        stores
+            .event_sets
+            .save(&event_set)
+            .await
+            .expect("save");
+
+        assert!(
+            dir.path()
+                .join("event_sets")
+                .join(format!("{}.json", event_set.id))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_stores_set_are_the_ones_shared() {
+        let first = Fixture::new().await.stores;
+        let second = Fixture::new().await.stores;
+
+        init_definition_stores(first.clone());
+        init_definition_stores(second);
+
+        assert!(Arc::ptr_eq(&definition_stores().expect("set"), &first));
     }
 }

@@ -184,26 +184,64 @@ the forward legs use. The client resolves the host again when it connects, so th
 address and the connected address are not bound together. See
 [`POLICY.md`](POLICY.md#egress-and-ssrf-controls) for the sinks that are pinned.
 
+## Endpoints, event sets and integrations
+
+The management API keeps three kinds of definition, one JSON file each
+([`src/integrations/definitions/`](../src/integrations/definitions/)):
+
+| Definition | Holds | Stored in |
+| --- | --- | --- |
+| Endpoint | `type` (`email`, `slack`, `webhook`, `stream`), `configuration`: the transport, destination and credentials | `storage_paths.integration_endpoints` |
+| Event set | `events`: event ids from the catalog, such as `gateway.created` or `audit.policy_decision`, audit and other events mixed freely | `storage_paths.integration_event_sets` |
+| Integration | `endpoint_id`, `event_set_id`, `content` (the template), `status`, and for audit events `audit_drop_after_secs` and `audit_max_attempts` | `storage_paths.integration_definitions` |
+
+Integrations belong to the whole appliance: none has a tenant owner, and a tenant or
+resource-scoped PAT is refused with `403` on every route below.
+
+**Event catalog.** `GET /v1/integrations/catalog` lists every event the gateway delivers, with
+its family (`gateway`, `user`, `connection_point`, `x402`, `mpp`, `audit`), its audit group for
+audit events, and the template variables its delivery fills; every template variable with its
+description; and each endpoint type with its secret fields
+([`events.rs`](../src/integrations/events.rs)).
+
+**Endpoint secrets.** `smtp_password` (email), `webhook_url` (Slack), `signing_secret` and
+`headers` (webhook), and `sasl_password` and `redis_url` (stream) are written but never read
+back: responses leave them out of `configuration` and name the ones set in `secrets`. An update
+that leaves a secret out keeps it, and one that sends it as `null` clears it. An endpoint's
+`type` cannot change. Its configuration is checked by its publisher when saved, so a webhook or
+Slack URL that fails the checks under _Outbound requests_ is refused with `400`.
+
+**Event sets** need at least one event, every one from the catalog; repeats are dropped.
+
+**Integrations** need an existing endpoint and event set. Their template must be a JSON object
+whose variables some event of the event set fills, and the audit delivery limits are accepted
+only when the event set holds audit events, and must be at least 1. Changing an event set is
+refused with `409` while one of its integrations would no longer fit it, and an endpoint or
+event set is not deleted (`409`) while an integration uses it.
+
+Event delivery reads the definitions described in _Integration definitions_ above, from
+`storage_paths.integrations`; integrations kept by this API are not delivered.
+
 ## Management API
 
 | Route | Purpose |
 | --- | --- |
-| `GET`, `POST /v1/integrations` | List and create definitions |
+| `GET`, `POST /v1/integrations` | List and create integrations |
 | `GET`, `PUT`, `DELETE /v1/integrations/{id}` | Read, change, and remove one |
-| `POST /v1/integrations/test` | Send a test message |
-| `POST /v1/integrations/{id}/trigger` | Fire one integration by hand |
-| `POST /v1/integrations/trigger-multiple` | Fire several |
-| `GET /v1/integrations/runtime-variables` | Variables available per category |
-| `GET /v1/integrations/config` | Publisher configuration |
+| `GET`, `POST /v1/integrations/endpoints` | List and create endpoints |
+| `GET`, `PUT`, `DELETE /v1/integrations/endpoints/{id}` | Read, change, and remove one |
+| `GET`, `POST /v1/integrations/event-sets` | List and create event sets |
+| `GET`, `PUT`, `DELETE /v1/integrations/event-sets/{id}` | Read, change, and remove one |
+| `GET /v1/integrations/catalog` | Events, template variables and endpoint types |
 | `/v1/gateways/{id}/integrations` | A gateway's trigger configuration |
 | `/v1/users/integrations`, `/v1/identities/integrations` | User and identity trigger configuration |
 
 Each route needs `integrations.view`, `integrations.edit`, or `integrations.delete`, checked
-by the RBAC guard ([`integration_handlers.rs`](../src/storage/integration_handlers.rs)). Mounted
-without a guard, every route above refuses the request with `403`. Governance Audit
-integrations also require `audit.view`. Without it they are left out of lists, a read returns
-404, and a write or manual trigger returns 403. See
-[`RBAC.md`](RBAC.md#governance-audit-integrations).
+by the RBAC guard ([`api/mod.rs`](../src/integrations/api/mod.rs),
+[`integration_handlers.rs`](../src/storage/integration_handlers.rs)). Mounted without a guard,
+every route above refuses the request with `403`. Each create, change and delete is logged as
+`integrations.<endpoint|event_set|integration>.<created|updated|deleted>` with its id and the
+caller; secret values are never logged.
 
 ## In-dashboard notifications
 

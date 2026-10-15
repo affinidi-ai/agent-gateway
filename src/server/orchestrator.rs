@@ -1771,6 +1771,11 @@ pub async fn run_axum_proxy(
 
             storage_arc
         };
+        crate::integrations::api::init_definition_stores(Arc::new(
+            crate::integrations::api::DefinitionStores::open_configured(&bootstrap_config.storage_paths)
+                .await
+                .expect("Failed to initialize integration endpoint, event set and integration storage"),
+        ));
 
         // Initialize delegation vault audit logger (started only on an Active node)
         crate::delegation_vault::audit::init_audit_logger(

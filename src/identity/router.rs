@@ -1829,15 +1829,19 @@ pub fn create_identity_api_router(
         Router::new()
     };
 
+    let integration_guard = passkey_storage_for_manager
+        .as_ref()
+        .map(|auth_storage| crate::auth_manager::middleware::RbacGuard::new(auth_storage.clone(), rbac_config.clone()));
     let integration_router = crate::storage::integration_handlers::integration_router(
         integration_storage,
-        passkey_storage_for_manager
-            .as_ref()
-            .map(|auth_storage| {
-                crate::auth_manager::middleware::RbacGuard::new(auth_storage.clone(), rbac_config.clone())
-            }),
+        integration_guard.clone(),
         state.config.clone(),
         state.bootstrap_config.clone(),
+    )
+    .merge(
+        crate::integrations::api::definition_stores()
+            .map(|stores| crate::integrations::api::router(stores, integration_guard))
+            .unwrap_or_default(),
     );
 
     // Create trust registry routes if store is provided

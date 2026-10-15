@@ -212,25 +212,18 @@ hold administrator-only evidence: the caller's email and name, request details a
 leave the appliance with each record, so point audit integrations only at destinations cleared
 for that data.
 
-**Access.** The records carry administrator-only evidence (caller context and VP JWTs), so
-Governance Audit integrations share the `audit.view` permission of `/v1/audit`, on top of the
-`integrations.*` permission of each route:
+**Access.** Integrations are managed through `/v1/integrations` with the `integrations.*`
+permissions alone, whatever events they deliver; `audit.view` guards `/v1/audit`, not the
+integrations that forward records. Changing integrations is administrator-only by default
+(see [`INTEGRATIONS.md`](INTEGRATIONS.md#management-api)).
 
-- `GET /v1/integrations` omits them and `GET /v1/integrations/{id}` returns 404 for a caller
-  without `audit.view`.
-- Creating one, editing one (including moving an integration into or out of the category),
-  deleting one, and triggering one through `/v1/integrations/{id}/trigger` or
-  `/v1/integrations/trigger-multiple` return 403 without `audit.view`. That stops a caller who
-  only has `integrations.edit` from reading or forging governance records.
-- A PAT must carry the `audit.view` scope as well; a request without an authenticated caller
-  or RBAC guard is refused.
-- They cannot belong to a tenant. Create or update with a tenant owner, and
-  `PUT /v1/tenant-ownership/integrations/{id}` with a tenant, return 400. A tenant-owned
-  integration never receives records even if its category is edited on disk.
-- Only the dispatcher and the two manual trigger endpoints above publish to them. A connection
-  point or gateway cannot link one (400), and every event trigger (connection point, gateway,
-  user, identity, surface, x402, MPP) refuses one, so values those triggers carry, some of them
-  caller-supplied, never reach the audit stream.
+- They cannot belong to a tenant. `PUT /v1/tenant-ownership/integrations/{id}` with a tenant
+  returns 400, and a tenant-owned integration never receives records even if its category is
+  edited on disk.
+- Only the dispatcher publishes to them. A connection point or gateway cannot link one (400),
+  and every event trigger (connection point, gateway, user, identity, surface, x402, MPP)
+  refuses one, so values those triggers carry, some of them caller-supplied, never reach the
+  audit stream.
 
 **Delivery.** No record is lost by the gateway except in the counted cases below.
 

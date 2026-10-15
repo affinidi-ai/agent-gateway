@@ -3,9 +3,35 @@ changes:
   added: []
   changed: []
   fixed: []
-  removed: []
-  security: []
-  breaking: []
+  removed:
+    - timestamp: '2026-10-15T08:16:21.000Z'
+      title: Remove the integration test, trigger, config and runtime-variables routes
+      description: >-
+        POST /v1/integrations/test, /v1/integrations/{id}/trigger and
+        /v1/integrations/trigger-multiple, GET /v1/integrations/config and
+        /v1/integrations/runtime-variables are gone; GET /v1/integrations/catalog lists the
+        events, template variables and endpoint types instead.
+  security:
+    - timestamp: '2026-10-15T08:16:21.000Z'
+      title: Never return integration endpoint credentials from the API
+      description: >-
+        SMTP passwords, Slack webhook URLs, webhook signing secrets and headers, and stream SASL
+        passwords and Redis URLs are write-only: responses name the secrets set but never their
+        values, so the user role's integrations.view no longer reveals credentials.
+    - timestamp: '2026-10-15T08:16:21.000Z'
+      title: Refuse tenant and resource-scoped tokens on the integrations API
+      description: >-
+        Integrations, endpoints and event sets belong to the whole appliance, so every
+        /v1/integrations route answers 403 to a tenant or resource-scoped access token.
+  breaking:
+    - timestamp: '2026-10-15T08:16:21.000Z'
+      title: ⭐ Manage integrations as an endpoint plus an event set
+      description: >-
+        /v1/integrations now keeps integrations that join one endpoint
+        (/v1/integrations/endpoints: transport, destination, credentials) and one event set
+        (/v1/integrations/event-sets: events picked from the whole catalog), with the template on
+        the integration. Categories and tenant owners are gone, and audit.view is no longer
+        needed to manage integrations that forward audit records.
   internal:
     - timestamp: '2026-10-14T09:03:25.000Z'
       title: Add one catalog of every event the gateway delivers to integrations
