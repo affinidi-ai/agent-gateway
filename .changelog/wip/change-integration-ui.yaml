@@ -23,6 +23,13 @@ changes:
         Templates can use EVENT_NAME, EVENT_SUMMARY (one line on what happened) and EVENT_DATA
         (the event's values, or the audit record, as JSON). A template that leaves fields out
         gets the endpoint type's defaults, so an empty template sends a complete message.
+    - timestamp: '2026-10-14T09:03:25.000Z'
+      title: List every event integrations can deliver in one catalog
+      description: >-
+        GET /v1/integrations/catalog lists every delivered gateway, user, connection point,
+        x402, MPP and Governance Audit event with its family, audit group and the template
+        variables its delivery fills, plus the placeholder syntax and each endpoint type's
+        secret fields.
     - timestamp: '2026-10-15T13:20:00.000Z'
       title: Reference stored secrets from integration endpoints
       description: >-
@@ -77,7 +84,7 @@ changes:
         Integrations belong to the whole appliance, so the tenant ownership API refuses the
         integrations kind with 400 instead of moving one to a tenant.
     - timestamp: '2026-10-15T09:55:00.000Z'
-      title: Remove integration attachments from gateways, users, identities and connection points
+      title: Remove per-resource integration attachments
       description: >-
         /v1/gateways/{id}/integrations, /v1/users/integrations and /v1/identities/integrations
         are gone, and connection points no longer take integration_id, integration_variables or
@@ -118,18 +125,3 @@ changes:
         (/v1/integrations/event-sets: events picked from the whole catalog), with the template on
         the integration. Categories and tenant owners are gone, and audit.view is no longer
         needed to manage integrations that forward audit records.
-  internal:
-    - timestamp: '2026-10-14T09:03:25.000Z'
-      title: Add one catalog of every event the gateway delivers to integrations
-      description: >-
-        Lists every delivered gateway, user, connection point, x402, MPP and governance
-        audit event with its family, audit group and the template variables each delivery
-        fills, so integrations can pick events without categories.
-    - timestamp: '2026-10-14T09:10:57.000Z'
-      title: Store endpoints, event sets and integrations as separate definitions
-      description: >-
-        Adds the endpoint definition (transport, destination and credentials, whose secret
-        fields are kept when an update leaves them out and are never read back), the event set
-        (events picked from the catalog, refused when empty or unknown), the integration that
-        joins one endpoint and one event set through its template, and a shared store that
-        keeps one JSON file per definition and lists them newest first.
