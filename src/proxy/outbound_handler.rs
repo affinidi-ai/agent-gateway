@@ -5547,7 +5547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_policy_audit_falls_back_to_package_name_when_unnamed() {
+    async fn outbound_policy_audit_falls_back_to_the_definition_id_when_unnamed() {
         use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
         use std::sync::Mutex;
 
@@ -5577,8 +5577,7 @@ mod tests {
         let decisions = collector.lock().unwrap();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].scope, "response");
-        // No operator name → the human-readable name falls back to the package.
-        assert_eq!(decisions[0].policy_name, "surface.policy");
+        assert_eq!(decisions[0].policy_name, "def-resp-1");
         assert!(
             decisions[0]
                 .caller_did

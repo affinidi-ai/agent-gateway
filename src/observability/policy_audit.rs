@@ -42,8 +42,8 @@ pub struct PolicyDecisionSummary {
     /// "access_point" | "transit_point" | "fabric" — which request flow produced
     /// the decision (ingress vs egress vs fabric-received).
     pub flow: &'static str,
-    /// Human-readable policy name. Operator-assigned definition name when set;
-    /// falls back to the Rego package name (e.g. "surface.policy").
+    /// Human-readable policy name: the operator-assigned definition name, else
+    /// the definition id, else a layer label such as "Surface policy".
     pub policy_name: String,
     /// Policy/definition identifier (e.g. the Rego package `gateway.policy` /
     /// `surface.policy`, or the definition id for response/MCP scopes).
@@ -287,7 +287,8 @@ pub struct PolicyDecisionEvent<'a> {
     /// policy record. `None` for the built-in allow-all default (no definition).
     pub policy_definition_id: Option<&'a str>,
     /// Human-readable policy name (e.g. the operator-assigned definition name).
-    /// When `None`, falls back to `policy_id` in the VP `policyDecisions` array.
+    /// When `None`, the recorded name falls back to the definition id, then to a
+    /// label for the policy layer.
     pub policy_name: Option<&'a str>,
     /// Surface/channel identifier the decision applies to.
     pub surface_id: Option<&'a str>,
@@ -348,6 +349,32 @@ pub fn record_tools_list_filtering(
     });
 }
 
+/// The best name the gateway knows for the policy that decided: the
+/// operator's definition name, else the definition id, else a readable label
+/// for the layer. A tool policy that matched no definition keeps the tool name.
+fn decision_policy_name(event: &PolicyDecisionEvent<'_>) -> String {
+    fn known(value: Option<&str>) -> Option<&str> {
+        value.filter(|v| !v.is_empty())
+    }
+    if let Some(name) = known(event.policy_name).or(known(event.policy_definition_id)) {
+        return name.to_string();
+    }
+    match known(event.policy_id) {
+        Some(crate::policies::GATEWAY_POLICY_PACKAGE) => "Gateway policy",
+        Some(crate::policies::SURFACE_POLICY_PACKAGE) => "Surface policy",
+        Some("mcp_tool_gating") => "MCP tool gating",
+        Some(other) => other,
+        None => match event.scope {
+            PolicyScope::Gateway => "Gateway policy",
+            PolicyScope::Surface => "Surface policy",
+            PolicyScope::McpTool => "MCP tool policy",
+            PolicyScope::Response => "Response policy",
+            PolicyScope::McpToolList => "MCP tool list filter",
+        },
+    }
+    .to_string()
+}
+
 pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     let (auth_method, principal, did_from_identity) = match event.identity {
         Some(id) => caller_fields(id),
@@ -406,6 +433,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     let policy_content_hash = event
         .policy_content_hash
         .unwrap_or_default();
+    let policy_name = decision_policy_name(&event);
 
     if allowed {
         tracing::debug!(
@@ -460,7 +488,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             scope,
             decision,
             policy_id,
-            event.policy_name,
+            Some(policy_name.as_str()),
             event.policy_definition_id,
             if allowed {
                 None
@@ -503,17 +531,11 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     // populated when a scope is active and is never embedded in a minted VP.
     let deny_reason_val = (!allowed && !reason.is_empty()).then(|| reason.to_string());
     let id = compute_decision_id(scope, policy_id, decision, deny_reason_val.as_deref(), resolved_trace_id.as_deref());
-    // Use the operator-assigned definition name when available; fall back to the Rego package name.
-    let policy_name_val = event
-        .policy_name
-        .filter(|n| !n.is_empty())
-        .unwrap_or(policy_id)
-        .to_string();
     push_policy_decision(PolicyDecisionSummary {
         id,
         scope: event.scope.as_str(),
         flow,
-        policy_name: policy_name_val,
+        policy_name,
         policy_id: if policy_id.is_empty() {
             None
         } else {
@@ -709,7 +731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_policy_name_falls_back_to_id_when_unset() {
+    async fn summary_policy_name_falls_back_to_the_layer_label_when_unset() {
         let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         POLICY_DECISION_COLLECTOR
             .scope(collector.clone(), async {
@@ -732,8 +754,7 @@ mod tests {
                 .as_deref(),
             Some("gateway.policy")
         );
-        // With no operator name, the summary name falls back to the policy id.
-        assert_eq!(decisions[0].policy_name, "gateway.policy");
+        assert_eq!(decisions[0].policy_name, "Gateway policy");
     }
 
     use std::sync::{Arc, Mutex};
@@ -935,6 +956,75 @@ mod tests {
             }
             other => panic!("expected a policy decision, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_decision_names_its_policy_by_the_best_name_known() {
+        let name = |scope, policy_name, policy_definition_id, policy_id| {
+            decision_policy_name(&PolicyDecisionEvent {
+                scope,
+                policy_name,
+                policy_definition_id,
+                policy_id,
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            name(
+                PolicyScope::Surface,
+                Some("Partner policy"),
+                Some("def-1"),
+                Some(crate::policies::SURFACE_POLICY_PACKAGE)
+            ),
+            "Partner policy"
+        );
+        assert_eq!(
+            name(PolicyScope::Surface, Some(""), Some("def-1"), Some(crate::policies::SURFACE_POLICY_PACKAGE)),
+            "def-1"
+        );
+        for (scope, policy_id, label) in [
+            (PolicyScope::Gateway, Some(crate::policies::GATEWAY_POLICY_PACKAGE), "Gateway policy"),
+            (PolicyScope::Surface, Some(crate::policies::SURFACE_POLICY_PACKAGE), "Surface policy"),
+            (PolicyScope::McpTool, Some("mcp_tool_gating"), "MCP tool gating"),
+            (PolicyScope::McpTool, Some("delete_repo"), "delete_repo"),
+            (PolicyScope::McpTool, None, "MCP tool policy"),
+            (PolicyScope::McpTool, Some(""), "MCP tool policy"),
+            (PolicyScope::Response, None, "Response policy"),
+            (PolicyScope::McpToolList, None, "MCP tool list filter"),
+            (PolicyScope::Gateway, None, "Gateway policy"),
+            (PolicyScope::Surface, None, "Surface policy"),
+        ] {
+            assert_eq!(name(scope, None, None, policy_id), label, "{scope:?} {policy_id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_decision_record_carries_a_policy_name() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Gateway,
+                allow: false,
+                policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
+                ..Default::default()
+            });
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::McpTool,
+                allow: true,
+                ..Default::default()
+            });
+        })
+        .await;
+
+        let names: Vec<Option<String>> = events
+            .iter()
+            .map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { policy_name, .. } => {
+                    policy_name.clone()
+                }
+                other => panic!("expected a policy decision, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, [Some("Gateway policy".to_string()), Some("MCP tool policy".to_string())]);
     }
 
     #[tokio::test]
