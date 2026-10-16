@@ -291,6 +291,8 @@ pub struct PolicyDecisionEvent<'a> {
     pub policy_name: Option<&'a str>,
     /// Surface/channel identifier the decision applies to.
     pub surface_id: Option<&'a str>,
+    /// Name of the surface the decision applies to, recorded as `channel_name`.
+    pub surface_name: Option<&'a str>,
     /// Per-request trace identifier for log/trace correlation.
     pub trace_id: Option<&'a str>,
     /// HTTP method of the request under evaluation.
@@ -470,6 +472,9 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             } else {
                 Some(surface_id)
             },
+            event
+                .surface_name
+                .filter(|name| !name.is_empty()),
             if caller_did.is_empty() {
                 None
             } else {
@@ -821,6 +826,7 @@ mod tests {
                 policy_definition_id: Some("def-uuid-7"),
                 policy_name: None,
                 surface_id: Some("surface-a"),
+                surface_name: Some("Surface A"),
                 trace_id: Some("trace-xyz"),
                 http_method: Some("POST"),
                 path: Some("/v1/agent"),
@@ -929,6 +935,40 @@ mod tests {
             }
             other => panic!("expected a policy decision, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_decision_record_names_its_surface() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Surface,
+                allow: false,
+                surface_id: Some("0b6f7a52-surface-uuid"),
+                surface_name: Some("Payments"),
+                ..Default::default()
+            });
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Gateway,
+                allow: true,
+                ..Default::default()
+            });
+        })
+        .await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]
+                .channel_name
+                .as_deref(),
+            Some("Payments")
+        );
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some("0b6f7a52-surface-uuid")
+        );
+        assert_eq!(events[1].channel_name, None, "no surface, no name");
     }
 
     #[tokio::test]

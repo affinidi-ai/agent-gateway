@@ -2418,6 +2418,7 @@ async fn evaluate_gateway_policy_for_fabric(
             policy_definition_id: gd.policy_id.as_deref(),
             policy_name: global_policy_name,
             surface_id: surface.config_id(),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -2493,6 +2494,7 @@ async fn evaluate_gateway_policy_for_fabric(
                     policy_definition_id: gw_policy_def_id.as_deref(),
                     policy_name: Some(gw_policy_name.as_str()),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -2512,6 +2514,7 @@ async fn evaluate_gateway_policy_for_fabric(
                     policy_definition_id: gw_policy_def_id.as_deref(),
                     policy_name: Some(gw_policy_name.as_str()),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -2538,6 +2541,7 @@ async fn evaluate_gateway_policy_for_fabric(
                     policy_definition_id: gw_policy_def_id.as_deref(),
                     policy_name: Some(gw_policy_name.as_str()),
                     surface_id: surface.config_id(),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -3148,6 +3152,7 @@ async fn enrich_and_evaluate_surface_policies(
                 policy_definition_id: gd.policy_id.as_deref(),
                 policy_name: global_policy_name,
                 surface_id: Some(config_id),
+                surface_name: Some(surface.name.as_str()),
                 http_method: Some(method),
                 path: Some(path),
                 identity: authenticated_identity,
@@ -3178,6 +3183,7 @@ async fn enrich_and_evaluate_surface_policies(
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: surface.opa_policy_definition_id(),
                     surface_id: Some(config_id),
+                    surface_name: Some(surface.name.as_str()),
                     http_method: Some(method),
                     path: Some(path),
                     identity: authenticated_identity,
@@ -3204,6 +3210,7 @@ async fn enrich_and_evaluate_surface_policies(
                         policy_definition_id: channel_opa_def_id,
                         policy_name: Some(channel_opa_name.as_str()),
                         surface_id: Some(config_id),
+                        surface_name: Some(surface.name.as_str()),
                         http_method: Some(method),
                         path: Some(path),
                         identity: authenticated_identity,
@@ -3223,6 +3230,7 @@ async fn enrich_and_evaluate_surface_policies(
                         policy_definition_id: channel_opa_def_id,
                         policy_name: Some(channel_opa_name.as_str()),
                         surface_id: Some(config_id),
+                        surface_name: Some(surface.name.as_str()),
                         http_method: Some(method),
                         path: Some(path),
                         identity: authenticated_identity,
@@ -3251,6 +3259,7 @@ async fn enrich_and_evaluate_surface_policies(
                             policy_definition_id: channel_opa_def_id,
                             policy_name: Some(channel_opa_name.as_str()),
                             surface_id: Some(config_id),
+                            surface_name: Some(surface.name.as_str()),
                             http_method: Some(method),
                             path: Some(path),
                             identity: authenticated_identity,
@@ -7117,6 +7126,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
         scope: crate::observability::PolicyScope::McpTool,
         flow: crate::observability::PolicyFlow::Fabric,
         surface_id: Some(config_id),
+        surface_name: Some(surface.name.as_str()),
         http_method: Some(method),
         path: Some(path),
         identity: authenticated_identity,
@@ -7183,6 +7193,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
             allow: false,
             reason: Some("Access denied: insufficient permissions for this tool"),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7262,6 +7273,7 @@ async fn evaluate_mcp_tool_policies_for_fabric(
                 .content_hash
                 .as_deref(),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7376,6 +7388,7 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
             reason: Some("tools/call without a readable tool name under MCP tool gating"),
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
+            surface_name: Some(surface.name.as_str()),
             http_method: Some(method),
             path: Some(path),
             identity: authenticated_identity,
@@ -7426,6 +7439,7 @@ async fn evaluate_mcp_tool_gating_call_for_fabric(
         },
         policy_id: Some("mcp_tool_gating"),
         surface_id: Some(config_id),
+        surface_name: Some(surface.name.as_str()),
         http_method: Some(method),
         path: Some(path),
         identity: authenticated_identity,
@@ -7528,6 +7542,7 @@ fn filter_mcp_tools_list_for_fabric(
             &filtered.kept,
             crate::observability::PolicyDecisionEvent {
                 surface_id: Some(config_id),
+                surface_name: Some(surface.name.as_str()),
                 http_method: Some(method),
                 path: Some(path),
                 actor_did: actor_did.as_deref(),
@@ -11298,10 +11313,12 @@ mod tests {
             assert_eq!(ids.len(), 1, "one request, one id");
             seen.extend(ids);
         }
-        assert!(seen.iter().all(|id| id.len() == 16
-            && id
-                .chars()
-                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))));
+        assert!(seen.iter().all(|id| {
+            id.len() == 16
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }));
         assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 

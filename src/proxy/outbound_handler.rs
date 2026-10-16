@@ -2824,6 +2824,7 @@ struct OutboundPolicyAudit<'a> {
     policy_definition_id: Option<&'a str>,
     policy_name: Option<&'a str>,
     surface_id: Option<&'a str>,
+    surface_name: Option<&'a str>,
     http_method: &'a str,
     path: &'a str,
     actor_did: Option<&'a str>,
@@ -2867,6 +2868,7 @@ impl OutboundPolicyAudit<'_> {
             policy_definition_id: self.policy_definition_id,
             policy_name: self.policy_name,
             surface_id: self.surface_id,
+            surface_name: self.surface_name,
             http_method: Some(self.http_method),
             path: Some(self.path),
             actor_did: self.actor_did,
@@ -2935,6 +2937,7 @@ async fn step_gateway_opa_policy(
         policy_definition_id: policy_definition_id.as_deref(),
         policy_name: Some(policy_name.as_str()),
         surface_id: ctx.surface.config_id(),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -2979,6 +2982,7 @@ fn record_surface_policy_unavailable(
         policy_definition_id,
         policy_name: None,
         surface_id: ctx.surface.config_id(),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3070,6 +3074,7 @@ async fn step_surface_opa_policy(
         policy_definition_id: def_id,
         policy_name: Some(policy_name.as_str()),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3212,6 +3217,7 @@ async fn step_transit_point_opa_policy(
         policy_definition_id: Some(tp_def_id.as_str()),
         policy_name: Some(policy_name.as_str()),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3307,6 +3313,7 @@ async fn step_transit_mcp_tool_gating(
             reason: Some("tools/call without a readable tool name under per-transit-point MCP tool gating"),
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
+            surface_name: Some(ctx.surface.name.as_str()),
             trace_id: Some(ctx.request_id.as_str()),
             http_method: Some(ctx.original_method.as_str()),
             path: Some(ctx.request_path.as_str()),
@@ -3356,6 +3363,7 @@ async fn step_transit_mcp_tool_gating(
         },
         policy_id: Some("mcp_tool_gating"),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         trace_id: Some(ctx.request_id.as_str()),
         http_method: Some(ctx.original_method.as_str()),
         path: Some(ctx.request_path.as_str()),
@@ -3497,6 +3505,7 @@ fn step_transit_point_response_policy(
             .name
             .as_deref(),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -5465,6 +5474,7 @@ mod tests {
                     policy_definition_id: None,
                     policy_name: None,
                     surface_id: Some("surf-1"),
+                    surface_name: Some("Surface one"),
                     http_method: "GET",
                     path: "/payments/pioneer/trust",
                     actor_did: Some("did:web:agent"),
@@ -5483,6 +5493,7 @@ mod tests {
                     policy_definition_id: Some("def-uuid-7"),
                     policy_name: Some("Partner egress policy"),
                     surface_id: Some("surf-1"),
+                    surface_name: Some("Surface one"),
                     http_method: "GET",
                     path: "/payments/pioneer/trust",
                     actor_did: Some("did:web:agent"),
@@ -5549,6 +5560,7 @@ mod tests {
                     policy_definition_id: Some("def-resp-1"),
                     policy_name: None,
                     surface_id: Some("surf-2"),
+                    surface_name: Some("Surface two"),
                     http_method: "POST",
                     path: "/a2a",
                     actor_did: None,
@@ -5588,6 +5600,7 @@ mod tests {
                     policy_definition_id: Some("def-resp-1"),
                     policy_name: None,
                     surface_id: Some("surf-2"),
+                    surface_name: Some("Surface two"),
                     http_method: "POST",
                     path: "/a2a",
                     actor_did: None,
@@ -7765,13 +7778,22 @@ mod tests {
             let decisions: Vec<_> = events
                 .iter()
                 .filter(|event| {
-                    matches!(
-                        event.event,
-                        crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. }
-                    )
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
                 })
                 .collect();
             assert_eq!(decisions.len(), 1, "{events:?}");
+            assert_eq!(
+                decisions[0]
+                    .channel_name
+                    .as_deref(),
+                Some("Request id surface")
+            );
+            assert_eq!(
+                decisions[0]
+                    .surface_id
+                    .as_deref(),
+                Some("request-id-surface")
+            );
             seen.push(
                 decisions[0]
                     .request_id
@@ -7779,10 +7801,12 @@ mod tests {
                     .expect("the decision carries the request id"),
             );
         }
-        assert!(seen.iter().all(|id| id.len() == 16
-            && id
-                .chars()
-                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))));
+        assert!(seen.iter().all(|id| {
+            id.len() == 16
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }));
         assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 

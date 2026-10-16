@@ -453,7 +453,12 @@ mod tests {
 
         producer.submit(consent());
 
-        assert_eq!(received(&rx)[0].record.request_id, None);
+        assert_eq!(
+            received(&rx)[0]
+                .record
+                .request_id,
+            None
+        );
     }
 
     #[tokio::test]
