@@ -70,7 +70,7 @@ dashboard: build it from `www/default`, and set the `static` route `path` in
 
 The gateway stores every surface, identity, policy, audit record and, by default, secret
 under `_storage/`. Losing that folder loses the appliance, so mount it on a persistent,
-writable volume. Set every `[storage_paths]` key in `config.toml` to an absolute path
+writable volume. Keep the folder name `_storage`: backups and restores look for it. Set every `[storage_paths]` key in `config.toml` to an absolute path
 inside that folder, except `backup_restore`. Put `backup_restore` on persistent, writable
 storage next to `_storage`, never inside it: a restore empties `_storage`. A full backup
 covers only the `_storage` folder. See
@@ -104,8 +104,10 @@ you open any listener:
 
 - **Restrict ports 8443 and 8080 with a firewall or security group.** These ports listen
   on every network interface of the host.
-- **Register the first administrator first.** The first account to register, by passkey
-  or SAML, becomes the primary administrator and cannot be deleted or demoted.
+- **Register the first administrator before anyone else can reach the gateway.** The
+  first account to register, by passkey or SAML, becomes the primary administrator and
+  cannot be deleted or demoted. Allow only your own address to reach 8443 and 8080,
+  register, then open the ports to everyone else.
 - **Keep port 9000 private.** It adds your Transit Points' credentials to the calls it
   forwards, so only your managed agents should reach it. Set its `bind_address` to an
   internal address, and remove the `localhost` entries from `external_urls` in
