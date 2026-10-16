@@ -776,6 +776,16 @@ fn build_bootstrap_config(
                 .join("integrations/integrations")
                 .to_string_lossy()
                 .into_owned(),
+            integrations: Some(
+                base.join("integrations/definitions")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            integration_triggers: Some(
+                base.join("integrations/triggers")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             webhooks: base
                 .join("webhooks")
                 .to_string_lossy()

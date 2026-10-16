@@ -2601,6 +2601,18 @@ pub struct StoragePaths {
     #[serde(default = "default_integration_definitions_storage_path")]
     pub integration_definitions: String,
 
+    /// Deprecated: where the version before endpoints and event sets kept integrations. Read
+    /// only to migrate them, never written; unset means `_storage/integrations/definitions`.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)] // Until the startup sweep reads it (stage 5.5).
+    pub integrations: Option<String>,
+
+    /// Deprecated: where that version kept integration attachments. Read only to migrate
+    /// them, never written; unset means `_storage/integrations/triggers`.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)] // Until the startup sweep reads it (stage 5.5).
+    pub integration_triggers: Option<String>,
+
     /// Path to store Webhook configurations
     #[serde(default = "default_webhooks_storage_path")]
     pub webhooks: String,
@@ -2717,6 +2729,8 @@ impl Default for StoragePaths {
             integration_endpoints: default_integration_endpoints_storage_path(),
             integration_event_sets: default_integration_event_sets_storage_path(),
             integration_definitions: default_integration_definitions_storage_path(),
+            integrations: None,
+            integration_triggers: None,
             webhooks: default_webhooks_storage_path(),
             vc_keys: default_vc_keys_path(),
             metrics: default_metrics_storage_path(),
@@ -3377,16 +3391,26 @@ mod storage_paths_tests {
     }
 
     #[test]
-    fn retired_integration_paths_are_ignored() {
+    fn retired_integration_paths_are_read_for_the_migration_and_never_written() {
         let paths: StoragePaths = toml::from_str(
             "integrations = \"/data/definitions\"\nintegration_triggers = \"/data/triggers\"\nintegration_definitions = \"/data/integrations\"",
         )
         .expect("parses");
 
         assert_eq!(paths.integration_definitions, "/data/integrations");
+        assert_eq!(paths.integrations.as_deref(), Some("/data/definitions"));
+        assert_eq!(
+            paths
+                .integration_triggers
+                .as_deref(),
+            Some("/data/triggers")
+        );
         let written = toml::to_string(&paths).expect("serializes");
         assert!(!written.contains("/data/definitions"), "{written}");
         assert!(!written.contains("integration_triggers"), "{written}");
+
+        let unset: StoragePaths = toml::from_str("").expect("parses");
+        assert_eq!((unset.integrations, unset.integration_triggers), (None, None));
     }
 }
 

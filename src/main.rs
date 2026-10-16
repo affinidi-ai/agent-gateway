@@ -1323,6 +1323,8 @@ fn render_default_bootstrap_toml(
             integration_endpoints: format!("{}_storage/integrations/endpoints", base_folder_prefix),
             integration_event_sets: format!("{}_storage/integrations/event_sets", base_folder_prefix),
             integration_definitions: format!("{}_storage/integrations/integrations", base_folder_prefix),
+            integrations: None,
+            integration_triggers: None,
             webhooks: format!("{}_storage/webhooks", base_folder_prefix),
             vc_keys: format!("{}_storage/vc_keys", base_folder_prefix),
             metrics: format!("{}_storage/metrics", base_folder_prefix),
