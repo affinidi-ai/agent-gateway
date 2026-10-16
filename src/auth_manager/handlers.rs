@@ -235,16 +235,11 @@ pub async fn get_user(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "User not found".to_string()))?
         .clone();
 
-    // Trigger user.accessed integration (async, non-blocking)
-    if let Some(notif) = notif_store.as_ref() {
-        let notif = notif.clone();
-        let user_clone = user_data.clone();
-        tokio::spawn(async move {
-            crate::integrations::trigger_user_accessed(notif.as_ref(), &user_clone).await;
-        });
-        if let Some(metrics_store) = metrics_store {
-            spawn_record_user_event(metrics_store, "accessed".to_string(), user_data.role.clone());
-        }
+    crate::integrations::trigger_user_accessed(&user_data);
+    if notif_store.is_some()
+        && let Some(metrics_store) = metrics_store
+    {
+        spawn_record_user_event(metrics_store, "accessed".to_string(), user_data.role.clone());
     }
 
     Ok(Json(User {
@@ -426,31 +421,20 @@ pub async fn update_user(
                     e
                 ),
             }
-            // Trigger user.approved integration
-            let notif = notif_store.clone();
-            let user_clone = user_data.clone();
-            tokio::spawn(async move {
-                crate::integrations::trigger_user_approved(notif.as_ref(), &user_clone).await;
-            });
             if let Some(metrics_store) = metrics_store.clone() {
                 spawn_record_user_event(metrics_store, "approved".to_string(), user_data.role.clone());
             }
         } else {
             tracing::error!("Notification store not available - cannot send welcome notification");
         }
+        crate::integrations::trigger_user_approved(&user_data);
     }
 
-    // Trigger user.updated integration for any update
-    if let Some(notif_store) = &notification_store {
-        let notif = notif_store.clone();
-        let old_user = user_before.clone();
-        let new_user = user_data.clone();
-        tokio::spawn(async move {
-            crate::integrations::trigger_user_updated(notif.as_ref(), &old_user, &new_user).await;
-        });
-        if let Some(metrics_store) = metrics_store {
-            spawn_record_user_event(metrics_store, "updated".to_string(), user_data.role.clone());
-        }
+    crate::integrations::trigger_user_updated(&user_before, &user_data);
+    if notification_store.is_some()
+        && let Some(metrics_store) = metrics_store
+    {
+        spawn_record_user_event(metrics_store, "updated".to_string(), user_data.role.clone());
     }
 
     Ok(Json(User {
@@ -477,7 +461,6 @@ pub async fn delete_user(
     Extension(caller_user_id): Extension<String>,
     Extension(storage): Extension<std::sync::Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<std::sync::Arc<RbacConfig>>,
-    Extension(notification_store): Extension<Option<std::sync::Arc<crate::integrations::FileSystemNotificationStore>>>,
     Extension(session_manager): Extension<std::sync::Arc<crate::auth::session::SessionManager>>,
     Path(user_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
@@ -508,14 +491,7 @@ pub async fn delete_user(
         return Err((StatusCode::FORBIDDEN, "Cannot delete administrator users".to_string()));
     }
 
-    // Trigger user.deleted integration before deletion
-    if let Some(notif_store) = &notification_store {
-        let notif = notif_store.clone();
-        let user_clone = user_data.clone();
-        tokio::spawn(async move {
-            crate::integrations::trigger_user_deleted(notif.as_ref(), &user_clone).await;
-        });
-    }
+    crate::integrations::trigger_user_deleted(&user_data);
 
     // Permanently delete the user
     storage

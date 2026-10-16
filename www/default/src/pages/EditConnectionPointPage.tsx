@@ -2,10 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { Tab, Tabs } from 'react-bootstrap';
 import { apiClient } from '../api';
-import { integrationIntegration } from '../components/connection-points/IntegrationsStep';
 import ConnectionPointOverviewTab from './EditConnectionPointPage/ConnectionPointOverviewTab';
 import ConnectionPointMetadataTab from './EditConnectionPointPage/ConnectionPointMetadataTab';
-import ConnectionPointIntegrationsTab from './EditConnectionPointPage/ConnectionPointIntegrationsTab';
 import { DeleteButton } from '../components/shared/DeleteButton';
 import { showToast } from '../utils/toaster';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
@@ -25,7 +23,6 @@ interface ConnectionPoint {
   cp_type?: 'user' | 'system';
   secret?: string;
   exposed_channels?: string[];
-  integrations?: integrationIntegration[];
   enabled?: boolean;
 }
 
@@ -33,7 +30,6 @@ interface ConnectionPointFormData {
   name: string;
   description: string;
   enabled: boolean;
-  integration_integrations: integrationIntegration[];
 }
 
 const EditConnectionPointPage: React.FC = () => {
@@ -47,38 +43,16 @@ const EditConnectionPointPage: React.FC = () => {
   const [success, setSuccess] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<string>('overview');
   const [isModified, setIsModified] = useState(false);
-  const [showTestModal, setShowTestModal] = useState(false);
-  const [gatewayData, setGatewayData] = useState<any>(null);
-  const [integrations, setIntegrations] = useState<any[]>([]);
-  const [testingIntegrations, setTestingIntegrations] = useState(false);
-  const [testResults, setTestResults] = useState<
-    Array<{ integration_id: string; success: boolean; message: string }>
-  >([]);
-  const [testVariables, setTestVariables] = useState<
-    Array<{ integration_id: string; variables: Record<string, string> }>
-  >([]);
-  const [integrationValidationErrors, setIntegrationValidationErrors] = useState(false);
   const [formData, setFormData] = useState<ConnectionPointFormData>({
     name: '',
     description: '',
     enabled: true,
-    integration_integrations: [],
   });
-
-  // Callback for validation state changes
-  const handleValidationChange = (hasErrors: boolean) => {
-    setIntegrationValidationErrors(hasErrors);
-  };
 
   useEffect(() => {
     if (id) {
       fetchConnectionPoint();
     }
-    // Fetch integrations for test modal
-    apiClient
-      .get('/integrations')
-      .then(res => setIntegrations(res.data))
-      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
@@ -87,7 +61,7 @@ const EditConnectionPointPage: React.FC = () => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault();
-        if (isModified && !saving && !integrationValidationErrors) {
+        if (isModified && !saving) {
           handleSave();
         }
       }
@@ -96,7 +70,7 @@ const EditConnectionPointPage: React.FC = () => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isModified, saving, deleting, integrationValidationErrors]);
+  }, [isModified, saving, deleting]);
 
   const fetchConnectionPoint = async () => {
     try {
@@ -109,18 +83,7 @@ const EditConnectionPointPage: React.FC = () => {
         name: data.name,
         description: data.description || '',
         enabled: data.enabled !== undefined ? data.enabled : true,
-        integration_integrations: data.integrations || [],
       });
-
-      // Fetch gateway data for runtime variables
-      if (data.gateway_id) {
-        try {
-          const gatewayResponse = await apiClient.get(`/gateways/${data.gateway_id}`);
-          setGatewayData(gatewayResponse.data);
-        } catch (err) {
-          console.error('Failed to fetch gateway data:', err);
-        }
-      }
     } catch (error: any) {
       setError(error.message || 'Failed to load connection point');
     } finally {
@@ -128,10 +91,7 @@ const EditConnectionPointPage: React.FC = () => {
     }
   };
 
-  const handleInputChange = (
-    field: keyof ConnectionPointFormData,
-    value: string | boolean | integrationIntegration[]
-  ) => {
+  const handleInputChange = (field: keyof ConnectionPointFormData, value: string | boolean) => {
     setFormData(prev => ({
       ...prev,
       [field]: value,
@@ -141,50 +101,10 @@ const EditConnectionPointPage: React.FC = () => {
 
   const handleSave = async () => {
     try {
-      // Filter out any "ghost" integrations that have all empty variable values
-      const cleanedIntegrations = formData.integration_integrations.filter(integration => {
-        const variableCount = Object.keys(integration.variables).length;
-        if (variableCount === 0) return true; // Keep integrations with no variables
-
-        // Check if ALL variables are empty (this indicates a ghost integration)
-        const allEmpty = Object.values(integration.variables).every(
-          value => !value || value.trim() === ''
-        );
-        return !allEmpty; // Remove ghost integrations
-      });
-
-      // Validate integrations - check if any variables have empty values
-      const hasEmptyVariables = cleanedIntegrations.some(integration => {
-        const variableCount = Object.keys(integration.variables).length;
-        if (variableCount === 0) return false; // No variables to validate
-        return Object.values(integration.variables).some(value => !value || value.trim() === '');
-      });
-
-      if (hasEmptyVariables) {
-        setError('Please fill in all integration variable values before saving');
-        return;
-      }
-
-      // Update formData with cleaned integrations
-      const updatedFormData = {
-        ...formData,
-        integration_integrations: cleanedIntegrations,
-      };
-
       setSaving(true);
       setError(null);
-      const response = await apiClient.put(`/connection-points/${id}`, updatedFormData);
-
-      // Update the connection point state with the response (backend returns 'integrations' field)
-      const updatedConnectionPoint = response.data;
-      setConnectionPoint(updatedConnectionPoint);
-
-      // Keep formData in sync - backend returns 'integrations', we use 'integration_integrations' in formData
-      setFormData(prev => ({
-        ...prev,
-        integration_integrations: updatedConnectionPoint.integrations || [],
-      }));
-
+      const response = await apiClient.put(`/connection-points/${id}`, formData);
+      setConnectionPoint(response.data);
       setIsModified(false);
       showToast('success', 'Connection point updated!');
       navigate('/connections?tab=gateways');
@@ -227,105 +147,6 @@ const EditConnectionPointPage: React.FC = () => {
       //setSuccess('Connection secret copied to clipboard!');
       setTimeout(() => setSuccess(null), 2000);
     }
-  };
-
-  const handleTest = () => {
-    if (formData.integration_integrations.length === 0) {
-      setError('No integrations configured to test');
-      return;
-    }
-
-    // Get runtime variable values
-    const runtimeValues = getRuntimeVariableValues();
-
-    // Initialize test variables with runtime variable references resolved
-    const initialTestVars = formData.integration_integrations.map(integration => {
-      const resolvedVariables: Record<string, string> = {};
-
-      // Resolve runtime variable references in each configured variable
-      for (const [key, value] of Object.entries(integration.variables)) {
-        // Check if value is a runtime variable reference like ${CP_NAME} or ${CP_NAME:Label}
-        // Match any content inside ${} to be flexible
-        const match = value.match(/^\$\{([^:}]+)(?::[^}]*)?\}$/);
-        const varName = match ? match[1].trim() : null;
-        if (varName && varName in runtimeValues) {
-          // Replace with actual runtime value
-          resolvedVariables[key] = runtimeValues[varName];
-        } else {
-          // Use literal value
-          resolvedVariables[key] = value;
-        }
-      }
-
-      return {
-        integration_id: integration.integration_id,
-        variables: resolvedVariables,
-      };
-    });
-
-    setTestVariables(initialTestVars);
-    setShowTestModal(true);
-    setTestResults([]);
-  };
-
-  const handleSendTest = async () => {
-    setTestingIntegrations(true);
-    setTestResults([]);
-
-    const results: Array<{ integration_id: string; success: boolean; message: string }> = [];
-
-    for (const testVar of testVariables) {
-      try {
-        const integration = integrations.find(n => n.id === testVar.integration_id);
-        if (!integration) {
-          results.push({
-            integration_id: testVar.integration_id,
-            success: false,
-            message: 'Integration not found',
-          });
-          continue;
-        }
-
-        // Use test variable values directly (no runtime resolution needed, they're already resolved)
-        const payload = {
-          type: integration.type,
-          configuration: integration.configuration,
-          content: integration.content,
-          variables: testVar.variables,
-        };
-
-        await apiClient.post('/integrations/test', payload);
-
-        results.push({
-          integration_id: testVar.integration_id,
-          success: true,
-          message: 'Test notification sent successfully',
-        });
-      } catch (error: any) {
-        results.push({
-          integration_id: testVar.integration_id,
-          success: false,
-          message:
-            error.response?.data?.message || error.message || 'Failed to send test notification',
-        });
-      }
-    }
-
-    setTestResults(results);
-    setTestingIntegrations(false);
-  };
-
-  const getRuntimeVariableValues = (): Record<string, string> => {
-    const now = new Date();
-    return {
-      CP_ID: connectionPoint?.id || 'cp_123456',
-      CP_NAME: formData.name || connectionPoint?.name || 'Connection Point',
-      CP_DESCRIPTION: formData.description || connectionPoint?.description || 'No description',
-      GATEWAY: gatewayData?.name || 'Gateway Name',
-      GATEWAY_ID: connectionPoint?.gateway_id || 'gw_123456',
-      TIMESTAMP: now.toISOString(),
-      MESSAGE_ID: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-    };
   };
 
   if (loading) {
@@ -384,20 +205,9 @@ const EditConnectionPointPage: React.FC = () => {
           </h6>
           <div>
             <button
-              className="btn btn-sm btn-info me-2"
-              onClick={handleTest}
-              disabled={formData.integration_integrations.length === 0}
-              title="Test integrations with current values"
-            >
-              <i className="fas fa-vial"></i> Test Integrations
-            </button>
-            <button
               className={`btn btn-sm btn-primary me-2 ${saving ? 'disabled' : ''}`}
               onClick={handleSave}
-              disabled={!isModified || saving || integrationValidationErrors}
-              title={
-                integrationValidationErrors ? 'Please fill in all integration variable values' : ''
-              }
+              disabled={!isModified || saving}
             >
               <i className={`fas ${saving ? 'fa-spinner fa-spin' : 'fa-save'}`}></i>
               {saving ? ' Saving...' : ' Save'}
@@ -507,164 +317,9 @@ const EditConnectionPointPage: React.FC = () => {
             >
               <ConnectionPointMetadataTab connectionPoint={connectionPoint} />
             </Tab>
-            <Tab
-              eventKey="integrations"
-              title={
-                <>
-                  <i className="fas fa-bell"></i> Integrations
-                </>
-              }
-            >
-              <ConnectionPointIntegrationsTab
-                integrations={formData.integration_integrations}
-                onIntegrationsChange={integrations =>
-                  handleInputChange('integration_integrations', integrations)
-                }
-                onValidationChange={handleValidationChange}
-              />
-            </Tab>
           </Tabs>
         </div>
       </div>
-
-      {/* Test Modal */}
-      {showTestModal && (
-        <>
-          <div
-            className="modal-backdrop fade show"
-            onClick={() => setShowTestModal(false)}
-            style={{ zIndex: 1040 }}
-          ></div>
-          <div className="modal fade show" style={{ display: 'block', zIndex: 1050 }} tabIndex={-1}>
-            <div className="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
-              <div className="modal-content">
-                <div className="modal-header">
-                  <h5 className="modal-title">
-                    <i className="fas fa-vial me-2"></i>
-                    Test Integrations
-                  </h5>
-                  <button
-                    type="button"
-                    className="btn-close"
-                    onClick={() => setShowTestModal(false)}
-                    title="Close"
-                    aria-label="Close"
-                  />
-                </div>
-                <div className="modal-body">
-                  <div className="alert alert-info">
-                    <i className="fas fa-info-circle me-2"></i>
-                    <strong>Test Mode:</strong> This will send actual notifications using the
-                    configured variables. Runtime variables will be substituted with current values
-                    where available.
-                  </div>
-
-                  {testResults.length === 0 ? (
-                    <>
-                      <h6 className="mb-3">Edit variable values for testing:</h6>
-                      {testVariables.map((testVar, index) => {
-                        const integration = integrations.find(n => n.id === testVar.integration_id);
-                        if (!integration) return null;
-
-                        return (
-                          <div key={index} className="mb-4 p-3 border rounded">
-                            <h6 className="font-weight-bold mb-3">
-                              <i className="fas fa-bell me-2"></i>
-                              {integration.name}
-                              <span className="badge text-bg-primary ms-2">{integration.type}</span>
-                            </h6>
-                            <div className="mb-3">
-                              {Object.entries(testVar.variables).map(([key, value]) => (
-                                <div key={key} className="mb-2">
-                                  <label className="mb-1 small font-weight-bold">
-                                    <code>{key}</code>
-                                  </label>
-                                  <input
-                                    type="text"
-                                    className="form-control form-control-sm"
-                                    value={value}
-                                    onChange={e => {
-                                      const updated = [...testVariables];
-                                      updated[index].variables[key] = e.target.value;
-                                      setTestVariables(updated);
-                                    }}
-                                    placeholder={`Enter value for ${key}`}
-                                  />
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </>
-                  ) : (
-                    <>
-                      <h6 className="mb-3">Test Results:</h6>
-                      {testResults.map((result, index) => {
-                        const integration = integrations.find(n => n.id === result.integration_id);
-                        return (
-                          <div
-                            key={index}
-                            className={`alert ${result.success ? 'alert-success' : 'alert-danger'} mb-2`}
-                          >
-                            <i
-                              className={`fas ${result.success ? 'fa-check-circle' : 'fa-exclamation-circle'} me-2`}
-                            ></i>
-                            <strong>{integration?.name || 'Unknown Integration'}</strong> -{' '}
-                            {result.message}
-                          </div>
-                        );
-                      })}
-                    </>
-                  )}
-                </div>
-                <div className="modal-footer">
-                  {testResults.length === 0 ? (
-                    <>
-                      <button
-                        type="button"
-                        className="btn btn-secondary"
-                        onClick={() => setShowTestModal(false)}
-                        disabled={testingIntegrations}
-                      >
-                        <i className="fas fa-times me-1"></i>
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-primary"
-                        onClick={handleSendTest}
-                        disabled={testingIntegrations}
-                      >
-                        {testingIntegrations ? (
-                          <>
-                            <i className="fas fa-spinner fa-spin me-1"></i>
-                            Sending...
-                          </>
-                        ) : (
-                          <>
-                            <i className="fas fa-paper-plane me-1"></i>
-                            Send Test Notifications
-                          </>
-                        )}
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      className="btn btn-secondary"
-                      onClick={() => setShowTestModal(false)}
-                    >
-                      <i className="fas fa-times me-1"></i>
-                      Close
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-        </>
-      )}
     </div>
   );
 };

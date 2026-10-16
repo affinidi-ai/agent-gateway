@@ -19,7 +19,7 @@ SHELL := /bin/bash
         config-certs config-debug config-debug-dev config-debug-x config-test config-release install-deps install-rust-deps verify-rust-deps install-git-hooks setup-vscode \
         docker-build-local docker-build-local-dev docker-rebuild-local docker-rebuild-local-dev docker-run docker-run-dev docker-shell docker-network \
         config-docker \
-	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
+	test test-unit test-bins test-policies test-coverage test-junit test-rust-ci npm-test npm-test-ci npm-build npm-build-ci npm-install npm-install-ci clippy clippy-ci fmt fmt-www-all fmt-check lint lint-changelog npm-lint shellcheck npm-lint-www-all npm-lint-ci check cargo-build-ci node-ci rust-ci node-local rust-local local audit-www-all audit-fix-www-all browserslist-update license-check \
         www www-dev \
         clean clean-all clear-storage clear-storage-local \
 		demo-multi-tenancy \
@@ -437,11 +437,26 @@ shellcheck: ## Lint all Bash scripts with ShellCheck (fails on warnings)
 	@shellcheck --severity=warning $$(git ls-files -- '*.sh')
 	@echo "$(GREEN)✅ ShellCheck passed!$(NC)"
 
-lint: ## Run all linters (format check + Clippy + ESLint + ShellCheck)
+lint-changelog: ## Validate changelog fragments like CI, requiring the current branch's fragment (needs python3 + PyYAML)
+	@echo "$(BLUE)📝 Validating changelog fragments...$(NC)"
+	@python3 -c 'import yaml' 2>/dev/null || { \
+		echo "$(RED)❌ PyYAML not found — install it (python3 -m pip install PyYAML)$(NC)"; \
+		exit 1; \
+	}
+	@branch="$$(git rev-parse --abbrev-ref HEAD)"; \
+	if [ "$$branch" = "main" ] || [ "$$branch" = "HEAD" ]; then \
+		python3 .github/scripts/changelog.py check; \
+	else \
+		python3 .github/scripts/changelog.py check --require "$$branch"; \
+	fi
+	@echo "$(GREEN)✅ Changelog fragments are valid!$(NC)"
+
+lint: ## Run all linters (format check + Clippy + ESLint + ShellCheck + changelog)
 	@$(MAKE) fmt-check
 	@$(MAKE) clippy
 	@$(MAKE) npm-lint
 	@$(MAKE) shellcheck
+	@$(MAKE) lint-changelog
 
 audit: ## Run security audit (manage ignores in .cargo/audit.toml)
 	@echo "$(BLUE)🔍 Running security audit...$(NC)"

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use tracing::{error, info};
+
+use super::delivery::dispatch::dispatch;
 
 /// Trigger integrations when an MPP payment verification fails
 pub async fn trigger_mpp_verification_failed(
@@ -20,7 +21,7 @@ pub async fn trigger_mpp_verification_failed(
     runtime_values.insert("ERROR_MESSAGE".to_string(), error_message.to_string());
     runtime_values.insert("SEVERITY".to_string(), "error".to_string());
 
-    trigger_mpp_integrations(&runtime_values, "mpp.verification.failed").await;
+    dispatch("mpp.verification.failed", runtime_values);
 }
 
 /// Trigger integrations when an MPP payment is verified successfully
@@ -42,7 +43,7 @@ pub async fn trigger_mpp_payment_verified(
     runtime_values.insert("REFERENCE".to_string(), reference.to_string());
     runtime_values.insert("SEVERITY".to_string(), "info".to_string());
 
-    trigger_mpp_integrations(&runtime_values, "mpp.payment.verified").await;
+    dispatch("mpp.payment.verified", runtime_values);
 }
 
 /// Trigger integrations when an MPP 402 challenge is issued
@@ -60,61 +61,5 @@ pub async fn trigger_mpp_challenge_issued(
     runtime_values.insert("RESOURCE_URL".to_string(), resource_url.to_string());
     runtime_values.insert("SEVERITY".to_string(), "info".to_string());
 
-    trigger_mpp_integrations(&runtime_values, "mpp.challenge.issued").await;
-}
-
-/// Internal helper to trigger integrations with the 'mpp' category
-async fn trigger_mpp_integrations(
-    runtime_values: &HashMap<String, String>,
-    event_type: &str,
-) {
-    // Get integration storage to list all integrations
-    let storage = match crate::storage::get_integration_storage() {
-        Some(storage) => storage,
-        None => {
-            error!("Integration storage not initialized for {}", event_type);
-            return;
-        }
-    };
-
-    // Get all integrations
-    let integrations = match storage.list().await {
-        Ok(integrations) => integrations,
-        Err(e) => {
-            error!("Failed to list integrations for {}: {}", event_type, e);
-            return;
-        }
-    };
-
-    // Filter for 'mpp' category integrations
-    let mpp_integrations: Vec<_> = integrations
-        .into_iter()
-        .filter(|i| i.status == "active" && i.category.as_deref() == Some("mpp"))
-        .collect();
-
-    if mpp_integrations.is_empty() {
-        info!("No active mpp integrations configured for {}", event_type);
-        return;
-    }
-
-    info!("Triggering {} mpp integrations for event: {}", mpp_integrations.len(), event_type);
-
-    // Execute each integration
-    for integration in mpp_integrations {
-        let subject = format!("MPP Event: {}", event_type);
-        let message = format!("MPP payment event '{}' occurred", event_type);
-
-        if let Err(e) = crate::integrations::integration_service::trigger_integration_with_variables(
-            &integration.id,
-            &subject,
-            &message,
-            runtime_values,
-        )
-        .await
-        {
-            error!("Failed to execute integration {} for {}: {}", integration.id, event_type, e);
-        } else {
-            info!("Successfully executed integration {} ({}) for {}", integration.id, integration.name, event_type);
-        }
-    }
+    dispatch("mpp.challenge.issued", runtime_values);
 }

@@ -448,14 +448,6 @@ pub struct CreateConnectionPointRequest {
     pub name: String,
     pub description: String,
     pub expiry_seconds: Option<u64>,
-    /// Optional integration ID to reference a configured integration (deprecated - use integrations array)
-    pub integration_id: Option<String>,
-    /// Template variable values for integration configuration (deprecated - use integrations array)
-    #[serde(default)]
-    pub integration_variables: serde_json::Value,
-    /// List of integration integrations (email, Slack, etc.)
-    #[serde(default)]
-    pub integrations: Vec<super::types::IntegrationIntegration>,
     /// Secret required for accepting the OOB invitation
     pub secret: String,
     #[serde(default)]
@@ -539,60 +531,6 @@ async fn load_accessible_connection_point<S: ConnectionPointStore>(
     }
     Ok((connection_point, gateway))
 }
-
-async fn validate_integration_references(
-    owner_tenant_id: Option<&str>,
-    legacy_id: Option<&str>,
-    integrations: &[super::types::IntegrationIntegration],
-    integration_store: Option<&Arc<crate::storage::IntegrationStorage>>,
-    context: &Option<Extension<PatTenantContext>>,
-    scope: &Option<Extension<PatResourceScope>>,
-) -> Result<(), (StatusCode, String)> {
-    let mut ids = integrations
-        .iter()
-        .map(|integration| {
-            integration
-                .integration_id
-                .as_str()
-        })
-        .collect::<std::collections::HashSet<_>>();
-    if let Some(legacy_id) = legacy_id {
-        ids.insert(legacy_id);
-    }
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let store = integration_store
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Integration store not configured".to_string()))?;
-    for id in ids {
-        let integration = store
-            .load(id)
-            .await
-            .map_err(|_| (StatusCode::BAD_REQUEST, "Integration reference is not accessible".to_string()))?;
-        if !can_reference(
-            owner_tenant_id,
-            integration
-                .tenant_id
-                .as_deref(),
-        ) || !scope_allows_resource(
-            resource_scope(scope),
-            tenant_context(context),
-            ResourceKind::Integrations,
-            &integration.id,
-        ) {
-            return Err((StatusCode::BAD_REQUEST, "Integration reference is not accessible".to_string()));
-        }
-        if crate::integrations::audit_integration_triggers::is_audit_integration(&integration) {
-            return Err((StatusCode::BAD_REQUEST, AUDIT_INTEGRATION_NOT_LINKABLE.to_string()));
-        }
-    }
-    Ok(())
-}
-
-/// Governance audit integrations receive only VP Audit Log records, so no
-/// connection point or gateway may trigger them.
-pub(crate) const AUDIT_INTEGRATION_NOT_LINKABLE: &str =
-    "Governance audit integrations receive only VP Audit Log records and cannot be linked";
 
 /// List all connection points
 pub async fn list_connection_points<S: ConnectionPointStore>(
@@ -686,7 +624,6 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
     Extension(network_config): Extension<std::sync::Arc<crate::config::NetworkConfig>>,
     Extension(listener_manager): Extension<std::sync::Arc<ConnectionPointListenerManager>>,
     Extension(notif_store): Extension<Option<std::sync::Arc<crate::integrations::FileSystemNotificationStore>>>,
-    Extension(integration_store): Extension<Option<Arc<crate::storage::IntegrationStorage>>>,
     #[cfg(feature = "didwebvh")] Extension(log_storage): Extension<
         Option<std::sync::Arc<dyn crate::storage::DidLogStorage>>,
     >,
@@ -755,16 +692,6 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
     {
         return Err((StatusCode::BAD_REQUEST, "Mediator reference is not accessible".to_string()));
     }
-
-    validate_integration_references(
-        gateway.tenant_id.as_deref(),
-        req.integration_id.as_deref(),
-        &req.integrations,
-        integration_store.as_ref(),
-        &context,
-        &scope,
-    )
-    .await?;
 
     info!("Mediator '{}' validated (DID: {})", mediator.name, mediator.did);
 
@@ -923,40 +850,6 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
     connection_point.did_method = req
         .did_method
         .unwrap_or_default();
-
-    // Apply integration configuration (move values instead of clone)
-    connection_point.integration_id = req.integration_id;
-    connection_point.integration_variables = req.integration_variables;
-    connection_point.integrations = req.integrations;
-
-    // Log integration configuration
-    if !connection_point
-        .integrations
-        .is_empty()
-    {
-        info!(
-            "Connection point '{}' configured with {} integration(s)",
-            connection_point.name,
-            connection_point
-                .integrations
-                .len()
-        );
-        for integration_integration in &connection_point.integrations {
-            info!("  - integration: {}", integration_integration.integration_id);
-        }
-    } else if connection_point
-        .integration_id
-        .is_some()
-    {
-        info!(
-            "Connection point '{}' configured with legacy single integration: {}",
-            connection_point.name,
-            connection_point
-                .integration_id
-                .as_ref()
-                .unwrap()
-        );
-    }
 
     debug!("Creating connection point with ID: {}", connection_point.id);
 
@@ -1350,7 +1243,6 @@ pub async fn use_connection_point<S: ConnectionPointStore>(
 pub struct UpdateConnectionPointRequest {
     pub name: Option<String>,
     pub description: Option<String>,
-    pub integration_integrations: Option<Vec<super::types::IntegrationIntegration>>,
     pub enabled: Option<bool>,
 }
 
@@ -1360,7 +1252,6 @@ pub async fn update_connection_point<S: ConnectionPointStore>(
     Extension(gateway_store): Extension<std::sync::Arc<crate::gateways::FileSystemGatewayStore>>,
     Extension(listener_manager): Extension<std::sync::Arc<ConnectionPointListenerManager>>,
     Extension(notif_store): Extension<Option<std::sync::Arc<crate::integrations::FileSystemNotificationStore>>>,
-    Extension(integration_store): Extension<Option<Arc<crate::storage::IntegrationStorage>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -1368,25 +1259,8 @@ pub async fn update_connection_point<S: ConnectionPointStore>(
 ) -> Result<Json<GatewayConnectionPoint>, (StatusCode, String)> {
     info!("Updating connection point: {}", id);
 
-    let (old_connection_point, gateway) =
+    let (old_connection_point, _gateway) =
         load_accessible_connection_point(store.as_ref(), gateway_store.as_ref(), &id, &context, &scope, true).await?;
-
-    if let Some(integrations) = req
-        .integration_integrations
-        .as_ref()
-    {
-        validate_integration_references(
-            gateway.tenant_id.as_deref(),
-            old_connection_point
-                .integration_id
-                .as_deref(),
-            integrations,
-            integration_store.as_ref(),
-            &context,
-            &scope,
-        )
-        .await?;
-    }
 
     let mut connection_point = old_connection_point.clone();
 
@@ -1403,9 +1277,6 @@ pub async fn update_connection_point<S: ConnectionPointStore>(
     }
     if let Some(description) = req.description {
         connection_point.description = description;
-    }
-    if let Some(integration_integrations) = req.integration_integrations {
-        connection_point.integrations = integration_integrations;
     }
     if let Some(enabled) = req.enabled {
         connection_point.enabled = enabled;
@@ -1898,62 +1769,9 @@ pub async fn serve_connection_point_did_witness<P: ConnectionPointStore>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AUDIT_INTEGRATION_NOT_LINKABLE, generate_connection_point_identity_webvh, load_connection_point_secrets,
-        validate_integration_references,
-    };
-    use crate::gateways::connection_points::types::IntegrationIntegration;
-    use crate::storage::{Integration, IntegrationStorage};
+    use super::{generate_connection_point_identity_webvh, load_connection_point_secrets};
     use axum::http::StatusCode;
     use std::sync::Arc;
-
-    async fn store_with(category: &str) -> (tempfile::TempDir, Arc<IntegrationStorage>, String) {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            IntegrationStorage::new(tmp.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        let integration = Integration::new(
-            "Sink".to_string(),
-            String::new(),
-            "stream".to_string(),
-            serde_json::json!({}),
-            serde_json::json!({}),
-            "active".to_string(),
-            Some(category.to_string()),
-        );
-        store
-            .save(&integration)
-            .await
-            .unwrap();
-        (tmp, store, integration.id)
-    }
-
-    fn link(integration_id: &str) -> Vec<IntegrationIntegration> {
-        vec![IntegrationIntegration {
-            integration_id: integration_id.to_string(),
-            variables: serde_json::json!({ "AUDIT_RECORD": "{\"forged\":true}" }),
-        }]
-    }
-
-    #[tokio::test]
-    async fn a_connection_point_cannot_link_an_audit_integration() {
-        let (_tmp, store, id) = store_with("audit").await;
-
-        let result = validate_integration_references(None, None, &link(&id), Some(&store), &None, &None).await;
-
-        assert_eq!(result, Err((StatusCode::BAD_REQUEST, AUDIT_INTEGRATION_NOT_LINKABLE.to_string())));
-    }
-
-    #[tokio::test]
-    async fn a_connection_point_can_link_other_integrations() {
-        let (_tmp, store, id) = store_with("connection_point").await;
-
-        let result = validate_integration_references(None, None, &link(&id), Some(&store), &None, &None).await;
-
-        assert_eq!(result, Ok(()));
-    }
 
     // === Connection Point Identity Tests ===
     /// key_0.json, key_1.json, key_2.json must be written to the storage directory.
@@ -2539,7 +2357,6 @@ mod tests {
             .layer(Extension(Arc::new(network)))
             .layer(Extension(Arc::new(listener_manager)))
             .layer(Extension(None::<Arc<crate::integrations::FileSystemNotificationStore>>))
-            .layer(Extension(None::<Arc<crate::storage::IntegrationStorage>>))
             .layer(Extension(None::<Arc<dyn crate::storage::DidLogStorage>>))
             .layer(Extension(None::<Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>));
         if let Some(tenant) = tenant {

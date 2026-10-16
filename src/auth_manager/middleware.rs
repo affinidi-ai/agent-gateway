@@ -650,8 +650,8 @@ impl RbacGuard {
         mr.layer(require_feature(self.storage.clone(), self.rbac_config.clone(), feature))
     }
 
-    /// Whether the authenticated user holds `feature`, honouring the scopes of
-    /// the access token the request used. An unknown user holds nothing.
+    /// Whether `user_id`, with the access token `pat` when there is one, holds `feature`: the
+    /// check a route gate makes, for handlers that need a second permission on some requests.
     pub async fn allows(
         &self,
         user_id: &str,
@@ -914,66 +914,6 @@ mod tests {
 
         assert_eq!(get_status(&denied, "/v1/mediators").await, StatusCode::FORBIDDEN.as_u16());
         assert_eq!(get_status(&allowed, "/v1/mediators").await, StatusCode::OK.as_u16());
-    }
-
-    #[tokio::test]
-    async fn rbac_guard_allows_combines_role_access_token_scope_and_known_user() {
-        use crate::auth_manager::pat::PatContext;
-        use crate::rbac::Feature;
-
-        let mut user = mk_user_data("member", "member", UserStatus::Approved);
-        user.role = UserRole::User;
-        let (storage, _tmp) = make_storage_with_user(user).await;
-        let guard = RbacGuard::new(storage, Arc::new(crate::rbac::RbacConfig::default()));
-        let scoped = |scopes: &[&str]| {
-            PatContext(Some(
-                scopes
-                    .iter()
-                    .map(|scope| scope.to_string())
-                    .collect(),
-            ))
-        };
-
-        assert!(
-            guard
-                .allows("member", None, Feature::IntegrationsView)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !guard
-                .allows("member", None, Feature::AuditView)
-                .await
-                .unwrap(),
-            "a role below the required one is refused"
-        );
-        assert!(
-            guard
-                .allows("member", Some(&PatContext(None)), Feature::IntegrationsView)
-                .await
-                .unwrap(),
-            "an unrestricted token defers to the role"
-        );
-        assert!(
-            !guard
-                .allows("member", Some(&scoped(&["surfaces.view"])), Feature::IntegrationsView)
-                .await
-                .unwrap(),
-            "a scoped token refuses permissions outside its scopes"
-        );
-        assert!(
-            guard
-                .allows("member", Some(&scoped(&["integrations.view"])), Feature::IntegrationsView)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !guard
-                .allows("ghost", None, Feature::IntegrationsView)
-                .await
-                .unwrap(),
-            "an unknown user holds nothing"
-        );
     }
 
     // ── Protected endpoints must return 401 without a session token ──

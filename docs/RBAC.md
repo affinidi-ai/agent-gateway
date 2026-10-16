@@ -91,12 +91,14 @@ both routers deny every request instead of serving unauthenticated. The built-in
 ## Governance Audit integrations
 
 The integration routes require `integrations.view` / `integrations.edit` / `integrations.delete`
-at the route. An integration in the `audit` category also requires `audit.view`, checked in the
-handler against the same role and PAT scopes (`RbacGuard::allows`): without it the integration is
-omitted from lists, reads return 404, and create, edit, delete and manual trigger return 403.
-Without an authenticated caller or RBAC guard, audit integrations are always refused.
-`gateways.edit` alone cannot reach one either: connection points and gateways cannot link an
-audit integration, and event triggers refuse to publish to one.
+at the route and refuse every request without an RBAC guard. Changes that decide where audit
+records go also need `audit.view`, checked in the handler
+([`api/audit_access.rs`](../src/integrations/api/audit_access.rs)): creating, changing or
+deleting an event set that holds audit events (before or after the change), an integration whose
+event set holds them, and an endpoint such an integration delivers to. Without it the request is
+refused with `403` "Audit events need the audit.view permission". `gateways.edit` alone cannot
+reach one: integrations are not linked from gateways or connection points, and audit events
+reach them only through the audit journal.
 See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
 ## Frontend use

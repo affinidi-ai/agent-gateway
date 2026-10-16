@@ -1,64 +1,22 @@
-//! The Governance Audit integration category: which integrations receive
-//! audit records, the template variables a record offers, and publishing one
-//! rendered record. Delivery order, retries and selection live in
-//! [`crate::audit`].
+//! Audit records as integration events: the template variables a record offers and
+//! publishing one record to an integration that receives it. Delivery order, retries and
+//! selection live in [`crate::audit`].
 
 use std::collections::HashMap;
 
 use anyhow::Context;
 use futures::future::BoxFuture;
 
-use crate::audit::catalog::AUDIT_EVENTS;
 use crate::delegation_vault::audit::{
     AuditCallerContext, DelegationAuditAction, DelegationAuditEvent, action_category,
 };
-use crate::storage::Integration;
+use crate::integrations::delivery::dispatch::{AuditReceiver, current_routes, deliver};
+use crate::integrations::delivery::values::event_values;
+use crate::integrations::events::find_event;
 
-/// Integration category whose integrations receive governance audit records.
-pub const AUDIT_CATEGORY: &str = "audit";
-
-/// The `audit` integration category offered in the integration configuration.
-/// Each event type is `audit.<category>`.
-pub fn audit_integration_category() -> crate::config::IntegrationCategory {
-    crate::config::IntegrationCategory {
-        enum_value: AUDIT_CATEGORY.to_string(),
-        name: "Governance Audit".to_string(),
-        description: "Sends the audit events you select, such as policy decisions, refused requests, trust checks, credential delegation and payment events, whether or not the VP Audit Log keeps them. Requires the audit.view permission.".to_string(),
-        metadata: serde_json::json!({
-            "event_types": AUDIT_EVENTS
-                .iter()
-                .map(|event| serde_json::json!({
-                    "event_type": format!("{}.{}", AUDIT_CATEGORY, event.category),
-                    "name": event.name,
-                    "description": event.description,
-                    "group": event.group,
-                }))
-                .collect::<Vec<_>>(),
-        }),
-    }
-}
-
-/// Whether the integration belongs to the governance audit category.
-pub fn is_audit_integration(integration: &Integration) -> bool {
-    integration
-        .category
-        .as_deref()
-        == Some(AUDIT_CATEGORY)
-}
-
-/// Audit records carry appliance-wide evidence, so only active integrations
-/// without a tenant owner receive them, whatever their type.
-pub(crate) fn receives_audit_records(integration: &Integration) -> bool {
-    is_audit_integration(integration)
-        && integration.status == "active"
-        && integration
-            .tenant_id
-            .is_none()
-}
-
-/// `audit.<category>`, e.g. `audit.policy_decision`.
+/// The catalog event of an audit record: `audit.<category>`, e.g. `audit.policy_decision`.
 pub fn audit_event_type(event: &DelegationAuditEvent) -> String {
-    format!("{}.{}", AUDIT_CATEGORY, action_category(&event.event))
+    format!("audit.{}", action_category(&event.event))
 }
 
 /// Runtime variables describing one audit record.
@@ -153,83 +111,74 @@ fn principal(caller: &AuditCallerContext) -> String {
         .unwrap_or_default()
 }
 
-/// One audit record, rendered once and shared by every subscribed integration.
+/// One audit record's delivery values, computed once and shared by every subscribed
+/// integration.
 #[derive(Debug, Clone)]
 pub(crate) struct AuditDelivery {
-    subject: String,
-    message: String,
-    variables: HashMap<String, String>,
+    values: HashMap<String, String>,
 }
 
 impl AuditDelivery {
-    pub(crate) fn subject(&self) -> &str {
-        &self.subject
-    }
-
-    pub(crate) fn message(&self) -> &str {
-        &self.message
-    }
-
-    pub(crate) fn variables(&self) -> &HashMap<String, String> {
-        &self.variables
+    pub(crate) fn values(&self) -> &HashMap<String, String> {
+        &self.values
     }
 
     pub(crate) fn from_event(event: &DelegationAuditEvent) -> Self {
-        let event_type = audit_event_type(event);
-        Self {
-            subject: format!("Governance Audit: {}", event_type),
-            message: format!("Governance audit record '{}' written", event_type),
-            variables: audit_variables(event),
-        }
+        let variables = audit_variables(event);
+        let values = match find_event(&audit_event_type(event)) {
+            Some(catalog_event) => {
+                event_values(catalog_event, variables, crate::storage::settings_store::global_appliance_id_override())
+            }
+            None => variables,
+        };
+        Self { values }
     }
 }
 
-/// The integration no longer receives audit records: it was disabled, given a
-/// tenant or moved out of the Governance Audit category.
+/// The integration no longer receives audit records: it was disabled, its endpoint was
+/// disabled, or its event set no longer holds audit events.
 #[derive(Debug, thiserror::Error)]
 #[error("integration {0} no longer receives audit records")]
 pub(crate) struct NotReceiving(String);
 
-/// Publishes one rendered record to a Governance Audit integration, counted in
-/// `agent_gateway_audit_forward_total`. An integration that no longer
-/// receives audit records refuses it with [`NotReceiving`], counted as
-/// `not_receiving`, so it is never reported as delivered: its reader retries
-/// until the dispatcher pauses the sink, which lets the record go and counts
-/// it as paused.
+/// Publishes one record to an integration that receives audit records, counted in
+/// `agent_gateway_audit_forward_total`. An integration that no longer receives them refuses
+/// it with [`NotReceiving`], counted as `not_receiving`, so it is never reported as
+/// delivered: its reader retries until the dispatcher pauses the sink, which lets the record
+/// go and counts it as paused.
 pub(crate) fn publish_audit_delivery(
     integration_id: String,
     delivery: AuditDelivery,
 ) -> BoxFuture<'static, anyhow::Result<()>> {
-    use crate::integrations::integration_service::load_integration;
-
     Box::pin(async move {
-        let integration = load_integration(&integration_id)
+        let routes = current_routes()
             .await
             .with_context(|| format!("loading audit integration {integration_id}"))?;
-        publish_audit_record(&integration, &delivery).await
+        publish_audit_record(routes.audit_receiver(&integration_id), &integration_id, &delivery).await
     })
 }
 
-/// [`publish_audit_delivery`] for an integration already loaded.
+/// [`publish_audit_delivery`] for the integration's audit route, `None` when it no longer
+/// receives audit records.
 async fn publish_audit_record(
-    integration: &Integration,
+    receiver: Option<AuditReceiver>,
+    integration_id: &str,
     delivery: &AuditDelivery,
 ) -> anyhow::Result<()> {
-    use crate::integrations::integration_service::publish_to_integration;
     use crate::metrics::backends::prometheus::track_audit_forward;
 
-    if !receives_audit_records(integration) {
-        track_audit_forward("not_receiving", Some(&integration.id));
-        return Err(NotReceiving(integration.id.clone()).into());
-    }
-    match publish_to_integration(integration, delivery.subject(), delivery.message(), delivery.variables()).await {
+    let Some(receiver) = receiver else {
+        track_audit_forward("not_receiving", Some(integration_id));
+        return Err(NotReceiving(integration_id.to_string()).into());
+    };
+    match deliver(&receiver.route, delivery.values()).await {
         Ok(()) => {
-            track_audit_forward("delivered", Some(&integration.id));
+            track_audit_forward("delivered", Some(integration_id));
             Ok(())
         }
         Err(e) => {
-            track_audit_forward("failed", Some(&integration.id));
-            Err(anyhow::Error::from(e).context(format!("publishing to audit integration {}", integration.id)))
+            track_audit_forward("failed", Some(integration_id));
+            Err(e.context(format!("publishing to audit integration {integration_id}")))
         }
     }
 }
@@ -243,24 +192,6 @@ mod tests {
     };
     use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, PaymentStage, audit_event};
     use std::collections::HashSet;
-
-    fn integration(
-        category: Option<&str>,
-        status: &str,
-        tenant_id: Option<&str>,
-    ) -> Integration {
-        let mut integration = Integration::new(
-            "Audit stream".to_string(),
-            String::new(),
-            "stream".to_string(),
-            serde_json::json!({"platform": "kafka", "topic": "audit"}),
-            serde_json::json!({}),
-            status.to_string(),
-            category.map(str::to_string),
-        );
-        integration.tenant_id = tenant_id.map(str::to_string);
-        integration
-    }
 
     fn policy_decision(decision: &str) -> DelegationAuditEvent {
         let mut event = audit_event(
@@ -325,20 +256,33 @@ mod tests {
     #[tokio::test]
     async fn an_integration_that_no_longer_receives_audit_records_refuses_the_record() {
         let delivery = AuditDelivery::from_event(&policy_decision("allow"));
-        for stopped in [
-            integration(Some(AUDIT_CATEGORY), "disabled", None),
-            integration(Some(AUDIT_CATEGORY), "active", Some("tenant-a")),
-            integration(Some("general"), "active", None),
-        ] {
-            let error = publish_audit_record(&stopped, &delivery)
-                .await
-                .unwrap_err();
+        let stopped = uuid::Uuid::new_v4().to_string();
 
-            assert!(error.is::<NotReceiving>(), "{error:#}");
-            assert_eq!(forwards("not_receiving", &stopped.id), 1);
-            assert_eq!(forwards("failed", &stopped.id), 0);
-            assert_eq!(forwards("delivered", &stopped.id), 0);
-        }
+        let error = publish_audit_record(None, &stopped, &delivery)
+            .await
+            .unwrap_err();
+
+        assert!(error.is::<NotReceiving>(), "{error:#}");
+        assert_eq!(forwards("not_receiving", &stopped), 1);
+        assert_eq!(forwards("failed", &stopped), 0);
+        assert_eq!(forwards("delivered", &stopped), 0);
+    }
+
+    #[test]
+    fn a_delivery_carries_the_record_and_the_event_name_summary_and_data() {
+        let event = policy_decision("deny");
+
+        let delivery = AuditDelivery::from_event(&event);
+
+        let values = delivery.values();
+        assert_eq!(values["EVENT_TYPE"], "audit.policy_decision");
+        assert_eq!(values["EVENT_NAME"], "Policy Decision");
+        assert_eq!(
+            values["EVENT_SUMMARY"],
+            "Policy Decision on surface Billing agent: deny by policy Deny unknown callers (caller not recognised) for ada@example.com"
+        );
+        assert_eq!(values["EVENT_DATA"], values["AUDIT_RECORD"]);
+        assert_eq!(values["AUDIT_DECISION"], "deny");
     }
 
     #[test]
@@ -462,10 +406,12 @@ mod tests {
         let produced: HashSet<String> = audit_variables(&policy_decision("deny"))
             .into_keys()
             .collect();
-        let offered: HashSet<String> =
-            crate::integrations::runtime_variables::get_variable_names_for_category(AUDIT_CATEGORY)
-                .into_iter()
-                .collect();
+        let offered: HashSet<String> = find_event("audit.policy_decision")
+            .expect("catalog event")
+            .variables
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
 
         let unregistered: Vec<_> = produced
             .difference(&offered)
@@ -479,29 +425,6 @@ mod tests {
             .difference(&produced)
             .collect();
         assert!(never_set.is_empty(), "offered variables that are never set: {never_set:?}");
-    }
-
-    #[test]
-    fn only_active_appliance_wide_audit_integrations_receive_records() {
-        assert!(receives_audit_records(&integration(Some("audit"), "active", None)));
-
-        assert!(!receives_audit_records(&integration(Some("audit"), "disabled", None)));
-        assert!(!receives_audit_records(&integration(Some("audit"), "active", Some("tenant-a"))));
-        assert!(!receives_audit_records(&integration(Some("gateway"), "active", None)));
-        assert!(!receives_audit_records(&integration(None, "active", None)));
-
-        for integration_type in ["stream", "webhook", "email", "slack"] {
-            let mut typed = integration(Some("audit"), "active", None);
-            typed.integration_type = integration_type.to_string();
-            assert!(receives_audit_records(&typed), "{integration_type}");
-        }
-    }
-
-    #[test]
-    fn is_audit_integration_matches_the_category_only() {
-        assert!(is_audit_integration(&integration(Some("audit"), "disabled", Some("tenant-a"))));
-        assert!(!is_audit_integration(&integration(Some("x402"), "active", None)));
-        assert!(!is_audit_integration(&integration(None, "active", None)));
     }
 
     /// Adding a `DelegationAuditAction` variant fails this match until the
@@ -629,22 +552,8 @@ mod tests {
         ]
     }
 
-    fn category_event_types(category: &crate::config::IntegrationCategory) -> Vec<String> {
-        category.metadata["event_types"]
-            .as_array()
-            .expect("the audit category lists its event types")
-            .iter()
-            .map(|event| {
-                event["event_type"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect()
-    }
-
     #[test]
-    fn audit_category_lists_every_audit_record_category_the_gateway_produces() {
+    fn the_event_catalog_lists_every_audit_record_category_the_gateway_produces() {
         let unproduced = ["delegation_failed", "request_failed", "request_completed"];
         let actions = every_action();
         actions
@@ -657,65 +566,25 @@ mod tests {
             .map(|category| format!("audit.{category}"))
             .collect();
 
-        let category = audit_integration_category();
-        let listed_types = category_event_types(&category);
-        let listed_set: HashSet<String> = listed_types
+        let listed_ids: HashSet<String> = crate::integrations::events::catalog()
             .iter()
-            .cloned()
+            .filter(|event| event.family == "audit")
+            .map(|event| event.id.clone())
             .collect();
 
-        assert_eq!(category.enum_value, "audit");
-        assert_eq!(listed_types.len(), listed_set.len(), "event types are unique");
-        assert_eq!(listed_set, produced, "every audit record category has exactly one event type");
+        assert_eq!(listed_ids, produced, "every audit record category has exactly one catalog event");
     }
 
     #[test]
-    fn audit_category_lists_the_group_of_each_event_type() {
-        let category = audit_integration_category();
-        let events = category.metadata["event_types"]
-            .as_array()
-            .unwrap();
-        let group_of = |event_type: &str| {
-            events
-                .iter()
-                .find(|event| event["event_type"] == event_type)
-                .and_then(|event| event["group"].as_str())
-                .map(str::to_string)
-        };
-        assert_eq!(group_of("audit.policy_decision").as_deref(), Some("policies"));
-        assert_eq!(group_of("audit.token_injected").as_deref(), Some("delegation"));
+    fn every_audit_event_sits_in_its_audit_group() {
+        let group_of = |id: &str| find_event(id).and_then(|event| event.group);
+        assert_eq!(group_of("audit.policy_decision"), Some("policies"));
+        assert_eq!(group_of("audit.token_injected"), Some("delegation"));
         assert!(
-            events
+            crate::integrations::events::catalog()
                 .iter()
-                .all(|event| event["group"].is_string())
-        );
-    }
-
-    #[test]
-    fn example_gateway_config_carries_the_built_in_audit_category() {
-        let example: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/config/examples/gateway.example.json"
-        )))
-        .unwrap();
-        let shipped = example["integration"]["categories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|category| category["enum_value"] == AUDIT_CATEGORY)
-            .expect("gateway.example.json offers the audit category");
-
-        assert_eq!(*shipped, serde_json::to_value(audit_integration_category()).unwrap());
-    }
-
-    #[test]
-    fn default_integration_config_offers_the_audit_category() {
-        let config = crate::config::IntegrationConfig::default_config();
-        assert!(
-            config
-                .categories
-                .iter()
-                .any(|category| category.enum_value == AUDIT_CATEGORY)
+                .filter(|event| event.family == "audit")
+                .all(|event| event.group.is_some())
         );
     }
 }

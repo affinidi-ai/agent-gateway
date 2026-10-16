@@ -1,0 +1,175 @@
+branch: change-integration-ui
+changes:
+  added:
+    - timestamp: '2026-10-15T16:00:00.000Z'
+      title: ⭐ Manage integrations, endpoints and event sets from one Integrations page
+      description: >-
+        The Integrations page has three tabs. Endpoints show the fields of their type, keep
+        stored secrets hidden and can point a secret field at a stored secret. Event sets pick
+        events from the whole catalog with search. The integration editor joins an endpoint
+        and an event set, writes the template with the event set's variables, sets the audit
+        delivery limits when audit events are picked, and sends a test as it stands. Endpoints
+        and event sets in use name their integrations instead of being deleted.
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Send test messages through an endpoint or an integration, saved or not
+      description: >-
+        POST /v1/integrations/endpoints/{id}/test sends the endpoint's default message,
+        POST /v1/integrations/{id}/test sends a saved integration's message for the first event
+        of its event set with sample values, and POST /v1/integrations/test does the same for an
+        integration not saved yet. A failed send answers 502 with the reason.
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Give every integration message the event's name, summary and data
+      description: >-
+        Templates can use EVENT_NAME, EVENT_SUMMARY (one line on what happened) and EVENT_DATA
+        (the event's values, or the audit record, as JSON). A template that leaves fields out
+        gets the endpoint type's defaults, so an empty template sends a complete message.
+    - timestamp: '2026-10-14T09:03:25.000Z'
+      title: List every event integrations can deliver in one catalog
+      description: >-
+        GET /v1/integrations/catalog lists every delivered gateway, user, connection point,
+        x402, MPP and Governance Audit event with its family, audit group and the template
+        variables its delivery fills, plus the placeholder syntax and each endpoint type's
+        secret fields.
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Reference stored secrets from integration endpoints
+      description: >-
+        An endpoint secret field may hold $SECRET:<secret_id>, resolved from the appliance-wide
+        secrets store at each delivery, so one credential can serve several endpoints.
+  changed:
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Deliver every event to the integrations whose event set holds it
+      description: >-
+        Gateway, user, connection point, x402 and MPP events go to every active integration
+        with an active endpoint whose event set holds the event, from every resource, and
+        Governance Audit records go to every integration whose event set holds their audit
+        event. A placeholder with no value now renders empty instead of staying in the message.
+    - timestamp: '2026-10-15T16:00:00.000Z'
+      title: Guard the Integrations pages with the integrations permissions
+      description: >-
+        The Integrations sidebar item and pages need integrations.view, the editors and test
+        sends integrations.edit and deleting integrations.delete, instead of the MCP proxy
+        permissions. The editors move to /integrations/new and /integrations/{id}, and the
+        Audit page's Forward records starts an event set of every audit event.
+  fixed:
+    - timestamp: '2026-10-16T15:00:00.000Z'
+      title: Disable integration changes the gateway refuses without audit.view
+      description: >-
+        Without audit.view, the integration editor's Save and Send test for an integration
+        receiving audit events, the endpoint editor's Save for an endpoint such an integration
+        uses, and Delete for audit integrations and event sets are disabled with the reason,
+        instead of failing with 403 when clicked.
+    - timestamp: '2026-10-16T14:00:00.000Z'
+      title: Report stored integration definitions that fail their checks at startup
+      description: >-
+        Each node checks the stored endpoints, event sets and integrations when it starts and
+        logs a warning for each that fails, such as an endpoint whose secret is missing after
+        a restore or an integration whose event set is gone, plus a summary with the counts.
+        Nothing is changed.
+    - timestamp: '2026-10-16T13:00:00.000Z'
+      title: Refuse to delete a secret an integration endpoint references
+      description: >-
+        Deleting a secret that an endpoint's secret field or webhook header names as
+        $SECRET:<secret_id> left every delivery to that endpoint failing. The delete now answers
+        409 naming the endpoints, and the Secrets page shows why a delete failed.
+    - timestamp: '2026-10-16T12:00:00.000Z'
+      title: Deliver an event to each integration without waiting for the others
+      description: >-
+        The integrations of one event were delivered one after another, so an endpoint that
+        was slow or unreachable, retrying for up to 30 seconds per attempt, delayed every other
+        integration of that event. Each integration is now delivered on its own.
+    - timestamp: '2026-10-16T11:00:00.000Z'
+      title: Share one Kafka producer per endpoint
+      description: >-
+        Kafka producers were kept per integration, so every test send built a new client with
+        its own broker connections, and integrations on one endpoint each held their own. The
+        producer now belongs to the endpoint and is dropped when the endpoint is changed or
+        deleted.
+    - timestamp: '2026-10-16T09:00:00.000Z'
+      title: Stop a VP Audit Log write from landing after the audit pipeline stops
+      description: >-
+        A write cancelled while the pipeline stopped could still land afterwards, after the
+        next pipeline had read the log's recent event ids, so the record was written twice
+        after a step-down and restart. Stopping now waits for that write or refuses it, so
+        the record is written once.
+    - timestamp: '2026-10-15T16:00:00.000Z'
+      title: Refuse webhook headers and methods an endpoint cannot send
+      description: >-
+        Webhook headers that are not an object of strings, including a $SECRET: reference as
+        the whole field, headers the gateway sets itself (Content-Type, X-Webhook-Timestamp,
+        X-Webhook-Signature-256) and methods other than POST, PUT and PATCH are refused when
+        the endpoint is saved. A stored endpoint with one of those headers sends it once, with
+        the gateway's value, instead of twice, which broke signature checks and body parsing.
+  removed:
+    - timestamp: '2026-10-15T16:00:00.000Z'
+      title: Remove integration tabs from gateway, connection point, user and identity pages
+      description: >-
+        An integration receives every event of its event set from every resource, so the
+        dashboard no longer attaches integrations to gateways, connection points, users or
+        identities, and the connection point wizard has no integrations step.
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Remove integration categories and custom variables from gateway.json
+      description: >-
+        The integration section keeps only variable_pattern and variable_pattern_description;
+        categories, their variable lists and custom_variable_prefix are gone, and
+        storage_paths.integrations and storage_paths.integration_triggers are replaced by
+        integration_endpoints, integration_event_sets and integration_definitions. The two old
+        keys are still read, with a deprecation warning, only to migrate from them.
+    - timestamp: '2026-10-15T10:35:00.000Z'
+      title: Stop reassigning integrations to tenants
+      description: >-
+        Integrations belong to the whole appliance, so the tenant ownership API refuses the
+        integrations kind with 400 instead of moving one to a tenant.
+    - timestamp: '2026-10-15T09:55:00.000Z'
+      title: Remove per-resource integration attachments
+      description: >-
+        /v1/gateways/{id}/integrations, /v1/users/integrations and /v1/identities/integrations
+        are gone, and connection points no longer take integration_id, integration_variables or
+        integrations. An integration receives every event its event set holds, from every
+        resource, and custom _ variables are gone with the attachments that held their values.
+    - timestamp: '2026-10-15T08:16:21.000Z'
+      title: Remove the integration trigger, config and runtime-variables routes
+      description: >-
+        /v1/integrations/{id}/trigger and /v1/integrations/trigger-multiple,
+        GET /v1/integrations/config and /v1/integrations/runtime-variables are gone; GET
+        /v1/integrations/catalog lists the events, template variables and endpoint types
+        instead. POST /v1/integrations/test now takes an integration that joins an endpoint and
+        an event set.
+  security:
+    - timestamp: '2026-10-15T13:20:00.000Z'
+      title: Escape event values in HTML integration emails
+      description: >-
+        Values filled into an HTML email body have &, <, >, " and ' escaped, so caller-supplied
+        text such as a user name cannot add markup or links to the message. The template itself
+        is not escaped.
+    - timestamp: '2026-10-15T08:16:21.000Z'
+      title: Never return integration endpoint credentials from the API
+      description: >-
+        SMTP passwords, Slack webhook URLs, webhook signing secrets and headers, and stream SASL
+        passwords, Redis URLs and Pulsar auth tokens are write-only: responses name the secrets set but never their
+        values, so the user role's integrations.view no longer reveals credentials.
+    - timestamp: '2026-10-15T08:16:21.000Z'
+      title: Refuse tenant and resource-scoped tokens on the integrations API
+      description: >-
+        Integrations, endpoints and event sets belong to the whole appliance, so every
+        /v1/integrations route answers 403 to a tenant or resource-scoped access token.
+  breaking:
+    - timestamp: '2026-10-16T16:00:00.000Z'
+      title: Migrate existing integrations to endpoints and event sets on upgrade
+      description: >-
+        On its first start the Active node turns each integration into an endpoint, an event
+        set of the events it received and an integration, with the same id, writes
+        _storage/integrations/migration-report-<unix seconds>.json and renames the old
+        directories to <dir>.migrated-<unix seconds>, deleted 30 days later as they may hold
+        plain-text credentials. Upgrade both nodes of a pair before the Active node starts; a
+        Standby migrates when promoted. Attachments to some gateways or connection points now
+        receive every resource's events, custom _ variables and unfilled placeholders leave the
+        templates, and endpoints failing the current checks are written disabled; the report
+        names each change. See the INTEGRATIONS upgrade section.
+    - timestamp: '2026-10-15T08:16:21.000Z'
+      title: ⭐ Manage integrations as an endpoint plus an event set
+      description: >-
+        /v1/integrations now keeps integrations that join one endpoint
+        (/v1/integrations/endpoints: transport, destination, credentials) and one event set
+        (/v1/integrations/event-sets: events picked from the whole catalog), with the template on
+        the integration. Categories and tenant owners are gone. Changing an event set that holds
+        audit events, an integration receiving them, or its endpoint needs audit.view as well.

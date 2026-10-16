@@ -4,8 +4,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::storage::Integration;
-
 mod email;
 mod slack;
 mod stream;
@@ -15,6 +13,52 @@ pub use email::EmailPublisher;
 pub use slack::SlackPublisher;
 pub use stream::StreamPublisher;
 pub use webhook::WebhookPublisher;
+pub(crate) use webhook::reserved_header;
+
+use crate::integrations::delivery::render::Escaping;
+
+/// One integration's message, rendered and ready to send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    pub integration_id: String,
+    pub integration_name: String,
+    /// The endpoint it is sent through, which owns connections kept between messages.
+    pub endpoint_id: String,
+    pub content: Value,
+}
+
+/// Whether an integration left its template empty.
+fn is_empty_template(template: &Value) -> bool {
+    template
+        .as_object()
+        .is_none_or(|fields| fields.is_empty())
+}
+
+/// What a webhook or stream integration sends when its template is empty.
+fn event_envelope() -> Value {
+    serde_json::json!({
+        "event_type": "${EVENT_TYPE}",
+        "event_name": "${EVENT_NAME}",
+        "timestamp": "${TIMESTAMP}",
+        "appliance_id": "${APPLIANCE_ID}",
+        "summary": "${EVENT_SUMMARY}",
+        "data": "${EVENT_DATA}"
+    })
+}
+
+/// `template` with each field of `defaults` it leaves out.
+fn with_defaults(
+    template: &Value,
+    defaults: Value,
+) -> Value {
+    let mut completed = defaults;
+    if let (Some(completed), Some(fields)) = (completed.as_object_mut(), template.as_object()) {
+        for (name, value) in fields {
+            completed.insert(name.clone(), value.clone());
+        }
+    }
+    completed
+}
 
 /// Trait for integration publishing implementations
 #[async_trait]
@@ -43,39 +87,27 @@ pub trait IntegrationPublisher: Send + Sync {
         Ok(())
     }
 
-    /// Validate content template
-    fn validate_content(
+    /// The template an integration sends with: its own, completed with whatever the
+    /// transport needs that it leaves out.
+    fn complete_template(
         &self,
-        _content: &Value,
-    ) -> Result<()> {
-        Ok(())
+        template: &Value,
+    ) -> Value;
+
+    /// How values are escaped when `template` is rendered.
+    fn escaping(
+        &self,
+        _template: &Value,
+    ) -> Escaping {
+        Escaping::None
     }
 
-    /// Publish a notification through the integration
-    async fn publish(
+    /// Sends a rendered message with an endpoint's configuration.
+    async fn send(
         &self,
-        integration: &Integration,
-        subject: &str,
-        message: &str,
-        variables: &HashMap<String, String>,
+        configuration: &Value,
+        message: &Message,
     ) -> Result<()>;
-
-    /// Publish multiple notifications in batch (default: sequential)
-    #[allow(dead_code)]
-    async fn publish_batch(
-        &self,
-        integration: &Integration,
-        items: Vec<(&str, &str, &HashMap<String, String>)>,
-    ) -> Result<Vec<Result<()>>> {
-        let mut results = Vec::new();
-        for (subject, message, variables) in items {
-            results.push(
-                self.publish(integration, subject, message, variables)
-                    .await,
-            );
-        }
-        Ok(results)
-    }
 }
 
 /// Registry for managing integration publishers

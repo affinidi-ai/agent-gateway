@@ -11,8 +11,9 @@ use std::sync::Arc;
 use tracing::error;
 
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
+use crate::integrations::definitions::DefinitionStores;
 use crate::tenancy::{
-    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+    PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
 };
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
@@ -242,11 +243,12 @@ pub async fn update_secret(
     }
 }
 
-/// Delete a secret
+/// Delete a secret, unless an integration endpoint references it
 pub async fn delete_secret(
     State(store): State<Arc<dyn SecretsStore>>,
     Extension(notification_store): Extension<Option<Arc<crate::integrations::FileSystemNotificationStore>>>,
     Extension(secrets_cache): Extension<Option<crate::a2a::auth::SecretsCache>>,
+    Extension(definitions): Extension<Option<Arc<DefinitionStores>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -268,6 +270,29 @@ pub async fn delete_secret(
             Json(serde_json::json!({ "message": "Secret is outside this token's permitted scope" })),
         )
             .into_response();
+    }
+    // Endpoints resolve appliance-wide secrets only, so only those can be in use.
+    if let Some(definitions) = definitions
+        && can_reference(None, secret.tenant_id.as_deref())
+    {
+        match definitions
+            .endpoints_referencing(&secret.secret_id)
+            .await
+        {
+            Ok(endpoints) if endpoints.is_empty() => {}
+            Ok(endpoints) => {
+                let names: Vec<String> = endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.name)
+                    .collect();
+                let message = format!("The secret is used by these integration endpoints: {}", names.join(", "));
+                return (StatusCode::CONFLICT, Json(serde_json::json!({ "message": message }))).into_response();
+            }
+            Err(e) => {
+                error!("Failed to check the integration endpoints using secret {}: {}", id, e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
+            }
+        }
     }
 
     match store.delete(&id).await {
@@ -595,6 +620,7 @@ mod tests {
             State(store),
             Extension(None),
             Extension(None),
+            Extension(None),
             Path("internal-1".to_string()),
             tenant_a(),
             scope,
@@ -688,6 +714,87 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
         );
+    }
+
+    /// Definitions with a webhook endpoint whose Authorization header references `secret_id`.
+    async fn endpoint_referencing(
+        dir: &std::path::Path,
+        secret_id: &str,
+    ) -> Arc<DefinitionStores> {
+        let stores = DefinitionStores::open(&dir.join("endpoints"), &dir.join("event_sets"), &dir.join("integrations"))
+            .await
+            .expect("stores");
+        let endpoint = crate::integrations::definitions::Endpoint::new(
+            "Ops webhook".to_string(),
+            String::new(),
+            crate::integrations::definitions::EndpointType::Webhook,
+            serde_json::json!({
+                "url": "https://93.184.215.14/hook",
+                "headers": {"Authorization": format!("$SECRET:{secret_id}")}
+            }),
+        );
+        stores
+            .endpoints
+            .save(&endpoint)
+            .await
+            .expect("save endpoint");
+        Arc::new(stores)
+    }
+
+    async fn delete_with_definitions(
+        store: Arc<dyn SecretsStore>,
+        definitions: Arc<DefinitionStores>,
+    ) -> (StatusCode, String) {
+        let response = delete_secret(
+            State(store),
+            Extension(None),
+            Extension(None),
+            Extension(Some(definitions)),
+            Path("internal-1".to_string()),
+            None,
+            None,
+        )
+        .await
+        .into_response();
+        status_and_body(response).await
+    }
+
+    #[tokio::test]
+    async fn a_secret_an_endpoint_references_is_not_deleted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let recording = recording_store(None);
+
+        let (status, body) =
+            delete_with_definitions(recording.clone(), endpoint_referencing(dir.path(), "billing_api_key").await).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("Ops webhook"), "{body}");
+        assert_eq!(
+            recording
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_secret_no_endpoint_can_reference_is_deleted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Another secret is referenced, and a tenant's secret is never resolved for an endpoint.
+        for (tenant_id, referenced) in [(None, "other_key"), (Some("tenant-a"), "billing_api_key")] {
+            let recording = recording_store(tenant_id);
+            let definitions = endpoint_referencing(&dir.path().join(referenced), referenced).await;
+
+            let (status, _) = delete_with_definitions(recording.clone(), definitions).await;
+
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert_eq!(
+                recording
+                    .writes
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+        }
     }
 
     #[tokio::test]
