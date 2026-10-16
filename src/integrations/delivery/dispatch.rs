@@ -311,11 +311,7 @@ pub fn dispatch(
         warn!(event_id, "Not dispatching an event outside the integration catalog");
         return;
     };
-    let values = Arc::new(event_values(
-        event,
-        trigger,
-        crate::storage::settings_store::global_appliance_id_override(),
-    ));
+    let values = Arc::new(event_values(event, trigger, crate::storage::settings_store::global_appliance_id_override()));
     spawn_background_task(event_id, async move {
         let routes = match current_routes().await {
             Ok(routes) => routes,
