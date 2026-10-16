@@ -15,9 +15,13 @@ use crate::tenancy::PatTenantContext;
 
 pub const ADMIN: &str = "admin-1";
 pub const VIEWER: &str = "viewer-1";
+/// May change integrations but not view audit records (`integrations.edit` and
+/// `integrations.delete` without `audit.view`).
+pub const EDITOR: &str = "editor-1";
 
-/// Stores in a temporary directory and the default RBAC roles: viewers may read
-/// integrations, only administrators may change them.
+/// Stores in a temporary directory and the default RBAC roles, with power users also allowed
+/// to change and delete integrations: viewers may read integrations, editors may change them
+/// but hold no `audit.view`, administrators may do everything.
 pub struct Fixture {
     pub stores: Arc<DefinitionStores>,
     guard: RbacGuard,
@@ -79,7 +83,9 @@ impl Fixture {
         )
         .await
         .expect("users");
-        for (user_id, role) in [(ADMIN, UserRole::Administrator), (VIEWER, UserRole::User)] {
+        for (user_id, role) in
+            [(ADMIN, UserRole::Administrator), (VIEWER, UserRole::User), (EDITOR, UserRole::PowerUser)]
+        {
             let now = chrono::Utc::now();
             users
                 .save_user(&UserData {
@@ -103,9 +109,14 @@ impl Fixture {
                 .await
                 .expect("save user");
         }
+        let mut rbac = RbacConfig::default();
+        for feature in ["integrations.edit", "integrations.delete"] {
+            rbac.permissions
+                .insert(feature.to_string(), "poweruser".to_string());
+        }
         Self {
             stores: Arc::new(stores),
-            guard: RbacGuard::new(Arc::new(users), Arc::new(RbacConfig::default())),
+            guard: RbacGuard::new(Arc::new(users), Arc::new(rbac)),
             _dir: dir,
         }
     }

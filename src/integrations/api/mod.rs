@@ -32,7 +32,7 @@ pub fn router(
     use send_test::{test_draft, test_endpoint, test_integration};
 
     let gate = |route: MethodRouter, feature: Feature| -> MethodRouter { maybe_gate(guard.as_ref(), route, feature) };
-    Router::new()
+    let router = Router::new()
         .route("/v1/integrations", gate(get(list_integrations), Feature::IntegrationsView))
         .route("/v1/integrations", gate(post(create_integration), Feature::IntegrationsEdit))
         .route("/v1/integrations/{id}", gate(get(get_integration), Feature::IntegrationsView))
@@ -53,7 +53,12 @@ pub fn router(
         .route("/v1/integrations/event-sets/{id}", gate(put(update_event_set), Feature::IntegrationsEdit))
         .route("/v1/integrations/event-sets/{id}", gate(delete(delete_event_set), Feature::IntegrationsDelete))
         .layer(axum::middleware::from_fn(appliance_wide_only))
-        .layer(Extension(stores))
+        .layer(Extension(stores));
+    // Handlers check `audit.view` themselves for changes that touch audit events.
+    match guard {
+        Some(guard) => router.layer(Extension(guard)),
+        None => router,
+    }
 }
 
 pub type ApiError = (StatusCode, String);
@@ -192,6 +197,7 @@ async fn get_catalog() -> Json<Catalog> {
     })
 }
 
+pub mod audit_access;
 pub mod endpoints;
 pub mod event_sets;
 pub mod integrations;

@@ -26,12 +26,12 @@ const ENTRIES: PickerEntry[] = [
   },
 ];
 
-function Harness({ initial = [] as string[] }) {
+function Harness({ initial = [] as string[], entries = ENTRIES }) {
   const [selected, setSelected] = useState<string[]>(initial);
   return (
     <>
       <GroupedEventPicker
-        entries={ENTRIES}
+        entries={entries}
         selected={selected}
         onChange={setSelected}
         testIdPrefix="picker"
@@ -94,4 +94,26 @@ test('says how many events are selected', () => {
   render(<Harness initial={['user.login', 'gateway.created']} />);
 
   expect(screen.getByText('2 of 3 events selected')).toBeInTheDocument();
+});
+
+test('a disabled entry cannot be toggled, alone or through its group', () => {
+  const entries = ENTRIES.map(entry =>
+    entry.key === 'gateway.deleted' ? { ...entry, disabled: true } : entry
+  );
+  render(<Harness entries={entries} initial={['gateway.deleted']} />);
+
+  expect(screen.getByLabelText(/gateway deleted/i)).toBeDisabled();
+  fireEvent.click(screen.getByTestId('picker-group-gateway'));
+
+  expect(selected()).toBe('gateway.deleted,gateway.created');
+});
+
+test('a group of only disabled entries has a disabled toggle', () => {
+  const entries = ENTRIES.map(entry =>
+    entry.group === 'user' ? { ...entry, disabled: true } : entry
+  );
+  render(<Harness entries={entries} />);
+
+  expect(screen.getByTestId('picker-group-user')).toBeDisabled();
+  expect(screen.getByTestId('picker-group-gateway')).toBeEnabled();
 });

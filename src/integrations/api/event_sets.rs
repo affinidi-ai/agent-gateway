@@ -6,6 +6,7 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use tracing::info;
 
+use super::audit_access::{AuditAccess, event_set_holds_audit, holds_audit_events};
 use super::{
     ApiError, DefinitionStores, caller_id, definitions_changed, integrations_using, internal_error, not_found,
     refuse_while_used, require_known_id, validate_text,
@@ -46,8 +47,12 @@ pub async fn get_event_set(
 pub async fn create_event_set(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
+    access: AuditAccess,
     Json(request): Json<EventSetRequest>,
 ) -> Result<(StatusCode, Json<EventSet>), ApiError> {
+    access
+        .require_if(holds_audit_events(&request.events))
+        .await?;
     let (name, description) = validate_text(&request.name, &request.description)?;
     let event_set = EventSet::new(name, description, request.events).map_err(bad_events)?;
     save(&stores, &event_set).await?;
@@ -60,14 +65,19 @@ pub async fn create_event_set(
     Ok((StatusCode::CREATED, Json(event_set)))
 }
 
-/// Refused while an integration of the set would no longer fit it.
+/// Refused while an integration of the set would no longer fit it. Needs `audit.view` when the
+/// set holds audit events before or after the change.
 pub async fn update_event_set(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
+    access: AuditAccess,
     Path(id): Path<String>,
     Json(request): Json<EventSetRequest>,
 ) -> Result<Json<EventSet>, ApiError> {
     let mut event_set = load(&stores, &id).await?;
+    access
+        .require_if(holds_audit_events(&event_set.events) || holds_audit_events(&request.events))
+        .await?;
     let (name, description) = validate_text(&request.name, &request.description)?;
     event_set.events = validate_events(request.events).map_err(bad_events)?;
     event_set.name = name;
@@ -102,9 +112,13 @@ pub async fn update_event_set(
 pub async fn delete_event_set(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
+    access: AuditAccess,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_known_id(&id)?;
+    access
+        .require_if(event_set_holds_audit(&stores, &id).await?)
+        .await?;
     refuse_while_used(&stores, "event set", |integration| integration.event_set_id == id).await?;
     let deleted = stores
         .event_sets

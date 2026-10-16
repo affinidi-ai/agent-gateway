@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tracing::info;
 
+use super::audit_access::{AuditAccess, event_set_holds_audit};
 use super::{
     ApiError, DefinitionStores, caller_id, definitions_changed, internal_error, not_found, require_known_id,
     validate_text,
@@ -54,8 +55,12 @@ pub async fn get_integration(
 pub async fn create_integration(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
+    access: AuditAccess,
     Json(request): Json<IntegrationRequest>,
 ) -> Result<(StatusCode, Json<Integration>), ApiError> {
+    access
+        .require_if(event_set_holds_audit(&stores, &request.event_set_id).await?)
+        .await?;
     let mut integration = Integration::new(String::new(), String::new(), String::new(), String::new(), JsonValue::Null);
     apply(&stores, &mut integration, request).await?;
     save(&stores, &integration).await?;
@@ -69,13 +74,21 @@ pub async fn create_integration(
     Ok((StatusCode::CREATED, Json(integration)))
 }
 
+/// Needs `audit.view` when the integration receives audit events before or after the change.
 pub async fn update_integration(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
+    access: AuditAccess,
     Path(id): Path<String>,
     Json(request): Json<IntegrationRequest>,
 ) -> Result<Json<Integration>, ApiError> {
     let mut integration = load(&stores, &id).await?;
+    access
+        .require_if(
+            event_set_holds_audit(&stores, &integration.event_set_id).await?
+                || event_set_holds_audit(&stores, &request.event_set_id).await?,
+        )
+        .await?;
     apply(&stores, &mut integration, request).await?;
     integration.updated_at = chrono::Utc::now().to_rfc3339();
     save(&stores, &integration).await?;
@@ -92,9 +105,13 @@ pub async fn update_integration(
 pub async fn delete_integration(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
+    access: AuditAccess,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_known_id(&id)?;
+    let integration = load(&stores, &id).await?;
+    access
+        .require_if(event_set_holds_audit(&stores, &integration.event_set_id).await?)
+        .await?;
     let deleted = stores
         .integrations
         .delete(&id)

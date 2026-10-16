@@ -123,5 +123,5 @@ changes:
         /v1/integrations now keeps integrations that join one endpoint
         (/v1/integrations/endpoints: transport, destination, credentials) and one event set
         (/v1/integrations/event-sets: events picked from the whole catalog), with the template on
-        the integration. Categories and tenant owners are gone, and audit.view is no longer
-        needed to manage integrations that forward audit records.
+        the integration. Categories and tenant owners are gone. Changing an event set that holds
+        audit events, an integration receiving them, or its endpoint needs audit.view as well.

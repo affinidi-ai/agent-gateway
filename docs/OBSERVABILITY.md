@@ -212,9 +212,11 @@ leave the appliance with each record, so point audit integrations only at destin
 for that data.
 
 **Access.** Integrations are managed through `/v1/integrations` with the `integrations.*`
-permissions alone, whatever events they deliver; `audit.view` guards `/v1/audit`, not the
-integrations that forward records. Changing integrations is administrator-only by default
-(see [`INTEGRATIONS.md`](INTEGRATIONS.md#management-api)).
+permissions. A change that decides where audit records go also needs `audit.view`: an event set
+that holds audit events, an integration whose event set holds them, and an endpoint such an
+integration delivers to (see [`RBAC.md`](RBAC.md#governance-audit-integrations)). Changing
+integrations is administrator-only by default (see
+[`INTEGRATIONS.md`](INTEGRATIONS.md#management-api)).
 
 - Integrations belong to the whole appliance. `PUT /v1/tenant-ownership/integrations/{id}`
   returns 400, and a tenant or resource-scoped PAT is refused on every integration route.

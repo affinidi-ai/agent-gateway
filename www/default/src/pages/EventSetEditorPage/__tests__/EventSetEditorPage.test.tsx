@@ -7,6 +7,15 @@ import { showToast } from '../../../utils/toaster';
 
 jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
 
+let mockPermissions: Record<string, boolean> = {};
+
+jest.mock('../../../context/PermissionsContext', () => ({
+  usePermissions: () => ({
+    loading: false,
+    hasPermission: (feature: string) => mockPermissions[feature] === true,
+  }),
+}));
+
 jest.mock('../../../integrationsApi', () => ({
   getCatalog: jest.fn(),
   getEventSet: jest.fn(),
@@ -84,6 +93,7 @@ const type = (label: RegExp, value: string) =>
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockPermissions = { 'integrations.edit': true, 'audit.view': true };
   mocked.getCatalog.mockResolvedValue(CATALOG);
   mocked.getEventSet.mockResolvedValue(STORED);
   mocked.listIntegrations.mockResolvedValue([]);
@@ -221,6 +231,46 @@ test('events the catalog no longer lists are shown and can be removed', async ()
       expect.objectContaining({ events: ['gateway.created'] })
     )
   );
+});
+
+describe('without audit.view', () => {
+  beforeEach(() => {
+    mockPermissions = { 'integrations.edit': true };
+  });
+
+  test('audit events are shown but cannot be picked, and the editor says why', async () => {
+    renderEditor('/integrations/event-sets/new');
+
+    expect(await screen.findByLabelText(/policy decision/i)).toBeDisabled();
+    expect(screen.getByLabelText(/authentication failed/i)).toBeDisabled();
+    expect(screen.getByLabelText(/gateway created/i)).toBeEnabled();
+    expect(screen.getByText(/audit events need the audit\.view permission/i)).toBeInTheDocument();
+  });
+
+  test('the audit preset picks nothing', async () => {
+    renderEditor('/integrations/event-sets/new?preset=audit');
+
+    expect(await screen.findByLabelText(/policy decision/i)).not.toBeChecked();
+    expect(screen.getByLabelText(/^name/i)).toHaveValue('');
+  });
+
+  test('an event set holding audit events cannot be saved', async () => {
+    mocked.getEventSet.mockResolvedValue({ ...STORED, events: ['audit.policy_decision'] });
+    renderEditor('/integrations/event-sets/s1');
+    await screen.findByDisplayValue('Gateway changes');
+
+    expect(screen.getByRole('button', { name: /^save/i })).toBeDisabled();
+    expect(screen.getByText(/audit events need the audit\.view permission/i)).toBeInTheDocument();
+  });
+
+  test('an event set without audit events is saved as usual', async () => {
+    renderEditor('/integrations/event-sets/s1');
+    await screen.findByDisplayValue('Gateway changes');
+
+    fireEvent.click(screen.getByRole('button', { name: /^save/i }));
+
+    await waitFor(() => expect(mocked.updateEventSet).toHaveBeenCalled());
+  });
 });
 
 test('a catalog that cannot be loaded says why', async () => {
