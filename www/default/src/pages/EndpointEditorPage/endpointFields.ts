@@ -196,6 +196,8 @@ export type SecretEdit = { state: 'keep' } | { state: 'set'; value: string } | {
 export interface EndpointForm {
   values: Record<string, string | boolean>;
   secrets: Record<string, SecretEdit>;
+  /** Secret fields the gateway holds a value for, a stored secret or a `$SECRET:` reference. */
+  stored: string[];
 }
 
 /** The fields of `type` to show for these values. */
@@ -206,10 +208,13 @@ export function visibleFields(type: EndpointType, values: Record<string, unknown
 /** The form for a new endpoint of `type`, or for a stored one. */
 export function initialForm(type: EndpointType, endpoint?: Endpoint): EndpointForm {
   const configuration = endpoint?.configuration ?? {};
-  const form: EndpointForm = { values: {}, secrets: {} };
+  const form: EndpointForm = { values: {}, secrets: {}, stored: [] };
   for (const field of ENDPOINT_FIELDS[type]) {
     const value = configuration[field.name];
     if (field.secret) {
+      if (typeof value === 'string' || endpoint?.secrets.includes(field.name)) {
+        form.stored.push(field.name);
+      }
       form.secrets[field.name] =
         typeof value === 'string'
           ? { state: 'set', value }
@@ -259,7 +264,17 @@ export function buildConfiguration(
   updating: boolean
 ): Record<string, unknown> {
   const configuration: Record<string, unknown> = {};
-  for (const field of visibleFields(type, form.values)) {
+  const visible = visibleFields(type, form.values);
+  if (updating) {
+    // The gateway keeps a secret left out of an update, so one the form now hides (SASL
+    // switched off, another stream platform) would stay stored unseen; clear it instead.
+    for (const field of ENDPOINT_FIELDS[type]) {
+      if (field.secret && !visible.includes(field) && form.stored.includes(field.name)) {
+        configuration[field.name] = null;
+      }
+    }
+  }
+  for (const field of visible) {
     if (field.secret) {
       const edit = form.secrets[field.name];
       if (edit?.state === 'clear' && updating) {

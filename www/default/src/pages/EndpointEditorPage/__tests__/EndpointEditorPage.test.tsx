@@ -244,6 +244,42 @@ describe('a stored endpoint', () => {
     );
   });
 
+  test('switching SASL off clears the stored SASL password instead of keeping it unseen', async () => {
+    mocked.getEndpoint.mockResolvedValue(
+      stored({
+        type: 'stream',
+        configuration: {
+          platform: 'kafka',
+          topic: 'events',
+          brokers: 'b:9092',
+          auth_type: 'sasl',
+          sasl_username: 'svc',
+        },
+        secrets: ['sasl_password'],
+      })
+    );
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('events');
+
+    type(/authentication/i, 'none');
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() =>
+      expect(mocked.updateEndpoint).toHaveBeenCalledWith(
+        'e1',
+        expect.objectContaining({
+          configuration: {
+            platform: 'kafka',
+            topic: 'events',
+            brokers: 'b:9092',
+            auth_type: 'none',
+            sasl_password: null,
+          },
+        })
+      )
+    );
+  });
+
   test('can be disabled', async () => {
     renderEditor('/integrations/endpoints/e1');
     await screen.findByDisplayValue('Ops mail');

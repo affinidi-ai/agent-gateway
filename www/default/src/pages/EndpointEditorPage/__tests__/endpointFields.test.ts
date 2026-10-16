@@ -186,6 +186,82 @@ describe('buildConfiguration', () => {
   });
 });
 
+describe('buildConfiguration for stored secrets the form now hides', () => {
+  const kafka = (secrets: string[], configuration: Record<string, unknown> = {}) =>
+    stored({
+      type: 'stream',
+      configuration: {
+        platform: 'kafka',
+        topic: 'events',
+        brokers: 'b:9092',
+        auth_type: 'sasl',
+        sasl_username: 'svc',
+        ...configuration,
+      },
+      secrets,
+    });
+
+  test('switching SASL off clears the stored SASL password', () => {
+    const form = initialForm('stream', kafka(['sasl_password']));
+    form.values.auth_type = 'none';
+
+    expect(buildConfiguration('stream', form, true)).toEqual({
+      platform: 'kafka',
+      topic: 'events',
+      brokers: 'b:9092',
+      auth_type: 'none',
+      sasl_password: null,
+    });
+  });
+
+  test('leaving the Redis platform clears the stored Redis URL', () => {
+    const form = initialForm(
+      'stream',
+      stored({
+        type: 'stream',
+        configuration: { platform: 'redis', topic: 'events' },
+        secrets: ['redis_url'],
+      })
+    );
+    form.values.platform = 'kinesis';
+    form.values.region = 'eu-west-1';
+
+    expect(buildConfiguration('stream', form, true)).toMatchObject({
+      platform: 'kinesis',
+      redis_url: null,
+    });
+  });
+
+  test('a stored secret reference the form now hides is cleared too', () => {
+    const form = initialForm('stream', kafka([], { sasl_password: '$SECRET:kafka-password' }));
+    form.values.auth_type = 'none';
+
+    expect(buildConfiguration('stream', form, true)).toMatchObject({ sasl_password: null });
+  });
+
+  test('a hidden secret that was never stored is not sent', () => {
+    const form = initialForm('stream', kafka(['sasl_password']));
+
+    const configuration = buildConfiguration('stream', form, true);
+
+    expect(configuration).not.toHaveProperty('redis_url');
+    expect(configuration).not.toHaveProperty('sasl_password');
+  });
+
+  test('a visible stored secret left alone is still left out, so the gateway keeps it', () => {
+    const form = initialForm('stream', kafka(['sasl_password']));
+
+    expect(buildConfiguration('stream', form, true)).not.toHaveProperty('sasl_password');
+  });
+
+  test('a new endpoint clears nothing', () => {
+    const form = initialForm('stream');
+    form.values.platform = 'redis';
+
+    expect(Object.values(buildConfiguration('stream', form, false))).not.toContain(null);
+  });
+});
+
 describe('missingRequired', () => {
   test('names required fields left empty, and required secrets neither set nor stored', () => {
     const form = initialForm('email');
