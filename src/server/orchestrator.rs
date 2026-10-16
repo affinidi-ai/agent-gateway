@@ -1753,6 +1753,7 @@ pub async fn run_axum_proxy(
             )
             .await;
         }
+        crate::integrations::migration::cleanup::spawn_cleanup(&bootstrap_config.storage_paths);
         // Definitions that stopped passing their checks, such as after a restore, are reported
         // now rather than at their first delivery.
         if let Err(error) = crate::integrations::definitions::check::report_stored_definitions(
