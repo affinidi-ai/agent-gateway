@@ -1,5 +1,6 @@
 //! Endpoints, event sets and the integrations that join them.
 
+pub mod check;
 pub mod endpoint;
 pub mod event_set;
 pub mod integration;

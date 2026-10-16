@@ -14,7 +14,7 @@ use super::{
 };
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::gateways::connection_points::message_processor::get_secrets_store;
-use crate::integrations::definitions::endpoint::{keep_unsent_secrets, resolve_secret_references};
+use crate::integrations::definitions::endpoint::keep_unsent_secrets;
 use crate::integrations::definitions::{Endpoint, EndpointType, Status};
 use crate::integrations::stream_publishers::invalidate_kafka_producer;
 
@@ -171,13 +171,9 @@ async fn load(
 /// Checks the configuration the endpoint would send with, its secret references resolved.
 async fn validate(endpoint: &Endpoint) -> Result<(), ApiError> {
     let store = get_secrets_store();
-    let mut resolved = endpoint.clone();
-    resolved.configuration =
-        resolve_secret_references(endpoint.endpoint_type, &endpoint.configuration, store.as_deref())
-            .await
-            .map_err(|reason| (StatusCode::BAD_REQUEST, reason))?;
-    resolved
-        .validate_configuration()
+    endpoint
+        .validate_resolved(store.as_deref())
+        .await
         .map_err(|reason| (StatusCode::BAD_REQUEST, reason))
 }
 

@@ -136,6 +136,17 @@ impl Endpoint {
             .validate_config(&self.configuration)
             .map_err(|error| error.to_string())
     }
+
+    /// Checks the configuration the endpoint would send with, its secret references resolved,
+    /// as saving it does.
+    pub async fn validate_resolved(
+        &self,
+        secrets: Option<&dyn SecretsStore>,
+    ) -> Result<(), String> {
+        let mut resolved = self.clone();
+        resolved.configuration = resolve_secret_references(self.endpoint_type, &self.configuration, secrets).await?;
+        resolved.validate_configuration()
+    }
 }
 
 /// Marks a secret field value, or a webhook header value, that names a secret in the secrets

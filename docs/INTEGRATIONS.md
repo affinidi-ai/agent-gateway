@@ -261,6 +261,25 @@ Welcome messages for administrators and users start from the templates
 [`admin_welcome.json`](../src/integrations/admin_welcome.json) and
 [`user_welcome.json`](../src/integrations/user_welcome.json).
 
+## Troubleshooting
+
+**Definitions checked at startup.** Each node checks the stored definitions when it starts
+([`definitions/check.rs`](../src/integrations/definitions/check.rs)), the way saving them
+would:
+
+- each endpoint's configuration, with its `$SECRET:` references resolved;
+- each event set's events, against the catalog;
+- each integration's endpoint and event set, which must exist, and its template, which must
+  fit the event set.
+
+Each definition that fails logs a warning, `integrations.definition.invalid`, with its kind,
+id, name and the reason, never a secret value. One summary line,
+`integrations.definitions.checked`, gives the counts: a warning when anything failed,
+otherwise info. Nothing is changed or disabled. A failing definition's deliveries fail and log
+`Integration delivery failed` until it is fixed through the API or the dashboard. The usual
+cause after a restore or an upgrade is a referenced secret that is missing from the secrets
+store, or an endpoint URL that the current _Outbound requests_ checks refuse.
+
 ## Related
 
 - [`CAPABILITIES.md`](CAPABILITIES.md#managing-the-gateway): integrations from a user's point of view.

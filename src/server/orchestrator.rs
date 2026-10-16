@@ -1743,6 +1743,16 @@ pub async fn run_axum_proxy(
                 .expect("Failed to initialize integration endpoint, event set and integration storage"),
         );
         crate::integrations::definitions::init_definition_stores(definition_stores.clone());
+        // Definitions that stopped passing their checks, such as after a restore, are reported
+        // now rather than at their first delivery.
+        if let Err(error) = crate::integrations::definitions::check::report_stored_definitions(
+            &definition_stores,
+            Some(secrets_store.as_ref()),
+        )
+        .await
+        {
+            warn!(error = %error, "Failed to check the stored integration definitions");
+        }
         crate::audit::sources::rebuild_sinks().await;
         if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
             spawn_x402_cleanup_worker(txn_store);

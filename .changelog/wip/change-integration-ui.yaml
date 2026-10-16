@@ -51,6 +51,13 @@ changes:
         permissions. The editors move to /integrations/new and /integrations/{id}, and the
         Audit page's Forward records starts an event set of every audit event.
   fixed:
+    - timestamp: '2026-10-16T14:00:00.000Z'
+      title: Report stored integration definitions that fail their checks at startup
+      description: >-
+        Each node checks the stored endpoints, event sets and integrations when it starts and
+        logs a warning for each that fails, such as an endpoint whose secret is missing after
+        a restore or an integration whose event set is gone, plus a summary with the counts.
+        Nothing is changed.
     - timestamp: '2026-10-16T13:00:00.000Z'
       title: Refuse to delete a secret an integration endpoint references
       description: >-
