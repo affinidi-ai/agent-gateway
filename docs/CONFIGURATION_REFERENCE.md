@@ -71,8 +71,10 @@ flowchart LR
 ```
 
 Path resolution is in
-[`BootstrapConfig::from_file`](../src/config/bootstrap.rs). `[storage_paths]` resolves
-the same way.
+[`BootstrapConfig::from_file`](../src/config/bootstrap.rs). Most `[storage_paths]` keys
+resolve the same way, but some, and `[encryption] key_file`, resolve a relative value
+against the working directory. Use absolute paths in a deployment; see
+[Storage](DEPLOYMENT_REQUIREMENTS.md#storage).
 
 ## Settings with non-obvious effects
 
