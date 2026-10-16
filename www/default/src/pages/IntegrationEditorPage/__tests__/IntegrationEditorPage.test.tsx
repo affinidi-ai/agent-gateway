@@ -309,6 +309,50 @@ test('cannot test before an endpoint and an event set are chosen', async () => {
   expect(screen.getByRole('button', { name: /send test/i })).toBeDisabled();
 });
 
+test('a draft with a broken payload cannot be tested until it is fixed', async () => {
+  await newIntegration();
+  choose(/^name/i, 'Hook');
+  choose(/^endpoint/i, 'hook');
+  choose(/^event set/i, 'gateways');
+  const send = screen.getByRole('button', { name: /send test/i });
+  expect(send).toBeEnabled();
+
+  choose(/^payload/i, '{"gateway": "${GATEWAY_NAME}",}');
+  expect(send).toBeDisabled();
+  expect(send).toHaveAttribute('title', 'The payload must be a JSON object.');
+  fireEvent.click(send);
+  expect(mocked.testDraftIntegration).not.toHaveBeenCalled();
+
+  choose(/^payload/i, '{"gateway": "${GATEWAY_NAME}"}');
+  expect(send).toBeEnabled();
+});
+
+test('a saved integration with a broken payload cannot be tested either', async () => {
+  mocked.getIntegration.mockResolvedValue({
+    ...STORED,
+    endpoint_id: 'hook',
+    content: { gateway: '${GATEWAY_NAME}' },
+  });
+  renderEditor('/integrations/i1');
+  await screen.findByDisplayValue('Gateway alerts');
+
+  choose(/^payload/i, '{"gateway": ');
+
+  expect(screen.getByRole('button', { name: /send test/i })).toBeDisabled();
+  expect(screen.getByRole('button', { name: /^save/i })).toBeEnabled();
+});
+
+test('a template using variables no event fills cannot be tested', async () => {
+  await newIntegration();
+  choose(/^name/i, 'Alerts');
+  choose(/^endpoint/i, 'slack');
+  choose(/^event set/i, 'gateways');
+
+  choose(/^message/i, '${AUDIT_DECISION}');
+
+  expect(screen.getByRole('button', { name: /send test/i })).toBeDisabled();
+});
+
 test('points to creating an endpoint or event set when there are none', async () => {
   mocked.listEndpoints.mockResolvedValue([]);
   mocked.listEventSets.mockResolvedValue([]);

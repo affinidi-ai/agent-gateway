@@ -151,7 +151,11 @@ const IntegrationEditorPage: React.FC = () => {
     }
   };
 
+  // A test sends what Save would store, so it is blocked for the same reason Save would refuse.
+  const blocker = problem();
+
   const sendTest = async () => {
+    if (blocker) return;
     setTesting(true);
     try {
       const result = await testDraftIntegration(request());
@@ -195,8 +199,11 @@ const IntegrationEditorPage: React.FC = () => {
               size="md"
               onClick={sendTest}
               loading={testing}
-              disabled={!endpointId || !eventSetId}
-              title="Sends one message for the first event of the event set, with sample values"
+              disabled={blocker !== null}
+              title={
+                blocker ??
+                'Sends one message for the first event of the event set, with sample values'
+              }
               iconStart={<i className="fas fa-paper-plane me-2" aria-hidden="true" />}
             >
               Send test
