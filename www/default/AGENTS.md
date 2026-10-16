@@ -201,6 +201,17 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
 
+## Secret editor
+
+- `/secrets/new` and `/secrets/:id` have one save button, at the bottom of the form beside
+  **Delete Secret** (`secret-save-button`); `Cmd+S` and `Ctrl+S` follow the same path.
+- The API never returns a stored secret value, so the editor never shows one. In edit mode
+  the value field is disabled with a **Stored value is hidden** placeholder until **Update
+  Secret Value** is checked.
+- **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
+  value field is editable, and reveals only what was typed or generated on this page. The
+  value field is `secret-value-input`.
+
 ## MCP Proxy write warnings
 
 MCP Proxy create and update responses can carry `warnings`, for example when only the
