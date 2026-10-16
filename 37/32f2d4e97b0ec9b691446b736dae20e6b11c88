@@ -1,0 +1,19 @@
+.changelog/wip/feat_release_hardening.yaml
+  s_09d9fb08a24a2a::t_745d5cb5c92e11 1-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3732f2d4e97b0ec9b691446b736dae20e6b11c88",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
