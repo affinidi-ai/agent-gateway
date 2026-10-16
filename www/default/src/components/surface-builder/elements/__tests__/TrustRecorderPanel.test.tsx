@@ -1,6 +1,8 @@
 import React from 'react';
 import { render, screen, within, fireEvent } from '@testing-library/react';
 import TrustRecorderPanel from '../trust-recorder/TrustRecorderPanel';
+import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../SurfaceMetaContext';
+import { SURFACE_ISSUER_DID_TEMPLATE } from '../trust-recorder/definition';
 
 const AP_SLOT = 'response:trust-recorder';
 
@@ -98,5 +100,61 @@ describe('TrustRecorderPanel — sidebar context block', () => {
 
     fireEvent.click(screen.getByTestId('trust-recorder-panel-configure'));
     expect(props.openFullscreenEditor).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TrustRecorderPanel — surface Issuer warning', () => {
+  const WARNING = 'trust-recorder-panel-no-surface-issuer-warning';
+
+  function entry(authority_did: string) {
+    return {
+      trust_registry_id: 'tr-1',
+      issuer_did: 'did:web:issuer.example',
+      authority_did,
+      include_owned_agent: true,
+      custom_resources: [],
+    };
+  }
+
+  function renderWithSurface(config: Record<string, unknown>, issuerId?: string) {
+    const meta = { issuerId } as unknown as SurfaceMetaValue;
+    const props = baseProps(config) as any;
+    return render(
+      issuerId === undefined ? (
+        <TrustRecorderPanel {...props} />
+      ) : (
+        <SurfaceMetaProvider value={meta}>
+          <TrustRecorderPanel {...props} />
+        </SurfaceMetaProvider>
+      )
+    );
+  }
+
+  it('warns that records are skipped when an entry uses the surface Issuer and none is selected', () => {
+    renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] }, '');
+
+    const warning = screen.getByTestId(WARNING);
+    expect(warning).toHaveTextContent('No Issuer is selected for this surface');
+    expect(warning).toHaveTextContent('no records are written');
+  });
+
+  it('stays quiet once the surface has an Issuer', () => {
+    renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] }, 'issuer-1');
+    expect(screen.queryByTestId(WARNING)).toBeNull();
+  });
+
+  it('stays quiet when every entry names an explicit Authority, since the surface Issuer is not needed', () => {
+    renderWithSurface({ entries: [entry('did:web:authority.example')] }, '');
+    expect(screen.queryByTestId(WARNING)).toBeNull();
+  });
+
+  it('stays quiet with no entries', () => {
+    renderWithSurface({ entries: [] }, '');
+    expect(screen.queryByTestId(WARNING)).toBeNull();
+  });
+
+  it('stays quiet outside a surface editor, where the Issuer is unknown', () => {
+    renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] });
+    expect(screen.queryByTestId(WARNING)).toBeNull();
   });
 });

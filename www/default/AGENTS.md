@@ -114,6 +114,27 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
 
+## Trust Recorder
+
+- The sidebar panel and each entry in its fullscreen editor show the shared
+  `NoSurfaceIssuerWarning` (`elements/trust-recorder/NoSurfaceIssuerWarning.tsx`, an
+  `InfoBanner` warning variant, never the amber `alert-warning`, which fails contrast) while
+  `SurfaceMetaContext.issuerId` is empty and an entry's Authority is **Use surface Issuer**
+  (`usesSurfaceIssuer`). The backend skips such an entry and writes no records.
+- It is a warning, not save validation. It stays hidden for entries with an explicit
+  Authority, and outside a surface editor, where there is no surface Issuer to check.
+- The entry **Issuer** is only the Entity of custom records whose Entity Target is Issuer DID.
+  Never describe it as signing records or setting the Authority.
+- The fullscreen editor opens with a collapsed `InfoBanner` explaining Authority, Entity, the
+  entry Issuer and the surface Issuer, linked to the Trust elements guide.
+
+| Element                            | Test id                                                                                                                           |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Panel warning                      | `trust-recorder-panel-no-surface-issuer-warning`                                                                                  |
+| Entry warning                      | `trust-recorder-entry-<index>-no-surface-issuer-warning`                                                                          |
+| Explainer toggle, body, guide link | `trust-recorder-fullscreen-context-toggle`, `trust-recorder-fullscreen-context-body`, `trust-recorder-fullscreen-context-doclink` |
+| Canvas node, by element type       | `surface-node-<type>`, for example `surface-node-trust-recorder`                                                                  |
+
 ## Access Tokens page
 
 Management personal access tokens live in the Secrets page's **Access Tokens** tab.

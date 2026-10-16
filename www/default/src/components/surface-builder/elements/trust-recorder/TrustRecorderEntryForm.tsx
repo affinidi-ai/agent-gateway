@@ -9,8 +9,10 @@ import {
   SURFACE_ISSUER_DID_TEMPLATE,
   type CustomResource,
   type EntityTarget,
+  usesSurfaceIssuer,
   type TrustRecorderEntry,
 } from './definition';
+import NoSurfaceIssuerWarning, { useSurfaceIssuerMissing } from './NoSurfaceIssuerWarning';
 
 interface TrustRecorderEntryFormProps {
   entry: TrustRecorderEntry;
@@ -55,6 +57,7 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
   saveAttempted = false,
 }) => {
   const tid = (suffix: string) => `trust-recorder-entry-${index}-${suffix}`;
+  const surfaceIssuerMissing = useSurfaceIssuerMissing();
   const hasCompleteCustomResource = entry.custom_resources.some(
     r =>
       r.action.trim().length > 0 && r.resource.trim().length > 0 && r.record_type.trim().length > 0
@@ -108,8 +111,9 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
   ];
   const hasAnyAuthorityOptions = authorityOptions.length > 0;
   const storedAuthority = entry.authority_did;
-  const authorityMode: 'explicit' | 'surface-issuer' =
-    storedAuthority === SURFACE_ISSUER_DID_TEMPLATE ? 'surface-issuer' : 'explicit';
+  const authorityMode: 'explicit' | 'surface-issuer' = usesSurfaceIssuer(entry)
+    ? 'surface-issuer'
+    : 'explicit';
   const explicitAuthority = authorityMode === 'explicit' ? storedAuthority : '';
   const storedAuthorityIsKnown =
     !explicitAuthority || authorityOptions.some(o => o.value === explicitAuthority);
@@ -175,7 +179,7 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
             testid={tid('issuer')}
           />
           {saveAttempted && !entry.issuer_did && (
-            <div className="invalid-feedback d-block">Select an Issuer to sign the records.</div>
+            <div className="invalid-feedback d-block">Select an Issuer for this entry.</div>
           )}
           {issuersLoadError && (
             <Form.Text className="text-danger d-block" style={{ fontSize: '11px' }}>
@@ -197,7 +201,8 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
             </Form.Text>
           )}
           <Form.Text className="text-muted d-block" style={{ fontSize: '11px' }}>
-            Issuer that signs the records written to this registry.
+            Recorded as the Entity of custom records whose Entity Target is Issuer DID. It does not
+            sign records or set the Authority.
           </Form.Text>
         </div>
 
@@ -289,6 +294,12 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
                 <em> the verified identity credential issuer</em>. If the surface has no Issuer
                 configured, the entry is skipped (fail-safe) with a WARN.
               </Form.Text>
+              {surfaceIssuerMissing && (
+                <NoSurfaceIssuerWarning testid={tid('no-surface-issuer-warning')}>
+                  This entry uses the surface Issuer as its Authority, so it is skipped and writes
+                  no records.
+                </NoSurfaceIssuerWarning>
+              )}
             </div>
           )}
         </div>

@@ -5,7 +5,8 @@ import AddResourceLink from '../../../shared/AddResourceLink';
 import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
 import { deepLinks } from '../../../../utils/deepLinks';
-import { readEntries, TRUST_RECORDER_ENTRIES_MAX } from './definition';
+import { readEntries, TRUST_RECORDER_ENTRIES_MAX, usesSurfaceIssuer } from './definition';
+import NoSurfaceIssuerWarning, { useSurfaceIssuerMissing } from './NoSurfaceIssuerWarning';
 
 const PREVIEW_MAX = 5;
 
@@ -32,6 +33,7 @@ function describeContext(): TrustRecorderContext {
 
 const TrustRecorderPanel: React.FC<ConfigPanelProps> = ({ config, openFullscreenEditor }) => {
   const entries = readEntries(config);
+  const surfaceIssuerMissing = useSurfaceIssuerMissing();
   const shown = entries.slice(0, PREVIEW_MAX);
   const remaining = entries.length - shown.length;
   const context = describeContext();
@@ -95,6 +97,12 @@ const TrustRecorderPanel: React.FC<ConfigPanelProps> = ({ config, openFullscreen
           </li>
         )}
       </ul>
+      {surfaceIssuerMissing && entries.some(usesSurfaceIssuer) && (
+        <NoSurfaceIssuerWarning testid="trust-recorder-panel-no-surface-issuer-warning">
+          Entries that use the surface Issuer as their Authority are skipped, so no records are
+          written.
+        </NoSurfaceIssuerWarning>
+      )}
     </div>
   );
 
