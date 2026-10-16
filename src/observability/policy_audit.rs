@@ -97,6 +97,31 @@ tokio::task_local! {
     /// so a request's audit events + policy decisions share a `trace_id` even
     /// when no OTEL exporter is configured. Absent elsewhere (`try_with` errs).
     pub static REQUEST_TRACE_ID: String;
+
+    /// Id of the gateway request being served, installed at each entry point
+    /// (Access Point, Transit Point, fabric receive) and stamped on every audit
+    /// record the request produces. Always minted here, never read from a
+    /// header or token.
+    pub static REQUEST_ID: String;
+}
+
+/// A fresh request id: a W3C span id (16 lowercase hex characters, never all
+/// zero).
+pub fn new_request_id() -> String {
+    loop {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+        if bytes != [0u8; 8] {
+            return hex::encode(bytes);
+        }
+    }
+}
+
+/// The id of the request being served, when an entry point scoped one.
+pub fn current_request_id() -> Option<String> {
+    REQUEST_ID
+        .try_with(String::clone)
+        .ok()
 }
 
 /// Push a decision into the per-request collector (no-op when no scope is active).
@@ -532,6 +557,34 @@ mod tests {
         assert_eq!(PolicyScope::Surface.as_str(), "surface");
         assert_eq!(PolicyScope::McpTool.as_str(), "mcp_tool");
         assert_eq!(PolicyScope::Response.as_str(), "response");
+    }
+
+    #[test]
+    fn a_new_request_id_is_a_w3c_span_id() {
+        let ids: Vec<String> = (0..64)
+            .map(|_| new_request_id())
+            .collect();
+        for id in &ids {
+            assert_eq!(id.len(), 16, "{id}");
+            assert!(
+                id.chars()
+                    .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{id}"
+            );
+            assert_ne!(id, "0000000000000000");
+        }
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len());
+    }
+
+    #[tokio::test]
+    async fn the_current_request_id_is_the_scoped_one_and_none_outside() {
+        assert_eq!(current_request_id(), None);
+        REQUEST_ID
+            .scope("0123456789abcdef".to_string(), async {
+                assert_eq!(current_request_id().as_deref(), Some("0123456789abcdef"));
+            })
+            .await;
     }
 
     #[test]

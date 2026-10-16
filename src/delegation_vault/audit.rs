@@ -154,6 +154,12 @@ pub struct DelegationAuditEvent {
     /// (policy decisions, VP injection, credential delegation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// Id of the gateway request that produced the record: 16 lowercase hex
+    /// characters, one per request. Several records of one request share it,
+    /// and an Access Point request and the Transit Point requests it triggers
+    /// each have their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// Additional context
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -810,6 +816,7 @@ pub fn audit_event(
         vp_jwt: None,
         vp_fingerprint: None,
         trace_id: None,
+        request_id: None,
         detail: None,
     }
 }
@@ -1387,6 +1394,7 @@ pub fn audit_policy_decision(
         vp_jwt: None,
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
+        request_id: None,
         detail: None,
     });
 }
@@ -1435,6 +1443,7 @@ pub fn audit_trust_check(
         vp_jwt: None,
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
+        request_id: None,
         detail: None,
     });
 }
@@ -1478,6 +1487,7 @@ pub fn audit_trace_terminated(
         vp_jwt: None,
         vp_fingerprint: None,
         trace_id: Some(own_trace_id.to_string()),
+        request_id: None,
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
     });
 }
@@ -1614,6 +1624,7 @@ mod tests {
             vp_jwt: None,
             vp_fingerprint: None,
             trace_id: Some("own-123".to_string()),
+            request_id: None,
             detail: Some("downstream_trace_id=down-456".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -1944,6 +1955,23 @@ mod tests {
     }
 
     #[test]
+    fn the_request_id_is_written_when_set_and_omitted_when_not() {
+        let mut event = audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None);
+        assert!(
+            serde_json::to_value(&event)
+                .unwrap()
+                .get("request_id")
+                .is_none()
+        );
+
+        event.request_id = Some("0123456789abcdef".to_string());
+        let written = serde_json::to_value(&event).unwrap();
+        assert_eq!(written["request_id"], "0123456789abcdef");
+        let read: DelegationAuditEvent = serde_json::from_value(written).unwrap();
+        assert_eq!(read.request_id.as_deref(), Some("0123456789abcdef"));
+    }
+
+    #[test]
     fn stored_pre_authorize_blocked_line_is_not_an_audit_event() {
         let stored = serde_json::to_string(&audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None))
             .unwrap()
@@ -2046,6 +2074,7 @@ mod tests {
                 vp_jwt: Some(vp),
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
+                request_id: None,
                 detail: None,
             },
             DelegationAuditEvent {
@@ -2085,6 +2114,7 @@ mod tests {
                 vp_jwt: None,
                 vp_fingerprint: None,
                 trace_id: Some("trace-1".to_string()),
+                request_id: None,
                 detail: None,
             },
         ];

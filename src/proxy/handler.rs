@@ -9172,6 +9172,21 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> Response {
+    crate::observability::policy_audit::REQUEST_ID
+        .scope(
+            crate::observability::policy_audit::new_request_id(),
+            Box::pin(multi_channel_proxy_handler_in_request_scope(addr, state, req, mcp_versions, mcp_continuations)),
+        )
+        .await
+}
+
+async fn multi_channel_proxy_handler_in_request_scope(
+    addr: SocketAddr,
+    state: MultiSurfaceProxyState,
+    req: Request,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> Response {
     // Generate unique ID for this handler invocation to track duplicates
     let handler_invocation_id = uuid::Uuid::new_v4();
     info!(
@@ -17022,6 +17037,29 @@ allow if {
         path: &str,
         body: serde_json::Value,
     ) -> (axum::http::StatusCode, Vec<RecordedRefusal>) {
+        let (status, events) = access_point_records(router, path, body).await;
+        let refusals = events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    rpc_error_code,
+                } => Some((stage, reason, http_status, rpc_error_code)),
+                _ => None,
+            })
+            .collect();
+        (status, refusals)
+    }
+
+    /// Sends one request through the Access Point and returns its status with
+    /// every audit record it produced.
+    async fn access_point_records(
+        router: crate::state::MultiSurfaceProxyState,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, Vec<crate::delegation_vault::audit::DelegationAuditEvent>) {
         let request = axum::http::Request::builder()
             .method("POST")
             .uri(path)
@@ -17042,19 +17080,44 @@ allow if {
                 None,
             )))
             .await;
-        let refusals = events
-            .into_iter()
-            .filter_map(|event| match event.event {
-                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
-                    stage,
-                    reason,
-                    http_status,
-                    rpc_error_code,
-                } => Some((stage, reason, http_status, rpc_error_code)),
-                _ => None,
-            })
-            .collect();
-        (response.status(), refusals)
+        (response.status(), events)
+    }
+
+    /// Every record an Access Point request produces carries the request's own
+    /// id: 16 lowercase hex characters, fresh for each request.
+    async fn access_point_requests_each_carry_their_own_request_id(state: &crate::state::ProxyState) {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "request-ids", "name": "Request ids",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:9"}
+        }))
+        .unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (_, events) = access_point_records(
+                direct_router_state(state, surface.clone()),
+                "/elsewhere/rpc",
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}),
+            )
+            .await;
+            assert!(!events.is_empty(), "the unroutable request is recorded");
+            let ids: std::collections::HashSet<_> = events
+                .iter()
+                .map(|event| {
+                    event
+                        .request_id
+                        .clone()
+                        .expect("every record carries the request id")
+                })
+                .collect();
+            assert_eq!(ids.len(), 1, "one request, one id");
+            seen.extend(ids);
+        }
+        assert!(seen.iter().all(|id| id.len() == 16
+            && id
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
     /// Each refusal the Access Point answers itself is recorded as
@@ -18629,6 +18692,7 @@ allow if {
         modern_extensions_survive_forwarding(&state).await;
         proxy_access_point_answers_modern_discovery(&state).await;
         access_point_records_request_refusals(&state).await;
+        access_point_requests_each_carry_their_own_request_id(&state).await;
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
         let runtime = negative_cases::continuation_runtime(now, 300);
         let bearer = issuer.sign_jwt_with_gateway_key_typ(&json!({

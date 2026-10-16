@@ -11,6 +11,7 @@ use crate::audit::journal::Pending;
 use crate::audit::registry::{Sinks, sinks};
 use crate::delegation_vault::audit::{DelegationAuditEvent, action_category, new_event_id};
 use crate::metrics::backends::prometheus::{track_audit_record_produced, track_audit_records_lost};
+use crate::observability::policy_audit::current_request_id;
 
 pub struct Producer {
     sinks: &'static Sinks,
@@ -84,8 +85,11 @@ impl Producer {
     /// select it now, and handed to the journal without waiting.
     pub fn submit(
         &self,
-        event: DelegationAuditEvent,
+        mut event: DelegationAuditEvent,
     ) {
+        if event.request_id.is_none() {
+            event.request_id = current_request_id();
+        }
         match DEFERRED.try_with(Arc::clone) {
             Ok(held) => held.lock().push(event),
             Err(_) => self.finalise(event),
@@ -401,6 +405,80 @@ mod tests {
             deferred.flush_with_vp("vp");
         }
         assert_eq!(received(&rx).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_record_submitted_in_a_request_scope_carries_its_request_id() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+
+        crate::observability::policy_audit::REQUEST_ID
+            .scope("0123456789abcdef".to_string(), async {
+                producer.submit(consent());
+            })
+            .await;
+
+        assert_eq!(
+            received(&rx)[0]
+                .record
+                .request_id
+                .as_deref(),
+            Some("0123456789abcdef")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_id_already_on_the_record_is_kept() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+        let mut record = consent();
+        record.request_id = Some("fedcba9876543210".to_string());
+
+        crate::observability::policy_audit::REQUEST_ID
+            .scope("0123456789abcdef".to_string(), async {
+                producer.submit(record);
+            })
+            .await;
+
+        assert_eq!(
+            received(&rx)[0]
+                .record
+                .request_id
+                .as_deref(),
+            Some("fedcba9876543210")
+        );
+    }
+
+    #[test]
+    fn a_record_outside_a_request_scope_has_no_request_id() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+
+        producer.submit(consent());
+
+        assert_eq!(received(&rx)[0].record.request_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_record_keeps_the_request_id_of_the_request_that_produced_it() {
+        let (producer, rx) = producer(&[(SinkId::AuditLog, &["consent_granted"])]);
+        let deferred = DeferredAudit::new(producer);
+
+        crate::observability::policy_audit::REQUEST_ID
+            .scope("0123456789abcdef".to_string(), async {
+                deferred
+                    .scope(async {
+                        producer.submit(consent());
+                    })
+                    .await;
+            })
+            .await;
+        deferred.flush_with_vp("vp");
+
+        assert_eq!(
+            received(&rx)[0]
+                .record
+                .request_id
+                .as_deref(),
+            Some("0123456789abcdef")
+        );
     }
 
     #[tokio::test]

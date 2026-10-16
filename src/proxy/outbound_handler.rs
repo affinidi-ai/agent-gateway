@@ -706,6 +706,20 @@ async fn outbound_proxy_handler_with_mcp_versions(
     req: Request,
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
 ) -> Result<Response, OutboundPipelineError> {
+    crate::observability::policy_audit::REQUEST_ID
+        .scope(
+            crate::observability::policy_audit::new_request_id(),
+            Box::pin(outbound_proxy_handler_in_request_scope(addr, state, req, versions)),
+        )
+        .await
+}
+
+async fn outbound_proxy_handler_in_request_scope(
+    addr: SocketAddr,
+    state: OutboundProxyState,
+    req: Request,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+) -> Result<Response, OutboundPipelineError> {
     let mut subscription_access =
         crate::mcp::subscriptions::SubscriptionLifetime::new(std::time::Duration::from_secs(86_400), None);
     let mut ctx = OutboundPipelineContext::new(addr, req, &state)?;
@@ -7711,6 +7725,65 @@ mod tests {
                 "an unmarked {method} without a body is forwarded"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn transit_requests_each_carry_their_own_request_id() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "request-id-surface", "name": "Request id surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"opa_policy_definition_id": "def-1", "points": [{"alias": "partner-a", "protocol": "mcp",
+                "require_transit_token": false, "target_endpoint": "http://127.0.0.1:9"}]}
+        }))
+        .unwrap();
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/outbound/mcp/partner-a")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+                .unwrap();
+            let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                state.clone(),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            )))
+            .await;
+            let decisions: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.event,
+                        crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. }
+                    )
+                })
+                .collect();
+            assert_eq!(decisions.len(), 1, "{events:?}");
+            seen.push(
+                decisions[0]
+                    .request_id
+                    .clone()
+                    .expect("the decision carries the request id"),
+            );
+        }
+        assert!(seen.iter().all(|id| id.len() == 16
+            && id
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
     // ── detect_protocol_and_operation ───────────────────────────────────────
