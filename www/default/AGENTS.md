@@ -207,7 +207,8 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   **Delete Secret** (`secret-save-button`); `Cmd+S` and `Ctrl+S` follow the same path.
 - The API never returns a stored secret value, so the editor never shows one. In edit mode
   the value field is disabled with a **Stored value is hidden** placeholder until **Update
-  Secret Value** is checked.
+  Secret Value** is checked. Unchecking it, or a successful save, clears the entered value
+  and returns the field to that hidden state.
 - **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.

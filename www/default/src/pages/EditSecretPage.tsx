@@ -17,7 +17,6 @@ interface Secret {
   name: string;
   secret_id: string;
   description?: string;
-  value: string;
   secret_type: string;
   tags: string[];
   created_at: string;
@@ -215,7 +214,7 @@ const EditSecretPage: React.FC = () => {
         name: secret.name,
         secret_id: secret.secret_id,
         description: secret.description || '',
-        value: secret.value || '',
+        value: '',
         secret_type: secret.secret_type || 'General',
         tags: secret.tags || [],
       });
@@ -229,6 +228,12 @@ const EditSecretPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  const discardValueChange = () => {
+    setFormData(prev => ({ ...prev, value: '' }));
+    setUpdateValue(false);
+    setRevealValue(false);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -281,6 +286,7 @@ const EditSecretPage: React.FC = () => {
       if (isEditMode && id) {
         await apiClient.put(`/secrets/${id}`, payload);
         showToast('success', 'Secret updated successfully');
+        discardValueChange();
         setIsModified(false);
       } else {
         await apiClient.post('/secrets/new', payload);
@@ -540,9 +546,11 @@ const EditSecretPage: React.FC = () => {
                         id="updateValueCheckbox"
                         checked={updateValue}
                         onChange={e => {
-                          setUpdateValue(e.target.checked);
                           if (e.target.checked) {
+                            setUpdateValue(true);
                             setIsModified(true);
+                          } else {
+                            discardValueChange();
                           }
                         }}
                       />
