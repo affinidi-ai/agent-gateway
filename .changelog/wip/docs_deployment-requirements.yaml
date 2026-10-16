@@ -15,8 +15,8 @@ changes:
       title: Correct how storage paths in config.toml are resolved
       description: >-
         CONFIGURATION_REFERENCE.md said every storage path resolves from the folder holding
-        config.toml. Some resolve from the working directory, so it now points deployments to
-        absolute paths.
+        config.toml. It now names the keys that resolve from the working directory or from
+        --base-folder, and points deployments to absolute paths.
   removed: []
   security: []
   breaking: []
