@@ -14,6 +14,12 @@ on:
       - .github/workflows/docker.yml
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      push_test_image:
+        description: "Also run the publish path, tagging the manifest dryrun-<sha> only (no version tags, no latest)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,7 +57,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build image
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && !inputs.push_test_image)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -61,13 +67,13 @@ jobs:
           provenance: false
 
       - name: Boot-probe image
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && !inputs.push_test_image)
         env:
           IMAGE: agent-gateway:verify
         run: bash scripts/ci/boot-probe.sh
 
       - name: Log in to GHCR
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_test_image)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -76,7 +82,7 @@ jobs:
 
       - name: Build and push image by digest
         id: push
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_test_image)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -86,7 +92,7 @@ jobs:
           provenance: false
 
       - name: Boot-probe pushed image
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_test_image)
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
@@ -94,7 +100,7 @@ jobs:
           IMAGE="${IMAGE_NAME}@${DIGEST}" bash scripts/ci/boot-probe.sh
 
       - name: Record digest
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_test_image)
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
@@ -102,7 +108,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_test_image)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: digests-${{ matrix.pair }}
@@ -112,7 +118,7 @@ jobs:
 
   publish:
     name: Publish multi-arch image
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push_test_image)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -149,9 +155,12 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=${{ github.ref_type == 'tag' && 'auto' || 'false' }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},enable=${{ github.ref_type == 'tag' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.ref_type == 'tag' }}
+            type=sha,prefix=dryrun-,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Create multi-arch manifest
         id: manifest
