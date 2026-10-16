@@ -42,6 +42,16 @@ const renderPage = (path: string) =>
   );
 
 describe('EditSecretPage', () => {
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+
+  afterEach(() => {
+    if (originalCrypto) {
+      Object.defineProperty(globalThis, 'crypto', originalCrypto);
+    } else {
+      delete (globalThis as { crypto?: Crypto }).crypto;
+    }
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
     (apiClient.get as jest.Mock).mockImplementation((url: string) => {
