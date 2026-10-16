@@ -17,7 +17,6 @@ interface Secret {
   name: string;
   secret_id: string;
   description?: string;
-  value: string;
   secret_type: string;
   tags: string[];
   created_at: string;
@@ -74,7 +73,6 @@ const EditSecretPage: React.FC = () => {
   const [loading, setLoading] = useState(isEditMode);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
-  const [isModified, setIsModified] = useState(false);
   const [secretData, setSecretData] = useState<Secret | null>(null);
   const [isSecretIdManuallyEdited, setIsSecretIdManuallyEdited] = useState(false);
   const [secretIdError, setSecretIdError] = useState('');
@@ -93,6 +91,14 @@ const EditSecretPage: React.FC = () => {
   const [existingTags, setExistingTags] = useState<string[]>([]);
   const [updateValue, setUpdateValue] = useState(false);
   const [revealValue, setRevealValue] = useState(false);
+
+  const hasChanges =
+    !!secretData &&
+    (updateValue ||
+      formData.name !== secretData.name ||
+      formData.description !== (secretData.description || '') ||
+      formData.secret_type !== (secretData.secret_type || 'General') ||
+      formData.tags.join('\n') !== (secretData.tags || []).join('\n'));
 
   // Fetch gateway configuration to get available secret types
   useEffect(() => {
@@ -191,7 +197,7 @@ const EditSecretPage: React.FC = () => {
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault();
         // Only trigger save if not already saving, form is modified (or it's create mode), and no secret_id error
-        if (!isSaving && (!isEditMode || isModified) && !secretIdError) {
+        if (!isSaving && (!isEditMode || hasChanges) && !secretIdError) {
           const form = document.querySelector('form');
           if (form) {
             form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
@@ -202,7 +208,7 @@ const EditSecretPage: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isSaving, isModified, isEditMode, secretIdError]);
+  }, [isSaving, hasChanges, isEditMode, secretIdError]);
 
   const fetchSecret = async (secretId: string) => {
     try {
@@ -215,7 +221,7 @@ const EditSecretPage: React.FC = () => {
         name: secret.name,
         secret_id: secret.secret_id,
         description: secret.description || '',
-        value: secret.value || '',
+        value: '',
         secret_type: secret.secret_type || 'General',
         tags: secret.tags || [],
       });
@@ -229,6 +235,12 @@ const EditSecretPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  const discardValueChange = () => {
+    setFormData(prev => ({ ...prev, value: '' }));
+    setUpdateValue(false);
+    setRevealValue(false);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -279,9 +291,10 @@ const EditSecretPage: React.FC = () => {
       }
 
       if (isEditMode && id) {
-        await apiClient.put(`/secrets/${id}`, payload);
+        const response = await apiClient.put(`/secrets/${id}`, payload);
+        setSecretData(response.data);
         showToast('success', 'Secret updated successfully');
-        setIsModified(false);
+        discardValueChange();
       } else {
         await apiClient.post('/secrets/new', payload);
         showToast('success', 'Secret created successfully');
@@ -313,7 +326,6 @@ const EditSecretPage: React.FC = () => {
 
   const handleInputChange = (field: string, value: any) => {
     setFormData(prev => ({ ...prev, [field]: value }));
-    setIsModified(true);
     // Track when user manually edits secret_id
     if (field === 'secret_id') {
       setIsSecretIdManuallyEdited(true);
@@ -327,7 +339,6 @@ const EditSecretPage: React.FC = () => {
         ...prev,
         tags: [...prev.tags, t],
       }));
-      setIsModified(true);
     }
   };
 
@@ -340,7 +351,6 @@ const EditSecretPage: React.FC = () => {
     crypto.getRandomValues(bytes);
     const value = Array.from(bytes, n => charset[n % charset.length]).join('');
     setFormData(prev => ({ ...prev, value }));
-    setIsModified(true);
     if (isEditMode) setUpdateValue(true);
   };
 
@@ -352,7 +362,6 @@ const EditSecretPage: React.FC = () => {
         tags: [...prev.tags, tag],
       }));
       setTagInput('');
-      setIsModified(true);
     }
   };
 
@@ -361,7 +370,6 @@ const EditSecretPage: React.FC = () => {
       ...prev,
       tags: prev.tags.filter(t => t !== tagToRemove),
     }));
-    setIsModified(true);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -370,6 +378,12 @@ const EditSecretPage: React.FC = () => {
       handleAddTag();
     }
   };
+
+  const isValueEditable = !isEditMode || updateValue;
+  const showPlainValue = isValueEditable && revealValue;
+  const valuePlaceholder = isValueEditable
+    ? `${isEditMode ? 'Enter a new' : 'Enter the'} secret value (API key, password, token, etc.)`
+    : 'Stored value is hidden';
 
   const appliedTagSet = new Set(formData.tags);
   const knownTagValues = new Set(KNOWN_SECRET_TAGS.map(k => k.tag));
@@ -411,29 +425,6 @@ const EditSecretPage: React.FC = () => {
           <p className="text-muted mt-2">
             {isEditMode ? 'Update secret details and value' : 'Create a new encrypted secret'}
           </p>
-        </div>
-        <div>
-          <button
-            className="btn btn-sm btn-primary me-2"
-            onClick={handleSubmit}
-            disabled={isSaving || (isEditMode && !isModified) || (!isEditMode && !!secretIdError)}
-          >
-            {isSaving ? (
-              <>
-                <span
-                  className="spinner-border spinner-border-sm me-1"
-                  role="status"
-                  aria-hidden="true"
-                ></span>
-                Saving...
-              </>
-            ) : (
-              <>
-                <i className="fas fa-save me-1"></i>
-                Save
-              </>
-            )}
-          </button>
         </div>
       </div>
 
@@ -557,9 +548,10 @@ const EditSecretPage: React.FC = () => {
                         id="updateValueCheckbox"
                         checked={updateValue}
                         onChange={e => {
-                          setUpdateValue(e.target.checked);
                           if (e.target.checked) {
-                            setIsModified(true);
+                            setUpdateValue(true);
+                          } else {
+                            discardValueChange();
                           }
                         }}
                       />
@@ -595,16 +587,16 @@ const EditSecretPage: React.FC = () => {
                     </FieldHelp>
                   </div>
                   <div className="input-group mb-2">
-                    {revealValue ? (
+                    {showPlainValue ? (
                       <textarea
                         className="form-control font-monospace"
                         id="value"
+                        data-testid="secret-value-input"
                         rows={4}
                         value={formData.value}
                         onChange={e => handleInputChange('value', e.target.value)}
-                        placeholder={`${isEditMode ? 'Modify' : 'Enter'} the secret value (API key, password, token, etc.)`}
-                        required={!isEditMode || updateValue}
-                        disabled={isEditMode && !updateValue}
+                        placeholder={valuePlaceholder}
+                        required
                         style={{ fontFamily: 'monospace' }}
                       />
                     ) : (
@@ -612,11 +604,12 @@ const EditSecretPage: React.FC = () => {
                         type="password"
                         className="form-control font-monospace"
                         id="value"
+                        data-testid="secret-value-input"
                         value={formData.value}
                         onChange={e => handleInputChange('value', e.target.value)}
-                        placeholder={`${isEditMode ? 'Modify' : 'Enter'} the secret value (API key, password, token, etc.)`}
-                        required={!isEditMode || updateValue}
-                        disabled={isEditMode && !updateValue}
+                        placeholder={valuePlaceholder}
+                        required={isValueEditable}
+                        disabled={!isValueEditable}
                         style={{ fontFamily: 'monospace' }}
                       />
                     )}
@@ -632,32 +625,25 @@ const EditSecretPage: React.FC = () => {
                   </div>
                   <small className="form-text text-muted d-block mb-2">
                     <i className="fas fa-shield-alt me-1"></i>
-                    Stored encrypted at rest. Anyone who can open this page and check &quot;Show
-                    secret value&quot; can still view it in plain text. Treat this page itself as
-                    sensitive.
+                    Stored encrypted at rest and never shown again once saved. To change it, enter a
+                    new value.
                   </small>
-                  <div className="custom-control custom-checkbox mb-2">
-                    <input
-                      type="checkbox"
-                      className="custom-control-input"
-                      id="revealValueCheckbox"
-                      checked={revealValue}
-                      onChange={e => setRevealValue(e.target.checked)}
-                    />
-                    <label className="custom-control-label" htmlFor="revealValueCheckbox">
-                      {revealValue ? (
-                        <>
-                          <i className="fas fa-eye me-1"></i>
-                          Reveal secret value
-                        </>
-                      ) : (
-                        <>
-                          <i className="fas fa-eye-slash me-1"></i>
-                          Show secret value
-                        </>
-                      )}
-                    </label>
-                  </div>
+                  {isValueEditable && (
+                    <div className="custom-control custom-checkbox mb-2">
+                      <input
+                        type="checkbox"
+                        className="custom-control-input"
+                        id="revealValueCheckbox"
+                        data-testid="secret-value-reveal-checkbox"
+                        checked={revealValue}
+                        onChange={e => setRevealValue(e.target.checked)}
+                      />
+                      <label className="custom-control-label" htmlFor="revealValueCheckbox">
+                        <i className={`fas ${revealValue ? 'fa-eye' : 'fa-eye-slash'} me-1`}></i>
+                        Show the value you entered
+                      </label>
+                    </div>
+                  )}
                 </div>
 
                 <div className="mb-3">
@@ -764,8 +750,9 @@ const EditSecretPage: React.FC = () => {
                     <button
                       type="submit"
                       className="btn btn-sm btn-primary"
+                      data-testid="secret-save-button"
                       disabled={
-                        isSaving || (isEditMode && !isModified) || (!isEditMode && !!secretIdError)
+                        isSaving || (isEditMode && !hasChanges) || (!isEditMode && !!secretIdError)
                       }
                     >
                       {isSaving ? (
