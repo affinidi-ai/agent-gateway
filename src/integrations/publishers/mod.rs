@@ -13,6 +13,7 @@ pub use email::EmailPublisher;
 pub use slack::SlackPublisher;
 pub use stream::StreamPublisher;
 pub use webhook::WebhookPublisher;
+pub(crate) use webhook::reserved_header;
 
 use crate::integrations::delivery::render::Escaping;
 

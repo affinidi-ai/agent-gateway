@@ -2,4 +2,5 @@
 //! and integrations. See `.plans/integrations-endpoints-event-sets.md`, stage 5.
 
 pub mod legacy;
+pub mod plan;
 pub mod received;

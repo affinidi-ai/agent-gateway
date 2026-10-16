@@ -132,7 +132,7 @@ const SIGNATURE_HEADER: &str = "x-webhook-signature-256";
 /// Headers the gateway sets on every delivery, so an endpoint cannot configure them.
 const RESERVED_HEADERS: &[&str] = &["content-type", TIMESTAMP_HEADER, SIGNATURE_HEADER];
 
-fn reserved_header(name: &str) -> bool {
+pub(crate) fn reserved_header(name: &str) -> bool {
     RESERVED_HEADERS.contains(
         &name
             .to_ascii_lowercase()
