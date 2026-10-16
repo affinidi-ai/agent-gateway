@@ -68,9 +68,10 @@ gateway, user or surface. Delivery reads a snapshot of the definitions
 change through the API and at most 5 seconds old otherwise, so definitions written by another
 node are picked up too.
 
-Delivery runs in a spawned task and never blocks or fails the operation that raised the event.
-At most 100 such tasks run at once; an event raised while all are busy is not delivered, and a
-warning is logged.
+Delivery runs in spawned tasks and never blocks or fails the operation that raised the event.
+Each integration of an event is delivered in a task of its own, so a slow or unreachable
+endpoint does not hold up the others. At most 100 such tasks run at once; a delivery due while
+all are busy is not made, and a warning is logged.
 
 A transient failure (a connection error, timeout, or request error, or an HTTP 429 or 5xx
 response) is retried up to five times, after 1, 2, 4, 8, and 16 seconds plus jitter
