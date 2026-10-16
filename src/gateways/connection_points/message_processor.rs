@@ -3854,6 +3854,25 @@ async fn process_forward_request_inner(
 
 async fn process_forward_request_with_mcp_runtime(
     message: &ReceivedMessage,
+    stream_request: Option<FabricStreamRequest>,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> ProcessingResult {
+    crate::observability::policy_audit::REQUEST_ID
+        .scope(
+            crate::observability::policy_audit::new_request_id(),
+            Box::pin(process_forward_request_in_request_scope(
+                message,
+                stream_request,
+                mcp_versions,
+                mcp_continuations,
+            )),
+        )
+        .await
+}
+
+async fn process_forward_request_in_request_scope(
+    message: &ReceivedMessage,
     mut stream_request: Option<FabricStreamRequest>,
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
@@ -11247,6 +11266,43 @@ mod tests {
             }
             other => panic!("expected ForwardResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fabric_requests_each_carry_their_own_request_id() {
+        let temp = tempfile::tempdir().unwrap();
+        register_gateway(
+            temp.path(),
+            "did:web:peer.example",
+            crate::gateways::types::GatewayStatus::Active,
+            crate::gateways::types::ExposureMode::All,
+            Vec::new(),
+        )
+        .await;
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "request-id-missing-surface");
+            let (response, events) = crate::audit::producer::capture(forward_response(&msg)).await;
+            assert_eq!(response["status"], 404, "{response}");
+            assert!(!events.is_empty(), "the refused request is recorded");
+            let ids: std::collections::HashSet<_> = events
+                .iter()
+                .map(|event| {
+                    event
+                        .request_id
+                        .clone()
+                        .expect("every record carries the request id")
+                })
+                .collect();
+            assert_eq!(ids.len(), 1, "one request, one id");
+            seen.extend(ids);
+        }
+        assert!(seen.iter().all(|id| id.len() == 16
+            && id
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
     #[tokio::test]
