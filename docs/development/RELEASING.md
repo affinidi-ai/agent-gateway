@@ -111,6 +111,12 @@ registry.
   build provenance. Verify an image with
   `gh attestation verify oci://ghcr.io/affinidi-ai/agent-gateway:X.Y.Z --repo affinidi-ai/agent-gateway`.
 
+A manual run of the workflow (**Run workflow** on the Actions tab) builds both architectures and
+boot-probes them without pushing anything. Setting `push_test_image` also runs the publish path
+(push by digest, pull-back probe, manifest merge, attestation) but tags the manifest only
+`dryrun-<short sha>`, never a version tag or `latest`; delete that tag from the package afterwards.
+GitHub offers a manual run only for a workflow file that exists on the default branch.
+
 The build uses no layer cache, so each run compiles from scratch. The first publish creates the
 package; set its visibility to public in the organization's package settings if GitHub does not
 inherit it from the repository.
