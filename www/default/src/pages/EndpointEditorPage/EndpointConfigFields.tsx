@@ -65,6 +65,7 @@ const EndpointConfigFields: React.FC<EndpointConfigFieldsProps> = ({
           <div className="form-check form-switch mb-3" key={field.name}>
             <input
               id={id}
+              data-testid={`${id}-input`}
               className="form-check-input"
               type="checkbox"
               checked={value === true}
@@ -87,6 +88,7 @@ const EndpointConfigFields: React.FC<EndpointConfigFieldsProps> = ({
           {field.kind === 'select' ? (
             <select
               id={id}
+              data-testid={`${id}-input`}
               className="form-select"
               value={String(value ?? '')}
               disabled={disabled}
@@ -101,6 +103,7 @@ const EndpointConfigFields: React.FC<EndpointConfigFieldsProps> = ({
           ) : field.kind === 'list' ? (
             <textarea
               id={id}
+              data-testid={`${id}-input`}
               className="form-control"
               rows={2}
               value={String(value ?? '')}
@@ -111,6 +114,7 @@ const EndpointConfigFields: React.FC<EndpointConfigFieldsProps> = ({
           ) : (
             <input
               id={id}
+              data-testid={`${id}-input`}
               className="form-control"
               type={field.kind === 'number' ? 'number' : 'text'}
               value={String(value ?? '')}

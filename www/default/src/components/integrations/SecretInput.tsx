@@ -60,6 +60,7 @@ const SecretInput: React.FC<SecretInputProps> = ({
             disabled={disabled}
             onClick={() => onChange({ state: 'set', value: '' })}
             aria-label={`Replace ${label}`}
+            data-testid={`${id}-replace-button`}
           >
             Replace
           </AppButton>
@@ -70,6 +71,7 @@ const SecretInput: React.FC<SecretInputProps> = ({
               disabled={disabled}
               onClick={() => onChange({ state: 'clear' })}
               aria-label={`Clear ${label}`}
+              data-testid={`${id}-clear-button`}
             >
               Clear
             </AppButton>
@@ -92,6 +94,7 @@ const SecretInput: React.FC<SecretInputProps> = ({
             disabled={disabled}
             onClick={() => onChange({ state: 'keep' })}
             aria-label={`Undo clearing ${label}`}
+            data-testid={`${id}-undo-button`}
           >
             Undo
           </AppButton>
@@ -106,6 +109,7 @@ const SecretInput: React.FC<SecretInputProps> = ({
   const referenced = secretOptions?.find(option => option.id === reference);
   const inputProps = {
     id,
+    'data-testid': `${id}-input`,
     className: 'form-control',
     value: edit.value,
     placeholder,
@@ -133,6 +137,7 @@ const SecretInput: React.FC<SecretInputProps> = ({
             size="sm"
             disabled={disabled}
             onClick={() => onChange({ state: 'keep' })}
+            data-testid={`${id}-keep-button`}
           >
             Keep stored value
           </AppButton>
@@ -145,6 +150,7 @@ const SecretInput: React.FC<SecretInputProps> = ({
           </label>
           <select
             id={`${id}-stored-secret`}
+            data-testid={`${id}-stored-secret-select`}
             className="form-select form-select-sm"
             value={reference ?? ''}
             disabled={disabled}

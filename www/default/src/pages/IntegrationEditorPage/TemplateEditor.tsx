@@ -115,6 +115,7 @@ const TemplateEditor: React.FC<TemplateEditorProps> = ({
               {field.kind === 'select' ? (
                 <select
                   id={id}
+                  data-testid={`${id}-input`}
                   className="form-select"
                   value={String(content[field.name] ?? '')}
                   onChange={event => setText(field, event.target.value)}
@@ -128,6 +129,7 @@ const TemplateEditor: React.FC<TemplateEditorProps> = ({
               ) : field.kind === 'text' ? (
                 <input
                   id={id}
+                  data-testid={`${id}-input`}
                   className="form-control"
                   value={textOf(field)}
                   placeholder={field.defaultText}
@@ -137,6 +139,7 @@ const TemplateEditor: React.FC<TemplateEditorProps> = ({
               ) : (
                 <textarea
                   id={id}
+                  data-testid={`${id}-input`}
                   className={`form-control ${field.kind === 'json' ? 'font-monospace' : ''}`}
                   rows={field.kind === 'json' ? 10 : 5}
                   spellCheck={field.kind !== 'json'}
@@ -178,6 +181,7 @@ const TemplateEditor: React.FC<TemplateEditorProps> = ({
                   onMouseDown={event => event.preventDefault()}
                   onClick={() => insert(variable.name)}
                   aria-label={`Insert ${variable.name}`}
+                  data-testid={`template-insert-${variable.name}-button`}
                 >
                   {`\${${variable.name}}`}
                 </button>

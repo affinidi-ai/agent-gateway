@@ -280,3 +280,25 @@ test('a catalog that cannot be loaded says why', async () => {
 
   expect(await screen.findByRole('alert')).toHaveTextContent('Forbidden (403)');
 });
+
+test('exposes the test ids ui-tests use', async () => {
+  mocked.getEventSet.mockResolvedValue({
+    ...STORED,
+    events: ['gateway.created', 'identity.created'],
+  });
+  renderEditor('/integrations/event-sets/s1');
+  await screen.findByDisplayValue('Gateway changes');
+
+  for (const id of [
+    'page-event-set-editor',
+    'event-set-save-button',
+    'event-set-cancel-button',
+    'event-set-name-input',
+    'event-set-search-input',
+    'event-set-group-gateway',
+    'event-set-event-gateway.created',
+    'event-set-remove-identity.created-button',
+  ]) {
+    expect(screen.getByTestId(id)).toBeInTheDocument();
+  }
+});

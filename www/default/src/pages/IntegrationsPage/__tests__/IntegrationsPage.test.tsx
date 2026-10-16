@@ -253,3 +253,36 @@ test('an empty list invites the first integration', async () => {
 
   expect(await screen.findByText(/add your first integration/i)).toBeInTheDocument();
 });
+
+test('exposes the test ids ui-tests use', async () => {
+  mockPermissions = {
+    'integrations.view': true,
+    'integrations.edit': true,
+    'integrations.delete': true,
+  };
+  renderPage();
+
+  const row = await screen.findByTestId('integration-row-i1');
+  expect(screen.getByTestId('page-integrations')).toBeInTheDocument();
+  for (const tab of ['integrations', 'endpoints', 'event-sets']) {
+    expect(screen.getByTestId(`integrations-tab-${tab}`)).toBeInTheDocument();
+  }
+  expect(screen.getByTestId('integrations-add-button')).toBeInTheDocument();
+  for (const action of ['test', 'edit', 'delete']) {
+    expect(within(row).getByTestId(`integration-${action}-button`)).toBeInTheDocument();
+  }
+
+  fireEvent.click(screen.getByTestId('integrations-tab-endpoints'));
+  const endpointRow = await screen.findByTestId('endpoint-row-e1');
+  expect(screen.getByTestId('endpoints-add-button')).toBeInTheDocument();
+  for (const action of ['test', 'edit', 'delete']) {
+    expect(within(endpointRow).getByTestId(`endpoint-${action}-button`)).toBeInTheDocument();
+  }
+
+  fireEvent.click(screen.getByTestId('integrations-tab-event-sets'));
+  const eventSetRow = await screen.findByTestId('event-set-row-s1');
+  expect(screen.getByTestId('event-sets-add-button')).toBeInTheDocument();
+  for (const action of ['edit', 'delete']) {
+    expect(within(eventSetRow).getByTestId(`event-set-${action}-button`)).toBeInTheDocument();
+  }
+});

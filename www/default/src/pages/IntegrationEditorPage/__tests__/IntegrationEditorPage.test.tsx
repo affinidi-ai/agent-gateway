@@ -314,7 +314,7 @@ test('a draft with a broken payload cannot be tested until it is fixed', async (
   choose(/^name/i, 'Hook');
   choose(/^endpoint/i, 'hook');
   choose(/^event set/i, 'gateways');
-  const send = screen.getByRole('button', { name: /send test/i });
+  const send = screen.getByTestId('integration-test-button');
   expect(send).toBeEnabled();
 
   choose(/^payload/i, '{"gateway": "${GATEWAY_NAME}",}');
@@ -338,8 +338,8 @@ test('a saved integration with a broken payload cannot be tested either', async 
 
   choose(/^payload/i, '{"gateway": ');
 
-  expect(screen.getByRole('button', { name: /send test/i })).toBeDisabled();
-  expect(screen.getByRole('button', { name: /^save/i })).toBeEnabled();
+  expect(screen.getByTestId('integration-test-button')).toBeDisabled();
+  expect(screen.getByTestId('integration-save-button')).toBeEnabled();
 });
 
 test('a template using variables no event fills cannot be tested', async () => {
@@ -350,7 +350,7 @@ test('a template using variables no event fills cannot be tested', async () => {
 
   choose(/^message/i, '${AUDIT_DECISION}');
 
-  expect(screen.getByRole('button', { name: /send test/i })).toBeDisabled();
+  expect(screen.getByTestId('integration-test-button')).toBeDisabled();
 });
 
 test('points to creating an endpoint or event set when there are none', async () => {
@@ -375,4 +375,24 @@ test('an integration that cannot be loaded says why', async () => {
   renderEditor('/integrations/missing');
 
   expect(await screen.findByRole('alert')).toHaveTextContent('Not found (404)');
+});
+
+test('exposes the test ids ui-tests use', async () => {
+  renderEditor('/integrations/i1');
+  await screen.findByDisplayValue('Gateway alerts');
+
+  for (const id of [
+    'page-integration-editor',
+    'integration-save-button',
+    'integration-cancel-button',
+    'integration-test-button',
+    'integration-name-input',
+    'integration-endpoint-select',
+    'integration-event-set-select',
+    'integration-active-switch',
+    'template-text-input',
+    'template-insert-GATEWAY_NAME-button',
+  ]) {
+    expect(screen.getByTestId(id)).toBeInTheDocument();
+  }
 });

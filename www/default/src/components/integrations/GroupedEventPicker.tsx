@@ -129,6 +129,7 @@ const GroupedEventPicker: React.FC<GroupedEventPickerProps> = ({
             style={{ maxWidth: '320px' }}
             placeholder="Search events"
             aria-label="Search events"
+            data-testid={`${testIdPrefix}-search-input`}
             value={search}
             onChange={event => setSearch(event.target.value)}
           />

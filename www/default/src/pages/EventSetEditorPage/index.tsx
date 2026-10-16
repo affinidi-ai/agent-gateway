@@ -145,7 +145,7 @@ const EventSetEditorPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-event-set-editor">
       <form onSubmit={save} noValidate>
         <div className="d-flex justify-content-between align-items-center mb-4">
           <h1 className="h4 mb-0">{stored ? `Event set ${stored.name}` : 'New event set'}</h1>
@@ -154,6 +154,7 @@ const EventSetEditorPage: React.FC = () => {
               variant="outline-secondary"
               size="md"
               onClick={() => navigate(EVENT_SETS_TAB)}
+              data-testid="event-set-cancel-button"
             >
               Cancel
             </AppButton>
@@ -164,6 +165,7 @@ const EventSetEditorPage: React.FC = () => {
               loading={saving}
               disabled={auditLocked}
               title={auditLocked ? AUDIT_VIEW_NEEDED : undefined}
+              data-testid="event-set-save-button"
             >
               Save
             </AppButton>
@@ -184,6 +186,7 @@ const EventSetEditorPage: React.FC = () => {
               </label>
               <input
                 id="event-set-name"
+                data-testid="event-set-name-input"
                 className="form-control"
                 value={name}
                 onChange={change => setName(change.target.value)}
@@ -195,6 +198,7 @@ const EventSetEditorPage: React.FC = () => {
               </label>
               <input
                 id="event-set-description"
+                data-testid="event-set-description-input"
                 className="form-control"
                 value={description}
                 onChange={change => setDescription(change.target.value)}
@@ -244,6 +248,7 @@ const EventSetEditorPage: React.FC = () => {
                         size="sm"
                         onClick={() => setEvents(current => current.filter(e => e !== event))}
                         aria-label={`Remove ${event}`}
+                        data-testid={`event-set-remove-${event}-button`}
                       >
                         Remove
                       </AppButton>

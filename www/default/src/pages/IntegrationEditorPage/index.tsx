@@ -189,7 +189,7 @@ const IntegrationEditorPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-integration-editor">
       <form onSubmit={save} noValidate>
         <div className="d-flex justify-content-between align-items-center mb-4">
           <h1 className="h4 mb-0">{stored ? `Integration ${stored.name}` : 'New integration'}</h1>
@@ -205,6 +205,7 @@ const IntegrationEditorPage: React.FC = () => {
                 'Sends one message for the first event of the event set, with sample values'
               }
               iconStart={<i className="fas fa-paper-plane me-2" aria-hidden="true" />}
+              data-testid="integration-test-button"
             >
               Send test
             </AppButton>
@@ -212,10 +213,17 @@ const IntegrationEditorPage: React.FC = () => {
               variant="outline-secondary"
               size="md"
               onClick={() => navigate(ROUTES.INTEGRATIONS)}
+              data-testid="integration-cancel-button"
             >
               Cancel
             </AppButton>
-            <AppButton type="submit" variant="primary" size="md" loading={saving}>
+            <AppButton
+              type="submit"
+              variant="primary"
+              size="md"
+              loading={saving}
+              data-testid="integration-save-button"
+            >
               Save
             </AppButton>
           </div>
@@ -236,6 +244,7 @@ const IntegrationEditorPage: React.FC = () => {
                 </label>
                 <input
                   id="integration-name"
+                  data-testid="integration-name-input"
                   className="form-control"
                   value={name}
                   onChange={event => setName(event.target.value)}
@@ -247,6 +256,7 @@ const IntegrationEditorPage: React.FC = () => {
                 </label>
                 <input
                   id="integration-description"
+                  data-testid="integration-description-input"
                   className="form-control"
                   value={description}
                   onChange={event => setDescription(event.target.value)}
@@ -258,6 +268,7 @@ const IntegrationEditorPage: React.FC = () => {
                 </label>
                 <select
                   id="integration-endpoint"
+                  data-testid="integration-endpoint-select"
                   className="form-select"
                   value={endpointId}
                   onChange={event => chooseEndpoint(event.target.value)}
@@ -279,6 +290,7 @@ const IntegrationEditorPage: React.FC = () => {
                 </label>
                 <select
                   id="integration-event-set"
+                  data-testid="integration-event-set-select"
                   className="form-select"
                   value={eventSetId}
                   onChange={event => {
@@ -301,6 +313,7 @@ const IntegrationEditorPage: React.FC = () => {
             <div className="form-check form-switch">
               <input
                 id="integration-active"
+                data-testid="integration-active-switch"
                 className="form-check-input"
                 type="checkbox"
                 checked={status === 'active'}

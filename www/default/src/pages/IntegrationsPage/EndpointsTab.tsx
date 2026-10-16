@@ -72,6 +72,7 @@ const EndpointsTab: React.FC<EndpointsTabProps> = ({
             className="shadow-sm"
             onClick={() => navigate(ROUTES.ENDPOINT_NEW)}
             iconStart={<i className="fas fa-plus fa-sm me-2" aria-hidden="true" />}
+            data-testid="endpoints-add-button"
           >
             Add Endpoint
           </AppButton>
@@ -108,6 +109,7 @@ const EndpointsTab: React.FC<EndpointsTabProps> = ({
                   return (
                     <tr
                       key={endpoint.id}
+                      data-testid={`endpoint-row-${endpoint.id}`}
                       onClick={canEdit ? () => navigate(endpointPath(endpoint.id)) : undefined}
                       style={canEdit ? { cursor: 'pointer' } : undefined}
                     >
@@ -140,6 +142,7 @@ const EndpointsTab: React.FC<EndpointsTabProps> = ({
                                   disabled={testingId === endpoint.id}
                                   title="Send a test message"
                                   aria-label={`Test endpoint ${endpoint.name}`}
+                                  data-testid="endpoint-test-button"
                                 >
                                   {testingId === endpoint.id ? (
                                     <span
@@ -157,6 +160,7 @@ const EndpointsTab: React.FC<EndpointsTabProps> = ({
                                   onClick={() => navigate(endpointPath(endpoint.id))}
                                   title="Edit"
                                   aria-label={`Edit endpoint ${endpoint.name}`}
+                                  data-testid="endpoint-edit-button"
                                 >
                                   <i className="fas fa-edit" aria-hidden="true"></i>
                                 </AppButton>
@@ -172,6 +176,7 @@ const EndpointsTab: React.FC<EndpointsTabProps> = ({
                                     : 'Delete endpoint'
                                 }
                                 aria-label={`Delete endpoint ${endpoint.name}`}
+                                data-testid="endpoint-delete-button"
                               />
                             )}
                           </div>

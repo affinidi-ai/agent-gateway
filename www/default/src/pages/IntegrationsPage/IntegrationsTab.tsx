@@ -88,6 +88,7 @@ const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
               className="shadow-sm"
               onClick={e => guard('integrations', () => navigate(ROUTES.INTEGRATION_NEW), e)}
               iconStart={<i className="fas fa-plus fa-sm me-2" aria-hidden="true" />}
+              data-testid="integrations-add-button"
             >
               Add Integration
             </AppButton>
@@ -135,6 +136,7 @@ const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                   return (
                     <tr
                       key={integration.id}
+                      data-testid={`integration-row-${integration.id}`}
                       onClick={
                         canEdit ? () => navigate(integrationPath(integration.id)) : undefined
                       }
@@ -188,6 +190,7 @@ const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                                   disabled={testingId === integration.id}
                                   title="Send a test message"
                                   aria-label={`Test integration ${integration.name}`}
+                                  data-testid="integration-test-button"
                                 >
                                   {testingId === integration.id ? (
                                     <span
@@ -205,6 +208,7 @@ const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                                   onClick={() => navigate(integrationPath(integration.id))}
                                   title="Edit"
                                   aria-label={`Edit integration ${integration.name}`}
+                                  data-testid="integration-edit-button"
                                 >
                                   <i className="fas fa-edit" aria-hidden="true"></i>
                                 </AppButton>
@@ -215,6 +219,7 @@ const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                                 onDelete={() => remove(integration)}
                                 title="Delete integration"
                                 aria-label={`Delete integration ${integration.name}`}
+                                data-testid="integration-delete-button"
                               />
                             )}
                           </div>

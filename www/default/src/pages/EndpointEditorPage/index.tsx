@@ -139,7 +139,7 @@ const EndpointEditorPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-endpoint-editor">
       <form onSubmit={save} noValidate>
         <div className="d-flex justify-content-between align-items-center mb-4">
           <h1 className="h4 mb-0">{stored ? `Endpoint ${stored.name}` : 'New endpoint'}</h1>
@@ -155,6 +155,7 @@ const EndpointEditorPage: React.FC = () => {
                   dirty ? 'Save your changes first: the test uses the saved endpoint' : undefined
                 }
                 iconStart={<i className="fas fa-paper-plane me-2" aria-hidden="true" />}
+                data-testid="endpoint-test-button"
               >
                 Send test
               </AppButton>
@@ -163,10 +164,17 @@ const EndpointEditorPage: React.FC = () => {
               variant="outline-secondary"
               size="md"
               onClick={() => navigate(ENDPOINTS_TAB)}
+              data-testid="endpoint-cancel-button"
             >
               Cancel
             </AppButton>
-            <AppButton type="submit" variant="primary" size="md" loading={saving}>
+            <AppButton
+              type="submit"
+              variant="primary"
+              size="md"
+              loading={saving}
+              data-testid="endpoint-save-button"
+            >
               Save
             </AppButton>
           </div>
@@ -186,6 +194,7 @@ const EndpointEditorPage: React.FC = () => {
               </label>
               <input
                 id="endpoint-name"
+                data-testid="endpoint-name-input"
                 className="form-control"
                 value={name}
                 onChange={event => {
@@ -200,6 +209,7 @@ const EndpointEditorPage: React.FC = () => {
               </label>
               <input
                 id="endpoint-description"
+                data-testid="endpoint-description-input"
                 className="form-control"
                 value={description}
                 onChange={event => {
@@ -223,6 +233,7 @@ const EndpointEditorPage: React.FC = () => {
                 </label>
                 <select
                   id="endpoint-type"
+                  data-testid="endpoint-type-select"
                   className="form-select"
                   value={type}
                   onChange={event => {
@@ -243,6 +254,7 @@ const EndpointEditorPage: React.FC = () => {
             <div className="form-check form-switch mb-3">
               <input
                 id="endpoint-active"
+                data-testid="endpoint-active-switch"
                 className="form-check-input"
                 type="checkbox"
                 checked={status === 'active'}

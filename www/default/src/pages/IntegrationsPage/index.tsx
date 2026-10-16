@@ -23,7 +23,7 @@ const IntegrationsPage: React.FC = () => {
   const definitions = { integrations, endpoints, eventSets };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-integrations">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <SearchInput
           value={searchTerm}
@@ -62,6 +62,7 @@ const IntegrationsPage: React.FC = () => {
         >
           <Tab
             eventKey="integrations"
+            tabAttrs={{ 'data-testid': 'integrations-tab-integrations' }}
             title={
               <>
                 <i className="fas fa-bell" aria-hidden="true"></i> Integrations
@@ -72,6 +73,7 @@ const IntegrationsPage: React.FC = () => {
           </Tab>
           <Tab
             eventKey="endpoints"
+            tabAttrs={{ 'data-testid': 'integrations-tab-endpoints' }}
             title={
               <>
                 <i className="fas fa-plug" aria-hidden="true"></i> Endpoints
@@ -82,6 +84,7 @@ const IntegrationsPage: React.FC = () => {
           </Tab>
           <Tab
             eventKey="event-sets"
+            tabAttrs={{ 'data-testid': 'integrations-tab-event-sets' }}
             title={
               <>
                 <i className="fas fa-list-check" aria-hidden="true"></i> Event Sets

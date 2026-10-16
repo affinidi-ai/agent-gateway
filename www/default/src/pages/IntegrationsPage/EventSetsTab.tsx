@@ -61,6 +61,7 @@ const EventSetsTab: React.FC<EventSetsTabProps> = ({
             className="shadow-sm"
             onClick={() => navigate(ROUTES.EVENT_SET_NEW)}
             iconStart={<i className="fas fa-plus fa-sm me-2" aria-hidden="true" />}
+            data-testid="event-sets-add-button"
           >
             Add Event Set
           </AppButton>
@@ -97,6 +98,7 @@ const EventSetsTab: React.FC<EventSetsTabProps> = ({
                   return (
                     <tr
                       key={eventSet.id}
+                      data-testid={`event-set-row-${eventSet.id}`}
                       onClick={canEdit ? () => navigate(eventSetPath(eventSet.id)) : undefined}
                       style={canEdit ? { cursor: 'pointer' } : undefined}
                     >
@@ -128,6 +130,7 @@ const EventSetsTab: React.FC<EventSetsTabProps> = ({
                                 onClick={() => navigate(eventSetPath(eventSet.id))}
                                 title="Edit"
                                 aria-label={`Edit event set ${eventSet.name}`}
+                                data-testid="event-set-edit-button"
                               >
                                 <i className="fas fa-edit" aria-hidden="true"></i>
                               </AppButton>
@@ -142,6 +145,7 @@ const EventSetsTab: React.FC<EventSetsTabProps> = ({
                                     : 'Delete event set'
                                 }
                                 aria-label={`Delete event set ${eventSet.name}`}
+                                data-testid="event-set-delete-button"
                               />
                             )}
                           </div>

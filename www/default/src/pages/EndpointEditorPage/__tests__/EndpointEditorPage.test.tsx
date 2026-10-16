@@ -261,8 +261,8 @@ describe('a stored endpoint', () => {
     renderEditor('/integrations/endpoints/e1');
     await screen.findByDisplayValue('events');
 
-    type(/authentication/i, 'none');
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    fireEvent.change(screen.getByTestId('endpoint-auth_type-input'), { target: { value: 'none' } });
+    fireEvent.click(screen.getByTestId('endpoint-save-button'));
 
     await waitFor(() =>
       expect(mocked.updateEndpoint).toHaveBeenCalledWith(
@@ -334,4 +334,48 @@ describe('a stored endpoint', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Not found (404)');
     expect(screen.queryByRole('button', { name: /save/i })).not.toBeInTheDocument();
   });
+
+  test('exposes the test ids ui-tests use', async () => {
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('Ops mail');
+
+    for (const id of [
+      'page-endpoint-editor',
+      'endpoint-save-button',
+      'endpoint-cancel-button',
+      'endpoint-test-button',
+      'endpoint-name-input',
+      'endpoint-active-switch',
+      'endpoint-smtp_host-input',
+      'endpoint-smtp_password-replace-button',
+    ]) {
+      expect(screen.getByTestId(id)).toBeInTheDocument();
+    }
+
+    fireEvent.click(screen.getByTestId('endpoint-smtp_password-replace-button'));
+    expect(screen.getByTestId('endpoint-smtp_password-input')).toBeInTheDocument();
+    expect(screen.getByTestId('endpoint-smtp_password-keep-button')).toBeInTheDocument();
+    expect(screen.getByTestId('endpoint-smtp_password-stored-secret-select')).toBeInTheDocument();
+  });
+
+  test('an optional stored secret exposes its clear and undo buttons', async () => {
+    mocked.getEndpoint.mockResolvedValue(
+      stored({
+        type: 'webhook',
+        configuration: { url: 'https://ops.example.com/hook' },
+        secrets: ['signing_secret'],
+      })
+    );
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('https://ops.example.com/hook');
+
+    fireEvent.click(screen.getByTestId('endpoint-signing_secret-clear-button'));
+    expect(screen.getByTestId('endpoint-signing_secret-undo-button')).toBeInTheDocument();
+  });
+});
+
+test('a new endpoint exposes its type select', () => {
+  renderEditor('/integrations/endpoints/new');
+
+  expect(screen.getByTestId('endpoint-type-select')).toBeInTheDocument();
 });
