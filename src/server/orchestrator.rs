@@ -1743,6 +1743,16 @@ pub async fn run_axum_proxy(
                 .expect("Failed to initialize integration endpoint, event set and integration storage"),
         );
         crate::integrations::definitions::init_definition_stores(definition_stores.clone());
+        // The previous version's integrations become endpoints, event sets and integrations
+        // once, on the Active node; a Standby runs this when it is promoted.
+        if !crate::server::mode::is_standby() {
+            crate::integrations::migration::run::migrate_on_activation(
+                &bootstrap_config.storage_paths,
+                &definition_stores,
+                Some(secrets_store.as_ref()),
+            )
+            .await;
+        }
         // Definitions that stopped passing their checks, such as after a restore, are reported
         // now rather than at their first delivery.
         if let Err(error) = crate::integrations::definitions::check::report_stored_definitions(
@@ -3184,6 +3194,13 @@ pub async fn run_axum_proxy(
         // while they are still owned here).
         let identity_state_for_mode = identity_state.clone();
         let gateway_store_for_mode = gateway_store.clone();
+        let integration_migration_for_mode = (
+            bootstrap_config
+                .storage_paths
+                .clone(),
+            definition_stores.clone(),
+            secrets_store.clone(),
+        );
 
         let mcp_replay = if network_config
             .sts
@@ -4031,6 +4048,21 @@ pub async fn run_axum_proxy(
                             // never accepts fabric traffic against stale surfaces,
                             // gateway/surface OPA, MCP gating, or global policy.
                             rederive_planes_on_activation(&identity_state_for_mode, &gateway_store_for_mode).await;
+
+                            // A node that booted Standby migrates the previous version's
+                            // integrations now; routes and sinks are already built, so they
+                            // are refreshed before the audit pipeline takes over.
+                            let (storage_paths, definition_stores, secrets_store) = &integration_migration_for_mode;
+                            if crate::integrations::migration::run::migrate_on_activation(
+                                storage_paths,
+                                definition_stores,
+                                Some(secrets_store.as_ref()),
+                            )
+                            .await
+                            {
+                                crate::integrations::delivery::dispatch::invalidate_routes().await;
+                                crate::audit::sources::rebuild_sinks().await;
+                            }
 
                             // Take over the audit journal before admitting traffic,
                             // continuing from what the previous Active node wrote.

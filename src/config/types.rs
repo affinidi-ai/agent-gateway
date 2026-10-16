@@ -2604,13 +2604,11 @@ pub struct StoragePaths {
     /// Deprecated: where the version before endpoints and event sets kept integrations. Read
     /// only to migrate them, never written; unset means `_storage/integrations/definitions`.
     #[serde(default, skip_serializing)]
-    #[allow(dead_code)] // Until the startup sweep reads it (stage 5.5).
     pub integrations: Option<String>,
 
     /// Deprecated: where that version kept integration attachments. Read only to migrate
     /// them, never written; unset means `_storage/integrations/triggers`.
     #[serde(default, skip_serializing)]
-    #[allow(dead_code)] // Until the startup sweep reads it (stage 5.5).
     pub integration_triggers: Option<String>,
 
     /// Path to store Webhook configurations

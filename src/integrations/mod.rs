@@ -13,7 +13,6 @@ pub mod handlers;
 pub mod identity_integration_triggers;
 pub mod mcp_proxy_integration_triggers;
 pub mod mediator_integration_triggers;
-#[allow(dead_code)] // Until the startup sweep calls it (stage 5.5).
 pub mod migration;
 pub mod mpp_integration_triggers;
 pub mod publishers;
