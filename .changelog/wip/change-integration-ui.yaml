@@ -44,6 +44,13 @@ changes:
         permissions. The editors move to /integrations/new and /integrations/{id}, and the
         Audit page's Forward records starts an event set of every audit event.
   fixed:
+    - timestamp: '2026-10-16T09:00:00.000Z'
+      title: Stop a VP Audit Log write from landing after the audit pipeline stops
+      description: >-
+        A write cancelled while the pipeline stopped could still land afterwards, after the
+        next pipeline had read the log's recent event ids, so the record was written twice
+        after a step-down and restart. Stopping now waits for that write or refuses it, so
+        the record is written once.
     - timestamp: '2026-10-15T16:00:00.000Z'
       title: Refuse webhook headers and methods an endpoint cannot send
       description: >-
