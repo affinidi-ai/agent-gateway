@@ -31,7 +31,10 @@ leaves a secret out keeps it, and one that sends it as `null` clears it. A secre
 instead hold `$SECRET:<secret_id>`, a reference to an appliance-wide secret in the secrets
 store, resolved at each delivery and shown in responses as written; a reference that does not
 resolve fails the delivery. Webhook `headers` must be an object of header names to strings, and
-each header value may be such a reference; the field as a whole cannot be one. An endpoint's `type` cannot change. Its configuration is checked by
+each header value may be such a reference; the field as a whole cannot be one. It cannot set
+`Content-Type`, `X-Webhook-Timestamp` or `X-Webhook-Signature-256`, which the gateway sets on
+every delivery; an endpoint stored with one of them still sends each exactly once, the
+gateway's value. An endpoint's `type` cannot change. Its configuration is checked by
 its publisher when saved, so a webhook or Slack URL that fails the checks under _Outbound
 requests_ is refused with `400`.
 

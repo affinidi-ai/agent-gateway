@@ -62,8 +62,10 @@ changes:
       title: Refuse webhook headers and methods an endpoint cannot send
       description: >-
         Webhook headers that are not an object of strings, including a $SECRET: reference as
-        the whole field, and methods other than POST, PUT and PATCH are refused when the
-        endpoint is saved, instead of being stored and silently not sent.
+        the whole field, headers the gateway sets itself (Content-Type, X-Webhook-Timestamp,
+        X-Webhook-Signature-256) and methods other than POST, PUT and PATCH are refused when
+        the endpoint is saved. A stored endpoint with one of those headers sends it once, with
+        the gateway's value, instead of twice, which broke signature checks and body parsing.
   removed:
     - timestamp: '2026-10-15T16:00:00.000Z'
       title: Remove integration tabs from gateway, connection point, user and identity pages

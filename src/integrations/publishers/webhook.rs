@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use tracing::info;
 
@@ -51,6 +52,17 @@ impl IntegrationPublisher for WebhookPublisher {
                 "The headers must be an object of header names to string values; a value may be $SECRET:<secret_id>"
             );
         }
+        if let Some(name) = config
+            .get("headers")
+            .and_then(Value::as_object)
+            .and_then(|headers| {
+                headers
+                    .keys()
+                    .find(|name| reserved_header(name))
+            })
+        {
+            anyhow::bail!("The header {name} is set by the gateway on every delivery; remove it from the headers");
+        }
         Ok(())
     }
 
@@ -92,25 +104,8 @@ impl IntegrationPublisher for WebhookPublisher {
         let timestamp = chrono::Utc::now()
             .timestamp()
             .to_string();
-        request = request.header("X-Webhook-Timestamp", &timestamp);
-        if let Some(secret) = configuration
-            .get("signing_secret")
-            .and_then(Value::as_str)
-        {
-            request = request.header("X-Webhook-Signature-256", signature(secret, &timestamp, &body)?);
-        }
-        if let Some(headers) = configuration
-            .get("headers")
-            .and_then(Value::as_object)
-        {
-            for (name, value) in headers {
-                if let Some(value) = value.as_str() {
-                    request = request.header(name, value);
-                }
-            }
-        }
+        request = request.headers(request_headers(configuration, &timestamp, &body)?);
         let response = request
-            .header("Content-Type", "application/json")
             .body(body)
             .send()
             .await
@@ -130,6 +125,58 @@ impl IntegrationPublisher for WebhookPublisher {
 }
 
 const SUPPORTED_METHODS: &[&str] = &["POST", "PUT", "PATCH"];
+
+const TIMESTAMP_HEADER: &str = "x-webhook-timestamp";
+const SIGNATURE_HEADER: &str = "x-webhook-signature-256";
+
+/// Headers the gateway sets on every delivery, so an endpoint cannot configure them.
+const RESERVED_HEADERS: &[&str] = &["content-type", TIMESTAMP_HEADER, SIGNATURE_HEADER];
+
+fn reserved_header(name: &str) -> bool {
+    RESERVED_HEADERS.contains(
+        &name
+            .to_ascii_lowercase()
+            .as_str(),
+    )
+}
+
+/// The headers of one delivery: the configured ones first, then the reserved ones, each set
+/// once with replace semantics. A stored endpoint that predates the reserved-header check
+/// therefore still sends one `Content-Type`, one timestamp and at most one signature.
+fn request_headers(
+    configuration: &Value,
+    timestamp: &str,
+    body: &str,
+) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    if let Some(configured) = configuration
+        .get("headers")
+        .and_then(Value::as_object)
+    {
+        for (name, value) in configured {
+            let Some(value) = value.as_str() else { continue };
+            if reserved_header(name) {
+                continue;
+            }
+            let name =
+                HeaderName::from_bytes(name.as_bytes()).with_context(|| format!("Invalid header name {name}"))?;
+            let value = HeaderValue::from_str(value).with_context(|| format!("Invalid value for header {name}"))?;
+            headers.insert(name, value);
+        }
+    }
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(timestamp).context("Invalid timestamp")?);
+    if let Some(secret) = configuration
+        .get("signing_secret")
+        .and_then(Value::as_str)
+    {
+        headers.insert(
+            SIGNATURE_HEADER,
+            HeaderValue::from_str(&signature(secret, timestamp, body)?).context("Invalid signature")?,
+        );
+    }
+    Ok(headers)
+}
 
 /// The `X-Webhook-Signature-256` value: `sha256=` and the hex HMAC-SHA256 of
 /// `timestamp.body` keyed with the signing secret.
@@ -204,6 +251,72 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn refuses_configured_headers_the_gateway_sets_itself() {
+        for name in ["content-type", "X-WEBHOOK-TIMESTAMP", "X-Webhook-Signature-256"] {
+            let error = WebhookPublisher
+                .validate_config(&json!({"url": URL, "headers": {name: "value"}}))
+                .expect_err("refused");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains(name),
+                "{error}"
+            );
+        }
+        assert!(
+            WebhookPublisher
+                .validate_config(&json!({"url": URL, "headers": {"Authorization": "Bearer x"}}))
+                .is_ok()
+        );
+    }
+
+    fn values<'a>(
+        headers: &'a reqwest::header::HeaderMap,
+        name: &str,
+    ) -> Vec<&'a str> {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_stored_endpoint_with_reserved_headers_still_sends_each_once() {
+        let configuration = json!({
+            "signing_secret": "s3cr3t",
+            "headers": {
+                "Content-Type": "text/plain",
+                "x-webhook-signature-256": "sha256=stale",
+                "X-Webhook-Timestamp": "0",
+                "Authorization": "Bearer x"
+            }
+        });
+
+        let headers = request_headers(&configuration, "1700000000", r#"{"a":1}"#).expect("headers");
+
+        assert_eq!(values(&headers, "content-type"), ["application/json"]);
+        assert_eq!(values(&headers, "x-webhook-timestamp"), ["1700000000"]);
+        assert_eq!(
+            values(&headers, "x-webhook-signature-256"),
+            [signature("s3cr3t", "1700000000", r#"{"a":1}"#)
+                .unwrap()
+                .as_str()]
+        );
+        assert_eq!(values(&headers, "authorization"), ["Bearer x"]);
+    }
+
+    #[test]
+    fn without_a_signing_secret_no_signature_is_sent() {
+        let configuration = json!({"headers": {"X-Webhook-Signature-256": "sha256=stale"}});
+
+        let headers = request_headers(&configuration, "1700000000", "{}").expect("headers");
+
+        assert!(values(&headers, "x-webhook-signature-256").is_empty());
     }
 
     #[test]
