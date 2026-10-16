@@ -29,9 +29,16 @@ the only complete build: it contains the binary and the dashboard, and runs as a
 user. No pre-built image is published, so build it yourself. The build needs much more
 memory than the running gateway; see [Build memory](development/DEVELOPMENT.md#build-memory-oom).
 
-The image starts with `--config /app/config/config.toml` and expects three mounts:
-`/app/config`, `/app/certs` and `/app/_storage` (persistent, writable).
-[`docker-compose.yml`](../docker-compose.yml) shows that mount layout, and
+The image starts with `--config /app/config/config.toml` and needs these mounts:
+
+| Mount | Holds | Access |
+| --- | --- | --- |
+| `/app/config` | Configuration files | Read-only |
+| `/app/certs` | TLS certificate and key | Read-only |
+| `/app/_storage` | Gateway state | Persistent, writable |
+| `/app/_backup_restore` | Restore staging and pre-restore backups; set `backup_restore = "/app/_backup_restore"` | Persistent, writable |
+
+[`docker-compose.yml`](../docker-compose.yml) shows the first three, and
 [`config/examples/README.md`](../config/examples/README.md) lists every configuration file.
 
 **Release binary.** Each GitHub release publishes `agent-gateway-linux-x86_64` with a
