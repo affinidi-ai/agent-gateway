@@ -49,7 +49,7 @@ pub(crate) async fn has_cached_producer(endpoint_id: &str) -> bool {
 /// Caches a producer for `endpoint_id` without sending anything.
 #[cfg(test)]
 pub(crate) async fn warm_producer(endpoint_id: &str) {
-    producer_for(endpoint_id, "127.0.0.1:1", &serde_json::json!({}))
+    let _cached = producer_for(endpoint_id, "127.0.0.1:1", &serde_json::json!({}))
         .await
         .expect("producer");
 }
@@ -230,7 +230,7 @@ mod tests {
     async fn invalidating_an_endpoint_drops_its_producer() {
         let endpoint_id = format!("kafka-cache-{}", uuid::Uuid::new_v4());
         let config = json!({"auth_type": "none"});
-        producer_for(&endpoint_id, "127.0.0.1:1", &config)
+        let _cached = producer_for(&endpoint_id, "127.0.0.1:1", &config)
             .await
             .unwrap();
         assert!(has_cached_producer(&endpoint_id).await);
