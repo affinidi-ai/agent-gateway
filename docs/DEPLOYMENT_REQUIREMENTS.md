@@ -64,7 +64,8 @@ dashboard: build it from `www/default`, and set the `static` route `path` in
 The gateway stores every surface, identity, policy, audit record and, by default, secret
 under `_storage/`. Losing that folder loses the appliance, so mount it on a persistent,
 writable volume. Set every `[storage_paths]` key in `config.toml` to an absolute path
-inside that folder, and put `backup_restore` on persistent storage too. A full backup
+inside that folder, except `backup_restore`. Put `backup_restore` on persistent, writable
+storage next to `_storage`, never inside it: a restore empties `_storage`. A full backup
 covers only the `_storage` folder. See
 [Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files).
 
