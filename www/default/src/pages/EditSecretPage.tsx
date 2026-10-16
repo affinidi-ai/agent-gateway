@@ -73,7 +73,6 @@ const EditSecretPage: React.FC = () => {
   const [loading, setLoading] = useState(isEditMode);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
-  const [isModified, setIsModified] = useState(false);
   const [secretData, setSecretData] = useState<Secret | null>(null);
   const [isSecretIdManuallyEdited, setIsSecretIdManuallyEdited] = useState(false);
   const [secretIdError, setSecretIdError] = useState('');
@@ -92,6 +91,14 @@ const EditSecretPage: React.FC = () => {
   const [existingTags, setExistingTags] = useState<string[]>([]);
   const [updateValue, setUpdateValue] = useState(false);
   const [revealValue, setRevealValue] = useState(false);
+
+  const hasChanges =
+    !!secretData &&
+    (updateValue ||
+      formData.name !== secretData.name ||
+      formData.description !== (secretData.description || '') ||
+      formData.secret_type !== (secretData.secret_type || 'General') ||
+      formData.tags.join('\n') !== (secretData.tags || []).join('\n'));
 
   // Fetch gateway configuration to get available secret types
   useEffect(() => {
@@ -190,7 +197,7 @@ const EditSecretPage: React.FC = () => {
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault();
         // Only trigger save if not already saving, form is modified (or it's create mode), and no secret_id error
-        if (!isSaving && (!isEditMode || isModified) && !secretIdError) {
+        if (!isSaving && (!isEditMode || hasChanges) && !secretIdError) {
           const form = document.querySelector('form');
           if (form) {
             form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
@@ -201,7 +208,7 @@ const EditSecretPage: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isSaving, isModified, isEditMode, secretIdError]);
+  }, [isSaving, hasChanges, isEditMode, secretIdError]);
 
   const fetchSecret = async (secretId: string) => {
     try {
@@ -284,10 +291,10 @@ const EditSecretPage: React.FC = () => {
       }
 
       if (isEditMode && id) {
-        await apiClient.put(`/secrets/${id}`, payload);
+        const response = await apiClient.put(`/secrets/${id}`, payload);
+        setSecretData(response.data);
         showToast('success', 'Secret updated successfully');
         discardValueChange();
-        setIsModified(false);
       } else {
         await apiClient.post('/secrets/new', payload);
         showToast('success', 'Secret created successfully');
@@ -319,7 +326,6 @@ const EditSecretPage: React.FC = () => {
 
   const handleInputChange = (field: string, value: any) => {
     setFormData(prev => ({ ...prev, [field]: value }));
-    setIsModified(true);
     // Track when user manually edits secret_id
     if (field === 'secret_id') {
       setIsSecretIdManuallyEdited(true);
@@ -333,7 +339,6 @@ const EditSecretPage: React.FC = () => {
         ...prev,
         tags: [...prev.tags, t],
       }));
-      setIsModified(true);
     }
   };
 
@@ -346,7 +351,6 @@ const EditSecretPage: React.FC = () => {
     crypto.getRandomValues(bytes);
     const value = Array.from(bytes, n => charset[n % charset.length]).join('');
     setFormData(prev => ({ ...prev, value }));
-    setIsModified(true);
     if (isEditMode) setUpdateValue(true);
   };
 
@@ -358,7 +362,6 @@ const EditSecretPage: React.FC = () => {
         tags: [...prev.tags, tag],
       }));
       setTagInput('');
-      setIsModified(true);
     }
   };
 
@@ -367,7 +370,6 @@ const EditSecretPage: React.FC = () => {
       ...prev,
       tags: prev.tags.filter(t => t !== tagToRemove),
     }));
-    setIsModified(true);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -548,7 +550,6 @@ const EditSecretPage: React.FC = () => {
                         onChange={e => {
                           if (e.target.checked) {
                             setUpdateValue(true);
-                            setIsModified(true);
                           } else {
                             discardValueChange();
                           }
@@ -751,7 +752,7 @@ const EditSecretPage: React.FC = () => {
                       className="btn btn-sm btn-primary"
                       data-testid="secret-save-button"
                       disabled={
-                        isSaving || (isEditMode && !isModified) || (!isEditMode && !!secretIdError)
+                        isSaving || (isEditMode && !hasChanges) || (!isEditMode && !!secretIdError)
                       }
                     >
                       {isSaving ? (

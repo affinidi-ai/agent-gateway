@@ -204,7 +204,9 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
 ## Secret editor
 
 - `/secrets/new` and `/secrets/:id` have one save button, at the bottom of the form beside
-  **Delete Secret** (`secret-save-button`); `Cmd+S` and `Ctrl+S` follow the same path.
+  **Delete Secret** (`secret-save-button`); `Cmd+S` and `Ctrl+S` follow the same path. In
+  edit mode, saving is possible only while **Update Secret Value** is checked or the name,
+  description, type or tags differ from the loaded secret, so undoing an edit disables it.
 - The API never returns a stored secret value, so the editor never shows one. In edit mode
   the value field is disabled with a **Stored value is hidden** placeholder until **Update
   Secret Value** is checked. Unchecking it, or a successful save, clears the entered value

@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -59,7 +59,10 @@ describe('EditSecretPage', () => {
       if (url === '/secrets/') return Promise.resolve({ data: [storedSecret] });
       return Promise.resolve({ data: {} });
     });
-    (apiClient.put as jest.Mock).mockResolvedValue({ data: storedSecret });
+    (apiClient.put as jest.Mock).mockImplementation(
+      (_url: string, { name, description, secret_type, tags }: Record<string, any>) =>
+        Promise.resolve({ data: { ...storedSecret, name, description, secret_type, tags } })
+    );
   });
 
   it('shows a single save button in edit mode', async () => {
@@ -143,11 +146,41 @@ describe('EditSecretPage', () => {
     expect(screen.getByTestId('secret-value-reveal-checkbox')).not.toBeChecked();
 
     await userEvent.click(screen.getByLabelText('Update Secret Value'));
-    await userEvent.click(screen.getByTestId('secret-save-button'));
+    expect(screen.getByTestId('secret-save-button')).toBeDisabled();
+    fireEvent.keyDown(window, { key: 's', ctrlKey: true });
+    expect(apiClient.put).not.toHaveBeenCalled();
+  });
+
+  it('keeps other edits when a value update is cancelled', async () => {
+    renderPage('/secrets/secret-1');
+    const nameInput = await screen.findByDisplayValue('OpenAI key');
+
+    await userEvent.click(screen.getByLabelText('Update Secret Value'));
+    await userEvent.type(nameInput, ' v2');
+    await userEvent.type(screen.getByTestId('secret-value-input'), 'sk-cancelled');
+    await userEvent.click(screen.getByLabelText('Update Secret Value'));
+
+    const saveButton = screen.getByTestId('secret-save-button');
+    expect(saveButton).toBeEnabled();
+    await userEvent.click(saveButton);
     await waitFor(() => expect(apiClient.put).toHaveBeenCalled());
     const [, payload] = (apiClient.put as jest.Mock).mock.calls[0];
+    expect(payload.name).toBe('OpenAI key v2');
     expect(payload.update_value).toBe(false);
     expect(payload).not.toHaveProperty('value');
+    await waitFor(() => expect(saveButton).toBeDisabled());
+  });
+
+  it('treats a tag added and then removed as no change', async () => {
+    renderPage('/secrets/secret-1');
+    await screen.findByDisplayValue('OpenAI key');
+
+    await userEvent.type(screen.getByLabelText('Tags'), 'prod{Enter}');
+    expect(screen.getByTestId('secret-save-button')).toBeEnabled();
+
+    const tagBadge = screen.getByText('prod', { selector: 'span' });
+    await userEvent.click(within(tagBadge).getByRole('button'));
+    expect(screen.getByTestId('secret-save-button')).toBeDisabled();
   });
 
   it('hides the saved value after a successful update', async () => {
