@@ -1,6 +1,7 @@
 //! Sends a catalog event to every active integration whose event set holds it.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use tracing::{error, warn};
 use super::render::render;
 use super::retry::{is_transient_publish_error, retry_delays};
 use super::values::event_values;
+use crate::integrations::background_tasks::spawn_background_task;
 use crate::integrations::definitions::endpoint::resolve_secret_references;
 use crate::integrations::definitions::{DefinitionStores, Endpoint, EventSet, Integration, Status, definition_stores};
 use crate::integrations::events::{IntegrationEvent, find_event};
@@ -309,8 +311,12 @@ pub fn dispatch(
         warn!(event_id, "Not dispatching an event outside the integration catalog");
         return;
     };
-    let values = event_values(event, trigger, crate::storage::settings_store::global_appliance_id_override());
-    crate::integrations::background_tasks::spawn_background_task(event_id, async move {
+    let values = Arc::new(event_values(
+        event,
+        trigger,
+        crate::storage::settings_store::global_appliance_id_override(),
+    ));
+    spawn_background_task(event_id, async move {
         let routes = match current_routes().await {
             Ok(routes) => routes,
             Err(error) => {
@@ -318,17 +324,38 @@ pub fn dispatch(
                 return;
             }
         };
-        for route in routes.for_event(&event.id) {
-            if let Err(error) = deliver(&route, &values).await {
+        deliver_each(&event.id, routes.for_event(&event.id), values, |route, values| async move {
+            deliver(&route, &values).await
+        });
+    });
+}
+
+/// Delivers each route in a background task of its own, so a slow or failing endpoint never
+/// holds up the other integrations of the event, and the task limit counts deliveries.
+fn deliver_each<D, F>(
+    event_id: &str,
+    routes: Vec<Route>,
+    values: Arc<HashMap<String, String>>,
+    deliver: D,
+) where
+    D: Fn(Route, Arc<HashMap<String, String>>) -> F,
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    for route in routes {
+        let event_id = event_id.to_string();
+        let integration_id = route.integration.id.clone();
+        let delivery = deliver(route, values.clone());
+        spawn_background_task(&format!("{event_id} to {integration_id}"), async move {
+            if let Err(error) = delivery.await {
                 error!(
-                    event_id = %event.id,
-                    integration_id = %route.integration.id,
+                    event_id = %event_id,
+                    integration_id = %integration_id,
                     error = %error,
                     "Integration delivery failed"
                 );
             }
-        }
-    });
+        });
+    }
 }
 
 #[cfg(test)]
@@ -612,6 +639,57 @@ mod tests {
                 .collect(),
         )
         .expect("set")
+    }
+
+    #[tokio::test]
+    async fn each_route_of_an_event_is_delivered_without_waiting_for_the_others() {
+        let endpoint = Endpoint::new("Ops".to_string(), String::new(), EndpointType::Stream, json!({}));
+        let gateways = set(&["gateway.created"]);
+        // The slow route comes first and the failing one before the last, so delivering them
+        // one after another would hold the others up.
+        let routes: Vec<Route> = ["slow", "failing", "fast"]
+            .iter()
+            .map(|name| Route {
+                integration: integration_for(name, &endpoint, &gateways),
+                endpoint: endpoint.clone(),
+            })
+            .collect();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (delivered, mut deliveries) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        deliver_each("gateway.created", routes, Arc::new(HashMap::new()), {
+            let release = release.clone();
+            move |route: Route, _values| {
+                let release = release.clone();
+                let delivered = delivered.clone();
+                async move {
+                    match route
+                        .integration
+                        .name
+                        .as_str()
+                    {
+                        "slow" => release.notified().await,
+                        "failing" => anyhow::bail!("endpoint refused"),
+                        _ => {}
+                    }
+                    delivered
+                        .send(route.integration.name)
+                        .expect("receiver");
+                    Ok(())
+                }
+            }
+        });
+
+        let wait = Duration::from_secs(5);
+        let first = tokio::time::timeout(wait, deliveries.recv())
+            .await
+            .expect("the fast route is not held up by the slow or the failing one");
+        assert_eq!(first.as_deref(), Some("fast"));
+        release.notify_one();
+        let second = tokio::time::timeout(wait, deliveries.recv())
+            .await
+            .expect("the slow route still completes");
+        assert_eq!(second.as_deref(), Some("slow"));
     }
 
     #[test]

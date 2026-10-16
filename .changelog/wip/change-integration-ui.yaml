@@ -51,6 +51,12 @@ changes:
         permissions. The editors move to /integrations/new and /integrations/{id}, and the
         Audit page's Forward records starts an event set of every audit event.
   fixed:
+    - timestamp: '2026-10-16T12:00:00.000Z'
+      title: Deliver an event to each integration without waiting for the others
+      description: >-
+        The integrations of one event were delivered one after another, so an endpoint that
+        was slow or unreachable, retrying for up to 30 seconds per attempt, delayed every other
+        integration of that event. Each integration is now delivered on its own.
     - timestamp: '2026-10-16T11:00:00.000Z'
       title: Share one Kafka producer per endpoint
       description: >-
