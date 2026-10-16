@@ -10,6 +10,17 @@ export interface AuditDeliveryLimits {
 export const AUDIT_MAX_ATTEMPTS_LABEL = 'Give up on a record after N attempts';
 export const AUDIT_DROP_AFTER_LABEL = 'Skip records older than N seconds';
 
+/**
+ * The gateway refuses, without `audit.view`, every change that decides where audit records
+ * go: an event set holding audit events, an integration receiving them, or its endpoint.
+ * Controls it would refuse are disabled with this note.
+ */
+export const AUDIT_VIEW_NEEDED = 'Audit events need the audit.view permission.';
+
+/** Whether `events` names any Governance Audit event. */
+export const holdsAuditEvents = (events: string[] | undefined): boolean =>
+  Boolean(events?.some(event => event.startsWith('audit.')));
+
 const LIMIT_RULE = 'a whole number of 1 or more, or leave it empty.';
 
 function isValidLimit(value: string): boolean {

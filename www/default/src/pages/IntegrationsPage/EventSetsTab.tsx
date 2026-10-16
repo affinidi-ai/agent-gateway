@@ -8,6 +8,7 @@ import { usePermissions } from '../../context/PermissionsContext';
 import { deleteEventSet, EventSet } from '../../integrationsApi';
 import { eventSetPath, ROUTES } from '../../routes';
 import { getErrorMessage } from '../../utils/apiError';
+import { AUDIT_VIEW_NEEDED, holdsAuditEvents } from '../../utils/auditIntegrations';
 import { showToast } from '../../utils/toaster';
 import { matches, namesOfIntegrations, STICKY_ERROR, usedByLabel } from './listHelpers';
 import { IntegrationDefinitions } from './useIntegrationDefinitions';
@@ -16,9 +17,6 @@ interface EventSetsTabProps extends IntegrationDefinitions {
   searchTerm: string;
   onChanged: () => void;
 }
-
-const holdsAuditEvents = (eventSet: EventSet) =>
-  eventSet.events.some(event => event.startsWith('audit.'));
 
 /** Which events integrations deliver, picked from the catalog. */
 const EventSetsTab: React.FC<EventSetsTabProps> = ({
@@ -31,6 +29,7 @@ const EventSetsTab: React.FC<EventSetsTabProps> = ({
   const { hasPermission } = usePermissions();
   const canEdit = hasPermission('integrations.edit');
   const canDelete = hasPermission('integrations.delete');
+  const canViewAudit = hasPermission('audit.view');
 
   const term = searchTerm.trim().toLowerCase();
   const shown = eventSets.filter(
@@ -95,6 +94,9 @@ const EventSetsTab: React.FC<EventSetsTabProps> = ({
                 {shown.map(eventSet => {
                   const users = usersOf(eventSet);
                   const count = eventSet.events.length;
+                  const withAudit = holdsAuditEvents(eventSet.events);
+                  // The gateway refuses to delete a set holding audit events without audit.view.
+                  const auditLocked = withAudit && !canViewAudit;
                   return (
                     <tr
                       key={eventSet.id}
@@ -110,7 +112,7 @@ const EventSetsTab: React.FC<EventSetsTabProps> = ({
                       </td>
                       <td>
                         {count} event{count === 1 ? '' : 's'}{' '}
-                        {holdsAuditEvents(eventSet) && (
+                        {withAudit && (
                           <span
                             className="badge text-bg-warning"
                             title="Holds Governance Audit events, delivered through the audit journal"
@@ -138,11 +140,13 @@ const EventSetsTab: React.FC<EventSetsTabProps> = ({
                             {canDelete && (
                               <DeleteButton
                                 onDelete={() => remove(eventSet)}
-                                disabled={users.length > 0}
+                                disabled={users.length > 0 || auditLocked}
                                 title={
                                   users.length > 0
                                     ? `Used by ${users.join(', ')}`
-                                    : 'Delete event set'
+                                    : auditLocked
+                                      ? AUDIT_VIEW_NEEDED
+                                      : 'Delete event set'
                                 }
                                 aria-label={`Delete event set ${eventSet.name}`}
                                 data-testid="event-set-delete-button"

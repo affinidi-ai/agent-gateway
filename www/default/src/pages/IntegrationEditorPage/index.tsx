@@ -19,23 +19,25 @@ import {
 } from '../../integrationsApi';
 import { ROUTES } from '../../routes';
 import { getErrorMessage } from '../../utils/apiError';
+import { usePermissions } from '../../context/PermissionsContext';
 import {
+  AUDIT_VIEW_NEEDED,
   AuditDeliveryLimits,
   auditDeliveryLimitsError,
   auditDeliveryLimitsOf,
   auditDeliveryLimitsPayload,
+  holdsAuditEvents,
 } from '../../utils/auditIntegrations';
 import { showToast } from '../../utils/toaster';
 import TemplateEditor from './TemplateEditor';
 import { unfilledVariables, variablesForEvents } from './templateModel';
 
-const holdsAuditEvents = (eventSet?: EventSet) =>
-  Boolean(eventSet?.events.some(event => event.startsWith('audit.')));
-
 /** Creates an integration, or changes a stored one: an endpoint, an event set and a template. */
 const IntegrationEditorPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { hasPermission } = usePermissions();
+  const canViewAudit = hasPermission('audit.view');
 
   const [catalog, setCatalog] = useState<IntegrationCatalog | null>(null);
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
@@ -89,8 +91,12 @@ const IntegrationEditorPage: React.FC = () => {
 
   const endpoint = endpoints.find(candidate => candidate.id === endpointId);
   const eventSet = eventSets.find(candidate => candidate.id === eventSetId);
-  const withAudit = holdsAuditEvents(eventSet);
+  const withAudit = holdsAuditEvents(eventSet?.events);
   const variables = catalog && eventSet ? variablesForEvents(catalog, eventSet.events) : [];
+  // The gateway refuses to change an integration that receives audit events, before or after,
+  // without audit.view.
+  const storedEventSet = eventSets.find(candidate => candidate.id === stored?.event_set_id);
+  const auditLocked = !canViewAudit && (withAudit || holdsAuditEvents(storedEventSet?.events));
 
   const chooseEndpoint = (next: string) => {
     const nextType = endpoints.find(candidate => candidate.id === next)?.type;
@@ -115,6 +121,7 @@ const IntegrationEditorPage: React.FC = () => {
 
   /** Why the integration cannot be saved as it stands, or null. */
   const problem = (): string | null => {
+    if (auditLocked) return AUDIT_VIEW_NEEDED;
     const missing = [
       ...(name.trim() ? [] : ['Name']),
       ...(endpointId ? [] : ['Endpoint']),
@@ -222,6 +229,8 @@ const IntegrationEditorPage: React.FC = () => {
               variant="primary"
               size="md"
               loading={saving}
+              disabled={auditLocked}
+              title={auditLocked ? AUDIT_VIEW_NEEDED : undefined}
               data-testid="integration-save-button"
             >
               Save
@@ -232,6 +241,13 @@ const IntegrationEditorPage: React.FC = () => {
         {error && (
           <div className="alert alert-danger" role="alert">
             {error}
+          </div>
+        )}
+
+        {auditLocked && (
+          <div className="alert alert-secondary small" data-testid="integration-audit-view-note">
+            {AUDIT_VIEW_NEEDED} This integration receives audit events, so only a user with it can
+            change or test it.
           </div>
         )}
 

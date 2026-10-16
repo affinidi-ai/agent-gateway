@@ -13,13 +13,11 @@ import {
   updateEventSet,
 } from '../../integrationsApi';
 import { getErrorMessage } from '../../utils/apiError';
+import { AUDIT_VIEW_NEEDED, holdsAuditEvents } from '../../utils/auditIntegrations';
 import { showToast } from '../../utils/toaster';
 
 const EVENT_SETS_TAB = '/integrations?tab=event-sets';
 const AUDIT_FAMILY = 'audit';
-const AUDIT_VIEW_NEEDED = 'Audit events need the audit.view permission.';
-
-const isAuditEvent = (event: string) => event.startsWith(`${AUDIT_FAMILY}.`);
 
 /**
  * Families as the catalog lists them; audit events split further by their audit group, and
@@ -92,10 +90,10 @@ const EventSetEditorPage: React.FC = () => {
 
   const known = new Set(catalog.map(event => event.id));
   const unknown = events.filter(event => !known.has(event));
-  const holdsAudit = events.some(isAuditEvent);
+  const holdsAudit = holdsAuditEvents(events);
   // The gateway refuses to change a set that holds audit events, before or after, without
   // audit.view.
-  const auditLocked = !canPickAudit && (holdsAudit || Boolean(stored?.events.some(isAuditEvent)));
+  const auditLocked = !canPickAudit && (holdsAudit || holdsAuditEvents(stored?.events));
 
   const save = async (event: React.FormEvent) => {
     event.preventDefault();

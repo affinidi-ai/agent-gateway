@@ -1,17 +1,21 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { AppButton } from '../../components/shared/AppButton';
+import { usePermissions } from '../../context/PermissionsContext';
 import {
   createEndpoint,
   DefinitionStatus,
   Endpoint,
   EndpointType,
   getEndpoint,
+  listEventSets,
+  listIntegrations,
   testEndpoint,
   updateEndpoint,
 } from '../../integrationsApi';
 import { useApplianceSecrets } from '../../hooks/useApplianceSecrets';
 import { getErrorMessage } from '../../utils/apiError';
+import { AUDIT_VIEW_NEEDED, holdsAuditEvents } from '../../utils/auditIntegrations';
 import { showToast } from '../../utils/toaster';
 import EndpointConfigFields from './EndpointConfigFields';
 import { buildConfiguration, EndpointForm, initialForm, missingRequired } from './endpointFields';
@@ -35,6 +39,8 @@ const EndpointEditorPage: React.FC = () => {
   const navigate = useNavigate();
   const requestedType = searchParams.get('type');
   const secretOptions = useApplianceSecrets();
+  const { hasPermission } = usePermissions();
+  const canViewAudit = hasPermission('audit.view');
 
   const [stored, setStored] = useState<Endpoint | null>(null);
   const [loading, setLoading] = useState(Boolean(id));
@@ -50,9 +56,24 @@ const EndpointEditorPage: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [auditReceivers, setAuditReceivers] = useState<string[]>([]);
 
   useEffect(() => {
     if (!id) return;
+    // The integrations receiving audit events through this endpoint. If they cannot be listed,
+    // nothing is locked here and the gateway still refuses what it must.
+    Promise.all([listIntegrations(), listEventSets()])
+      .then(([integrations, eventSets]) =>
+        setAuditReceivers(
+          integrations
+            .filter(integration => integration.endpoint_id === id)
+            .filter(integration =>
+              holdsAuditEvents(eventSets.find(set => set.id === integration.event_set_id)?.events)
+            )
+            .map(integration => integration.name)
+        )
+      )
+      .catch(() => setAuditReceivers([]));
     getEndpoint(id)
       .then(endpoint => {
         setStored(endpoint);
@@ -66,6 +87,10 @@ const EndpointEditorPage: React.FC = () => {
       .finally(() => setLoading(false));
   }, [id]);
 
+  // The gateway refuses to change an endpoint an audit integration delivers through without
+  // audit.view.
+  const auditLocked = !canViewAudit && auditReceivers.length > 0;
+
   const changed = () => {
     setDirty(true);
     setError(null);
@@ -73,6 +98,7 @@ const EndpointEditorPage: React.FC = () => {
 
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (auditLocked) return;
     const missing = [...(name.trim() ? [] : ['Name']), ...missingRequired(type, form)];
     if (missing.length) {
       setError(`Fill in: ${missing.join(', ')}`);
@@ -173,6 +199,8 @@ const EndpointEditorPage: React.FC = () => {
               variant="primary"
               size="md"
               loading={saving}
+              disabled={auditLocked}
+              title={auditLocked ? AUDIT_VIEW_NEEDED : undefined}
               data-testid="endpoint-save-button"
             >
               Save
@@ -183,6 +211,14 @@ const EndpointEditorPage: React.FC = () => {
         {error && (
           <div className="alert alert-danger" role="alert">
             {error}
+          </div>
+        )}
+
+        {auditLocked && (
+          <div className="alert alert-secondary small" data-testid="endpoint-audit-view-note">
+            {AUDIT_VIEW_NEEDED} {auditReceivers.join(', ')}{' '}
+            {auditReceivers.length === 1 ? 'receives' : 'receive'} audit events through this
+            endpoint, so only a user with it can change it.
           </div>
         )}
 

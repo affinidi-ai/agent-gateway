@@ -11,11 +11,20 @@ jest.mock('../../../hooks/useApplianceSecrets', () => ({
   useApplianceSecrets: () => [{ id: 'slack-hook', name: 'Slack hook' }],
 }));
 
+let mockPermissions: Record<string, boolean> = {};
+jest.mock('../../../context/PermissionsContext', () => ({
+  usePermissions: () => ({
+    hasPermission: (feature: string) => mockPermissions[feature] === true,
+  }),
+}));
+
 jest.mock('../../../integrationsApi', () => ({
   getEndpoint: jest.fn(),
   createEndpoint: jest.fn(),
   updateEndpoint: jest.fn(),
   testEndpoint: jest.fn(),
+  listIntegrations: jest.fn(),
+  listEventSets: jest.fn(),
 }));
 
 const mocked = api as jest.Mocked<typeof api>;
@@ -64,8 +73,42 @@ function renderEditor(path: string) {
 const type = (label: string | RegExp, value: string) =>
   fireEvent.change(screen.getByLabelText(label), { target: { value } });
 
+function integration(id: string, name: string, eventSetId: string): api.Integration {
+  return {
+    id,
+    name,
+    description: '',
+    endpoint_id: 'e1',
+    event_set_id: eventSetId,
+    content: {},
+    status: 'active',
+    created_at: '',
+    updated_at: '',
+  };
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
+  mockPermissions = { 'integrations.edit': true, 'audit.view': true };
+  mocked.listIntegrations.mockResolvedValue([]);
+  mocked.listEventSets.mockResolvedValue([
+    {
+      id: 'gateways',
+      name: 'Gateways',
+      description: '',
+      events: ['gateway.created'],
+      created_at: '',
+      updated_at: '',
+    },
+    {
+      id: 'governance',
+      name: 'Governance',
+      description: '',
+      events: ['audit.policy_decision'],
+      created_at: '',
+      updated_at: '',
+    },
+  ]);
   mocked.getEndpoint.mockResolvedValue(stored());
   mocked.createEndpoint.mockImplementation(async request => ({
     ...stored(),
@@ -372,6 +415,49 @@ describe('a stored endpoint', () => {
     fireEvent.click(screen.getByTestId('endpoint-signing_secret-clear-button'));
     expect(screen.getByTestId('endpoint-signing_secret-undo-button')).toBeInTheDocument();
   });
+});
+
+describe('without audit.view', () => {
+  beforeEach(() => {
+    mockPermissions = { 'integrations.edit': true };
+  });
+
+  test('an endpoint an audit integration delivers through cannot be saved', async () => {
+    mocked.listIntegrations.mockResolvedValue([
+      integration('i1', 'Gateway alerts', 'gateways'),
+      integration('i2', 'Audit to SIEM', 'governance'),
+    ]);
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('Ops mail');
+
+    const save = screen.getByTestId('endpoint-save-button');
+    await waitFor(() => expect(save).toBeDisabled());
+    expect(save).toHaveAttribute('title', 'Audit events need the audit.view permission.');
+    expect(screen.getByTestId('endpoint-audit-view-note')).toHaveTextContent('Audit to SIEM');
+    fireEvent.submit(save.closest('form')!);
+    expect(mocked.updateEndpoint).not.toHaveBeenCalled();
+  });
+
+  test('an endpoint only gateway integrations use is saved as before', async () => {
+    mocked.listIntegrations.mockResolvedValue([integration('i1', 'Gateway alerts', 'gateways')]);
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('Ops mail');
+
+    fireEvent.click(screen.getByTestId('endpoint-save-button'));
+
+    await waitFor(() => expect(mocked.updateEndpoint).toHaveBeenCalled());
+    expect(screen.queryByTestId('endpoint-audit-view-note')).not.toBeInTheDocument();
+  });
+});
+
+test('with audit.view an endpoint an audit integration uses is saved', async () => {
+  mocked.listIntegrations.mockResolvedValue([integration('i2', 'Audit to SIEM', 'governance')]);
+  renderEditor('/integrations/endpoints/e1');
+  await screen.findByDisplayValue('Ops mail');
+
+  fireEvent.click(screen.getByTestId('endpoint-save-button'));
+
+  await waitFor(() => expect(mocked.updateEndpoint).toHaveBeenCalled());
 });
 
 test('a new endpoint exposes its type select', () => {

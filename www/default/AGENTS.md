@@ -353,8 +353,21 @@ identities: an integration receives every event of its event set, from every res
 - In the lists, Add, Test and Edit need `integrations.edit`, and Delete `integrations.delete`.
 - A change that decides where audit records go also needs `audit.view`: an event set holding
   `audit.*` events, an integration whose event set holds them, and an endpoint such an
-  integration uses. The gateway refuses it with `403`; the event set editor lists audit events
-  without `audit.view` but does not let them be picked.
+  integration uses. The gateway refuses it with `403`, and the dashboard mirrors that without
+  `audit.view`. The controls are disabled with the title `AUDIT_VIEW_NEEDED` ("Audit events
+  need the audit.view permission.", with `holdsAuditEvents`, from `utils/auditIntegrations.ts`):
+  - the event set editor's Save, for a set that holds audit events now or did when loaded; its
+    audit events are listed but cannot be picked;
+  - the integration editor's Save and Send test, for an integration whose chosen or stored
+    event set holds them (`integration-audit-view-note`);
+  - the endpoint editor's Save, for an endpoint an audit integration delivers through
+    (`endpoint-audit-view-note`, naming those integrations);
+  - Delete in the Integrations tab, for an integration receiving audit events, and in the Event
+    Sets tab, for a set holding them. An endpoint such an integration uses is in use, so its
+    Delete is disabled anyway.
+
+  Test sends from the lists and the endpoint editor are not gated, as the gateway does not
+  refuse them.
 
 ### Integrations page
 
