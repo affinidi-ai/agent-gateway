@@ -434,7 +434,8 @@ describe('without audit.view', () => {
     await waitFor(() => expect(save).toBeDisabled());
     expect(save).toHaveAttribute('title', 'Audit events need the audit.view permission.');
     expect(screen.getByTestId('endpoint-audit-view-note')).toHaveTextContent('Audit to SIEM');
-    fireEvent.submit(save.closest('form')!);
+    // Submitting from a field, as Enter does, is refused too.
+    fireEvent.submit(screen.getByTestId('endpoint-name-input'));
     expect(mocked.updateEndpoint).not.toHaveBeenCalled();
   });
 
@@ -443,7 +444,7 @@ describe('without audit.view', () => {
     renderEditor('/integrations/endpoints/e1');
     await screen.findByDisplayValue('Ops mail');
 
-    fireEvent.click(screen.getByTestId('endpoint-save-button'));
+    fireEvent.submit(screen.getByTestId('endpoint-name-input'));
 
     await waitFor(() => expect(mocked.updateEndpoint).toHaveBeenCalled());
     expect(screen.queryByTestId('endpoint-audit-view-note')).not.toBeInTheDocument();

@@ -428,7 +428,8 @@ describe('without audit.view', () => {
     // The gateway refuses a change to an integration that receives audit events now, too.
     choose(/^event set/i, 'gateways');
     expect(save).toBeDisabled();
-    fireEvent.submit(save.closest('form')!);
+    // Submitting from a field, as Enter does, is refused too.
+    fireEvent.submit(screen.getByTestId('integration-name-input'));
     expect(mocked.updateIntegration).not.toHaveBeenCalled();
   });
 
