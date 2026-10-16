@@ -435,3 +435,14 @@ applies on the direct, Fabric and MCP-proxy paths.
 When the `policy_decision` audit event is selected, the decision is also written to the VP Audit
 Log, and from there forwarded to any Governance Audit integrations (any type). See
 [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
+
+Every decision record names its surface and its policy:
+
+- `surface_id` is the surface UUID and `channel_name` the surface name, on every scope and flow.
+- `policy_name` is never empty: the policy definition's name, else the definition id, else a
+  label for the layer that decided: `Gateway policy`, `Surface policy`, `MCP tool gating`,
+  `MCP tool policy`, `Response policy` or `MCP tool list filter`. A tool policy that matched no
+  definition keeps the tool name.
+- `request_id` identifies the gateway request the decision belongs to; one request yields a
+  decision per policy layer, all with the same `request_id` (see
+  [`OBSERVABILITY.md`](OBSERVABILITY.md)).

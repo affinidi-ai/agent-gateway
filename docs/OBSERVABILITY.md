@@ -230,7 +230,12 @@ integrations is administrator-only by default (see
 - *Producing.* The producer (`src/audit/producer.rs`) is the only place a record is finalised.
   It checks the selections first (one atomic read), gives the record an `event_id` (UUID v4),
   addresses it to the sinks that select its event at that moment, and hands it to the journal
-  without waiting. Records a proxied request produces while credential delegation runs are held
+  without waiting. A record produced while the gateway serves a request also gets that
+  request's `request_id`: 16 lowercase hex characters (the W3C span-id format), minted afresh
+  when an Access Point request, a Transit Point request or a fabric-received request starts,
+  never read from a header or token. Every record of one request shares it, and an Access
+  Point request and the Transit Point requests its agent makes each have their own, linked by
+  `trace_id`; a sink counts requests by distinct `request_id`. Records a proxied request produces while credential delegation runs are held
   until the request's identity VP is minted, then stamped with it; any still held when the
   request ends, on any path, are submitted without a VP. A selected record produced while the
   pipeline is not running is dropped and counted in

@@ -158,6 +158,22 @@ The placeholder syntax is `integration.variable_pattern` in `gateway.json`, fixe
 ([`runtime_variables.rs`](../src/integrations/runtime_variables.rs)); a pattern that is not a
 valid regular expression stops the gateway from starting.
 
+### Example: policy decisions to Agent Watch
+
+Agent Watch's Enforcement insights read the gateway's policy decisions from Kafka:
+
+- an endpoint of type `stream`, platform Kafka, on the topic Agent Watch consumes;
+- an event set holding `audit.policy_decision`;
+- an integration joining the two with this template, so `record` is the full audit record:
+
+  ```json
+  {"event_type":"${EVENT_TYPE}","timestamp":"${TIMESTAMP}","appliance_id":"${APPLIANCE_ID}","record":"${EVENT_DATA}"}
+  ```
+
+Set the **Appliance ID** to the gateway's appliance id in Agent Watch, and bind the topic in
+Agent Watch with the `integration_json` format for that appliance. Agent Watch counts a record
+delivered again once by its `event_id`, and counts requests by `request_id`.
+
 ## Publishers
 
 | Type | Sends to | Configuration |

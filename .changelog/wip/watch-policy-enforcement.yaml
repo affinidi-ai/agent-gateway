@@ -1,0 +1,22 @@
+branch: watch-policy-enforcement
+changes:
+  added:
+    - timestamp: '2026-10-16T16:00:00Z'
+      title: Stamp every audit record with the id of the gateway request that produced it
+      description: >-
+        Audit records now carry a `request_id` (16 lowercase hex characters) minted when an
+        Access Point, Transit Point or fabric-received request starts. All records of one
+        request share it, so a sink such as Agent Watch can count requests rather than policy
+        evaluations; `trace_id` still links the requests of one chain.
+  changed:
+    - timestamp: '2026-10-16T16:01:00Z'
+      title: Name the surface and the policy on every policy decision record
+      description: >-
+        Policy decision records left `channel_name` empty and `policy_name` empty unless the
+        call site passed one. They now carry the surface name in `channel_name` beside the
+        surface UUID, and always name the policy: the definition name, else the definition id,
+        else a label for the layer, such as "Gateway policy" or "MCP tool gating".
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
