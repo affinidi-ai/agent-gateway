@@ -1,0 +1,22 @@
+branch: docs/deployment-requirements
+changes:
+  added:
+    - timestamp: '2026-10-14T12:47:17Z'
+      title: Document the infrastructure needed to self-host Agent Gateway
+      description: >-
+        Add docs/DEPLOYMENT_REQUIREMENTS.md, covering what a self-hosted deployment of the
+        open-source gateway needs: the build to deploy, host sizing and libraries, persistent
+        storage and backups, ports, DNS, TLS and safe listener exposure, outbound
+        destinations, required secrets, time sync, and the Fabric mediator. Link it from the
+        README, the docs index, CAPABILITIES.md and AGENTS.md so partners can find it.
+  changed: []
+  fixed:
+    - timestamp: '2026-10-16T09:00:00Z'
+      title: Document which storage paths resolve from the working directory
+      description: >-
+        CONFIGURATION_REFERENCE.md said every storage path resolves from the folder holding
+        config.toml. It now names the keys that resolve from the working directory or from
+        --base-folder, and points deployments to absolute paths.
+  removed: []
+  security: []
+  breaking: []
