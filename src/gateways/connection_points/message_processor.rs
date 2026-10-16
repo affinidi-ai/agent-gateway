@@ -11285,6 +11285,30 @@ mod tests {
 
     #[tokio::test]
     async fn fabric_requests_each_carry_their_own_request_id() {
+        // Surface lookup prefers the process-global surface store, which other
+        // tests in this binary can initialise; run in a child process where it
+        // is unset, so the missing surface is reported as not found.
+        if std::env::var_os("ATG_FABRIC_REQUEST_ID_CHILD").is_none() {
+            let test_name = std::thread::current()
+                .name()
+                .unwrap()
+                .to_string();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env("ATG_FABRIC_REQUEST_ID_CHILD", "1")
+                .env("RUST_MIN_STACK", "8388608")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated fabric request id check failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         register_gateway(
             temp.path(),
