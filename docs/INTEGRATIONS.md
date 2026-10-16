@@ -30,7 +30,10 @@ responses leave them out of `configuration` and name the ones set in `secrets`. 
 leaves a secret out keeps it, and one that sends it as `null` clears it. A secret field may
 instead hold `$SECRET:<secret_id>`, a reference to an appliance-wide secret in the secrets
 store, resolved at each delivery and shown in responses as written; a reference that does not
-resolve fails the delivery. Webhook `headers` must be an object of header names to strings, and
+resolve fails the delivery. Only a value that is the reference as a whole counts. Deleting a
+secret that an endpoint references is refused with `409` naming the endpoints; change or
+delete those endpoints first. Changing the secret's value is allowed, and the next delivery
+uses it. Webhook `headers` must be an object of header names to strings, and
 each header value may be such a reference; the field as a whole cannot be one. It cannot set
 `Content-Type`, `X-Webhook-Timestamp` or `X-Webhook-Signature-256`, which the gateway sets on
 every delivery; an endpoint stored with one of them still sends each exactly once, the

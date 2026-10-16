@@ -34,6 +34,20 @@ impl DefinitionStores {
         )
         .await
     }
+
+    /// The endpoints whose secret fields or webhook headers reference `secret_id`.
+    pub async fn endpoints_referencing(
+        &self,
+        secret_id: &str,
+    ) -> Result<Vec<Endpoint>> {
+        let mut endpoints = self.endpoints.list().await?;
+        endpoints.retain(|endpoint| {
+            endpoint
+                .secret_references()
+                .contains(&secret_id)
+        });
+        Ok(endpoints)
+    }
 }
 
 static DEFINITION_STORES: OnceLock<Arc<DefinitionStores>> = OnceLock::new();

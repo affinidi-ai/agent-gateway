@@ -102,6 +102,28 @@ impl Endpoint {
         (redacted, set)
     }
 
+    /// The secret ids its secret fields and webhook header values reference, in the form
+    /// `resolve_secret_references` resolves: the whole value is `$SECRET:<secret_id>`.
+    pub fn secret_references(&self) -> Vec<&str> {
+        let mut references = Vec::new();
+        for field in self
+            .endpoint_type
+            .secret_fields()
+        {
+            match self.configuration.get(*field) {
+                Some(JsonValue::String(value)) => references.extend(value.strip_prefix(SECRET_REFERENCE_PREFIX)),
+                Some(JsonValue::Object(headers)) => references.extend(
+                    headers
+                        .values()
+                        .filter_map(JsonValue::as_str)
+                        .filter_map(|value| value.strip_prefix(SECRET_REFERENCE_PREFIX)),
+                ),
+                _ => {}
+            }
+        }
+        references
+    }
+
     /// Checks the configuration the endpoint's publisher would send with.
     pub fn validate_configuration(&self) -> Result<(), String> {
         if !self.configuration.is_object() {
@@ -485,6 +507,27 @@ mod tests {
                 .expect_err("fails");
             assert!(error.contains(reason), "{error}");
         }
+    }
+
+    #[test]
+    fn names_the_secrets_its_secret_fields_and_headers_reference() {
+        let mut endpoint = webhook();
+        endpoint.configuration = json!({
+            "url": "$SECRET:not-a-secret-field",
+            "signing_secret": "$SECRET:hook-signing",
+            "headers": {
+                "Authorization": "$SECRET:ops-token",
+                "X-Note": "Bearer $SECRET:inside-a-longer-value",
+                "X-Team": "ops"
+            }
+        });
+
+        assert_eq!(endpoint.secret_references(), ["hook-signing", "ops-token"]);
+        assert!(
+            webhook()
+                .secret_references()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -3261,6 +3261,7 @@ pub async fn run_axum_proxy(
             secrets_store.clone(),
             notification_store.clone(),
             None,
+            Some(definition_stores.clone()),
             vault_rbac_guard.clone(),
         );
 

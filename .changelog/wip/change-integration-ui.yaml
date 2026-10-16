@@ -51,6 +51,12 @@ changes:
         permissions. The editors move to /integrations/new and /integrations/{id}, and the
         Audit page's Forward records starts an event set of every audit event.
   fixed:
+    - timestamp: '2026-10-16T13:00:00.000Z'
+      title: Refuse to delete a secret an integration endpoint references
+      description: >-
+        Deleting a secret that an endpoint's secret field or webhook header names as
+        $SECRET:<secret_id> left every delivery to that endpoint failing. The delete now answers
+        409 naming the endpoints, and the Secrets page shows why a delete failed.
     - timestamp: '2026-10-16T12:00:00.000Z'
       title: Deliver an event to each integration without waiting for the others
       description: >-
