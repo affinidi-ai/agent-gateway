@@ -261,6 +261,78 @@ Welcome messages for administrators and users start from the templates
 [`admin_welcome.json`](../src/integrations/admin_welcome.json) and
 [`user_welcome.json`](../src/integrations/user_welcome.json).
 
+## Upgrading from the previous version
+
+The version before endpoints and event sets kept each integration as one record (transport,
+credentials, category and template) and attached it to gateways, users and connection points.
+On the first start of the Active node, a one-time migration
+([`src/integrations/migration/`](../src/integrations/migration/)) turns each one into an
+endpoint, an event set and an integration, all three with the old integration's id.
+
+**What it becomes.**
+- **Endpoint:** its type and configuration, with credentials kept as written (they become
+  write-only).
+- **Event set:** the events it actually received. That means:
+  - the event types of its gateway and user attachments (an empty list meant all of them);
+  - every x402 or MPP event for those categories;
+  - `connection_point.connected` when a connection point named it;
+  - for an appliance-wide `audit` integration, the audit records the previous version
+    forwarded, including the three the VP Audit Log settings gated.
+- **Integration:** its name, template and status. An audit integration gets the delivery
+  limits of 7 days and 20 attempts, since unset means retried forever.
+- **Endpoint only:** an integration that received nothing keeps only its endpoint, so its
+  destination is not lost. This covers `surface`, `identity` and unattached
+  `general`/`connection_point` integrations, and tenant-owned `audit` ones.
+
+**What changes, for each integration the report names:**
+- **Scope:** an integration attached to some gateways or connection points now receives the
+  event from all of them. A tenant-owned integration becomes appliance-wide.
+- **Templates:**
+  - `${CHANNEL_*}` becomes `${SURFACE_*}`.
+  - Custom `_` variables and variables that no event of its set fills are removed. Attachment
+    values for custom variables are not migrated.
+  - Placeholders in webhook header values are removed, since header values are sent as
+    written.
+  - An empty webhook or stream template sends the event envelope.
+- **Slack:** `bot_name` and `icon_emoji` move from the template to the endpoint, and
+  `channel` is dropped.
+- **Dropped:**
+  - Kinesis `access_key` and `secret_key`, which nothing read;
+  - webhook headers the gateway sets itself, or whose value is not text;
+  - `pre_authorize_blocked`, which no longer exists.
+- **Disabled:** an endpoint that fails the current checks, such as a URL now refused, is
+  written disabled with the reason.
+- **Audit:** audit records are now journaled and retried. Audit events added since the
+  previous version are not selected.
+
+**Where it reads and what it leaves.**
+- It reads `_storage/integrations/definitions` and `_storage/integrations/triggers`, or the
+  deprecated `storage_paths.integrations` and `storage_paths.integration_triggers` when set.
+  Those keys are read for this only, log a deprecation warning, and can be removed once
+  migrated.
+- Each integration logs `integrations.migration.integration`. A disabled endpoint logs
+  `integrations.migration.endpoint_disabled`, an integration that cannot be migrated logs
+  `integrations.migration.skipped`, and the end logs `integrations.migration.done`.
+- The report is `_storage/integrations/migration-report-<unix seconds>.json`, with no secret,
+  header or attachment value in it.
+- The two old directories are renamed to `<dir>.migrated-<unix seconds>`, which also keeps
+  the migration from running again. They may hold credentials in plain text, so the Active
+  node deletes them 30 days later, without a restart.
+- Connection point records keep their old integration fields until they are next saved.
+
+**When something goes wrong.**
+- If any old record cannot be read or decrypted, nothing is written or renamed. The node logs
+  `integrations.migration.failed` and starts normally, and the next start tries again.
+- Restoring a backup that holds the old directories runs the migration again. Definitions
+  whose id already exists, migrated or edited since, are left as they are.
+
+**High availability.** Upgrade both nodes before the Active node first starts on the new
+version: the rename removes the directories an old-version node still reads. A node started
+as Standby migrates when it is promoted, then refreshes delivery and the audit sinks.
+
+After the upgrade, check the startup summary `integrations.definitions.checked` (below) for
+migrated definitions that do not pass their checks.
+
 ## Troubleshooting
 
 **Definitions checked at startup.** Each node checks the stored definitions when it starts

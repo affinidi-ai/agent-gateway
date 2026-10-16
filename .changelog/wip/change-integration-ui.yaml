@@ -112,7 +112,8 @@ changes:
         The integration section keeps only variable_pattern and variable_pattern_description;
         categories, their variable lists and custom_variable_prefix are gone, and
         storage_paths.integrations and storage_paths.integration_triggers are replaced by
-        integration_endpoints, integration_event_sets and integration_definitions.
+        integration_endpoints, integration_event_sets and integration_definitions. The two old
+        keys are still read, with a deprecation warning, only to migrate from them.
     - timestamp: '2026-10-15T10:35:00.000Z'
       title: Stop reassigning integrations to tenants
       description: >-
@@ -152,6 +153,18 @@ changes:
         Integrations, endpoints and event sets belong to the whole appliance, so every
         /v1/integrations route answers 403 to a tenant or resource-scoped access token.
   breaking:
+    - timestamp: '2026-10-16T16:00:00.000Z'
+      title: Migrate existing integrations to endpoints and event sets on upgrade
+      description: >-
+        On its first start the Active node turns each integration into an endpoint, an event
+        set of the events it received and an integration, with the same id, writes
+        _storage/integrations/migration-report-<unix seconds>.json and renames the old
+        directories to <dir>.migrated-<unix seconds>, deleted 30 days later as they may hold
+        plain-text credentials. Upgrade both nodes of a pair before the Active node starts; a
+        Standby migrates when promoted. Attachments to some gateways or connection points now
+        receive every resource's events, custom _ variables and unfilled placeholders leave the
+        templates, and endpoints failing the current checks are written disabled; the report
+        names each change. See the INTEGRATIONS upgrade section.
     - timestamp: '2026-10-15T08:16:21.000Z'
       title: ⭐ Manage integrations as an endpoint plus an event set
       description: >-
