@@ -9,33 +9,55 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
+  gate:
+    name: Detect release PR merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      release: ${{ steps.pr.outputs.release }}
+    steps:
+      - name: Require a merged release PR opened by a bot
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          match="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+            | jq --arg repo "${GITHUB_REPOSITORY}" '[.[] | select(
+                .merged_at != null
+                and .base.ref == "main"
+                and (.head.ref | startswith("release/v"))
+                and .head.repo.full_name == $repo
+                and .user.type == "Bot"
+              )] | length')"
+          if [[ "${match}" -ge 1 ]]; then
+            echo "release=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "${GITHUB_SHA} is not the merge of a bot-opened release/v* PR; nothing to publish."
+            echo "release=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   publish:
     name: Publish reviewed release
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
-
-      - name: Create release app token
-        id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
-        with:
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
-          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: read
 
       # Pinned to the exact commit that triggered this run, not the (possibly moved-on)
       # main tip, so the binary built below always matches the commit tagged later.
@@ -43,7 +65,6 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
-          token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -56,16 +77,8 @@ jobs:
       - name: Detect reviewed release
         id: release
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          release_branch="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
-            --jq '.[] | select(.base.ref == "main" and (.head.ref | startswith("release/"))) | .head.ref' \
-            | head -1)"
-          if [[ -z "${release_branch}" ]]; then
-            echo "This commit is not associated with a release PR merge; nothing to publish."
-            echo "publish=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
           version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
           tag="v${version}"
           if ! python3 .github/scripts/changelog.py github-notes "${version}" > "${RUNNER_TEMP}/release-body.md"; then
@@ -118,17 +131,30 @@ jobs:
         with:
           subject-path: target/release/agent-gateway-linux-x86_64
 
+      # Minted after the build so no build script or proc-macro can read it.
+      - name: Create release app token
+        if: steps.release.outputs.publish == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+
       # Idempotent so a re-run after a partial failure (e.g. the release step below
       # failed after the tag was already pushed) does not fail on "tag already exists".
       - name: Tag reviewed merge commit
         if: steps.release.outputs.publish == 'true'
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${{ steps.app-token.outputs.token }}" | base64 -w0)"
-          existing_sha="$(git -c "http.extraheader=${auth_header}" ls-remote origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -1 | awk '{print $1}')"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          existing_sha="$(git ls-remote "${remote}" "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -1 | awk '{print $1}')"
           if [[ -n "${existing_sha}" ]]; then
             if [[ "${existing_sha}" != "${GITHUB_SHA}" ]]; then
               echo "::error::Tag ${TAG} already exists on a different commit (${existing_sha})."
@@ -137,7 +163,7 @@ jobs:
             echo "Tag ${TAG} already points at ${GITHUB_SHA}; skipping re-tag."
           else
             git tag --annotate "${TAG}" --message "Release ${TAG}" "${GITHUB_SHA}"
-            git -c "http.extraheader=${auth_header}" push origin "${TAG}"
+            git push "${remote}" "refs/tags/${TAG}"
           fi
 
       - name: Create GitHub Release
