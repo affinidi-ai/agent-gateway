@@ -16,6 +16,7 @@ use crate::auth_manager::middleware::AuthGuardOk;
 use crate::gateways::connection_points::message_processor::get_secrets_store;
 use crate::integrations::definitions::endpoint::{keep_unsent_secrets, resolve_secret_references};
 use crate::integrations::definitions::{Endpoint, EndpointType, Status};
+use crate::integrations::stream_publishers::invalidate_kafka_producer;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +121,7 @@ pub async fn update_endpoint(
     endpoint.updated_at = chrono::Utc::now().to_rfc3339();
     validate(&endpoint).await?;
     save(&stores, &endpoint).await?;
+    invalidate_kafka_producer(&endpoint.id).await;
     info!(
         event = "integrations.endpoint.updated",
         endpoint_id = %endpoint.id,
@@ -148,6 +150,7 @@ pub async fn delete_endpoint(
         return Err(not_found());
     }
     definitions_changed().await;
+    invalidate_kafka_producer(&id).await;
     info!(event = "integrations.endpoint.deleted", endpoint_id = %id, caller = caller_id(&caller));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -222,6 +225,41 @@ mod tests {
             .as_str()
             .expect("id")
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn changing_or_deleting_a_stream_endpoint_drops_its_kafka_producer() {
+        use crate::integrations::stream_publishers::{has_cached_kafka_producer, warm_kafka_producer};
+        let f = Fixture::new().await;
+        let kafka = |brokers: &str| json!({"platform": "kafka", "topic": "events", "brokers": brokers});
+        let (_, created) = f
+            .call(
+                ADMIN,
+                "POST",
+                "/v1/integrations/endpoints",
+                Some(json!({"name": "Events", "type": "stream", "configuration": kafka("127.0.0.1:1")})),
+            )
+            .await;
+        let path = format!("/v1/integrations/endpoints/{}", id(&created));
+
+        warm_kafka_producer(&id(&created)).await;
+        let (updated, _) = f
+            .call(
+                ADMIN,
+                "PUT",
+                &path,
+                Some(json!({"name": "Events", "configuration": kafka("127.0.0.1:2"), "status": "active"})),
+            )
+            .await;
+        assert_eq!(updated, StatusCode::OK);
+        assert!(!has_cached_kafka_producer(&id(&created)).await, "an update drops the producer");
+
+        warm_kafka_producer(&id(&created)).await;
+        let (deleted, _) = f
+            .call(ADMIN, "DELETE", &path, None)
+            .await;
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+        assert!(!has_cached_kafka_producer(&id(&created)).await, "a delete drops the producer");
     }
 
     #[tokio::test]

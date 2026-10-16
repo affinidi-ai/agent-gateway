@@ -12,14 +12,17 @@ use super::StreamPublisher;
 
 pub struct KafkaPublisher;
 
-/// A producer keeps its broker connections open between events; it is rebuilt
-/// when the integration's connection settings change and evicted once idle.
+/// A producer keeps its broker connections open between events. It belongs to the endpoint,
+/// which holds the brokers and credentials, so every integration and test send on one
+/// endpoint shares it; it is rebuilt when the connection settings change and evicted once
+/// idle.
 #[derive(Clone)]
 struct CachedProducer {
     settings: String,
     producer: FutureProducer,
 }
 
+/// Producers by endpoint id.
 static PRODUCERS: Lazy<Cache<String, CachedProducer>> = Lazy::new(|| {
     Cache::builder()
         .max_capacity(256)
@@ -27,12 +30,28 @@ static PRODUCERS: Lazy<Cache<String, CachedProducer>> = Lazy::new(|| {
         .build()
 });
 
-/// Drop the integration's cached producer, and with it its broker connections
-/// and SASL credentials, when the integration is saved or deleted.
-pub async fn invalidate_producer(integration_id: &str) {
+/// Drop the endpoint's cached producer, and with it its broker connections and SASL
+/// credentials, when the endpoint is changed or deleted.
+pub async fn invalidate_producer(endpoint_id: &str) {
     PRODUCERS
-        .invalidate(integration_id)
+        .invalidate(endpoint_id)
         .await;
+}
+
+#[cfg(test)]
+pub(crate) async fn has_cached_producer(endpoint_id: &str) -> bool {
+    PRODUCERS
+        .get(endpoint_id)
+        .await
+        .is_some()
+}
+
+/// Caches a producer for `endpoint_id` without sending anything.
+#[cfg(test)]
+pub(crate) async fn warm_producer(endpoint_id: &str) {
+    producer_for(endpoint_id, "127.0.0.1:1", &serde_json::json!({}))
+        .await
+        .expect("producer");
 }
 
 fn client_config(
@@ -84,13 +103,13 @@ fn connection_settings(
 }
 
 async fn producer_for(
-    integration_id: &str,
+    endpoint_id: &str,
     brokers: &str,
     config: &Value,
 ) -> Result<FutureProducer> {
     let settings = connection_settings(brokers, config);
     if let Some(cached) = PRODUCERS
-        .get(integration_id)
+        .get(endpoint_id)
         .await
         && cached.settings == settings
     {
@@ -101,7 +120,7 @@ async fn producer_for(
         .context("Failed to create Kafka producer")?;
     PRODUCERS
         .insert(
-            integration_id.to_string(),
+            endpoint_id.to_string(),
             CachedProducer {
                 settings,
                 producer: producer.clone(),
@@ -119,6 +138,7 @@ impl StreamPublisher for KafkaPublisher {
         event: &Value,
         config: &Value,
         integration_id: &str,
+        endpoint_id: &str,
     ) -> Result<()> {
         let brokers = config
             .get("brokers")
@@ -127,7 +147,7 @@ impl StreamPublisher for KafkaPublisher {
 
         debug!("Publishing to Kafka topic '{}' on brokers '{}'", topic, brokers);
 
-        let producer = producer_for(integration_id, brokers, config).await?;
+        let producer = producer_for(endpoint_id, brokers, config).await?;
 
         let event_json = serde_json::to_string(event).context("Failed to serialize event payload")?;
 
@@ -173,25 +193,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn producer_is_reused_until_connection_settings_change() {
-        let integration_id = format!("kafka-cache-{}", uuid::Uuid::new_v4());
+    async fn an_endpoints_producer_is_reused_until_its_connection_settings_change() {
+        let endpoint_id = format!("kafka-cache-{}", uuid::Uuid::new_v4());
         let config = json!({"auth_type": "none"});
 
-        let first = producer_for(&integration_id, "127.0.0.1:1", &config)
+        // Every integration and test send on the endpoint asks for the same producer.
+        let first = producer_for(&endpoint_id, "127.0.0.1:1", &config)
             .await
             .unwrap();
-        let again = producer_for(&integration_id, "127.0.0.1:1", &config)
+        let again = producer_for(&endpoint_id, "127.0.0.1:1", &config)
             .await
             .unwrap();
         assert_eq!(native(&first), native(&again), "same settings reuse the cached producer");
 
-        let moved = producer_for(&integration_id, "127.0.0.1:2", &config)
+        let moved = producer_for(&endpoint_id, "127.0.0.1:2", &config)
             .await
             .unwrap();
         assert_ne!(native(&first), native(&moved), "a broker change builds a new producer");
 
         let reauthed = producer_for(
-            &integration_id,
+            &endpoint_id,
             "127.0.0.1:2",
             &json!({"auth_type": "sasl", "sasl_username": "svc", "sasl_password": "pw"}),
         )
@@ -199,9 +220,23 @@ mod tests {
         .unwrap();
         assert_ne!(native(&moved), native(&reauthed), "an auth change builds a new producer");
 
-        let other = producer_for(&format!("{integration_id}-other"), "127.0.0.1:2", &config)
+        let other = producer_for(&format!("{endpoint_id}-other"), "127.0.0.1:2", &config)
             .await
             .unwrap();
-        assert_ne!(native(&moved), native(&other), "producers are never shared across integrations");
+        assert_ne!(native(&moved), native(&other), "producers are never shared across endpoints");
+    }
+
+    #[tokio::test]
+    async fn invalidating_an_endpoint_drops_its_producer() {
+        let endpoint_id = format!("kafka-cache-{}", uuid::Uuid::new_v4());
+        let config = json!({"auth_type": "none"});
+        producer_for(&endpoint_id, "127.0.0.1:1", &config)
+            .await
+            .unwrap();
+        assert!(has_cached_producer(&endpoint_id).await);
+
+        invalidate_producer(&endpoint_id).await;
+
+        assert!(!has_cached_producer(&endpoint_id).await);
     }
 }

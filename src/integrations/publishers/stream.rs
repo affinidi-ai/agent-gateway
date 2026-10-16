@@ -70,7 +70,7 @@ impl IntegrationPublisher for StreamPublisher {
         STREAM_PUBLISHER_REGISTRY
             .get(platform)
             .ok_or_else(|| anyhow::anyhow!("Unsupported streaming platform: {}", platform))?
-            .publish(topic, &message.content, configuration, &message.integration_id)
+            .publish(topic, &message.content, configuration, &message.integration_id, &message.endpoint_id)
             .await
     }
 }

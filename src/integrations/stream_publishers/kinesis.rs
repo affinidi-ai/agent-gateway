@@ -15,6 +15,7 @@ impl StreamPublisher for KinesisPublisher {
         event: &Value,
         config: &Value,
         integration_id: &str,
+        _endpoint_id: &str,
     ) -> Result<()> {
         let region = config
             .get("region")

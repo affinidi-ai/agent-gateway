@@ -376,9 +376,10 @@ template sends the default event envelope, whose `data` is the record:
 }
 ```
 
-Kafka producers are reused per integration, rebuilt when its brokers or SASL settings change,
-and dropped when the integration is deleted; the Kinesis, Pulsar and Redis Streams publishers
-still open a client per record.
+Kafka producers belong to the endpoint: every integration and test send on one endpoint shares
+it. It is rebuilt when the brokers or SASL settings change and dropped when the endpoint is
+changed or deleted; the Kinesis, Pulsar and Redis Streams publishers still open a client per
+record.
 
 **Configuration.** Settings saved with the older `audit_categories` booleans are read as the
 events `policy_decision`, `trust_check` and `vp_injected`; nothing else is selected on upgrade.

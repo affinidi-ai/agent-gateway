@@ -15,6 +15,7 @@ impl StreamPublisher for RedisPublisher {
         event: &Value,
         config: &Value,
         integration_id: &str,
+        _endpoint_id: &str,
     ) -> Result<()> {
         let redis_url = config
             .get("redis_url")

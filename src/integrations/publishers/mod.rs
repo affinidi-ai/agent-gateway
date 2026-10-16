@@ -21,6 +21,8 @@ use crate::integrations::delivery::render::Escaping;
 pub struct Message {
     pub integration_id: String,
     pub integration_name: String,
+    /// The endpoint it is sent through, which owns connections kept between messages.
+    pub endpoint_id: String,
     pub content: Value,
 }
 

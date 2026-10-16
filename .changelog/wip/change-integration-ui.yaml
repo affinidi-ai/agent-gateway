@@ -51,6 +51,13 @@ changes:
         permissions. The editors move to /integrations/new and /integrations/{id}, and the
         Audit page's Forward records starts an event set of every audit event.
   fixed:
+    - timestamp: '2026-10-16T11:00:00.000Z'
+      title: Share one Kafka producer per endpoint
+      description: >-
+        Kafka producers were kept per integration, so every test send built a new client with
+        its own broker connections, and integrations on one endpoint each held their own. The
+        producer now belongs to the endpoint and is dropped when the endpoint is changed or
+        deleted.
     - timestamp: '2026-10-16T09:00:00.000Z'
       title: Stop a VP Audit Log write from landing after the audit pipeline stops
       description: >-

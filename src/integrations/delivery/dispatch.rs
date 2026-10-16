@@ -245,6 +245,7 @@ pub async fn prepare(
         Message {
             integration_id: route.integration.id.clone(),
             integration_name: route.integration.name.clone(),
+            endpoint_id: route.endpoint.id.clone(),
             content,
         },
     ))
@@ -546,6 +547,7 @@ mod tests {
             Message {
                 integration_id: slack.id,
                 integration_name: "alerts".to_string(),
+                endpoint_id: s.endpoint.id.clone(),
                 content: json!({"text": "&lt;!channel&gt; by Gateway created"}),
             }
         );

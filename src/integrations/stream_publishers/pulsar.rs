@@ -15,6 +15,7 @@ impl StreamPublisher for PulsarPublisher {
         event: &Value,
         config: &Value,
         _integration_id: &str,
+        _endpoint_id: &str,
     ) -> Result<()> {
         let brokers = config
             .get("brokers")
