@@ -2,6 +2,7 @@
 //! may hold plain-text credentials, so they are not kept longer than a restore needs them.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -23,6 +24,18 @@ pub async fn remove_expired(
 ) -> Result<Vec<PathBuf>> {
     let retention = MIGRATED_RETENTION_DAYS * 86_400;
     let mut removed = Vec::new();
+    for (path, renamed_at) in renamed_dirs(dirs).await? {
+        if renamed_at.saturating_add(retention) <= now {
+            tokio::fs::remove_dir_all(&path).await?;
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
+/// Each `<dir>.migrated-<unix seconds>` directory beside one of `dirs`, with its timestamp.
+async fn renamed_dirs(dirs: &[PathBuf]) -> Result<Vec<(PathBuf, u64)>> {
+    let mut found = Vec::new();
     for dir in dirs {
         let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
             continue;
@@ -43,25 +56,60 @@ pub async fn remove_expired(
             else {
                 continue;
             };
-            if renamed_at.saturating_add(retention) > now
-                || !entry
-                    .file_type()
-                    .await?
-                    .is_dir()
+            if entry
+                .file_type()
+                .await?
+                .is_dir()
             {
-                continue;
+                found.push((entry.path(), renamed_at));
             }
-            tokio::fs::remove_dir_all(entry.path()).await?;
-            removed.push(entry.path());
         }
     }
-    Ok(removed)
+    Ok(found)
 }
 
-/// Checks every few hours, on the Active node only, for renamed live directories to delete.
-pub fn spawn_cleanup(storage_paths: &StoragePaths) {
+/// Whether a renamed live directory is waiting to be deleted. A directory that cannot be
+/// listed counts as pending, so the job starts and reports the failure.
+pub async fn cleanup_pending(dirs: &[PathBuf]) -> bool {
+    renamed_dirs(dirs)
+        .await
+        .map_or(true, |found| !found.is_empty())
+}
+
+/// Deletes what has expired, and returns whether any renamed directory is still waiting.
+pub async fn cleanup_round(
+    dirs: &[PathBuf],
+    now: u64,
+) -> Result<bool> {
+    for dir in remove_expired(dirs, now).await? {
+        info!(
+            event = "integrations.migration.cleaned",
+            dir = %dir.display(),
+            "Deleted a live integration directory the migration renamed {MIGRATED_RETENTION_DAYS} days ago"
+        );
+    }
+    Ok(!renamed_dirs(dirs)
+        .await?
+        .is_empty())
+}
+
+/// Set while a cleanup job runs, so a promotion that migrates does not start a second one.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Starts the cleanup job when a renamed live directory is waiting, unless one already runs,
+/// and returns whether it started one. Called at startup, after the sweep, and after a sweep
+/// on promotion; a node with nothing to delete runs no job. The job checks every few hours,
+/// deletes only on the Active node, and ends once nothing is left.
+pub async fn start_cleanup_if_pending(storage_paths: &StoragePaths) -> bool {
     let paths = LegacyPaths::configured(storage_paths);
     let dirs = vec![paths.definitions, paths.triggers];
+    if !cleanup_pending(&dirs).await
+        || RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return false;
+    }
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(CHECK_EVERY);
         loop {
@@ -73,20 +121,16 @@ pub fn spawn_cleanup(storage_paths: &StoragePaths) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or_default();
-            match remove_expired(&dirs, now).await {
-                Ok(removed) => {
-                    for dir in removed {
-                        info!(
-                            event = "integrations.migration.cleaned",
-                            dir = %dir.display(),
-                            "Deleted a live integration directory the migration renamed {MIGRATED_RETENTION_DAYS} days ago"
-                        );
-                    }
-                }
+            match cleanup_round(&dirs, now).await {
+                Ok(true) => {}
+                Ok(false) => break,
                 Err(error) => warn!(error = %error, "Failed to delete the old integration directories"),
             }
         }
+        RUNNING.store(false, Ordering::SeqCst);
+        info!(event = "integrations.migration.cleanup_done", "No migrated integration directories are left to delete");
     });
+    true
 }
 
 #[cfg(test)]
@@ -141,6 +185,78 @@ mod tests {
                 .is_file(),
             "only directories are deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_is_pending_only_while_a_renamed_live_directory_is_left() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let parent = root
+            .path()
+            .join("integrations");
+        let dirs = [parent.join("definitions"), parent.join("triggers")];
+        assert!(!cleanup_pending(&dirs).await, "nothing there");
+
+        make(&parent, "definitions");
+        make(&parent, &format!("endpoints.migrated-{NOW}"));
+        assert!(!cleanup_pending(&dirs).await, "neither the live directory nor another one counts");
+
+        make(&parent, &format!("triggers.migrated-{NOW}"));
+        assert!(cleanup_pending(&dirs).await);
+    }
+
+    #[tokio::test]
+    async fn a_round_says_whether_anything_is_left_to_wait_for() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let parent = root
+            .path()
+            .join("integrations");
+        let dirs = [parent.join("definitions"), parent.join("triggers")];
+        let expired = MIGRATED_RETENTION_DAYS * DAY + 1;
+        make(&parent, &format!("definitions.migrated-{}", NOW - expired));
+        let recent = make(&parent, &format!("triggers.migrated-{}", NOW - DAY));
+
+        assert!(
+            cleanup_round(&dirs, NOW)
+                .await
+                .expect("round"),
+            "the recent one is still waiting"
+        );
+
+        std::fs::remove_dir_all(recent).expect("remove");
+        make(&parent, &format!("triggers.migrated-{}", NOW - expired));
+        assert!(
+            !cleanup_round(&dirs, NOW)
+                .await
+                .expect("round"),
+            "everything was deleted, so the job can stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_job_starts_only_when_cleanup_is_pending() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let base = root
+            .path()
+            .join("integrations");
+        let paths = StoragePaths {
+            integrations: Some(
+                base.join("definitions")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            integration_triggers: Some(
+                base.join("triggers")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..StoragePaths::default()
+        };
+
+        assert!(!start_cleanup_if_pending(&paths).await, "a fresh install starts no job");
+
+        make(&base, &format!("definitions.migrated-{NOW}"));
+        assert!(start_cleanup_if_pending(&paths).await, "a renamed directory starts it");
+        assert!(!start_cleanup_if_pending(&paths).await, "one job at a time");
     }
 
     #[tokio::test]

@@ -1753,7 +1753,9 @@ pub async fn run_axum_proxy(
             )
             .await;
         }
-        crate::integrations::migration::cleanup::spawn_cleanup(&bootstrap_config.storage_paths);
+        // Only a node holding renamed live directories, from this sweep or an earlier one,
+        // runs the job that deletes them after the retention.
+        crate::integrations::migration::cleanup::start_cleanup_if_pending(&bootstrap_config.storage_paths).await;
         // Definitions that stopped passing their checks, such as after a restore, are reported
         // now rather than at their first delivery.
         if let Err(error) = crate::integrations::definitions::check::report_stored_definitions(
@@ -4063,6 +4065,7 @@ pub async fn run_axum_proxy(
                             {
                                 crate::integrations::delivery::dispatch::invalidate_routes().await;
                                 crate::audit::sources::rebuild_sinks().await;
+                                crate::integrations::migration::cleanup::start_cleanup_if_pending(storage_paths).await;
                             }
 
                             // Take over the audit journal before admitting traffic,
