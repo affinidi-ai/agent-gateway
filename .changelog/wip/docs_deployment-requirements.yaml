@@ -12,7 +12,7 @@ changes:
   changed: []
   fixed:
     - timestamp: '2026-10-16T09:00:00Z'
-      title: Correct how storage paths in config.toml are resolved
+      title: Document which storage paths resolve from the working directory
       description: >-
         CONFIGURATION_REFERENCE.md said every storage path resolves from the folder holding
         config.toml. It now names the keys that resolve from the working directory or from

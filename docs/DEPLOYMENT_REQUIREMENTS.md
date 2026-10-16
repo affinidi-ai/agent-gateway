@@ -38,6 +38,11 @@ The image starts with `--config /app/config/config.toml` and needs these mounts:
 | `/app/_storage` | Gateway state | Persistent, writable |
 | `/app/_backup_restore` | Restore staging and pre-restore backups; set `backup_restore = "/app/_backup_restore"` | Persistent, writable |
 
+The image runs as `lowPrivUser`, which has no fixed uid, and only `/app/_storage` is
+created and owned by it in the image. Make the `/app/_backup_restore` mount writable by
+that user: check its uid with `docker run --rm --entrypoint id <image>` and give the
+volume that owner.
+
 [`docker-compose.yml`](../docker-compose.yml) shows the first three, and
 [`config/examples/README.md`](../config/examples/README.md) lists every configuration file.
 
@@ -51,8 +56,8 @@ dashboard: build it with Node 22 by running `www/default/build.sh`, and set the
 ## Host
 
 - **Operating system.** Linux. The release binary is x86_64 only. The image builds for
-  the architecture of the machine that builds it; architectures other than x86_64 are
-  untested.
+  the architecture of the machine that builds it; CI also builds and runs the gateway on
+  arm64.
 - **CPU and memory.**
   - *Testing and evaluation:* a minimum host configuration of 2 vCPUs and 1 GiB of RAM,
     with the Agent Gateway container limited to 512 MiB of RAM by default.
@@ -144,6 +149,7 @@ The gateway only calls out to what you configure. Allow egress to:
 | Peer DID hosts, trust registries, OAuth providers, x402 facilitators | A surface uses identity verification, Trust Check, credential delegation or payments |
 | AWS Secrets Manager, Parameter Store, KMS | `secrets_backend = "aws"`, a secret uses an `aws_` reference, or encryption at rest uses KMS |
 | An OpenTelemetry collector or CloudWatch | You configure them in `metrics.json` |
+| `login.microsoftonline.com` and `graph.microsoft.com` | SAML login uses `graph_api` for Microsoft Entra ID provisioning and profile photos |
 | SMTP, Slack, webhooks, Kafka, Kinesis, Pulsar or Redis Streams | An integration uses them ([details](INTEGRATIONS.md)) |
 
 ## Secrets and keys
@@ -174,6 +180,7 @@ travel over DIDComm v2.1 through a mediator, which needs:
 - a public URL that both gateways can reach;
 - a Redis-compatible store, or its embedded Fjall store.
 
-Check that the mediator image matches your host's architecture with
+The published mediator image is built for linux/arm64 only. Check that it matches your
+host's architecture with
 `docker manifest inspect public.ecr.aws/affinidi/messaging-mediator:<tag>`. See
 [`FABRIC.md`](FABRIC.md).
