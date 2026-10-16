@@ -201,6 +201,12 @@ to the surface's configured Issuer DID. When the surface has no issuer configure
 template does not resolve and the entry is skipped with a warning rather than written
 with a placeholder.
 
+An entry's `issuer_did` is not a signer and does not set the authority. It is written as
+the `entity_id` of custom records whose `entity_target` is `issuer`, and nothing else. The
+dashboard warns on the Trust Recorder panel and on the entry while the surface has no Issuer
+selected and an entry's authority is the template, because that entry writes nothing. The
+warning does not block saving, and it does not appear for entries with an explicit authority.
+
 ## Display names
 
 A display name is an unverified, human-readable label for a DID
