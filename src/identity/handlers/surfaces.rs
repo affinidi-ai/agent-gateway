@@ -16,6 +16,7 @@ use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
 };
+use crate::trust_registry_verification::recorder_status::{RecorderStatus, global_store};
 
 fn tenant_context(context: &Option<Extension<PatTenantContext>>) -> Option<&PatTenantContext> {
     context
@@ -671,6 +672,37 @@ pub async fn get_surface(
         Some(_) => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
         None => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
     }
+}
+
+#[derive(Serialize)]
+pub struct TrustRecorderStatusResponse {
+    pub status: Option<RecorderStatus>,
+}
+
+/// Last known Trust Recorder outcome of a surface: the most recently attempted of its
+/// managed agents. `status` is `null` until the recorder has run, and while the surface
+/// has no Trust Recorder.
+pub async fn get_trust_recorder_status(
+    Path(surface_id): Path<String>,
+    State(state): State<IdentityApiState>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Result<Json<TrustRecorderStatusResponse>, SurfaceApiError> {
+    let (_, surface) =
+        load_surface_or_404(&state, &surface_id, tenant_context(&context), resource_scope(&scope), SurfaceAccess::Read)
+            .await?;
+    let has_recorder = surface
+        .trust_recorder()
+        .is_some_and(|recorder| !recorder.entries.is_empty());
+    let status = match global_store() {
+        Some(store) if has_recorder => {
+            store
+                .latest_for_surface(&surface.surface_id)
+                .await
+        }
+        _ => None,
+    };
+    Ok(Json(TrustRecorderStatusResponse { status }))
 }
 
 /// Validate (and resolve) every x402 payment policy attached to the
@@ -1578,6 +1610,11 @@ pub async fn delete_surface(
 
             info!("Deleted agent surface '{}' (surface_id={})", surface.name, surface_id);
 
+            if let Some(recorder_status) = global_store() {
+                recorder_status
+                    .remove_surface(&surface_id)
+                    .await;
+            }
             apply_surface_change(&state, SurfaceChange::Delete(&surface_id)).await;
 
             Ok(Json(DeleteSurfaceResponse {

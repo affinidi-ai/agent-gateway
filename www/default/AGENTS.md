@@ -147,6 +147,18 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 | Explainer toggle, body, guide link | `trust-recorder-fullscreen-context-toggle`, `trust-recorder-fullscreen-context-body`, `trust-recorder-fullscreen-context-doclink` |
 | Canvas node, by element type       | `surface-node-<type>`, for example `surface-node-trust-recorder`                                                                  |
 
+### Trust Recorder panel
+
+The Trust Recorder panel (sidebar and fullscreen) shows a **Last outcome** row from
+`GET /surfaces/{id}/trust-recorder-status` (`apiClient.getSurfaceTrustRecorderStatus`), rendered
+by one shared component, `components/trust-recorder/TrustRecorderLastOutcome.tsx`. It reads the
+surface id from `SurfaceMetaContext` and is hidden outside the builder, while a surface is
+being created, and without an id. States: a quiet **Loading…**, **No attempt yet** for a
+`null` status, the state badge with reason text, relative time (absolute in its `title`) and
+the counts summed across entries, and **Status unavailable** when the fetch fails; a failed
+fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-state`,
+`-reason`, `-time`, `-counts`, `-loading`, `-empty`, and `-unavailable`.
+
 ## Access Tokens page
 
 Management personal access tokens live in the Secrets page's **Access Tokens** tab.
@@ -273,8 +285,8 @@ modern catalog could be registered. Render them with the shared `WriteWarnings` 
 
 `pages/IdentitiesPage.tsx` orchestrates. Its page-only parts live in
 `pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: search,
-unnamed filter, and surface links in the `useIdentityRows` hook, and the row parts
-`IdentityNameCell` and `IdentityOriginBadge`.
+unnamed filter, recorder filter, and surface links in the `useIdentityRows` hook, and the row
+parts `IdentityNameCell`, `IdentityOriginBadge`, and `IdentityRecorderChip`.
 
 - Each DID gets its own row, keyed by the DID, with its own actions (Trust Score, Version History, Configure Policy, Copy link).
   Managed identities that share a surface, such as parallel `from_jwt_claim` DIDs, are
@@ -297,6 +309,27 @@ unnamed filter, and surface links in the `useIdentityRows` hook, and the row par
   `/surfaces/<surface_id>`, and the credential principal as a separate field.
 - When the backend sends none of the naming fields, the page renders as it did without
   them: no name line, filter, or origin badge.
+- **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
+  `types.ts`), present only when the identity's surface has a Trust Recorder. It is the
+  gateway recorder's last known outcome, not a live registry check. When any identity has it,
+  the table gains a **Recorder** column and the filter row gains a **Recorder** select; with
+  none, neither appears and the page looks as before.
+  - The column holds `IdentityRecorderChip`, a shared `Badge` (never colour-only: the text is
+    always shown) in a focusable button, so the tooltip opens on hover and keyboard focus and a
+    click does not expand the row. Labels and tones come from `utils/trustRecorderStatus.ts`:
+    Recorded (success), Partly recorded (warning), Failed (danger), Skipped (secondary), Not
+    attempted yet (light). The tooltip gives the last attempt (relative plus absolute) or
+    "No attempt yet", the overall reason text, and one row per entry with the registry id, its
+    state, its reason, and "created N, already existed N, failed N". Reason codes map to fixed
+    text; no registry error text is ever shown.
+  - The **Recorder** select (`recorderFilter.ts`, a pure predicate) offers All, Recorded,
+    Partly recorded, Failed, Skipped, Not attempted yet, and No recorder (identities without
+    the field). It is page state like the unnamed filter, and combines with the search and the
+    unnamed filter (AND).
+  - A websocket identity update replaces the whole identity, so a changed `trust_recorder`
+    outcome shows without a reload. The backend includes an identity in the delta when its
+    recorder outcome changes; adding or removing a Trust Recorder shows on the next update or
+    reload.
 
 | Element                                       | Test id                                                                                                                            |
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
@@ -306,6 +339,11 @@ unnamed filter, and surface links in the `useIdentityRows` hook, and the row par
 | Origin badge                                  | `identities-origin-<origin>`                                                                                                       |
 | Surface link, credential principal            | `identities-surface-link`, `identities-credential-principal`                                                                       |
 | Unnamed filter                                | `identities-unnamed-filter-button`                                                                                                 |
+| Recorder filter                               | `identities-recorder-filter`                                                                                                       |
+| Recorder chip                                 | `identities-recorder-chip-<state>`                                                                                                 |
+| Recorder tooltip                              | `identities-recorder-tooltip`                                                                                                      |
+| Tooltip last attempt, reason                  | `identities-recorder-last-attempt`, `identities-recorder-reason`                                                                   |
+| Tooltip registry entry                        | `identities-recorder-entry-<registry id>`                                                                                          |
 
 ## Remote gateway Issuer DIDs
 

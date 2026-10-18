@@ -522,12 +522,8 @@ async fn surface_has_request_policy_allowing_a2a_metadata_field(
     update_named_surface(world, &surface_name, surface, "attaching header metadata policy").await;
 }
 
-#[given(expr = "surface {string} has caller Trust Check that uses A2A metadata field {string}")]
-async fn surface_has_caller_trust_check_using_a2a_metadata_field(
-    world: &mut SurfaceWorld,
-    surface_name: String,
-    field: String,
-) {
+/// Adds a trust registry whose connection fails, so it stays stored but unconnected.
+async fn create_unconnected_trust_registry(world: &mut SurfaceWorld) -> String {
     crate::steps::when::ensure_admin_session(world).await;
     let registry_name = format!("bdd-unreachable-registry-{}", uuid::Uuid::new_v4());
     let admin_client = world
@@ -551,12 +547,21 @@ async fn surface_has_caller_trust_check_using_a2a_metadata_field(
         .send_json::<(), _>(reqwest::Method::GET, "/v1/trust-registries", None)
         .await
         .expect("list Trust Registries through admin API");
-    let trust_registry_id = registries
+    registries
         .iter()
         .find(|registry| registry["name"] == registry_name)
         .and_then(|registry| registry["id"].as_str())
         .expect("created unreachable Trust Registry must remain persisted")
-        .to_string();
+        .to_string()
+}
+
+#[given(expr = "surface {string} has caller Trust Check that uses A2A metadata field {string}")]
+async fn surface_has_caller_trust_check_using_a2a_metadata_field(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    field: String,
+) {
+    let trust_registry_id = create_unconnected_trust_registry(world).await;
     let policy_id = format!("bdd-header-metadata-trust-check-policy-{}", uuid::Uuid::new_v4());
     let rego = r#"package surface.policy
 
@@ -637,6 +642,70 @@ fn surface_has_caller_trust_check_with_entity_template(
         .surface_config
         .caller_trust_check_list
         .push(element);
+}
+
+const RECORDER_AUTHORITY_DID: &str = "did:web:example.com:authority";
+const SURFACE_ISSUER_AUTHORITY_TEMPLATE: &str = "{{ surface.issuer_did }}";
+
+pub(crate) fn trust_recorder_entry(
+    trust_registry_id: &str,
+    issuer_did: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "trust_registry_id": trust_registry_id,
+        "issuer_did": issuer_did,
+        "authority_did": RECORDER_AUTHORITY_DID,
+        "include_owned_agent": true,
+        "custom_resources": [],
+    })
+}
+
+#[given(expr = "the surface has a Trust Recorder for trust registry {string} with issuer {string}")]
+fn surface_has_trust_recorder(
+    world: &mut SurfaceWorld,
+    trust_registry_id: String,
+    issuer_did: String,
+) {
+    world
+        .surface_config
+        .trust_recorder_entries
+        .push(trust_recorder_entry(&trust_registry_id, &issuer_did));
+}
+
+#[given(expr = "the Trust Recorder for trust registry {string} takes the surface Issuer as its authority")]
+fn trust_recorder_takes_surface_issuer_as_authority(
+    world: &mut SurfaceWorld,
+    trust_registry_id: String,
+) {
+    let entry = world
+        .surface_config
+        .trust_recorder_entries
+        .iter_mut()
+        .find(|entry| entry["trust_registry_id"] == trust_registry_id)
+        .unwrap_or_else(|| panic!("the surface has no Trust Recorder for trust registry {trust_registry_id:?}"));
+    entry["authority_did"] = serde_json::json!(SURFACE_ISSUER_AUTHORITY_TEMPLATE);
+}
+
+#[given(expr = "surface {string} later gets a Trust Recorder for an unconnected trust registry with issuer {string}")]
+async fn surface_later_gets_trust_recorder_for_unconnected_registry(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    issuer_did: String,
+) {
+    let trust_registry_id = create_unconnected_trust_registry(world).await;
+    let surface_id = tracked_surface_id(world, &surface_name);
+    world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .patch_surface(
+            &surface_id,
+            &serde_json::json!({
+                "access_point": { "trust_recorder": { "entries": [trust_recorder_entry(&trust_registry_id, &issuer_did)] } }
+            }),
+        )
+        .await
+        .expect("adding a Trust Recorder through the admin API should succeed");
 }
 
 #[given("the surface has a policy that denies unless every caller Trust Check succeeded")]

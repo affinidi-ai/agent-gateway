@@ -105,6 +105,7 @@ flowchart LR
 | **Verifiable Presentation** (_VP_)        | A signed credential bundle the gateway attaches when identity injection is enabled, proving the agent DID being forwarded. On receipt it counts only if it verifies against the rules in [`docs/FABRIC.md`](docs/FABRIC.md#peer-issuer-dids).                                                                                                  |
 | **Trust registry verification**           | A trust-context lookup and recognition check that enriches policy input or validates a fetched target agent card.                                                                                                                                                   |
 | **Trust registry injection**              | Rules that attach trust-registry metadata to supported requests or responses.                                                                                                                                                                                       |
+| **Recorder status**                       | The last known outcome of a surface's Trust Recorder for one managed agent identity: Recorded, Partly recorded, Failed, Skipped or Not attempted yet. It is not a live check of the trust registry. See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#recorder-status). |
 
 ## Terms and consent
 

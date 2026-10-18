@@ -2,7 +2,8 @@
 //!
 //! Writes `TrAdminRecordRequest`s to one or more configured trust registries
 //! on the MA→AP response leg. Fire-and-forget: any per-record failure is
-//! logged and the response continues.
+//! logged, the response continues, and the per-entry outcome is kept as the
+//! agent's recorder status (see [`super::recorder_status`]).
 //!
 //! Wire path: `AgentSurface::access_point::trust_recorder`.
 //! Frontend element: `www/default/src/components/surface-builder/elements/trust-recorder/`.
@@ -15,12 +16,16 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tracing::{debug, info, warn};
+
+use super::recorder_status::{EntryStatus, RecorderReason, global_store};
 
 use crate::config::agent_surface::AgentSurface;
 use crate::config::types::{EntityTarget, TrustRecorderConfig, TrustRecorderEntry};
 use crate::identity::display_name::DisplayName;
 use crate::trust_registries::TrustRegistryListenerManager;
+use crate::trust_registries::communication::TrustRegistryError;
 use crate::trust_registries::reference_fields::{
     ReferenceFieldPublisher, ReferenceFieldValue, authority_value_for_did, issuer_entity_value_for_did,
 };
@@ -37,9 +42,178 @@ use crate::trust_registries::types::TrAdminRecordRequest;
 /// `www/default/src/components/surface-builder/elements/trust-recorder/definition.ts`.
 pub const SURFACE_ISSUER_DID_TEMPLATE: &str = "{{ surface.issuer_did }}";
 
+/// Result of writing one record to a trust registry.
+///
+/// `detail` is the registry error text for the operator log only; it is never
+/// stored or sent to the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordOutcome {
+    Created,
+    AlreadyExisted,
+    Failed { reason: RecorderReason, detail: String },
+}
+
+/// Seam over the registry write protocol so the recorder's outcome handling
+/// does not depend on which protocol the registry speaks.
+#[async_trait]
+pub trait RecordWriter: Send + Sync {
+    async fn write_record(
+        &self,
+        tr_did: &str,
+        record: &TrAdminRecordRequest,
+    ) -> RecordOutcome;
+}
+
+#[async_trait]
+impl RecordWriter for TrustRegistryListenerManager {
+    async fn write_record(
+        &self,
+        tr_did: &str,
+        record: &TrAdminRecordRequest,
+    ) -> RecordOutcome {
+        match self
+            .create_record(tr_did, record)
+            .await
+        {
+            Ok(_) => RecordOutcome::Created,
+            Err(e) => classify_write_error(&e),
+        }
+    }
+}
+
+/// Duplicate records are expected on every response from the same managed
+/// agent: the recorder is idempotent by design, so a duplicate is not a failure.
+fn classify_write_error(error: &TrustRegistryError) -> RecordOutcome {
+    if error.is_conflict()
+        || error
+            .to_string()
+            .contains("already exists")
+    {
+        return RecordOutcome::AlreadyExisted;
+    }
+    let reason = match error {
+        TrustRegistryError::Timeout(_) => RecorderReason::NoResponse,
+        TrustRegistryError::ProblemReport(..) => RecorderReason::Rejected,
+        _ => RecorderReason::Error,
+    };
+    RecordOutcome::Failed {
+        reason,
+        detail: error.to_string(),
+    }
+}
+
+struct ReadyEntry<'a> {
+    entry: &'a TrustRecorderEntry,
+    authority_did: String,
+    tr_did: String,
+}
+
+enum Resolution<'a> {
+    Ready(ReadyEntry<'a>),
+    Skipped(EntryStatus),
+}
+
+async fn resolve_entries<'a>(
+    cfg: &'a TrustRecorderConfig,
+    resolved_issuer_did: Option<&str>,
+    tr_store: &dyn TrustRegistryStore,
+) -> Vec<Resolution<'a>> {
+    let mut resolutions = Vec::with_capacity(cfg.entries.len());
+    for entry in &cfg.entries {
+        let Some(authority_did) = resolve_authority_did(entry, resolved_issuer_did) else {
+            resolutions.push(Resolution::Skipped(EntryStatus::skipped(
+                &entry.trust_registry_id,
+                RecorderReason::NoSurfaceIssuer,
+            )));
+            continue;
+        };
+        match lookup_entry_tr_did(tr_store, &entry.trust_registry_id).await {
+            Ok(tr_did) => resolutions.push(Resolution::Ready(ReadyEntry { entry, authority_did, tr_did })),
+            Err(reason) => {
+                resolutions.push(Resolution::Skipped(EntryStatus::skipped(&entry.trust_registry_id, reason)))
+            }
+        }
+    }
+    resolutions
+}
+
+/// Writes every record of every ready entry, sequentially, and returns one
+/// status per entry in configuration order. Skipped entries pass through;
+/// entries that declare no records are left out.
+async fn write_entries<W: RecordWriter + ?Sized>(
+    writer: &W,
+    resolutions: &[Resolution<'_>],
+    agent_did: &str,
+    context: Option<&serde_json::Value>,
+) -> Vec<EntryStatus> {
+    let mut statuses = Vec::with_capacity(resolutions.len());
+    for resolution in resolutions {
+        let ready = match resolution {
+            Resolution::Skipped(status) => {
+                statuses.push(status.clone());
+                continue;
+            }
+            Resolution::Ready(ready) => ready,
+        };
+        let records = build_records(ready.entry, agent_did, &ready.authority_did, context);
+        if records.is_empty() {
+            continue;
+        }
+        let (mut created, mut already_existed, mut failed) = (0, 0, 0);
+        let mut first_failure = None;
+        for record in &records {
+            match writer
+                .write_record(&ready.tr_did, record)
+                .await
+            {
+                RecordOutcome::Created => {
+                    created += 1;
+                    info!(
+                        trust_registry_did = %ready.tr_did,
+                        authority = %record.authority_id,
+                        entity = %record.entity_id,
+                        action = %record.action,
+                        resource = %record.resource,
+                        "Trust Recorder: record created"
+                    );
+                }
+                RecordOutcome::AlreadyExisted => {
+                    already_existed += 1;
+                    debug!(
+                        trust_registry_did = %ready.tr_did,
+                        action = %record.action,
+                        resource = %record.resource,
+                        "Trust Recorder: record already exists (idempotent)"
+                    );
+                }
+                RecordOutcome::Failed { reason, detail } => {
+                    failed += 1;
+                    first_failure.get_or_insert(reason);
+                    warn!(
+                        trust_registry_did = %ready.tr_did,
+                        error = %detail,
+                        action = %record.action,
+                        resource = %record.resource,
+                        "Trust Recorder: create_record failed (non-fatal)"
+                    );
+                }
+            }
+        }
+        statuses.push(EntryStatus::from_counts(
+            &ready.entry.trust_registry_id,
+            created,
+            already_existed,
+            failed,
+            first_failure,
+        ));
+    }
+    statuses
+}
+
 /// Write all triples declared by `cfg` for `agent_did` to their target
 /// trust registries. Runs sequentially per entry × per triple; errors are
-/// logged and the loop continues (never fails the response leg).
+/// logged and the loop continues (never fails the response leg). Returns one
+/// [`EntryStatus`] per entry that was skipped or wrote at least one record.
 ///
 /// Resolves each entry's `trust_registry_id` → TR DID via `tr_store`.
 /// The TR DID is required by `TrustRegistryListenerManager::create_record`.
@@ -57,9 +231,9 @@ pub async fn apply_trust_recorder(
     display_name: Option<&DisplayName>,
     tr_manager: Arc<TrustRegistryListenerManager>,
     tr_store: Arc<dyn TrustRegistryStore>,
-) {
+) -> Vec<EntryStatus> {
     if cfg.entries.is_empty() {
-        return;
+        return Vec::new();
     }
     info!(
         entry_count = cfg.entries.len(),
@@ -68,61 +242,17 @@ pub async fn apply_trust_recorder(
         cfg.entries.len()
     );
 
-    let mut targets = Vec::with_capacity(cfg.entries.len());
-    for entry in &cfg.entries {
-        let Some(authority_did) = resolve_authority_did(entry, resolved_issuer_did) else {
-            continue;
-        };
-        let Some(tr_did) = resolve_entry_tr_did(tr_store.as_ref(), &entry.trust_registry_id).await else {
-            continue;
-        };
-        targets.push((entry, authority_did, tr_did));
-    }
-
+    let resolutions = resolve_entries(cfg, resolved_issuer_did, tr_store.as_ref()).await;
     let context = display_name.map(record_context);
-    for (entry, authority_did, tr_did) in &targets {
-        for record in build_records(entry, agent_did, authority_did, context.as_ref()) {
-            match tr_manager
-                .create_record(tr_did, &record)
-                .await
-            {
-                Ok(_) => info!(
-                    trust_registry_did = %tr_did,
-                    authority = %record.authority_id,
-                    entity = %record.entity_id,
-                    action = %record.action,
-                    resource = %record.resource,
-                    "Trust Recorder: record created"
-                ),
-                Err(e) => {
-                    // Duplicate records are expected on every subsequent
-                    // response from the same managed agent — the recorder
-                    // is idempotent by design. Drop these to debug so the
-                    // warn stream stays actionable.
-                    if e.is_conflict()
-                        || e.to_string()
-                            .contains("already exists")
-                    {
-                        debug!(
-                            trust_registry_did = %tr_did,
-                            action = %record.action,
-                            resource = %record.resource,
-                            "Trust Recorder: record already exists (idempotent)"
-                        );
-                    } else {
-                        warn!(
-                            trust_registry_did = %tr_did,
-                            error = %e,
-                            action = %record.action,
-                            resource = %record.resource,
-                            "Trust Recorder: create_record failed (non-fatal)"
-                        );
-                    }
-                }
-            }
-        }
-    }
+    let statuses = write_entries(tr_manager.as_ref(), &resolutions, agent_did, context.as_ref()).await;
 
+    let targets: Vec<(&TrustRecorderEntry, String, String)> = resolutions
+        .iter()
+        .filter_map(|resolution| match resolution {
+            Resolution::Ready(ready) => Some((ready.entry, ready.authority_did.clone(), ready.tr_did.clone())),
+            Resolution::Skipped(_) => None,
+        })
+        .collect();
     let authorities = crate::gateways::connection_points::get_authority_store();
     let issuers = crate::gateways::connection_points::get_issuer_store();
     let fields = recorder_reference_fields(
@@ -140,6 +270,7 @@ pub async fn apply_trust_recorder(
             .publish(tr_manager.as_ref(), tr_did, value)
             .await;
     }
+    statuses
 }
 
 /// Names for the DIDs the recorder wrote, per trust registry: the agent entity (when
@@ -183,12 +314,12 @@ async fn recorder_reference_fields(
 }
 
 /// Resolve a Trust Recorder entry's `trust_registry_id` to the TR DID that
-/// `TrustRegistryListenerManager` addresses. Returns `None` (with a WARN)
-/// when the TR is unknown or not connected yet.
-async fn resolve_entry_tr_did(
+/// `TrustRegistryListenerManager` addresses. Fails (with a WARN) with the
+/// reason the entry is skipped when the TR is unknown or not connected yet.
+async fn lookup_entry_tr_did(
     tr_store: &dyn TrustRegistryStore,
     trust_registry_id: &str,
-) -> Option<String> {
+) -> Result<String, RecorderReason> {
     let tr = match tr_store
         .get(trust_registry_id)
         .await
@@ -199,7 +330,7 @@ async fn resolve_entry_tr_did(
                 trust_registry_id = %trust_registry_id,
                 "Trust Recorder: TR not found, skipping entry"
             );
-            return None;
+            return Err(RecorderReason::RegistryNotFound);
         }
         Err(e) => {
             warn!(
@@ -207,7 +338,7 @@ async fn resolve_entry_tr_did(
                 error = %e,
                 "Trust Recorder: TR lookup failed, skipping entry"
             );
-            return None;
+            return Err(RecorderReason::Error);
         }
     };
 
@@ -217,13 +348,13 @@ async fn resolve_entry_tr_did(
         .or(tr.registry_did.as_deref())
         .or(tr.did.as_deref())
         .map(str::to_string);
-    if tr_did.is_none() {
+    tr_did.ok_or_else(|| {
         warn!(
             trust_registry_id = %trust_registry_id,
             "Trust Recorder: TR has no resolved DID (not connected yet), skipping entry"
         );
-    }
-    tr_did
+        RecorderReason::RegistryNotConnected
+    })
 }
 
 /// Distinct TR DIDs a Trust Recorder configuration writes to.
@@ -233,7 +364,7 @@ pub async fn recorder_registry_dids(
 ) -> BTreeSet<String> {
     let mut dids = BTreeSet::new();
     for entry in &cfg.entries {
-        if let Some(did) = resolve_entry_tr_did(tr_store, &entry.trust_registry_id).await {
+        if let Ok(did) = lookup_entry_tr_did(tr_store, &entry.trust_registry_id).await {
             dids.insert(did);
         }
     }
@@ -329,7 +460,7 @@ pub fn spawn_trust_recorder(
         };
         let resolved_issuer_did = resolve_surface_issuer_did(issuer_id.as_deref()).await;
         let display_name = resolve_recorder_display_name(&did, &surface_id).await;
-        apply_trust_recorder(
+        let entries = apply_trust_recorder(
             &cfg,
             &did,
             resolved_issuer_did.as_deref(),
@@ -339,6 +470,13 @@ pub fn spawn_trust_recorder(
             store,
         )
         .await;
+        if let Some(status_store) = global_store()
+            && let Err(e) = status_store
+                .record(&surface_id, &did, entries, chrono::Utc::now())
+                .await
+        {
+            warn!(surface_id = %surface_id, error = %e, "Trust Recorder: failed to store status");
+        }
     });
 }
 
@@ -429,6 +567,7 @@ mod tests {
     use super::*;
     use crate::config::types::CustomResource;
     use crate::identity::display_name::ManagedDisplayName;
+    use crate::trust_registry_verification::recorder_status::RecorderState;
 
     fn base_entry() -> TrustRecorderEntry {
         TrustRecorderEntry {
@@ -769,5 +908,323 @@ mod tests {
 
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].context, None);
+    }
+
+    struct ScriptedWriter {
+        outcomes: std::sync::Mutex<std::collections::VecDeque<RecordOutcome>>,
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl ScriptedWriter {
+        fn new(outcomes: Vec<RecordOutcome>) -> Self {
+            Self {
+                outcomes: std::sync::Mutex::new(outcomes.into()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl RecordWriter for ScriptedWriter {
+        async fn write_record(
+            &self,
+            tr_did: &str,
+            record: &TrAdminRecordRequest,
+        ) -> RecordOutcome {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((tr_did.to_string(), record.action.clone(), record.resource.clone()));
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(RecordOutcome::Created)
+        }
+    }
+
+    fn entry_writing(
+        registry: &str,
+        resources: &[&str],
+    ) -> TrustRecorderEntry {
+        let mut entry = base_entry();
+        entry.trust_registry_id = registry.into();
+        entry.custom_resources = resources
+            .iter()
+            .map(|resource| CustomResource {
+                action: "is".into(),
+                resource: (*resource).into(),
+                entity_target: EntityTarget::Agent,
+                record_type: "recognition".into(),
+            })
+            .collect();
+        entry
+    }
+
+    fn ready(entry: &TrustRecorderEntry) -> Resolution<'_> {
+        Resolution::Ready(ReadyEntry {
+            entry,
+            authority_did: "did:example:authority".into(),
+            tr_did: format!("did:example:{}", entry.trust_registry_id),
+        })
+    }
+
+    fn failure(
+        reason: RecorderReason,
+        detail: &str,
+    ) -> RecordOutcome {
+        RecordOutcome::Failed { reason, detail: detail.into() }
+    }
+
+    #[tokio::test]
+    async fn created_records_make_a_recorded_entry_and_go_to_the_entrys_registry() {
+        let entry = entry_writing("tr-1", &["a", "b"]);
+        let writer = ScriptedWriter::new(vec![RecordOutcome::Created, RecordOutcome::Created]);
+
+        let statuses = write_entries(&writer, &[ready(&entry)], "did:example:agent", None).await;
+
+        assert_eq!(statuses, vec![EntryStatus::from_counts("tr-1", 2, 0, 0, None)]);
+        assert_eq!(
+            writer.calls(),
+            vec![
+                ("did:example:tr-1".into(), "is".into(), "a".into()),
+                ("did:example:tr-1".into(), "is".into(), "b".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_records_still_count_as_recorded() {
+        let entry = entry_writing("tr-1", &["a"]);
+        let writer = ScriptedWriter::new(vec![RecordOutcome::AlreadyExisted]);
+
+        let statuses = write_entries(&writer, &[ready(&entry)], "did:example:agent", None).await;
+
+        assert_eq!(statuses, vec![EntryStatus::from_counts("tr-1", 0, 1, 0, None)]);
+        assert_eq!(statuses[0].state, RecorderState::Recorded);
+    }
+
+    #[tokio::test]
+    async fn one_failed_record_among_written_ones_makes_the_entry_partial() {
+        let entry = entry_writing("tr-1", &["a", "b", "c"]);
+        let writer = ScriptedWriter::new(vec![
+            RecordOutcome::Created,
+            failure(RecorderReason::NoResponse, "Timeout: no reply"),
+            RecordOutcome::AlreadyExisted,
+        ]);
+
+        let statuses = write_entries(&writer, &[ready(&entry)], "did:example:agent", None).await;
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, RecorderState::Partial);
+        assert_eq!(statuses[0].reason, Some(RecorderReason::NoResponse));
+        assert_eq!((statuses[0].created, statuses[0].already_existed, statuses[0].failed), (1, 1, 1));
+        assert_eq!(writer.calls().len(), 3, "a failure must not stop the remaining records");
+    }
+
+    #[tokio::test]
+    async fn every_record_failing_makes_a_failed_entry_with_the_first_failure_reason() {
+        let entry = entry_writing("tr-1", &["a", "b"]);
+        let writer = ScriptedWriter::new(vec![
+            failure(RecorderReason::Rejected, "Problem report [e.p.x]: no"),
+            failure(RecorderReason::NoResponse, "Timeout"),
+        ]);
+
+        let statuses = write_entries(&writer, &[ready(&entry)], "did:example:agent", None).await;
+
+        assert_eq!(statuses[0].state, RecorderState::Failed);
+        assert_eq!(statuses[0].reason, Some(RecorderReason::Rejected));
+        assert_eq!(statuses[0].failed, 2);
+    }
+
+    #[tokio::test]
+    async fn registry_error_text_never_reaches_the_status() {
+        let entry = entry_writing("tr-1", &["a"]);
+        let writer = ScriptedWriter::new(vec![failure(RecorderReason::Error, "internal host db.corp:5432 refused")]);
+
+        let statuses = write_entries(&writer, &[ready(&entry)], "did:example:agent", None).await;
+
+        let json = serde_json::to_string(&statuses).unwrap();
+        assert!(!json.contains("db.corp"), "status leaked registry error text: {json}");
+    }
+
+    #[tokio::test]
+    async fn skipped_entries_keep_their_place_and_entries_without_records_are_left_out() {
+        let writes = entry_writing("tr-b", &["a"]);
+        let declares_nothing = entry_writing("tr-d", &[]);
+        let resolutions = vec![
+            Resolution::Skipped(EntryStatus::skipped("tr-a", RecorderReason::NoSurfaceIssuer)),
+            ready(&writes),
+            Resolution::Skipped(EntryStatus::skipped("tr-c", RecorderReason::RegistryNotConnected)),
+            ready(&declares_nothing),
+        ];
+        let writer = ScriptedWriter::new(vec![]);
+
+        let statuses = write_entries(&writer, &resolutions, "did:example:agent", None).await;
+
+        let order: Vec<(&str, RecorderState)> = statuses
+            .iter()
+            .map(|s| (s.trust_registry_id.as_str(), s.state))
+            .collect();
+        assert_eq!(
+            order,
+            vec![("tr-a", RecorderState::Skipped), ("tr-b", RecorderState::Recorded), ("tr-c", RecorderState::Skipped),]
+        );
+        assert_eq!(writer.calls().len(), 1);
+    }
+
+    #[test]
+    fn write_errors_are_classified_into_outcomes() {
+        use crate::trust_registries::communication::TR_CONFLICT_CODE;
+        let failed_with = |error: TrustRegistryError| match classify_write_error(&error) {
+            RecordOutcome::Failed { reason, .. } => reason,
+            other => panic!("expected a failure, got {other:?}"),
+        };
+
+        assert_eq!(
+            classify_write_error(&TrustRegistryError::ProblemReport(TR_CONFLICT_CODE.into(), "x".into())),
+            RecordOutcome::AlreadyExisted
+        );
+        assert_eq!(
+            classify_write_error(&TrustRegistryError::ProblemReport(
+                "e.p.msg.other".into(),
+                "Record already exists: k".into()
+            )),
+            RecordOutcome::AlreadyExisted
+        );
+        assert_eq!(failed_with(TrustRegistryError::Timeout("t".into())), RecorderReason::NoResponse);
+        assert_eq!(
+            failed_with(TrustRegistryError::ProblemReport("e.p.me.unauthorized".into(), "no".into())),
+            RecorderReason::Rejected
+        );
+        for error in [
+            TrustRegistryError::SendError("s".into()),
+            TrustRegistryError::NoConnection("n".into()),
+            TrustRegistryError::ConnectionError("c".into()),
+            TrustRegistryError::StaleConnection("s".into()),
+            TrustRegistryError::ParseError("p".into()),
+            TrustRegistryError::NotFound("f".into()),
+        ] {
+            assert_eq!(failed_with(error), RecorderReason::Error);
+        }
+    }
+
+    #[test]
+    fn a_failure_outcome_keeps_the_registry_text_for_the_operator_log() {
+        match classify_write_error(&TrustRegistryError::Timeout("No response within 10s".into())) {
+            RecordOutcome::Failed { detail, .. } => assert!(detail.contains("No response within 10s")),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    async fn store_with(
+        registries: &[(&str, Option<&str>)]
+    ) -> (crate::trust_registries::FileSystemTrustRegistryStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::trust_registries::FileSystemTrustRegistryStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        for (id, main_did) in registries {
+            let mut registry = crate::trust_registries::types::TrustRegistry::new(
+                format!("registry {id}"),
+                String::new(),
+                "https://example.com/oob".into(),
+                crate::trust_registries::did_manager::DidMethod::default(),
+            );
+            registry.id = (*id).into();
+            registry.main_did = main_did.map(str::to_string);
+            store
+                .create(&registry)
+                .await
+                .unwrap();
+        }
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn entries_are_resolved_or_skipped_with_the_reason_in_configuration_order() {
+        let (store, _dir) = store_with(&[("tr-connected", Some("did:example:tr")), ("tr-pending", None)]).await;
+        let mut cfg = TrustRecorderConfig::default();
+        let mut templated = entry_writing("tr-connected", &["a"]);
+        templated.authority_did = SURFACE_ISSUER_DID_TEMPLATE.into();
+        cfg.entries = vec![
+            entry_writing("tr-connected", &["a"]),
+            entry_writing("tr-pending", &["a"]),
+            entry_writing("tr-missing", &["a"]),
+            templated,
+        ];
+
+        let resolutions = resolve_entries(&cfg, None, &store).await;
+
+        let summary: Vec<String> = resolutions
+            .iter()
+            .map(|r| match r {
+                Resolution::Ready(ready) => format!("ready {} -> {}", ready.entry.trust_registry_id, ready.tr_did),
+                Resolution::Skipped(status) => format!("skipped {} {:?}", status.trust_registry_id, status.reason),
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                "ready tr-connected -> did:example:tr".to_string(),
+                "skipped tr-pending Some(RegistryNotConnected)".to_string(),
+                "skipped tr-missing Some(RegistryNotFound)".to_string(),
+                "skipped tr-connected Some(NoSurfaceIssuer)".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_template_authority_resolves_when_the_surface_has_an_issuer() {
+        let (store, _dir) = store_with(&[("tr-1", Some("did:example:tr"))]).await;
+        let mut entry = entry_writing("tr-1", &["a"]);
+        entry.authority_did = SURFACE_ISSUER_DID_TEMPLATE.into();
+        let cfg = TrustRecorderConfig { entries: vec![entry] };
+
+        let resolutions = resolve_entries(&cfg, Some("did:example:issuer-runtime"), &store).await;
+
+        match &resolutions[0] {
+            Resolution::Ready(ready) => assert_eq!(ready.authority_did, "did:example:issuer-runtime"),
+            Resolution::Skipped(status) => panic!("unexpected skip: {status:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_runs_store_the_status_only_when_the_outcome_changes() {
+        use crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore;
+        let entry = entry_writing("tr-1", &["a"]);
+        let status_store = TrustRecorderStatusStore::in_memory();
+        let now = chrono::Utc::now();
+        let run = |outcome: RecordOutcome, at: chrono::DateTime<chrono::Utc>| {
+            let entry = &entry;
+            let status_store = &status_store;
+            async move {
+                let writer = ScriptedWriter::new(vec![outcome]);
+                let statuses = write_entries(&writer, &[ready(entry)], "did:example:agent", None).await;
+                status_store
+                    .record("surface-1", "did:example:agent", statuses, at)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert!(run(RecordOutcome::Created, now).await);
+        assert!(run(RecordOutcome::AlreadyExisted, now + chrono::Duration::seconds(1)).await);
+        assert!(!run(RecordOutcome::AlreadyExisted, now + chrono::Duration::seconds(2)).await);
+        assert!(run(failure(RecorderReason::NoResponse, "Timeout"), now + chrono::Duration::seconds(3)).await);
+
+        let status = status_store
+            .status_for("surface-1", "did:example:agent")
+            .await
+            .unwrap();
+        assert_eq!(status.state, RecorderState::Failed);
+        assert_eq!(status.reason, Some(RecorderReason::NoResponse));
     }
 }
