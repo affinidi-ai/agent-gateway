@@ -19,6 +19,7 @@ use crate::observability::caller_names::{CallerNameService, DisplayNameSource};
 use crate::observability::identity_view::{
     CredentialPrincipal, PrincipalNames, credential_principal, naming_for, with_target_card_name,
 };
+use crate::trust_registry_verification::recorder_status::{RecorderStatus, TrustRecorderStatusStore, global_store};
 use crate::{config::GatewayConfig, observability::system_metrics::SystemInfo};
 
 // Store proxy start time
@@ -308,6 +309,8 @@ pub struct IdentityInfo {
     pub credential_principal: Option<CredentialPrincipal>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub name_conflict: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_recorder: Option<RecorderStatus>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -926,7 +929,16 @@ pub async fn compute_dashboard_delta(
             .changed_since(since)
             .into_iter()
             .collect();
-        let modified_identities = identities_changed_since(all_identities, since, &renamed, &renamed_surfaces);
+        let recorder_changed = match global_store() {
+            Some(recorder_status) => {
+                recorder_status
+                    .changed_dids_since(since)
+                    .await
+            }
+            None => std::collections::HashSet::new(),
+        };
+        let modified_identities =
+            identities_changed_since(all_identities, since, &renamed, &renamed_surfaces, &recorder_changed);
 
         if !modified_identities.is_empty() {
             changes.identities = Some(IdentitiesDelta {
@@ -1948,7 +1960,8 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-/// Identities created, last used, or whose caller or target Agent Card name changed after `since`.
+/// Identities created, last used, whose caller or target Agent Card name changed, or whose
+/// Trust Recorder status changed after `since`.
 /// Newly issued identities have `last_used_at = None` until the first usage
 /// event, so falling back to `created_at` surfaces them on the very first
 /// request that creates them.
@@ -1957,6 +1970,7 @@ pub(crate) fn identities_changed_since(
     since: DateTime<Utc>,
     renamed_dids: &std::collections::HashSet<String>,
     renamed_surfaces: &std::collections::HashSet<String>,
+    recorder_changed_dids: &std::collections::HashSet<String>,
 ) -> Vec<IdentityInfo> {
     identities
         .into_iter()
@@ -1966,6 +1980,7 @@ pub(crate) fn identities_changed_since(
                 .as_deref()
                 .unwrap_or(id.created_at.as_str());
             renamed_dids.contains(&id.did)
+                || (id.trust_recorder.is_some() && recorder_changed_dids.contains(&id.did))
                 || id
                     .surface_id
                     .as_ref()
@@ -1984,6 +1999,7 @@ async fn build_identity_list(
     metrics_store: &Arc<MetricsStore>,
     agent_surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
 ) -> Result<Vec<IdentityInfo>, (axum::http::StatusCode, String)> {
+    let recorder_status = global_store();
     build_identity_list_with(
         identity_store,
         &current_config.surfaces,
@@ -1991,6 +2007,7 @@ async fn build_identity_list(
         agent_surface_store,
         CallerNameService::global(),
         TargetCardNameService::global(),
+        recorder_status.as_deref(),
     )
     .await
 }
@@ -2002,6 +2019,7 @@ pub(crate) async fn build_identity_list_with(
     agent_surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
     caller_names: &Arc<CallerNameService>,
     card_names: &Arc<TargetCardNameService>,
+    recorder_status: Option<&TrustRecorderStatusStore>,
 ) -> Result<Vec<IdentityInfo>, (axum::http::StatusCode, String)> {
     let records = identity_store
         .list_all()
@@ -2144,6 +2162,7 @@ pub(crate) async fn build_identity_list_with(
                 surface_name,
                 credential_principal: principal,
                 name_conflict: naming.name_conflict,
+                trust_recorder: None,
             }
         })
         .collect();
@@ -2163,7 +2182,42 @@ pub(crate) async fn build_identity_list_with(
             .take()
             .map(|p| principal_names.named(p));
     }
+    if let Some(recorder_status) = recorder_status {
+        for identity in &mut identities {
+            identity.trust_recorder = recorder_status_for(identity, &surfaces_by_id, recorder_status).await;
+        }
+    }
     Ok(identities)
+}
+
+/// Managed identities on a surface with a Trust Recorder carry its last known outcome, or
+/// `not_attempted` before the first one. Every other identity carries none.
+async fn recorder_status_for(
+    identity: &IdentityInfo,
+    surfaces_by_id: &std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface>,
+    recorder_status: &TrustRecorderStatusStore,
+) -> Option<RecorderStatus> {
+    if identity.origin != Some(IdentityOrigin::Managed) {
+        return None;
+    }
+    let surface = surfaces_by_id.get(
+        identity
+            .surface_id
+            .as_deref()?,
+    )?;
+    if surface
+        .trust_recorder()?
+        .entries
+        .is_empty()
+    {
+        return None;
+    }
+    Some(
+        recorder_status
+            .status_for(&surface.surface_id, &identity.did)
+            .await
+            .unwrap_or_else(RecorderStatus::not_attempted),
+    )
 }
 
 /// Helper function to build channel list
@@ -2589,6 +2643,7 @@ mod tests {
                 None,
                 caller_names,
                 &Arc::new(TargetCardNameService::new(Arc::new(NoTargetCards))),
+                None,
             )
             .await
             .unwrap()
@@ -2637,6 +2692,207 @@ mod tests {
                 row.get("name_conflict")
                     .is_none()
             );
+        }
+
+        fn surface_with_recorder(
+            id: &str,
+            name: &str,
+        ) -> AgentSurface {
+            let mut surface = surface(id, name);
+            surface
+                .access_point
+                .trust_recorder = Some(crate::config::types::TrustRecorderConfig {
+                entries: vec![crate::config::types::TrustRecorderEntry {
+                    trust_registry_id: "tr-1".into(),
+                    issuer_did: "did:example:issuer".into(),
+                    authority_did: "did:example:authority".into(),
+                    include_owned_agent: true,
+                    custom_resources: vec![],
+                }],
+            });
+            surface
+        }
+
+        async fn list_with_recorder(
+            records: Vec<AgentIdentityRecord>,
+            surfaces: &[AgentSurface],
+            recorder_status: &crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore,
+        ) -> HashMap<String, IdentityInfo> {
+            let store = MockIdentityStore::new();
+            for record in records {
+                store
+                    .create(record)
+                    .await
+                    .unwrap();
+            }
+            let store: Arc<dyn IdentityStore> = Arc::new(store);
+            build_identity_list_with(
+                &store,
+                surfaces,
+                &Arc::new(MetricsStore::new(10)),
+                None,
+                &names(),
+                &Arc::new(TargetCardNameService::new(Arc::new(NoTargetCards))),
+                Some(recorder_status),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.did.clone(), i))
+            .collect()
+        }
+
+        #[tokio::test]
+        async fn test_managed_identity_on_a_recorder_surface_is_not_attempted_before_any_outcome() {
+            use crate::trust_registry_verification::recorder_status::{RecorderState, TrustRecorderStatusStore};
+            let status_store = TrustRecorderStatusStore::in_memory();
+            let rows = list_with_recorder(
+                vec![managed("did:example:oxygen", "oxygen")],
+                &[surface_with_recorder("oxygen", "OXYGEN")],
+                &status_store,
+            )
+            .await;
+
+            let status = rows["did:example:oxygen"]
+                .trust_recorder
+                .as_ref()
+                .expect("recorder status");
+            assert_eq!(status.state, RecorderState::NotAttempted);
+            let json = serde_json::to_value(&rows["did:example:oxygen"]).unwrap();
+            assert_eq!(json["trust_recorder"]["state"], json!("not_attempted"));
+            assert_eq!(json["trust_recorder"]["entries"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn test_managed_identity_carries_the_recorded_outcome_of_its_own_surface_only() {
+            use crate::trust_registry_verification::recorder_status::{
+                EntryStatus, RecorderState, TrustRecorderStatusStore,
+            };
+            let status_store = TrustRecorderStatusStore::in_memory();
+            status_store
+                .record(
+                    "oxygen",
+                    "did:example:oxygen",
+                    vec![EntryStatus::from_counts("tr-1", 1, 1, 0, None)],
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            status_store
+                .record(
+                    "helium",
+                    "did:example:helium",
+                    vec![EntryStatus::from_counts("tr-1", 0, 0, 1, None)],
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            let rows = list_with_recorder(
+                vec![managed("did:example:oxygen", "oxygen"), managed("did:example:helium", "helium")],
+                &[surface_with_recorder("oxygen", "OXYGEN"), surface_with_recorder("helium", "HELIUM")],
+                &status_store,
+            )
+            .await;
+
+            let oxygen = rows["did:example:oxygen"]
+                .trust_recorder
+                .as_ref()
+                .unwrap();
+            assert_eq!(oxygen.state, RecorderState::Recorded);
+            assert_eq!((oxygen.entries[0].created, oxygen.entries[0].already_existed), (1, 1));
+            assert!(
+                oxygen
+                    .last_attempt_at
+                    .is_some()
+            );
+            let helium = rows["did:example:helium"]
+                .trust_recorder
+                .as_ref()
+                .unwrap();
+            assert_eq!(helium.state, RecorderState::Failed);
+        }
+
+        #[tokio::test]
+        async fn test_identities_without_a_recorder_or_not_managed_carry_no_recorder_status() {
+            use crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore;
+            let status_store = TrustRecorderStatusStore::in_memory();
+            let rows = list_with_recorder(
+                vec![managed("did:example:plain", "plain"), caller(CALLER_DID)],
+                &[surface("plain", "PLAIN"), surface_with_recorder("oxygen", "OXYGEN")],
+                &status_store,
+            )
+            .await;
+
+            for did in ["did:example:plain", CALLER_DID] {
+                let json = serde_json::to_value(&rows[did]).unwrap();
+                assert!(
+                    json.get("trust_recorder")
+                        .is_none(),
+                    "{did} must not carry a recorder status: {json}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_a_surface_with_an_empty_recorder_has_no_recorder_status() {
+            use crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore;
+            let mut empty = surface_with_recorder("oxygen", "OXYGEN");
+            empty
+                .access_point
+                .trust_recorder
+                .as_mut()
+                .unwrap()
+                .entries
+                .clear();
+            let rows = list_with_recorder(
+                vec![managed("did:example:oxygen", "oxygen")],
+                &[empty],
+                &TrustRecorderStatusStore::in_memory(),
+            )
+            .await;
+            assert!(
+                rows["did:example:oxygen"]
+                    .trust_recorder
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_a_recorder_status_change_alone_puts_the_identity_in_the_delta() {
+            use crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore;
+            let status_store = TrustRecorderStatusStore::in_memory();
+            let rows = || async {
+                let mut record = managed("did:example:oxygen", "oxygen");
+                record.last_used_at = Some(Utc::now() - chrono::Duration::hours(1));
+                list_with_recorder(vec![record], &[surface_with_recorder("oxygen", "OXYGEN")], &status_store)
+                    .await
+                    .into_values()
+                    .collect::<Vec<IdentityInfo>>()
+            };
+            let since = Utc::now() - chrono::Duration::minutes(1);
+
+            let unchanged =
+                identities_changed_since(rows().await, since, &HashSet::new(), &HashSet::new(), &HashSet::new());
+            assert!(unchanged.is_empty());
+
+            let changed = HashSet::from(["did:example:oxygen".to_string()]);
+            let delta = identities_changed_since(rows().await, since, &HashSet::new(), &HashSet::new(), &changed);
+            assert_eq!(delta.len(), 1);
+            assert_eq!(delta[0].did, "did:example:oxygen");
+        }
+
+        #[tokio::test]
+        async fn test_a_recorder_change_for_an_identity_without_a_recorder_is_not_pushed() {
+            let record = managed("did:example:plain", "plain");
+            let mut rows: Vec<IdentityInfo> = list(vec![record], &[surface("plain", "PLAIN")], &names())
+                .await
+                .into_values()
+                .collect();
+            rows[0].last_used_at = Some((Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+            let since = Utc::now() - chrono::Duration::minutes(1);
+
+            let changed = HashSet::from(["did:example:plain".to_string()]);
+            assert!(identities_changed_since(rows, since, &HashSet::new(), &HashSet::new(), &changed).is_empty());
         }
 
         #[tokio::test]
@@ -2776,7 +3032,7 @@ mod tests {
                 .changed_since(since)
                 .into_iter()
                 .collect();
-            assert!(identities_changed_since(rows, since, &renamed, &HashSet::new()).is_empty());
+            assert!(identities_changed_since(rows, since, &renamed, &HashSet::new(), &HashSet::new()).is_empty());
 
             wait_for_caller_name(&caller_names).await;
             let rows: Vec<IdentityInfo> = list(vec![record], &[], &caller_names)
@@ -2787,7 +3043,7 @@ mod tests {
                 .changed_since(since)
                 .into_iter()
                 .collect();
-            let delta = identities_changed_since(rows, since, &renamed, &HashSet::new());
+            let delta = identities_changed_since(rows, since, &renamed, &HashSet::new(), &HashSet::new());
             assert_eq!(delta.len(), 1);
             assert_eq!(
                 delta[0]

@@ -357,7 +357,7 @@ from.
 | [`issuers/`](src/issuers/) | Issuer records with generated `did:web` / `did:webvh` DIDs | Source only: [`src/issuers/mod.rs`](src/issuers/mod.rs) |
 | [`authorities/`](src/authorities/) | Local record of external authority DIDs used as trust anchors | Source only: [`src/authorities/mod.rs`](src/authorities/mod.rs) |
 | [`trust_registries/`](src/trust_registries/) | Trust registry connection records, display-name reference fields | [`POLICY.md`](docs/POLICY.md#trust-check) for Trust Check. Records: [`src/trust_registries/mod.rs`](src/trust_registries/mod.rs) |
-| [`trust_registry_verification/`](src/trust_registry_verification/) | TRQP queries, Trust Check, the Trust Recorder | [`POLICY.md`](docs/POLICY.md) |
+| [`trust_registry_verification/`](src/trust_registry_verification/) | TRQP queries, Trust Check, the Trust Recorder and its last-outcome status | [`POLICY.md`](docs/POLICY.md), [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#recorder-status) |
 | [`sts/`](src/sts/) | RFC 8693 token exchange, and ID-JAG issuance and redemption | [`STS.md`](docs/STS.md) |
 
 ### Policy

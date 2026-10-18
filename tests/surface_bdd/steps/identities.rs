@@ -3,10 +3,13 @@ use serde_json::Value;
 
 use crate::bdd_support::caller::post_json;
 use crate::bdd_support::json_rpc::build_a2a_message_send_body;
+use crate::steps::given::tracked_surface_id;
 use crate::steps::when::{ensure_admin_session, ensure_gateway_running};
 use crate::world::SurfaceWorld;
 
 const DASHBOARD_STATS_PATH: &str = "/v1/dashboard/stats";
+const RECORDER_STATUS_ATTEMPTS: usize = 50;
+const RECORDER_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[given("the caller has sent a request to the surface")]
 async fn caller_has_sent_request_to_surface(world: &mut SurfaceWorld) {
@@ -117,4 +120,100 @@ fn managed_identity_belongs_to_surface(
             .is_some_and(|id| !id.is_empty()),
         "Managed Agent identity should carry its surface id, observed: {identity}"
     );
+}
+
+fn recorder_state_and_reason(status: &Value) -> (Option<&str>, Option<&str>) {
+    (
+        status
+            .get("state")
+            .and_then(Value::as_str),
+        status
+            .get("reason")
+            .and_then(Value::as_str),
+    )
+}
+
+#[then(expr = "within ten seconds the Managed Agent identity shows Trust Recorder status {string} because {string}")]
+async fn managed_identity_shows_recorder_status_because(
+    world: &mut SurfaceWorld,
+    expected_state: String,
+    expected_reason: String,
+) {
+    ensure_admin_session(world).await;
+    let mut observed = Value::Null;
+    for _ in 0..RECORDER_STATUS_ATTEMPTS {
+        let response = world
+            .admin_client
+            .as_ref()
+            .expect("admin client must exist")
+            .send_recorded_json::<Value>(reqwest::Method::GET, DASHBOARD_STATS_PATH, None)
+            .await
+            .expect("dashboard stats read should return an HTTP response");
+        world.admin_response = Some(response);
+        observed = single_identity_with_origin(world, "managed")
+            .get("trust_recorder")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if recorder_state_and_reason(&observed) == (Some(expected_state.as_str()), Some(expected_reason.as_str())) {
+            return;
+        }
+        tokio::time::sleep(RECORDER_STATUS_POLL_INTERVAL).await;
+    }
+    panic!("expected Trust Recorder status {expected_state:?} because {expected_reason:?}, last observed: {observed}");
+}
+
+#[then(expr = "the Managed Agent identity shows Trust Recorder status {string}")]
+fn managed_identity_shows_recorder_status(
+    world: &mut SurfaceWorld,
+    expected_state: String,
+) {
+    let identity = single_identity_with_origin(world, "managed");
+    let status = identity
+        .get("trust_recorder")
+        .unwrap_or_else(|| panic!("expected a Trust Recorder status, observed: {identity}"));
+    assert_eq!(recorder_state_and_reason(status).0, Some(expected_state.as_str()), "observed: {identity}");
+}
+
+#[then("the Managed Agent identity shows no Trust Recorder status")]
+fn managed_identity_shows_no_recorder_status(world: &mut SurfaceWorld) {
+    let identity = single_identity_with_origin(world, "managed");
+    assert!(
+        identity
+            .get("trust_recorder")
+            .is_none(),
+        "a surface without a Trust Recorder must not show a recorder status, observed: {identity}"
+    );
+}
+
+#[then(expr = "within ten seconds the Trust Recorder status of surface {string} is {string}")]
+async fn surface_recorder_status_is(
+    world: &mut SurfaceWorld,
+    surface_name: String,
+    expected_state: String,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = tracked_surface_id(world, &surface_name);
+    let path = format!("/v1/surfaces/{surface_id}/trust-recorder-status");
+    let mut observed = Value::Null;
+    for _ in 0..RECORDER_STATUS_ATTEMPTS {
+        let response = world
+            .admin_client
+            .as_ref()
+            .expect("admin client must exist")
+            .send_recorded_json::<Value>(reqwest::Method::GET, &path, None)
+            .await
+            .expect("surface Trust Recorder status read should return an HTTP response");
+        assert_eq!(response.status, 200, "unexpected response: {}", response.body);
+        observed = response
+            .body
+            .get("status")
+            .cloned()
+            .unwrap_or(Value::Null);
+        world.admin_response = Some(response);
+        if recorder_state_and_reason(&observed).0 == Some(expected_state.as_str()) {
+            return;
+        }
+        tokio::time::sleep(RECORDER_STATUS_POLL_INTERVAL).await;
+    }
+    panic!("expected surface {surface_name:?} Trust Recorder status {expected_state:?}, last observed: {observed}");
 }
