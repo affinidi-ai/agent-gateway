@@ -18,5 +18,13 @@ changes:
         config.toml. It now names the keys that resolve from the working directory or from
         --base-folder, and points deployments to absolute paths.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-19T08:55:23Z'
+      title: Upgrade zip to 9.0.5 to clear three archive extraction advisories
+      description: >-
+        zip 8.6.0 is affected by RustSec advisories 2026-0367, 2026-0368 and 2026-0369:
+        extraction kept SUID/SGID bits, created symbolic links pointing outside the destination,
+        and applied Unix permissions through symbolic links. Agent Gateway reads backup and
+        export entries itself and never calls the affected extract functions, so it was not
+        exposed, but the dependency now carries the fixes and the dependency audit passes again.
   breaking: []
