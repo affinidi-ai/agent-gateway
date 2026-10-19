@@ -1,4 +1,4 @@
-import { removeToast, showToast } from '../toaster';
+import { removeToast, showToast, showUndoToast } from '../toaster';
 
 const PAYLOAD = '<img src=x onerror="window.__toastXss = true">';
 
@@ -152,5 +152,26 @@ describe('showToast', () => {
 
       expect(getToast().querySelector('#app-toast-action')).toBeNull();
     });
+  });
+});
+
+describe('showUndoToast', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    (window as unknown as { __toastXss?: boolean }).__toastXss = undefined;
+  });
+
+  afterEach(() => {
+    removeToast();
+    jest.useRealTimers();
+  });
+
+  it('renders markup in the message literally and adds no element for it', () => {
+    showUndoToast({ message: PAYLOAD, duration: 60000, onUndo: jest.fn() });
+
+    const toast = getToast();
+    expect(toast.querySelector('img')).toBeNull();
+    expect(toast.textContent).toContain(PAYLOAD);
+    expect((window as unknown as { __toastXss?: boolean }).__toastXss).toBeUndefined();
   });
 });
