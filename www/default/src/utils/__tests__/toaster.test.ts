@@ -61,17 +61,20 @@ describe('showToast', () => {
       ['warning', 'alert-warning', 'Warning', 'fa-exclamation-triangle'],
       ['error', 'alert-danger', 'Error!', 'fa-exclamation-circle'],
       ['loading', 'alert-info', 'Loading...', 'fa-spinner'],
-    ] as const)('shows a %s toast with its class, icon and label', (type, alertClass, label, icon) => {
-      showToast(type, 'Hello there');
+    ] as const)(
+      'shows a %s toast with its class, icon and label',
+      (type, alertClass, label, icon) => {
+        showToast(type, 'Hello there');
 
-      const toast = getToast();
-      const alert = toast.querySelector('.alert');
-      expect(alert).not.toBeNull();
-      expect(alert).toHaveClass(alertClass, 'alert-dismissible', 'fade', 'show');
-      expect(toast.querySelector('strong')?.textContent).toBe(label);
-      expect(toast.querySelector('i.fas')).toHaveClass(icon);
-      expect(toast.querySelector('.flex-grow-1 span')?.textContent).toBe('Hello there');
-    });
+        const toast = getToast();
+        const alert = toast.querySelector('.alert');
+        expect(alert).not.toBeNull();
+        expect(alert).toHaveClass(alertClass, 'alert-dismissible', 'fade', 'show');
+        expect(toast.querySelector('strong')?.textContent).toBe(label);
+        expect(toast.querySelector('i.fas')).toHaveClass(icon);
+        expect(toast.querySelector('.flex-grow-1 span')?.textContent).toBe('Hello there');
+      }
+    );
 
     it('keeps the layout classes of the message block', () => {
       showToast('success', 'Hello');

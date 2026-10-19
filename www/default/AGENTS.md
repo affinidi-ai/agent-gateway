@@ -35,6 +35,13 @@ Applies to:
 8. Header topbar controls must use the shared topbar action button pattern, a single
    reusable component plus shared CSS state rules, rather than ad-hoc per-button markup.
 
+## Toasts
+
+`showToast` and `showUndoToast` (`utils/toaster.ts`) render the message and the action label as
+text (`textContent`), never as HTML, so a name or a server error message in a toast cannot run
+script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
+escape the text themselves.
+
 ## Test identifiers
 
 Every new interactive element ships with a `data-testid`. Tests under `ui-tests/specs/`
@@ -139,7 +146,7 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
   invalid (a resource pattern or required header the form rejects, or a refused expiry) the
   copy still happens and a `warning` toast says the opened form will not create a token until
   they are fixed; missing fields and scopes the operator cannot grant do not warn. The toast
-  text never repeats what was typed (toasts render HTML). In edit mode it sits beside
+  text never repeats what was typed. In edit mode it sits beside
   **Revoke token** and the link carries no expiry.
 - A successful create replaces the editor with the secret page. The secret isn't rendered:
   the field shows a masked placeholder and **Copy** puts the real value on the clipboard.
