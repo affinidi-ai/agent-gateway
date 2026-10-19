@@ -102,6 +102,12 @@ pub trait IntegrationPublisher: Send + Sync {
         Escaping::None
     }
 
+    /// Whether the transport takes structured JSON, so a JSON-valued variable alone in a field
+    /// is embedded as JSON. Otherwise it is sent as text.
+    fn embeds_json(&self) -> bool {
+        false
+    }
+
     /// Sends a rendered message with an endpoint's configuration.
     async fn send(
         &self,

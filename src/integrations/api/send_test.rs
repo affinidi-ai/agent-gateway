@@ -54,7 +54,7 @@ pub async fn test_endpoint(
     send(&route, &values, TEST_EVENT, &caller).await
 }
 
-/// Sends the integration's message for the first event of its event set, with sample values.
+/// Sends the integration's message for one event of its event set, with sample values.
 pub async fn test_integration(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
@@ -86,9 +86,11 @@ async fn send_sample(
 ) -> Result<Json<TestResult>, ApiError> {
     let endpoint = load(&stores.endpoints, &integration.endpoint_id, "endpoint").await?;
     let event_set: EventSet = load(&stores.event_sets, &integration.event_set_id, "event set").await?;
+    // Any event of the set will do; the smallest id, so repeated tests send the same sample.
     let event = event_set
         .events
-        .first()
+        .iter()
+        .min()
         .and_then(|id| find_event(id))
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "The event set holds no known event".to_string()))?;
     let values = event_values(
@@ -225,6 +227,37 @@ mod tests {
         assert!(failed_on_the_secret(endpoint_status, &endpoint_body), "{endpoint_status} {endpoint_body}");
         assert!(failed_on_the_secret(integration_status, &integration_body), "{integration_status} {integration_body}");
         assert!(failed_on_the_secret(draft_status, &draft_body), "{draft_status} {draft_body}");
+    }
+
+    #[tokio::test]
+    async fn a_test_send_that_fails_never_shows_a_secret_or_a_slack_webhook_url() {
+        let f = Fixture::new()
+            .await
+            .with_secrets(Secrets(vec![("slack-hook", None, "not a url s3cr3t-stored")]));
+        for webhook_url in ["$SECRET:slack-hook", "hooks.slack.com/services/T0/B0/s3cr3t-plain"] {
+            let endpoint = Endpoint::new(
+                "Ops Slack".to_string(),
+                String::new(),
+                EndpointType::Slack,
+                json!({"webhook_url": webhook_url}),
+            );
+            f.stores
+                .endpoints
+                .save(&endpoint)
+                .await
+                .expect("endpoint");
+
+            let (status, body) = f
+                .call(ADMIN, "POST", &format!("/v1/integrations/endpoints/{}/test", endpoint.id), None)
+                .await;
+
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            let message = body
+                .as_str()
+                .expect("message");
+            assert!(message.contains("webhook_url rejected"), "{message}");
+            assert!(!message.contains("s3cr3t"), "{message}");
+        }
     }
 
     #[tokio::test]

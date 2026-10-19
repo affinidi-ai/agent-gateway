@@ -547,7 +547,7 @@ mod tests {
             .save()
             .await
             .unwrap();
-        events.events = vec!["audit.trust_check".to_string()];
+        events.events = std::collections::HashSet::from(["audit.trust_check".to_string()]);
         stores
             .event_sets
             .save(&events)

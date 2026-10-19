@@ -1,5 +1,6 @@
 //! Writes a migration plan to the definition stores and reports what it did.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -17,7 +18,7 @@ pub enum Outcome {
     Created,
     /// A definition with its id exists, from an earlier run or written since; left as it is.
     AlreadyPresent,
-    /// Live delivered it nothing, so there is no event set or integration (Q5).
+    /// Live delivered it nothing, so there is no event set or integration.
     None,
 }
 
@@ -27,11 +28,11 @@ pub struct ReportEntry {
     pub id: String,
     pub name: String,
     pub endpoint: Outcome,
-    /// Why the endpoint was written disabled: its configuration fails the current checks (Q9).
+    /// Why the endpoint was written disabled: its configuration fails the current checks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_disabled: Option<String>,
     pub event_set: Outcome,
-    pub events: Vec<String>,
+    pub events: HashSet<String>,
     pub integration: Outcome,
     pub notes: Vec<String>,
 }
@@ -62,7 +63,7 @@ impl From<Skipped> for SkippedEntry {
 
 /// Saves each planned definition whose id is not stored yet. An endpoint whose configuration
 /// fails the checks a save through the API runs is written disabled, so its destination and
-/// credentials are kept but nothing is sent (Q9).
+/// credentials are kept but nothing is sent.
 pub async fn apply(
     plan: MigrationPlan,
     stores: &DefinitionStores,
@@ -318,7 +319,7 @@ mod tests {
                 endpoint: Outcome::Created,
                 endpoint_disabled: None,
                 event_set: Outcome::Created,
-                events: vec!["gateway.created".to_string()],
+                events: HashSet::from(["gateway.created".to_string()]),
                 integration: Outcome::Created,
                 notes: vec!["Received gateway events only from gw-1".to_string()],
             }]
@@ -347,6 +348,32 @@ mod tests {
             .expect("reason");
         assert!(reason.contains("169.254.169.254"), "{reason}");
         assert_eq!(report.integrations[0].integration, Outcome::Created, "the integration is kept");
+    }
+
+    #[tokio::test]
+    async fn the_report_never_shows_a_slack_webhook_url_that_fails_the_checks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stores = stores(dir.path()).await;
+        let mut planned = planned("https://93.184.215.14/hook", false);
+        planned.endpoint = Endpoint::new(
+            "Ops Slack".to_string(),
+            String::new(),
+            EndpointType::Slack,
+            json!({"webhook_url": "hooks.slack.com/services/T0/B0/s3cr3t-plain"}),
+        );
+        planned.endpoint.id = ID.to_string();
+
+        let report = apply(one(planned), &stores, None)
+            .await
+            .expect("applies");
+
+        let reason = report.integrations[0]
+            .endpoint_disabled
+            .clone()
+            .expect("reason");
+        assert!(reason.starts_with("webhook_url rejected: Invalid URL"), "{reason}");
+        let written = serde_json::to_string(&report).expect("serializes");
+        assert!(!written.contains("s3cr3t-plain"), "{written}");
     }
 
     #[tokio::test]

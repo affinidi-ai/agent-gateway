@@ -45,12 +45,14 @@ impl<T: Definition> DefinitionStore<T> {
         Ok(definitions)
     }
 
+    /// Writes the record through a temporary file and a rename, so a concurrent read sees the
+    /// previous record or the new one, never a partial file.
     pub async fn save(
         &self,
         definition: &T,
     ) -> Result<()> {
         self.storage
-            .save(definition)
+            .save_atomic(definition)
             .await
     }
 
@@ -170,5 +172,97 @@ mod tests {
                 .expect("find"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn save_leaves_only_the_record_file_and_it_parses() {
+        let dir = tempdir().expect("temp dir");
+        let store = DefinitionStore::<Endpoint>::new(dir.path().to_path_buf(), "endpoint")
+            .await
+            .expect("store");
+        let saved = endpoint("saved", "2026-01-01T00:00:00+00:00");
+        store
+            .save(&saved)
+            .await
+            .expect("save");
+        store
+            .save(&saved)
+            .await
+            .expect("save again");
+
+        let files: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(files, [format!("{}.json", saved.id)]);
+        assert_eq!(
+            store
+                .find(&saved.id)
+                .await
+                .expect("find"),
+            Some(saved)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_list_never_fails_while_a_definition_is_being_saved() {
+        let dir = tempdir().expect("temp dir");
+        let store = std::sync::Arc::new(
+            DefinitionStore::<Endpoint>::new(dir.path().to_path_buf(), "endpoint")
+                .await
+                .expect("store"),
+        );
+        let mut big = endpoint("big", "2026-01-01T00:00:00+00:00");
+        big.configuration = json!({ "padding": "x".repeat(256 * 1024) });
+        store
+            .save(&big)
+            .await
+            .expect("first save");
+
+        let writer = {
+            let store = store.clone();
+            let big = big.clone();
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    store
+                        .save(&big)
+                        .await
+                        .expect("save");
+                }
+            })
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let store = store.clone();
+                let id = big.id.clone();
+                tokio::spawn(async move {
+                    for _ in 0..200 {
+                        let listed = store
+                            .list()
+                            .await
+                            .expect("list while saving");
+                        assert_eq!(listed.len(), 1);
+                        assert!(
+                            store
+                                .find(&id)
+                                .await
+                                .expect("find while saving")
+                                .is_some()
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        writer.await.expect("writer");
+        for reader in readers {
+            reader.await.expect("reader");
+        }
     }
 }

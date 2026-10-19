@@ -6,8 +6,9 @@ use serde_json::Value as JsonValue;
 
 use crate::integrations::runtime_variables::patterns;
 
-/// Variables whose value is JSON text. A template string that is exactly one of these
-/// placeholders (`"data": "${EVENT_DATA}"`) embeds the value as JSON instead of a string.
+/// Variables whose value is JSON text. For a transport that takes structured JSON, a template
+/// string that is exactly one of these placeholders (`"data": "${EVENT_DATA}"`) embeds the
+/// value as JSON instead of a string.
 const JSON_VALUED_VARIABLES: &[&str] = &["EVENT_DATA", "AUDIT_RECORD"];
 
 /// How values are escaped before they enter the message, so caller-supplied text cannot
@@ -22,26 +23,30 @@ pub enum Escaping {
 }
 
 /// `template` with every placeholder filled from `values` in one pass: a placeholder without
-/// a value becomes empty, and a filled value is never scanned for placeholders again.
+/// a value becomes empty, and a filled value is never scanned for placeholders again. With
+/// `embed_json`, a JSON-valued placeholder alone in a string becomes that JSON value; without
+/// it, such a field stays a string, escaped like any other value.
 pub fn render(
     template: &JsonValue,
     values: &HashMap<String, String>,
     escaping: Escaping,
+    embed_json: bool,
 ) -> JsonValue {
     match template {
-        JsonValue::String(text) => {
-            embedded_json(text, values).unwrap_or_else(|| JsonValue::String(fill(text, values, escaping)))
-        }
+        JsonValue::String(text) => embed_json
+            .then(|| embedded_json(text, values))
+            .flatten()
+            .unwrap_or_else(|| JsonValue::String(fill(text, values, escaping))),
         JsonValue::Array(items) => JsonValue::Array(
             items
                 .iter()
-                .map(|item| render(item, values, escaping))
+                .map(|item| render(item, values, escaping, embed_json))
                 .collect(),
         ),
         JsonValue::Object(fields) => JsonValue::Object(
             fields
                 .iter()
-                .map(|(name, field)| (name.clone(), render(field, values, escaping)))
+                .map(|(name, field)| (name.clone(), render(field, values, escaping, embed_json)))
                 .collect(),
         ),
         other => other.clone(),
@@ -131,6 +136,7 @@ mod tests {
                 ("TIMESTAMP", "2026-10-15T00:00:00Z"),
             ]),
             Escaping::None,
+            true,
         );
 
         assert_eq!(
@@ -146,7 +152,7 @@ mod tests {
 
     #[test]
     fn a_placeholder_without_a_value_becomes_empty() {
-        let rendered = render(&json!({"text": "by ${USERNAME}."}), &values(&[]), Escaping::None);
+        let rendered = render(&json!({"text": "by ${USERNAME}."}), &values(&[]), Escaping::None, true);
 
         assert_eq!(rendered, json!({"text": "by ."}));
     }
@@ -157,6 +163,7 @@ mod tests {
             &json!({"text": "${USERNAME}"}),
             &values(&[("USERNAME", "${SECRET_VALUE}"), ("SECRET_VALUE", "leak")]),
             Escaping::None,
+            true,
         );
 
         assert_eq!(rendered, json!({"text": "${SECRET_VALUE}"}));
@@ -166,14 +173,27 @@ mod tests {
     fn a_json_valued_placeholder_alone_in_a_string_is_embedded_as_json() {
         let data = values(&[("EVENT_DATA", r#"{"gateway_id":"gw-1","old_state":null}"#)]);
 
-        let embedded = render(&json!({"data": "${EVENT_DATA}"}), &data, Escaping::None);
-        let in_text = render(&json!({"text": "data: ${EVENT_DATA}"}), &data, Escaping::None);
+        let embedded = render(&json!({"data": "${EVENT_DATA}"}), &data, Escaping::None, true);
+        let in_text = render(&json!({"text": "data: ${EVENT_DATA}"}), &data, Escaping::None, true);
         let not_json =
-            render(&json!({"data": "${EVENT_DATA}"}), &values(&[("EVENT_DATA", "not json")]), Escaping::None);
+            render(&json!({"data": "${EVENT_DATA}"}), &values(&[("EVENT_DATA", "not json")]), Escaping::None, true);
 
         assert_eq!(embedded, json!({"data": {"gateway_id": "gw-1", "old_state": null}}));
         assert_eq!(in_text, json!({"text": r#"data: {"gateway_id":"gw-1","old_state":null}"#}));
         assert_eq!(not_json, json!({"data": "not json"}));
+    }
+
+    #[test]
+    fn a_json_valued_placeholder_alone_in_a_string_stays_text_without_json_embedding() {
+        let data = values(&[("EVENT_DATA", r#"{"name":"<b>"}"#)]);
+        let template = json!({"data": "${EVENT_DATA}"});
+
+        assert_eq!(render(&template, &data, Escaping::None, false), json!({"data": r#"{"name":"<b>"}"#}));
+        assert_eq!(render(&template, &data, Escaping::SlackMrkdwn, false), json!({"data": r#"{"name":"&lt;b&gt;"}"#}));
+        assert_eq!(
+            render(&template, &data, Escaping::Html, false),
+            json!({"data": "{&quot;name&quot;:&quot;&lt;b&gt;&quot;}"})
+        );
     }
 
     #[test]
@@ -182,23 +202,27 @@ mod tests {
         let template = json!({"text": "<b>${USERNAME}</b>"});
 
         assert_eq!(
-            render(&template, &caller, Escaping::SlackMrkdwn),
+            render(&template, &caller, Escaping::SlackMrkdwn, true),
             json!({"text": "<b>&lt;!channel&gt; &amp; &lt;a href=\"x\"&gt;'hi'&lt;/a&gt;</b>"})
         );
         assert_eq!(
-            render(&template, &caller, Escaping::Html),
+            render(&template, &caller, Escaping::Html, true),
             json!({"text": "<b>&lt;!channel&gt; &amp; &lt;a href=&quot;x&quot;&gt;&#39;hi&#39;&lt;/a&gt;</b>"})
         );
         assert_eq!(
-            render(&template, &caller, Escaping::None),
+            render(&template, &caller, Escaping::None, true),
             json!({"text": "<b><!channel> & <a href=\"x\">'hi'</a></b>"})
         );
     }
 
     #[test]
     fn embedded_json_is_not_escaped() {
-        let rendered =
-            render(&json!({"data": "${EVENT_DATA}"}), &values(&[("EVENT_DATA", r#"{"name":"<b>"}"#)]), Escaping::Html);
+        let rendered = render(
+            &json!({"data": "${EVENT_DATA}"}),
+            &values(&[("EVENT_DATA", r#"{"name":"<b>"}"#)]),
+            Escaping::Html,
+            true,
+        );
 
         assert_eq!(rendered, json!({"data": {"name": "<b>"}}));
     }

@@ -212,11 +212,12 @@ leave the appliance with each record, so point audit integrations only at destin
 for that data.
 
 **Access.** Integrations are managed through `/v1/integrations` with the `integrations.*`
-permissions. A change that decides where audit records go also needs `audit.view`: an event set
-that holds audit events, an integration whose event set holds them, and an endpoint such an
-integration delivers to (see [`RBAC.md`](RBAC.md#governance-audit-integrations)). Changing
-integrations is administrator-only by default (see
-[`INTEGRATIONS.md`](INTEGRATIONS.md#management-api)).
+permissions alone, audit ones included; `audit.view` is not checked there. It guards reading the
+audit records, not where they are forwarded. So every holder of `integrations.view` (the `user`
+role by default) sees where Governance Audit records go, and every holder of `integrations.edit`
+can change it. The previous release hid audit integrations without `audit.view` and needed it to
+change them (see [`RBAC.md`](RBAC.md#governance-audit-integrations)). Changing integrations is
+administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#management-api)).
 
 - Integrations belong to the whole appliance. `PUT /v1/tenant-ownership/integrations/{id}`
   returns 400, and a tenant or resource-scoped PAT is refused on every integration route.
@@ -366,8 +367,9 @@ Transit Point whose token carries no caller). The policy variables describe the 
 a `policy_decision` (`AUDIT_POLICY_NAME` falls back to the Rego package when the policy has no
 stored definition) and are empty for other records; see
 [`POLICY.md`](POLICY.md#versioned-policy-definitions) for which decisions carry a revision. A
-string value that is exactly `${AUDIT_RECORD}` or `${EVENT_DATA}` is embedded as a JSON object;
-inside other text it is inserted as JSON text. A Stream or Webhook integration with an empty
+string value that is exactly `${AUDIT_RECORD}` or `${EVENT_DATA}` is embedded as a JSON object
+for Webhook and Stream integrations; for Slack and Email, and inside other text, it is inserted
+as JSON text. A Stream or Webhook integration with an empty
 template sends the default event envelope, whose `data` is the record:
 
 ```json

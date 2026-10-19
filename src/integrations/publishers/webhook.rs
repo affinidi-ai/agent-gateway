@@ -77,6 +77,10 @@ impl IntegrationPublisher for WebhookPublisher {
         }
     }
 
+    fn embeds_json(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         configuration: &Value,

@@ -6,6 +6,8 @@ pub mod event_set;
 pub mod integration;
 pub mod store;
 pub mod stores;
+#[cfg(test)]
+pub(crate) mod test_secrets;
 
 pub use endpoint::{Endpoint, EndpointType};
 pub use event_set::{EventSet, EventSetError};

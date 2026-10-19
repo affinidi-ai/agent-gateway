@@ -14,7 +14,7 @@ use crate::config::StoragePaths;
 use crate::integrations::definitions::DefinitionStores;
 use crate::secrets::SecretsStore;
 
-/// Old directories are deleted this long after the migration renamed them (Q6).
+/// Old directories are deleted this long after the migration renamed them.
 pub const MIGRATED_RETENTION_DAYS: u64 = 30;
 
 /// Migrates the live records under `paths`, if there are any. `now` (unix seconds) names the
@@ -94,7 +94,7 @@ pub async fn migrate_on_activation(
         if value.is_some() {
             warn!(
                 key = %format!("storage_paths.{key}"),
-                "Deprecated: used only to migrate integrations from the previous version; remove it once migrated"
+                "Deprecated: used only to migrate integrations from the previous version. Once migrated, set storage_paths.integration_endpoints, integration_event_sets and integration_definitions to the paths in use, then remove it"
             );
         }
     }
@@ -111,8 +111,18 @@ pub async fn migrate_on_activation(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
-    match migrate_from_live(&LegacyPaths::configured(storage_paths), report_dir, stores, secrets, &audit, now).await {
-        Ok(report) => report.is_some(),
+    let paths = LegacyPaths::configured(storage_paths);
+    match migrate_from_live(&paths, report_dir, stores, secrets, &audit, now).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            log_not_found(
+                &paths.definitions,
+                storage_paths
+                    .integrations
+                    .is_some(),
+            );
+            false
+        }
         Err(error) => {
             error!(
                 event = "integrations.migration.failed",
@@ -121,6 +131,29 @@ pub async fn migrate_on_activation(
             );
             false
         }
+    }
+}
+
+/// Names the live definitions directory the sweep did not find, so a wrong path is visible.
+/// Expected on a fresh install and after the migration, so INFO; a WARN when
+/// `storage_paths.integrations` named it, since the operator said the records are there.
+fn log_not_found(
+    definitions: &Path,
+    configured: bool,
+) {
+    let dir = definitions.display();
+    if configured {
+        warn!(
+            event = "integrations.migration.not_found",
+            dir = %dir,
+            "storage_paths.integrations names no directory; no integrations of the previous version to migrate"
+        );
+    } else {
+        info!(
+            event = "integrations.migration.not_found",
+            dir = %dir,
+            "No integrations of the previous version to migrate"
+        );
     }
 }
 
@@ -173,8 +206,12 @@ mod tests {
     }
 
     fn seed_live(f: &Fixture) {
+        seed_live_at(&f.paths);
+    }
+
+    fn seed_live_at(paths: &LegacyPaths) {
         write(
-            &f.paths.definitions,
+            &paths.definitions,
             ID,
             &json!({
                 "id": ID, "name": "Ops webhook", "description": "", "type": "webhook", "category": "gateway",
@@ -184,7 +221,7 @@ mod tests {
             }),
         );
         write(
-            &f.paths
+            &paths
                 .triggers
                 .join("gateways/gw-1"),
             "config",
@@ -314,5 +351,204 @@ mod tests {
         assert_eq!(report.integrations.len(), 1);
         assert!(renamed(&f.paths.definitions).exists());
         assert!(!renamed(&f.paths.triggers).exists());
+    }
+
+    /// The names in `dir`, with the unix seconds of `.migrated-<now>` and
+    /// `migration-report-<now>.json` replaced by `<now>`.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("dir")
+            .map(|entry| {
+                let name = entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned();
+                let stamp = name
+                    .rsplit(['-', '.'])
+                    .find(|part| part.parse::<u64>().is_ok());
+                match stamp {
+                    Some(stamp) => name.replace(stamp, "<now>"),
+                    None => name,
+                }
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn sweep(config: &crate::config::BootstrapConfig) -> (bool, DefinitionStores) {
+        let stores = DefinitionStores::open_configured(&config.storage_paths)
+            .await
+            .expect("stores");
+        let migrated = migrate_on_activation(&config.storage_paths, &stores, None).await;
+        (migrated, stores)
+    }
+
+    #[tokio::test]
+    async fn a_config_file_elsewhere_with_relative_deprecated_keys_migrates_its_records() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = root.path().join("_storage");
+        seed_live_at(&LegacyPaths {
+            definitions: storage.join("integrations/definitions"),
+            triggers: storage.join("integrations/triggers"),
+            connection_points: storage.join("connection_points"),
+        });
+        let config = super::super::config_in(
+            &root.path().join("config"),
+            r#"
+connection_points = "../_storage/connection_points"
+integration_endpoints = "../_storage/integrations/endpoints"
+integration_event_sets = "../_storage/integrations/event_sets"
+integration_definitions = "../_storage/integrations/integrations"
+integrations = "../_storage/integrations/definitions"
+integration_triggers = "../_storage/integrations/triggers"
+"#,
+        );
+
+        let (migrated, stores) = sweep(&config).await;
+
+        assert!(migrated);
+        assert!(
+            stores
+                .integrations
+                .find(ID)
+                .await
+                .expect("reads")
+                .is_some()
+        );
+        assert_eq!(
+            names_in(&storage.join("integrations")),
+            [
+                "definitions.migrated-<now>",
+                "endpoints",
+                "event_sets",
+                "integrations",
+                "migration-report-<now>.json",
+                "triggers.migrated-<now>"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_file_elsewhere_without_the_deprecated_keys_migrates_from_lives_defaults_beside_it() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let config_dir = root.path().join("config");
+        let storage = config_dir.join("_storage");
+        seed_live_at(&LegacyPaths {
+            definitions: storage.join("integrations/definitions"),
+            triggers: storage.join("integrations/triggers"),
+            connection_points: storage.join("connection_points"),
+        });
+        let config = super::super::config_in(&config_dir, "");
+
+        let (migrated, stores) = sweep(&config).await;
+
+        assert!(migrated);
+        assert!(
+            stores
+                .integrations
+                .find(ID)
+                .await
+                .expect("reads")
+                .is_some()
+        );
+        assert_eq!(
+            names_in(&storage.join("integrations")),
+            [
+                "definitions.migrated-<now>",
+                "endpoints",
+                "event_sets",
+                "integrations",
+                "migration-report-<now>.json",
+                "triggers.migrated-<now>"
+            ]
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(
+            &mut self,
+            buf: &[u8],
+        ) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("logs")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The line the sweep logged about not finding the live definitions directory.
+    async fn not_found_line(config: &crate::config::BootstrapConfig) -> String {
+        use tracing::instrument::WithSubscriber;
+
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let (migrated, _) = sweep(config)
+            .with_subscriber(subscriber)
+            .await;
+        assert!(!migrated);
+        let written = String::from_utf8(
+            logs.0
+                .lock()
+                .expect("logs")
+                .clone(),
+        )
+        .expect("utf-8");
+        let mut lines = written
+            .lines()
+            .filter(|line| line.contains("integrations.migration.not_found"));
+        let line = lines
+            .next()
+            .unwrap_or_else(|| panic!("no not_found line in:\n{written}"))
+            .to_string();
+        assert_eq!(lines.next(), None, "logged once");
+        line
+    }
+
+    #[tokio::test]
+    async fn the_sweep_names_the_resolved_live_directory_it_did_not_find() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let config_dir = root.path().join("config");
+        let config = super::super::config_in(&config_dir, "");
+
+        let line = not_found_line(&config).await;
+
+        let expected = config_dir.join("_storage/integrations/definitions");
+        assert!(line.contains(&expected.display().to_string()), "{line}");
+        assert!(line.contains(" INFO "), "nothing is expected on a fresh install: {line}");
+    }
+
+    #[tokio::test]
+    async fn a_deprecated_key_naming_a_missing_directory_warns_with_the_resolved_path() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let config = super::super::config_in(&root.path().join("config"), "integrations = \"../old/definitions\"");
+
+        let line = not_found_line(&config).await;
+
+        let expected = root
+            .path()
+            .join("old/definitions");
+        assert!(line.contains(&expected.display().to_string()), "{line}");
+        assert!(line.contains(" WARN "), "the operator named this directory: {line}");
     }
 }

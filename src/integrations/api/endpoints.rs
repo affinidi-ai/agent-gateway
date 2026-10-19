@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tracing::info;
 
-use super::audit_access::AuditAccess;
 use super::{
     ApiError, DefinitionStores, caller_id, definitions_changed, internal_error, not_found, refuse_while_used,
     require_known_id, validate_text,
@@ -99,19 +98,13 @@ pub async fn create_endpoint(
     Ok((StatusCode::CREATED, Json(EndpointResponse::from(&endpoint))))
 }
 
-/// Needs `audit.view` while an integration delivering audit events uses the endpoint, since
-/// the change decides where those records go.
 pub async fn update_endpoint(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
-    access: AuditAccess,
     Path(id): Path<String>,
     Json(request): Json<UpdateEndpointRequest>,
 ) -> Result<Json<EndpointResponse>, ApiError> {
     let mut endpoint = load(&stores, &id).await?;
-    access
-        .require_for_endpoint(&stores, &id)
-        .await?;
     let (name, description) = validate_text(&request.name, &request.description)?;
     endpoint.configuration =
         keep_unsent_secrets(endpoint.endpoint_type, request.configuration, &endpoint.configuration);
@@ -133,13 +126,9 @@ pub async fn update_endpoint(
 pub async fn delete_endpoint(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
-    access: AuditAccess,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_known_id(&id)?;
-    access
-        .require_for_endpoint(&stores, &id)
-        .await?;
     refuse_while_used(&stores, "endpoint", |integration| integration.endpoint_id == id).await?;
     let deleted = stores
         .endpoints
@@ -336,6 +325,29 @@ mod tests {
                 .is_some_and(|message| message.contains("never-stored")),
             "{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_referenced_secret_failing_the_checks_without_showing_it() {
+        let f = Fixture::new()
+            .await
+            .with_secrets(Secrets(vec![("slack-hook", None, "not a url s3cr3t-stored")]));
+
+        let (status, body) = f
+            .call(
+                EDITOR,
+                "POST",
+                "/v1/integrations/endpoints",
+                Some(json!({
+                    "name": "Ops Slack",
+                    "type": "slack",
+                    "configuration": {"webhook_url": "$SECRET:slack-hook"}
+                })),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!("The value of webhook_url from secret slack-hook fails the endpoint checks"));
     }
 
     #[tokio::test]

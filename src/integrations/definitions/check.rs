@@ -204,7 +204,7 @@ mod tests {
         let mut stale = gateway_events();
         stale
             .events
-            .push("identity.created".to_string());
+            .insert("identity.created".to_string());
         let events = gateway_events();
         let orphan = integration("Orphan", &internal, "missing-set", json!({}));
         let unfilled = integration("Unfilled", &internal, &events.id, json!({"text": "${USERNAME}"}));
@@ -243,6 +243,36 @@ mod tests {
         assert_eq!(problems[3], "Its event set missing-set does not exist");
         assert_eq!(problems[4], "No event of the event set fills these template variables: USERNAME");
         assert_eq!((report.endpoints, report.event_sets, report.integrations), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn a_finding_never_shows_a_secret_or_a_slack_webhook_url() {
+        let slack = |webhook_url: &str| {
+            Endpoint::new(
+                "Ops Slack".to_string(),
+                String::new(),
+                EndpointType::Slack,
+                json!({"webhook_url": webhook_url}),
+            )
+        };
+        let referenced = slack("$SECRET:slack-hook");
+        let plain = slack("hooks.slack.com/services/T0/B0/s3cr3t-plain");
+        let store = crate::integrations::definitions::test_secrets::Secrets(vec![(
+            "slack-hook",
+            None,
+            "not a url s3cr3t-stored",
+        )]);
+
+        let report = check_definitions(&[referenced, plain], &[], &[], Some(&store)).await;
+
+        let problems: Vec<&str> = report
+            .findings
+            .iter()
+            .map(|finding| finding.problem.as_str())
+            .collect();
+        assert_eq!(problems.len(), 2);
+        assert_eq!(problems[0], "The value of webhook_url from secret slack-hook fails the endpoint checks");
+        assert!(!problems[1].contains("s3cr3t-plain"), "{}", problems[1]);
     }
 
     #[tokio::test]

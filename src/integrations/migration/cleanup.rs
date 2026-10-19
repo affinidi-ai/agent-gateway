@@ -1,4 +1,4 @@
-//! Deletes the live directories the migration renamed, once they are old enough (Q6). They
+//! Deletes the live directories the migration renamed, once they are old enough. They
 //! may hold plain-text credentials, so they are not kept longer than a restore needs them.
 
 use std::path::PathBuf;
@@ -239,16 +239,14 @@ mod tests {
             .path()
             .join("integrations");
         let paths = StoragePaths {
-            integrations: Some(
-                base.join("definitions")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            integration_triggers: Some(
-                base.join("triggers")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            legacy_integrations: base
+                .join("definitions")
+                .to_string_lossy()
+                .into_owned(),
+            legacy_integration_triggers: base
+                .join("triggers")
+                .to_string_lossy()
+                .into_owned(),
             ..StoragePaths::default()
         };
 
@@ -257,6 +255,49 @@ mod tests {
         make(&base, &format!("definitions.migrated-{NOW}"));
         assert!(start_cleanup_if_pending(&paths).await, "a renamed directory starts it");
         assert!(!start_cleanup_if_pending(&paths).await, "one job at a time");
+    }
+
+    #[tokio::test]
+    async fn finds_the_renamed_directories_beside_the_live_paths_resolved_from_the_config_file() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let expired = NOW - MIGRATED_RETENTION_DAYS * DAY - 1;
+        let cases = [
+            (
+                "defaults",
+                "",
+                root.path()
+                    .join("defaults/config/_storage/integrations"),
+            ),
+            (
+                "keys",
+                "integrations = \"../_storage/integrations/definitions\"\nintegration_triggers = \"../_storage/integrations/triggers\"",
+                root.path()
+                    .join("keys/_storage/integrations"),
+            ),
+        ];
+        for (name, storage_paths, parent) in cases {
+            let config = super::super::config_in(
+                &root
+                    .path()
+                    .join(name)
+                    .join("config"),
+                storage_paths,
+            );
+            let renamed = [
+                make(&parent, &format!("definitions.migrated-{expired}")),
+                make(&parent, &format!("triggers.migrated-{expired}")),
+            ];
+            let live = LegacyPaths::configured(&config.storage_paths);
+
+            let removed = remove_expired(&[live.definitions, live.triggers], NOW)
+                .await
+                .expect("cleans");
+
+            assert_eq!(removed.len(), 2, "{name}: {removed:?}");
+            for dir in renamed {
+                assert!(!dir.exists(), "{name}: {} was kept", dir.display());
+            }
+        }
     }
 
     #[tokio::test]

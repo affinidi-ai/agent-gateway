@@ -26,7 +26,10 @@ impl StreamPublisher for RedisPublisher {
 
         use redis::AsyncCommands;
 
-        let client = redis::Client::open(redis_url).context("Failed to create Redis client")?;
+        // The URL can hold a password, and the error's detail can repeat part of it.
+        let client = redis::Client::open(redis_url).map_err(|error| {
+            anyhow::anyhow!("Failed to create Redis client: the Redis URL is not usable ({:?})", error.kind())
+        })?;
 
         let mut con = client
             .get_multiplexed_async_connection()
@@ -45,5 +48,29 @@ impl StreamPublisher for RedisPublisher {
 
         info!("Successfully published event to Redis Stream '{}'", topic);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn a_redis_url_it_cannot_use_is_refused_without_repeating_it() {
+        let error = RedisPublisher
+            .publish(
+                "events",
+                &json!({}),
+                &json!({"redis_url": "redis://cache.example.com/?protocol=s3cr3t-value"}),
+                "integration",
+                "endpoint",
+            )
+            .await
+            .expect_err("refused");
+
+        let message = format!("{error:#}");
+        assert!(message.starts_with("Failed to create Redis client"), "{message}");
+        assert!(!message.contains("s3cr3t-value"), "{message}");
     }
 }

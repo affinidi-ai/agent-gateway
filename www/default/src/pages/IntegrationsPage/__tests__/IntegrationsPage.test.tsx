@@ -219,7 +219,7 @@ test('integrations.delete removes an integration after confirmation', async () =
   expect(await screen.findByText(/add your first integration/i)).toBeInTheDocument();
 });
 
-test('an integration receiving audit events is deleted only with audit.view', async () => {
+test('without audit.view an integration receiving audit events is deleted like any other', async () => {
   mocked.listIntegrations.mockResolvedValue([
     integration(),
     integration({ id: 'i2', name: 'Audit to SIEM', event_set_id: 's2' }),
@@ -232,24 +232,12 @@ test('an integration receiving audit events is deleted only with audit.view', as
   renderPage();
 
   const audit = within(await row('Audit to SIEM')).getByRole('button', { name: /delete/i });
-  expect(audit).toBeDisabled();
-  expect(audit).toHaveAttribute('title', 'Audit events need the audit.view permission.');
-  expect(
-    within(await row('Gateway alerts')).getByRole('button', { name: /delete/i })
-  ).toBeEnabled();
-});
+  expect(audit).toBeEnabled();
+  expect(audit).toHaveAttribute('title', 'Delete integration');
 
-test('with audit.view an audit integration can be deleted', async () => {
-  mocked.listIntegrations.mockResolvedValue([integration({ event_set_id: 's2' })]);
-  mocked.listEventSets.mockResolvedValue([
-    { ...eventSet, id: 's2', name: 'Governance', events: ['audit.policy_decision'] },
-  ]);
-  mockPermissions = { 'integrations.view': true, 'integrations.delete': true, 'audit.view': true };
-  renderPage();
-
-  expect(
-    within(await row('Gateway alerts')).getByRole('button', { name: /delete/i })
-  ).toBeEnabled();
+  fireEvent.click(audit);
+  fireEvent.click(audit);
+  await waitFor(() => expect(mocked.deleteIntegration).toHaveBeenCalledWith('i2'));
 });
 
 test('a failed delete shows why and keeps the integration', async () => {

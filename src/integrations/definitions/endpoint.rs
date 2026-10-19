@@ -105,18 +105,35 @@ impl Endpoint {
     /// The secret ids its secret fields and webhook header values reference, in the form
     /// `resolve_secret_references` resolves: the whole value is `$SECRET:<secret_id>`.
     pub fn secret_references(&self) -> Vec<&str> {
+        self.referencing_fields()
+            .into_iter()
+            .map(|(_, secret_id)| secret_id)
+            .collect()
+    }
+
+    /// Each secret field and webhook header whose value references a secret, named as an
+    /// error may show it, with the secret id.
+    fn referencing_fields(&self) -> Vec<(String, &str)> {
         let mut references = Vec::new();
         for field in self
             .endpoint_type
             .secret_fields()
         {
             match self.configuration.get(*field) {
-                Some(JsonValue::String(value)) => references.extend(value.strip_prefix(SECRET_REFERENCE_PREFIX)),
+                Some(JsonValue::String(value)) => references.extend(
+                    value
+                        .strip_prefix(SECRET_REFERENCE_PREFIX)
+                        .map(|secret_id| (field.to_string(), secret_id)),
+                ),
                 Some(JsonValue::Object(headers)) => references.extend(
                     headers
-                        .values()
-                        .filter_map(JsonValue::as_str)
-                        .filter_map(|value| value.strip_prefix(SECRET_REFERENCE_PREFIX)),
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            let secret_id = value
+                                .as_str()?
+                                .strip_prefix(SECRET_REFERENCE_PREFIX)?;
+                            Some((format!("the header {name}"), secret_id))
+                        }),
                 ),
                 _ => {}
             }
@@ -138,14 +155,44 @@ impl Endpoint {
     }
 
     /// Checks the configuration the endpoint would send with, its secret references resolved,
-    /// as saving it does.
+    /// as saving it does. The publisher's reason is returned only when the referenced values
+    /// blanked give the same one, so it can neither hold nor depend on a secret; otherwise the
+    /// reason names the fields and secret ids alone.
     pub async fn validate_resolved(
         &self,
         secrets: Option<&dyn SecretsStore>,
     ) -> Result<(), String> {
         let mut resolved = self.clone();
         resolved.configuration = resolve_secret_references(self.endpoint_type, &self.configuration, secrets).await?;
-        resolved.validate_configuration()
+        let Err(reason) = resolved.validate_configuration() else {
+            return Ok(());
+        };
+        let references = self.referencing_fields();
+        if references.is_empty() {
+            return Err(reason);
+        }
+        let mut blanked = self.clone();
+        for value in secret_values_mut(self.endpoint_type, &mut blanked.configuration) {
+            if value.starts_with(SECRET_REFERENCE_PREFIX) {
+                value.clear();
+            }
+        }
+        if blanked
+            .validate_configuration()
+            .err()
+            .as_ref()
+            == Some(&reason)
+        {
+            return Err(reason);
+        }
+        let named: Vec<String> = references
+            .iter()
+            .map(|(field, secret_id)| format!("{field} from secret {secret_id}"))
+            .collect();
+        Err(match named.as_slice() {
+            [one] => format!("The value of {one} fails the endpoint checks"),
+            many => format!("The values of {} fail the endpoint checks", many.join(", ")),
+        })
     }
 }
 
@@ -161,23 +208,36 @@ pub async fn resolve_secret_references(
     store: Option<&dyn SecretsStore>,
 ) -> Result<JsonValue, String> {
     let mut resolved = configuration.clone();
-    let Some(fields) = resolved.as_object_mut() else {
-        return Ok(resolved);
-    };
-    for field in endpoint_type.secret_fields() {
-        match fields.get_mut(*field) {
-            Some(JsonValue::String(value)) => resolve_reference(value, store).await?,
-            Some(JsonValue::Object(headers)) => {
-                for header in headers.values_mut() {
-                    if let JsonValue::String(value) = header {
-                        resolve_reference(value, store).await?;
-                    }
-                }
-            }
-            _ => {}
-        }
+    for value in secret_values_mut(endpoint_type, &mut resolved) {
+        resolve_reference(value, store).await?;
     }
     Ok(resolved)
+}
+
+/// The text values of `configuration`'s secret fields and webhook headers.
+fn secret_values_mut(
+    endpoint_type: EndpointType,
+    configuration: &mut JsonValue,
+) -> Vec<&mut String> {
+    let Some(fields) = configuration.as_object_mut() else {
+        return Vec::new();
+    };
+    let secret_fields = endpoint_type.secret_fields();
+    fields
+        .iter_mut()
+        .filter(|(name, _)| secret_fields.contains(&name.as_str()))
+        .flat_map(|(_, value)| match value {
+            JsonValue::String(value) => vec![value],
+            JsonValue::Object(headers) => headers
+                .values_mut()
+                .filter_map(|header| match header {
+                    JsonValue::String(value) => Some(value),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// Replaces a `$SECRET:<secret_id>` `value` with the appliance-wide secret it names.
@@ -242,6 +302,7 @@ impl Definition for Endpoint {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_secrets::Secrets;
     use super::*;
     use serde_json::json;
 
@@ -399,74 +460,6 @@ mod tests {
         );
     }
 
-    struct Secrets(Vec<(&'static str, Option<&'static str>, &'static str)>);
-
-    #[async_trait::async_trait]
-    impl SecretsStore for Secrets {
-        async fn create(
-            &self,
-            _request: crate::secrets::CreateSecretRequest,
-        ) -> anyhow::Result<crate::secrets::Secret> {
-            unimplemented!()
-        }
-
-        async fn get(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
-            unimplemented!()
-        }
-
-        async fn get_by_secret_id(
-            &self,
-            secret_id: &str,
-        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
-            let now = chrono::Utc::now();
-            Ok(self
-                .0
-                .iter()
-                .find(|(id, _, _)| *id == secret_id)
-                .map(|(id, tenant, value)| crate::secrets::Secret {
-                    id: format!("internal-{id}"),
-                    tenant_id: tenant.map(str::to_string),
-                    name: id.to_string(),
-                    secret_id: id.to_string(),
-                    description: None,
-                    value: value.to_string(),
-                    secret_type: "General".to_string(),
-                    tags: Vec::new(),
-                    created_at: now,
-                    updated_at: now,
-                }))
-        }
-
-        async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
-            unimplemented!()
-        }
-
-        async fn update(
-            &self,
-            _id: &str,
-            _request: crate::secrets::UpdateSecretRequest,
-        ) -> anyhow::Result<crate::secrets::Secret> {
-            unimplemented!()
-        }
-
-        async fn delete(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-
-        async fn find_by_tag(
-            &self,
-            _tag: &str,
-        ) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
-            unimplemented!()
-        }
-    }
-
     #[tokio::test]
     async fn resolves_secret_references_in_secret_fields_and_headers() {
         let store = Secrets(vec![("hook-signing", None, "s3cr3t"), ("ops-token", None, "Bearer abc")]);
@@ -518,6 +511,65 @@ mod tests {
                 .expect_err("fails");
             assert!(error.contains(reason), "{error}");
         }
+    }
+
+    const SECRET_VALUE: &str = "s3cr3t-value";
+
+    fn slack(webhook_url: &str) -> Endpoint {
+        Endpoint::new("Ops Slack".to_string(), String::new(), EndpointType::Slack, json!({"webhook_url": webhook_url}))
+    }
+
+    #[tokio::test]
+    async fn a_referenced_secret_failing_the_checks_is_named_but_never_shown() {
+        for value in ["not a url s3cr3t-value", "http://10.0.0.1/services/s3cr3t-value"] {
+            let store = Secrets(vec![("slack-hook", None, value)]);
+
+            let error = slack("$SECRET:slack-hook")
+                .validate_resolved(Some(&store))
+                .await
+                .expect_err("refused");
+
+            assert_eq!(error, "The value of webhook_url from secret slack-hook fails the endpoint checks");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_problem_the_secret_values_do_not_cause_is_reported_as_it_is() {
+        let store = Secrets(vec![("ops-token", None, SECRET_VALUE)]);
+        let mut endpoint = webhook();
+        endpoint.configuration = json!({
+            "url": "http://169.254.169.254/latest",
+            "headers": {"Authorization": "$SECRET:ops-token"}
+        });
+
+        let error = endpoint
+            .validate_resolved(Some(&store))
+            .await
+            .expect_err("refused");
+
+        assert!(error.contains("169.254.169.254"), "{error}");
+        assert!(!error.contains(SECRET_VALUE), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_plain_slack_url_failing_the_checks_is_never_shown() {
+        let error = slack(&format!("hooks.slack.com/services/T0/B0/{SECRET_VALUE}"))
+            .validate_resolved(None)
+            .await
+            .expect_err("refused");
+
+        assert!(error.starts_with("webhook_url rejected: Invalid URL: "), "{error}");
+        assert!(!error.contains(SECRET_VALUE), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_secret_is_named() {
+        let error = slack("$SECRET:slack-hook")
+            .validate_resolved(Some(&Secrets(Vec::new())))
+            .await
+            .expect_err("refused");
+
+        assert_eq!(error, "Secret 'slack-hook' not found");
     }
 
     #[test]

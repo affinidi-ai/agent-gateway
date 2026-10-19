@@ -33,7 +33,18 @@ store, resolved at each delivery and shown in responses as written; a reference 
 resolve fails the delivery. Only a value that is the reference as a whole counts. Deleting a
 secret that an endpoint references is refused with `409` naming the endpoints; change or
 delete those endpoints first. Changing the secret's value is allowed, and the next delivery
-uses it. Webhook `headers` must be an object of header names to strings, and
+uses it. Only appliance-wide secrets resolve; a tenant-owned one never does. No `secrets.*`
+permission is checked when a reference is saved or resolved, so `integrations.edit` can use, and
+therefore read, every appliance-wide secret: pointing an endpoint that holds a reference at a
+host of the caller's choosing and sending a test delivers the value there. Grant
+`integrations.edit` only to roles that may read secrets; by default it and `secrets.*` are
+administrator-only (see [`RBAC.md`](RBAC.md#secrets-in-endpoints)). The dashboard's stored
+secret picker lists secrets only for callers with `secrets.view`, but a typed reference resolves
+regardless. A save checks the configuration with its references resolved; when a referenced
+value fails the checks, the `400` names the field and the secret id, for example "The value of
+webhook_url from secret slack-hook fails the endpoint checks", and never the value. No error
+of a save, a test, the startup check or the migration repeats a secret value or a URL (a
+blocked host is named). Webhook `headers` must be an object of header names to strings, and
 each header value may be such a reference; the field as a whole cannot be one. It cannot set
 `Content-Type`, `X-Webhook-Timestamp` or `X-Webhook-Signature-256`, which the gateway sets on
 every delivery; an endpoint stored with one of them still sends each exactly once, the
@@ -41,7 +52,8 @@ gateway's value. An endpoint's `type` cannot change. Its configuration is checke
 its publisher when saved, so a webhook or Slack URL that fails the checks under _Outbound
 requests_ is refused with `400`.
 
-**Event sets** need at least one event, every one from the catalog; repeats are dropped.
+**Event sets** need at least one event, every one from the catalog; repeats are dropped. A
+request listing more events than the catalog holds is refused with `400`.
 
 **Integrations** need an existing endpoint and event set. Their template must be a JSON object
 whose variables some event of the event set fills, and the audit delivery limits are accepted
@@ -146,8 +158,10 @@ variables for a template that needs them.
 Placeholders are filled in one pass
 ([`delivery/render.rs`](../src/integrations/delivery/render.rs)): a placeholder with no value
 becomes empty, and a substituted value is never scanned for placeholders again, so a username
-of `${SECRET}` stays literal. A string that is exactly `${EVENT_DATA}` or `${AUDIT_RECORD}` is
-embedded as a JSON value; inside other text it is inserted as JSON text.
+of `${SECRET}` stays literal. For `webhook` and `stream`, a string that is exactly
+`${EVENT_DATA}` or `${AUDIT_RECORD}` is embedded as a JSON value. Everywhere else, including
+`slack` and `email`, and inside other text, these JSON-valued variables are inserted as JSON
+text and escaped like any other value.
 
 Values, never the template, are escaped for the transport. Slack messages are sent as mrkdwn,
 with `&`, `<`, and `>` escaped, so caller-supplied text such as a JWT `name` claim cannot
@@ -218,8 +232,7 @@ sidebar item and the pages need `integrations.view`, the editors and test sends
   can be kept, replaced or cleared, or point to an appliance-wide secret with
   `$SECRET:<secret_id>`. A saved endpoint can send a test message.
 - **Event sets** pick events from the catalog, grouped by family and audit events by their
-  audit group, with search. Without `audit.view` the audit events are listed but cannot be
-  picked, and an event set that holds them cannot be saved.
+  audit group, with search. Audit events are picked and saved like any other.
 - **Integrations** join an endpoint and an event set and hold the template for the endpoint's
   type. The editor lists the variables the event set fills, refuses a template that uses
   others, sets the audit delivery limits when the event set holds audit events, and tests the
@@ -245,17 +258,21 @@ sidebar item and the pages need `integrations.view`, the editors and test sends
 
 A test sends one message without retries
 ([`api/send_test.rs`](../src/integrations/api/send_test.rs)). An integration test renders its
-template for the first event of its event set, filled with sample values; an unsaved one is
+template for one event of its event set (the smallest event id, so repeated tests match),
+filled with sample values; an unsaved one is
 checked as a save would be first. An endpoint test sends the endpoint type's default message
 for the event `integration.test`. A test that reaches the destination returns
 `{"delivered": true, "event_type": ...}`; one that fails returns `502` with the reason.
 
 Each route needs `integrations.view`, `integrations.edit` (including the tests), or
 `integrations.delete`, checked by the RBAC guard ([`api/mod.rs`](../src/integrations/api/mod.rs)).
-Mounted without a guard, every route above refuses the request with `403`. Creating, changing
-or deleting an event set that holds audit events, an integration whose event set holds them, or
-an endpoint such an integration delivers to also needs `audit.view` (`403` "Audit events need
-the audit.view permission" otherwise), since it decides where audit records go. Each create, change
+Mounted without a guard, every route above refuses the request with `403`. No route checks any
+other permission: an event set holding audit events, an integration delivering them and its
+endpoint are managed and tested like any other, and every `integrations.view` holder sees every
+endpoint's destination, including where Governance Audit records go. `audit.view` guards reading
+the audit records, not where they are forwarded; the previous release hid audit integrations
+from callers without it and needed it to change them (see
+[`RBAC.md`](RBAC.md#governance-audit-integrations)). Each create, change
 and delete is logged as `integrations.<endpoint|event_set|integration>.<created|updated|deleted>`
 with its id and the caller, and each test as `integrations.test_sent`; secret values are never
 logged.
@@ -324,13 +341,27 @@ endpoint, an event set and an integration, all three with the old integration's 
 **Where it reads and what it leaves.**
 - It reads `_storage/integrations/definitions` and `_storage/integrations/triggers`, or the
   deprecated `storage_paths.integrations` and `storage_paths.integration_triggers` when set.
-  Those keys are read for this only, log a deprecation warning, and can be removed once
-  migrated.
+  Like every other storage path, a relative path, the defaults included, is relative to the
+  config file's directory, not the working directory. Those keys are read for this only and
+  log a deprecation warning.
+- When `storage_paths.integrations` is set, each of `integration_endpoints`,
+  `integration_event_sets` and `integration_definitions` that the config leaves unset goes
+  beside it: with the old example config, `../_storage/integrations/endpoints`,
+  `…/event_sets` and `…/integrations`. So a config written for the previous version keeps the
+  definitions with the rest of its storage, which matters in Docker, where the config
+  directory is mounted read-only. Before removing the deprecated keys, set those three keys to
+  the paths in use; otherwise they fall back to `_storage/integrations/…` under the config
+  directory.
+- When the old definitions directory is not there, the node logs
+  `integrations.migration.not_found` with the path it looked in: INFO, as on a fresh install
+  or once migrated, or WARN when `storage_paths.integrations` names it.
 - Each integration logs `integrations.migration.integration`. A disabled endpoint logs
   `integrations.migration.endpoint_disabled`, an integration that cannot be migrated logs
   `integrations.migration.skipped`, and the end logs `integrations.migration.done`.
-- The report is `_storage/integrations/migration-report-<unix seconds>.json`, with no secret,
-  header or attachment value in it.
+- The report is `migration-report-<unix seconds>.json` in the directory holding
+  `storage_paths.integration_definitions` (by default `_storage/integrations/` beside the
+  config file, or the directory holding the old definitions when only
+  `storage_paths.integrations` is set), with no secret, header or attachment value in it.
 - The two old directories are renamed to `<dir>.migrated-<unix seconds>`, which also keeps
   the migration from running again. They may hold credentials in plain text, so the Active
   node deletes them 30 days later, without a restart.

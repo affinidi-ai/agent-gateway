@@ -6,7 +6,6 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use tracing::info;
 
-use super::audit_access::{AuditAccess, event_set_holds_audit, holds_audit_events};
 use super::{
     ApiError, DefinitionStores, caller_id, definitions_changed, integrations_using, internal_error, not_found,
     refuse_while_used, require_known_id, validate_text,
@@ -14,6 +13,7 @@ use super::{
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::integrations::definitions::event_set::validate_events;
 use crate::integrations::definitions::{EventSet, EventSetError};
+use crate::integrations::events::catalog;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,13 +47,10 @@ pub async fn get_event_set(
 pub async fn create_event_set(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
-    access: AuditAccess,
     Json(request): Json<EventSetRequest>,
 ) -> Result<(StatusCode, Json<EventSet>), ApiError> {
-    access
-        .require_if(holds_audit_events(&request.events))
-        .await?;
     let (name, description) = validate_text(&request.name, &request.description)?;
+    within_catalog(&request.events)?;
     let event_set = EventSet::new(name, description, request.events).map_err(bad_events)?;
     save(&stores, &event_set).await?;
     info!(
@@ -65,20 +62,16 @@ pub async fn create_event_set(
     Ok((StatusCode::CREATED, Json(event_set)))
 }
 
-/// Refused while an integration of the set would no longer fit it. Needs `audit.view` when the
-/// set holds audit events before or after the change.
+/// Refused while an integration of the set would no longer fit it.
 pub async fn update_event_set(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
-    access: AuditAccess,
     Path(id): Path<String>,
     Json(request): Json<EventSetRequest>,
 ) -> Result<Json<EventSet>, ApiError> {
     let mut event_set = load(&stores, &id).await?;
-    access
-        .require_if(holds_audit_events(&event_set.events) || holds_audit_events(&request.events))
-        .await?;
     let (name, description) = validate_text(&request.name, &request.description)?;
+    within_catalog(&request.events)?;
     event_set.events = validate_events(request.events).map_err(bad_events)?;
     event_set.name = name;
     event_set.description = description;
@@ -112,13 +105,9 @@ pub async fn update_event_set(
 pub async fn delete_event_set(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
-    access: AuditAccess,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_known_id(&id)?;
-    access
-        .require_if(event_set_holds_audit(&stores, &id).await?)
-        .await?;
     refuse_while_used(&stores, "event set", |integration| integration.event_set_id == id).await?;
     let deleted = stores
         .event_sets
@@ -131,6 +120,15 @@ pub async fn delete_event_set(
     definitions_changed().await;
     info!(event = "integrations.event_set.deleted", event_set_id = %id, caller = caller_id(&caller));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Refuses a list longer than the catalog: an event set holds each catalog event at most once.
+fn within_catalog(events: &[String]) -> Result<(), ApiError> {
+    let most = catalog().len();
+    if events.len() > most {
+        return Err((StatusCode::BAD_REQUEST, format!("An event set holds at most {most} events")));
+    }
+    Ok(())
 }
 
 fn bad_events(error: EventSetError) -> ApiError {
@@ -214,16 +212,20 @@ mod tests {
 
         let created = create(&f, &["gateway.created", "audit.policy_decision", "gateway.created"]).await;
 
-        assert_eq!(created["name"], "Ops events");
-        assert_eq!(created["events"], json!(["gateway.created", "audit.policy_decision"]));
+        let created: EventSet = serde_json::from_value(created).expect("event set");
+        assert_eq!(created.name, "Ops events");
+        assert_eq!(
+            created.events,
+            std::collections::HashSet::from(["gateway.created".to_string(), "audit.policy_decision".to_string()])
+        );
         let (_, read) = f
-            .call(VIEWER, "GET", &format!("/v1/integrations/event-sets/{}", id(&created)), None)
+            .call(VIEWER, "GET", &format!("/v1/integrations/event-sets/{}", created.id), None)
             .await;
-        assert_eq!(read, created);
+        assert_eq!(serde_json::from_value::<EventSet>(read).expect("event set"), created);
         let (_, listed) = f
             .call(VIEWER, "GET", "/v1/integrations/event-sets", None)
             .await;
-        assert_eq!(listed, json!([created]));
+        assert_eq!(serde_json::from_value::<Vec<EventSet>>(listed).expect("event sets"), [created]);
     }
 
     #[tokio::test]
@@ -248,6 +250,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_list_longer_than_the_catalog_is_refused() {
+        let f = Fixture::new().await;
+        let every_event: Vec<String> = crate::integrations::events::catalog()
+            .iter()
+            .map(|event| event.id.to_string())
+            .collect();
+        let mut too_many = every_event.clone();
+        too_many.push(every_event[0].clone());
+        let created = create(&f, &["gateway.created"]).await;
+        let item = format!("/v1/integrations/event-sets/{}", id(&created));
+
+        let (create_status, create_body) = f
+            .call(ADMIN, "POST", "/v1/integrations/event-sets", Some(json!({"name": "All", "events": too_many})))
+            .await;
+        let (update_status, _) = f
+            .call(ADMIN, "PUT", &item, Some(json!({"name": "All", "events": too_many})))
+            .await;
+        let (every_status, _) = f
+            .call(ADMIN, "POST", "/v1/integrations/event-sets", Some(json!({"name": "All", "events": every_event})))
+            .await;
+
+        assert_eq!(create_status, StatusCode::BAD_REQUEST, "{create_body}");
+        assert_eq!(create_body, json!(format!("An event set holds at most {} events", every_event.len())));
+        assert_eq!(update_status, StatusCode::BAD_REQUEST);
+        assert_eq!(every_status, StatusCode::CREATED, "every catalog event once fits");
+    }
+
+    #[tokio::test]
     async fn an_update_that_an_integration_still_fits_is_saved() {
         let f = Fixture::new().await;
         let created = create(&f, &["gateway.created"]).await;
@@ -264,7 +294,12 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{updated}");
         assert_eq!(updated["name"], "Gateways");
-        assert_eq!(updated["events"], json!(["gateway.created", "gateway.deleted"]));
+        assert_eq!(
+            serde_json::from_value::<EventSet>(updated.clone())
+                .expect("event set")
+                .events,
+            std::collections::HashSet::from(["gateway.created".to_string(), "gateway.deleted".to_string()])
+        );
         assert_eq!(updated["created_at"], created["created_at"]);
     }
 
@@ -296,7 +331,7 @@ mod tests {
             .await
             .expect("find")
             .expect("stored");
-        assert_eq!(stored.events, ["gateway.created"]);
+        assert_eq!(stored.events, std::collections::HashSet::from(["gateway.created".to_string()]));
     }
 
     #[tokio::test]

@@ -73,42 +73,9 @@ function renderEditor(path: string) {
 const type = (label: string | RegExp, value: string) =>
   fireEvent.change(screen.getByLabelText(label), { target: { value } });
 
-function integration(id: string, name: string, eventSetId: string): api.Integration {
-  return {
-    id,
-    name,
-    description: '',
-    endpoint_id: 'e1',
-    event_set_id: eventSetId,
-    content: {},
-    status: 'active',
-    created_at: '',
-    updated_at: '',
-  };
-}
-
 beforeEach(() => {
   jest.clearAllMocks();
-  mockPermissions = { 'integrations.edit': true, 'audit.view': true };
-  mocked.listIntegrations.mockResolvedValue([]);
-  mocked.listEventSets.mockResolvedValue([
-    {
-      id: 'gateways',
-      name: 'Gateways',
-      description: '',
-      events: ['gateway.created'],
-      created_at: '',
-      updated_at: '',
-    },
-    {
-      id: 'governance',
-      name: 'Governance',
-      description: '',
-      events: ['audit.policy_decision'],
-      created_at: '',
-      updated_at: '',
-    },
-  ]);
+  mockPermissions = { 'integrations.edit': true };
   mocked.getEndpoint.mockResolvedValue(stored());
   mocked.createEndpoint.mockImplementation(async request => ({
     ...stored(),
@@ -417,47 +384,19 @@ describe('a stored endpoint', () => {
   });
 });
 
-describe('without audit.view', () => {
-  beforeEach(() => {
-    mockPermissions = { 'integrations.edit': true };
-  });
-
-  test('an endpoint an audit integration delivers through cannot be saved', async () => {
-    mocked.listIntegrations.mockResolvedValue([
-      integration('i1', 'Gateway alerts', 'gateways'),
-      integration('i2', 'Audit to SIEM', 'governance'),
-    ]);
-    renderEditor('/integrations/endpoints/e1');
-    await screen.findByDisplayValue('Ops mail');
-
-    const save = screen.getByTestId('endpoint-save-button');
-    await waitFor(() => expect(save).toBeDisabled());
-    expect(save).toHaveAttribute('title', 'Audit events need the audit.view permission.');
-    expect(screen.getByTestId('endpoint-audit-view-note')).toHaveTextContent('Audit to SIEM');
-    // Submitting from a field, as Enter does, is refused too.
-    fireEvent.submit(screen.getByTestId('endpoint-name-input'));
-    expect(mocked.updateEndpoint).not.toHaveBeenCalled();
-  });
-
-  test('an endpoint only gateway integrations use is saved as before', async () => {
-    mocked.listIntegrations.mockResolvedValue([integration('i1', 'Gateway alerts', 'gateways')]);
-    renderEditor('/integrations/endpoints/e1');
-    await screen.findByDisplayValue('Ops mail');
-
-    fireEvent.submit(screen.getByTestId('endpoint-name-input'));
-
-    await waitFor(() => expect(mocked.updateEndpoint).toHaveBeenCalled());
-    expect(screen.queryByTestId('endpoint-audit-view-note')).not.toBeInTheDocument();
-  });
-});
-
-test('with audit.view an endpoint an audit integration uses is saved', async () => {
-  mocked.listIntegrations.mockResolvedValue([integration('i2', 'Audit to SIEM', 'governance')]);
+test('without audit.view an endpoint is saved with no audit note, whatever delivers through it', async () => {
   renderEditor('/integrations/endpoints/e1');
   await screen.findByDisplayValue('Ops mail');
 
-  fireEvent.click(screen.getByTestId('endpoint-save-button'));
+  const save = screen.getByTestId('endpoint-save-button');
+  expect(save).toBeEnabled();
+  expect(save).not.toHaveAttribute('title');
+  expect(screen.queryByTestId('endpoint-audit-view-note')).not.toBeInTheDocument();
+  expect(screen.queryByText(/audit\.view/)).not.toBeInTheDocument();
+  expect(mocked.listIntegrations).not.toHaveBeenCalled();
+  expect(mocked.listEventSets).not.toHaveBeenCalled();
 
+  fireEvent.click(save);
   await waitFor(() => expect(mocked.updateEndpoint).toHaveBeenCalled());
 });
 

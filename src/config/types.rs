@@ -2611,6 +2611,17 @@ pub struct StoragePaths {
     #[serde(default, skip_serializing)]
     pub integration_triggers: Option<String>,
 
+    /// The directory the migration reads live integrations from: `integrations`, or
+    /// `_storage/integrations/definitions` when unset, resolved like every storage path when
+    /// the config file is loaded. Not a config key.
+    #[serde(skip, default = "default_legacy_integrations_storage_path")]
+    pub legacy_integrations: String,
+
+    /// The directory the migration reads live attachments from: `integration_triggers`, or
+    /// `_storage/integrations/triggers` when unset, resolved the same way. Not a config key.
+    #[serde(skip, default = "default_legacy_integration_triggers_storage_path")]
+    pub legacy_integration_triggers: String,
+
     /// Path to store Webhook configurations
     #[serde(default = "default_webhooks_storage_path")]
     pub webhooks: String,
@@ -2729,6 +2740,8 @@ impl Default for StoragePaths {
             integration_definitions: default_integration_definitions_storage_path(),
             integrations: None,
             integration_triggers: None,
+            legacy_integrations: default_legacy_integrations_storage_path(),
+            legacy_integration_triggers: default_legacy_integration_triggers_storage_path(),
             webhooks: default_webhooks_storage_path(),
             vc_keys: default_vc_keys_path(),
             metrics: default_metrics_storage_path(),
@@ -3152,6 +3165,14 @@ fn default_integration_definitions_storage_path() -> String {
     "_storage/integrations/integrations".to_string()
 }
 
+fn default_legacy_integrations_storage_path() -> String {
+    "_storage/integrations/definitions".to_string()
+}
+
+fn default_legacy_integration_triggers_storage_path() -> String {
+    "_storage/integrations/triggers".to_string()
+}
+
 fn default_webhooks_storage_path() -> String {
     "_storage/webhooks".to_string()
 }
@@ -3406,6 +3427,7 @@ mod storage_paths_tests {
         let written = toml::to_string(&paths).expect("serializes");
         assert!(!written.contains("/data/definitions"), "{written}");
         assert!(!written.contains("integration_triggers"), "{written}");
+        assert!(!written.contains("legacy_integrations"), "{written}");
 
         let unset: StoragePaths = toml::from_str("").expect("parses");
         assert_eq!((unset.integrations, unset.integration_triggers), (None, None));

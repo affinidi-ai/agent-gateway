@@ -10,7 +10,10 @@ use crate::auth::storage::{PasskeyStorage, UserData};
 use crate::auth::types::{UserRole, UserStatus};
 use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard};
 use crate::auth_manager::pat::PatResourceScope;
+use crate::gateways::connection_points::message_processor::TEST_SECRETS_STORE;
+pub use crate::integrations::definitions::test_secrets::Secrets;
 use crate::rbac::RbacConfig;
+use crate::secrets::SecretsStore;
 use crate::tenancy::PatTenantContext;
 
 pub const ADMIN: &str = "admin-1";
@@ -25,6 +28,7 @@ pub const EDITOR: &str = "editor-1";
 pub struct Fixture {
     pub stores: Arc<DefinitionStores>,
     guard: RbacGuard,
+    secrets: Option<Arc<dyn SecretsStore>>,
     _dir: tempfile::TempDir,
 }
 
@@ -117,8 +121,18 @@ impl Fixture {
         Self {
             stores: Arc::new(stores),
             guard: RbacGuard::new(Arc::new(users), Arc::new(rbac)),
+            secrets: None,
             _dir: dir,
         }
+    }
+
+    /// The fixture with `secrets` as the secrets store its calls see.
+    pub fn with_secrets(
+        mut self,
+        secrets: Secrets,
+    ) -> Self {
+        self.secrets = Some(Arc::new(secrets));
+        self
     }
 
     pub async fn call(
@@ -158,7 +172,15 @@ impl Fixture {
         if let Some(pattern) = caller.resource_scope {
             app = app.layer(Extension(PatResourceScope(Arc::new(regex::Regex::new(pattern).expect("pattern")))));
         }
-        send(app, caller.user_id, method, uri, body).await
+        let call = send(app, caller.user_id, method, uri, body);
+        match &self.secrets {
+            Some(secrets) => {
+                TEST_SECRETS_STORE
+                    .scope(secrets.clone(), call)
+                    .await
+            }
+            None => call.await,
+        }
     }
 
     pub async fn call_unguarded(
