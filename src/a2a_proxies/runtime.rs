@@ -36,9 +36,8 @@ fn is_supported_proxy_method(method: &str) -> bool {
 
 /// The shape of a successful reply: the A2A version the send method is spelled
 /// in, rather than the negotiated version. A caller using `message/send` reads
-/// the A2A 0.3 reply whatever `A2A-Version` it sent, as callers did before the
-/// proxy negotiated versions at all, and one using `SendMessage` reads the 1.0
-/// reply.
+/// the A2A 0.3 reply whatever `A2A-Version` it sent, and one using
+/// `SendMessage` reads the 1.0 reply.
 fn reply_shape(method: &str) -> ReplyShape {
     ReplyShape::of(method).unwrap_or(ReplyShape::V1_0)
 }

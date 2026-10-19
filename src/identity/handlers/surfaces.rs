@@ -9,7 +9,7 @@ use axum::{
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 
-use crate::auth_manager::pat::{PatContext, PatResourceScope};
+use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
 use crate::config::agent_surface::AgentSurface;
 use crate::identity::state::IdentityApiState;
 use crate::surfaces::AgentSurfaceStore;
@@ -27,6 +27,15 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
     scope
         .as_ref()
         .map(|Extension(scope)| scope)
+}
+
+/// Whether the caller's token carries a resource scope of any kind, including
+/// one made of required headers alone, which yields neither a tenant nor a
+/// [`PatResourceScope`].
+fn resource_scoped(delegation: &Option<Extension<PatDelegationContext>>) -> bool {
+    delegation
+        .as_ref()
+        .is_some_and(|Extension(delegation)| delegation.resource_scoped)
 }
 
 /// Validate that all variant aliases within a surface are unique.
@@ -821,6 +830,7 @@ pub async fn create_surface(
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
     Json(mut surface): Json<AgentSurface>,
 ) -> Result<(StatusCode, Json<AgentSurface>), SurfaceApiError> {
     let store = state
@@ -927,7 +937,13 @@ pub async fn create_surface(
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
     normalize_a2a_settings(&mut surface, None).map_err(SurfaceApiError::BadRequest)?;
-    refuse_validation_off_by_scoped_caller(&surface, None, tenant_context(&context), resource_scope(&scope))?;
+    refuse_validation_off_by_scoped_caller(
+        &surface,
+        None,
+        tenant_context(&context),
+        resource_scope(&scope),
+        resource_scoped(&delegation),
+    )?;
     validate_mcp_resource_declarations(&state, &surface).await?;
     if let Ok(Some(_)) = store
         .get(&surface.surface_id)
@@ -959,6 +975,7 @@ pub async fn update_surface(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
     Json(mut surface): Json<AgentSurface>,
 ) -> Result<Json<AgentSurface>, SurfaceApiError> {
     let store = state
@@ -1001,6 +1018,7 @@ pub async fn update_surface(
         Some(&existing),
         tenant_context(&context),
         resource_scope(&scope),
+        resource_scoped(&delegation),
     )
     .await?;
     Ok(Json(saved))
@@ -1094,6 +1112,7 @@ fn normalize_a2a_settings(
             _ => A2aAccessPointSettings::a2a_proxy().accepted_versions,
         });
     let validation_applies = surface.a2a_validation_applies();
+    let surface_name = surface.name.clone();
     let settings = surface
         .access_point
         .a2a
@@ -1115,6 +1134,19 @@ fn normalize_a2a_settings(
                 fixed.join(", ")
             ));
         }
+        if let Some(stored) = stored
+            && stored.accepted_versions != fixed
+        {
+            warn!(
+                surface = ?crate::a2a::clip_for_log(&surface_name),
+                "The Target moved to an A2A proxy, so the surface now accepts A2A {} only, not {}; callers using \
+                 another version are refused with -32009",
+                fixed.join(", "),
+                stored
+                    .accepted_versions
+                    .join(", ")
+            );
+        }
         settings.accepted_versions = fixed;
     }
     if !validation_applies
@@ -1130,20 +1162,21 @@ fn normalize_a2a_settings(
 /// it off, a JSON-RPC batch or a non-string `method` reaches policy and the
 /// payment filters without a method to match, so a scoped token could otherwise
 /// step around operator-wide method rules. A caller is appliance-wide when its
-/// token has neither a tenant nor a resource scope; each is checked on its own,
-/// rather than relying on today's rule that a resource scope always names a
-/// tenant. A surface that is already `off` stays editable.
+/// token has no tenant, no resource pattern and no required headers; each is
+/// checked on its own, so a token scoped by required headers alone is refused
+/// too. A surface that is already `off` stays editable.
 fn refuse_validation_off_by_scoped_caller(
     surface: &AgentSurface,
     stored: Option<&crate::config::agent_surface::A2aAccessPointSettings>,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
+    resource_scoped: bool,
 ) -> Result<(), SurfaceApiError> {
     use crate::config::agent_surface::A2aValidation;
     let is_off = |settings: Option<&crate::config::agent_surface::A2aAccessPointSettings>| {
         settings.is_some_and(|settings| settings.validation == A2aValidation::Off)
     };
-    if (context.is_some() || scope.is_some())
+    if (context.is_some() || scope.is_some() || resource_scoped)
         && is_off(
             surface
                 .access_point
@@ -1269,6 +1302,7 @@ async fn validate_and_save_surface(
     existing: Option<&AgentSurface>,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
+    resource_scoped: bool,
 ) -> Result<AgentSurface, SurfaceApiError> {
     // Ensure route starts with / BEFORE the shape check so the
     // historical "missing slash is auto-fixed" behaviour is preserved.
@@ -1324,7 +1358,7 @@ async fn validate_and_save_surface(
             .a2a
             .as_ref()
     });
-    refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope)?;
+    refuse_validation_off_by_scoped_caller(&surface, stored_a2a, context, scope, resource_scoped)?;
     validate_mcp_resource_declarations(state, &surface).await?;
 
     store
@@ -1378,6 +1412,7 @@ pub async fn patch_surface(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<AgentSurface>, SurfaceApiError> {
@@ -1423,6 +1458,7 @@ pub async fn patch_surface(
         Some(&existing),
         tenant_context(&context),
         resource_scope(&scope),
+        resource_scoped(&delegation),
     )
     .await?;
     Ok(Json(saved))
@@ -1442,6 +1478,7 @@ pub async fn patch_variant(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<AgentSurface>, SurfaceApiError> {
@@ -1494,6 +1531,7 @@ pub async fn patch_variant(
         Some(&existing),
         tenant_context(&context),
         resource_scope(&scope),
+        resource_scoped(&delegation),
     )
     .await?;
     Ok(Json(saved))
@@ -1907,6 +1945,7 @@ pub async fn create_variant(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
     Json(body): Json<CreateVariantRequest>,
 ) -> Result<(StatusCode, Json<SurfaceVariant>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
@@ -1981,6 +2020,7 @@ pub async fn create_variant(
         Some(&existing),
         tenant_context(&context),
         resource_scope(&scope),
+        resource_scoped(&delegation),
     )
     .await?;
     let new_variant = saved
@@ -2006,6 +2046,7 @@ pub async fn update_variant(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
     Json(body): Json<UpdateVariantRequest>,
 ) -> Result<Json<SurfaceVariant>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
@@ -2069,6 +2110,7 @@ pub async fn update_variant(
         Some(&existing),
         tenant_context(&context),
         resource_scope(&scope),
+        resource_scoped(&delegation),
     )
     .await?;
 
@@ -2099,6 +2141,7 @@ pub async fn delete_variant(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
 ) -> Result<Json<DeleteSurfaceResponse>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -2143,6 +2186,7 @@ pub async fn delete_variant(
         Some(&existing),
         tenant_context(&context),
         resource_scope(&scope),
+        resource_scoped(&delegation),
     )
     .await?;
 
@@ -2167,6 +2211,7 @@ pub async fn promote_variant_to_default(
     State(state): State<IdentityApiState>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
+    delegation: Option<Extension<PatDelegationContext>>,
 ) -> Result<Json<AgentSurface>, SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
@@ -2203,6 +2248,7 @@ pub async fn promote_variant_to_default(
         Some(&existing),
         tenant_context(&context),
         resource_scope(&scope),
+        resource_scoped(&delegation),
     )
     .await?;
 
@@ -2553,13 +2599,13 @@ mod validation_tests {
         surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
         let envelope = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
 
-        match refuse_validation_off_by_scoped_caller(&surface, Some(&envelope), Some(&tenant()), None) {
+        match refuse_validation_off_by_scoped_caller(&surface, Some(&envelope), Some(&tenant()), None, false) {
             Err(SurfaceApiError::Forbidden(message)) => assert!(message.contains("appliance-wide administrator")),
             other => panic!("expected a 403, got {other:?}"),
         }
         assert!(
             matches!(
-                refuse_validation_off_by_scoped_caller(&surface, None, Some(&tenant()), None),
+                refuse_validation_off_by_scoped_caller(&surface, None, Some(&tenant()), None, false),
                 Err(SurfaceApiError::Forbidden(_))
             ),
             "on create too"
@@ -2579,7 +2625,13 @@ mod validation_tests {
         for context in [None, Some(tenant())] {
             assert!(
                 matches!(
-                    refuse_validation_off_by_scoped_caller(&surface, Some(&envelope), context.as_ref(), Some(&scope)),
+                    refuse_validation_off_by_scoped_caller(
+                        &surface,
+                        Some(&envelope),
+                        context.as_ref(),
+                        Some(&scope),
+                        false
+                    ),
                     Err(SurfaceApiError::Forbidden(_))
                 ),
                 "tenant context: {context:?}"
@@ -2587,8 +2639,27 @@ mod validation_tests {
         }
         let off = a2a_block(&["1.0"], A2aValidation::Off);
         assert!(
-            refuse_validation_off_by_scoped_caller(&surface, Some(&off), None, Some(&scope)).is_ok(),
+            refuse_validation_off_by_scoped_caller(&surface, Some(&off), None, Some(&scope), false).is_ok(),
             "a scoped caller may edit a surface that is already off"
+        );
+    }
+
+    /// A token scoped by required headers alone carries neither a tenant nor a
+    /// resource scope, yet is still a scoped caller.
+    #[test]
+    fn a_token_scoped_by_required_headers_alone_cannot_turn_validation_off() {
+        let mut surface = base_surface();
+        surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
+        let envelope = a2a_block(&["0.3", "1.0"], A2aValidation::Envelope);
+
+        assert!(matches!(
+            refuse_validation_off_by_scoped_caller(&surface, Some(&envelope), None, None, true),
+            Err(SurfaceApiError::Forbidden(_))
+        ));
+        let off = a2a_block(&["1.0"], A2aValidation::Off);
+        assert!(
+            refuse_validation_off_by_scoped_caller(&surface, Some(&off), None, None, true).is_ok(),
+            "it may edit a surface that is already off"
         );
     }
 
@@ -2598,15 +2669,18 @@ mod validation_tests {
         surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Off));
         let off = a2a_block(&["1.0"], A2aValidation::Off);
 
-        assert!(refuse_validation_off_by_scoped_caller(&surface, None, None, None).is_ok(), "appliance-wide caller");
         assert!(
-            refuse_validation_off_by_scoped_caller(&surface, Some(&off), Some(&tenant()), None).is_ok(),
+            refuse_validation_off_by_scoped_caller(&surface, None, None, None, false).is_ok(),
+            "appliance-wide caller"
+        );
+        assert!(
+            refuse_validation_off_by_scoped_caller(&surface, Some(&off), Some(&tenant()), None, false).is_ok(),
             "a tenant may edit a surface that is already off"
         );
 
         surface.access_point.a2a = Some(a2a_block(&["0.3", "1.0"], A2aValidation::Full));
         assert!(
-            refuse_validation_off_by_scoped_caller(&surface, None, Some(&tenant()), None).is_ok(),
+            refuse_validation_off_by_scoped_caller(&surface, None, Some(&tenant()), None, false).is_ok(),
             "a tenant may choose any other level"
         );
     }

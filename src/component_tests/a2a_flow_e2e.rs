@@ -2348,10 +2348,15 @@ const ELEMENTS_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent
 
 // ── A2A validation off is for appliance-wide callers only ──────────────────
 
-/// Seed an administrator who owns `token`, and a tenant access token scoped to
-/// tenant `tenant-a`'s surfaces, into the gateway's stores before it boots.
-/// Returns a client that sends the token and the tenant header.
-fn seed_tenant_access_token(bootstrap: &crate::config::BootstrapConfig) -> reqwest::Client {
+/// Seed an administrator and an access token they own into the gateway's stores
+/// before it boots: with `resource_pattern`, a token scoped to tenant
+/// `tenant-a`'s surfaces; without one, a token scoped by its required
+/// `x-external-account` header alone. Returns a client that sends the token and
+/// the header.
+fn seed_scoped_access_token(
+    bootstrap: &crate::config::BootstrapConfig,
+    resource_pattern: Option<&str>,
+) -> reqwest::Client {
     let now = chrono::Utc::now();
     let owner = "tenant-token-owner";
     let user: crate::auth::storage::UserData = serde_json::from_value(serde_json::json!({
@@ -2375,7 +2380,7 @@ fn seed_tenant_access_token(bootstrap: &crate::config::BootstrapConfig) -> reqwe
         token_hash: crate::access_tokens::store::hash_secret(&secret),
         user_id: owner.to_string(),
         scopes: Vec::new(),
-        resource_pattern: Some("TENANT:${x-external-account}:surfaces:.*".to_string()),
+        resource_pattern: resource_pattern.map(str::to_string),
         required_headers: vec![crate::auth_manager::resource_scope::RequiredHeader {
             name: "x-external-account".to_string(),
             pattern: "tenant-a".to_string(),
@@ -2416,17 +2421,20 @@ fn seed_tenant_access_token(bootstrap: &crate::config::BootstrapConfig) -> reqwe
 }
 
 /// A tenant access token cannot set an A2A surface's validation to `off`
-/// through the admin API, on create, PUT or merge PATCH, while it can choose
-/// another level; an appliance-wide caller can set `off`.
+/// through the admin API, on create, PUT or merge PATCH, and neither can a token
+/// scoped by required headers alone, while both can choose another level; an
+/// appliance-wide caller can set `off`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_api() {
     let mut clients = None;
     let h = GatewayHarness::start(|_, _, bootstrap| {
         let admin = helpers::configure_admin_api(bootstrap);
-        clients = Some((admin, seed_tenant_access_token(bootstrap)));
+        let tenant = seed_scoped_access_token(bootstrap, Some("TENANT:${x-external-account}:surfaces:.*"));
+        let header_scoped = seed_scoped_access_token(bootstrap, None);
+        clients = Some((admin, tenant, header_scoped));
     })
     .await;
-    let (admin, tenant) = clients.unwrap();
+    let (admin, tenant, header_scoped) = clients.unwrap();
     let collection = format!("{}/api/v1/surfaces", h.gateway_base);
     let send = |request: reqwest::RequestBuilder| async move {
         let response = request
@@ -2461,6 +2469,26 @@ async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_
             .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
         "{body}"
     );
+
+    let (status, body) = send(
+        header_scoped
+            .post(&collection)
+            .json(&surface("/header-off", "off")),
+    )
+    .await;
+    assert_eq!(status, 403, "a token scoped by required headers alone, create with off: {body}");
+    assert!(
+        body.to_string()
+            .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
+        "{body}"
+    );
+    let (status, body) = send(
+        header_scoped
+            .post(&collection)
+            .json(&surface("/header-envelope", "envelope")),
+    )
+    .await;
+    assert_eq!(status, 201, "a token scoped by required headers alone may choose another level: {body}");
 
     let (status, created) = send(
         tenant
@@ -2524,4 +2552,100 @@ async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_
     .await;
     assert_eq!(status, 200, "an appliance-wide caller may set off: {body}");
     assert_eq!(body["access_point"]["a2a"]["validation"], "off");
+}
+
+/// Settings a configuration reload gives a stored surface without its own reach
+/// the traffic it serves: after the reload, the surface accepts what the
+/// carried settings say, not what the resolved-surface cache held before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_settings_carried_over_on_reload_are_served() {
+    let mut paths = None;
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        let admin = helpers::configure_admin_api(bootstrap);
+        paths = Some((
+            admin,
+            std::path::PathBuf::from(
+                &bootstrap
+                    .storage_paths
+                    .agent_surfaces,
+            ),
+            std::path::PathBuf::from(
+                &bootstrap
+                    .storage_paths
+                    .settings,
+            ),
+        ));
+    })
+    .await;
+    let (admin, surfaces_dir, settings_dir) = paths.unwrap();
+    let mut listener = url::Url::parse(&h.gateway_base).unwrap();
+    listener
+        .set_host(Some("localhost"))
+        .unwrap();
+    let response = admin
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&serde_json::json!({
+            "name": "reloaded", "status": "active",
+            "access_point": {"listen_address": listener.origin().ascii_serialization(), "route": "/smoke/reloaded",
+                             "protocol": "a2a"},
+            "target": {"endpoint": h.mock.url()}
+        }))
+        .send()
+        .await
+        .expect("create surface");
+    assert_eq!(response.status(), 201);
+    let created: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(created["access_point"]["a2a"]["accepted_versions"], serde_json::json!(["0.3", "1.0"]));
+
+    let send_without_version = || async {
+        reqwest::Client::new()
+            .post(format!("{}/smoke/reloaded", h.gateway_base))
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"m-1","parts":[{"kind":"text","text":"hi"}]}}}"#)
+            .send()
+            .await
+            .expect("request")
+    };
+    assert_eq!(
+        send_without_version()
+            .await
+            .status(),
+        200,
+        "the stored surface accepts A2A 0.3"
+    );
+
+    let surface_id = created["surface_id"]
+        .as_str()
+        .unwrap();
+    let stored_path = std::fs::read_dir(&surfaces_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| std::fs::read_to_string(path).is_ok_and(|content| content.contains(surface_id)))
+        .expect("stored surface file");
+    let mut stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
+    stored["access_point"]
+        .as_object_mut()
+        .unwrap()
+        .remove("a2a");
+    std::fs::write(&stored_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+    std::fs::create_dir_all(&settings_dir).unwrap();
+    std::fs::write(
+        settings_dir.join(crate::storage::settings_store::SETTINGS_FILE_NAME),
+        r#"{"feature_flags":{"a2a_legacy_compatibility":false}}"#,
+    )
+    .unwrap();
+
+    let reload = admin
+        .post(format!("{}/api/v1/config/reload", h.gateway_base))
+        .send()
+        .await
+        .expect("reload");
+    assert!(reload.status().is_success(), "reload: {}", reload.status());
+
+    let refused = send_without_version().await;
+    assert_eq!(refused.status(), 400, "the carried A2A 1.0-only settings are served");
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32009, "{body}");
+    assert_eq!(body["error"]["data"]["supported"], serde_json::json!(["1.0"]), "{body}");
 }

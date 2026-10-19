@@ -387,16 +387,15 @@ async fn async_main() -> Result<()> {
     // before this point consider using println
     let _guard: Option<WorkerGuard> = init_logging(&config, &bootstrap_config, otlp_auth_header)?;
 
-    if bootstrap_config
-        .a2a
-        .validate_messages
-        .is_some()
-    {
-        warn!(
-            "[a2a] validate_messages is deprecated: validation is set per A2A surface (access_point.a2a.validation). \
-             It is only applied to A2A surfaces loaded without their own settings, as \"off\" when false and \
-             \"envelope\" otherwise. Remove it from the config file once every surface has its own settings."
-        );
+    let retired_a2a_switches =
+        surfaces::RetiredA2aSwitches::read(&bootstrap_config).unwrap_or(surfaces::RetiredA2aSwitches {
+            validate_messages: bootstrap_config
+                .a2a
+                .validate_messages,
+            legacy_compatibility: None,
+        });
+    for warning in retired_a2a_switches.startup_warnings(&bootstrap_config.channel_config_source) {
+        warn!("{warning}");
     }
 
     // Load resource-limit configuration into the process-global. Placed after

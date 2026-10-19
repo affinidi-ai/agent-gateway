@@ -128,11 +128,50 @@ impl RetiredA2aSwitches {
         })
     }
 
-    /// The settings a surface without its own takes: A2A 1.0 only when the flag
-    /// turned 0.3 off, and no validation when `[a2a] validate_messages` was
-    /// `false`. Otherwise `envelope` validation, never `full`, although `true`
-    /// (the old default) also checked the request shape: that check can refuse
-    /// lenient callers, so it is now opt-in per surface.
+    /// The startup warnings about the retired switches. With the `local`
+    /// configuration source they give surfaces without settings their settings
+    /// (see [`carry_over_a2a_settings`]); any other source serves such surfaces
+    /// with the defaults, so a switch that would have changed them is reported
+    /// as not applied.
+    pub fn startup_warnings(
+        &self,
+        config_source: &str,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let local = config_source == "local";
+        if self
+            .validate_messages
+            .is_some()
+        {
+            warnings.push(if local {
+                "[a2a] validate_messages is deprecated: validation is set per A2A surface \
+                 (access_point.a2a.validation). It is only applied to A2A surfaces loaded without their own \
+                 settings, as \"off\" when false and \"envelope\" otherwise. Remove it from the config file once \
+                 every surface has its own settings."
+                    .to_string()
+            } else {
+                format!(
+                    "[a2a] validate_messages is deprecated and is not applied with the {config_source:?} \
+                     configuration source: A2A surfaces from it without their own settings are served with \
+                     validation=envelope. Set access_point.a2a.validation on each surface instead."
+                )
+            });
+        }
+        if !local && self.legacy_compatibility == Some(false) {
+            warnings.push(format!(
+                "The retired a2a_legacy_compatibility setting is off but is not applied with the {config_source:?} \
+                 configuration source: A2A surfaces from it without their own settings accept A2A 0.3 and 1.0. Set \
+                 access_point.a2a.accepted_versions on each surface instead."
+            ));
+        }
+        warnings
+    }
+
+    /// The settings a surface without its own takes from the retired switches:
+    /// A2A 1.0 only when the flag is off, and both versions otherwise;
+    /// validation `off` when `[a2a] validate_messages` is `false`, and
+    /// `envelope` otherwise. It is never `full`: the request-shape check can
+    /// refuse lenient callers, so a surface opts into it.
     pub fn settings(&self) -> A2aAccessPointSettings {
         let defaults = A2aAccessPointSettings::default();
         A2aAccessPointSettings {
@@ -193,13 +232,9 @@ fn names_losing_request_shape_check<'a>(
         .collect()
 }
 
-/// The warning naming the surfaces that lost the request-shape check, or
-/// `None` when none did. At most [`MAX_NAMED_SURFACES`] names are listed, each
-/// quoted and escaped.
-fn request_shape_check_warning(names: &[&str]) -> Option<String> {
-    if names.is_empty() {
-        return None;
-    }
+/// Surface names for a log line: at most [`MAX_NAMED_SURFACES`], each quoted
+/// and escaped, then a count of the rest.
+fn named_list(names: &[&str]) -> String {
     let mut list = names
         .iter()
         .take(MAX_NAMED_SURFACES)
@@ -209,6 +244,97 @@ fn request_shape_check_warning(names: &[&str]) -> Option<String> {
     if names.len() > MAX_NAMED_SURFACES {
         list.push_str(&format!(" and {} more", names.len() - MAX_NAMED_SURFACES));
     }
+    list
+}
+
+/// Whether `surface` sends over the fabric: its Target, or a variant's, is
+/// `fabric://`.
+fn has_fabric_target(surface: &AgentSurface) -> bool {
+    let fabric = |surface: &AgentSurface| {
+        surface
+            .target
+            .endpoint
+            .starts_with("fabric://")
+    };
+    fabric(surface)
+        || surface
+            .variants
+            .iter()
+            .any(|variant| {
+                surface
+                    .resolve_variant(Some(&variant.alias))
+                    .is_ok_and(|resolved| fabric(&resolved))
+            })
+}
+
+/// The names of the surfaces being given settings whose Targets are all A2A
+/// proxies, when `[a2a] validate_messages` is `false`: they are given
+/// `envelope`, which an A2A-proxy Target always checks, rather than `off`.
+fn names_given_envelope_despite_validation_off<'a>(
+    retired: &RetiredA2aSwitches,
+    carried: impl IntoIterator<Item = &'a AgentSurface>,
+) -> Vec<&'a str> {
+    if retired.validate_messages != Some(false) {
+        return Vec::new();
+    }
+    carried
+        .into_iter()
+        .filter(|surface| !surface.a2a_validation_applies())
+        .map(|surface| surface.name.as_str())
+        .collect()
+}
+
+/// The warning naming A2A-proxy surfaces given `envelope` although
+/// `[a2a] validate_messages` is `false`, or `None` when there are none.
+fn envelope_despite_validation_off_warning(names: &[&str]) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        format!(
+            "{} A2A surface(s) whose Targets are all A2A proxies were given validation=envelope although [a2a] \
+             validate_messages is false, because an A2A proxy Target always checks the JSON-RPC envelope: {}. \
+             Their callers must send a single, well-formed JSON-RPC 2.0 request",
+            names.len(),
+            named_list(names)
+        )
+    })
+}
+
+/// The warning naming `fabric://` surfaces given settings, which this gateway
+/// applies before sending a request over the fabric, or `None` when there are none.
+fn fabric_settings_warning(
+    names: &[&str],
+    settings: &A2aAccessPointSettings,
+) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        let refused = if settings
+            .validation
+            .checks_envelope()
+        {
+            "an A2A-Version they do not accept or an invalid JSON-RPC envelope"
+        } else {
+            "an A2A-Version they do not accept"
+        };
+        format!(
+            "{} fabric:// surface(s) apply their A2A settings on this gateway before sending a request over the \
+             fabric (accepted versions {}, validation={}): {}. A request with {refused} is refused here instead \
+             of being forwarded",
+            names.len(),
+            settings
+                .accepted_versions
+                .join(", "),
+            settings.validation.as_str(),
+            named_list(names)
+        )
+    })
+}
+
+/// The warning naming the surfaces that lost the request-shape check, or
+/// `None` when none did. At most [`MAX_NAMED_SURFACES`] names are listed, each
+/// quoted and escaped.
+fn request_shape_check_warning(names: &[&str]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let list = named_list(names);
     Some(format!(
         "{} A2A surface(s) checked the A2A request shape before ([a2a] validate_messages, on by default) and now \
          check only the JSON-RPC envelope: {list}. Set Message validation to \"Envelope + A2A fields\" \
@@ -228,24 +354,35 @@ fn request_shape_check_warning(names: &[&str]) -> Option<String> {
 /// surface has its own, a load does not touch the settings file. When it fails
 /// (the file exists but cannot be read or parsed), nothing is stored, a warning
 /// is logged, and the next load tries again; until then those surfaces are
-/// served with the defaults. A block that cannot be saved stays in memory, with
-/// a warning, and the next load tries again.
+/// served with the defaults. A block that cannot be saved is kept on the
+/// surface passed in, with a warning, and the next load tries again; startup
+/// seeds the resolved-surface cache from storage, so until then that surface is
+/// served with the defaults.
+///
+/// Each surface is read from `store` again just before its block is saved: a
+/// block an API edit stored meanwhile is kept, with the rest of that edit, and
+/// the surface passed in is replaced by the stored one.
+///
+/// Returns the ids of the surfaces that now carry settings, so a caller can
+/// refresh what it serves from.
 ///
 /// An invalid stored block (only reachable by editing storage by hand) is not
 /// refused: the surface keeps being served, accepting both versions when its
 /// version list is unusable, and the warning says so.
 ///
-/// Surfaces given settings that had the request-shape check before, which they
-/// lose as `envelope`, are named in one warning (see
-/// [`request_shape_check_warning`]); since they are stored with settings, it
-/// is logged once, on the first load after the upgrade.
+/// Warnings name the surfaces whose behaviour the carried settings change: those
+/// that lose the request-shape check ([`request_shape_check_warning`]), A2A-proxy
+/// surfaces given `envelope` although `validate_messages` is `false`, and
+/// `fabric://` surfaces, which now apply their settings before dispatch. Since
+/// those surfaces are stored with settings, each warning is logged once, on the
+/// first load after the upgrade.
 ///
 /// Called from the same load paths as [`strip_unsupported_header_metadata_mappings`].
 pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
     store: &S,
     surfaces: &mut [AgentSurface],
     retired: impl FnOnce() -> Result<RetiredA2aSwitches, String>,
-) {
+) -> Vec<String> {
     let mut needing = Vec::new();
     for (index, surface) in surfaces.iter().enumerate() {
         if !surface.uses_a2a_settings() {
@@ -272,7 +409,7 @@ pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
         }
     }
     if needing.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let retired = match retired() {
@@ -284,12 +421,26 @@ pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
                  a later load",
                 needing.len()
             );
-            return;
+            return Vec::new();
         }
     };
     let carried = retired.settings();
+    let mut given = Vec::new();
+    let mut carried_indices = Vec::new();
     for index in &needing {
         let surface = &mut surfaces[*index];
+        if let Ok(Some(stored)) = store
+            .get(&surface.surface_id)
+            .await
+            && stored
+                .access_point
+                .a2a
+                .is_some()
+        {
+            *surface = stored;
+            given.push(surface.surface_id.clone());
+            continue;
+        }
         let mut settings = carried.clone();
         if !surface.a2a_validation_applies() {
             settings.validation = A2aValidation::Envelope;
@@ -300,14 +451,34 @@ pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
                 surface = %surface.name,
                 surface_id = %surface.surface_id,
                 error = %error,
-                "Could not store the carried-over A2A settings; they apply in memory and will be stored on a later \
-                 load or save"
+                "Could not store the carried-over A2A settings; they will be stored on a later load or save"
             );
         }
+        given.push(surface.surface_id.clone());
+        carried_indices.push(*index);
     }
+    if carried_indices.is_empty() {
+        return given;
+    }
+    let proxy_envelope = if carried.validation == A2aValidation::Envelope {
+        0
+    } else {
+        carried_indices
+            .iter()
+            .filter(|index| !surfaces[**index].a2a_validation_applies())
+            .count()
+    };
+    let overridden = if proxy_envelope > 0 {
+        format!(
+            "; {proxy_envelope} of them, whose Targets are all A2A proxies, were given validation=envelope, which an \
+             A2A proxy Target always checks"
+        )
+    } else {
+        String::new()
+    };
     info!(
-        "Gave A2A settings to {} A2A surface(s) that had none: accepted versions {}, validation={}",
-        needing.len(),
+        "Gave A2A settings to {} A2A surface(s) that had none: accepted versions {}, validation={}{overridden}",
+        carried_indices.len(),
         carried
             .accepted_versions
             .join(", "),
@@ -317,18 +488,32 @@ pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
         warn!(
             "The a2a_legacy_compatibility setting is retired. It was off, so {} A2A surface(s) were given A2A 1.0 \
              only; accepted A2A versions are now set per surface",
-            needing.len()
+            carried_indices.len()
         );
     }
-    let names = names_losing_request_shape_check(
-        &retired,
-        needing
+    let carried_surfaces = || {
+        carried_indices
             .iter()
-            .map(|index| &surfaces[*index]),
-    );
-    if let Some(warning) = request_shape_check_warning(&names) {
+            .map(|index| &surfaces[*index])
+    };
+    let warnings = [
+        request_shape_check_warning(&names_losing_request_shape_check(&retired, carried_surfaces())),
+        envelope_despite_validation_off_warning(&names_given_envelope_despite_validation_off(
+            &retired,
+            carried_surfaces(),
+        )),
+        fabric_settings_warning(
+            &carried_surfaces()
+                .filter(|surface| has_fabric_target(surface))
+                .map(|surface| surface.name.as_str())
+                .collect::<Vec<_>>(),
+            &carried,
+        ),
+    ];
+    for warning in warnings.into_iter().flatten() {
         warn!("{warning}");
     }
+    given
 }
 
 #[cfg(test)]
@@ -499,7 +684,7 @@ mod tests {
         assert_eq!(
             switches(None, None).settings(),
             settings(&["0.3", "1.0"], A2aValidation::Envelope),
-            "unset means both versions with envelope validation, the old default"
+            "unset means both versions with envelope validation, the defaults"
         );
         assert_eq!(
             switches(Some(true), Some(true)).settings(),
@@ -898,5 +1083,163 @@ mod tests {
         );
         let mut reloaded = vec![stored];
         carry_over_a2a_settings(&store, &mut reloaded, || panic!("a later load gives no surface settings")).await;
+    }
+
+    #[test]
+    fn a2a_proxy_surfaces_given_envelope_despite_validation_off_are_named() {
+        let surfaces = [
+            a2a_surface("proxy", "a2a-proxy://worker", None),
+            a2a_surface("url", "https://a2a.internal/a", None),
+            with_variant_target(a2a_surface("proxy-url", "a2a-proxy://worker", None), "https://a2a.internal/b"),
+        ];
+        let off = RetiredA2aSwitches {
+            validate_messages: Some(false),
+            legacy_compatibility: None,
+        };
+        let names = names_given_envelope_despite_validation_off(&off, &surfaces);
+        assert_eq!(names, vec!["proxy"], "only surfaces whose Targets are all A2A proxies");
+        assert_eq!(
+            envelope_despite_validation_off_warning(&names).unwrap(),
+            "1 A2A surface(s) whose Targets are all A2A proxies were given validation=envelope although [a2a] \
+             validate_messages is false, because an A2A proxy Target always checks the JSON-RPC envelope: \
+             \"proxy\". Their callers must send a single, well-formed JSON-RPC 2.0 request"
+        );
+        for validate_messages in [None, Some(true)] {
+            let retired = RetiredA2aSwitches {
+                validate_messages,
+                legacy_compatibility: None,
+            };
+            assert!(names_given_envelope_despite_validation_off(&retired, &surfaces).is_empty());
+        }
+        assert_eq!(envelope_despite_validation_off_warning(&[]), None);
+    }
+
+    #[test]
+    fn fabric_surfaces_given_settings_are_named_with_what_they_now_refuse() {
+        assert!(has_fabric_target(&a2a_surface("fabric", "fabric://peer/agent", None)));
+        assert!(has_fabric_target(&with_variant_target(
+            a2a_surface("url-fabric", "https://a2a.internal/a", None),
+            "fabric://peer/agent"
+        )));
+        assert!(!has_fabric_target(&a2a_surface("url", "https://a2a.internal/a", None)));
+
+        let envelope = settings(&["0.3", "1.0"], A2aValidation::Envelope);
+        assert_eq!(
+            fabric_settings_warning(&["fabric"], &envelope).unwrap(),
+            "1 fabric:// surface(s) apply their A2A settings on this gateway before sending a request over the \
+             fabric (accepted versions 0.3, 1.0, validation=envelope): \"fabric\". A request with an A2A-Version \
+             they do not accept or an invalid JSON-RPC envelope is refused here instead of being forwarded"
+        );
+        let off = settings(&["0.3", "1.0"], A2aValidation::Off);
+        assert!(
+            fabric_settings_warning(&["fabric"], &off)
+                .unwrap()
+                .contains("A request with an A2A-Version they do not accept is refused here")
+        );
+        assert_eq!(fabric_settings_warning(&[], &envelope), None);
+    }
+
+    /// A block an API edit stored while the load ran is kept, with the rest of
+    /// that edit, rather than replaced by the copy listed at the start.
+    #[tokio::test]
+    async fn a_block_stored_meanwhile_is_kept_and_the_ids_given_settings_are_returned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let edited = a2a_surface(
+            "s-edited",
+            "https://a2a.internal/edited",
+            Some(serde_json::to_value(settings(&["1.0"], A2aValidation::Full)).unwrap()),
+        );
+        store
+            .save(&edited)
+            .await
+            .unwrap();
+        let mut surfaces = vec![
+            a2a_surface("s-edited", "https://a2a.internal/listed", None),
+            a2a_surface("s-old", "https://a2a.internal/old", None),
+            mcp_surface_with_mapping("s-mcp"),
+        ];
+
+        let given = carry_over_a2a_settings(&store, &mut surfaces, || Ok(RetiredA2aSwitches::default())).await;
+
+        assert_eq!(given, vec!["s-edited".to_string(), "s-old".to_string()]);
+        assert_eq!(surfaces[0].access_point.a2a, Some(settings(&["1.0"], A2aValidation::Full)));
+        assert_eq!(surfaces[0].target.endpoint, "https://a2a.internal/edited", "the stored edit is kept whole");
+        let stored = store
+            .get("s-edited")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_point.a2a, Some(settings(&["1.0"], A2aValidation::Full)), "not overwritten");
+        assert_eq!(surfaces[1].access_point.a2a, Some(settings(&["0.3", "1.0"], A2aValidation::Envelope)));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_returned_when_every_surface_has_settings_or_the_settings_file_is_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut unreadable = vec![a2a_surface("s-old", "https://a2a.internal/a", None)];
+        assert!(
+            carry_over_a2a_settings(&store, &mut unreadable, || Err("settings.json: EOF".to_string()))
+                .await
+                .is_empty()
+        );
+        let mut own = vec![a2a_surface(
+            "s-own",
+            "https://a2a.internal/a",
+            Some(serde_json::to_value(settings(&["1.0"], A2aValidation::Envelope)).unwrap()),
+        )];
+        assert!(
+            carry_over_a2a_settings(&store, &mut own, || panic!("not read"))
+                .await
+                .is_empty()
+        );
+    }
+
+    /// With the `local` source the retired switches are carried over; any other
+    /// source serves surfaces without settings with the defaults, so a switch
+    /// that would have changed them is reported as not applied.
+    #[test]
+    fn startup_warnings_say_whether_the_retired_switches_apply() {
+        let off = RetiredA2aSwitches {
+            validate_messages: Some(false),
+            legacy_compatibility: Some(false),
+        };
+        let local = off.startup_warnings("local");
+        assert_eq!(local.len(), 1);
+        assert!(local[0].starts_with("[a2a] validate_messages is deprecated: validation is set per A2A surface"));
+
+        let dynamodb = off.startup_warnings("dynamodb");
+        assert_eq!(dynamodb.len(), 2);
+        assert!(
+            dynamodb[0].starts_with(
+                "[a2a] validate_messages is deprecated and is not applied with the \"dynamodb\" configuration source"
+            ),
+            "{}",
+            dynamodb[0]
+        );
+        assert!(
+            dynamodb[1].starts_with(
+                "The retired a2a_legacy_compatibility setting is off but is not applied with the \"dynamodb\""
+            ),
+            "{}",
+            dynamodb[1]
+        );
+
+        assert!(
+            RetiredA2aSwitches::default()
+                .startup_warnings("dynamodb")
+                .is_empty()
+        );
+        let flag_on = RetiredA2aSwitches {
+            validate_messages: None,
+            legacy_compatibility: Some(true),
+        };
+        assert!(
+            flag_on
+                .startup_warnings("dynamodb")
+                .is_empty(),
+            "a flag that changes nothing is not reported"
+        );
     }
 }

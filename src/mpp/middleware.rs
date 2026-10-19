@@ -48,20 +48,12 @@ pub fn should_require_payment(
                 return false;
             }
 
-            // As for x402: no body (a GET) is not charged; a body the filters cannot
-            // be matched against is charged rather than let through free.
-            if body_bytes.is_empty() {
-                return false;
-            }
-            let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
-                return true;
+            let (json, method) = match crate::x402::middleware::a2a_filter_input(body_bytes) {
+                crate::x402::middleware::A2aFilterInput::Empty => return false,
+                crate::x402::middleware::A2aFilterInput::Unmatchable(_) => return true,
+                crate::x402::middleware::A2aFilterInput::Method { json, method } => (json, method),
             };
-            let Some(method) = json
-                .get("method")
-                .and_then(|m| m.as_str())
-            else {
-                return true;
-            };
+            let method = method.as_str();
 
             let normalized = crate::x402::middleware::normalize_a2a_method(method);
 
@@ -176,7 +168,7 @@ pub async fn process_payment(
             let payer = cred.source.clone();
             tracing::info!(
                 channel = channel_name,
-                method = %method_str,
+                method = ?crate::a2a::clip_for_log(&method_str),
                 "[mpp] Verifying payment credential"
             );
 
@@ -196,7 +188,7 @@ pub async fn process_payment(
                                 let err_msg = "Payment settlement already consumed (replay detected)".to_string();
                                 tracing::warn!(
                                     channel = channel_name,
-                                    method = %method_str,
+                                    method = ?crate::a2a::clip_for_log(&method_str),
                                     "[mpp] Rejected replayed payment settlement"
                                 );
 
@@ -247,7 +239,7 @@ pub async fn process_payment(
                             tracing::info!(
                                 channel = channel_name,
                                 channel_id = channel_id,
-                                method = %method_str,
+                                method = ?crate::a2a::clip_for_log(&method_str),
                                 reference = %reference,
                                 "[mpp] Payment verified successfully"
                             );

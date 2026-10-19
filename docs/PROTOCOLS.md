@@ -147,7 +147,8 @@ default) or **Envelope + A2A fields**.
 
 - `"off"` lets a JSON-RPC batch, a non-string `method` and a body that is not JSON reach surface
   policy and the agent with no method that rules keyed on `input.a2a.method` could match. Only an
-  appliance-wide caller can set it: an access token with a tenant or a resource scope that sets
+  appliance-wide caller can set it: an access token with a tenant or a resource scope (a resource
+  pattern or required headers) that sets
   `"off"` on a surface that was not already `"off"` is refused with `403`, on create, `PUT`, merge
   `PATCH` and the variant routes alike. On such a request, an x402 or MPP payment with A2A method
   filters is required rather than skipped, since the filters cannot be matched. A batch that
@@ -184,18 +185,31 @@ default) or **Envelope + A2A fields**.
   over as `"full"`, although `validate_messages = true` (the old default) also checked the request
   shape: the shape check is the one that can refuse lenient callers, so it is now opt-in per surface,
   and a surface that relied on it must select `"full"`. A log line reports how many surfaces were
-  given settings, with a warning when the retired flag was off. Another warning names the surfaces
-  that had the request-shape check (a Target that is neither an A2A proxy nor `fabric://`, with
-  `validate_messages` unset or `true`) and now check only the envelope, up to 20 of them, with how to
-  restore the check. Because those surfaces are then stored with settings, it is logged once, on the
-  first load after the upgrade.
+  given settings, counting separately the A2A-proxy surfaces given `"envelope"` while the others get
+  `"off"`, with a warning when the retired flag was off. Further warnings name the surfaces whose
+  behaviour the carried settings change, up to 20 each: those that had the request-shape check (a
+  Target that is neither an A2A proxy nor `fabric://`, with `validate_messages` unset or `true`) and
+  now check only the envelope, with how to restore the check; A2A-proxy surfaces given `"envelope"`
+  while `validate_messages` is `false`, whose callers must now send a well-formed JSON-RPC request;
+  and `fabric://` surfaces, which now apply their settings before sending over the fabric. Because
+  those surfaces are then stored with settings, each warning is logged once, on the first load after
+  the upgrade.
 - The settings file is read for the retired flag only while some surface still needs a block, and
   never written. If it exists but cannot be read or parsed, no block is stored, a warning is logged,
   and the next load retries; those surfaces are served with the defaults meanwhile. A block that
-  cannot be saved applies in memory and is stored on a later load or save.
+  cannot be saved is stored on a later load or save; until then, a startup serves that surface with
+  the defaults, while a configuration reload serves the carried settings straight away. Each surface
+  is read again just before its block is stored, so a block saved through the API while a reload
+  runs is kept, with the rest of that edit.
+- With `channel_config_source = "dynamodb"` the carry-over does not run: an A2A surface without a
+  block is served with the defaults. A startup warning says when a retired switch is therefore not
+  applied (`validate_messages` set, or the flag off); set `access_point.a2a` on each surface instead.
 - Rolling back to a version from before per-surface settings needs `access_point.a2a` removed from
   every stored surface first. Those versions reject unknown Access Point fields, so they skip any
-  surface that has the block, and almost every A2A or AP2 surface has it after the first start. For
+  surface that has the block, and almost every A2A or AP2 surface has it after the first start.
+  With the gateway stopped, remove it from each surface file in the `agent_surfaces` storage
+  directory, for example
+  `for f in _storage/agent_surfaces/*.json; do jq 'del(.access_point.a2a)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done`. For
   the same reason, nodes that share surface storage (Active and Standby) must run the same version:
   upgrade them together, and set `cache_refresh_interval_secs` to `0` on the older node until it is
   upgraded, or its refresh drops the surfaces the newer node has written.
@@ -554,11 +568,10 @@ gateway does not run them again. So on a G2G hop:
 - an x402 or MPP payment with A2A method filters is checked on the receiving gateway without the
   envelope check, so a body the filters cannot match is charged there whatever the validation level.
 
-Before these checks applied to `fabric://` targets, a fabric surface forwarded every request for the
-agent to decide. Now a malformed envelope, a batch, or an `A2A-Version` the surface does not accept
-is refused on the sending gateway, as on any other A2A surface, instead of being forwarded for a
-conformant agent to refuse. A fabric surface given settings on upgrade where the retired
-`a2a_legacy_compatibility` flag was off accepts A2A 1.0 only, as other surfaces already did.
+A malformed envelope, a batch, or an `A2A-Version` a `fabric://` surface does not accept is refused
+on the sending gateway, as on any other A2A surface, rather than forwarded for a conformant agent to
+refuse. On upgrade, a fabric surface without its own settings is given them like any other surface
+(see [A2A surface settings](#a2a-surface-settings)), and a warning names it.
 
 Source authentication, gateway and surface policy, and Trust Check run on each leg.
 
