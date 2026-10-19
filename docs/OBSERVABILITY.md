@@ -361,8 +361,9 @@ Transit Point whose token carries no caller). The policy variables describe the 
 a `policy_decision` (`AUDIT_POLICY_NAME` falls back to the Rego package when the policy has no
 stored definition) and are empty for other records; see
 [`POLICY.md`](POLICY.md#versioned-policy-definitions) for which decisions carry a revision. A
-string value that is exactly `${AUDIT_RECORD}` or `${EVENT_DATA}` is embedded as a JSON object;
-inside other text it is inserted as JSON text. A Stream or Webhook integration with an empty
+string value that is exactly `${AUDIT_RECORD}` or `${EVENT_DATA}` is embedded as a JSON object
+for Webhook and Stream integrations; for Slack and Email, and inside other text, it is inserted
+as JSON text. A Stream or Webhook integration with an empty
 template sends the default event envelope, whose `data` is the record:
 
 ```json
