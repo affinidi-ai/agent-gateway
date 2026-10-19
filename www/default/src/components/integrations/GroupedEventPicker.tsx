@@ -7,8 +7,6 @@ export interface PickerEntry {
   description: string;
   group: string;
   groupLabel: string;
-  /** Shown, but neither its own toggle nor its group's changes it. */
-  disabled?: boolean;
 }
 
 interface GroupedEventPickerProps {
@@ -140,16 +138,16 @@ const GroupedEventPicker: React.FC<GroupedEventPickerProps> = ({
       )}
       {shown.length === 0 && <p className="text-muted">No events match your search.</p>}
       {groupEntries(shown).map(group => {
-        const keys = group.entries.filter(entry => !entry.disabled).map(entry => entry.key);
+        const keys = group.entries.map(entry => entry.key);
         const groupSelected = keys.filter(isSelected).length;
-        const allOn = keys.length > 0 && groupSelected === keys.length;
+        const allOn = groupSelected === keys.length;
         return (
           <fieldset key={group.group} className="mb-3">
             <GroupToggle
               id={`${testIdPrefix}-group-${group.group}`}
               checked={allOn}
               indeterminate={groupSelected > 0 && !allOn}
-              disabled={disabled || keys.length === 0}
+              disabled={disabled}
               onToggle={() => setEvents(keys, !allOn)}
               label={group.label}
             />
@@ -164,7 +162,7 @@ const GroupedEventPicker: React.FC<GroupedEventPickerProps> = ({
                       id={id}
                       data-testid={id}
                       checked={isSelected(entry.key)}
-                      disabled={disabled || entry.disabled}
+                      disabled={disabled}
                       onChange={() => toggleEvent(entry.key)}
                     />
                     <label className="custom-control-label" htmlFor={id}>

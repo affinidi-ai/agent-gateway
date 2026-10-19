@@ -10,7 +10,6 @@ import { useLimitGuard } from '../../hooks/useLimitGuard';
 import { deleteIntegration, Integration, testIntegration } from '../../integrationsApi';
 import { integrationPath, ROUTES } from '../../routes';
 import { getErrorMessage } from '../../utils/apiError';
-import { AUDIT_VIEW_NEEDED, holdsAuditEvents } from '../../utils/auditIntegrations';
 import { showToast } from '../../utils/toaster';
 import { matches, STICKY_ERROR } from './listHelpers';
 import { IntegrationDefinitions } from './useIntegrationDefinitions';
@@ -33,15 +32,11 @@ const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
   const [testingId, setTestingId] = useState<string | null>(null);
   const canEdit = hasPermission('integrations.edit');
   const canDelete = hasPermission('integrations.delete');
-  const canViewAudit = hasPermission('audit.view');
 
   const endpointOf = (integration: Integration) =>
     endpoints.find(endpoint => endpoint.id === integration.endpoint_id);
   const eventSetOf = (integration: Integration) =>
     eventSets.find(eventSet => eventSet.id === integration.event_set_id);
-  // The gateway refuses to delete an integration receiving audit events without audit.view.
-  const auditLocked = (integration: Integration) =>
-    !canViewAudit && holdsAuditEvents(eventSetOf(integration)?.events);
 
   const term = searchTerm.trim().toLowerCase();
   const shown = integrations.filter(
@@ -222,12 +217,7 @@ const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                             {canDelete && (
                               <DeleteButton
                                 onDelete={() => remove(integration)}
-                                disabled={auditLocked(integration)}
-                                title={
-                                  auditLocked(integration)
-                                    ? AUDIT_VIEW_NEEDED
-                                    : 'Delete integration'
-                                }
+                                title="Delete integration"
                                 aria-label={`Delete integration ${integration.name}`}
                                 data-testid="integration-delete-button"
                               />

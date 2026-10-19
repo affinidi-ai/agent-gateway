@@ -118,7 +118,7 @@ async function newIntegration() {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockPermissions = { 'integrations.edit': true, 'audit.view': true };
+  mockPermissions = { 'integrations.edit': true };
   mocked.getCatalog.mockResolvedValue(CATALOG);
   mocked.listEndpoints.mockResolvedValue([
     endpoint('slack', 'Ops Slack', 'slack'),
@@ -386,33 +386,41 @@ test('an integration that cannot be loaded says why', async () => {
 });
 
 describe('without audit.view', () => {
-  const AUDIT_VIEW_NEEDED = 'Audit events need the audit.view permission.';
+  const expectNoAuditGate = () => {
+    for (const id of ['integration-save-button', 'integration-test-button']) {
+      expect(screen.getByTestId(id)).toBeEnabled();
+      expect(screen.getByTestId(id)).not.toHaveAttribute('title', expect.stringMatching(/audit/i));
+    }
+    expect(screen.queryByTestId('integration-audit-view-note')).not.toBeInTheDocument();
+    expect(screen.queryByText(/audit\.view/)).not.toBeInTheDocument();
+  };
 
-  beforeEach(() => {
-    mockPermissions = { 'integrations.edit': true };
-  });
-
-  test('an audit event set cannot be saved or tested, and a gateway one can', async () => {
+  test('an audit event set is tested and saved like any other', async () => {
+    mocked.testDraftIntegration.mockResolvedValue({
+      delivered: true,
+      event_type: 'audit.policy_decision',
+    });
     await newIntegration();
     choose(/^name/i, 'SIEM');
     choose(/^endpoint/i, 'hook');
-    const save = screen.getByTestId('integration-save-button');
-    const send = screen.getByTestId('integration-test-button');
-
     choose(/^event set/i, 'governance');
-    expect(save).toBeDisabled();
-    expect(save).toHaveAttribute('title', AUDIT_VIEW_NEEDED);
-    expect(send).toBeDisabled();
-    expect(send).toHaveAttribute('title', AUDIT_VIEW_NEEDED);
-    expect(screen.getByTestId('integration-audit-view-note')).toHaveTextContent(AUDIT_VIEW_NEEDED);
+    expectNoAuditGate();
 
-    choose(/^event set/i, 'gateways');
-    expect(save).toBeEnabled();
-    expect(send).toBeEnabled();
-    expect(screen.queryByTestId('integration-audit-view-note')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('integration-test-button'));
+    await waitFor(() =>
+      expect(mocked.testDraftIntegration).toHaveBeenCalledWith(
+        expect.objectContaining({ event_set_id: 'governance' })
+      )
+    );
+    fireEvent.click(screen.getByTestId('integration-save-button'));
+    await waitFor(() =>
+      expect(mocked.createIntegration).toHaveBeenCalledWith(
+        expect.objectContaining({ event_set_id: 'governance' })
+      )
+    );
   });
 
-  test('a stored audit integration starts locked, even when moved to a gateway set', async () => {
+  test('a stored audit integration is changed like any other', async () => {
     mocked.getIntegration.mockResolvedValue({
       ...STORED,
       endpoint_id: 'hook',
@@ -421,36 +429,18 @@ describe('without audit.view', () => {
     });
     renderEditor('/integrations/i1');
     await screen.findByDisplayValue('Gateway alerts');
-    const save = screen.getByTestId('integration-save-button');
-    expect(save).toBeDisabled();
-    expect(screen.getByTestId('integration-test-button')).toBeDisabled();
+    expectNoAuditGate();
 
-    // The gateway refuses a change to an integration that receives audit events now, too.
     choose(/^event set/i, 'gateways');
-    expect(save).toBeDisabled();
-    // Submitting from a field, as Enter does, is refused too.
-    fireEvent.submit(screen.getByTestId('integration-name-input'));
-    expect(mocked.updateIntegration).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId('integration-save-button'));
+
+    await waitFor(() =>
+      expect(mocked.updateIntegration).toHaveBeenCalledWith(
+        'i1',
+        expect.objectContaining({ event_set_id: 'gateways' })
+      )
+    );
   });
-
-  test('a gateway integration is unaffected', async () => {
-    renderEditor('/integrations/i1');
-    await screen.findByDisplayValue('Gateway alerts');
-
-    expect(screen.getByTestId('integration-save-button')).toBeEnabled();
-    expect(screen.getByTestId('integration-test-button')).toBeEnabled();
-  });
-});
-
-test('with audit.view an audit event set can be saved and tested', async () => {
-  await newIntegration();
-  choose(/^name/i, 'SIEM');
-  choose(/^endpoint/i, 'hook');
-  choose(/^event set/i, 'governance');
-
-  expect(screen.getByTestId('integration-save-button')).toBeEnabled();
-  expect(screen.getByTestId('integration-test-button')).toBeEnabled();
-  expect(screen.queryByTestId('integration-audit-view-note')).not.toBeInTheDocument();
 });
 
 test('exposes the test ids ui-tests use', async () => {

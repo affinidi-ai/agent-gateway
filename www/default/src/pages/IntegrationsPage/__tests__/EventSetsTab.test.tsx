@@ -157,24 +157,13 @@ test('an event set in use cannot be deleted and names its integrations', async (
   expect(remove).toHaveAttribute('title', 'Used by Gateway alerts');
 });
 
-test('without audit.view an unused audit event set cannot be deleted', async () => {
+test('without audit.view an unused audit event set is deleted after confirmation', async () => {
   mockPermissions = { 'integrations.view': true, 'integrations.delete': true };
-  mocked.listIntegrations.mockResolvedValue([]);
-  renderPage();
-
-  const audit = within(await row('Governance')).getByRole('button', { name: /delete/i });
-  const gateways = within(await row('Gateway changes')).getByRole('button', { name: /delete/i });
-
-  expect(audit).toBeDisabled();
-  expect(audit).toHaveAttribute('title', 'Audit events need the audit.view permission.');
-  expect(gateways).toBeEnabled();
-});
-
-test('an unused event set is deleted after confirmation', async () => {
-  mockPermissions = { 'integrations.view': true, 'integrations.delete': true, 'audit.view': true };
   renderPage();
   const remove = within(await row('Governance')).getByRole('button', { name: /delete/i });
 
+  expect(remove).toBeEnabled();
+  expect(remove).toHaveAttribute('title', 'Delete event set');
   mocked.listEventSets.mockResolvedValue([eventSet()]);
   fireEvent.click(remove);
   fireEvent.click(remove);
@@ -184,7 +173,7 @@ test('an unused event set is deleted after confirmation', async () => {
 });
 
 test('a delete refused by the gateway shows why', async () => {
-  mockPermissions = { 'integrations.view': true, 'integrations.delete': true, 'audit.view': true };
+  mockPermissions = { 'integrations.view': true, 'integrations.delete': true };
   mocked.deleteEventSet.mockRejectedValue(
     new Error('The event set is used by these integrations: X (409)')
   );

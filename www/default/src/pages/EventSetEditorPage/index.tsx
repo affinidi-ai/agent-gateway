@@ -2,7 +2,6 @@ import React, { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import GroupedEventPicker, { PickerEntry } from '../../components/integrations/GroupedEventPicker';
 import { AppButton } from '../../components/shared/AppButton';
-import { usePermissions } from '../../context/PermissionsContext';
 import {
   CatalogEvent,
   createEventSet,
@@ -13,17 +12,14 @@ import {
   updateEventSet,
 } from '../../integrationsApi';
 import { getErrorMessage } from '../../utils/apiError';
-import { AUDIT_VIEW_NEEDED, holdsAuditEvents } from '../../utils/auditIntegrations';
+import { holdsAuditEvents } from '../../utils/auditIntegrations';
 import { showToast } from '../../utils/toaster';
 
 const EVENT_SETS_TAB = '/integrations?tab=event-sets';
 const AUDIT_FAMILY = 'audit';
 
-/**
- * Families as the catalog lists them; audit events split further by their audit group, and
- * shown but not pickable without `audit.view`.
- */
-const toEntry = (event: CatalogEvent, canPickAudit: boolean): PickerEntry => ({
+/** Families as the catalog lists them; audit events split further by their audit group. */
+const toEntry = (event: CatalogEvent): PickerEntry => ({
   key: event.id,
   label: event.name,
   description: event.description,
@@ -32,7 +28,6 @@ const toEntry = (event: CatalogEvent, canPickAudit: boolean): PickerEntry => ({
     event.family === AUDIT_FAMILY
       ? `${event.family_label}: ${event.group_label}`
       : event.family_label,
-  disabled: event.family === AUDIT_FAMILY && !canPickAudit,
 });
 
 /** Creates an event set, or changes a stored one. */
@@ -40,9 +35,7 @@ const EventSetEditorPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { hasPermission } = usePermissions();
-  const canPickAudit = hasPermission('audit.view');
-  const auditPreset = !id && searchParams.get('preset') === 'audit' && canPickAudit;
+  const auditPreset = !id && searchParams.get('preset') === 'audit';
 
   const [catalog, setCatalog] = useState<CatalogEvent[]>([]);
   const [stored, setStored] = useState<EventSet | null>(null);
@@ -91,9 +84,6 @@ const EventSetEditorPage: React.FC = () => {
   const known = new Set(catalog.map(event => event.id));
   const unknown = events.filter(event => !known.has(event));
   const holdsAudit = holdsAuditEvents(events);
-  // The gateway refuses to change a set that holds audit events, before or after, without
-  // audit.view.
-  const auditLocked = !canPickAudit && (holdsAudit || holdsAuditEvents(stored?.events));
 
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -161,8 +151,6 @@ const EventSetEditorPage: React.FC = () => {
               variant="primary"
               size="md"
               loading={saving}
-              disabled={auditLocked}
-              title={auditLocked ? AUDIT_VIEW_NEEDED : undefined}
               data-testid="event-set-save-button"
             >
               Save
@@ -219,14 +207,6 @@ const EventSetEditorPage: React.FC = () => {
             <p className="text-muted small">
               An enabled event is delivered for every gateway, user or surface that raises it.
             </p>
-            {!canPickAudit && (
-              <div className="alert alert-secondary small">
-                {AUDIT_VIEW_NEEDED}{' '}
-                {auditLocked
-                  ? 'This event set holds audit events, so only a user with it can change it.'
-                  : 'They are listed but cannot be picked.'}
-              </div>
-            )}
             {holdsAudit && (
               <div className="alert alert-info small">
                 Governance Audit events are delivered through the audit journal: each record is kept
@@ -256,7 +236,7 @@ const EventSetEditorPage: React.FC = () => {
               </div>
             )}
             <GroupedEventPicker
-              entries={catalog.map(event => toEntry(event, canPickAudit))}
+              entries={catalog.map(toEntry)}
               selected={events}
               onChange={setEvents}
               testIdPrefix="event-set"

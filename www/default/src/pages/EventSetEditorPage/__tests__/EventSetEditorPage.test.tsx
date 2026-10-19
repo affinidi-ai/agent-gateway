@@ -93,7 +93,7 @@ const type = (label: RegExp, value: string) =>
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockPermissions = { 'integrations.edit': true, 'audit.view': true };
+  mockPermissions = { 'integrations.edit': true };
   mocked.getCatalog.mockResolvedValue(CATALOG);
   mocked.getEventSet.mockResolvedValue(STORED);
   mocked.listIntegrations.mockResolvedValue([]);
@@ -234,42 +234,32 @@ test('events the catalog no longer lists are shown and can be removed', async ()
 });
 
 describe('without audit.view', () => {
-  beforeEach(() => {
-    mockPermissions = { 'integrations.edit': true };
-  });
-
-  test('audit events are shown but cannot be picked, and the editor says why', async () => {
+  test('audit events are picked like any other, with no audit note', async () => {
     renderEditor('/integrations/event-sets/new');
 
-    expect(await screen.findByLabelText(/policy decision/i)).toBeDisabled();
-    expect(screen.getByLabelText(/authentication failed/i)).toBeDisabled();
-    expect(screen.getByLabelText(/gateway created/i)).toBeEnabled();
-    expect(screen.getByText(/audit events need the audit\.view permission/i)).toBeInTheDocument();
+    expect(await screen.findByLabelText(/policy decision/i)).toBeEnabled();
+    expect(screen.getByLabelText(/authentication failed/i)).toBeEnabled();
+    expect(screen.getByTestId('event-set-group-audit-policy')).toBeEnabled();
+    expect(screen.queryByText(/audit\.view/)).not.toBeInTheDocument();
   });
 
-  test('the audit preset picks nothing', async () => {
-    renderEditor('/integrations/event-sets/new?preset=audit');
-
-    expect(await screen.findByLabelText(/policy decision/i)).not.toBeChecked();
-    expect(screen.getByLabelText(/^name/i)).toHaveValue('');
-  });
-
-  test('an event set holding audit events cannot be saved', async () => {
+  test('an event set holding audit events is saved like any other', async () => {
     mocked.getEventSet.mockResolvedValue({ ...STORED, events: ['audit.policy_decision'] });
     renderEditor('/integrations/event-sets/s1');
     await screen.findByDisplayValue('Gateway changes');
+    const save = screen.getByRole('button', { name: /^save/i });
 
-    expect(screen.getByRole('button', { name: /^save/i })).toBeDisabled();
-    expect(screen.getByText(/audit events need the audit\.view permission/i)).toBeInTheDocument();
-  });
+    expect(save).toBeEnabled();
+    expect(save).not.toHaveAttribute('title');
+    fireEvent.click(screen.getByLabelText(/authentication failed/i));
+    fireEvent.click(save);
 
-  test('an event set without audit events is saved as usual', async () => {
-    renderEditor('/integrations/event-sets/s1');
-    await screen.findByDisplayValue('Gateway changes');
-
-    fireEvent.click(screen.getByRole('button', { name: /^save/i }));
-
-    await waitFor(() => expect(mocked.updateEventSet).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(mocked.updateEventSet).toHaveBeenCalledWith(
+        's1',
+        expect.objectContaining({ events: ['audit.policy_decision', 'audit.auth_failed'] })
+      )
+    );
   });
 });
 
