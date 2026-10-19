@@ -260,6 +260,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finds_the_renamed_directories_beside_the_live_paths_resolved_from_the_config_file() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let expired = NOW - MIGRATED_RETENTION_DAYS * DAY - 1;
+        let cases = [
+            ("defaults", "", root.path().join("defaults/config/_storage/integrations")),
+            (
+                "keys",
+                "integrations = \"../_storage/integrations/definitions\"\nintegration_triggers = \"../_storage/integrations/triggers\"",
+                root.path().join("keys/_storage/integrations"),
+            ),
+        ];
+        for (name, storage_paths, parent) in cases {
+            let config = super::super::config_in(
+                &root
+                    .path()
+                    .join(name)
+                    .join("config"),
+                storage_paths,
+            );
+            let renamed = [
+                make(&parent, &format!("definitions.migrated-{expired}")),
+                make(&parent, &format!("triggers.migrated-{expired}")),
+            ];
+            let live = LegacyPaths::configured(&config.storage_paths);
+
+            let removed = remove_expired(&[live.definitions, live.triggers], NOW)
+                .await
+                .expect("cleans");
+
+            assert_eq!(removed.len(), 2, "{name}: {removed:?}");
+            for dir in renamed {
+                assert!(!dir.exists(), "{name}: {} was kept", dir.display());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_missing_parent_deletes_nothing() {
         let root = tempfile::tempdir().expect("temp dir");
 

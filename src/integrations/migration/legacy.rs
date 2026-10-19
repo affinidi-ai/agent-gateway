@@ -312,25 +312,69 @@ mod tests {
     }
 
     #[test]
-    fn the_live_paths_are_the_deprecated_keys_or_lives_defaults() {
-        let custom = crate::config::StoragePaths {
-            integrations: Some("/data/definitions".to_string()),
-            integration_triggers: Some("/data/triggers".to_string()),
-            connection_points: "/data/connection_points".to_string(),
-            ..crate::config::StoragePaths::default()
-        };
+    fn the_live_paths_are_the_deprecated_keys_resolved_against_the_config_files_directory() {
+        let root = tempfile::tempdir().expect("temp dir");
+
+        let custom = super::super::config_in(
+            &root
+                .path()
+                .join("custom/config"),
+            "integrations = \"../old/definitions\"\nintegration_triggers = \"/data/triggers\"\nconnection_points = \"../cp\"",
+        );
 
         assert_eq!(
-            LegacyPaths::configured(&custom),
+            LegacyPaths::configured(&custom.storage_paths),
             LegacyPaths {
-                definitions: PathBuf::from("/data/definitions"),
+                definitions: root
+                    .path()
+                    .join("custom/old/definitions"),
                 triggers: PathBuf::from("/data/triggers"),
-                connection_points: PathBuf::from("/data/connection_points"),
+                connection_points: root
+                    .path()
+                    .join("custom/cp"),
             }
         );
-        let defaults = LegacyPaths::configured(&crate::config::StoragePaths::default());
-        assert_eq!(defaults.definitions, PathBuf::from("_storage/integrations/definitions"));
-        assert_eq!(defaults.triggers, PathBuf::from("_storage/integrations/triggers"));
+        assert!(
+            custom
+                .storage_paths
+                .integrations
+                .is_some()
+                && custom
+                    .storage_paths
+                    .integration_triggers
+                    .is_some(),
+            "the deprecation warning still knows the keys were set"
+        );
+    }
+
+    #[test]
+    fn without_the_deprecated_keys_the_live_defaults_resolve_against_the_config_files_directory() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let config_dir = root
+            .path()
+            .join("config");
+
+        let defaults = super::super::config_in(&config_dir, "");
+
+        assert_eq!(
+            LegacyPaths::configured(&defaults.storage_paths),
+            LegacyPaths {
+                definitions: config_dir.join("_storage/integrations/definitions"),
+                triggers: config_dir.join("_storage/integrations/triggers"),
+                connection_points: config_dir.join("_storage/connection_points"),
+            }
+        );
+        assert_eq!(
+            (
+                defaults
+                    .storage_paths
+                    .integrations,
+                defaults
+                    .storage_paths
+                    .integration_triggers
+            ),
+            (None, None)
+        );
     }
 
     #[tokio::test]
