@@ -31,7 +31,6 @@ const CATEGORY_BADGE: Record<string, string> = {
   consent_required: 'badge-warning',
   refresh_failed: 'badge-danger',
   token_revoked: 'badge-danger',
-  pre_authorize_blocked: 'badge-danger',
 };
 
 export function categoryBadgeClass(name: string): string {
@@ -150,8 +149,6 @@ export function categoryLabel(name: string): string {
       return 'User Revoked';
     case 'token_not_found':
       return 'Not Found';
-    case 'pre_authorize_blocked':
-      return 'Pre-Auth Blocked';
     default:
       return name.replace(/_/g, ' ');
   }

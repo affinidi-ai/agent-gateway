@@ -42,10 +42,12 @@ Feature: Routing through a proxy:// MCP target
 
   Scenario: A configured tool policy denies an unlisted tool on a proxy:// MCP target
     Given the MCP surface enforces a tool policy allowing only tool "get_forecast"
+    And the VP Audit Log keeps every audit event
     When the caller invokes the MCP tool "get_weather" for city "Paris"
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32000
     And REST API "bravo" was not called
+    And the VP Audit Log's MCP tool policy decisions name the surface by its id
 
   Scenario: A configured tool policy forwards an allowed tool on a proxy:// MCP target
     Given the MCP surface enforces a tool policy allowing only tool "get_weather"
@@ -54,29 +56,28 @@ Feature: Routing through a proxy:// MCP target
     And REST API "bravo" received "GET /weather/Paris"
     And the MCP tool result matches REST API "bravo" response
 
-  Scenario: Tool calls over Legacy SSE reach the REST backend
-    When the caller invokes the MCP tool "get_weather" for city "Paris" over Legacy SSE
-    Then REST API "bravo" received "GET /weather/Paris"
-    And the MCP tool result matches REST API "bravo" response
-
-  Scenario: Calling a disabled MCP proxy over Legacy SSE returns a JSON-RPC error and does not contact the REST backend
-    Given the MCP proxy backing REST API "bravo" is disabled
-    When the caller invokes the MCP tool "get_weather" for city "Paris" over Legacy SSE
-    Then the MCP response carries a JSON-RPC error for a disabled proxy
-    And REST API "bravo" was not called
-
-  Scenario: Tool calls over Streamable HTTP reach the REST backend
-    When the caller invokes the MCP tool "get_weather" for city "Paris" over Streamable HTTP
+  Scenario Outline: Tool calls over <transport> reach the REST backend
+    When the caller invokes the MCP tool "get_weather" for city "Paris" over <transport>
     Then the response status is 200
     And REST API "bravo" received "GET /weather/Paris"
     And the MCP tool result matches REST API "bravo" response
 
-  Scenario: Calling a disabled MCP proxy over Streamable HTTP returns a JSON-RPC error and does not contact the REST backend
+    Examples:
+      | transport       |
+      | Legacy SSE      |
+      | Streamable HTTP |
+
+  Scenario Outline: Calling a disabled MCP proxy over <transport> returns a JSON-RPC error and does not contact the REST backend
     Given the MCP proxy backing REST API "bravo" is disabled
-    When the caller invokes the MCP tool "get_weather" for city "Paris" over Streamable HTTP
+    When the caller invokes the MCP tool "get_weather" for city "Paris" over <transport>
     Then the response status is 200
     And the MCP response carries a JSON-RPC error for a disabled proxy
     And REST API "bravo" was not called
+
+    Examples:
+      | transport       |
+      | Legacy SSE      |
+      | Streamable HTTP |
 
   # ── MCP tool gating on proxy:// targets ────────────────────────────────
 

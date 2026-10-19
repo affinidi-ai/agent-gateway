@@ -114,6 +114,9 @@ fn write_single_surface_config_inner(
         .collect::<Vec<_>>();
     let mut config_tree = GatewayBootstrapFixture::new(gateway_port, "api", bootstrap_surfaces, "");
     config_tree.outbound_listener_port = outbound_port;
+    if surface_config.audit_log_keeps_every_event {
+        config_tree.settings = Some(crate::bdd_support::admin_client::audit_log_keeping_every_event());
+    }
     config_tree.terms_enabled = options
         .affinidi_terms_url
         .is_some();
@@ -151,6 +154,9 @@ fn write_single_surface_config_inner(
     }
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         surface_fixture = surface_fixture.with_a2a_proxy_id(&proxy.proxy_id);
+    }
+    if let Some(requests) = surface_config.rate_limit_per_minute {
+        surface_fixture = surface_fixture.with_rate_limit(requests, 60);
     }
     if let Some(path) = &surface_config.agent_card_path {
         surface_fixture = surface_fixture.with_agent_card_path(path);

@@ -94,6 +94,7 @@ mod tests {
     use axum::body::to_bytes;
 
     use super::*;
+    use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
 
     async fn response_json(response: Response) -> JsonValue {
         let (_, body) = response.into_parts();
@@ -117,14 +118,14 @@ mod tests {
             Some(json!("request-1")),
             error_codes::UNSUPPORTED_PROTOCOL_VERSION,
             "Unsupported protocol version",
-            Some(json!({"requested": "2026-07-28", "supported": ["2024-11-05"]})),
+            Some(json!({"requested": MCP_MODERN_VERSION, "supported": [MCP_LEGACY_VERSION]})),
         );
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(response.headers()["content-type"], "application/json");
         let body = response_json(response).await;
         assert_eq!(body["id"], "request-1");
         assert_eq!(body["error"]["code"], error_codes::UNSUPPORTED_PROTOCOL_VERSION);
-        assert_eq!(body["error"]["data"]["supported"], json!(["2024-11-05"]));
+        assert_eq!(body["error"]["data"]["supported"], json!([MCP_LEGACY_VERSION]));
     }
 
     #[tokio::test]

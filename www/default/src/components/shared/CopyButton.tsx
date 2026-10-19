@@ -6,6 +6,8 @@ interface CopyButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> 
   variant?: 'link' | 'outline-primary';
   label?: string;
   copiedLabel?: string;
+  /** Called after the text is on the clipboard. */
+  onCopied?: () => void;
   onCopyError?: (error: unknown) => void;
 }
 
@@ -17,6 +19,7 @@ export const CopyButton: React.FC<CopyButtonProps> = ({
   variant = 'link',
   label,
   copiedLabel = 'Copied',
+  onCopied,
   onCopyError,
   style,
   ...rest
@@ -42,9 +45,11 @@ export const CopyButton: React.FC<CopyButtonProps> = ({
       } catch (error) {
         setCopied(false);
         onCopyError?.(error);
+        return;
       }
+      onCopied?.();
     },
-    [onCopyError, text]
+    [onCopied, onCopyError, text]
   );
 
   const buttonClasses =

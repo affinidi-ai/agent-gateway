@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn modern_top_level_metadata_without_protocol_keys_is_rejected() {
-        use crate::mcp::request_validation::{LegacySessionEvidence, McpVersionPolicy, validate_mcp_post};
+        use crate::mcp::request_validation::{LegacySessionEvidence, validate_mcp_post};
         use axum::http::HeaderMap;
         let admitted = serde_json::json!({"jsonrpc": "2.0", "id": "modern", "method": "tools/list", "params": {"_meta": {
             "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
@@ -509,10 +509,7 @@ mod tests {
                 .to_string()
                 .as_bytes(),
             LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-            ),
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )
         .unwrap();
         let context = super::McpMetadataContext::from_classification(&classification, None);
@@ -534,9 +531,7 @@ mod tests {
 
     #[test]
     fn modern_context_forces_canonical_without_changing_runtime_admission() {
-        use crate::mcp::request_validation::{
-            LEGACY_ONLY_POLICY, LegacySessionEvidence, McpVersionPolicy, validate_mcp_post,
-        };
+        use crate::mcp::request_validation::{LEGACY_ONLY_POLICY, LegacySessionEvidence, validate_mcp_post};
         use axum::http::HeaderMap;
         let body = serde_json::json!({"jsonrpc": "2.0", "id": "modern", "method": "tools/list", "params": {"_meta": {
             "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
@@ -555,10 +550,7 @@ mod tests {
             &headers,
             body.to_string().as_bytes(),
             LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-            ),
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )
         .unwrap();
         let context = super::McpMetadataContext::from_classification(

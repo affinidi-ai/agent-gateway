@@ -27,6 +27,7 @@ mod access_tokens;
 mod agents_api;
 mod ap2; // AP2 protocol (Agent-to-Agent Plus)
 mod api_keys; // API Key Provider for A2A authentication
+mod audit;
 mod auth;
 mod auth_manager;
 mod authorities; // Local record book of external authority DIDs (trust anchors)

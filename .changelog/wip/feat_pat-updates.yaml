@@ -1,30 +1,48 @@
+---
 branch: feat/pat-updates
 changes:
   added:
-    - timestamp: "2026-10-12T00:00:00.000Z"
-      title: Preset the new access token form from link query parameters
-      description: /access-tokens/new reads name, description, scope or scopes, expires_at, resource_pattern and header query parameters into the form, so an external link opens a filled-in form. The link never saves; the operator still clicks Create, and preset scopes they cannot grant block submission.
-    - timestamp: "2026-10-12T00:00:00.000Z"
-      title: Copy a permalink to the new access token form with its current settings
-      description: Create Access Token has a Copy creation link button that copies a /access-tokens/new URL carrying the configured name, description, scopes, expiry, resource pattern and headers, so the same form can be shared and reopened prefilled. The button is disabled until the configuration is valid, so only links that would pass Create are shared.
+  - timestamp: '2026-10-12T00:00:00.000Z'
+    title: Preset the new access token form from link query parameters
+    description: "/access-tokens/new reads name, description, scope or scopes, expires_at,
+      resource_pattern and header query parameters into the form, so an external link
+      opens a filled-in form. The link never saves; the operator still clicks Create,
+      and preset scopes they cannot grant block submission."
+  - timestamp: '2026-10-12T00:00:00.000Z'
+    title: Copy a permalink to the new access token form with its current settings
+    description: Create Access Token has a Copy creation link button that copies a
+      /access-tokens/new URL carrying the configured name, description, scopes, expiry,
+      resource pattern and headers, so the same form can be shared and reopened prefilled.
+      The button is disabled until the configuration is valid, so only links that
+      would pass Create are shared.
   changed:
-    - timestamp: "2026-10-12T00:00:00.000Z"
-      title: Hide a new access token's secret and offer it through Copy
-      description: The created-token page no longer renders the secret. The field shows a masked placeholder and the Copy button puts the real value on the clipboard. If copying fails, for example without clipboard access on a plain-HTTP origin, the field shows the secret so it can still be copied by hand instead of being lost.
+  - timestamp: '2026-10-12T00:00:00.000Z'
+    title: Hide a new access token's secret and offer it through Copy
+    description: The created-token page no longer renders the secret. The field shows
+      a masked placeholder and the Copy button puts the real value on the clipboard.
+      If copying fails, for example without clipboard access on a plain-HTTP origin,
+      the field shows the secret so it can still be copied by hand instead of being
+      lost.
+  - timestamp: '2026-10-12T00:00:00.000Z'
+    title: List the most used make targets in AGENTS.md
+    description: The Commands to run section now lists the everyday make targets and
+      notes that config-test prepares the certificates and keys the tests need, so
+      every agent tool sees them in the canonical AGENTS.md instead of a separate
+      per-tool file.
   fixed:
-    - timestamp: "2026-10-12T00:00:00.000Z"
-      title: Keep a new access token link and its presets across sign-in
-      description: Opening a /access-tokens/new link while signed out landed on the dashboard root after SAML login, because the return target was limited to the root and the CLI authorize path. The login page now carries the form and its re-encoded query as the return target, and the gateway's SAML return-target allowlist accepts /access-tokens/new. The form is only prefilled, never submitted.
-    - timestamp: "2026-10-12T00:00:00.000Z"
-      title: Stop offering invalid departments.* scopes for access tokens
-      description: The permissions endpoint no longer emits the legacy departments.* aliases. The token form built its scope list from that map, and creating a token with one of them failed with unknown scope because the RBAC loader normalises them to issuers.*.
+  - timestamp: '2026-10-12T00:00:00.000Z'
+    title: Keep a new access token link and its presets across sign-in
+    description: Opening a /access-tokens/new link while signed out landed on the
+      dashboard root after SAML login, because the return target was limited to the
+      root and the CLI authorize path. The login page now carries the form and its
+      re-encoded query as the return target, and the gateway's SAML return-target
+      allowlist accepts /access-tokens/new. The form is only prefilled, never submitted.
+  - timestamp: '2026-10-12T00:00:00.000Z'
+    title: Stop offering invalid departments.* scopes for access tokens
+    description: The permissions endpoint no longer emits the legacy departments.*
+      aliases. The token form built its scope list from that map, and creating a token
+      with one of them failed with unknown scope because the RBAC loader normalises
+      them to issuers.*.
   removed: []
   security: []
   breaking: []
-  internal:
-    - timestamp: "2026-10-12T00:00:00.000Z"
-      title: Test that every permissions key is an accepted access token scope
-      description: A unit test checks that each key the permissions endpoint returns, which the token form offers as a scope, exists in the RBAC permission map that token creation validates against, so an alias like departments.* cannot reappear.
-    - timestamp: "2026-10-12T00:00:00.000Z"
-      title: List the most used make targets in AGENTS.md
-      description: The Commands to run section now lists the everyday make targets and notes that config-test prepares the certificates and keys the tests need, so every agent tool sees them in the canonical AGENTS.md instead of a separate per-tool file.

@@ -138,22 +138,80 @@ match, or Terms the token owner has not accepted.
 
 ## Governance audit forwarding
 
-Every record the VP Audit Log appends to `delegation-audit.jsonl` is also handed to the
-Governance Audit integrations: integrations in the `audit` category. Forwarding happens in the
-audit writer after the append succeeds, so an integration receives exactly the records the log
-holds, including the signed VP stamped on each record of a proxied request. A record counts as
-appended once the write is flushed; a record the log could not append or flush is not
-forwarded.
+Governance audit records go to **sinks**: the VP Audit Log (`delegation-audit.jsonl`, read by
+`/v1/audit`) and each Governance Audit integration (category `audit`). Every sink selects the
+audit events it wants, and the selections are independent: an integration can receive an event
+the VP Audit Log does not keep, and the reverse. Nothing is selected on a fresh install, and a
+record nobody selects is never built.
+
+**Selection.** The VP Audit Log keeps the events in the settings field `audit_events` while
+`audit_enabled` is on (Settings › VP Audit); turning it off pauses the log without losing the
+selection. Each Governance Audit integration receives the events in its own `audit_events` list;
+an empty list receives nothing. Both take event names from the audit event catalog
+(`src/audit/catalog.rs`), for example `policy_decision`, `auth_failed`, `token_injected`; an
+unknown name is rejected (400). An integration update that leaves `audit_events` out keeps the
+integration's current list. `GET /v1/settings/audit-events` lists the catalog in order, each entry
+with its `event` name, `label`, `description`, `group` and `group_label`; the dashboard builds its
+event pickers from it. The catalog is also listed in the category's
+`metadata.event_types` as `audit.<event>` with the event's `group`.
+
+**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
+Reasons are fixed codes; no record carries a credential, token or validator message.
+
+- `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
+  `mtls` or `mcp_resource_token`. `reason` is `missing_credential`, `invalid_credential`,
+  `insufficient_scope`, `config_not_found`, `internal`, `setup_failed` or `unavailable` (no MCP
+  resource authorization context). `blocking` is false when the failure was handed to policy
+  (`input.source_auth.method == "failed"`) instead of refusing the request. `client_ip` is the
+  resolved client address (forwarded headers only from `client_ip.trusted_proxies`); absent on
+  the fabric path, where the caller connected to the sending gateway.
+- `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
+  rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
+  stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
+  when there is one; the surface limit also sends it as `Retry-After` in whole seconds.
+- `request_rejected`: the Access Point refused the request before or while forwarding it.
+  `http_status` is what the caller received and `rpc_error_code` the JSON-RPC error code, when
+  the refusal was one; legacy MCP refuses a malformed request with HTTP 200 and a JSON-RPC error,
+  so read the two together. `stage` and `reason`:
+  - `routing`: `no_route` (no surface matches; recorded against surface `unknown`, with no trace
+    id on the direct path), `unknown_variant`, `variant_disabled`.
+  - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
+    reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
+    revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
+    `mcp_admission` (MCP transport rules: Origin, header size, mirrored method or protocol
+    headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
+    extension rules, and an inbound identity that is missing or invalid),
+    `consent_identity_required` (credential delegation for an anonymous caller).
+  - `forward`: `ssrf_blocked` (egress policy refuses the target address).
+
+  Requests answered before any gateway handler runs (a path under no configured route) and
+  gateway faults (a misconfigured default variant, a failed egress check task) are not recorded.
+- `identity_binding_verified` and `identity_binding_failed`: the outcome of checking the identity
+  presentation (identity binding VP) a request carries, recorded wherever the gateway checks one:
+  A2A requests on the direct path, MCP requests at admission, Transit Point MCP requests, and, on
+  the fabric receive path, when a surface policy relies on the presentation. These record that a
+  received presentation was checked; `vp_injected` records the gateway creating one.
+  - `identity_binding_verified`: the presentation verified and a trust anchor vouches for its
+    issuer. Carries `agent_did`, `issuer_gateway` and the caller-context `assurance`.
+  - `identity_binding_failed`: `outcome` is `absent` (no presentation was sent), `invalid` (it
+    failed verification, including an issuer the receiving connection does not trust) or
+    `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).
+    `error_detail` is a short diagnostic and never carries the presentation itself.
+
+**Volume.** Request events are unbounded by design: each is recorded once per request, with no
+aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
+the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,
+so an unauthenticated or unroutable client produces one record per request it sends
+(unroutable ones against surface `unknown`). Selecting these events for an Email or Slack
+integration sends one message per record. They also count towards the journal size and its
+1 GiB backlog cap (see _Backlog_ below), so a flood can make a slow sink skip records.
 
 **Recipients.** Every integration with category `audit`, status `active` and no tenant owner,
 whatever its type. Every record is one delivery, so Email and Slack send one message per record;
 Stream (Kafka, Kinesis, Pulsar or Redis Streams) and Webhook suit busy appliances. The records
 hold administrator-only evidence: the caller's email and name, request details and the signed VP
 leave the appliance with each record, so point audit integrations only at destinations cleared
-for that data. There is no per-integration event filter: each recipient gets every record, and
-`EVENT_TYPE` (`audit.<category>`) lets the consumer filter. The offered event types are listed
-in the category's `metadata.event_types`, one per audit record category (`audit.policy_decision`,
-`audit.trust_check`, `audit.vp_injected`, `audit.payment`, …).
+for that data.
 
 **Access.** The records carry administrator-only evidence (caller context and VP JWTs), so
 Governance Audit integrations share the `audit.view` permission of `/v1/audit`, on top of the
@@ -175,20 +233,125 @@ Governance Audit integrations share the `audit.view` permission of `/v1/audit`, 
   user, identity, surface, x402, MPP) refuses one, so values those triggers carry, some of them
   caller-supplied, never reach the audit stream.
 
-**Delivery.** `forward` never blocks the writer. A dispatcher task keeps the recipient list,
-reloaded once it is 30 seconds old (so manual `_storage/` edits are picked up) and straight
-after any integration is saved or deleted through the API, and gives each recipient its own
-bounded queue (1024 records) drained by its own task. A slow
-or unreachable destination therefore delays only itself; records arrive at each destination in
-the order the log wrote them. Each delivery re-checks that the integration is still a recipient
-and uses the integration retry policy, which retries only transient failures (connect, timeout
-or send errors, HTTP 429 and 5xx) and fails a 4xx at once. When a queue (or the 4096-record
-intake) is full the record is skipped for that destination; when a recipient stops receiving
-records, what is still queued for it is discarded. Outcomes are counted in
-`agent_gateway_audit_forward_total{result="delivered"|"failed"|"dropped", integration_id}`
-(`integration_id` is empty for an intake drop), and drops and delivery failures are each
-logged at most every 10 seconds with the number held back. Delivery is best-effort: the VP
-Audit Log remains the source of truth, and forwarding is not replayed after a restart.
+**Delivery.** No record is lost by the gateway except in the counted cases below.
+
+- *Producing.* The producer (`src/audit/producer.rs`) is the only place a record is finalised.
+  It checks the selections first (one atomic read), gives the record an `event_id` (UUID v4),
+  addresses it to the sinks that select its event at that moment, and hands it to the journal
+  without waiting. Records a proxied request produces while credential delegation runs are held
+  until the request's identity VP is minted, then stamped with it; any still held when the
+  request ends, on any path, are submitted without a VP. A selected record produced while the
+  pipeline is not running is dropped and counted in
+  `agent_gateway_audit_records_lost_total{reason="pipeline_not_running"}`, and one handed to a
+  journal writer that has stopped in `reason="journal_closed"`.
+- *Journal.* Every record is appended to the journal (`{log_directory}/journal/`, segment
+  files named by their first sequence number) by a dedicated thread that writes in batches of up
+  to 256 records or 5 ms and syncs each batch to disk before any sink may read it. A crash can
+  lose at most the last unsynced batch. If the journal cannot be written the writer retries with
+  backoff while holding up to 10,000 records in memory; beyond that the oldest are discarded and
+  counted in `agent_gateway_audit_records_lost_total{reason="journal_write"}`. A failed batch
+  is cut off again; if that fails too, the segment is re-read before the next batch, as on start.
+  When the pipeline stops before the writer has written records it was handed, the writer stops
+  between batches or during its backoff and discards them, counted in
+  `agent_gateway_audit_records_lost_total{reason="aborted"}`.
+  The journal directory is owner-only (`0700`) and its files `0600`.
+- *One writer.* Only an Active node runs the pipeline (see
+  [Server mode](CONFIGURATION_RELOAD.md#server-mode)); a Standby node keeps no audit records.
+  On stepping down a node stops taking records, gives the writer up to 5 s to journal what it
+  was handed, then cancels the writer, the dispatcher and every reader: a delivery in flight is
+  dropped, no cursor is saved after that, and records still unwritten are counted with
+  `reason="aborted"`. The journal lock is released last, once all of them have stopped. On
+  becoming Active it re-opens the journal and cursors from disk and continues after
+  the last record the previous Active node wrote. Before the pipeline starts, on start-up or on
+  becoming Active, the sinks are built from the current settings and integrations, so delivery
+  never starts from sinks that were never built or are stale; while the integrations cannot be
+  listed the pipeline does not start and is tried again every 5 s. A node becoming Active
+  first re-reads the dashboard settings (`settings.json`, which hold the VP Audit Log
+  selection) from disk and empties its integration cache, so the sinks it builds and every
+  delivery follow the settings and integrations the previous Active node left, not those this
+  node loaded before (see [Server mode](CONFIGURATION_RELOAD.md#server-mode)). The node admits
+  traffic after one start attempt; a refused start keeps being retried in the background. The
+  writer holds an exclusive lock on `journal/journal.lock`, so a second process sharing the
+  directory cannot write to it; a node that becomes Active while another still holds the lock
+  tries again every 5 s. Stepping down ends these retries, and the sink rebuild retries below,
+  along with the pipeline.
+- *Dispatch.* Each sink has its own reader and cursor (`journal/cursors.json`). A reader
+  delivers the records addressed to its sink in journal order and saves its cursor after each
+  batch, so it resumes there after a restart; a slow or unreachable destination only delays
+  itself. A failed delivery is retried with backoff (1 s up to 5 min) and holds back the records
+  after it, until the integration's drop policy or attempt limit (below) skips it; the
+  integration retry policy still applies inside each attempt. Delivery is
+  at-least-once: a record may be delivered again after a restart, so receivers should
+  deduplicate on `event_id`. The VP Audit Log does this itself for the records at the end of
+  its file.
+- *Sinks coming and going.* A new sink reads from the start of the journal; no record is
+  addressed to a sink before it exists, so it misses nothing. A Governance Audit integration
+  that is disabled, given a tenant or moved to another category is paused: it keeps its
+  configuration but receives nothing, and records addressed to it while it is paused are not
+  kept. Pausing moves its cursor to the end of the journal, letting go of the records it had not
+  received; each one addressed to it is counted in
+  `agent_gateway_audit_sink_skipped_total{sink, reason="paused"}` (unreadable lines with
+  `reason="corrupt"`) and one warning per integration gives the count. An integration paused
+  while the gateway was stopped is paused the same way when the pipeline starts. Resuming
+  continues from where the pause left it, so it receives only records produced after the pause;
+  that position never holds back journal pruning, and once pruning has deleted everything up to
+  it the integration resumes from the oldest remaining record, all of them produced after the
+  pause. Deleting an integration lets go of its records in the same way and drops its cursor.
+  The VP Audit Log is never paused. Until its reader is stopped a paused integration refuses
+  records, counted with `result="not_receiving"`, so none is reported as delivered; those
+  records are counted as paused. Records produced at the moment of pausing, before the change
+  takes effect, may still be delivered after the integration resumes, or be counted as paused.
+  The sinks are rebuilt from the settings and integrations one rebuild at a time, so an older
+  rebuild never replaces newer sinks. When the integrations cannot be listed, including before
+  integration storage is set up, the previous sinks are kept, the failure is counted in
+  `agent_gateway_audit_sink_rebuild_failed_total`, and the rebuild is retried every 5 s until it
+  succeeds or the node steps down.
+- *Backlog.* Journal segments every active cursor has passed are deleted. The journal size is
+  reported in `agent_gateway_audit_journal_bytes` and logged as a warning above 256 MiB. Above
+  1 GiB, every sink still in the oldest segment is moved past it so the segment can be deleted;
+  the records each one skips are counted in
+  `agent_gateway_audit_sink_skipped_total{sink, reason="backlog_cap"}`.
+- *Drop policy.* A Governance Audit integration may set `audit_drop_after_secs`: records older
+  than that are skipped for it, including one still being retried, and counted with
+  `reason="expired"`. Without it nothing is skipped.
+- *Attempt limit.* A Governance Audit integration may set `audit_max_attempts`: a record that
+  fails that many delivery attempts is skipped for it, so a record the destination never
+  accepts does not hold back the records after it. Every failed attempt counts, whatever the
+  error; one attempt is one hand-over to the integration, including the integration retry
+  policy inside it. The skipped record is counted with `reason="rejected"` and one warning gives
+  its seq, the attempt count and the last error. Attempts are counted while the reader stays on
+  the record, so a restart starts the count again. A changed limit applies to the record being
+  retried. Without it a record is retried until it is delivered. The limit does not tell a
+  rejected record from an outage: while the destination is down, each record is skipped once it
+  reaches the limit. With the retry backoff (1 s, doubling, up to 5 min), 10 attempts span
+  about 8.5 minutes and 20 about an hour, plus the time the attempts themselves take.
+- *Damage.* A damaged journal or cursors file never stops the pipeline. On start, everything
+  after the last readable line of the newest segment is cut off and logged with the number of
+  bytes discarded; a segment with no readable line is emptied. Files in `journal/` that are not
+  segments are logged and ignored. An unreadable `cursors.json` is renamed to
+  `cursors.json.corrupt-<unix seconds>` and every sink starts without a cursor. A reader moves
+  past a journal line that does not parse as it would past a delivered record, counts it with
+  `reason="corrupt"` and logs one warning per batch naming the segment.
+
+Records produced are counted in `agent_gateway_audit_records_produced_total{event}`;
+integration deliveries in
+`agent_gateway_audit_forward_total{result="delivered"|"failed"|"not_receiving", integration_id}`;
+records a sink skipped in
+`agent_gateway_audit_sink_skipped_total{sink, reason="backlog_cap"|"expired"|"corrupt"|"paused"|"rejected"}`.
+
+`agent_gateway_audit_pipeline_started` is 1 while the pipeline runs and 0 when it could not start
+(the journal directory cannot be created or written, for example) or the node is in Standby.
+While it is 0 on an Active node the gateway keeps serving requests but keeps and forwards no
+audit records; alert on that.
+
+*A writer stuck in I/O.* A journal writer blocked inside a write or sync (a failing disk, for
+example) cannot see that the pipeline was stopped. It keeps the journal lock, deliberately, so no
+other writer interleaves with it; ten seconds after the stop the node logs an error saying the
+writer is stuck in I/O and keeps the journal lock. The node taking over then cannot open the
+journal and keeps retrying every 5 s. Alert when `agent_gateway_audit_pipeline_started` is 0 on
+the Active node, or `agent_gateway_audit_records_lost_total{reason="pipeline_not_running"}`
+increases; if the stuck-writer error was logged on the node that stepped down, reboot that node to
+release the lock.
 
 **Payload.** Audit templates may use `EVENT_TYPE`, `TIMESTAMP` (the record's own timestamp),
 `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
@@ -226,7 +389,7 @@ publishers still open a client per record.
 **Configuration.** `config/examples/gateway.example.json` carries the canonical `audit`
 category entry. A `gateway.json` that lacks it, such as one created before the category
 existed, is given the built-in entry at load with a WARN, so an upgrade offers Governance Audit
-without an edit; an operator's own `audit` entry is kept. The records forwarded are those the VP
-Audit Log writes, so VP Auditing and the audit categories enabled in Settings › Security also
-decide what is forwarded.
-See `src/integrations/audit_integration_triggers.rs`.
+without an edit; an operator's own `audit` entry is kept. Settings saved with the older
+`audit_categories` booleans are read as the events `policy_decision`, `trust_check` and
+`vp_injected`; nothing else is selected on upgrade, and existing Governance Audit integrations
+start with no events. See `src/audit/` and `src/integrations/audit_integration_triggers.rs`.

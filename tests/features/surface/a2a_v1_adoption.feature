@@ -48,6 +48,7 @@ Feature: A2A v1.0 adoption on an A2A surface
     And managed agent "bravo" received the forwarded request
 
   Scenario: An unsupported A2A-Version is rejected before the Target is called
+    Given the VP Audit Log keeps every audit event
     When the caller sends a request to the surface with header "A2A-Version" set to "2.0" and body
       """
       {"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"user","parts":[{"kind":"text","text":"probe"}],"messageId":"bdd-message"}}}
@@ -57,6 +58,7 @@ Feature: A2A v1.0 adoption on an A2A surface
     And the response error lists supported version "1.0"
     And the response error lists supported version "0.3"
     And managed agent "bravo" was not called
+    And the VP Audit Log records a request refusal for "an unsupported protocol version"
 
   Scenario: A pre-1.0 version outside the accepted set is rejected
     When the caller sends a request to the surface with header "A2A-Version" set to "0.2" and body
@@ -104,13 +106,27 @@ Feature: A2A v1.0 adoption on an A2A surface
     Then the response status is 200
     And managed agent "bravo" received the request body {"jsonrpc":"2.0","id":1,"method":"tasks/list","params":{}}
 
-  Scenario: The authenticated extended-card method is forwarded to the Target
+  Scenario: The authenticated extended-card method is forwarded and its card rewritten
+    Given managed agent "bravo" publishes a v1.0 extended agent card with multiple interfaces
     When the caller sends a request to the surface with body
       """
       {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
       """
     Then the response status is 200
     And managed agent "bravo" received the request body {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
+    And every interface url in the extended agent card points to the gateway listen address
+    And the extended agent card lists its supported interfaces in the order "JSONRPC, GRPC"
+    And the agent card does not contain managed agent "bravo" endpoint anywhere
+
+  Scenario: An extended-card reply that is not a card is refused
+    Given managed agent "bravo" publishes a non-card extended-card result
+    When the caller sends a request to the surface with body
+      """
+      {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
+      """
+    Then the response status is 502
+    And managed agent "bravo" received the request body {"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard","params":{}}
+    And the response does not contain managed agent "bravo" endpoint
 
   # ── Agent-card media type negotiation ─────────────────────────────────────
 

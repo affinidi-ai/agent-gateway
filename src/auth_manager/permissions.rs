@@ -86,6 +86,9 @@ pub async fn get_permissions_optional(
         ("sts_clients.view", Feature::StsClientsView),
         ("sts_clients.edit", Feature::StsClientsEdit),
         ("sts_clients.delete", Feature::StsClientsDelete),
+        ("policies.view", Feature::PoliciesView),
+        ("policies.edit", Feature::PoliciesEdit),
+        ("policies.delete", Feature::PoliciesDelete),
         ("terms.view", Feature::TermsView),
         ("terms.edit", Feature::TermsEdit),
     ];
@@ -209,6 +212,9 @@ pub async fn get_permissions(
         ("sts_clients.view", Feature::StsClientsView),
         ("sts_clients.edit", Feature::StsClientsEdit),
         ("sts_clients.delete", Feature::StsClientsDelete),
+        ("policies.view", Feature::PoliciesView),
+        ("policies.edit", Feature::PoliciesEdit),
+        ("policies.delete", Feature::PoliciesDelete),
         ("terms.view", Feature::TermsView),
         ("terms.edit", Feature::TermsEdit),
     ];
@@ -456,6 +462,21 @@ mod tests {
             })
             .collect();
         assert!(unknown.is_empty(), "permissions keys rejected as access-token scopes: {unknown:?}");
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_reports_policy_features_as_grantable_scopes() {
+        let admin = permissions_for_token(UserRole::Administrator, None).await;
+        assert_eq!(admin["policies.view"], serde_json::Value::Bool(true));
+        assert_eq!(admin["policies.edit"], serde_json::Value::Bool(true));
+        assert_eq!(admin["policies.delete"], serde_json::Value::Bool(true));
+
+        let scoped = permissions_for_token(UserRole::Administrator, scopes(&["policies.edit"])).await;
+        assert_eq!(scoped["policies.edit"], serde_json::Value::Bool(true));
+        assert_eq!(scoped["policies.view"], serde_json::Value::Bool(false));
+
+        let power_user = permissions_for_token(UserRole::PowerUser, scopes(&["policies.edit"])).await;
+        assert_eq!(power_user["policies.edit"], serde_json::Value::Bool(false));
     }
 
     #[tokio::test]

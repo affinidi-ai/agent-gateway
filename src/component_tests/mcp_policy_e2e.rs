@@ -171,14 +171,14 @@ async fn modern_mcp_follows_the_direct_access_point_policy() {
     .await;
     reqwest::Client::new()
         .post(&harness.gateway_url)
-        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
         .header("mcp-method", "tools/call")
         .header("mcp-name", "echo")
         .header("accept", "application/json, text/event-stream")
         .json(&json!({
             "jsonrpc": "2.0", "id": "mode", "method": "tools/call",
             "params": {"name": "echo", "arguments": {}, "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
                 "io.modelcontextprotocol/clientCapabilities": {}
             }}
         }))
@@ -543,7 +543,7 @@ async fn mcp_http_direct_guards_opt_in_before_target_dispatch() {
     for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
         let response = client
             .request(method, &harness.gateway_url)
-            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
             .header("mcp-session-id", "attached-legacy-session")
             .send()
             .await

@@ -1257,21 +1257,28 @@ pub async fn extract_identity_binding_vp(
     verify_identity_binding_presentation(&vp_jwt, None, identity_selector, channel_name, issuer_anchor).await
 }
 
+/// Verifies the identity binding VP in an MCP request's metadata and records
+/// the outcome against `facts`, which names the surface.
 pub async fn verify_mcp_metadata_identity(
     body: &[u8],
     issuer: Option<&Arc<crate::identity::VCIssuer>>,
-    surface_id: &str,
+    facts: &crate::audit::request_events::RequestFacts<'_>,
     issuer_anchor: Option<&crate::gateways::types::PeerIssuers>,
 ) -> Result<Option<crate::surface_context::IdentityBindingContext>, String> {
     let selector = issuer
         .map(|issuer| crate::identity::IdentitySelector::new(&serde_json::json!({}), issuer.clone()).map(Arc::new))
         .transpose()
         .map_err(|error| error.to_string())?;
-    let result =
-        extract_identity_binding_vp(body, &crate::config::ChannelProtocol::Mcp, &selector, surface_id, issuer_anchor)
-            .await;
+    let result = extract_identity_binding_vp(
+        body,
+        &crate::config::ChannelProtocol::Mcp,
+        &selector,
+        facts.surface_id,
+        issuer_anchor,
+    )
+    .await;
     crate::observability::identity_binding_audit::audit_extraction(
-        surface_id,
+        facts,
         issuer_anchor.and_then(|anchor| anchor.attested.as_deref()),
         &result,
     );
@@ -1600,6 +1607,15 @@ pub fn should_forward_request_header(name: &str) -> bool {
 mod tests {
     use crate::identity::test_helpers::{SignedAgentPresentation, signed_agent_presentation};
 
+    fn test_facts() -> crate::audit::request_events::RequestFacts<'static> {
+        crate::audit::request_events::RequestFacts {
+            surface_id: "test",
+            channel_name: "test",
+            trace_id: None,
+            via_fabric: false,
+        }
+    }
+
     #[tokio::test]
     async fn mcp_signed_aliases_preserve_verification_and_reject_spoofing() {
         use crate::identity::ssi::verifier::{LocalVerifier, Verifier};
@@ -1632,7 +1648,7 @@ mod tests {
             let verified = super::verify_mcp_metadata_identity(
                 body.to_string().as_bytes(),
                 Some(&issuer),
-                "test",
+                &test_facts(),
                 Some(&peer_issuers(&issuer_did)),
             )
             .await
@@ -1652,7 +1668,7 @@ mod tests {
                 super::verify_mcp_metadata_identity(
                     body.to_string().as_bytes(),
                     Some(&issuer),
-                    "test",
+                    &test_facts(),
                     Some(&peer_issuers("did:example:untrusted")),
                 )
                 .await
@@ -1663,7 +1679,7 @@ mod tests {
                 super::verify_mcp_metadata_identity(
                     body.to_string().as_bytes(),
                     Some(&issuer),
-                    "test",
+                    &test_facts(),
                     Some(&peer_issuers(&issuer_did)),
                 )
                 .await

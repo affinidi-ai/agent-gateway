@@ -21,7 +21,7 @@ import { pathToFileURL } from 'node:url';
 const SUBSCRIPTION_ID = 'io.modelcontextprotocol/subscriptionId';
 
 // The id of a `subscriptions/listen` request, or undefined for anything else.
-function listenId(body) {
+export function listenId(body) {
   try {
     const request = JSON.parse(body);
     return request?.method === 'subscriptions/listen' ? request.id : undefined;
@@ -31,7 +31,7 @@ function listenId(body) {
 }
 
 // Restores a stringified subscription tag to the request's typed id.
-function retag(line, id) {
+export function retag(line, id) {
   let message;
   try {
     message = JSON.parse(line);
@@ -46,7 +46,9 @@ function retag(line, id) {
   return JSON.stringify(message);
 }
 
-function reframe(upstream, res, id) {
+// Re-frames a newline-delimited JSON response as SSE, one `message` event per
+// non-blank line, each retagged with the request's typed id.
+export function reframe(upstream, res, id) {
   const headers = { ...upstream.headers, 'content-type': 'text/event-stream' };
   delete headers['content-length'];
   res.writeHead(upstream.statusCode, headers);

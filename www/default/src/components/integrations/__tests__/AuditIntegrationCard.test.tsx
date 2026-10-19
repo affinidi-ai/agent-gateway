@@ -8,7 +8,7 @@ describe('AuditIntegrationCard', () => {
     const onUseTemplate = jest.fn();
     render(<AuditIntegrationCard type={type} onUseTemplate={onUseTemplate} />);
 
-    expect(screen.getByTestId('integration-audit-card')).toHaveTextContent('VP Audit Log');
+    expect(screen.getByTestId('integration-audit-card')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('integration-audit-template-button'));
     expect(onUseTemplate).toHaveBeenCalledTimes(1);
   });
@@ -18,6 +18,33 @@ describe('AuditIntegrationCard', () => {
 
     expect(screen.getByTestId('integration-audit-card')).toBeInTheDocument();
     expect(screen.queryByTestId('integration-audit-template-button')).not.toBeInTheDocument();
+  });
+
+  it('says only the selected events are sent, independently of the VP Audit Log', () => {
+    render(<AuditIntegrationCard type="stream" onUseTemplate={jest.fn()} />);
+
+    const scope = screen.getByTestId('integration-audit-scope-note');
+    expect(scope).toHaveTextContent('Only the events selected');
+    expect(scope).toHaveTextContent('whether or not the VP Audit Log keeps them');
+  });
+
+  it('explains at-least-once delivery and how a stuck destination catches up', () => {
+    render(<AuditIntegrationCard type="stream" onUseTemplate={jest.fn()} />);
+
+    const delivery = screen.getByTestId('integration-audit-delivery-note');
+    expect(delivery).toHaveTextContent('at least once');
+    expect(delivery).toHaveTextContent('event_id');
+    expect(delivery).toHaveTextContent('falls behind');
+    expect(delivery).toHaveTextContent('agent_gateway_audit_sink_skipped_total');
+  });
+
+  it('explains that pausing lets go of undelivered records and resuming sends only new ones', () => {
+    render(<AuditIntegrationCard type="stream" onUseTemplate={jest.fn()} />);
+
+    const delivery = screen.getByTestId('integration-audit-delivery-note');
+    expect(delivery).toHaveTextContent('Disabling the integration pauses it');
+    expect(delivery).toHaveTextContent('lets go of the records it has not received');
+    expect(delivery).toHaveTextContent('once re-enabled it receives only new records');
   });
 
   it('warns that caller data and the signed VP leave the appliance', () => {

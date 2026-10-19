@@ -196,6 +196,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         addressSource="outbound"
         routeFieldName="listen_path"
         bannerLabel="Listener URL"
+        bannerTestId="transit-point-listener-url"
         replaceCommit={replaceCommit}
         hasAttemptedSave={hasAttemptedSave}
       />

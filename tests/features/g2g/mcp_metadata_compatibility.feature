@@ -7,7 +7,7 @@ Feature: Canonical MCP metadata over Fabric
     And MCP server "bravo" publishes a tool catalog
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     And gateway 2 surface "alpha" uses "canonical" MCP metadata output
-    When the caller asks gateway 1 surface "charlie" for available MCP tools with top-level metadata key "tenant" value "acme"
+    When the caller asks gateway 1 MCP surface "charlie" for available tools with top-level metadata key "tenant" value "acme"
     Then the response status is 200
     And MCP server "bravo" received MCP metadata key "tenant" only in "params._meta"
     And MCP server "bravo" received MCP _meta key "tenant" with value "acme"

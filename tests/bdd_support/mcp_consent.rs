@@ -12,7 +12,7 @@ use url::Url;
 use crate::bdd_support::config::modern_consent::{
     MCP_SCOPE, PUBLIC_ORIGIN, STS_CLIENT_ID, STS_CLIENT_SECRET, access_point_resource,
 };
-use crate::bdd_support::json_rpc::build_modern_mcp_tool_call_body;
+use crate::bdd_support::json_rpc::{McpVersion, build_modern_mcp_tool_call_body};
 use crate::bdd_support::oidc::OidcProvider;
 
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -71,7 +71,7 @@ impl ConsentRequest {
 pub fn build_consent_capable_tool_call_body(
     id: Value,
     tool_name: &str,
-    protocol_version: &str,
+    protocol_version: &McpVersion,
 ) -> Value {
     let mut body = build_modern_mcp_tool_call_body(id, tool_name, protocol_version);
     body["params"]["_meta"][CLIENT_CAPABILITIES_KEY] = json!({ "elicitation": { "url": {} } });

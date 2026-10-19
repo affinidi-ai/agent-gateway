@@ -1,0 +1,15 @@
+branch: fix/mcp-conformance-node-22
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-14T12:00:00Z'
+      title: Run the MCP conformance harness on Node 22
+      description: >-
+        The pinned @modelcontextprotocol/conformance suite imports fs.globSync, which only
+        exists in Node 22 and newer, so every conformance scenario crashed on load in CI under
+        Node 20. The CI conformance job now uses Node 22, and the harness preflight, package
+        engines and docs require Node 22 or newer instead of 20.18.1.
+  removed: []
+  security: []
+  breaking: []

@@ -14,7 +14,7 @@ use affinidi_messaging_didcomm::Message as DIDCommMessage;
 
 use crate::gateways::connection_points::messages::ReceivedMessage;
 use crate::gateways::issuer_attestation::IssuerAttestationError;
-use crate::gateways::types::{Gateway, GatewayStatus, GatewayType};
+use crate::gateways::types::Gateway;
 use crate::messages::MessageType;
 
 /// How long the requester waits for the `gateway-issuer-response`.
@@ -105,15 +105,14 @@ pub fn attestation_from_issuer_response<'a>(
 /// Whether a Remote gateway record still needs the issuer exchange: only
 /// active remote gateways without a stored issuer DID.
 pub fn needs_issuer_reconciliation(gateway: &Gateway) -> bool {
-    gateway.gateway_type == GatewayType::Remote
-        && gateway.status == GatewayStatus::Active
-        && gateway.issuer_did.is_none()
+    gateway.is_active_remote_peer() && gateway.issuer_did.is_none()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gateways::connection_points::messages::MessageMetadata;
+    use crate::gateways::types::{GatewayStatus, GatewayType};
 
     const OUR_CP: &str = "did:web:us.example:connection-points:1111";
     const PEER_CP: &str = "did:web:peer.example:connection-points:2222";

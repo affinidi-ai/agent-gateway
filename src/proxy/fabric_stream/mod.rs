@@ -174,8 +174,7 @@ impl StreamRuntime {
             .request_streams
             || !connection_point.enabled
             || connection_point.id != message.connection_point_id
-            || peer.status != crate::gateways::types::GatewayStatus::Active
-            || peer.gateway_type != crate::gateways::types::GatewayType::Remote
+            || !peer.is_active_remote_peer()
             || message.from_did.as_deref() != Some(peer.did.as_str())
             || (!connection_point
                 .exposed_channels
@@ -814,8 +813,7 @@ impl<'change> Revocation<'change> {
             }
             Self::PeersOutside(gateways) => !gateways.iter().any(|peer| {
                 peer.did == binding.peer_did
-                    && peer.gateway_type == crate::gateways::types::GatewayType::Remote
-                    && peer.status == crate::gateways::types::GatewayStatus::Active
+                    && peer.is_active_remote_peer()
                     && (!inbound || peer.exposes_surface(&binding.surface_id))
             }),
             Self::ConnectionPointsOutside(connection_points) => !connection_points
@@ -836,16 +834,12 @@ impl<'change> Revocation<'change> {
         previous: &'change crate::gateways::types::Gateway,
         current: Option<&'change crate::gateways::types::Gateway>,
     ) -> Option<Self> {
-        use crate::gateways::types::{ExposureMode, GatewayStatus, GatewayType};
-        if previous.gateway_type != GatewayType::Remote || previous.status != GatewayStatus::Active {
+        use crate::gateways::types::ExposureMode;
+        if !previous.is_active_remote_peer() {
             return None;
         }
         match current {
-            Some(current)
-                if current.status == GatewayStatus::Active
-                    && current.gateway_type == GatewayType::Remote
-                    && current.did == previous.did =>
-            {
+            Some(current) if current.is_active_remote_peer() && current.did == previous.did => {
                 let narrowed = match (previous.exposure(), current.exposure()) {
                     (ExposureMode::None, _) | (_, ExposureMode::All) => false,
                     (ExposureMode::All, _) => true,
@@ -978,7 +972,7 @@ mod tests {
     async fn incoming_open_uses_current_peer_offer_and_surface() {
         use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
         use crate::gateways::types::{Gateway, GatewayType};
-        use crate::mcp::request_validation::{McpPathKind, McpVersionPolicy, runtime_policy_for};
+        use crate::mcp::request_validation::{McpPathKind, runtime_policy_for};
         use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
         use serde_json::json;
 
@@ -1143,10 +1137,7 @@ mod tests {
         .with_context("agent_surface_storage_path", json!(surfaces_path));
         listener.stamp(&mut message);
         assert!(runtime_policy_for(McpPathKind::FabricReceive).supports_modern(crate::mcp::MCP_MODERN_VERSION));
-        let versions = McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let incoming = runtime
             .prepare_incoming_with_versions(&message, &connection, &peer, versions)
             .await

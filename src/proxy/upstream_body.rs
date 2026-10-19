@@ -32,6 +32,10 @@ impl UpstreamBodyLimits {
             total: Duration::from_secs(request_secs),
         }
     }
+
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

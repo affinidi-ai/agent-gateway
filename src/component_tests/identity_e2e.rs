@@ -788,6 +788,91 @@ async fn inbound_agent_card_has_credential_extension() {
     assert!(did.starts_with("did:"), "did should start with 'did:', got: {did}");
 }
 
+/// Inbound extended agent card: a `GetExtendedAgentCard` JSON-RPC result gets
+/// the same identity treatment as the public card — `agent-identity/v1` is
+/// replaced by `agent-identity-credential/v1` and the endpoint URL is rewritten.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_extended_agent_card_has_credential_extension() {
+    //
+    // Given — the protected agent returns an extended card as a JSON-RPC result
+    //
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "name": "test-agent",
+            "version": "1.0.0",
+            "supportedInterfaces": [
+                {"url": "http://backend.internal/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}
+            ],
+            "capabilities": {
+                "extensions": [
+                    {
+                        "uri": AGENT_IDENTITY_URI,
+                        "params": {
+                            "softwareInfo": { "name": "backend-agent", "version": "2.0" },
+                            "cloudProvider": "local"
+                        }
+                    }
+                ]
+            }
+        }
+    });
+
+    let mock = MockServer::start_with_response(serde_json::to_string(&response).unwrap()).await;
+
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![helpers::build_identity_channel()];
+    })
+    .await;
+
+    //
+    // When — a caller fetches the extended card through the gateway
+    //
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .body(json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard", "params": {}}).to_string())
+        .send()
+        .await
+        .expect("extended card request failed");
+
+    assert_eq!(resp.status(), 200, "expected 200, got {}", resp.status());
+
+    //
+    // Then — the card carries the credential extension and no backend URL
+    //
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("extended card response is not JSON");
+    let card = &body["result"];
+
+    let uris: Vec<&str> = card["capabilities"]["extensions"]
+        .as_array()
+        .expect("capabilities.extensions should be an array")
+        .iter()
+        .filter_map(|ext| {
+            ext.get("uri")
+                .and_then(|u| u.as_str())
+        })
+        .collect();
+    assert!(
+        uris.contains(&AGENT_IDENTITY_CREDENTIAL_URI),
+        "extended card extensions should contain credential URI, got: {uris:?}"
+    );
+    assert!(
+        !uris.contains(&AGENT_IDENTITY_URI),
+        "extended card extensions should NOT contain raw identity URI, got: {uris:?}"
+    );
+    assert!(
+        !body
+            .to_string()
+            .contains("backend.internal"),
+        "extended card still exposes the backend endpoint: {body}"
+    );
+}
+
 // ── Extra fields filtering ───────────────────────────────────────────────────
 
 /// Inbound A2A: fields NOT marked with `x-identity: true` in the schema must

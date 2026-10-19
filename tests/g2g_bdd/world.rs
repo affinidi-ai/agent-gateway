@@ -16,15 +16,13 @@ use crate::bdd_support::actors::ActorRegistry;
 use crate::bdd_support::admin_client::GatewayRecord;
 use crate::bdd_support::config::fabric_surface_fixture::{SourceAuthSpec, SurfaceSpec};
 use crate::bdd_support::json_rpc::{
-    IdentityBindingProof, build_a2a_request_body, build_mcp_list_tools_body, build_mcp_tool_call_body,
+    IdentityBindingProof, McpVersion, build_a2a_request_body, build_mcp_list_tools_body, build_mcp_tool_call_body,
     build_modern_mcp_list_tools_body, modern_mcp_request_headers,
 };
 use crate::bdd_support::mcp_consent::{ConsentRequest, exchange_identity_token};
 use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::policies::build_gateway_source_did_allow_policy;
 use crate::harness::multi_gateway::{FabricRouteReadyProbe, GatewayPlan, MultiGatewayHarness};
-
-const MODERN_PROBE_VERSION: &str = "2026-07-28";
 
 /// A fabric link: `from_gw`'s `from_surface` forwards to `to_gw`'s
 /// `to_surface` over DIDComm once federation is complete.
@@ -159,8 +157,8 @@ pub(crate) fn fabric_route_probe(
         // answer only legacy MCP, which every MCP surface also carries, so
         // their routes are probed with legacy MCP.
         "mcp" if target.external_target => {
-            extra_headers.extend(modern_mcp_request_headers(MODERN_PROBE_VERSION, "tools/list"));
-            build_modern_mcp_list_tools_body(Value::from("fabric-route-probe"), MODERN_PROBE_VERSION, true)
+            extra_headers.extend(modern_mcp_request_headers(&McpVersion::Modern, "tools/list"));
+            build_modern_mcp_list_tools_body(Value::from("fabric-route-probe"), &McpVersion::Modern, true)
         }
         "mcp" => match target
             .mcp_tool_policy
@@ -292,7 +290,12 @@ pub struct G2gWorld {
     pub response_elapsed: Option<std::time::Duration>,
     pub concurrent_requests: Vec<Value>,
     pub concurrent_responses: Vec<ConcurrentResponse>,
-    pub fabric_forward_baseline: HashMap<usize, usize>,
+    /// Fabric forward requests each gateway had received before the caller's
+    /// action, keyed by gateway index; a failed read is kept for the Then that
+    /// needs it, so scenarios that never check forwards are unaffected.
+    pub fabric_forward_baseline: HashMap<usize, Result<usize, String>>,
+    /// Each gateway's Self gateway DID, read once the topology has started.
+    pub self_gateway_dids: HashMap<usize, String>,
     /// Ping outcomes keyed by `(from_gw, to_gw)`.
     pub ping_results: HashMap<(usize, usize), bool>,
     /// Remote gateway records the operator read, keyed by the gateway they
@@ -306,8 +309,8 @@ pub struct G2gWorld {
     /// Outcome of the last MCP conformance suite run.
     pub conformance_run: Option<ConformanceRun>,
     /// Requests sent over one Legacy SSE session, each with the SSE reply
-    /// that answered it.
-    pub legacy_sse_exchange: Vec<(Value, Value)>,
+    /// that answered it, if one arrived.
+    pub legacy_sse_exchange: Vec<(Value, Option<Value>)>,
     /// Mediator record ids created for negative-path mediator-selection
     /// scenarios, keyed by the Gherkin-facing mediator label (e.g. `"M1"`).
     pub named_mediators: HashMap<String, String>,
@@ -350,6 +353,7 @@ impl G2gWorld {
             concurrent_requests: Vec::new(),
             concurrent_responses: Vec::new(),
             fabric_forward_baseline: HashMap::new(),
+            self_gateway_dids: HashMap::new(),
             ping_results: HashMap::new(),
             remote_gateway_records: HashMap::new(),
             issuer_request_result: None,
@@ -489,7 +493,28 @@ impl G2gWorld {
                 .expect("opt the fabric route into delegated credentials");
         }
 
+        for gw_index in 1..=count {
+            let did = harness
+                .self_gateway_did(gw_index)
+                .await
+                .unwrap_or_else(|error| panic!("setup failed: {error:#}"));
+            self.self_gateway_dids
+                .insert(gw_index, did);
+        }
+
         self.harness = Some(harness);
+    }
+
+    /// The Self gateway DID of gateway `gw_index`, recorded when the topology started.
+    pub fn self_gateway_did(
+        &self,
+        gw_index: usize,
+    ) -> &str {
+        self.self_gateway_dids
+            .get(&gw_index)
+            .unwrap_or_else(|| {
+                panic!("no Self gateway DID recorded for gateway {gw_index}; the topology must start first")
+            })
     }
 
     async fn exchange_caller_identity_tokens(
@@ -676,10 +701,11 @@ impl G2gWorld {
 
     pub async fn remember_fabric_forward_baseline(&mut self) {
         let Some(harness) = self.harness.as_ref() else {
+            self.fabric_forward_baseline
+                .clear();
             return;
         };
-        self.fabric_forward_baseline
-            .clear();
+        let mut counts = HashMap::new();
         for gateway_index in 1..=self
             .topology
             .gateway_count
@@ -688,10 +714,10 @@ impl G2gWorld {
             let count = harness
                 .fabric_forward_request_count(gateway_index)
                 .await
-                .unwrap_or_else(|error| panic!("{error:#}"));
-            self.fabric_forward_baseline
-                .insert(gateway_index, count);
+                .map_err(|error| format!("{error:#}"));
+            counts.insert(gateway_index, count);
         }
+        self.fabric_forward_baseline = counts;
     }
 
     pub fn expects_allow_only_denial(

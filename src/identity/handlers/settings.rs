@@ -68,6 +68,35 @@ pub async fn get_settings(State(state): State<IdentityApiState>) -> Result<Json<
     Ok(Json(settings))
 }
 
+/// One selectable audit event, as the dashboard lists it.
+#[derive(Debug, Serialize)]
+pub struct AuditEventCatalogEntry {
+    /// Name stored in `audit_events` and sent to the settings and integrations APIs.
+    pub event: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub group: crate::audit::catalog::AuditEventGroup,
+    pub group_label: &'static str,
+}
+
+/// The audit events a sink can select, in catalog order, grouped as the
+/// dashboard shows them. The same names are valid for the VP Audit Log
+/// (`audit_events` in settings) and for Governance Audit integrations.
+pub async fn get_audit_event_catalog() -> Json<Vec<AuditEventCatalogEntry>> {
+    Json(
+        crate::audit::catalog::AUDIT_EVENTS
+            .iter()
+            .map(|spec| AuditEventCatalogEntry {
+                event: spec.category,
+                label: spec.name,
+                description: spec.description,
+                group: spec.group,
+                group_label: spec.group.label(),
+            })
+            .collect(),
+    )
+}
+
 /// Helper to check if the calling user has the required RBAC permission.
 /// Returns `Ok(())` if the user is authorised, or an `AppError` otherwise.
 async fn require_settings_edit(
@@ -110,7 +139,7 @@ pub struct UpdateSettingsRequest {
     /// Plaintext password — hashed with bcrypt before storing.
     pub prometheus_auth_password: Option<String>,
     pub audit_enabled: Option<bool>,
-    pub audit_categories: Option<crate::storage::settings_store::AuditCategories>,
+    pub audit_events: Option<Vec<String>>,
     /// Id that fills `${APPLIANCE_ID}`; empty leaves the variable unfilled.
     pub appliance_id: Option<String>,
 }
@@ -202,8 +231,8 @@ pub async fn update_settings(
     if let Some(v) = req.audit_enabled {
         settings.audit_enabled = v;
     }
-    if let Some(v) = req.audit_categories {
-        settings.audit_categories = v;
+    if let Some(v) = req.audit_events {
+        settings.audit_events = v;
     }
     if let Some(appliance_id) = req.appliance_id {
         settings.appliance_id = appliance_id
@@ -223,6 +252,7 @@ pub async fn update_settings(
         .save()
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save settings: {}", e)))?;
+    crate::audit::sources::rebuild_sinks().await;
 
     info!(
         "Settings updated: badge_threshold={} minutes, metrics_retention={} minutes, task_activity_window={} seconds, connections_window={} minutes, latency_window={} minutes, temp_channel_ttl={} seconds",
@@ -269,8 +299,34 @@ pub async fn reset_settings(
         .save()
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save settings: {}", e)))?;
+    crate::audit::sources::rebuild_sinks().await;
 
     info!("Settings reset to defaults");
 
     Ok(Json(default_settings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_audit_event_catalog_lists_every_event_with_its_group() {
+        let Json(catalog) = get_audit_event_catalog().await;
+
+        assert_eq!(catalog.len(), crate::audit::catalog::AUDIT_EVENTS.len());
+        for (entry, spec) in catalog
+            .iter()
+            .zip(crate::audit::catalog::AUDIT_EVENTS)
+        {
+            assert_eq!(entry.event, spec.category);
+            assert_eq!(entry.label, spec.name);
+            assert_eq!(entry.description, spec.description);
+            assert_eq!(entry.group, spec.group);
+        }
+        let policy = serde_json::to_value(&catalog[0]).unwrap();
+        assert_eq!(policy["event"], "policy_decision");
+        assert_eq!(policy["group"], "policies");
+        assert_eq!(policy["group_label"], "Policies");
+    }
 }

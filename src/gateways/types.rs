@@ -243,6 +243,16 @@ impl Gateway {
         )
     }
 
+    pub fn is_active(&self) -> bool {
+        self.status == GatewayStatus::Active
+    }
+
+    /// Whether this is an active Remote gateway, the only kind of peer that
+    /// holds Fabric streams.
+    pub fn is_active_remote_peer(&self) -> bool {
+        self.is_active() && self.gateway_type == GatewayType::Remote
+    }
+
     /// Whether this peer's exposure admits `surface_id`. The tenant rule is
     /// checked separately.
     pub fn exposes_surface(
@@ -348,6 +358,23 @@ mod tests {
         assert_eq!(gateway.exposure_mode, Some(ExposureMode::None));
         assert!(!gateway.exposes_surface("alpha"));
         assert_eq!(serde_json::to_value(&gateway).unwrap()["exposure_mode"], "none");
+    }
+
+    #[test]
+    fn only_an_active_remote_gateway_is_an_active_remote_peer() {
+        let mut remote = Gateway::new("peer".into(), String::new(), "did:web:peer.example".into(), GatewayType::Remote);
+        let own = Gateway::new("self".into(), String::new(), "did:web:self.example".into(), GatewayType::SelfGateway);
+
+        assert!(remote.is_active() && remote.is_active_remote_peer());
+        assert!(own.is_active());
+        assert!(!own.is_active_remote_peer());
+        for status in
+            [GatewayStatus::Pending, GatewayStatus::AwaitingApproval, GatewayStatus::Disabled, GatewayStatus::Failed]
+        {
+            remote.status = status.clone();
+            assert!(!remote.is_active(), "{status:?}");
+            assert!(!remote.is_active_remote_peer(), "{status:?}");
+        }
     }
 
     #[test]

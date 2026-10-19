@@ -1,0 +1,17 @@
+branch: feat/pat-policy
+changes:
+  added:
+    - timestamp: "2026-10-15T00:00:00Z"
+      title: Offer policy permissions as access token scopes
+      description: GET /v1/permissions now reports policies.view, policies.edit and policies.delete, so the access token form lists them as grantable scopes and a token's permissions response shows its real policy access. The policy-definition routes already accepted these scopes.
+  changed:
+    - timestamp: "2026-10-15T00:00:00Z"
+      title: Always show the Copy creation link button on access tokens
+      description: The access token editor now shows Copy creation link in edit mode as well as create mode, and keeps it enabled for incomplete settings, so a link to a prefilled new-token form can be shared at any time.
+    - timestamp: "2026-10-15T00:00:00Z"
+      title: Warn when a copied access token creation link has invalid settings
+      description: Copy creation link still copies, but when the resource pattern, a required header or the expiry is invalid a warning toast says the opened form will not create a token until they are fixed. Incomplete settings and scopes the operator cannot grant do not warn.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

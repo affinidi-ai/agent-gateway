@@ -23,6 +23,17 @@ pub struct Integration {
     /// Message content template (subject, body, text, etc. with ${VARIABLE} placeholders)
     pub content: JsonValue,
     pub status: String,
+    /// Audit event catalog names a Governance Audit integration receives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_events: Vec<String>,
+    /// Audit records older than this many seconds are skipped for this
+    /// integration instead of delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_drop_after_secs: Option<u64>,
+    /// An audit record this integration has failed to accept this many times
+    /// is skipped for it instead of retried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_max_attempts: Option<u32>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -89,6 +100,9 @@ impl Integration {
             configuration,
             content,
             status,
+            audit_events: Vec::new(),
+            audit_drop_after_secs: None,
+            audit_max_attempts: None,
             created_at: now.clone(),
             updated_at: now,
         }

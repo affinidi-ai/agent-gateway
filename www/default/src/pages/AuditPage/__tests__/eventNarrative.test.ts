@@ -111,7 +111,7 @@ describe('eventNarrative', () => {
   it('tones unit events semantically', () => {
     expect(eventTone(at('token_injected'))).toBe('allow');
     expect(eventTone(at('consent_required'))).toBe('warn');
-    expect(eventTone(at('pre_authorize_blocked'))).toBe('deny');
+    expect(eventTone(at('refresh_failed'))).toBe('deny');
     expect(eventTone(at('something_unknown'))).toBe('neutral');
   });
 

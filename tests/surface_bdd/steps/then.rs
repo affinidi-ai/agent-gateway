@@ -16,6 +16,7 @@ use crate::bdd_support::collaborators::{
     assert_header_value as assert_collaborator_header_value, assert_json_request_body,
     assert_request_content_type_starts_with,
 };
+use crate::bdd_support::json_rpc::McpVersion;
 
 use crate::world::{ObservedTarget, SurfaceWorld, identity_schema_has_field};
 
@@ -221,6 +222,9 @@ fn named_non_a2a_managed_agent_received_text(
     agent_name: String,
     expected_text: String,
 ) {
+    // Gherkin strings are not unescaped, so `\n` in the step text stands for a
+    // line break between text parts.
+    let expected_text = expected_text.replace("\\n", "\n");
     let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
     let requests = get_observed_target_requests(target, &agent_name);
     let activity_post = direct_line_activity_post(requests, &agent_name);
@@ -623,6 +627,132 @@ fn vp_audit_log_includes_policy_decision(world: &mut SurfaceWorld) {
     );
 }
 
+#[then("the VP Audit Log records that the request policy failed to evaluate")]
+async fn vp_audit_log_records_request_policy_evaluation_failure(world: &mut SurfaceWorld) {
+    expect_vp_audit_record(
+        world,
+        "a policy decision that could not be made because the policy failed to evaluate",
+        |event| {
+            let recorded = &event["event"]["policy_decision"];
+            recorded["decision"] == "error" && recorded["deny_reason"] == "evaluation_error"
+        },
+    )
+    .await;
+}
+
+/// The VP Audit Log once a record satisfies `matches`, or as last read when
+/// none does within the wait. Whether one matched comes first.
+async fn vp_audit_events_matching(
+    world: &mut SurfaceWorld,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> (bool, Vec<serde_json::Value>) {
+    crate::steps::when::ensure_admin_session(world).await;
+    world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .wait_for_audit_event(matches)
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log must be readable: {error:#}"))
+}
+
+async fn expect_vp_audit_record(
+    world: &mut SurfaceWorld,
+    what: &str,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) {
+    let (found, events) = vp_audit_events_matching(world, matches).await;
+    assert!(found, "expected {what}, got {events:?}");
+}
+
+/// The audit scheme of a source authentication method, as the step names it.
+fn audited_auth_scheme(auth_type: &str) -> &'static str {
+    match auth_type {
+        "JWT Bearer" => "jwt",
+        "API Key" | "API Key Provider" => "api_key",
+        other => panic!("no audited authentication scheme for source authentication '{other}'"),
+    }
+}
+
+/// The audit reason code for a source authentication failure, as the step names it.
+fn audited_auth_failure_reason(failure: &str) -> &'static str {
+    match failure {
+        "a missing credential" => "missing_credential",
+        "an invalid credential" => "invalid_credential",
+        other => panic!("no audited reason for the source authentication failure '{other}'"),
+    }
+}
+
+#[then(expr = "the VP Audit Log records a non-blocking {string} source authentication failure for {string}")]
+async fn vp_audit_log_records_non_blocking_source_auth_failure(
+    world: &mut SurfaceWorld,
+    auth_type: String,
+    failure: String,
+) {
+    let scheme = audited_auth_scheme(&auth_type);
+    let reason = audited_auth_failure_reason(&failure);
+    let what = format!("a non-blocking '{auth_type}' source authentication failure for {failure}");
+    expect_vp_audit_record(world, &what, |event| {
+        let recorded = &event["event"]["auth_failed"];
+        recorded["scheme"] == scheme && recorded["reason"] == reason && recorded["blocking"] == false
+    })
+    .await;
+}
+
+/// The audit reason code for a refused request, as the step names the refusal.
+fn audited_refusal_reason(refusal: &str) -> &'static str {
+    match refusal {
+        "a disabled surface variant" => "variant_disabled",
+        "an unsupported protocol version" => "version_unsupported",
+        "a request that fails MCP admission" => "mcp_admission",
+        "a malformed request" => "invalid_envelope",
+        "a rejected request extension" => "extension_rejected",
+        other => panic!("no audited reason for the request refusal '{other}'"),
+    }
+}
+
+#[then(expr = "the VP Audit Log records a request refusal for {string}")]
+async fn vp_audit_log_records_request_refusal(
+    world: &mut SurfaceWorld,
+    refusal: String,
+) {
+    let reason = audited_refusal_reason(&refusal);
+    let what = format!("a request refusal for {refusal}");
+    expect_vp_audit_record(world, &what, |event| event["event"]["request_rejected"]["reason"] == reason).await;
+}
+
+#[then("the VP Audit Log records the surface rate limit refusal")]
+async fn vp_audit_log_records_surface_rate_limit_refusal(world: &mut SurfaceWorld) {
+    expect_vp_audit_record(world, "a surface rate limit refusal", |event| {
+        event["event"]["rate_limited"]["scope"] == "surface"
+    })
+    .await;
+}
+
+#[then("the VP Audit Log's MCP tool policy decisions name the surface by its id")]
+async fn vp_audit_log_mcp_tool_policy_decisions_name_surface_by_id(world: &mut SurfaceWorld) {
+    let surface_name = world
+        .surface_config
+        .surface_name
+        .clone()
+        .unwrap_or_default();
+    let surface_id = crate::steps::given::tracked_surface_id(world, &surface_name);
+    let is_tool_decision = |event: &serde_json::Value| event["event"]["policy_decision"]["scope"] == "mcp_tool";
+    let (_, events) = vp_audit_events_matching(world, is_tool_decision).await;
+    let recorded: Vec<_> = events
+        .iter()
+        .filter(|event| is_tool_decision(event))
+        .map(|event| event["event"]["policy_decision"]["surface_id"].clone())
+        .collect();
+    assert!(!recorded.is_empty(), "expected an MCP tool policy decision, got {events:?}");
+    assert!(
+        recorded
+            .iter()
+            .all(|id| id == surface_id.as_str()),
+        "expected every MCP tool policy decision to carry surface id {surface_id}, got {recorded:?}"
+    );
+}
+
 #[then(expr = "the Credential Delegation Audit Log includes caller email {string}")]
 fn credential_delegation_audit_log_includes_caller_email(
     world: &mut SurfaceWorld,
@@ -810,44 +940,21 @@ async fn caller_trust_check_reported_error_code(
 }
 
 async fn assert_trust_check_error_code(
-    world: &SurfaceWorld,
+    world: &mut SurfaceWorld,
     leg: &str,
     expected_code: &str,
 ) {
-    let client = world
-        .admin_client
-        .as_ref()
-        .expect(
-            "admin client must exist before asserting Trust Check audit; add the 'trust check audit is enabled' given",
-        );
-    let mut observed: Vec<(bool, Option<String>)> = Vec::new();
-    for _ in 0..30 {
-        let response = client
-            .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/audit?limit=200", None)
-            .await
-            .expect("read VP Audit Log events from the gateway");
-        assert!(
-            (200..300).contains(&response.status),
-            "VP Audit Log read returned status {}; body {}",
-            response.status,
-            response.body
-        );
-        let events = response
-            .body
-            .get("events")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        observed = extract_trust_check_error_codes(&events, leg);
-        if observed
+    let reports_code = |event: &serde_json::Value| {
+        extract_trust_check_error_codes(std::slice::from_ref(event), leg)
             .iter()
             .any(|(_, code)| code.as_deref() == Some(expected_code))
-        {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    panic!("expected a {leg}-leg Trust Check audit event with error code {expected_code:?}; observed {observed:?}");
+    };
+    let (found, events) = vp_audit_events_matching(world, reports_code).await;
+    assert!(
+        found,
+        "expected a {leg}-leg Trust Check audit event with error code {expected_code:?}; observed {:?}",
+        extract_trust_check_error_codes(&events, leg)
+    );
 }
 
 fn extract_trust_check_error_codes(
@@ -2113,7 +2220,15 @@ fn mcp_unsupported_version_error_has_exact_versions(
     requested: String,
     supported: String,
 ) {
-    assert_mcp_unsupported_version_error(get_response_body_value(world), &requested, &supported);
+    let supported: Vec<McpVersion> = supported
+        .split(", ")
+        .map(McpVersion::from)
+        .collect();
+    assert_mcp_unsupported_version_error(
+        get_response_body_value(world),
+        &McpVersion::from(requested.as_str()),
+        &supported,
+    );
 }
 
 #[then(expr = "the MCP response tool catalog does not include a tool named {string}")]
@@ -2532,7 +2647,7 @@ fn mcp_response_carries_unknown_tool_error(world: &mut SurfaceWorld) {
     );
 }
 
-#[then(expr = "managed agent {string} received exactly {int} requests")]
+#[then(expr = "managed agent {string} received exactly {int} request(s)")]
 fn named_managed_agent_received_exactly_n_requests(
     world: &mut SurfaceWorld,
     agent_name: String,
@@ -2817,13 +2932,12 @@ fn oauth_provider_received_refresh_request(
 }
 
 #[then(expr = "the delegation audit trail contains event {string} for OAuth provider {string}")]
-fn delegation_audit_trail_contains_event(
+async fn delegation_audit_trail_contains_event(
     world: &mut SurfaceWorld,
     event: String,
     provider: String,
 ) {
-    let events = read_delegation_audit_events(world);
-    assert!(
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
         events.iter().any(|entry| {
             entry
                 .get("event")
@@ -2833,25 +2947,45 @@ fn delegation_audit_trail_contains_event(
                     .get("provider_id")
                     .and_then(|value| value.as_str())
                     == Some(provider.as_str())
-        }),
-        "expected delegation audit event '{event}' for provider '{provider}', got {events:?}"
-    );
+        })
+    })
+    .await;
+    assert!(found, "expected delegation audit event '{event}' for provider '{provider}', got {events:?}");
+}
+
+/// Audit records reach the log shortly after the request that produced them,
+/// so a check reads the log again until it holds what is expected, for up to
+/// five seconds. Returns whether `expected` held and the events last read.
+async fn eventually_delegation_audit_events(
+    world: &mut SurfaceWorld,
+    expected: impl Fn(&[serde_json::Value]) -> bool,
+) -> (bool, Vec<serde_json::Value>) {
+    let mut events = Vec::new();
+    for _ in 0..50 {
+        events = read_delegation_audit_events(world).await;
+        if expected(&events) {
+            return (true, events);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    (false, events)
 }
 
 #[then(
     expr = "the delegation audit trail contains event {string} for OAuth provider {string} on the later MCP tool call"
 )]
-fn delegation_audit_trail_contains_later_event(
+async fn delegation_audit_trail_contains_later_event(
     world: &mut SurfaceWorld,
     event: String,
     provider: String,
 ) {
-    delegation_audit_trail_contains_event(world, event, provider);
+    delegation_audit_trail_contains_event(world, event, provider).await;
 }
 
 #[then("the delegation audit trail does not expose delegated credential secrets")]
-fn delegation_audit_trail_does_not_expose_delegated_secrets(world: &mut SurfaceWorld) {
-    let text = delegation_audit_text(world);
+async fn delegation_audit_trail_does_not_expose_delegated_secrets(world: &mut SurfaceWorld) {
+    let text = serde_json::to_string(&read_delegation_audit_events(world).await)
+        .expect("delegation audit events should serialize");
     assert!(!text.contains("bdd-delegated-access-token"), "audit trail exposed delegated access token: {text}");
     assert!(!text.contains("bdd-delegated-refresh-token"), "audit trail exposed delegated refresh token: {text}");
     assert!(!text.contains("bdd-delegated-api-key"), "audit trail exposed delegated API key: {text}");
@@ -2866,85 +3000,92 @@ fn mcp_response_does_not_expose_delegated_secrets(world: &mut SurfaceWorld) {
 }
 
 #[then(expr = "the delegation audit trail identifies caller {string}")]
-fn delegation_audit_trail_identifies_caller(
+async fn delegation_audit_trail_identifies_caller(
     world: &mut SurfaceWorld,
     caller: String,
 ) {
-    let events = read_delegation_audit_events(world);
-    assert!(
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
         events.iter().any(|event| {
             event
                 .get("caller")
                 .and_then(|caller| caller.get("sub"))
                 .and_then(|sub| sub.as_str())
                 == Some(caller.as_str())
-        }),
-        "expected delegation audit trail to identify caller '{caller}', got {events:?}"
-    );
+        })
+    })
+    .await;
+    assert!(found, "expected delegation audit trail to identify caller '{caller}', got {events:?}");
 }
 
 #[then("the delegation audit trail identifies the caller Agent DID")]
-fn delegation_audit_trail_identifies_caller_agent_did(world: &mut SurfaceWorld) {
-    let events = read_delegation_audit_events(world);
-    assert!(
+async fn delegation_audit_trail_identifies_caller_agent_did(world: &mut SurfaceWorld) {
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
         events
             .iter()
-            .any(|event| event_contains_text(event, "did:")),
-        "expected delegation audit trail to identify caller Agent DID, got {events:?}"
-    );
+            .any(|event| event_contains_text(event, "did:"))
+    })
+    .await;
+    assert!(found, "expected delegation audit trail to identify caller Agent DID, got {events:?}");
 }
 
 #[then(expr = "the delegation audit trail identifies MCP tool {string}")]
-fn delegation_audit_trail_identifies_mcp_tool(
+async fn delegation_audit_trail_identifies_mcp_tool(
     world: &mut SurfaceWorld,
     tool: String,
 ) {
-    let events = read_delegation_audit_events(world);
-    assert!(
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
         events.iter().any(|event| {
             event
                 .get("mcp_tool_name")
                 .and_then(|value| value.as_str())
                 == Some(tool.as_str())
-        }),
-        "expected delegation audit trail to identify MCP tool '{tool}', got {events:?}"
-    );
+        })
+    })
+    .await;
+    assert!(found, "expected delegation audit trail to identify MCP tool '{tool}', got {events:?}");
 }
 
 #[then(expr = "the delegation audit trail contains distinct authenticated caller records for {string} and {string}")]
-fn delegation_audit_trail_contains_distinct_callers(
+async fn delegation_audit_trail_contains_distinct_callers(
     world: &mut SurfaceWorld,
     first: String,
     second: String,
 ) {
-    delegation_audit_trail_identifies_caller(world, first);
-    delegation_audit_trail_identifies_caller(world, second);
+    delegation_audit_trail_identifies_caller(world, first).await;
+    delegation_audit_trail_identifies_caller(world, second).await;
 }
 
 #[then(expr = "both audit records are bound to caller Agent identity {string}")]
-fn both_audit_records_are_bound_to_agent_identity(
+async fn both_audit_records_are_bound_to_agent_identity(
     world: &mut SurfaceWorld,
     identity: String,
 ) {
-    let events = read_delegation_audit_events(world);
-    assert!(
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
         events
             .iter()
             .filter(|event| event_contains_text(event, &identity))
             .count()
-            >= 2,
-        "expected at least two audit records bound to caller Agent identity '{identity}', got {events:?}"
-    );
+            >= 2
+    })
+    .await;
+    assert!(found, "expected at least two audit records bound to caller Agent identity '{identity}', got {events:?}");
 }
 
 #[then("both audit records identify the same caller Agent DID")]
-fn both_audit_records_identify_same_caller_agent_did(world: &mut SurfaceWorld) {
-    let events = read_delegation_audit_events(world);
+async fn both_audit_records_identify_same_caller_agent_did(world: &mut SurfaceWorld) {
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
+        events
+            .iter()
+            .filter_map(extract_holder_did_from_audit_event)
+            .count()
+            >= 2
+    })
+    .await;
+    assert!(found, "expected at least two audit records with caller Agent DIDs, got {events:?}");
     let dids = events
         .iter()
         .filter_map(extract_holder_did_from_audit_event)
         .collect::<Vec<_>>();
-    assert!(dids.len() >= 2, "expected at least two audit records with caller Agent DIDs, got {events:?}");
     assert!(
         dids.iter()
             .all(|did| did == &dids[0]),
@@ -3003,12 +3144,8 @@ fn oauth_provider_requests(world: &SurfaceWorld) -> Vec<crate::bdd_support::mock
         .unwrap_or_default()
 }
 
-fn delegation_audit_text(world: &mut SurfaceWorld) -> String {
-    serde_json::to_string(&read_delegation_audit_events(world)).expect("delegation audit events should serialize")
-}
-
-fn read_delegation_audit_events(world: &mut SurfaceWorld) -> Vec<serde_json::Value> {
-    refresh_delegation_audit_trail(world);
+async fn read_delegation_audit_events(world: &mut SurfaceWorld) -> Vec<serde_json::Value> {
+    crate::steps::when::read_delegation_audit_trail(world).await;
     get_admin_response(world)
         .body
         .get("events")
@@ -3017,12 +3154,6 @@ fn read_delegation_audit_events(world: &mut SurfaceWorld) -> Vec<serde_json::Val
         .unwrap_or_else(|| {
             panic!("admin delegation audit response should include events, got {}", get_admin_response(world).body)
         })
-}
-
-fn refresh_delegation_audit_trail(world: &mut SurfaceWorld) {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(crate::steps::when::read_delegation_audit_trail(world));
-    });
 }
 
 fn consent_entry<'a>(
@@ -3391,11 +3522,52 @@ fn agent_card_excludes_managed_agent_endpoint_anywhere(
     }
 }
 
+#[then(expr = "the response does not contain managed agent {string} endpoint")]
+fn response_excludes_managed_agent_endpoint(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    agent_card_excludes_managed_agent_endpoint_anywhere(world, agent_name);
+}
+
 /// Host the managed-agent card fixtures publish as their own endpoint.
 const PUBLISHED_MANAGED_AGENT_HOST: &str = "managed-agent.local";
 
 #[then(expr = "every interface url in the agent card points to the gateway listen address")]
 fn agent_card_interface_urls_point_to_gateway(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world).clone();
+    assert_interface_urls_point_to_gateway(world, &body);
+}
+
+#[then(expr = "every interface url in the extended agent card points to the gateway listen address")]
+fn extended_agent_card_interface_urls_point_to_gateway(world: &mut SurfaceWorld) {
+    let card = get_response_body_value(world)["result"].clone();
+    assert_interface_urls_point_to_gateway(world, &card);
+}
+
+#[then(expr = "the extended agent card lists its supported interfaces in the order {string}")]
+fn extended_agent_card_interface_order(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let card = &get_response_body_value(world)["result"];
+    let bindings: Vec<&str> = card["supportedInterfaces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("extended agent card must expose supportedInterfaces, got: {card}"))
+        .iter()
+        .filter_map(|interface| interface["protocolBinding"].as_str())
+        .collect();
+    let expected: Vec<&str> = expected
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(bindings, expected, "interface order must be preserved, got: {card}");
+}
+
+fn assert_interface_urls_point_to_gateway(
+    world: &SurfaceWorld,
+    card: &serde_json::Value,
+) {
     let gateway_base = format!(
         "http://localhost:{}/",
         world
@@ -3404,10 +3576,9 @@ fn agent_card_interface_urls_point_to_gateway(world: &mut SurfaceWorld) {
             .expect("scenario infra must be initialised before asserting on the agent card")
             .gateway_port
     );
-    let body = get_response_body_value(world);
     let mut checked = 0;
     for key in ["supportedInterfaces", "additionalInterfaces"] {
-        for interface in body
+        for interface in card
             .get(key)
             .and_then(|v| v.as_array())
             .into_iter()
@@ -3419,12 +3590,12 @@ fn agent_card_interface_urls_point_to_gateway(world: &mut SurfaceWorld) {
                 .unwrap_or_else(|| panic!("every {key} entry must carry a url, got: {interface}"));
             assert!(
                 url.starts_with(&gateway_base),
-                "{key} url should point to the gateway ('{gateway_base}...'), got '{url}' in {body}"
+                "{key} url should point to the gateway ('{gateway_base}...'), got '{url}' in {card}"
             );
             checked += 1;
         }
     }
-    assert!(checked > 0, "agent card must expose at least one interface url, got: {body}");
+    assert!(checked > 0, "agent card must expose at least one interface url, got: {card}");
 }
 
 #[then(expr = "the agent card field {string} does not contain managed agent {string} endpoint")]
@@ -3488,48 +3659,6 @@ fn agent_card_first_endpoint_url_excludes_managed_agent_endpoint(
     );
 }
 
-/// Reads the next JSON-RPC message from the open MCP response stream,
-/// skipping SSE comments. `Ok(None)` means the stream ended; `Err` means it
-/// stayed open with nothing new within `wait`.
-async fn next_mcp_stream_message(
-    world: &mut SurfaceWorld,
-    wait: std::time::Duration,
-) -> Result<Option<serde_json::Value>, ()> {
-    loop {
-        if let Some(end) = world
-            .mcp_stream_buffer
-            .find("\n\n")
-        {
-            let event: String = world
-                .mcp_stream_buffer
-                .drain(..end + 2)
-                .collect();
-            let data: Vec<&str> = event
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect();
-            if data.is_empty() {
-                continue;
-            }
-            return Ok(Some(serde_json::from_str(&data.join("\n")).expect("MCP stream event data is JSON")));
-        }
-        let stream = world
-            .mcp_stream
-            .as_mut()
-            .expect("an open MCP response stream");
-        match tokio::time::timeout(wait, stream.chunk()).await {
-            Err(_) => return Err(()),
-            Ok(chunk) => match chunk.expect("read the MCP response stream") {
-                Some(chunk) => world
-                    .mcp_stream_buffer
-                    .push_str(&String::from_utf8_lossy(&chunk)),
-                None => return Ok(None),
-            },
-        }
-    }
-}
-
 fn primary_mock_for<'a>(
     world: &'a SurfaceWorld,
     server_name: &str,
@@ -3568,37 +3697,30 @@ fn response_does_not_include_header(
 }
 
 #[then(expr = "the caller receives MCP progress before MCP server {string} completes the tool")]
-async fn caller_receives_progress_before_completion(
+fn caller_receives_progress_before_completion(
     world: &mut SurfaceWorld,
     server_name: String,
 ) {
-    let wait = std::time::Duration::from_secs(10);
-    let progress = next_mcp_stream_message(world, wait)
-        .await
-        .expect("progress arrives while the tool is still running")
-        .expect("the stream stays open for progress");
-    assert_eq!(progress["method"], "notifications/progress", "{progress}");
+    primary_mock_for(world, &server_name);
+    let progress = world
+        .mcp_stream_progress
+        .as_ref()
+        .expect("the caller received no message while the tool was running");
+    assert_eq!(progress["method"], "notifications/progress", "expected an MCP progress notification, got {progress}");
     let sent_token = world
         .sent_body
         .as_ref()
         .and_then(|body| body.pointer("/params/_meta/progressToken"))
-        .cloned();
-    assert_eq!(progress["params"]["progressToken"], sent_token.unwrap_or_default());
-    let mock = primary_mock_for(world, &server_name);
-    assert!(!mock.stream_completed().await, "progress must arrive before the tool completes");
-    mock.release_stream().await;
-    let complete = next_mcp_stream_message(world, wait)
-        .await
-        .expect("the final response arrives after release")
-        .expect("the stream carries a final response");
-    world.mcp_stream_closed_after_final =
-        matches!(next_mcp_stream_message(world, std::time::Duration::from_secs(5)).await, Ok(None));
-    world
-        .caller_response
-        .as_mut()
-        .expect("caller response")
-        .body = complete;
-    crate::steps::when::record_mock_observation(world).await;
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        progress["params"]["progressToken"], sent_token,
+        "progress must carry the caller's progress token, got {progress}"
+    );
+    assert!(
+        world.mcp_progress_before_completion,
+        "MCP server '{server_name}' completed the tool before the caller received progress"
+    );
 }
 
 #[then("the MCP response stream closes after the final response")]

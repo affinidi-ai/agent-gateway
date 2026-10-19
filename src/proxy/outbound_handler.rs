@@ -103,20 +103,30 @@ pub(crate) enum OutboundPipelineError {
     #[error("MCP request body refused: {}", .0.reason())]
     McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal),
 
+    #[error("{}", crate::a2a::EXTENDED_AGENT_CARD_BATCH_REFUSAL)]
+    ExtendedAgentCardBatch,
+
+    #[error("{}", crate::a2a::url_rewriter::EXTENDED_AGENT_CARD_REFUSAL)]
+    UnrewritableExtendedAgentCardResponse { rpc_request_id: Option<serde_json::Value> },
+
     #[error("{error}")]
     McpMetadata { error: crate::mcp::meta::McpMetadataError, body: Bytes, response: bool },
 
     #[error("Request blocked by gateway policy")]
     GatewayPolicyDenied,
 
-    #[error("Request blocked by gateway policy: {0}")]
-    GatewayPolicyError(String),
+    /// The gateway policy could not decide. Why is logged and audited, never
+    /// shown to the caller.
+    #[error("Request blocked by gateway policy")]
+    GatewayPolicyError(crate::observability::PolicyEvaluationError),
 
     #[error("Request blocked by surface policy")]
     SurfacePolicyDenied,
 
-    #[error("Request blocked by surface policy: {0}")]
-    SurfacePolicyError(String),
+    /// The surface or transit-point policy could not decide. Why is logged
+    /// and audited, never shown to the caller.
+    #[error("Request blocked by surface policy")]
+    SurfacePolicyError(crate::observability::PolicyEvaluationError),
 
     #[error("Target authentication credentials unavailable")]
     TargetAuthUnavailable,
@@ -184,7 +194,9 @@ impl OutboundPipelineError {
                 StatusCode::NOT_FOUND
             }
 
-            Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) => StatusCode::BAD_REQUEST,
+            Self::BodyReadFailed(_) | Self::HeaderMetadataMappingFailed(_) | Self::ExtendedAgentCardBatch => {
+                StatusCode::BAD_REQUEST
+            }
 
             Self::ExtensionValidationFailed(_) | Self::ProtocolMismatch { .. } => StatusCode::UNPROCESSABLE_ENTITY,
 
@@ -212,7 +224,8 @@ impl OutboundPipelineError {
             Self::TargetAuthUnavailable
             | Self::UpstreamConnectionFailed(_)
             | Self::UpstreamResponseReadFailed
-            | Self::ResponseValidationFailed(_) => StatusCode::BAD_GATEWAY,
+            | Self::ResponseValidationFailed(_)
+            | Self::UnrewritableExtendedAgentCardResponse { .. } => StatusCode::BAD_GATEWAY,
 
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
 
@@ -234,6 +247,12 @@ impl IntoResponse for OutboundPipelineError {
         }
         if let Self::McpBodyRefused(refusal) = self {
             return refusal.into_response();
+        }
+        if let Self::UnrewritableExtendedAgentCardResponse { rpc_request_id } = self {
+            return crate::a2a::url_rewriter::extended_agent_card_refusal(rpc_request_id.as_ref());
+        }
+        if let Self::ExtendedAgentCardBatch = self {
+            return crate::a2a::create_jsonrpc_error_response(StatusCode::BAD_REQUEST, -32600, &self.to_string());
         }
         if let Self::UpstreamCapacityReached(id) = self {
             return crate::proxy::fabric_forward::capacity_response(id);
@@ -845,6 +864,8 @@ async fn outbound_proxy_handler_with_mcp_versions(
         return Ok(response);
     }
     step_inject_credentials(&state, &mut ctx).await?;
+
+    request_uncompressed_extended_agent_card(&mut ctx);
 
     // [12] Forward Request
     let upstream_response = step_forward_request(&state, &mut ctx).await?;
@@ -1793,27 +1814,28 @@ async fn step_extract_protocol_context_with_versions(
             ctx.surface
                 .mcp_legacy_metadata_output,
         );
-        let mut normalized = crate::mcp::meta::normalize_bytes(&body, ctx.mcp_metadata_context).map_err(|error| {
+        let normalized = crate::mcp::meta::normalize_bytes(&body, ctx.mcp_metadata_context).map_err(|error| {
             OutboundPipelineError::McpMetadata {
                 error,
                 body: body.clone(),
                 response: false,
             }
         })?;
-        if let Some(capped) = policy.cap_legacy_initialize(&normalized, &classification) {
-            info!(
-                request_id = %ctx.request_id,
-                "Forwarding MCP initialize with protocolVersion {} in place of unsupported {}",
-                capped.offered,
-                capped.requested_for_log()
-            );
-            normalized = capped.body;
-        }
-        ctx.body_bytes = Some(normalized);
+        ctx.body_bytes = Some(policy.cap_legacy_initialize(
+            normalized,
+            &classification,
+            &ctx.surface.surface_id,
+            Some(&ctx.request_id),
+        ));
         crate::protocols::extensions::verify_mcp_metadata_identity(
             &body,
             state.vc_issuer.as_ref(),
-            &ctx.surface.surface_id,
+            &crate::audit::request_events::RequestFacts {
+                surface_id: &ctx.surface.surface_id,
+                channel_name: &ctx.surface.name,
+                trace_id: Some(&ctx.request_id),
+                via_fabric: false,
+            },
             None,
         )
         .await
@@ -1846,6 +1868,15 @@ async fn step_extract_protocol_context_with_versions(
     };
     ctx.protocol = Some(protocol);
     ctx.operation = operation;
+
+    // An extended agent card inside a JSON-RPC batch response cannot be
+    // rewritten, so such a batch is refused on A2A/AP2 transit points.
+    if transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
+        && crate::a2a::is_extended_agent_card_batch(body)
+    {
+        warn!(request_id = %ctx.request_id, "Rejected JSON-RPC batch containing an extended agent card request");
+        return Err(OutboundPipelineError::ExtendedAgentCardBatch);
+    }
 
     // Enforce that the request body actually speaks the protocol this transit
     // point is configured for. A2A/AP2 and MCP have distinct JSON-RPC method
@@ -2646,7 +2677,7 @@ async fn step_trust_check(
     }
 
     if ctx.target_agent_card_unavailable {
-        let synthesized = synthesize_target_unavailable_results(
+        let synthesized = crate::trust_registry_verification::synthesize_unavailable_target(
             ctx.surface
                 .surface_id
                 .as_str(),
@@ -2677,7 +2708,7 @@ async fn step_trust_check(
         .target_identity_failure
         .clone()
     {
-        let synthesized = synthesize_target_unavailable_results(
+        let synthesized = crate::trust_registry_verification::synthesize_unavailable_target(
             ctx.surface
                 .surface_id
                 .as_str(),
@@ -2754,49 +2785,6 @@ async fn step_trust_check(
     Ok(())
 }
 
-/// Build the per-element target-leg `TrustCheckResult` list for the
-/// whole-surface `AGENT_CARD_UNAVAILABLE` path (card fetch itself
-/// failed) and emit the matching audit events. The
-/// `TRUST_REGISTRY_METADATA_UNAVAILABLE` path is per-element and lives
-/// in [`crate::trust_registry_verification::metadata_gate`], driven
-/// automatically by [`run_trust_check_stage`].
-fn synthesize_target_unavailable_results(
-    surface_id: &str,
-    elements: &[crate::trust_registry_verification::TrustCheckElement],
-    error_code: &'static str,
-    error_detail: &'static str,
-) -> Vec<crate::trust_registry_verification::TrustCheckResult> {
-    elements
-        .iter()
-        .map(|elem| {
-            let result =
-                crate::trust_registry_verification::synthesize_failure(elem, error_code, error_detail.to_string());
-            crate::observability::trust_check_audit::record_trust_check(
-                crate::observability::trust_check_audit::TrustCheckAuditEvent {
-                    surface_id,
-                    leg: crate::trust_registry_verification::TrustCheckLeg::Target,
-                    element_id: elem.id.as_str(),
-                    element_name: elem.name.as_deref(),
-                    // Match the wire shape: the two "unavailable" codes
-                    // omit authority_id / entity_id since the raw
-                    // template strings would be noise on those paths.
-                    authority_id: None,
-                    entity_id: None,
-                    trust_registry_id: elem
-                        .trust_registry_id
-                        .as_str(),
-                    query_type: elem.query_type,
-                    ok: false,
-                    error_code: Some(error_code),
-                    error_detail: Some(error_detail),
-                    latency_ms: 0,
-                },
-            );
-            result
-        })
-        .collect()
-}
-
 /// The protected agent's DID for outbound policy-audit attribution, or `None`
 /// when no managed identity was resolved.
 fn outbound_actor_did(ctx: &OutboundPipelineContext) -> Option<&str> {
@@ -2839,10 +2827,28 @@ impl OutboundPolicyAudit<'_> {
         allow: bool,
         reason: Option<&str>,
     ) {
+        self.record_event(allow, reason, None);
+    }
+
+    /// Emit the `error` decision for a policy that could not decide.
+    fn record_error(
+        &self,
+        error: crate::observability::PolicyEvaluationError,
+    ) {
+        self.record_event(false, None, Some(error));
+    }
+
+    fn record_event(
+        &self,
+        allow: bool,
+        reason: Option<&str>,
+        error: Option<crate::observability::PolicyEvaluationError>,
+    ) {
         crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
             scope: self.scope,
             allow,
             reason,
+            error,
             policy_id: Some(self.policy_id),
             policy_definition_id: self.policy_definition_id,
             policy_name: self.policy_name,
@@ -2935,13 +2941,41 @@ async fn step_gateway_opa_policy(
             return Err(OutboundPipelineError::GatewayPolicyDenied);
         }
         Err(e) => {
-            audit.record(false, Some(e.as_str()));
+            let error = crate::observability::PolicyEvaluationError::EvaluationError;
+            audit.record_error(error);
             warn!(request_id = %ctx.request_id, error = %e, "Gateway OPA evaluation error (denying)");
-            return Err(OutboundPipelineError::GatewayPolicyError(e.to_string()));
+            return Err(OutboundPipelineError::GatewayPolicyError(error));
         }
     }
 
     Ok(())
+}
+
+/// Record the `error` decision for a configured surface or transit-point
+/// policy that cannot run, and return the fail-closed pipeline error.
+fn record_surface_policy_unavailable(
+    ctx: &OutboundPipelineContext,
+    policy_definition_id: Option<&str>,
+    error: crate::observability::PolicyEvaluationError,
+) -> OutboundPipelineError {
+    let caller = outbound_caller(ctx);
+    OutboundPolicyAudit {
+        scope: crate::observability::PolicyScope::Surface,
+        policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
+        policy_definition_id,
+        policy_name: None,
+        surface_id: ctx.surface.config_id(),
+        http_method: ctx.original_method.as_str(),
+        path: ctx.request_path.as_str(),
+        actor_did: outbound_actor_did(ctx),
+        gateway_did: None,
+        trace_id: &ctx.request_id,
+        policy_version: None,
+        policy_content_hash: None,
+        caller: caller.as_ref(),
+    }
+    .record_error(error);
+    OutboundPipelineError::SurfacePolicyError(error)
 }
 
 /// [10] Surface-Level OPA Policy — evaluates the per-surface outbound Rego policy.
@@ -2963,8 +2997,12 @@ async fn step_surface_opa_policy(
             request_id = %ctx.request_id,
             "[OPA-INPUT] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
         );
-        return Err(OutboundPipelineError::SurfacePolicyError(
-            "Outbound OPA policy configured but policy manager not available".to_string(),
+        return Err(record_surface_policy_unavailable(
+            ctx,
+            ctx.outbound_shared
+                .opa_policy_definition_id
+                .as_deref(),
+            crate::observability::PolicyEvaluationError::NoPolicyManager,
         ));
     };
 
@@ -2982,8 +3020,12 @@ async fn step_surface_opa_policy(
             config_id = %config_id,
             "Outbound OPA policy is configured but engine not found (compilation may have failed); denying"
         );
-        return Err(OutboundPipelineError::SurfacePolicyError(
-            "Outbound OPA policy configured but not compiled".to_string(),
+        return Err(record_surface_policy_unavailable(
+            ctx,
+            ctx.outbound_shared
+                .opa_policy_definition_id
+                .as_deref(),
+            crate::observability::PolicyEvaluationError::PolicyNotCompiled,
         ));
     }
 
@@ -3034,9 +3076,10 @@ async fn step_surface_opa_policy(
             return Err(OutboundPipelineError::SurfacePolicyDenied);
         }
         Err(e) => {
-            audit.record(false, Some(e.as_str()));
+            let error = crate::observability::PolicyEvaluationError::EvaluationError;
+            audit.record_error(error);
             warn!(request_id = %ctx.request_id, error = %e, "Channel OPA evaluation error (denying)");
-            return Err(OutboundPipelineError::SurfacePolicyError(e.to_string()));
+            return Err(OutboundPipelineError::SurfacePolicyError(error));
         }
     }
 
@@ -3113,8 +3156,10 @@ async fn step_transit_point_opa_policy(
             alias = %ctx.virtual_channel.alias,
             "Per-transit-point OPA policy configured but SurfacePolicyManager not available; denying"
         );
-        return Err(OutboundPipelineError::SurfacePolicyError(
-            "Transit point OPA policy configured but policy manager not available".to_string(),
+        return Err(record_surface_policy_unavailable(
+            ctx,
+            Some(tp_def_id.as_str()),
+            crate::observability::PolicyEvaluationError::NoPolicyManager,
         ));
     };
 
@@ -3130,8 +3175,10 @@ async fn step_transit_point_opa_policy(
             alias = %ctx.virtual_channel.alias,
             "Per-transit-point OPA policy configured but engine not found; denying"
         );
-        return Err(OutboundPipelineError::SurfacePolicyError(
-            "Transit point OPA policy configured but not compiled".to_string(),
+        return Err(record_surface_policy_unavailable(
+            ctx,
+            Some(tp_def_id.as_str()),
+            crate::observability::PolicyEvaluationError::PolicyNotCompiled,
         ));
     }
 
@@ -3179,14 +3226,15 @@ async fn step_transit_point_opa_policy(
             return Err(OutboundPipelineError::SurfacePolicyDenied);
         }
         Err(e) => {
-            audit.record(false, Some(e.as_str()));
+            let error = crate::observability::PolicyEvaluationError::EvaluationError;
+            audit.record_error(error);
             warn!(
                 request_id = %ctx.request_id,
                 alias = %ctx.virtual_channel.alias,
                 error = %e,
                 "Per-transit-point OPA evaluation error (denying)"
             );
-            return Err(OutboundPipelineError::SurfacePolicyError(e.to_string()));
+            return Err(OutboundPipelineError::SurfacePolicyError(error));
         }
     }
 
@@ -3447,7 +3495,10 @@ fn step_transit_point_response_policy(
         caller: caller.as_ref(),
     };
     if !decision.allow {
-        audit.record(false, decision.reason.as_deref());
+        match decision.error {
+            Some(error) => audit.record_error(error),
+            None => audit.record(false, decision.reason.as_deref()),
+        }
         warn!(
             request_id = %ctx.request_id,
             alias = %ctx.virtual_channel.alias,
@@ -3656,7 +3707,6 @@ async fn step_inject_trusted_identity(
                         .target_endpoint
                         .as_str(),
                 ),
-                policy_decisions: crate::observability::policy_audit::current_policy_decisions(),
                 ..Default::default()
             },
         );
@@ -3754,34 +3804,29 @@ async fn step_inject_trusted_identity(
     // recorded on this (producing) gateway, mirroring the direct/`fabric://`
     // injection sites in `proxy::handler`. The receiving gateway separately
     // audits the same VP on extraction.
-    if let Some(vp_jwt) = injected_vp_jwt
-        && crate::delegation_vault::audit::identity_binding_vp_audit_enabled()
-    {
-        let mut evt = crate::delegation_vault::audit::audit_event(
-            crate::delegation_vault::audit::DelegationAuditAction::VpInjected,
-            None,
-            None,
-            None,
-            Some(
-                ctx.surface
-                    .surface_id
-                    .as_str(),
-            ),
-        );
-        evt.agent_identity_did = Some(did.clone());
-        evt.channel_name = Some(channel_name.to_string());
-        evt.target_endpoint = Some(
-            ctx.virtual_channel
-                .target_endpoint
-                .clone(),
-        );
-        evt.protocol = Some(format!("{:?}", protocol).to_lowercase());
-        evt.via_fabric = true;
-        evt.vp_fingerprint = Some(crate::delegation_vault::audit::vp_fingerprint(&vp_jwt));
-        evt.vp_jwt = Some(vp_jwt);
-        evt.trace_id = Some(ctx.request_id.clone());
-        evt.detail = Some("transit_point".to_string());
-        crate::delegation_vault::audit::audit(evt);
+    if let Some(vp_jwt) = injected_vp_jwt {
+        crate::delegation_vault::audit::emit("vp_injected", || {
+            crate::delegation_vault::audit::vp_injected_event(crate::delegation_vault::audit::VpInjection {
+                agent_did: Some(did.as_str()),
+                user_hash: None,
+                surface_id: Some(
+                    ctx.surface
+                        .surface_id
+                        .as_str(),
+                ),
+                channel_name,
+                target_endpoint: &ctx
+                    .virtual_channel
+                    .target_endpoint,
+                protocol: &format!("{:?}", protocol).to_lowercase(),
+                mcp_tool_name: None,
+                vp_jwt: &vp_jwt,
+                trace_id: Some(&ctx.request_id),
+                detail: "transit_point".to_string(),
+                caller: outbound_caller(ctx),
+                via_fabric: true,
+            })
+        });
     }
 
     Ok(())
@@ -4657,13 +4702,50 @@ fn compute_outbound_remainder_path(
         .to_string()
 }
 
-/// Check whether the upstream response is an agent card based on the request path and status.
+/// Whether the request fetches the extended agent card over the HTTP+JSON binding
+/// on an A2A/AP2 transit point.
+fn is_rest_extended_card_request(ctx: &OutboundPipelineContext) -> bool {
+    transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
+        && crate::proxy::paths::is_rest_extended_agent_card_request(
+            ctx.original_method.as_str(),
+            &ctx.virtual_channel
+                .target_endpoint,
+            &compute_outbound_remainder_path(
+                &ctx.request_path,
+                &ctx.surface.access_point.route,
+                &ctx.virtual_channel.alias,
+                ctx.virtual_channel
+                    .listen_path
+                    .as_deref(),
+            ),
+        )
+}
+
+/// Whether the request calls an extended-card JSON-RPC method on an A2A/AP2
+/// transit point.
+fn is_rpc_extended_card_request(ctx: &OutboundPipelineContext) -> bool {
+    transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
+        && ctx
+            .operation
+            .as_deref()
+            .is_some_and(crate::a2a::is_extended_agent_card_method)
+}
+
+/// A compressed extended card cannot be rewritten, so the Target is asked for an
+/// uncompressed one.
+fn request_uncompressed_extended_agent_card(ctx: &mut OutboundPipelineContext) {
+    if is_rest_extended_card_request(ctx) || is_rpc_extended_card_request(ctx) {
+        ctx.original_headers
+            .insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
+    }
+}
+
+/// Check whether the upstream response is a well-known agent card based on the request path and status.
 fn is_agent_card_response(
     request_path: &str,
     status: reqwest::StatusCode,
 ) -> bool {
-    status.is_success()
-        && (request_path.ends_with("/.well-known/agent-card.json") || request_path.ends_with("/.well-known/agent.json"))
+    status.is_success() && crate::proxy::paths::is_well_known_agent_card_path(request_path)
 }
 
 /// [12] Response Processing — strips headers and optionally rewrites agent card URLs.
@@ -5065,19 +5147,50 @@ fn process_outbound_response_body(
     // through the gateway. `TransitPoint.gateway_url` is declared
     // "computed" but never assigned, so derive it here from the surface
     // + listener config.
-    let body_bytes = if is_agent_card_response(&ctx.request_path, status) {
+    let is_rest_extended_card_response = status.is_success() && is_rest_extended_card_request(ctx);
+    let is_rpc_extended_card_response = is_rpc_extended_card_request(ctx);
+    let is_extended_card_response = is_rest_extended_card_response || is_rpc_extended_card_response;
+    let body_bytes = if is_agent_card_response(&ctx.request_path, status) || is_extended_card_response {
         let proxy_endpoint = crate::a2a::url_rewriter::build_transit_point_proxy_endpoint(
             &ctx.surface,
             &ctx.virtual_channel,
             &state.network_config,
         );
-        match crate::a2a::url_rewriter::process_outbound_agent_card(&body_bytes, &proxy_endpoint, &ctx.surface.name) {
-            Ok(rewritten) => {
+        let rewritten = if is_rpc_extended_card_response {
+            crate::a2a::url_rewriter::process_outbound_extended_agent_card(
+                &body_bytes,
+                &proxy_endpoint,
+                &ctx.surface.name,
+                status,
+            )
+        } else {
+            let kind = if is_extended_card_response {
+                crate::a2a::AgentCardKind::Extended
+            } else {
+                crate::a2a::AgentCardKind::Public
+            };
+            crate::a2a::url_rewriter::process_outbound_agent_card(&body_bytes, &proxy_endpoint, &ctx.surface.name, kind)
+                .map(Some)
+        };
+        match rewritten {
+            Ok(Some(rewritten)) => {
                 info!(
                     request_id = %ctx.request_id,
                     "Rewrote outbound agent card URLs to outbound virtual channel endpoint"
                 );
                 rewritten
+            }
+            Ok(None) => body_bytes,
+            Err(e) if is_extended_card_response => {
+                warn!(request_id = %ctx.request_id, error = %e, "Failed to rewrite outbound extended agent card URLs");
+                return Err(OutboundPipelineError::UnrewritableExtendedAgentCardResponse {
+                    rpc_request_id: is_rpc_extended_card_response.then(|| {
+                        ctx.body_bytes
+                            .as_deref()
+                            .and_then(crate::a2a::url_rewriter::extended_agent_card_request_id)
+                            .unwrap_or(serde_json::Value::Null)
+                    }),
+                });
             }
             Err(e) => {
                 warn!(
@@ -5447,6 +5560,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn outbound_policy_audit_records_an_evaluation_error_as_error() {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        use std::sync::Mutex;
+
+        let collector = Arc::new(Mutex::new(Vec::new()));
+        POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), async {
+                OutboundPolicyAudit {
+                    scope: crate::observability::PolicyScope::Response,
+                    policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
+                    policy_definition_id: Some("def-resp-1"),
+                    policy_name: None,
+                    surface_id: Some("surf-2"),
+                    http_method: "POST",
+                    path: "/a2a",
+                    actor_did: None,
+                    gateway_did: None,
+                    trace_id: "req-3",
+                    policy_version: None,
+                    policy_content_hash: None,
+                    caller: None,
+                }
+                .record_error(crate::observability::PolicyEvaluationError::EvaluationError);
+            })
+            .await;
+
+        let decisions = collector.lock().unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "error");
+        assert_eq!(
+            decisions[0]
+                .deny_reason
+                .as_deref(),
+            Some("evaluation_error")
+        );
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     fn test_virtual_channel() -> TransitPoint {
@@ -5579,10 +5730,7 @@ mod tests {
             &headers,
             &serde_json::to_vec(&body).unwrap(),
             crate::mcp::request_validation::LegacySessionEvidence::Absent,
-            crate::mcp::request_validation::McpVersionPolicy::new(
-                &[crate::mcp::MCP_MODERN_VERSION],
-                &[crate::mcp::MCP_MODERN_VERSION],
-            ),
+            crate::mcp::request_validation::MODERN_ONLY_POLICY,
         )
         .unwrap();
         ctx.mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(&classification, None);
@@ -5619,12 +5767,7 @@ mod tests {
         use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
         use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
         use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
-        use crate::mcp::continuations::{
-            config::ContinuationRuntime,
-            embedded::EmbeddedContinuations,
-            protected::{ContinuationCipher, ContinuationKey, ContinuationRoute},
-            service::ContinuationService,
-        };
+        use crate::mcp::continuations::{config::ContinuationRuntime, negative_cases, protected::ContinuationRoute};
         use futures::TryStreamExt;
         use sha2::{Digest, Sha256};
         use std::collections::HashMap;
@@ -5736,14 +5879,7 @@ mod tests {
         state.consent_identity_strategies = Some(strategies);
         state.delegation_vault_store = Some(vault.clone());
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
-        let runtime = Arc::new(ContinuationRuntime {
-            config: serde_json::from_value(json!({"deployment": "deployment", "ttl_secs": 300, "active_key": "key",
-                "keys": [{"id": "key", "secret_id": "key-secret", "not_before": now - 1, "seal_until": now + 3600, "open_until": now + 4500}],
-                "storage": {"backend": "embedded", "capacity": 32}})).unwrap(),
-            service: Arc::new(ContinuationService::new(ContinuationCipher::new("deployment".into(), "key".into(), vec![
-                ContinuationKey::new("key".into(), [7; 32], now - 1, now + 3600, now + 4500).unwrap(),
-            ]).unwrap(), Arc::new(EmbeddedContinuations::new(32).unwrap()))),
-        });
+        let runtime = negative_cases::continuation_runtime(now, 300);
         state.mcp_continuations = Some(runtime.clone());
         let resource = "https://outbound.example/outbound/mcp/partner-a";
         let caller_claims = json!({"iss": "https://gateway.example/api/oauth2/mcp", "sub": "user",
@@ -5808,10 +5944,7 @@ mod tests {
                 &ctx.original_headers,
                 &body,
                 crate::mcp::request_validation::LegacySessionEvidence::Absent,
-                crate::mcp::request_validation::McpVersionPolicy::new(
-                    &[crate::mcp::MCP_MODERN_VERSION],
-                    &[crate::mcp::MCP_MODERN_VERSION],
-                ),
+                crate::mcp::request_validation::MODERN_ONLY_POLICY,
             )
             .unwrap();
             ctx.mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(&classification, None);
@@ -5859,8 +5992,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response["result"]["resultType"], "input_required");
-        // Tampered, expired, cross-user and incapable MRTR retries, on a continuation of their
-        // own so the flow below keeps its state.
         {
             async fn prepare(
                 state: &OutboundProxyState,
@@ -5885,54 +6016,28 @@ mod tests {
                 .unwrap();
                 (status, body)
             }
-            let pending = |id: &str, request_state: Option<&str>| {
-                let mut pending = message.clone();
-                pending["id"] = json!(id);
-                if let Some(request_state) = request_state {
-                    pending["params"]["requestState"] = json!(request_state);
+            let send = |message: serde_json::Value, bearer: Option<String>, runtime: Arc<ContinuationRuntime>| {
+                let mut state = state.clone();
+                state.mcp_continuations = Some(runtime);
+                let mut ctx = context_for(&message, &surface);
+                if let Some(bearer) = bearer {
+                    ctx.original_headers.insert(
+                        "authorization",
+                        format!("Bearer {bearer}")
+                            .parse()
+                            .unwrap(),
+                    );
                 }
-                pending
+                async move { prepare(&state, ctx).await }
             };
-            let (_, issued) = prepare(&state, context_for(&pending("negatives", None), &surface)).await;
-            let issued_state = issued["result"]["requestState"]
-                .as_str()
-                .expect("a continuation to replay")
-                .to_string();
-
-            // A tampered state does not open.
-            let mut bytes = issued_state
-                .clone()
-                .into_bytes();
-            let last = bytes.len() - 1;
-            bytes[last] = if bytes[last] == b'A' {
-                b'B'
-            } else {
-                b'A'
-            };
-            let tampered = String::from_utf8(bytes).unwrap();
-            let (status, body) = prepare(&state, context_for(&pending("tampered", Some(&tampered)), &surface)).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "tampered: {body}");
-            assert_eq!(body["error"]["code"], crate::mcp::error_codes::INVALID_PARAMS, "tampered: {body}");
-
-            // Another principal cannot resume it.
             let mut other_claims = caller_claims.clone();
             other_claims["sub"] = json!("other-user");
             let other = issuer
                 .sign_jwt_with_gateway_key_typ(&other_claims, "at+jwt")
                 .await
                 .unwrap();
-            let mut cross_user = context_for(&pending("cross-user", Some(&issued_state)), &surface);
-            cross_user
-                .original_headers
-                .insert(
-                    "authorization",
-                    format!("Bearer {other}")
-                        .parse()
-                        .unwrap(),
-                );
-            let (status, body) = prepare(&state, cross_user).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "cross-user: {body}");
-            assert_eq!(body["error"]["code"], -32001, "cross-user: {body}");
+            let issued_state =
+                negative_cases::assert_rejected_retries(&message, runtime.clone(), other, now, send).await;
 
             // It is bound to the Transit Point that issued it: another Transit
             // Point, reached with a token for its own resource, cannot resume it.
@@ -5947,7 +6052,8 @@ mod tests {
                 .sign_jwt_with_gateway_key_typ(&claims_b, "at+jwt")
                 .await
                 .unwrap();
-            let mut cross_route = context_for(&pending("cross-route", Some(&issued_state)), &surface_b);
+            let cross_route = negative_cases::retry(&message, "cross-route", Some(&issued_state));
+            let mut cross_route = context_for(&cross_route, &surface_b);
             cross_route.request_path = "/outbound/mcp/partner-b".into();
             cross_route
                 .original_headers
@@ -5960,37 +6066,6 @@ mod tests {
             let (status, body) = prepare(&state, cross_route).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "cross-route: {body}");
             assert_eq!(body["error"]["code"], -32001, "cross-route: {body}");
-
-            // A client that did not declare URL elicitation is not sent a consent request.
-            let mut incapable = pending("incapable", None);
-            incapable["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
-            let (status, body) = prepare(&state, context_for(&incapable, &surface)).await;
-            assert_eq!(
-                body["error"]["code"],
-                crate::mcp::error_codes::MISSING_REQUIRED_CLIENT_CAPABILITY,
-                "incapable: {status} {body}"
-            );
-
-            // An expired state does not open.
-            let mut short_state = state.clone();
-            short_state.mcp_continuations = Some(Arc::new(ContinuationRuntime {
-                config: serde_json::from_value(json!({"deployment": "deployment", "ttl_secs": 1, "active_key": "key",
-                    "keys": [{"id": "key", "secret_id": "key-secret", "not_before": now - 1, "seal_until": now + 3600, "open_until": now + 4500}],
-                    "storage": {"backend": "embedded", "capacity": 32}})).unwrap(),
-                service: Arc::new(ContinuationService::new(ContinuationCipher::new("deployment".into(), "key".into(), vec![
-                    ContinuationKey::new("key".into(), [7; 32], now - 1, now + 3600, now + 4500).unwrap(),
-                ]).unwrap(), Arc::new(EmbeddedContinuations::new(32).unwrap()))),
-            }));
-            let (_, short_issued) = prepare(&short_state, context_for(&pending("short", None), &surface)).await;
-            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
-            let short_request_state = short_issued["result"]["requestState"]
-                .as_str()
-                .unwrap()
-                .to_string();
-            let (status, body) =
-                prepare(&short_state, context_for(&pending("expired", Some(&short_request_state)), &surface)).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "expired: {body}");
-            assert_eq!(body["error"]["code"], crate::mcp::error_codes::INVALID_PARAMS, "expired: {body}");
             assert!(calls.lock().await.is_empty(), "no negative case reaches the upstream");
         }
         let mut retry = match ctx
@@ -6215,10 +6290,7 @@ mod tests {
         let address = "127.0.0.1:12345"
             .parse()
             .unwrap();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         assert!(
             subscriptions_rx
                 .try_recv()
@@ -6968,10 +7040,7 @@ mod tests {
                     &headers,
                     &serde_json::to_vec(&body).unwrap(),
                     crate::mcp::request_validation::LegacySessionEvidence::Absent,
-                    crate::mcp::request_validation::McpVersionPolicy::new(
-                        &[crate::mcp::MCP_MODERN_VERSION],
-                        &[crate::mcp::MCP_MODERN_VERSION],
-                    ),
+                    crate::mcp::request_validation::MODERN_ONLY_POLICY,
                 )
                 .unwrap();
                 ctx.mcp_metadata_context =
@@ -7529,10 +7598,7 @@ mod tests {
                     .unwrap(),
                 state.clone(),
                 request,
-                crate::mcp::request_validation::McpVersionPolicy::new(
-                    &[crate::mcp::MCP_MODERN_VERSION],
-                    &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-                ),
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
             ))
             .await
             .unwrap_or_else(|error| error.into_response());
@@ -7599,10 +7665,7 @@ mod tests {
                         .unwrap(),
                     state,
                     request,
-                    crate::mcp::request_validation::McpVersionPolicy::new(
-                        &[crate::mcp::MCP_MODERN_VERSION],
-                        &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-                    ),
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
                 ))
                 .await
                 .unwrap_or_else(|error| error.into_response())
@@ -7969,10 +8032,7 @@ mod tests {
             .to_string(),
         )
         .await;
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for case in ["empty-catalog", "unknown", "disabled", "missing-default", "disabled-default"] {
             let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                 "surface_id": "variant-surface", "name": "Variant surface",
@@ -8235,10 +8295,7 @@ mod tests {
         use crate::mcp::admission_cases::{ALLOWED_ORIGIN, admission_cases, assert_rejected, body_refusal_cases};
 
         let state = test_outbound_state();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for case in admission_cases()
             .into_iter()
             .chain(body_refusal_cases())
@@ -8288,10 +8345,7 @@ mod tests {
     #[tokio::test]
     async fn test_step_extract_protocol_context_strips_session_and_resumption_state_from_modern_requests() {
         let state = test_outbound_state();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let mut ctx = test_pipeline_context();
         Arc::make_mut(&mut ctx.surface)
             .access_point
@@ -8351,7 +8405,8 @@ mod tests {
     #[tokio::test]
     async fn test_step_extract_protocol_context_caps_initialize_to_a_served_revision() {
         let state = test_outbound_state();
-        for (requested, forwarded) in [("2025-11-25", "2024-11-05"), ("2024-11-05", "2024-11-05")] {
+        let legacy = crate::mcp::MCP_LEGACY_VERSION;
+        for (requested, forwarded) in [("2025-11-25", legacy), (legacy, legacy)] {
             let mut ctx = test_pipeline_context();
             Arc::make_mut(&mut ctx.surface)
                 .access_point
@@ -8398,10 +8453,7 @@ mod tests {
     #[tokio::test]
     async fn test_step_extract_protocol_context_limits_fabric_transit_points_to_fabric_send() {
         let state = test_outbound_state();
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[crate::mcp::MCP_MODERN_VERSION],
-            &[crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         // A `fabric://` Transit Point resolves to the Fabric send policy, which
         // admits the same revisions as an HTTP(S) Target; each row pins that
         // the two Targets still agree.
@@ -8464,10 +8516,7 @@ mod tests {
     async fn test_step_extract_protocol_context_advertises_versions_learned_from_transit_discovery() {
         use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
 
-        let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-            &[MCP_MODERN_VERSION],
-            &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION],
-        );
+        let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let transit_point = |ctx: &mut OutboundPipelineContext, alias: &str| {
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
             ctx.virtual_channel.alias = alias.to_string();
@@ -9877,6 +9926,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_transit_point_vp_injection_record_names_the_transit_caller() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface)
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                extension_uri: None,
+                meta_field: "agentIdentity".to_string(),
+                fields: Vec::new(),
+                json_schema: None,
+                extension_rules: None,
+                strip_raw_meta: false,
+            },
+        ));
+        ctx.protocol = Some(ChannelProtocol::A2a);
+        ctx.body_bytes = Some(Bytes::from(
+            serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "method": "message/send",
+                "params": { "message": { "metadata": {
+                    "https://fabric.affinidi.io/extensions/agent-identity/v1": { "cloudProvider": "local", "model": "gpt-4" }
+                }}}
+            }))
+            .unwrap(),
+        ));
+        step_resolve_agent_identity(&state, &mut ctx)
+            .await
+            .unwrap();
+        ctx.transit_token_claims = Some(crate::proxy::transit_token::TransitTokenClaims {
+            iss: "gw".to_string(),
+            sub: None,
+            surface_id: "surf-001".to_string(),
+            iat: 0,
+            exp: u64::MAX,
+            jti: "jti".to_string(),
+            identity_source: None,
+            caller_dna_uai: None,
+            user_identity_hash: None,
+            caller_context_fields: serde_json::Map::from_iter([("email".to_string(), json!("ada@example.com"))]),
+            allowed_transit_points: vec![],
+            trace_id: None,
+        });
+
+        let (result, events) =
+            crate::audit::producer::capture(async { step_inject_trusted_identity(&state, &mut ctx).await }).await;
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        let injected: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::VpInjected))
+            .collect();
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].detail.as_deref(), Some("transit_point"));
+        assert_eq!(
+            injected[0]
+                .caller
+                .as_ref()
+                .and_then(|caller| caller.email.as_deref()),
+            Some("ada@example.com")
+        );
+    }
+
     // ── step_collect_trust_context ─────────────────────────────────────────
 
     #[tokio::test]
@@ -9913,6 +10028,83 @@ mod tests {
             .opa_policy_definition_id = None;
         let result = step_surface_opa_policy(&state, &mut ctx).await;
         assert!(result.is_ok());
+    }
+
+    /// Run `step_surface_opa_policy` with a policy definition configured and
+    /// return the pipeline result plus the recorded decisions.
+    async fn surface_opa_outcome(
+        manager: Option<Arc<crate::policies::SurfacePolicyManager>>
+    ) -> (Result<(), OutboundPipelineError>, Vec<crate::observability::policy_audit::PolicyDecisionSummary>) {
+        use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
+        use std::sync::Mutex;
+
+        let mut state = test_outbound_state();
+        state.policy_manager = manager;
+        let mut ctx = test_pipeline_context();
+        ctx.outbound_shared
+            .opa_policy_definition_id = Some("def-out-1".to_string());
+        let collector = Arc::new(Mutex::new(Vec::new()));
+        let result = POLICY_DECISION_COLLECTOR
+            .scope(collector.clone(), step_surface_opa_policy(&state, &mut ctx))
+            .await;
+        let decisions = collector
+            .lock()
+            .unwrap()
+            .clone();
+        (result, decisions)
+    }
+
+    fn assert_error_decision(
+        result: Result<(), OutboundPipelineError>,
+        decisions: &[crate::observability::policy_audit::PolicyDecisionSummary],
+        expected: crate::observability::PolicyEvaluationError,
+    ) {
+        let err = result.expect_err("a policy that could not decide fails closed");
+        assert!(
+            matches!(err, OutboundPipelineError::SurfacePolicyError(e) if e == expected),
+            "expected SurfacePolicyError({expected:?}), got {err:?}"
+        );
+        assert_eq!(err.to_string(), "Request blocked by surface policy", "no engine detail for the caller");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, "error");
+        assert_eq!(
+            decisions[0]
+                .deny_reason
+                .as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_opa_without_policy_manager_records_an_error_decision() {
+        let (result, decisions) = surface_opa_outcome(None).await;
+        assert_error_decision(result, &decisions, crate::observability::PolicyEvaluationError::NoPolicyManager);
+    }
+
+    #[tokio::test]
+    async fn surface_opa_without_compiled_policy_records_an_error_decision() {
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        let (result, decisions) = surface_opa_outcome(Some(manager)).await;
+        assert_error_decision(result, &decisions, crate::observability::PolicyEvaluationError::PolicyNotCompiled);
+    }
+
+    #[tokio::test]
+    async fn surface_opa_evaluation_error_records_an_error_decision() {
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        let config_id = test_pipeline_context()
+            .surface
+            .config_id()
+            .unwrap_or("unknown")
+            .to_string();
+        // Compiles, but `allow` gets two values for every input.
+        manager
+            .load_policy_text(
+                &format!("outbound:{config_id}"),
+                "package surface.policy\n\nallow := true if {\n    true\n}\n\nallow := false if {\n    true\n}\n",
+            )
+            .unwrap();
+        let (result, decisions) = surface_opa_outcome(Some(manager)).await;
+        assert_error_decision(result, &decisions, crate::observability::PolicyEvaluationError::EvaluationError);
     }
 
     // ── step_record_metrics ────────────────────────────────────────────────
@@ -11134,7 +11326,7 @@ mod tests {
 
     #[test]
     fn build_outbound_policy_input_uses_modern_transit_admission_snapshot() {
-        use crate::mcp::request_validation::{LegacySessionEvidence, McpVersionPolicy, validate_mcp_post};
+        use crate::mcp::request_validation::{LegacySessionEvidence, validate_mcp_post};
         let body = json!({"jsonrpc": "2.0", "id": "task", "method": "tasks/get", "params": {
             "taskId": "original-task", "_meta": {
                 "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
@@ -11156,7 +11348,7 @@ mod tests {
                 &ctx.original_headers,
                 &serde_json::to_vec(&body).unwrap(),
                 LegacySessionEvidence::Absent,
-                McpVersionPolicy::new(&[crate::mcp::MCP_MODERN_VERSION], &[crate::mcp::MCP_MODERN_VERSION]),
+                crate::mcp::request_validation::MODERN_ONLY_POLICY,
             )
             .unwrap(),
         );

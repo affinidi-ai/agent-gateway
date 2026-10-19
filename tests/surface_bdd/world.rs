@@ -103,6 +103,8 @@ pub struct SurfaceWorld {
     pub created_surface_id: Option<String>,
     pub surface_under_test_id: Option<String>,
     pub admin_response: Option<RecordedResponse>,
+    /// The delegation audit trail as last read through the admin API.
+    pub delegation_audit_trail: Option<RecordedResponse>,
     pub surface_lookup_response: Option<RecordedResponse>,
     pub collected_dids: Vec<String>,
     pub caller_claims: HashMap<String, serde_json::Map<String, serde_json::Value>>,
@@ -127,6 +129,10 @@ pub struct SurfaceWorld {
     /// A modern MCP response read incrementally by later steps.
     pub mcp_stream: Option<reqwest::Response>,
     pub mcp_stream_buffer: String,
+    /// The first message the caller read from a streamed modern MCP response.
+    pub mcp_stream_progress: Option<serde_json::Value>,
+    /// Whether that first message arrived while the MCP server was still running the tool.
+    pub mcp_progress_before_completion: bool,
     pub mcp_stream_closed_after_final: bool,
     /// The query of the last OAuth callback sent with a gateway-issued state.
     pub oauth_callback_query: Option<String>,
@@ -153,6 +159,7 @@ impl SurfaceWorld {
             created_surface_id: None,
             surface_under_test_id: None,
             admin_response: None,
+            delegation_audit_trail: None,
             surface_lookup_response: None,
             collected_dids: Vec::new(),
             caller_claims: HashMap::new(),
@@ -186,6 +193,8 @@ impl SurfaceWorld {
             sse_responses: Vec::new(),
             mcp_stream: None,
             mcp_stream_buffer: String::new(),
+            mcp_stream_progress: None,
+            mcp_progress_before_completion: false,
             mcp_stream_closed_after_final: false,
             oauth_callback_query: None,
             temp_dir: get_default_temp_dir(),

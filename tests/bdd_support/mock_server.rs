@@ -1136,4 +1136,114 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_millis(360), "delayed responses were serialized: {elapsed:?}");
         assert_eq!(mock.request_count().await, 2);
     }
+
+    fn streamed_tool_result(stream: super::MockStream) -> super::MockResponse {
+        super::MockResponse::streamed(
+            serde_json::json!({"jsonrpc": "2.0", "id": "placeholder", "result": {"ok": true}}),
+            stream,
+        )
+    }
+
+    async fn post_tool_call(mock: &super::MockServer) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}/mcp", mock.url()))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "caller-request-alpha",
+                "method": "tools/call",
+                "params": {"name": "echo", "_meta": {"progressToken": "token-alpha"}}
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn next_chunk(response: &mut reqwest::Response) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), response.chunk())
+            .await
+            .expect("mock stream produced a chunk in time")
+            .unwrap()
+            .map(|chunk| String::from_utf8_lossy(&chunk).into_owned())
+    }
+
+    #[tokio::test]
+    async fn sse_stream_frames_the_response_as_one_message_event() {
+        let mock = super::MockServer::start(streamed_tool_result(super::MockStream::Sse)).await;
+
+        let response = post_tool_call(&mock).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let body = response.text().await.unwrap();
+        let expected = serde_json::json!({"jsonrpc": "2.0", "id": "caller-request-alpha", "result": {"ok": true}});
+        assert_eq!(body, format!("event: message\ndata: {expected}\n\n"));
+    }
+
+    #[tokio::test]
+    async fn progress_then_release_holds_the_final_message_until_released() {
+        let mock = super::MockServer::start(streamed_tool_result(super::MockStream::ProgressThenRelease)).await;
+        let mut response = post_tool_call(&mock).await;
+
+        let progress = next_chunk(&mut response)
+            .await
+            .expect("progress event");
+        assert!(progress.contains("\"method\":\"notifications/progress\""), "got: {progress}");
+        assert!(progress.contains("\"progressToken\":\"token-alpha\""), "got: {progress}");
+        let held = tokio::time::timeout(std::time::Duration::from_millis(300), response.chunk()).await;
+        assert!(held.is_err(), "the final message must wait for release");
+        assert!(!mock.stream_completed().await);
+
+        mock.release_stream().await;
+
+        let complete = next_chunk(&mut response)
+            .await
+            .expect("final message");
+        assert!(complete.contains("\"id\":\"caller-request-alpha\""), "got: {complete}");
+        assert!(complete.contains("\"result\":{\"ok\":true}"), "got: {complete}");
+        assert!(mock.stream_completed().await);
+        assert_eq!(next_chunk(&mut response).await, None, "the stream ends after the final message");
+        assert!(!mock.stream_cancelled().await);
+    }
+
+    #[tokio::test]
+    async fn release_before_the_progress_is_read_is_not_lost() {
+        let mock = super::MockServer::start(streamed_tool_result(super::MockStream::ProgressThenRelease)).await;
+        let response = post_tool_call(&mock).await;
+
+        mock.release_stream().await;
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), response.text())
+            .await
+            .expect("the released stream ends")
+            .unwrap();
+        assert!(body.contains("notifications/progress"), "got: {body}");
+        assert!(body.contains("\"result\":{\"ok\":true}"), "got: {body}");
+        assert!(mock.stream_completed().await);
+    }
+
+    #[tokio::test]
+    async fn quiet_stream_sends_only_keep_alives_until_the_caller_goes_away() {
+        let mock = super::MockServer::start(streamed_tool_result(super::MockStream::Quiet)).await;
+        let mut response = post_tool_call(&mock).await;
+
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(
+            next_chunk(&mut response)
+                .await
+                .as_deref(),
+            Some(": keep-alive\n\n")
+        );
+        assert!(!mock.stream_cancelled().await);
+        assert!(!mock.stream_completed().await);
+
+        drop(response);
+
+        for _ in 0..50 {
+            if mock.stream_cancelled().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the quiet stream was not cancelled after the caller went away");
+    }
 }

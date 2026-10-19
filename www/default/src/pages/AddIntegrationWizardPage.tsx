@@ -5,6 +5,9 @@ import { showToast } from '../utils/toaster';
 import { getRuntimeVariablesForCategories } from '../utils/runtimeVariables';
 import {
   AUDIT_INTEGRATION_CATEGORY,
+  type AuditDeliveryLimits,
+  auditDeliveryLimitsError,
+  auditDeliveryLimitsPayload,
   auditPayloadTemplate,
   selectableCategories,
 } from '../utils/auditIntegrations';
@@ -17,6 +20,8 @@ import { useIntegrationSamples } from '../hooks/useIntegrationSamples';
 import { IntegrationContents } from '../utils/integrationSamples';
 import RuntimeVariablesSidebar from '../components/RuntimeVariablesSidebar';
 import AuditIntegrationCard from '../components/integrations/AuditIntegrationCard';
+import AuditEventsSection from '../components/integrations/AuditEventsSection';
+import AuditDeliveryLimitsSection from '../components/integrations/AuditDeliveryLimitsSection';
 
 interface IntegrationFieldMetadata {
   name: string;
@@ -124,6 +129,12 @@ const AddIntegrationWizardPage: React.FC = () => {
   const [category, setCategory] = useState('general');
   const [configuration, setConfiguration] = useState('{}');
   const [content, setContent] = useState('{}');
+  // Events a Governance Audit integration receives; nothing until chosen.
+  const [auditEvents, setAuditEvents] = useState<string[]>([]);
+  const [auditLimits, setAuditLimits] = useState<AuditDeliveryLimits>({
+    maxAttempts: '',
+    dropAfterSecs: '',
+  });
 
   // Email-specific state
   const [emailConfiguration, setEmailConfiguration] = useState<EmailConfiguration>({
@@ -464,6 +475,12 @@ const AddIntegrationWizardPage: React.FC = () => {
       setError('Integration name is required');
       return;
     }
+    const isAudit = category === AUDIT_INTEGRATION_CATEGORY;
+    const limitsError = isAudit ? auditDeliveryLimitsError(auditLimits) : null;
+    if (limitsError) {
+      setError(limitsError);
+      return;
+    }
 
     let configObj: any;
     let contentObj: any;
@@ -582,6 +599,10 @@ const AddIntegrationWizardPage: React.FC = () => {
         configuration: configObj,
         content: contentObj,
         status: 'active',
+        // The event list and delivery limits belong to Governance Audit integrations only.
+        ...(isAudit
+          ? { audit_events: auditEvents, ...auditDeliveryLimitsPayload(auditLimits, false) }
+          : {}),
       };
 
       const response = await apiClient.post('/integrations', payload);
@@ -904,6 +925,27 @@ const AddIntegrationWizardPage: React.FC = () => {
                           {`\${MESSAGE_ID}`}, {`\${TIMESTAMP}`}
                         </small>
                       </div>
+                    </>
+                  )}
+
+                  {category === AUDIT_INTEGRATION_CATEGORY && (
+                    <>
+                      <AuditEventsSection
+                        selected={auditEvents}
+                        onChange={events => {
+                          setAuditEvents(events);
+                          setIsModified(true);
+                        }}
+                        disabled={isSubmitting}
+                      />
+                      <AuditDeliveryLimitsSection
+                        limits={auditLimits}
+                        onChange={limits => {
+                          setAuditLimits(limits);
+                          setIsModified(true);
+                        }}
+                        disabled={isSubmitting}
+                      />
                     </>
                   )}
 

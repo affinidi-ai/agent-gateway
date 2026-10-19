@@ -1,48 +1,42 @@
-//! Delegation vault audit logger
+//! Governance audit records: their shape, the builders call sites use, and
+//! reading the VP Audit Log.
 //!
-//! Writes structured JSONL events to a dedicated audit log file for every
-//! credential delegation operation: consent granted, token injected, token refreshed,
-//! token revoked, consent required. This provides a tamper-evident, append-only
-//! audit trail separate from the general application logs.
-//!
-//! The audit file rotates daily and is written under `{log_directory}/delegation-audit.jsonl`
-//! or `_storage/audit/delegation-audit.jsonl` if no log directory is configured.
-//! Every appended event is also forwarded to the governance audit integrations
-//! (see [`crate::integrations::audit_integration_triggers`]).
+//! Records are submitted through [`audit`] to the producer in
+//! [`crate::audit::producer`], which journals them for every sink that
+//! selects them. The VP Audit Log sink writes them to
+//! `{log_directory}/delegation-audit.jsonl`, or
+//! `_storage/audit/delegation-audit.jsonl` if no log directory is configured.
 
+use crate::audit::events::{
+    AuthScheme, DelegationFailureReason, IdentityBindingFailure, RateLimitScope, RejectionReason, RejectionStage,
+    RequestFailureOutcome, TargetKind,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::mpsc;
+use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
-tokio::task_local! {
-    /// Per-task buffer that intercepts audit events while the request handler
-    /// is still computing the canonical identity VP. The handler installs this
-    /// via [`AUDIT_DEFER_QUEUE::scope`] around `resolve_delegation_credentials`,
-    /// then drains the queue and re-stamps each event with the final VP before
-    /// flushing to the audit sink. When workload-binding attestation is enabled,
-    /// that VP carries `workloadBinding.delegationAction`.
-    pub static AUDIT_DEFER_QUEUE: Arc<Mutex<Vec<DelegationAuditEvent>>>;
-}
-
-/// Global audit sender — events are sent to a background writer task
-static AUDIT_SENDER: OnceLock<mpsc::UnboundedSender<DelegationAuditEvent>> = OnceLock::new();
+use crate::audit::pipeline::PipelineControl;
+use crate::metrics::backends::prometheus::set_audit_pipeline_started;
+use crate::server::mode::ServerMode;
 
 /// Global audit file path — for reading the log
 static AUDIT_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Returns true if identity-binding VP injection should be recorded.
-///
-/// Controlled entirely by Settings › Security (audit_categories.identity).
-/// Defaults to false when the settings store is not yet available.
+/// The audit pipeline, run only while the node is Active.
+static AUDIT_PIPELINE: OnceLock<PipelineControl> = OnceLock::new();
+
+/// How often a node waiting for the journal tries to take it.
+const AUDIT_JOURNAL_RETRY: Duration = Duration::from_secs(5);
+
+/// Whether any sink selects `vp_injected`, so identity-binding VP injections
+/// should be recorded.
 pub fn identity_binding_vp_audit_enabled() -> bool {
-    crate::storage::settings_store::global_settings()
-        .map(|s| s.audit_category_enabled("identity"))
-        .unwrap_or(false)
+    crate::audit::producer::producer().wants("vp_injected")
 }
 
 /// Caller context captured from source authentication
@@ -96,6 +90,10 @@ pub struct AuditCallerContext {
 /// A delegation vault audit event
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct DelegationAuditEvent {
+    /// Unique id of this record (UUID v4). Lets a sink recognise a record
+    /// delivered again. Absent on records stored before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
     /// ISO-8601 timestamp
     pub timestamp: String,
     /// The type of audit event
@@ -148,9 +146,8 @@ pub struct DelegationAuditEvent {
     /// VP JWT injected into the upstream response (if identity VP was sent)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vp_jwt: Option<String>,
-    /// SHA-256 fingerprint of the VP JWT (`sha256:<hex>`). Lets verifiers
-    /// confirm that the policy decisions listed in `workloadBinding.policyDecisions`
-    /// inside the signed VP match what the audit log recorded for this request.
+    /// SHA-256 fingerprint of the VP JWT (`sha256:<hex>`). Lets verifiers tie
+    /// this record to the exact signed VP that was injected for the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vp_fingerprint: Option<String>,
     /// Request trace ID — correlates all audit events for the same request
@@ -247,6 +244,9 @@ pub struct PaymentEventDetails {
 }
 
 /// The type of delegation audit action
+// Records are built only for wanted events and serialized straight away, so
+// the size of the `PolicyDecision` variant costs nothing worth boxing for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationAuditAction {
@@ -278,9 +278,6 @@ pub enum DelegationAuditAction {
     ElicitationCancelled,
     /// No response within `elicit_timeout_secs`
     ElicitationTimedOut,
-    /// `consent_mode = pre_authorize` blocked a session/bind because at least
-    /// one required credential was missing
-    PreAuthorizeBlocked,
     /// OPA policy decision (allow or deny)
     PolicyDecision {
         scope: String,
@@ -309,12 +306,16 @@ pub enum DelegationAuditAction {
         /// `sha256:<hex>` content hash of the exact Rego enforced (attestation).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_content_hash: Option<String>,
+        /// Tools a `tools/list` filter took out of the catalog the caller
+        /// sees (scope `mcp_tool_list`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removed_tools: Option<Vec<String>>,
     },
     /// TRQP trust-check outcome. `authority_id` / `entity_id` are
     /// `Option<String>` and omitted from the JSONL on the target-leg
     /// "unavailable" pre-check paths (`AGENT_CARD_UNAVAILABLE`,
     /// `TRUST_REGISTRY_METADATA_UNAVAILABLE`) — matching the wire shape
-    /// of [`crate::trust_registry_verification::TrustCheckResult`].
+    /// of [`crate::trust_registry_verification::trust_check_element::TrustCheckResult`].
     TrustCheck {
         leg: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,6 +343,71 @@ pub enum DelegationAuditAction {
     /// `delegated` is true and the remote ids / status are populated). Boxed to
     /// keep the enum small.
     PaymentEvent(Box<PaymentEventDetails>),
+    /// Source authentication failed. `blocking` is false when the failure was
+    /// handed to policy instead of refusing the request.
+    AuthFailed {
+        scheme: AuthScheme,
+        reason: String,
+        blocking: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_ip: Option<String>,
+    },
+    RateLimited {
+        scope: RateLimitScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+    },
+    RequestRejected {
+        stage: RejectionStage,
+        reason: RejectionReason,
+        /// The HTTP status the caller received. Legacy MCP refuses a malformed
+        /// request with 200 and a JSON-RPC error, so read it with `rpc_error_code`.
+        http_status: u16,
+        /// The JSON-RPC error code the caller received, when the refusal was one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rpc_error_code: Option<i64>,
+    },
+    IdentityBindingFailed {
+        outcome: IdentityBindingFailure,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_did: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issuer_gateway: Option<String>,
+        /// Verification-failure detail. Never carries signed VP material.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_detail: Option<String>,
+    },
+    IdentityBindingVerified {
+        agent_did: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issuer_gateway: Option<String>,
+        /// `gateway_attested` or `caller_credential_chained`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assurance: Option<String>,
+    },
+    DelegationFailed {
+        reason: DelegationFailureReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+    },
+    RequestFailed {
+        outcome: RequestFailureOutcome,
+        target_kind: TargetKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream_status: Option<u16>,
+        latency_ms: u64,
+    },
+    RequestCompleted {
+        target_kind: TargetKind,
+        upstream_status: u16,
+        latency_ms: u64,
+        request_bytes: u64,
+        response_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ucp_op: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant_alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,11 +438,23 @@ struct TracePolicyDecisionEvidence {
 
 impl DelegationAuditAction {
     /// Whether this action belongs to the VP Audit Log (`/v1/audit`) rather
-    /// than the Credential Delegation Audit Log. Policy decisions and
-    /// trust-check outcomes are surfaced there, so the delegation log filters
-    /// them out.
+    /// than the Credential Delegation Audit Log. Policy, trust, trace,
+    /// authentication, identity binding and request outcomes are surfaced
+    /// there, so the delegation log filters them out.
     pub fn is_vp_audit(&self) -> bool {
-        matches!(self, Self::PolicyDecision { .. } | Self::TrustCheck { .. } | Self::TraceTerminated { .. })
+        matches!(
+            self,
+            Self::PolicyDecision { .. }
+                | Self::TrustCheck { .. }
+                | Self::TraceTerminated { .. }
+                | Self::AuthFailed { .. }
+                | Self::RateLimited { .. }
+                | Self::RequestRejected { .. }
+                | Self::IdentityBindingFailed { .. }
+                | Self::IdentityBindingVerified { .. }
+                | Self::RequestFailed { .. }
+                | Self::RequestCompleted { .. }
+        )
     }
 }
 
@@ -584,131 +662,125 @@ fn enrich_policy_decisions_from_signed_vps(events: &mut [DelegationAuditEvent]) 
     }
 }
 
-/// Initialize the audit logger with the given log directory.
-///
-/// Spawns a background task that writes events as JSONL to the audit file.
-/// Call once at startup from the orchestrator.
-pub fn init_audit_logger(log_directory: Option<&str>) {
+/// Sets up the audit pipeline with the VP Audit Log at
+/// `{log_directory}/delegation-audit.jsonl` and the journal next to it, and
+/// starts it unless the node is in Standby: only the Active node writes the
+/// journal (see [`set_audit_pipeline_mode`]). Call once at startup from the
+/// orchestrator.
+pub async fn init_audit_logger(log_directory: Option<&str>) {
     let dir = log_directory
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("_storage/audit"));
-
-    // Ensure directory exists
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        error!(
-            target: "credential_delegation",
-            path = %dir.display(),
-            error = %e,
-            "Failed to create delegation audit log directory"
-        );
-        return;
-    }
-
-    let (tx, rx) = mpsc::unbounded_channel();
-
-    if AUDIT_SENDER.set(tx).is_err() {
-        warn!(target: "credential_delegation", "Delegation audit logger already initialized");
-        return;
-    }
-
     let audit_path = dir.join("delegation-audit.jsonl");
-    let _ = AUDIT_PATH.set(audit_path.clone());
-    info!(
-        target: "credential_delegation",
-        path = %audit_path.display(),
-        "Delegation audit logger initialized"
-    );
-
-    tokio::spawn(audit_writer_task(audit_path, rx, crate::integrations::audit_integration_triggers::forward));
+    if AUDIT_PATH
+        .set(audit_path.clone())
+        .is_err()
+    {
+        warn!(target: "credential_delegation", "Audit pipeline already set up");
+        return;
+    }
+    let control = AUDIT_PIPELINE.get_or_init(|| PipelineControl::process_wide(dir, audit_path));
+    if crate::server::mode::is_standby() {
+        set_audit_pipeline_started(false);
+        info!(target: "credential_delegation", "Standby mode: audit pipeline not started until the node becomes active");
+        return;
+    }
+    start_audit_pipeline(control).await;
 }
 
-/// Background task that receives audit events, appends them to the JSONL file,
-/// and hands each successfully appended event to `on_persisted`.
-async fn audit_writer_task(
-    path: PathBuf,
-    mut rx: mpsc::UnboundedReceiver<DelegationAuditEvent>,
-    on_persisted: impl Fn(DelegationAuditEvent),
-) {
-    use tokio::fs::OpenOptions;
-    use tokio::io::AsyncWriteExt;
-
-    while let Some(event) = rx.recv().await {
-        let line = match serde_json::to_string(&event) {
-            Ok(json) => format!("{}\n", json),
-            Err(e) => {
-                error!(
-                    target: "credential_delegation",
-                    error = %e,
-                    "Failed to serialize audit event"
-                );
-                continue;
-            }
-        };
-
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-        {
-            // A tokio `File` finishes a write on the blocking pool and can report
-            // its error (a full disk) only on flush, so an event counts as
-            // persisted once the flush succeeds.
-            Ok(mut file) => match async {
-                file.write_all(line.as_bytes())
-                    .await?;
-                file.flush().await
-            }
-            .await
-            {
-                Ok(()) => on_persisted(event),
-                Err(e) => {
-                    error!(
-                        target: "credential_delegation",
-                        error = %e,
-                        "Failed to write delegation audit event"
-                    );
-                }
-            },
-            Err(e) => {
-                error!(
-                    target: "credential_delegation",
-                    path = %path.display(),
-                    error = %e,
-                    "Failed to open delegation audit log"
-                );
-            }
+/// Follows the node's mode: an Active node runs the audit pipeline, and a
+/// Standby node stops it, releasing the journal for the node taking over. A
+/// node becoming Active first re-reads the dashboard settings and forgets its
+/// cached integrations (see [`crate::audit::sources::reload_sources`]), so the
+/// sinks the pipeline builds as it starts follow what is stored now.
+pub async fn set_audit_pipeline_mode(mode: ServerMode) {
+    let Some(control) = AUDIT_PIPELINE.get() else {
+        return;
+    };
+    match mode {
+        ServerMode::Active => {
+            crate::audit::sources::reload_sources().await;
+            start_audit_pipeline(control).await;
+        }
+        ServerMode::Standby => {
+            control.stop().await;
+            set_audit_pipeline_started(false);
+            info!(target: "credential_delegation", "Standby mode: audit pipeline stopped");
         }
     }
 }
 
-/// Emit an audit event. Non-blocking; returns immediately.
-///
-/// If a task-local [`AUDIT_DEFER_QUEUE`] is installed in the current task,
-/// the event is buffered there instead of being sent to the writer. The
-/// caller (typically the proxy request handler) is responsible for draining
-/// the queue once it has minted the canonical identity VP and stamping
-/// `vp_jwt` on every event before invoking [`audit`] again — which will then
-/// emit directly because the drain happens outside the `task_local!` scope.
-pub fn audit(event: DelegationAuditEvent) {
-    if let Ok(queue) = AUDIT_DEFER_QUEUE.try_with(|q| q.clone())
-        && let Ok(mut guard) = queue.lock()
-    {
-        guard.push(event);
-        return;
+/// Builds the audit sinks and starts the pipeline. While the sinks cannot be
+/// built, or another writer still has the journal open (a node that has not
+/// finished stepping down), keeps trying in the background until it starts
+/// or the pipeline is stopped for Standby.
+async fn start_audit_pipeline(control: &'static PipelineControl) {
+    let epoch = control.epoch();
+    match control.try_start().await {
+        Ok(()) => audit_pipeline_started(),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            set_audit_pipeline_started(false);
+            warn!(
+                target: "credential_delegation",
+                error = %e,
+                "Audit pipeline cannot start yet; starting it once it can"
+            );
+            tokio::spawn(async move {
+                match control
+                    .start_when_free(AUDIT_JOURNAL_RETRY, &epoch)
+                    .await
+                {
+                    Ok(true) => audit_pipeline_started(),
+                    Ok(false) => {}
+                    Err(e) => audit_pipeline_failed(&e),
+                }
+            });
+        }
+        Err(e) => audit_pipeline_failed(&e),
     }
-    if let Some(sender) = AUDIT_SENDER.get()
-        && sender.send(event).is_err()
-    {
-        warn!(
-            target: "credential_delegation",
-            "Delegation audit channel closed — event dropped"
-        );
+}
+
+fn audit_pipeline_started() {
+    set_audit_pipeline_started(true);
+    if let Some(path) = AUDIT_PATH.get() {
+        info!(target: "credential_delegation", path = %path.display(), "Audit pipeline started");
     }
-    // If audit logger not initialized, silently drop — tracing still captures the event
+}
+
+fn audit_pipeline_failed(e: &std::io::Error) {
+    set_audit_pipeline_started(false);
+    error!(
+        target: "credential_delegation",
+        error = %e,
+        "Failed to start the audit pipeline; no audit records will be kept or forwarded"
+    );
+}
+
+/// Whether any audit sink selects `category`. For records whose building
+/// needs `.await`; otherwise use [`emit`].
+pub fn wants(category: &str) -> bool {
+    crate::audit::producer::producer().wants(category)
+}
+
+/// Submits a record built after [`wants`] returned true. Non-blocking.
+pub fn submit(event: DelegationAuditEvent) {
+    crate::audit::producer::producer().submit(event);
+}
+
+/// Builds an audit record with `build` and submits it, only when an audit sink
+/// selects `category`. Non-blocking; returns at once.
+pub fn emit(
+    category: &'static str,
+    build: impl FnOnce() -> DelegationAuditEvent,
+) {
+    crate::audit::producer::producer().emit(category, build);
 }
 
 /// Convenience: build an audit event with common fields pre-filled
+pub(crate) fn new_event_id() -> Option<String> {
+    Some(uuid::Uuid::new_v4().to_string())
+}
+
 pub fn audit_event(
     action: DelegationAuditAction,
     agent_did: Option<&str>,
@@ -717,6 +789,7 @@ pub fn audit_event(
     channel_id: Option<&str>,
 ) -> DelegationAuditEvent {
     DelegationAuditEvent {
+        event_id: new_event_id(),
         timestamp: Utc::now().to_rfc3339(),
         event: action,
         agent_did: agent_did.map(String::from),
@@ -756,15 +829,78 @@ pub fn record_payment_event(
     via_fabric: bool,
     vc_jwt: Option<&str>,
 ) {
-    let mut event = audit_event(DelegationAuditAction::PaymentEvent(Box::new(details)), None, None, None, surface_id);
-    event.channel_name = channel_name.map(String::from);
-    event.trace_id = trace_id.map(String::from);
-    event.via_fabric = via_fabric;
-    if let Some(jwt) = vc_jwt {
-        event.vp_jwt = Some(jwt.to_string());
-        event.vp_fingerprint = Some(vp_fingerprint(jwt));
-    }
-    audit(event);
+    emit("payment", || {
+        let mut event =
+            audit_event(DelegationAuditAction::PaymentEvent(Box::new(details)), None, None, None, surface_id);
+        event.channel_name = channel_name.map(String::from);
+        event.trace_id = trace_id.map(String::from);
+        event.via_fabric = via_fabric;
+        if let Some(jwt) = vc_jwt {
+            event.vp_jwt = Some(jwt.to_string());
+            event.vp_fingerprint = Some(vp_fingerprint(jwt));
+        }
+        event
+    });
+}
+
+/// One identity VP injected into a proxied request or response.
+pub struct VpInjection<'a> {
+    pub agent_did: Option<&'a str>,
+    pub user_hash: Option<&'a str>,
+    pub surface_id: Option<&'a str>,
+    pub channel_name: &'a str,
+    pub target_endpoint: &'a str,
+    pub protocol: &'a str,
+    pub mcp_tool_name: Option<&'a str>,
+    pub vp_jwt: &'a str,
+    /// The request's own trace id, which groups the record with its policy
+    /// decisions.
+    pub trace_id: Option<&'a str>,
+    /// Where the VP went, e.g. `request_path` or `response_path`.
+    pub detail: String,
+    /// The authenticated caller; the request's audit caller when `None`.
+    pub caller: Option<AuditCallerContext>,
+    pub via_fabric: bool,
+}
+
+/// The `vp_injected` record for `injection`: every site records the same
+/// fields, including the VP's fingerprint.
+pub fn vp_injected_event(injection: VpInjection<'_>) -> DelegationAuditEvent {
+    let mut event = audit_event(
+        DelegationAuditAction::VpInjected,
+        injection.agent_did,
+        injection.user_hash,
+        None,
+        injection.surface_id,
+    );
+    event.agent_identity_did = injection
+        .agent_did
+        .map(str::to_string);
+    event.channel_name = Some(
+        injection
+            .channel_name
+            .to_string(),
+    );
+    event.target_endpoint = Some(
+        injection
+            .target_endpoint
+            .to_string(),
+    );
+    event.protocol = Some(injection.protocol.to_string());
+    event.mcp_tool_name = injection
+        .mcp_tool_name
+        .map(str::to_string);
+    event.vp_jwt = Some(injection.vp_jwt.to_string());
+    event.vp_fingerprint = Some(vp_fingerprint(injection.vp_jwt));
+    event.trace_id = injection
+        .trace_id
+        .map(str::to_string);
+    event.detail = Some(injection.detail);
+    event.caller = injection
+        .caller
+        .or_else(crate::audit::context::current_caller);
+    event.via_fabric = injection.via_fabric;
+    event
 }
 
 /// Compute a `sha256:<hex>` fingerprint for a VP JWT string.
@@ -914,6 +1050,46 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
     })
 }
 
+/// Build an `AuditCallerContext` from the caller a received identity binding
+/// discloses in `workloadBinding.caller`: the `sub`, `email` and `name` the
+/// sending gateway chose to include, with that gateway as the issuer. `None`
+/// unless a trust anchor vouched for the binding and it names a caller.
+pub fn binding_caller_context(binding: &crate::surface_context::IdentityBindingContext) -> Option<AuditCallerContext> {
+    if !binding.verified {
+        return None;
+    }
+    let fields = &binding
+        .caller
+        .as_ref()?
+        .fields;
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let (sub, email, name) = (field("sub"), field("email"), field("name"));
+    if sub.is_none() && email.is_none() && name.is_none() {
+        return None;
+    }
+    Some(AuditCallerContext {
+        auth_method: "workload_binding".to_string(),
+        iss: Some(binding.gateway_did.clone()),
+        aud: None,
+        sub,
+        token_id: None,
+        email,
+        name,
+        email_redacted: None,
+        name_redacted: None,
+        mtls_fingerprint: None,
+        mtls_subject_dn: None,
+        mtls_issuer_dn: None,
+        mtls_source: None,
+    })
+}
+
 /// Build an `AuditCallerContext` for a management-API caller (delegation-vault
 /// management routes). The caller is a console operator authenticated by the
 /// session/PAT middleware, so `sub` is the authenticated `user_id` and, when the
@@ -985,8 +1161,15 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::ElicitationDeclined => "elicitation_declined",
         DelegationAuditAction::ElicitationCancelled => "elicitation_cancelled",
         DelegationAuditAction::ElicitationTimedOut => "elicitation_timed_out",
-        DelegationAuditAction::PreAuthorizeBlocked => "pre_authorize_blocked",
         DelegationAuditAction::PaymentEvent(_) => "payment",
+        DelegationAuditAction::AuthFailed { .. } => "auth_failed",
+        DelegationAuditAction::RateLimited { .. } => "rate_limited",
+        DelegationAuditAction::RequestRejected { .. } => "request_rejected",
+        DelegationAuditAction::IdentityBindingFailed { .. } => "identity_binding_failed",
+        DelegationAuditAction::IdentityBindingVerified { .. } => "identity_binding_verified",
+        DelegationAuditAction::DelegationFailed { .. } => "delegation_failed",
+        DelegationAuditAction::RequestFailed { .. } => "request_failed",
+        DelegationAuditAction::RequestCompleted { .. } => "request_completed",
     }
 }
 
@@ -1142,11 +1325,12 @@ pub async fn read_audit_log(
     })
 }
 
-/// Emit a policy-decision audit event when the audit config has `policies` enabled.
-/// Called from policy_audit.rs once a global settings accessor is available.
+/// Emit a policy-decision audit record (`decision` is `allow`, `deny` or
+/// `error`) when a sink selects `policy_decision`. Called from
+/// [`crate::observability::policy_audit::record_policy_decision`].
 pub fn audit_policy_decision(
     scope: &str,
-    decision: bool,
+    decision: &str,
     policy_id: &str,
     policy_name: Option<&str>,
     policy_definition_id: Option<&str>,
@@ -1160,8 +1344,10 @@ pub fn audit_policy_decision(
     policy_version: Option<u32>,
     policy_content_hash: Option<&str>,
     caller: Option<AuditCallerContext>,
+    removed_tools: Option<&[String]>,
 ) {
-    let mut event = DelegationAuditEvent {
+    emit("policy_decision", || DelegationAuditEvent {
+        event_id: new_event_id(),
         timestamp: Utc::now().to_rfc3339(),
         event: DelegationAuditAction::PolicyDecision {
             scope: scope.to_string(),
@@ -1173,11 +1359,7 @@ pub fn audit_policy_decision(
             policy_definition_id: policy_definition_id
                 .filter(|d| !d.is_empty())
                 .map(str::to_string),
-            decision: if decision {
-                "allow".to_string()
-            } else {
-                "deny".to_string()
-            },
+            decision: decision.to_string(),
             deny_reason: deny_reason.map(str::to_string),
             surface_id: surface_id.map(str::to_string),
             caller_did: caller_did.map(str::to_string),
@@ -1185,6 +1367,7 @@ pub fn audit_policy_decision(
             http_path: http_path.map(str::to_string),
             policy_version,
             policy_content_hash: policy_content_hash.map(str::to_string),
+            removed_tools: removed_tools.map(<[String]>::to_vec),
         },
         agent_did: None,
         agent_identity_did: None,
@@ -1205,26 +1388,27 @@ pub fn audit_policy_decision(
         vp_fingerprint: None,
         trace_id: trace_id.map(str::to_string),
         detail: None,
-    };
-    let _ = &mut event;
-    audit(event);
+    });
 }
 
-/// Emit a trust-check audit event when the audit config has `trust_checks` enabled.
-/// Called from [`crate::observability::trust_check_audit::record_trust_check`],
-/// which applies the `trust_checks` category gate.
+/// Emit a trust-check audit record when a sink selects `trust_check`. Called
+/// from [`crate::observability::trust_check_audit::record_trust_check`]. The
+/// caller comes from [`crate::audit::context::with_caller`].
 ///
 /// `authority_id` / `entity_id` are `None` on the target-leg pre-check
 /// paths (`AGENT_CARD_UNAVAILABLE`, `TRUST_REGISTRY_METADATA_UNAVAILABLE`)
 /// so the emitted JSONL omits them, matching the wire shape.
 pub fn audit_trust_check(
+    surface_id: Option<&str>,
+    trace_id: Option<&str>,
     leg: &str,
     authority_id: Option<&str>,
     entity_id: Option<&str>,
     ok: bool,
     error_code: Option<&str>,
 ) {
-    let event = DelegationAuditEvent {
+    emit("trust_check", || DelegationAuditEvent {
+        event_id: new_event_id(),
         timestamp: Utc::now().to_rfc3339(),
         event: DelegationAuditAction::TrustCheck {
             leg: leg.to_string(),
@@ -1238,7 +1422,7 @@ pub fn audit_trust_check(
         user_identity_hash: None,
         provider_id: None,
         provider_name: None,
-        surface_id: None,
+        surface_id: surface_id.map(str::to_string),
         channel_name: None,
         target_endpoint: None,
         protocol: None,
@@ -1246,14 +1430,13 @@ pub fn audit_trust_check(
         token_id: None,
         inject_as: None,
         via_fabric: false,
-        caller: None,
+        caller: crate::audit::context::current_caller(),
         mcp_tool_name: None,
         vp_jwt: None,
         vp_fingerprint: None,
-        trace_id: None,
+        trace_id: trace_id.map(str::to_string),
         detail: None,
-    };
-    audit(event);
+    });
 }
 
 /// Emit a dedicated audit event recording that this surface terminated the
@@ -1269,7 +1452,8 @@ pub fn audit_trace_terminated(
     flow: &str,
     via_fabric: bool,
 ) {
-    let event = DelegationAuditEvent {
+    emit("trace_terminated", || DelegationAuditEvent {
+        event_id: new_event_id(),
         timestamp: Utc::now().to_rfc3339(),
         event: DelegationAuditAction::TraceTerminated {
             own_trace_id: own_trace_id.to_string(),
@@ -1295,8 +1479,7 @@ pub fn audit_trace_terminated(
         vp_fingerprint: None,
         trace_id: Some(own_trace_id.to_string()),
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
-    };
-    audit(event);
+    });
 }
 
 #[cfg(test)]
@@ -1406,6 +1589,7 @@ mod tests {
     #[test]
     fn test_trace_terminated_event_correlates_to_own_trace() {
         let event = DelegationAuditEvent {
+            event_id: None,
             timestamp: Utc::now().to_rfc3339(),
             event: DelegationAuditAction::TraceTerminated {
                 own_trace_id: "own-123".to_string(),
@@ -1545,7 +1729,6 @@ mod tests {
             (DelegationAuditAction::ElicitationDeclined, "elicitation_declined"),
             (DelegationAuditAction::ElicitationCancelled, "elicitation_cancelled"),
             (DelegationAuditAction::ElicitationTimedOut, "elicitation_timed_out"),
-            (DelegationAuditAction::PreAuthorizeBlocked, "pre_authorize_blocked"),
         ];
 
         for (action, expected_name) in actions {
@@ -1578,6 +1761,7 @@ mod tests {
                 http_path: None,
                 policy_version: None,
                 policy_content_hash: None,
+                removed_tools: None,
             }
             .is_vp_audit()
         );
@@ -1608,11 +1792,164 @@ mod tests {
             DelegationAuditAction::ElicitationDeclined,
             DelegationAuditAction::ElicitationCancelled,
             DelegationAuditAction::ElicitationTimedOut,
-            DelegationAuditAction::PreAuthorizeBlocked,
         ];
         for action in delegation_actions {
             assert!(!action.is_vp_audit(), "{:?} should not be classified as VP audit", action);
         }
+    }
+
+    fn request_path_actions() -> Vec<(DelegationAuditAction, &'static str)> {
+        vec![
+            (
+                DelegationAuditAction::AuthFailed {
+                    scheme: AuthScheme::ApiKey,
+                    reason: "unknown_key".to_string(),
+                    blocking: true,
+                    client_ip: Some("203.0.113.7".to_string()),
+                },
+                "auth_failed",
+            ),
+            (
+                DelegationAuditAction::RateLimited {
+                    scope: RateLimitScope::SseSessions,
+                    retry_after_ms: Some(1500),
+                },
+                "rate_limited",
+            ),
+            (
+                DelegationAuditAction::RequestRejected {
+                    stage: RejectionStage::Admission,
+                    reason: RejectionReason::BodyTooLarge,
+                    http_status: 413,
+                    rpc_error_code: Some(-32600),
+                },
+                "request_rejected",
+            ),
+            (
+                DelegationAuditAction::IdentityBindingFailed {
+                    outcome: IdentityBindingFailure::Invalid,
+                    agent_did: None,
+                    issuer_gateway: None,
+                    error_detail: Some("signature mismatch".to_string()),
+                },
+                "identity_binding_failed",
+            ),
+            (
+                DelegationAuditAction::IdentityBindingVerified {
+                    agent_did: "did:web:agent.example".to_string(),
+                    issuer_gateway: Some("did:web:gw.example".to_string()),
+                    assurance: Some("gateway_attested".to_string()),
+                },
+                "identity_binding_verified",
+            ),
+            (
+                DelegationAuditAction::DelegationFailed {
+                    reason: DelegationFailureReason::AnonymousCaller,
+                    provider_id: Some("github".to_string()),
+                },
+                "delegation_failed",
+            ),
+            (
+                DelegationAuditAction::RequestFailed {
+                    outcome: RequestFailureOutcome::UpstreamTimeout,
+                    target_kind: TargetKind::Fabric,
+                    upstream_status: None,
+                    latency_ms: 30_000,
+                },
+                "request_failed",
+            ),
+            (
+                DelegationAuditAction::RequestCompleted {
+                    target_kind: TargetKind::McpProxy,
+                    upstream_status: 200,
+                    latency_ms: 42,
+                    request_bytes: 128,
+                    response_bytes: 2048,
+                    ucp_op: None,
+                    variant_alias: Some("beta".to_string()),
+                },
+                "request_completed",
+            ),
+        ]
+    }
+
+    #[test]
+    fn request_path_actions_have_their_category() {
+        for (action, category) in request_path_actions() {
+            assert_eq!(action_category(&action), category);
+        }
+    }
+
+    #[test]
+    fn request_path_actions_round_trip_through_the_stored_form() {
+        for (action, category) in request_path_actions() {
+            let stored = serde_json::to_value(&action).unwrap();
+            assert!(stored.get(category).is_some(), "{category} is stored under its own key: {stored}");
+            let read: DelegationAuditAction = serde_json::from_value(stored.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&read).unwrap(), stored, "{category}");
+        }
+    }
+
+    #[test]
+    fn request_path_actions_use_snake_case_values() {
+        let stored = serde_json::to_value(DelegationAuditAction::RequestRejected {
+            stage: RejectionStage::Admission,
+            reason: RejectionReason::ConsentIdentityRequired,
+            http_status: 403,
+            rpc_error_code: None,
+        })
+        .unwrap();
+        assert_eq!(stored["request_rejected"]["stage"], "admission");
+        assert_eq!(stored["request_rejected"]["reason"], "consent_identity_required");
+        assert!(
+            stored["request_rejected"]
+                .get("rpc_error_code")
+                .is_none(),
+            "an absent JSON-RPC code is left out of the record"
+        );
+    }
+
+    #[test]
+    fn unknown_value_in_a_closed_field_is_rejected() {
+        let stored = serde_json::json!({ "rate_limited": { "scope": "everything" } });
+        assert!(serde_json::from_value::<DelegationAuditAction>(stored).is_err());
+    }
+
+    #[test]
+    fn only_delegation_failed_belongs_to_the_delegation_log() {
+        for (action, category) in request_path_actions() {
+            assert_eq!(action.is_vp_audit(), category != "delegation_failed", "{category}");
+        }
+    }
+
+    #[test]
+    fn every_new_event_gets_its_own_event_id() {
+        let first = audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None);
+        let second = audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None);
+        let (first, second) = (first.event_id.unwrap(), second.event_id.unwrap());
+        assert_ne!(first, second);
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+    }
+
+    #[test]
+    fn a_stored_line_without_an_event_id_still_reads() {
+        let mut stored =
+            serde_json::to_value(audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None)).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .remove("event_id");
+        let read: DelegationAuditEvent = serde_json::from_value(stored).unwrap();
+        assert_eq!(read.event_id, None);
+    }
+
+    #[test]
+    fn stored_pre_authorize_blocked_line_is_not_an_audit_event() {
+        let stored = serde_json::to_string(&audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None))
+            .unwrap()
+            .replace("\"consent_granted\"", "\"pre_authorize_blocked\"");
+        assert!(stored.contains("\"pre_authorize_blocked\""));
+        assert!(serde_json::from_str::<DelegationAuditEvent>(&stored).is_err());
     }
 
     #[test]
@@ -1636,6 +1973,7 @@ mod tests {
                 http_path: None,
                 policy_version: None,
                 policy_content_hash: None,
+                removed_tools: None,
             }),
         ];
 
@@ -1687,6 +2025,7 @@ mod tests {
         }));
         let mut events = vec![
             DelegationAuditEvent {
+                event_id: None,
                 timestamp: "2026-08-18T00:00:00Z".to_string(),
                 event: DelegationAuditAction::VpInjected,
                 agent_did: None,
@@ -1710,6 +2049,7 @@ mod tests {
                 detail: None,
             },
             DelegationAuditEvent {
+                event_id: None,
                 timestamp: "2026-08-18T00:00:01Z".to_string(),
                 event: DelegationAuditAction::PolicyDecision {
                     scope: "surface".to_string(),
@@ -1725,6 +2065,7 @@ mod tests {
                     http_path: Some("/payments/collect/caviar".to_string()),
                     policy_version: None,
                     policy_content_hash: None,
+                    removed_tools: None,
                 },
                 agent_did: None,
                 agent_identity_did: None,
@@ -1769,34 +2110,32 @@ mod tests {
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
         };
-        let queue: Arc<Mutex<Vec<DelegationAuditEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        AUDIT_DEFER_QUEUE
-            .scope(queue.clone(), async {
-                let decide = |caller| {
-                    audit_policy_decision(
-                        "surface",
-                        false,
-                        "surface.policy",
-                        Some("Deny unknown callers"),
-                        None,
-                        Some("caller not recognised"),
-                        Some("surface-1"),
-                        None,
-                        Some("POST"),
-                        Some("/a2a"),
-                        Some("trace-1"),
-                        "access_point",
-                        Some(3),
-                        Some("sha256:abc"),
-                        caller,
-                    )
-                };
-                decide(Some(build_caller_context(&identity)));
-                decide(None);
-            })
-            .await;
+        let ((), events) = crate::audit::producer::capture(async {
+            let decide = |caller| {
+                audit_policy_decision(
+                    "surface",
+                    "deny",
+                    "surface.policy",
+                    Some("Deny unknown callers"),
+                    None,
+                    Some("caller not recognised"),
+                    Some("surface-1"),
+                    None,
+                    Some("POST"),
+                    Some("/a2a"),
+                    Some("trace-1"),
+                    "access_point",
+                    Some(3),
+                    Some("sha256:abc"),
+                    caller,
+                    None,
+                )
+            };
+            decide(Some(build_caller_context(&identity)));
+            decide(None);
+        })
+        .await;
 
-        let events = queue.lock().unwrap();
         assert_eq!(events.len(), 2);
         let caller = events[0]
             .caller
@@ -1864,112 +2203,136 @@ mod tests {
         );
     }
 
+    fn binding(
+        verified: bool,
+        caller_fields: Option<serde_json::Value>,
+    ) -> crate::surface_context::IdentityBindingContext {
+        crate::surface_context::IdentityBindingContext {
+            verified,
+            agent_did: "did:key:agent".to_string(),
+            gateway_did: "did:web:gw-1".to_string(),
+            identity_fields: std::collections::HashMap::new(),
+            caller: caller_fields.map(|fields| crate::surface_context::CallerBindingContext {
+                fields: serde_json::from_value(fields).unwrap(),
+                user_hash: Some("hash-1".to_string()),
+                assurance: "gateway_attested".to_string(),
+                identity_source: Some("jwt_bearer".to_string()),
+            }),
+            delegated: true,
+            target: None,
+            intent: None,
+            inbound_credentials: Vec::new(),
+        }
+    }
+
     #[test]
-    fn test_audit_without_init_does_not_panic() {
-        // audit() should silently drop when logger is not initialized
-        let evt = audit_event(DelegationAuditAction::TokenInjected, None, None, None, None);
-        audit(evt); // Should not panic
+    fn a_verified_binding_names_the_caller_its_gateway_disclosed() {
+        let caller = binding_caller_context(&binding(
+            true,
+            Some(serde_json::json!({"sub": "user-123", "email": "ada@example.com", "name": "Ada Lovelace"})),
+        ))
+        .unwrap();
+
+        assert_eq!(caller.auth_method, "workload_binding");
+        assert_eq!(caller.iss.as_deref(), Some("did:web:gw-1"), "the gateway that signed the binding");
+        assert_eq!(caller.sub.as_deref(), Some("user-123"));
+        assert_eq!(caller.email.as_deref(), Some("ada@example.com"));
+        assert_eq!(caller.name.as_deref(), Some("Ada Lovelace"));
+    }
+
+    #[test]
+    fn a_binding_names_no_caller_unless_verified_and_disclosed() {
+        let disclosed = Some(serde_json::json!({"email": "ada@example.com"}));
+        assert!(binding_caller_context(&binding(false, disclosed)).is_none(), "no trust anchor vouched for it");
+        assert!(binding_caller_context(&binding(true, None)).is_none());
+        assert!(binding_caller_context(&binding(true, Some(serde_json::json!({"email": ""})))).is_none());
+    }
+
+    fn injection<'a>(caller: Option<AuditCallerContext>) -> VpInjection<'a> {
+        VpInjection {
+            agent_did: Some("did:web:agent"),
+            user_hash: Some("sha256:user"),
+            surface_id: Some("surface-1"),
+            channel_name: "alpha",
+            target_endpoint: "https://target.example/a2a",
+            protocol: "a2a",
+            mcp_tool_name: None,
+            vp_jwt: "header.payload.signature",
+            trace_id: Some("trace-1"),
+            detail: "request_path".to_string(),
+            caller,
+            via_fabric: false,
+        }
+    }
+
+    #[test]
+    fn a_vp_injection_record_has_the_full_field_set() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "user-1".to_string(),
+            claims: serde_json::json!({}),
+        };
+        let event = vp_injected_event(injection(Some(build_caller_context(&identity))));
+
+        assert!(matches!(event.event, DelegationAuditAction::VpInjected));
+        assert_eq!(event.trace_id.as_deref(), Some("trace-1"));
+        assert_eq!(event.detail.as_deref(), Some("request_path"));
+        assert_eq!(event.vp_jwt.as_deref(), Some("header.payload.signature"));
+        assert_eq!(event.vp_fingerprint, Some(vp_fingerprint("header.payload.signature")));
+        assert_eq!(
+            event
+                .caller
+                .as_ref()
+                .and_then(|caller| caller.sub.as_deref()),
+            Some("user-1")
+        );
+        assert_eq!(
+            event
+                .agent_identity_did
+                .as_deref(),
+            Some("did:web:agent")
+        );
+        assert_eq!(event.surface_id.as_deref(), Some("surface-1"));
+        assert_eq!(event.channel_name.as_deref(), Some("alpha"));
     }
 
     #[tokio::test]
-    async fn test_audit_writer_writes_jsonl() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit_path = dir
-            .path()
-            .join("test-audit.jsonl");
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        let forwarded: Arc<Mutex<Vec<DelegationAuditEvent>>> = Arc::new(Mutex::new(Vec::new()));
-
-        // Spawn writer
-        let path_clone = audit_path.clone();
-        let sink = forwarded.clone();
-        let handle = tokio::spawn(audit_writer_task(path_clone, rx, move |event| {
-            sink.lock()
-                .unwrap()
-                .push(event)
-        }));
-
-        // Send a couple of events
-        let evt1 = audit_event(
-            DelegationAuditAction::ConsentGranted,
-            Some("did:web:agent1"),
-            Some("sha256:user1"),
-            Some("github"),
-            Some("ch-1"),
+    async fn a_vp_injection_without_a_caller_takes_the_requests_caller() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "user-2".to_string(),
+            claims: serde_json::json!({}),
+        };
+        let event = crate::audit::context::with_caller(Some(build_caller_context(&identity)), async {
+            vp_injected_event(injection(None))
+        })
+        .await;
+        assert_eq!(
+            event
+                .caller
+                .as_ref()
+                .and_then(|caller| caller.sub.as_deref()),
+            Some("user-2")
         );
-        let mut evt2 =
-            audit_event(DelegationAuditAction::TokenInjected, Some("did:web:agent2"), None, Some("google"), None);
-        evt2.via_fabric = true;
-
-        tx.send(evt1).unwrap();
-        tx.send(evt2).unwrap();
-
-        // Drop sender to signal EOF
-        drop(tx);
-
-        // Wait for writer to finish
-        handle.await.unwrap();
-
-        // Read and verify
-        let contents = std::fs::read_to_string(&audit_path).unwrap();
-        let lines: Vec<&str> = contents
-            .trim()
-            .split('\n')
-            .collect();
-        assert_eq!(lines.len(), 2, "Should have 2 JSONL lines");
-
-        let line1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(line1["event"], "consent_granted");
-        assert_eq!(line1["agent_did"], "did:web:agent1");
-        assert_eq!(line1["via_fabric"], false);
-
-        let line2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(line2["event"], "token_injected");
-        assert_eq!(line2["provider_id"], "google");
-        assert_eq!(line2["via_fabric"], true);
-        // None fields should not appear
-        assert!(
-            line2
-                .get("user_identity_hash")
-                .is_none()
-        );
-        assert!(
-            line2
-                .get("channel_id")
-                .is_none()
-        );
-
-        let forwarded = forwarded.lock().unwrap();
-        assert_eq!(forwarded.len(), 2, "every appended event is forwarded");
-        assert!(matches!(forwarded[0].event, DelegationAuditAction::ConsentGranted));
-        assert!(matches!(forwarded[1].event, DelegationAuditAction::TokenInjected));
-        assert!(forwarded[1].via_fabric);
     }
 
     #[tokio::test]
-    async fn test_audit_writer_does_not_forward_unpersisted_events() {
-        let dir = tempfile::tempdir().unwrap();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let forwarded: Arc<Mutex<Vec<DelegationAuditEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = forwarded.clone();
-        let handle = tokio::spawn(audit_writer_task(dir.path().to_path_buf(), rx, move |event| {
-            sink.lock()
-                .unwrap()
-                .push(event)
-        }));
-
-        tx.send(audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None))
-            .unwrap();
-        drop(tx);
-        handle.await.unwrap();
-
-        assert!(
-            forwarded
-                .lock()
-                .unwrap()
-                .is_empty(),
-            "an event the audit log could not append must not be forwarded"
+    async fn a_trust_check_record_carries_its_surface_and_trace() {
+        let ((), events) = crate::audit::producer::capture(async {
+            audit_trust_check(Some("surface-1"), Some("trace-1"), "caller", Some("did:a"), Some("did:e"), true, None);
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some("surface-1")
         );
+        assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[test]
+    fn emitting_before_the_pipeline_starts_does_not_panic() {
+        emit("token_injected", || audit_event(DelegationAuditAction::TokenInjected, None, None, None, None));
+        submit(audit_event(DelegationAuditAction::TokenInjected, None, None, None, None));
     }
 }

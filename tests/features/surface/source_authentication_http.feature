@@ -11,16 +11,18 @@ Feature: HTTP surface source authentication
   Scenario Outline: JWT Bearer failures are forwarded when no blocking policy is configured
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "JWT Bearer" source authentication
+    And the VP Audit Log keeps every audit event
     When the caller sends a request to the surface <auth condition>
     Then the response status is 200
     And managed agent "bravo" received the forwarded request
+    And the VP Audit Log records a non-blocking "JWT Bearer" source authentication failure for "<failure>"
 
     Examples:
-      | auth condition         |
-      | without a token        |
-      | with an expired token  |
-      | with a malformed token |
-      | with a tampered token  |
+      | auth condition         | failure               |
+      | without a token        | a missing credential  |
+      | with an expired token  | an invalid credential |
+      | with a malformed token | an invalid credential |
+      | with a tampered token  | an invalid credential |
 
   Scenario Outline: JWT Bearer failures are blocked when a policy denies unverified callers
     Given an A2A surface targeting managed agent "bravo"
@@ -50,16 +52,18 @@ Feature: HTTP surface source authentication
   Scenario Outline: API key failures are forwarded when no blocking policy is configured
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "<auth type>" source authentication
+    And the VP Audit Log keeps every audit event
     When the caller sends a request to the surface <credential condition>
     Then the response status is 200
     And managed agent "bravo" received the forwarded request
+    And the VP Audit Log records a non-blocking "<auth type>" source authentication failure for "<failure>"
 
     Examples:
-      | auth type        | credential condition    |
-      | API Key          | without an API key      |
-      | API Key          | with an invalid API key |
-      | API Key Provider | without an API key      |
-      | API Key Provider | with an invalid API key |
+      | auth type        | credential condition    | failure               |
+      | API Key          | without an API key      | a missing credential  |
+      | API Key          | with an invalid API key | an invalid credential |
+      | API Key Provider | without an API key      | a missing credential  |
+      | API Key Provider | with an invalid API key | an invalid credential |
 
   Scenario Outline: API key failures are blocked when a policy denies unverified callers
     Given an A2A surface targeting managed agent "bravo"

@@ -88,7 +88,7 @@ fn fabric_route_probe_reaches_an_external_upstream_without_waiting_for_a_mock() 
     assert!(
         probe
             .extra_headers
-            .contains(&("MCP-Protocol-Version".to_string(), "2026-07-28".to_string()))
+            .contains(&("MCP-Protocol-Version".to_string(), bdd_support::json_rpc::McpVersion::Modern.to_string()))
     );
     assert_eq!(probe.sub_path, "");
     assert!(!probe.expect_target_call);

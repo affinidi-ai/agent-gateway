@@ -6,6 +6,7 @@ import type { SurfaceNodeType } from '../components/surface-builder/nodeTypes';
 import { getIncompleteReason } from '../components/surface-builder/SurfaceCanvas';
 import type { Protocol } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
+import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
@@ -34,6 +35,7 @@ import { showToast } from '../utils/toaster';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
+const GENERATED_NAME_SIGNATURE = '\u0000generated-name';
 
 interface CreateBuilderState {
   nodes: CanvasNode[];
@@ -98,8 +100,15 @@ const AddSurfacePage: React.FC = () => {
   const [status, setStatus] = useState<AgentSurface['status']>('active');
   const [protocol, setProtocol] = useState<Protocol>(initialProtocol);
   const [surfaceId] = useState<string>(() => crypto.randomUUID());
-  const [name, setName] = useState(
-    () => `${initialProtocol.toUpperCase()} Surface #${surfaceId.slice(-4)}`
+  const [existingSurfaces, setExistingSurfaces] = useState<AgentSurface[] | null>(null);
+  // `null` keeps the generated `<protocol>_surface_<n>` default, which
+  // follows the protocol until the user types a different name.
+  const [customName, setName] = useState<string | null>(null);
+  const generatedName = defaultSurfaceName(protocol, existingSurfaces ?? []);
+  const name = customName ?? generatedName;
+  const setTypedName = useCallback(
+    (value: string) => setName(value === generatedName ? null : value),
+    [generatedName]
   );
   const [publishToDid, setPublishToDid] = useState(false);
   const [terminateTraceId, setTerminateTraceId] = useState(false);
@@ -196,6 +205,21 @@ const AddSurfacePage: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    let alive = true;
+    apiClient
+      .listSurfaces()
+      .then(list => {
+        if (alive) setExistingSurfaces(list);
+      })
+      .catch(() => {
+        if (alive) setExistingSurfaces([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const surfaceSizeRef = useRef<{ w: number; h: number } | null>(null);
   const canvasViewRef = useRef<{ x: number; y: number; k: number } | null>(null);
   /**
@@ -282,19 +306,6 @@ const AddSurfacePage: React.FC = () => {
     hasDependencyErrors,
     dependencyErrors,
   } = builder;
-
-  // Once the AP node has a route replace the "{PROTOCOL} Surface #{xxxx}" placeholder
-  // with"{PROTOCOL} Surface - {route}" so users see a meaningful default.
-  // Only fires while the name still holds the initial #-id placeholder;
-  // once the user has typed custom name the check fails and the name value
-  // stay untouched.
-  useEffect(() => {
-    const route = builder.state.nodes.find(n => n.id === 'access-point')?.config?.route;
-    if (!route) return;
-    if (!name.startsWith(`${protocol.toUpperCase()} Surface #`)) return;
-    setName(`${protocol.toUpperCase()} Surface - ${route}`);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [builder.state.nodes]);
 
   const buildSurfacePayload = useCallback((): Partial<AgentSurface> => {
     const payload = buildPayload({
@@ -477,9 +488,11 @@ const AddSurfacePage: React.FC = () => {
   // Compute the live dirty signature on every render. Cheap (a single
   // JSON.stringify of the canvas + meta state) and reused for both the
   // baseline-capture effect and the unsaved-changes prompt.
+  // The generated name changes when the surface list loads, so it is left
+  // out of the signature; only a name the user set counts as an edit.
   const currentSignature = serializeDirtySignature({
     nodes: builder.state.nodes,
-    name,
+    name: customName ?? GENERATED_NAME_SIGNATURE,
     description,
     tagsCsv,
     status,
@@ -558,9 +571,9 @@ const AddSurfacePage: React.FC = () => {
         const tags = Array.isArray(payload.tags) ? payload.tags : [];
         // Only touch `name` when the payload actually carries the key.
         // Full-template apply deletes it so we preserve whatever the
-        // user has already typed (or the empty default).
+        // user has already typed (or the generated default).
         if ('name' in payload) {
-          setName(typeof payload.name === 'string' ? payload.name : '');
+          setTypedName(typeof payload.name === 'string' ? payload.name : '');
         }
         setDescription(typeof payload.description === 'string' ? payload.description : '');
         setTagsCsv(tags.join(', '));
@@ -586,7 +599,7 @@ const AddSurfacePage: React.FC = () => {
       }
       return null;
     },
-    [builder]
+    [builder, setTypedName]
   );
 
   const handleApplyStarterTemplate = useCallback(
@@ -598,14 +611,7 @@ const AddSurfacePage: React.FC = () => {
         const tplProtocol = surface?.access_point?.protocol as Protocol | undefined;
         if (tplProtocol && ALL_PROTOCOLS.includes(tplProtocol)) {
           setProtocol(tplProtocol);
-          // Derive name from the template's access-point route when available;
-          // fall back to the random-id placeholder if the route is absent.
-          const tplRoute = surface?.access_point?.route;
-          setName(
-            tplRoute
-              ? `${tplProtocol.toUpperCase()} Surface - ${tplRoute}`
-              : `${tplProtocol.toUpperCase()} Surface #${surfaceId.slice(-4)}`
-          );
+          setName(null);
         }
         const err = applyJsonPayloadToCanvas(surface);
         if (err) {
@@ -792,7 +798,7 @@ const AddSurfacePage: React.FC = () => {
           didwebvh,
         }}
         setMeta={{
-          setName,
+          setName: setTypedName,
           setDescription,
           setTagsCsv,
           setStatus,

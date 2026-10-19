@@ -12,7 +12,9 @@ use crate::bdd_support::config::fabric_surface_fixture::{
     TransitPointHeaderMetadataMappingRowSpec, TransitPointSpec,
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
-use crate::bdd_support::json_rpc::{IdentityBindingProof, build_mcp_echo_response_body, build_target_ok_response};
+use crate::bdd_support::json_rpc::{
+    IdentityBindingProof, McpVersion, build_mcp_echo_response_body, build_target_ok_response,
+};
 use crate::bdd_support::mcp_consent::{ConsentRequest, complete_consent, open_consent_callback_with_tampered_state};
 use crate::bdd_support::mediator::Mediator as _;
 use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
@@ -21,8 +23,6 @@ use crate::bdd_support::policies::{
     build_surface_identity_binding_issuer_policy,
 };
 use crate::world::{FabricLink, G2gWorld, McpCaller, TransitPointFabricLink};
-
-const MODERN_MCP_VERSION: &str = "2026-07-28";
 
 fn set_target_response(
     world: &mut G2gWorld,
@@ -135,8 +135,8 @@ pub async fn a_fabric_with_n_gateways(
 }
 
 /// The receiving gateway admits Fabric streams as one whose surfaces serve
-/// only legacy MCP does; no product setting does this.
-#[given(regex = r#"^gateway (\d+) admits only MCP protocol version "2024-11-05" over Fabric$"#)]
+/// only that MCP revision does; no product setting does this.
+#[given(expr = "gateway {int} admits only MCP protocol version \"2024-11-05\" over Fabric")]
 pub async fn gateway_admits_only_legacy_mcp_over_fabric(
     world: &mut G2gWorld,
     gw_index: usize,
@@ -144,7 +144,7 @@ pub async fn gateway_admits_only_legacy_mcp_over_fabric(
     world
         .topology
         .plan_mut(gw_index)
-        .legacy_only_fabric_receive = true;
+        .fabric_receive_only = Some(McpVersion::Legacy);
 }
 
 #[given(regex = r"^mediator federation is enabled on gateway (\d+)$")]
@@ -792,6 +792,21 @@ pub async fn surface_requires_caller_identity_issued_by_gateway(
         .unwrap_or_else(|error| panic!("attach identity issuer policy to surface '{surface_id}': {error:#}"));
 }
 
+#[given(expr = "the VP Audit Log of gateway {int} keeps every audit event")]
+async fn vp_audit_log_of_gateway_keeps_every_audit_event(
+    world: &mut G2gWorld,
+    gateway: usize,
+) {
+    world.start().await;
+    world
+        .harness()
+        .gw(gateway)
+        .admin
+        .enable_every_audit_event()
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must keep every audit event: {error:#}"));
+}
+
 #[given(expr = "gateway {int} surface {string} has managed identity enabled")]
 pub async fn surface_has_managed_identity_enabled(
     world: &mut G2gWorld,
@@ -962,7 +977,11 @@ async fn surface_requires_delegated_credentials(
     let plan = world
         .topology
         .plan_mut(gw_index);
-    assert!(plan.modern_consent.is_none(), "gateway {gw_index} already has a surface with delegated credentials");
+    if plan.modern_consent.is_some() {
+        panic!(
+            "setup failed: the harness supports one surface with delegated credentials per gateway, gateway {gw_index} already has one"
+        );
+    }
     let surface = plan
         .surfaces
         .iter_mut()
@@ -1028,7 +1047,7 @@ async fn caller_has_been_asked_for_consent(
         &tool,
         gw_index,
         &surface_name,
-        MODERN_MCP_VERSION,
+        &McpVersion::Modern,
     )
     .await;
     let response = world
@@ -1036,12 +1055,15 @@ async fn caller_has_been_asked_for_consent(
         .take()
         .unwrap_or(Value::Null);
     let consent = ConsentRequest::from_response(&response).unwrap_or_else(|| {
-        panic!("gateway {gw_index} did not ask caller '{caller}' for consent: {:?} {response}", world.response_status)
+        panic!(
+            "setup failed: gateway {gw_index} did not ask caller '{caller}' for consent: {:?} {response}",
+            world.response_status
+        )
     });
     let original = world
         .sent_body
         .take()
-        .expect("the request that needs consent was sent");
+        .expect("setup failed: the request that needs consent was not recorded");
     world.response_status = None;
     world.consent_request = Some((consent, original));
 }
@@ -1062,11 +1084,12 @@ async fn caller_has_completed_consented_tool_call(
         .response_body
         .take()
         .unwrap_or(Value::Null);
-    assert!(
-        world.response_status == Some(200) && ConsentRequest::from_response(&response).is_none(),
-        "caller '{caller}' did not complete MCP tool '{tool}' after consent: {:?} {response}",
-        world.response_status
-    );
+    if world.response_status != Some(200) || ConsentRequest::from_response(&response).is_some() {
+        panic!(
+            "setup failed: caller '{caller}' did not complete MCP tool '{tool}' after consent: {:?} {response}",
+            world.response_status
+        );
+    }
     world.response_status = None;
     world.sent_body = None;
     world
@@ -1089,8 +1112,10 @@ async fn surface_no_longer_sends_delegated_credentials_over_fabric(
         .expect("opt the fabric route out of delegated credentials");
 }
 
-/// The caller signs in at the provider, which redirects back with a valid
-/// code; the gateway must refuse the callback because its `state` was altered.
+/// Seeds a consent callback the gateway has already refused: the caller signs
+/// in at the provider, which redirects back with a valid code but an altered
+/// `state`. The refusal is a precondition of the later retry, so a callback
+/// that is not refused fails setup.
 #[given(
     expr = "caller {string} has had a consent callback with a tampered state rejected for OAuth provider {string} at gateway {int}"
 )]
@@ -1120,11 +1145,10 @@ async fn caller_has_had_tampered_consent_callback_rejected(
         provider,
     )
     .await
-    .unwrap_or_else(|error| panic!("caller '{caller}' could not reach the consent callback: {error:#}"));
-    assert!(
-        status.is_client_error(),
-        "the consent callback with a tampered state should be rejected with a 4xx, got {status}"
-    );
+    .unwrap_or_else(|error| panic!("setup failed: caller '{caller}' could not reach the consent callback: {error:#}"));
+    if !status.is_client_error() {
+        panic!("setup failed: the consent callback with a tampered state was not rejected, got {status}");
+    }
 }
 
 #[given(expr = "caller {string} has completed consent for OAuth provider {string} at gateway {int}")]

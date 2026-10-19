@@ -91,6 +91,22 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning names the receiving gateway. Test ids:
   `<managed-agent|transit-point>-fabric-delegated-credentials-switch` and
   `-warning`. There is no surface-wide switch.
+- **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
+  access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
+  and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
+  (`_shared/RouteListenerSection.tsx`) with the shared `CopyButton`; a failed copy shows an
+  error toast. The canvas banner sits in the `.surface-canvas-topbar` flex row between the
+  variants widget and the toolbar, so it shrinks instead of sliding under either; only its
+  URL text truncates, and it leaves out the info icon. The Managed Agent panel does not
+  repeat the URL. Test ids: `access-point-entry-point-url` and `surface-entry-point-url`,
+  each with `-help` and `-copy-button`; the Transit Point's **Listener URL** banner is
+  `transit-point-listener-url`.
+- A new surface is named `<protocol>_surface_<n>` (`surfaceNaming.ts`), where `n` is one more
+  than the existing surfaces of that protocol, skipping names already taken. The name follows
+  the protocol until the user types a different name, from the Name field or the Config tab
+  JSON; typing the generated name back keeps it generated. It never derives from the route. The
+  unsaved-changes check ignores the generated name, so the surface list arriving never marks
+  the page dirty and edits made while it loads still do.
 - **Networking** retryable status codes: an empty field means the gateway default and
   saves no `retryable_status_codes`, and its placeholder says so. The **Retry on
   connection errors only** switch saves an empty list and disables the field. A field
@@ -115,12 +131,16 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
   a signed-out visitor sees the login page at that URL, and `loginNextTarget` re-encodes the
   query and returns to the form after passkey or SAML login (the gateway's SAML return-target
   allowlist accepts `/access-tokens/new`).
-- In create mode the form footer has a **Copy creation link** button
-  (`access-token-copy-permalink-button`) that copies an absolute `/access-tokens/new` URL
-  encoding the current name, description, scopes, expiry, resource pattern and headers
-  in the parameters above. It is disabled until the configuration would pass Create's
-  validation (name, scopes, resource pattern, headers, expiry), and it is not shown in edit
-  mode.
+- The form footer always has a **Copy creation link** button
+  (`access-token-copy-permalink-button`), in create and edit mode, that copies an absolute
+  `/access-tokens/new` URL encoding the current name, description, scopes, expiry, resource
+  pattern and headers in the parameters above. It is always enabled, even for an incomplete
+  or invalid configuration; the opened form validates on Create. When the settings are
+  invalid (a resource pattern or required header the form rejects, or a refused expiry) the
+  copy still happens and a `warning` toast says the opened form will not create a token until
+  they are fixed; missing fields and scopes the operator cannot grant do not warn. The toast
+  text never repeats what was typed (toasts render HTML). In edit mode it sits beside
+  **Revoke token** and the link carries no expiry.
 - A successful create replaces the editor with the secret page. The secret isn't rendered:
   the field shows a masked placeholder and **Copy** puts the real value on the clipboard.
   If copying fails (clipboard denied, or no clipboard API on a plain-HTTP origin), the
@@ -180,6 +200,20 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 - Do not add a PAT-only tenant field or tenant picker.
 
 Keep labels associated, timestamps exact, and clipboard failures visible.
+
+## Secret editor
+
+- `/secrets/new` and `/secrets/:id` have one save button, at the bottom of the form beside
+  **Delete Secret** (`secret-save-button`); `Cmd+S` and `Ctrl+S` follow the same path. In
+  edit mode, saving is possible only while **Update Secret Value** is checked or the name,
+  description, type or tags differ from the loaded secret, so undoing an edit disables it.
+- The API never returns a stored secret value, so the editor never shows one. In edit mode
+  the value field is disabled with a **Stored value is hidden** placeholder until **Update
+  Secret Value** is checked. Unchecking it, or a successful save, clears the entered value
+  and returns the field to that hidden state.
+- **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
+  value field is editable, and reveals only what was typed or generated on this page. The
+  value field is `secret-value-input`.
 
 ## MCP Proxy write warnings
 
@@ -349,6 +383,43 @@ The hidden file input is `data-testid="restore-file-input"`.
   template** action (`integration-audit-template-button`) replaces the payload with the
   audit template (routing fields plus `record: ${AUDIT_RECORD}`), which is the `audit`
   category's Stream/Webhook sample (see [Starting content](#starting-content)).
+- The card states that only the selected events are sent, whether or not the VP Audit Log
+  keeps them (`integration-audit-scope-note`), and that delivery is at least once, so
+  receivers deduplicate on `event_id`, with a stuck destination catching up in order, and
+  that disabling the integration pauses it, letting go of what it has not received, so once
+  re-enabled it receives only new records (`integration-audit-delivery-note`).
+
+### Events to send
+
+- The Add wizard and Edit page show **Events to send**
+  (`components/integrations/AuditEventsSection.tsx`, `integration-audit-events`) in the main
+  form, above the action buttons, only for the `audit` category. It is bound to the
+  integration's `audit_events`, and `audit_events` is sent only for that category.
+- It renders `components/integrations/AuditEventPicker.tsx` with the test id prefix
+  `integration-audit`: `integration-audit-picker`, one group toggle per group
+  (`integration-audit-group-<group>`, checked, unchecked or indeterminate) and one toggle
+  per event (`integration-audit-event-<event>`). Groups, labels and descriptions come from
+  `GET /v1/settings/audit-events` (`apiClient.getAuditEventCatalog`), never a hard-coded
+  list. Selected names the catalogue does not list are kept.
+- With nothing selected, saving is allowed and `integration-audit-events-empty` warns that
+  the integration will receive nothing. When the catalogue cannot be loaded,
+  `integration-audit-events-error` says so, no toggles are shown and saving keeps the stored
+  selection.
+- Below it, **Delivery limits**
+  (`components/integrations/AuditDeliveryLimitsSection.tsx`, `integration-audit-limits`), also
+  only for the `audit` category, has two optional number fields with the placeholder
+  **Never**: **Give up on a record after … attempts** (`integration-audit-max-attempts-input`,
+  bound to `audit_max_attempts`) and **Skip records older than … seconds**
+  (`integration-audit-drop-after-input`, bound to `audit_drop_after_secs`). Empty means no
+  limit. A value that is not a whole number of 1 or more is marked invalid
+  (`integration-audit-max-attempts-error`, `integration-audit-drop-after-error`) and blocks
+  saving with a message naming the field. Both are sent only for the `audit` category: the
+  Add wizard leaves an empty one out, and the Edit page loads the stored values and sends an
+  emptied one as `null`, which clears it. The helpers live in `utils/auditIntegrations.ts`.
+- Settings › Security › VP Audit uses the same picker with the prefix `vp-audit` under
+  **Events to keep**, bound to the settings' `audit_events`. Its `vp-audit-scope-note` says
+  those settings control the VP Audit Log only, and `vp-audit-catalog-error` replaces the
+  picker when the catalogue cannot be loaded.
 
 ### Query parameters
 
@@ -361,11 +432,21 @@ shows the `integration-category-unavailable` warning instead of silently falling
 The Audit Log header shows `audit-forward-button` beside Refresh for users with
 `integrations.view`, only when `/integrations/config` offers the `audit` category.
 
-- **Forwarding to N integration(s)** counts active integrations without a `tenant_id`,
-  the ones the gateway forwards to, and opens the Integrations list. It adds
-  "(VP Auditing off)" and a tooltip when VP Auditing is disabled in Settings › Security.
-- With none, users with `integrations.edit` get **Forward records**, which opens the wizard
-  at `?category=audit&type=stream`.
+- **Forwarding to N integration(s)** counts active `audit` integrations without a
+  `tenant_id` whose `audit_events` is not empty, the ones that receive records, and opens
+  the Integrations list (`useAuditForwarding`).
+- When active appliance-wide `audit` integrations select no events, the button shows a
+  warning icon (`audit-forward-no-events-warning`) and its tooltip says how many select no
+  events and receive nothing.
+- When VP Auditing is disabled in Settings › Security, the label is unchanged and the
+  tooltip says the VP Audit Log keeps nothing while integrations still receive the events
+  selected for them.
+- With none receiving, users with `integrations.edit` get **Forward records**, which opens
+  the wizard at `?category=audit&type=stream`.
+- The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says the log keeps the events
+  selected under Settings › Security › VP Audit while VP Auditing is enabled, and that each
+  Governance Audit integration receives its own selected events independently of the log,
+  at least once, so receivers deduplicate on `event_id`.
 
 ### Starting content
 

@@ -79,7 +79,7 @@ async fn receive(message: &ReceivedMessage) -> (Value, Value) {
 
 #[test]
 fn fabric_policy_context_matches_direct_admission_without_changing_legacy_shape() {
-    use crate::mcp::request_validation::{LegacySessionEvidence, McpVersionPolicy, validate_mcp_post};
+    use crate::mcp::request_validation::{LegacySessionEvidence, validate_mcp_post};
     let surface: AgentSurface = serde_json::from_value(json!({
         "surface_id": "context", "name": "context",
         "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
@@ -100,7 +100,7 @@ fn fabric_policy_context_matches_direct_admission_without_changing_legacy_shape(
         &wire_headers,
         &bytes,
         LegacySessionEvidence::Absent,
-        McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]),
+        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
     )
     .unwrap();
     let direct = crate::mcp::build_validated_mcp_context(&bytes, &classification).unwrap();
@@ -129,9 +129,7 @@ fn fabric_policy_context_matches_direct_admission_without_changing_legacy_shape(
 
 #[tokio::test]
 async fn modern_fabric_response_reuses_final_processing_in_json_and_sse() {
-    use crate::mcp::request_validation::{
-        LegacySessionEvidence, McpRequestClassification, McpVersionPolicy, validate_mcp_post,
-    };
+    use crate::mcp::request_validation::{LegacySessionEvidence, McpRequestClassification, validate_mcp_post};
     use std::sync::{Arc, atomic::AtomicUsize};
 
     let request_headers = super::fabric_mcp_headers(
@@ -149,7 +147,7 @@ async fn modern_fabric_response_reuses_final_processing_in_json_and_sse() {
         &request_headers,
         &serde_json::to_vec(&request_body).unwrap(),
         LegacySessionEvidence::Absent,
-        McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]),
+        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
     )
     .unwrap();
     let metadata = crate::mcp::meta::McpMetadataContext::from_classification(&classification, None);
@@ -251,9 +249,7 @@ async fn modern_fabric_response_reuses_final_processing_in_json_and_sse() {
 /// injection is not configured.
 #[tokio::test]
 async fn modern_fabric_response_preserves_every_result_field() {
-    use crate::mcp::request_validation::{
-        LegacySessionEvidence, McpRequestClassification, McpVersionPolicy, validate_mcp_post,
-    };
+    use crate::mcp::request_validation::{LegacySessionEvidence, McpRequestClassification, validate_mcp_post};
 
     for fixture in crate::mcp::result_fixtures::result_fixtures() {
         let (request_body, request_headers) = fixture.request("stream");
@@ -265,7 +261,7 @@ async fn modern_fabric_response_preserves_every_result_field() {
             &headers,
             &serde_json::to_vec(&request_body).unwrap(),
             LegacySessionEvidence::Absent,
-            McpVersionPolicy::new(&[MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]),
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )
         .unwrap();
         let metadata = crate::mcp::meta::McpMetadataContext::from_classification(&classification, None);
@@ -705,19 +701,69 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(envelope["id"], "http-receive");
         assert_eq!(envelope["error"]["code"], -32022);
     }
-    for (body, headers, expected_status) in [
+    use crate::audit::request_events::RejectionReason;
+    for (body, headers, expected_status, expected_refusal) in [
         (
             legacy_body.clone(),
             json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION, "origin": "https://untrusted.example", "Origin": "https://untrusted.example"}),
             200,
+            None,
         ),
-        (json!(" ".repeat(1025)), json!({}), 413),
-        (legacy_body.clone(), json!({"x-extra": "x".repeat(513)}), 431),
-        (legacy_body, json!({"Origin": format!("https://{}.example", "a".repeat(500))}), 431),
+        (json!(" ".repeat(1025)), json!({}), 413, Some(RejectionReason::BodyTooLarge)),
+        (legacy_body.clone(), json!({"x-extra": "x".repeat(513)}), 431, Some(RejectionReason::McpAdmission)),
+        (
+            legacy_body.clone(),
+            json!({"Origin": format!("https://{}.example", "a".repeat(500))}),
+            431,
+            Some(RejectionReason::McpAdmission),
+        ),
     ] {
-        let (response, _) = receive(&forward_message(body, headers)).await;
+        let ((response, _), audit) = crate::audit::producer::capture(receive(&forward_message(body, headers))).await;
         assert_eq!(response["status"], expected_status);
+        let refusals: Vec<_> = audit
+            .iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    reason, http_status, ..
+                } => {
+                    assert!(event.via_fabric, "a Fabric receive refusal is marked as such");
+                    Some((reason, http_status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refusals,
+            expected_refusal
+                .map(|reason| (reason, expected_status))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "recorded refusals for a {expected_status}"
+        );
     }
+    let mut unknown_surface = forward_message(legacy_body, json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION}));
+    unknown_surface.message_body["channel_id"] = json!("no-such-surface");
+    let (response, audit) = crate::audit::producer::capture(refused(&unknown_surface)).await;
+    assert_eq!(response["status"], 404);
+    let unroutable = audit
+        .iter()
+        .find(|event| {
+            matches!(
+                event.event,
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    reason: RejectionReason::NoRoute,
+                    ..
+                }
+            )
+        })
+        .unwrap_or_else(|| panic!("an unknown surface is recorded as unroutable: {audit:?}"));
+    assert_eq!(
+        unroutable
+            .surface_id
+            .as_deref(),
+        Some(crate::audit::request_events::UNKNOWN_SURFACE)
+    );
+    assert!(unroutable.via_fabric);
     for method in ["GET", "DELETE"] {
         let mut message = forward_message(
             Value::Null,
@@ -850,15 +896,30 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     let before = target
         .request_count
         .load(Ordering::SeqCst);
-    let denied = process_forward_request(&forward_message(
+    let (denied, audit) = crate::audit::producer::capture(process_forward_request(&forward_message(
         json!({"jsonrpc": "2.0", "id": "protected", "method": "tools/list"}),
         json!({"Authorization": "Bearer cannot-establish-receiver-authority"}),
-    ))
+    )))
     .await;
     let ProcessingResult::RequiresResponse { response_body, .. } = denied else {
         panic!("protected Fabric request must fail closed without resource authorization context");
     };
     assert_eq!(response_body["status"], 503);
+    assert!(
+        audit
+            .iter()
+            .any(|event| event.via_fabric
+                && matches!(
+                    &event.event,
+                    crate::delegation_vault::audit::DelegationAuditAction::AuthFailed {
+                        scheme: crate::audit::events::AuthScheme::McpResourceToken,
+                        reason,
+                        blocking: true,
+                        client_ip: None,
+                    } if reason == "unavailable"
+                )),
+        "the refused resource token is audited: {audit:?}"
+    );
     assert_eq!(
         target
             .request_count
@@ -1330,10 +1391,7 @@ async fn fabric_consent_flow() {
             },
         )
     };
-    let versions = crate::mcp::request_validation::McpVersionPolicy::new(
-        &[MCP_MODERN_VERSION],
-        &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION],
-    );
+    let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
     {
         let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
         let rejected = decode(
@@ -1381,13 +1439,12 @@ async fn fabric_consent_flow() {
     assert_eq!(pending.0, 200, "{:?}", pending.1);
     assert_eq!(pending.1["result"]["resultType"], "input_required");
     assert!(calls.lock().await.is_empty());
-    // Tampered, expired, cross-user and incapable MRTR retries, on a continuation of their own
-    // so the flow below keeps its state.
     {
-        let send = |body: Value, token: String, runtime: Arc<ContinuationRuntime>| {
+        let send = |body: Value, token: Option<String>, runtime: Arc<ContinuationRuntime>| {
+            let token = token.unwrap_or_else(|| bearer.clone());
             let (message, stream) = make_request(&body, &surface, &sender_did, &token);
             async move {
-                decode(
+                let (status, body) = decode(
                     Box::pin(super::process_forward_request_with_mcp_runtime(
                         &message,
                         Some(stream),
@@ -1396,39 +1453,10 @@ async fn fabric_consent_flow() {
                     ))
                     .await,
                 )
-                .await
+                .await;
+                (axum::http::StatusCode::from_u16(status).unwrap(), body)
             }
         };
-        let pending = |id: &str, request_state: Option<&str>| {
-            let mut pending = body.clone();
-            pending["id"] = json!(id);
-            if let Some(request_state) = request_state {
-                pending["params"]["requestState"] = json!(request_state);
-            }
-            pending
-        };
-        let (_, issued) = send(pending("negatives", None), bearer.clone(), runtime.clone()).await;
-        let issued_state = issued["result"]["requestState"]
-            .as_str()
-            .expect("a continuation to replay")
-            .to_string();
-
-        // A tampered state does not open.
-        let mut bytes = issued_state
-            .clone()
-            .into_bytes();
-        let last = bytes.len() - 1;
-        bytes[last] = if bytes[last] == b'A' {
-            b'B'
-        } else {
-            b'A'
-        };
-        let tampered = String::from_utf8(bytes).unwrap();
-        let (status, response) = send(pending("tampered", Some(&tampered)), bearer.clone(), runtime.clone()).await;
-        assert_eq!(status, 400, "tampered: {response}");
-        assert_eq!(response["error"]["code"], crate::mcp::error_codes::INVALID_PARAMS, "tampered: {response}");
-
-        // Another principal cannot resume it.
         let other = receiver
             .sign_jwt_with_gateway_key_typ(
                 &json!({"iss": "https://receiver.example/api/oauth2/mcp", "sub": "other-user", "scope": "read",
@@ -1437,38 +1465,8 @@ async fn fabric_consent_flow() {
             )
             .await
             .unwrap();
-        let (status, response) = send(pending("cross-user", Some(&issued_state)), other, runtime.clone()).await;
-        assert_eq!(status, 403, "cross-user: {response}");
-        assert_eq!(response["error"]["code"], -32001, "cross-user: {response}");
-
-        // A client that did not declare URL elicitation is not sent a consent request.
-        let mut incapable = pending("incapable", None);
-        incapable["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
-        let (status, response) = send(incapable, bearer.clone(), runtime.clone()).await;
-        assert_eq!(
-            response["error"]["code"],
-            crate::mcp::error_codes::MISSING_REQUIRED_CLIENT_CAPABILITY,
-            "incapable: {status} {response}"
-        );
-
-        // An expired state does not open.
-        let short = Arc::new(ContinuationRuntime {
-            config: serde_json::from_value(json!({"deployment": "deployment", "ttl_secs": 1, "active_key": "key",
-                "keys": [{"id": "key", "secret_id": "key-secret", "not_before": now - 1, "seal_until": now + 3600, "open_until": now + 4500}],
-                "storage": {"backend": "embedded", "capacity": 32}})).unwrap(),
-            service: Arc::new(ContinuationService::new(ContinuationCipher::new("deployment".into(), "key".into(), vec![
-                ContinuationKey::new("key".into(), [7; 32], now - 1, now + 3600, now + 4500).unwrap(),
-            ]).unwrap(), Arc::new(EmbeddedContinuations::new(32).unwrap()))),
-        });
-        let (_, short_issued) = send(pending("short", None), bearer.clone(), short.clone()).await;
-        tokio::time::sleep(Duration::from_millis(2100)).await;
-        let short_state = short_issued["result"]["requestState"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let (status, response) = send(pending("expired", Some(&short_state)), bearer.clone(), short).await;
-        assert_eq!(status, 400, "expired: {response}");
-        assert_eq!(response["error"]["code"], crate::mcp::error_codes::INVALID_PARAMS, "expired: {response}");
+        crate::mcp::continuations::negative_cases::assert_rejected_retries(&body, runtime.clone(), other, now, send)
+            .await;
         assert!(calls.lock().await.is_empty(), "no negative case reaches the upstream");
     }
 

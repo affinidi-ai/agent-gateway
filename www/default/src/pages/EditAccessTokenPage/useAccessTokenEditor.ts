@@ -81,6 +81,10 @@ export function useAccessTokenEditor(id: string | undefined, availableScopes: st
   }, [availableScopes, form.scopes]);
   const revoked = Boolean(token?.revoked_at);
   const nameError = form.name.trim() ? undefined : 'Name is required.';
+  // Settings the opened form would reject however it is completed: a bad resource pattern or
+  // header, or an expiry it does not accept. Missing fields and scopes the copier cannot grant
+  // are not counted - the link may be a draft, or for someone who can grant them.
+  const hasInvalidSettings = scopeErrors.length > 0 || Boolean(expiry.error);
   const canSave =
     !nameError &&
     scopeErrors.length === 0 &&
@@ -147,6 +151,7 @@ export function useAccessTokenEditor(id: string | undefined, availableScopes: st
     expiryBounds,
     expiryError: expiry.error,
     nameError,
+    hasInvalidSettings,
     validationAttempted,
     unavailableScopes,
     revoked,
