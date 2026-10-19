@@ -26,7 +26,10 @@ impl StreamPublisher for RedisPublisher {
 
         use redis::AsyncCommands;
 
-        let client = redis::Client::open(redis_url).context("Failed to create Redis client")?;
+        // The URL can hold a password, and the error's detail can repeat part of it.
+        let client = redis::Client::open(redis_url).map_err(|error| {
+            anyhow::anyhow!("Failed to create Redis client: the Redis URL is not usable ({:?})", error.kind())
+        })?;
 
         let mut con = client
             .get_multiplexed_async_connection()
