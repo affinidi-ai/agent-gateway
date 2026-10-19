@@ -819,10 +819,11 @@ fn validate_zip_entries_with_limits(
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let path = validated_entry_path(entry.name())?;
+        let name = entry.name()?.into_owned();
+        let path = validated_entry_path(&name)?;
         let is_manifest = is_manifest_entry(&path);
         if !seen_paths.insert(path.clone()) {
-            anyhow::bail!("ZIP contains duplicate entry path: {}", entry.name());
+            anyhow::bail!("ZIP contains duplicate entry path: {}", name);
         }
         if path
             .ancestors()
@@ -835,7 +836,7 @@ fn validate_zip_entries_with_limits(
             })
             || (!entry.is_dir() && paths_with_children.contains(&path))
         {
-            anyhow::bail!("ZIP contains a file/directory path collision: {}", entry.name());
+            anyhow::bail!("ZIP contains a file/directory path collision: {}", name);
         }
         for ancestor in path.ancestors().skip(1) {
             if !ancestor
@@ -852,7 +853,7 @@ fn validate_zip_entries_with_limits(
         let uncompressed_bytes = entry.size();
         let compressed_bytes = entry.compressed_size();
         if uncompressed_bytes > limits.max_entry_uncompressed_bytes {
-            anyhow::bail!("ZIP entry exceeds the uncompressed size limit: {}", entry.name());
+            anyhow::bail!("ZIP entry exceeds the uncompressed size limit: {}", name);
         }
         if is_manifest && (entry.is_dir() || uncompressed_bytes > limits.max_manifest_bytes) {
             anyhow::bail!("backup manifest exceeds the size limit");
@@ -867,7 +868,7 @@ fn validate_zip_entries_with_limits(
             && (compressed_bytes == 0
                 || uncompressed_bytes > compressed_bytes.saturating_mul(limits.max_compression_ratio))
         {
-            anyhow::bail!("ZIP entry exceeds the compression ratio limit: {}", entry.name());
+            anyhow::bail!("ZIP entry exceeds the compression ratio limit: {}", name);
         }
 
         if !entry.is_dir() {
@@ -879,7 +880,7 @@ fn validate_zip_entries_with_limits(
                 &mut sink(),
             )?;
             if actual_bytes != expected_bytes || actual_bytes > limits.max_entry_uncompressed_bytes {
-                anyhow::bail!("ZIP entry size does not match its metadata: {}", entry.name());
+                anyhow::bail!("ZIP entry size does not match its metadata: {}", name);
             }
         }
     }
@@ -907,7 +908,8 @@ fn extract_zip_bytes_to_dir(
 
         // Primary guard: validate the raw entry name for absolute paths and
         // '..' traversal, independent of the zip crate's normalization.
-        let rel_path = validated_entry_path(entry.name())?;
+        let name = entry.name()?.into_owned();
+        let rel_path = validated_entry_path(&name)?;
         if is_manifest_entry(&rel_path) {
             continue;
         }
@@ -917,13 +919,13 @@ fn extract_zip_bytes_to_dir(
         // Defense in depth: verify the resolved path is inside target_dir.
         if let Ok(canonical_out) = out_path.canonicalize() {
             if !canonical_out.starts_with(&canonical_target) {
-                anyhow::bail!("ZIP entry resolves outside target directory: {}", entry.name());
+                anyhow::bail!("ZIP entry resolves outside target directory: {}", name);
             }
         } else if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
             let canonical_parent = parent.canonicalize()?;
             if !canonical_parent.starts_with(&canonical_target) {
-                anyhow::bail!("ZIP entry resolves outside target directory: {}", entry.name());
+                anyhow::bail!("ZIP entry resolves outside target directory: {}", name);
             }
         }
 
@@ -941,7 +943,7 @@ fn extract_zip_bytes_to_dir(
                 &mut output,
             )?;
             if written != entry.size() || written > ARCHIVE_LIMITS.max_entry_uncompressed_bytes {
-                anyhow::bail!("ZIP entry size does not match its metadata: {}", entry.name());
+                anyhow::bail!("ZIP entry size does not match its metadata: {}", name);
             }
             output.sync_all()?;
             count += 1;
@@ -999,6 +1001,7 @@ mod tests {
                 archive
                     .name_for_index(i)
                     .unwrap()
+                    .unwrap()
                     .to_string()
             })
             .collect();
@@ -1016,7 +1019,10 @@ mod tests {
         let mut out = Vec::new();
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .expect("valid entry name")
+                .to_string();
             let mut buf = Vec::new();
             file.read_to_end(&mut buf)
                 .unwrap();

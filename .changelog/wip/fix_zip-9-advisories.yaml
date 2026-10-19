@@ -1,0 +1,11 @@
+branch: fix/zip-9-advisories
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-19T00:00:00Z'
+      title: Update zip to 9.0.5 to fix ZIP extraction advisories
+      description: Bumps zip from 8.6.0 to 9.0.5, which fixes RUSTSEC-2026-0367 (SUID and SGID bits kept on extraction), RUSTSEC-2026-0368 (extracted symlinks pointing outside the destination) and RUSTSEC-2026-0369 (Unix permissions applied through symlinks). Backup restore validates and writes each entry itself and never calls the crate's extract, so it was not exposed. Restores a passing cargo audit.
+  breaking: []

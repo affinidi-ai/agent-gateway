@@ -365,6 +365,7 @@ mod tests {
                     .by_index(i)
                     .unwrap()
                     .name()
+                    .unwrap()
                     .to_string()
             })
             .collect();
