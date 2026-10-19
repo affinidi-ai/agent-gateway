@@ -38,6 +38,7 @@ impl BootstrapConfig {
         let contents = std::fs::read_to_string(path)?;
 
         let mut config: BootstrapConfig = toml::from_str(&contents)?;
+        place_unset_integration_keys_beside_the_deprecated_one(&contents, &mut config.storage_paths);
 
         // Resolve config file paths relative to the config file directory
         if let Some(config_dir) = path.parent() {
@@ -347,6 +348,48 @@ impl BootstrapConfig {
     }
 }
 
+/// Puts each integration storage key the raw config leaves unset beside the deprecated
+/// `integrations` directory, when that key is set. A config written for the version before
+/// endpoints and event sets sets `integrations` (`../_storage/integrations/definitions` in the
+/// example) but none of the new keys, whose defaults would otherwise resolve under the config
+/// directory: read-only in Docker, and outside the persisted storage elsewhere.
+fn place_unset_integration_keys_beside_the_deprecated_one(
+    raw: &str,
+    paths: &mut StoragePaths,
+) {
+    let Some(deprecated) = paths.integrations.clone() else {
+        return;
+    };
+    let parent = Path::new(&deprecated)
+        .parent()
+        .unwrap_or(Path::new(""));
+    let section = toml::from_str::<toml::Table>(raw)
+        .ok()
+        .and_then(|table| {
+            table
+                .get("storage_paths")?
+                .as_table()
+                .cloned()
+        });
+    let is_set = |key: &str| {
+        section
+            .as_ref()
+            .is_some_and(|section| section.contains_key(key))
+    };
+    for (key, path, folder) in [
+        ("integration_endpoints", &mut paths.integration_endpoints, "endpoints"),
+        ("integration_event_sets", &mut paths.integration_event_sets, "event_sets"),
+        ("integration_definitions", &mut paths.integration_definitions, "integrations"),
+    ] {
+        if !is_set(key) {
+            *path = parent
+                .join(folder)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+}
+
 /// Return true when the raw TOML config text mentions the legacy
 /// `[storage_paths].departments` key (case-sensitive). Cheap substring scan
 /// of the section — enough to surface a deprecation WARN without a full
@@ -539,6 +582,60 @@ key_path = "key.pem"
 
         let config = BootstrapConfig::from_file(&path).expect("unknown top-level keys are ignored");
         assert_eq!(config.backup_encryption_key, "unused");
+    }
+
+    /// The storage paths of `config.toml` written to `<tempdir>/config` with `storage_paths`.
+    fn storage_paths_of(storage_paths: &str) -> (tempfile::TempDir, StoragePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        let path = config_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "backup_encryption_key = \"unused\"\n\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n\n[storage_paths]\n{storage_paths}\n"
+            ),
+        )
+        .unwrap();
+        let paths = BootstrapConfig::from_file(&path)
+            .unwrap()
+            .storage_paths;
+        (dir, paths)
+    }
+
+    #[test]
+    fn unset_integration_keys_live_beside_the_deprecated_integrations_directory() {
+        let (dir, paths) = storage_paths_of(
+            "integrations = \"../_storage/integrations/definitions\"\nintegration_definitions = \"/data/integrations\"",
+        );
+        let beside = |folder: &str| {
+            dir.path()
+                .join("_storage/integrations")
+                .join(folder)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(paths.integration_endpoints, beside("endpoints"));
+        assert_eq!(paths.integration_event_sets, beside("event_sets"));
+        assert_eq!(paths.integration_definitions, "/data/integrations", "a set key wins");
+        assert_eq!(paths.legacy_integrations, beside("definitions"));
+    }
+
+    #[test]
+    fn without_the_deprecated_key_integration_keys_keep_their_defaults() {
+        let (dir, paths) = storage_paths_of("integration_triggers = \"/old/triggers\"");
+        let default = |folder: &str| {
+            dir.path()
+                .join("config/_storage/integrations")
+                .join(folder)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(paths.integration_endpoints, default("endpoints"));
+        assert_eq!(paths.integration_event_sets, default("event_sets"));
+        assert_eq!(paths.integration_definitions, default("integrations"));
     }
 
     #[test]
