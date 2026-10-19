@@ -242,7 +242,8 @@ sidebar item and the pages need `integrations.view`, the editors and test sends
 
 A test sends one message without retries
 ([`api/send_test.rs`](../src/integrations/api/send_test.rs)). An integration test renders its
-template for the first event of its event set, filled with sample values; an unsaved one is
+template for one event of its event set (the smallest event id, so repeated tests match),
+filled with sample values; an unsaved one is
 checked as a save would be first. An endpoint test sends the endpoint type's default message
 for the event `integration.test`. A test that reaches the destination returns
 `{"delivered": true, "event_type": ...}`; one that fails returns `502` with the reason.

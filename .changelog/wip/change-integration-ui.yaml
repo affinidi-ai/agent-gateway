@@ -14,8 +14,8 @@ changes:
       title: Send test messages through an endpoint or an integration, saved or not
       description: >-
         POST /v1/integrations/endpoints/{id}/test sends the endpoint's default message,
-        POST /v1/integrations/{id}/test sends a saved integration's message for the first event
-        of its event set with sample values, and POST /v1/integrations/test does the same for an
+        POST /v1/integrations/{id}/test sends a saved integration's message for one event of its
+        event set with sample values, and POST /v1/integrations/test does the same for an
         integration not saved yet. A failed send answers 502 with the reason.
     - timestamp: '2026-10-15T13:20:00.000Z'
       title: Give every integration message the event's name, summary and data
