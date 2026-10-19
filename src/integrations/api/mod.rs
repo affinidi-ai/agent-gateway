@@ -286,6 +286,18 @@ mod tests {
         assert_eq!(scoped, StatusCode::FORBIDDEN);
     }
 
+    fn integration(
+        endpoint_id: &str,
+        event_set_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": "Forward",
+            "endpoint_id": endpoint_id,
+            "event_set_id": event_set_id,
+            "content": {}
+        })
+    }
+
     /// Calls every route on an event set of `events`, an integration on it and its endpoint:
     /// changes and test sends as `EDITOR`, reads as `VIEWER`, neither holding `audit.view`. Test
     /// sends go through a stored Slack endpoint whose secret does not exist, so they fail with
@@ -314,9 +326,6 @@ mod tests {
             .save(&unreachable)
             .await
             .expect("endpoint");
-        let integration = |endpoint_id: &str, event_set_id: &str| {
-            json!({"name": "Forward", "endpoint_id": endpoint_id, "event_set_id": event_set_id, "content": {}})
-        };
         let webhook = |url: &str| json!({"name": "SIEM", "configuration": {"url": url}, "status": "active"});
         let mut statuses = Vec::new();
 
@@ -342,22 +351,27 @@ mod tests {
         let set_path = format!("/v1/integrations/event-sets/{}", id(&set));
         let endpoint_path = format!("/v1/integrations/endpoints/{}", id(&endpoint));
         let integration_path = format!("/v1/integrations/{}", id(&created));
-        for (what, list, item) in [
-            ("event set", "/v1/integrations/event-sets", &set_path),
-            ("endpoint", "/v1/integrations/endpoints", &endpoint_path),
-            ("integration", "/v1/integrations", &integration_path),
+        for (list_label, list, read_label, item) in [
+            ("list event sets", "/v1/integrations/event-sets", "read event set", &set_path),
+            ("list endpoints", "/v1/integrations/endpoints", "read endpoint", &endpoint_path),
+            ("list integrations", "/v1/integrations", "read integration", &integration_path),
         ] {
-            let (status, listed) = f
+            let (listed, all) = f
                 .call(VIEWER, "GET", list, None)
                 .await;
-            let (got, read) = f
+            let (read, one) = f
                 .call(VIEWER, "GET", item, None)
                 .await;
-            let listed = listed
+            let shown = all
                 .as_array()
-                .is_some_and(|items| items.contains(&read));
-            statuses.push((what, if listed { status } else { StatusCode::NOT_FOUND }));
-            statuses.push((what, got));
+                .is_some_and(|items| items.contains(&one));
+            let listed = if shown {
+                listed
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            statuses.push((list_label, listed));
+            statuses.push((read_label, read));
         }
 
         let (status, _) = f
@@ -408,12 +422,12 @@ mod tests {
             ("create endpoint", StatusCode::CREATED),
             ("create integration", StatusCode::CREATED),
             ("create integration on the unreachable endpoint", StatusCode::CREATED),
-            ("event set", StatusCode::OK),
-            ("event set", StatusCode::OK),
-            ("endpoint", StatusCode::OK),
-            ("endpoint", StatusCode::OK),
-            ("integration", StatusCode::OK),
-            ("integration", StatusCode::OK),
+            ("list event sets", StatusCode::OK),
+            ("read event set", StatusCode::OK),
+            ("list endpoints", StatusCode::OK),
+            ("read endpoint", StatusCode::OK),
+            ("list integrations", StatusCode::OK),
+            ("read integration", StatusCode::OK),
             ("update event set", StatusCode::OK),
             ("update endpoint", StatusCode::OK),
             ("update integration", StatusCode::OK),
