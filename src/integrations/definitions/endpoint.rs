@@ -125,12 +125,16 @@ impl Endpoint {
                         .strip_prefix(SECRET_REFERENCE_PREFIX)
                         .map(|secret_id| (field.to_string(), secret_id)),
                 ),
-                Some(JsonValue::Object(headers)) => references.extend(headers.iter().filter_map(|(name, value)| {
-                    let secret_id = value
-                        .as_str()?
-                        .strip_prefix(SECRET_REFERENCE_PREFIX)?;
-                    Some((format!("the header {name}"), secret_id))
-                })),
+                Some(JsonValue::Object(headers)) => references.extend(
+                    headers
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            let secret_id = value
+                                .as_str()?
+                                .strip_prefix(SECRET_REFERENCE_PREFIX)?;
+                            Some((format!("the header {name}"), secret_id))
+                        }),
+                ),
                 _ => {}
             }
         }

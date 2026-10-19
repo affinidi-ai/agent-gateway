@@ -174,9 +174,11 @@ impl Fixture {
         }
         let call = send(app, caller.user_id, method, uri, body);
         match &self.secrets {
-            Some(secrets) => TEST_SECRETS_STORE
-                .scope(secrets.clone(), call)
-                .await,
+            Some(secrets) => {
+                TEST_SECRETS_STORE
+                    .scope(secrets.clone(), call)
+                    .await
+            }
             None => call.await,
         }
     }

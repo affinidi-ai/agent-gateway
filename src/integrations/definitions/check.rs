@@ -248,7 +248,12 @@ mod tests {
     #[tokio::test]
     async fn a_finding_never_shows_a_secret_or_a_slack_webhook_url() {
         let slack = |webhook_url: &str| {
-            Endpoint::new("Ops Slack".to_string(), String::new(), EndpointType::Slack, json!({"webhook_url": webhook_url}))
+            Endpoint::new(
+                "Ops Slack".to_string(),
+                String::new(),
+                EndpointType::Slack,
+                json!({"webhook_url": webhook_url}),
+            )
         };
         let referenced = slack("$SECRET:slack-hook");
         let plain = slack("hooks.slack.com/services/T0/B0/s3cr3t-plain");
