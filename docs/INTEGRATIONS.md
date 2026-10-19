@@ -40,7 +40,11 @@ host of the caller's choosing and sending a test delivers the value there. Grant
 `integrations.edit` only to roles that may read secrets; by default it and `secrets.*` are
 administrator-only (see [`RBAC.md`](RBAC.md#secrets-in-endpoints)). The dashboard's stored
 secret picker lists secrets only for callers with `secrets.view`, but a typed reference resolves
-regardless. Webhook `headers` must be an object of header names to strings, and
+regardless. A save checks the configuration with its references resolved; when a referenced
+value fails the checks, the `400` names the field and the secret id, for example "The value of
+webhook_url from secret slack-hook fails the endpoint checks", and never the value. No error
+of a save, a test, the startup check or the migration repeats a secret value or a URL (a
+blocked host is named). Webhook `headers` must be an object of header names to strings, and
 each header value may be such a reference; the field as a whole cannot be one. It cannot set
 `Content-Type`, `X-Webhook-Timestamp` or `X-Webhook-Signature-256`, which the gateway sets on
 every delivery; an endpoint stored with one of them still sends each exactly once, the
