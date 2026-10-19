@@ -103,7 +103,7 @@ pub(crate) fn mcp_requires_payment(
     };
 
     let requires = triggers.requires_payment(&name);
-    info!("[{tag}] MCP tool '{name}' triggers={triggers:?} requires_payment={requires}");
+    info!("[{tag}] MCP tool {:?} triggers={triggers:?} requires_payment={requires}", crate::a2a::clip_for_log(&name));
     requires
 }
 
@@ -224,10 +224,9 @@ pub fn should_require_payment(
                         let content = extract_a2a_message_text(&json);
                         if let Some(ref text) = content {
                             info!(
-                                "[x402] A2A/AP2 extracted message content for method {:?} (length: {} chars): '{}'",
+                                "[x402] A2A/AP2 extracted message content for method {:?} (length: {} chars)",
                                 logged_method,
-                                text.len(),
-                                truncate_at_char_boundary(text, 200)
+                                text.len()
                             );
                         } else {
                             info!("[x402] A2A/AP2 failed to extract message content for method {:?}", logged_method);
@@ -253,19 +252,15 @@ pub fn should_require_payment(
 
                     // Check if message content matches any pattern
                     for pattern in &filter.message_patterns {
-                        info!(
-                            "[x402] A2A/AP2 checking pattern '{}' against message content (first 200 chars): '{}'",
-                            pattern,
-                            truncate_at_char_boundary(&content, 200)
-                        );
+                        info!("[x402] A2A/AP2 checking pattern '{}' against message content", pattern);
                         // Escape pattern to treat it as literal text match
                         let escaped_pattern = regex::escape(pattern);
                         match regex::Regex::new(&escaped_pattern) {
                             Ok(re) => {
                                 if re.is_match(&content) {
                                     info!(
-                                        "[x402] A2A/AP2 payment required: method {:?} and message matches pattern '{}'\nMessage: {}",
-                                        logged_method, pattern, content
+                                        "[x402] A2A/AP2 payment required: method {:?} and message matches pattern '{}'",
+                                        logged_method, pattern
                                     );
                                     return true;
                                 } else {
@@ -300,7 +295,7 @@ pub fn should_require_payment(
                     .any(|m| normalize_a2a_method(m) == normalized_method);
                 info!(
                     "[x402] A2A/AP2 payment required={}: method {:?} (legacy mode, configured methods: {:?})",
-                    requires_payment, method, methods
+                    requires_payment, logged_method, methods
                 );
                 return requires_payment;
             }
@@ -350,10 +345,10 @@ pub async fn process_payment(
                 Ok((payload, correlation_id)) => {
                     channel_info!(
                         channel_id,
-                        "Payment verified successfully correlation_id={} network={} amount={}",
+                        "Payment verified successfully correlation_id={} network={:?} amount={:?}",
                         correlation_id,
-                        payload.network(),
-                        payload.amount()
+                        crate::a2a::clip_for_log(payload.network()),
+                        crate::a2a::clip_for_log(payload.amount())
                     );
 
                     // Settlement gating is driven by X402SettlementMode — see
@@ -374,7 +369,7 @@ pub async fn process_payment(
                         Err(e) => {
                             tracing::warn!(
                                 channel = channel_name,
-                                error = %e,
+                                error = ?e.to_string(),
                                 "Failed to create payment response"
                             );
                             Ok(None)
@@ -570,9 +565,9 @@ async fn dispatch_settlement(
                 Ok(Err(e)) => {
                     channel_warn!(
                         channel_id,
-                        "Immediate settlement failed correlation_id={} error={}",
+                        "Immediate settlement failed correlation_id={} error={:?}",
                         correlation_id,
-                        e
+                        e.to_string()
                     );
                     Err(super::create_invalid_payment_response(&format!("Payment settlement failed: {e}")))
                 }
@@ -607,7 +602,7 @@ async fn dispatch_settlement(
                 )
                 .await
                 {
-                    channel_warn!(&channel_id_clone, "Deferred settlement failed error={}", e);
+                    channel_warn!(&channel_id_clone, "Deferred settlement failed error={:?}", e.to_string());
                 }
             });
             Ok(false)
@@ -660,21 +655,6 @@ pub fn normalize_a2a_method(method: &str) -> String {
     // v0.3 slash-form. This is internal gating only; it does not change the method
     // exposed to policy, which stays exactly as the caller sent it.
     crate::a2a::canonical_method(method).to_string()
-}
-
-/// Longest prefix of `text` that is at most `max_bytes` long and ends on a char boundary.
-fn truncate_at_char_boundary(
-    text: &str,
-    max_bytes: usize,
-) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let end = (0..=max_bytes)
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
-    &text[..end]
 }
 
 /// Extract message text content from A2A SendMessage/SendStreamingMessage request
@@ -1038,21 +1018,6 @@ mod a2a_method_gating_tests {
         assert!(requires(&config, "custom/charge"));
         assert!(!requires(&config, "custom/Charge"));
         assert!(!requires(&config, "message/send"));
-    }
-
-    #[test]
-    fn truncate_at_char_boundary_backs_off_inside_multibyte_char() {
-        let text = format!("a{}", "é".repeat(150));
-        assert!(!text.is_char_boundary(200));
-        let truncated = truncate_at_char_boundary(&text, 200);
-        assert_eq!(truncated.len(), 199);
-        assert_eq!(truncated, format!("a{}", "é".repeat(99)));
-    }
-
-    #[test]
-    fn truncate_at_char_boundary_returns_short_text_unchanged() {
-        assert_eq!(truncate_at_char_boundary("héllo", 200), "héllo");
-        assert_eq!(truncate_at_char_boundary("", 200), "");
     }
 
     #[test]

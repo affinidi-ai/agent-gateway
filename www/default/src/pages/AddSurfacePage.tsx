@@ -15,6 +15,7 @@ import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { freezeEmptyVariantOverrides } from '../components/surface-builder/variants/resolve';
+import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -447,7 +448,7 @@ const AddSurfacePage: React.FC = () => {
     setSaving(true);
     setError(null);
     try {
-      const payload: Partial<AgentSurface> = buildSurfacePayload();
+      const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
       await apiClient.createSurface(payload);
       justCreatedRef.current = true;
       showToast('success', `Agent Surface "${name}" created`);

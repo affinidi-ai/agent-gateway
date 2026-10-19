@@ -84,6 +84,16 @@ export interface CompatibilitySpec {
   connectFrom?: string[];
 }
 
+/**
+ * The base surface, given while the canvas shows a variant; absent in the base
+ * view, where the canvas is the base. Surface-level settings, such as the A2A
+ * versions of an Access Point, follow the base Target.
+ */
+export interface BaseSurfaceView {
+  targetEndpoint: unknown;
+  accessPointConfig?: Record<string, unknown>;
+}
+
 /** Full surface state passed to dependency checks. */
 export interface SurfaceContext {
   protocol: Protocol;
@@ -91,6 +101,7 @@ export interface SurfaceContext {
   target: any;
   transitPoints: any[];
   allNodes: CanvasNode[];
+  base?: BaseSurfaceView;
 }
 
 /**
@@ -114,6 +125,7 @@ export interface PayloadContext {
   nodesOfType: (type: SurfaceNodeType) => CanvasNode[];
   /** First node of the requested type, or undefined. */
   firstNodeOfType: (type: SurfaceNodeType) => CanvasNode | undefined;
+  base?: BaseSurfaceView;
 }
 
 /**
@@ -221,6 +233,7 @@ export interface ConfigPanelProps {
    * red after an actual save attempt.
    */
   hasAttemptedSave?: boolean;
+  base?: BaseSurfaceView;
 }
 
 /**

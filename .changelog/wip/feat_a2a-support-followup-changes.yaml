@@ -9,10 +9,11 @@ changes:
         validation dropdown: Off, JSON-RPC envelope (the default) or Envelope + A2A
         fields, stored as access_point.a2a.accepted_versions and access_point.a2a.validation
         (off, envelope, full). Version negotiation and the -32009 supported list follow the
-        surface's accepted versions. When the Target is an A2A proxy, the section shows the
-        surface's fixed versions and the JSON-RPC envelope, locked, and the Managed Agent
-        panel explains why; on such a surface the stored settings configure the variants
-        that point the Target at a URL. The
+        surface's accepted versions. When the surface's own Target is an A2A proxy, the
+        versions are fixed and shown locked, in every variant view, and the Managed Agent
+        panel explains why; a Target in view that is an A2A proxy shows the JSON-RPC
+        envelope, locked, while a variant that points the Target at a URL keeps Message
+        validation editable. The
         surface API refuses the block on a surface that is not A2A or AP2, and only an
         appliance-wide administrator can set validation to off; an access token with a
         tenant or a resource scope, a resource pattern or required headers alone, is
@@ -73,7 +74,10 @@ changes:
         for the key to be removed, and it is removed from the example configuration. With
         the DynamoDB configuration source the retired switches are not applied, and the
         startup warning says so. A configuration reload that gives surfaces settings
-        serves them at once, and keeps a block saved through the API while it runs.
+        serves them at once, reads each surface again before storing its block, so it keeps
+        a block saved through the API before then, and does not bring back a surface
+        deleted meanwhile. Only an Active node stores the
+        settings; a Standby node stores them when it is promoted.
     - timestamp: '2026-10-08T00:00:00.000Z'
       title: Explain A2A version and validation refusals in the gateway log
       description: >-
@@ -115,11 +119,14 @@ changes:
         validation is off; on the fabric receiving gateway, which checks payment without
         the envelope check, it can at any validation level.
     - timestamp: '2026-10-19T00:00:00Z'
-      title: Escape and cut caller-supplied method names in payment log lines
+      title: Stop logging A2A message text and escape caller values in payment logs
       description: >-
-        x402 and MPP log lines now quote, escape and cut to 64 characters the JSON-RPC
-        method and payment method a caller sends, so a request cannot write forged lines
-        into the gateway log.
+        The x402 A2A method filter logged the caller's message text, up to 200 characters
+        and in full when a message pattern matched; it now logs only its length. x402 and
+        MPP log lines quote, escape and cut to 64 characters the JSON-RPC method, the MCP
+        tool name, the payment method, network, amount and reference a caller sends, and
+        escape payment verification and settlement errors, which can quote the caller's
+        payment proof, so a request cannot write extra lines into the gateway log.
   breaking:
     - timestamp: '2026-10-08T00:00:00.000Z'
       title: ⭐ Stop checking the A2A request shape by default

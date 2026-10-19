@@ -6,7 +6,9 @@ import { DOCS_URL } from '../../../../config/docs';
 import { isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 import {
   DEFAULT_A2A_SETTINGS,
+  servedA2aVersions,
   a2aSettingsForPayload,
+  baseTargetEndpoint,
   isA2aValidation,
   selectedA2aVersions,
 } from './a2aSettings';
@@ -52,11 +54,11 @@ export const accessPointDefinition: NodeDefinition = {
   featureDependencies: [
     {
       description: 'An A2A surface accepts at least one A2A version',
-      // An A2A proxy Target's versions are fixed by the gateway, so its locked
-      // checkboxes never block a save.
+      // The gateway fixes the versions of a surface whose base Target is an
+      // A2A proxy, so its locked checkboxes never block a save.
       condition: (_config, ctx) =>
         (ctx.protocol === 'a2a' || ctx.protocol === 'ap2') &&
-        !isA2aProxyEndpoint(ctx.target?.endpoint),
+        !isA2aProxyEndpoint(baseTargetEndpoint(ctx.base, ctx.target?.endpoint)),
       check: config => selectedA2aVersions(config).length > 0,
       severity: 'error',
       message: 'Select at least one supported A2A version',
@@ -110,20 +112,27 @@ export const accessPointDefinition: NodeDefinition = {
     if (Array.isArray(slice?.supported_extensions)) {
       c.supported_extensions = slice.supported_extensions.slice();
     }
-    // Always set explicitly, so a stale canvas-blob copy cannot reappear on load.
-    delete c.a2a;
+    // Assigned rather than deleted, so the canvas-blob overlay, which fills
+    // only missing keys, cannot bring back a stale copy.
+    c.a2a = undefined;
     if (slice?.protocol === 'a2a' || slice?.protocol === 'ap2') {
-      const a2a = slice?.a2a ?? {};
-      c.a2a_accepted_versions = Array.isArray(a2a.accepted_versions)
-        ? a2a.accepted_versions.slice()
-        : [...DEFAULT_A2A_SETTINGS.accepted_versions];
-      c.a2a_validation = isA2aValidation(a2a.validation)
+      const a2a = slice?.a2a;
+      // A block without versions comes from a dashboard payload whose base
+      // Target is an A2A proxy; the versions then come from the canvas blob
+      // built with it.
+      const versions: string[] | undefined = Array.isArray(a2a?.accepted_versions)
+        ? a2a.accepted_versions
+        : undefined;
+      if (versions || !a2a) {
+        c.a2a_accepted_versions = (versions ?? DEFAULT_A2A_SETTINGS.accepted_versions).slice();
+      }
+      c.a2a_validation = isA2aValidation(a2a?.validation)
         ? a2a.validation
         : DEFAULT_A2A_SETTINGS.validation;
-      if (isA2aProxyEndpoint(payload?.target?.endpoint) && Array.isArray(a2a.accepted_versions)) {
-        c.a2a_locked_versions = a2a.accepted_versions.slice();
-      } else {
-        delete c.a2a_locked_versions;
+      if (!isA2aProxyEndpoint(payload?.target?.endpoint)) {
+        c.a2a_locked_versions = undefined;
+      } else if (versions || !a2a) {
+        c.a2a_locked_versions = servedA2aVersions(versions);
       }
     }
     return c;
@@ -191,8 +200,10 @@ export const accessPointDefinition: NodeDefinition = {
       ap.name = c.name.trim();
     }
     if (ap.protocol === 'a2a' || ap.protocol === 'ap2') {
-      const a2a = a2aSettingsForPayload(c, ctx.firstNodeOfType('target')?.config?.endpoint);
-      if (a2a) ap.a2a = a2a;
+      ap.a2a = a2aSettingsForPayload(
+        c,
+        baseTargetEndpoint(ctx.base, ctx.firstNodeOfType('target')?.config?.endpoint)
+      );
     }
     return [{ path: 'access_point', value: ap }];
   },

@@ -164,10 +164,13 @@ default) or **Envelope + A2A fields**.
   `GET`) takes the fixed ones; one that asks for other versions is refused with `400`.
 - An `a2a-proxy://` Target accepts the block's versions and always checks the JSON-RPC envelope
   only, whatever `validation` says, and so does a variant that points the Target at an A2A proxy.
-  While the Target in view is an A2A proxy, the dashboard shows the fixed versions and
-  **JSON-RPC envelope**, locked, and leaves the block out of the payload.
+  The dashboard follows the base Target for the versions: with an A2A proxy base Target it shows
+  the fixed versions, locked, in every view, and sends only `validation` (`"envelope"` when no
+  variant points the Target at a URL). It locks **Message validation** at **JSON-RPC envelope**
+  only while the Target in view is an A2A proxy.
 - On a surface whose Target is an A2A proxy, `validation` configures only the variants that point
-  the Target at a URL. With no such variant it applies to no request and must be `"envelope"`. A
+  the Target at a URL, enabled or not, so disabling one and enabling it again keeps the level. With
+  no such variant it applies to no request and must be `"envelope"`. A
   save that only carries the stored level along (a Target moved to a proxy, a `PUT` echoing `GET`,
   the last URL variant changed or removed) resets it to `"envelope"` and keeps the versions; a save
   that changes it to another level is refused with `400`.
@@ -199,8 +202,13 @@ default) or **Envelope + A2A fields**.
   and the next load retries; those surfaces are served with the defaults meanwhile. A block that
   cannot be saved is stored on a later load or save; until then, a startup serves that surface with
   the defaults, while a configuration reload serves the carried settings straight away. Each surface
-  is read again just before its block is stored, so a block saved through the API while a reload
-  runs is kept, with the rest of that edit.
+  is read again just before its block is stored, and the block is set on what is read: a block saved
+  through the API before that read is kept, with the rest of that edit, and a surface deleted or
+  moved to another protocol meanwhile is not stored again. There is no lock, so an API save that
+  lands between that read and the store is overwritten.
+- Only an Active node stores carried settings. A Standby node gives them in memory, so it cannot
+  overwrite an edit the Active node saves meanwhile, and the configuration reload that promotes it to
+  Active stores the blocks that are still missing.
 - With `channel_config_source = "dynamodb"` the carry-over does not run: an A2A surface without a
   block is served with the defaults. A startup warning says when a retired switch is therefore not
   applied (`validate_messages` set, or the flag off); set `access_point.a2a` on each surface instead.
@@ -215,7 +223,8 @@ default) or **Envelope + A2A fields**.
   upgraded, or its refresh drops the surfaces the newer node has written.
 - A stored version list that is invalid, which only editing storage by hand can produce, is not
   refused: a startup warning names the surface, and an empty or unrecognised `accepted_versions`
-  serves both versions until the surface is saved with valid settings. A stored block with an
+  serves both versions until the surface is saved with valid settings. On an A2A-proxy surface, the
+  versions it is served with become its fixed versions, so it can still be saved. A stored block with an
   unknown field or an unknown `validation` level does not parse, like any other unknown Access
   Point field, so the surface is not loaded and the load logs why.
 - Changes take effect when the surface is saved, without a restart.

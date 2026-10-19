@@ -14,17 +14,27 @@ interface A2aProxyEndpointFieldsProps {
   selectedProxyId?: string;
   a2aProxies: A2aProxyOption[];
   updateFields: (fields: Record<string, unknown>) => void;
-  /** The surface's fixed A2A versions, as the Access Point shows them. */
+  /** The surface's A2A versions, as the Access Point shows them. */
   acceptedVersions?: string[];
+  /** The base Target is an A2A proxy, so the gateway fixes the versions. */
+  versionsFixed?: boolean;
 }
+
+const acceptsLabel = (versions: string[]): string => {
+  if (versions.length === 0) return 'Accepts no A2A version';
+  if (versions.length === 1) return `Accepts A2A ${versions[0]} only`;
+  return `Accepts A2A ${versions.join(' and ')}`;
+};
 
 const A2aProxyEndpointFields: React.FC<A2aProxyEndpointFieldsProps> = ({
   selectedProxyId = '',
   a2aProxies,
   updateFields,
   acceptedVersions = A2A_PROXY_SETTINGS.accepted_versions,
+  versionsFixed = true,
 }) => {
   const accepts0_3 = acceptedVersions.includes('0.3');
+  const accepts1_0 = acceptedVersions.includes('1.0');
   const navigate = useNavigate();
   const selectedA2aProxy = a2aProxies.find(proxy => proxy.id === selectedProxyId);
 
@@ -65,32 +75,40 @@ const A2aProxyEndpointFields: React.FC<A2aProxyEndpointFieldsProps> = ({
         data-testid="managed-agent-a2a-proxy-protocol-hint"
       >
         <div className="fw-semibold mb-1" data-testid="managed-agent-a2a-proxy-versions">
-          {accepts0_3 ? 'Accepts A2A 0.3 and 1.0' : 'Accepts A2A 1.0 only'}
+          {acceptsLabel(acceptedVersions)}
         </div>
-        {accepts0_3 && (
+        {versionsFixed && accepts0_3 && (
           <div className="mb-1" data-testid="managed-agent-a2a-proxy-0-3-reason">
             {A2A_PROXY_0_3_REASON}
           </div>
         )}
         <ul className="mb-0 ps-3">
-          <li>
-            {accepts0_3 ? (
-              <>
-                Callers may send <code>A2A-Version: 1.0</code> or <code>0.3</code>, or no header
-                (read as 0.3).
-              </>
-            ) : (
-              <>
-                Callers must send <code>A2A-Version: 1.0</code>. A request without it is refused.
-              </>
-            )}
-          </li>
+          {accepts0_3 && accepts1_0 && (
+            <li>
+              Callers may send <code>A2A-Version: 1.0</code> or <code>0.3</code>, or no header (read
+              as 0.3).
+            </li>
+          )}
+          {accepts1_0 && !accepts0_3 && (
+            <li>
+              Callers must send <code>A2A-Version: 1.0</code>. A request without it is refused.
+            </li>
+          )}
+          {accepts0_3 && !accepts1_0 && (
+            <li>
+              Callers may send <code>A2A-Version: 0.3</code>, or no header (read as 0.3).
+            </li>
+          )}
           <li>
             The reply follows the method: <code>SendMessage</code> gets an A2A 1.0 reply,{' '}
             <code>message/send</code> an A2A 0.3 reply.
           </li>
           <li>Only the JSON-RPC envelope is checked, not the A2A message fields.</li>
-          <li>These versions are fixed.</li>
+          <li>
+            {versionsFixed
+              ? 'These versions are fixed.'
+              : "These are the surface's versions, set in the Access Point."}
+          </li>
         </ul>
       </div>
       <div

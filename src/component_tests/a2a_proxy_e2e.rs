@@ -1162,6 +1162,26 @@ async fn surface_api_settles_a2a_settings_on_a2a_proxy_surfaces() {
     let (_, stored) = send(client.get(surface_url(&created))).await;
     assert_eq!(stored["access_point"]["a2a"], only_1_0_envelope, "{stored}");
 
+    // Disabling and re-enabling the only URL variant keeps `full`.
+    let (_, created) = send(
+        client
+            .post(&collection)
+            .json(&create("/variant-disable", &proxy, Some(&h.mock.url()))),
+    )
+    .await;
+    for enabled in [false, true] {
+        let (status, patched) = send(
+            client
+                .patch(format!("{}/variants/url-variant", surface_url(&created)))
+                .header("content-type", "application/merge-patch+json")
+                .json(&json!({"enabled": enabled})),
+        )
+        .await;
+        assert_eq!(status, 200, "{patched}");
+        let (_, stored) = send(client.get(surface_url(&created))).await;
+        assert_eq!(stored["access_point"]["a2a"]["validation"], "full", "enabled={enabled}: {stored}");
+    }
+
     // The versions of an A2A-proxy surface are fixed, and a level it applies to nothing is refused.
     let (_, created) = send(
         client

@@ -12,7 +12,8 @@ import FabricDelegatedCredentialsSection, {
   hasOutboundCredentialBindings,
 } from '../_shared/FabricDelegatedCredentialsSection';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
-import { a2aProxyVersions } from '../access-point/a2aSettings';
+import { a2aTargetView } from '../access-point/a2aSettings';
+import { a2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 
 interface Gateway {
   id: string;
@@ -42,6 +43,7 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
   errorByField,
   openFullscreenEditor,
   allNodes,
+  base,
 }) => {
   const [gateways, setGateways] = useState<Gateway[]>([]);
   const [gatewayChannels, setGatewayChannels] = useState<GatewayChannel[]>([]);
@@ -56,6 +58,11 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
   // would silently drift from the saved wire shape (e.g. a saved
   // `fabric://...` endpoint would render as Direct URL on reload).
   const endpointType: 'url' | 'gateway' | 'mcp-proxy' | 'a2a-proxy' = config.endpoint_type || 'url';
+  const a2aProxyView = a2aTargetView(
+    allNodes?.find(n => n.type === 'access-point')?.config,
+    a2aProxyEndpoint(config.a2a_proxy_id || ''),
+    base
+  );
   const selectedGatewayId: string = config.gateway_id || '';
   const selectedGatewayChannel: string = config.gateway_channel || '';
 
@@ -430,9 +437,8 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
             selectedProxyId={config.a2a_proxy_id || ''}
             a2aProxies={a2aProxies}
             updateFields={updateFields}
-            acceptedVersions={a2aProxyVersions(
-              allNodes?.find(n => n.type === 'access-point')?.config
-            )}
+            acceptedVersions={a2aProxyView.versions}
+            versionsFixed={a2aProxyView.versionsFixed}
           />
         )}
       </div>

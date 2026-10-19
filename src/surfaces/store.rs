@@ -359,9 +359,18 @@ fn request_shape_check_warning(names: &[&str]) -> Option<String> {
 /// seeds the resolved-surface cache from storage, so until then that surface is
 /// served with the defaults.
 ///
-/// Each surface is read from `store` again just before its block is saved: a
-/// block an API edit stored meanwhile is kept, with the rest of that edit, and
-/// the surface passed in is replaced by the stored one.
+/// With `persist` false (a Standby node, so it cannot overwrite an Active node's edit),
+/// the blocks are set on the surfaces passed in only; the reload that promotes
+/// the node to Active stores them.
+///
+/// With `persist`, each surface is read from `store` again just before its
+/// block is saved, and the block is set on the stored copy, which replaces the
+/// one passed in. A stored copy that has a block (an API edit stored it
+/// meanwhile) or no longer uses A2A settings is kept as it is; a surface that is
+/// gone is removed from `surfaces`, and one that cannot be read is skipped. An
+/// API save that lands between the re-read and the save is still overwritten.
+/// The re-read sees what `store` has, so at startup it is the snapshot the
+/// surfaces were listed from.
 ///
 /// Returns the ids of the surfaces that now carry settings, so a caller can
 /// refresh what it serves from.
@@ -380,8 +389,22 @@ fn request_shape_check_warning(names: &[&str]) -> Option<String> {
 /// Called from the same load paths as [`strip_unsupported_header_metadata_mappings`].
 pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
     store: &S,
-    surfaces: &mut [AgentSurface],
+    surfaces: &mut Vec<AgentSurface>,
+    persist: bool,
     retired: impl FnOnce() -> Result<RetiredA2aSwitches, String>,
+) -> Vec<String> {
+    let mut gone = Vec::new();
+    let given = give_a2a_settings(store, surfaces, persist, retired, &mut gone).await;
+    surfaces.retain(|surface| !gone.contains(&surface.surface_id));
+    given
+}
+
+async fn give_a2a_settings<S: AgentSurfaceStore + ?Sized>(
+    store: &S,
+    surfaces: &mut [AgentSurface],
+    persist: bool,
+    retired: impl FnOnce() -> Result<RetiredA2aSwitches, String>,
+    gone: &mut Vec<String>,
 ) -> Vec<String> {
     let mut needing = Vec::new();
     for (index, surface) in surfaces.iter().enumerate() {
@@ -429,24 +452,47 @@ pub async fn carry_over_a2a_settings<S: AgentSurfaceStore + ?Sized>(
     let mut carried_indices = Vec::new();
     for index in &needing {
         let surface = &mut surfaces[*index];
-        if let Ok(Some(stored)) = store
-            .get(&surface.surface_id)
-            .await
-            && stored
-                .access_point
-                .a2a
-                .is_some()
-        {
-            *surface = stored;
-            given.push(surface.surface_id.clone());
-            continue;
+        if persist {
+            match store
+                .get(&surface.surface_id)
+                .await
+            {
+                Ok(Some(stored)) => {
+                    let has_block = stored
+                        .access_point
+                        .a2a
+                        .is_some();
+                    let uses_settings = stored.uses_a2a_settings();
+                    *surface = stored;
+                    if has_block {
+                        given.push(surface.surface_id.clone());
+                    }
+                    if has_block || !uses_settings {
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    gone.push(surface.surface_id.clone());
+                    continue;
+                }
+                Err(error) => {
+                    warn!(
+                        surface = %surface.name,
+                        surface_id = %surface.surface_id,
+                        error = %error,
+                        "Could not read the surface again before storing carried-over A2A settings; it is given them \
+                         on a later load"
+                    );
+                    continue;
+                }
+            }
         }
         let mut settings = carried.clone();
         if !surface.a2a_validation_applies() {
             settings.validation = A2aValidation::Envelope;
         }
         surface.access_point.a2a = Some(settings);
-        if let Err(error) = store.save(surface).await {
+        if persist && let Err(error) = store.save(surface).await {
             warn!(
                 surface = %surface.name,
                 surface_id = %surface.surface_id,
@@ -661,6 +707,20 @@ mod tests {
         .expect("test surface should deserialize")
     }
 
+    /// Store `surfaces`, as the load that lists them would have found them.
+    async fn listed(
+        store: &FileSystemAgentSurfaceStore,
+        surfaces: Vec<AgentSurface>,
+    ) -> Vec<AgentSurface> {
+        for surface in &surfaces {
+            store
+                .save(surface)
+                .await
+                .expect("save");
+        }
+        surfaces
+    }
+
     fn settings(
         versions: &[&str],
         validation: A2aValidation,
@@ -700,13 +760,13 @@ mod tests {
     async fn an_a2a_surface_without_settings_takes_the_retired_switches_and_is_stored() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(dir.path()).await;
-        let mut surfaces = vec![a2a_surface("s-old", "https://a2a.internal/a2a", None)];
+        let mut surfaces = listed(&store, vec![a2a_surface("s-old", "https://a2a.internal/a2a", None)]).await;
         let retired = RetiredA2aSwitches {
             validate_messages: Some(false),
             legacy_compatibility: Some(false),
         };
 
-        carry_over_a2a_settings(&store, &mut surfaces, || Ok(retired)).await;
+        carry_over_a2a_settings(&store, &mut surfaces, true, || Ok(retired)).await;
 
         let expected = settings(&["1.0"], A2aValidation::Off);
         assert_eq!(surfaces[0].access_point.a2a, Some(expected.clone()));
@@ -740,7 +800,7 @@ mod tests {
             mcp_surface_with_mapping("s-mcp"),
         ];
 
-        carry_over_a2a_settings(&store, &mut surfaces, || panic!("the settings file must not be read")).await;
+        carry_over_a2a_settings(&store, &mut surfaces, true, || panic!("the settings file must not be read")).await;
 
         assert_eq!(surfaces[0].access_point.a2a, Some(own), "a surface's own settings are kept");
         assert_eq!(surfaces[1].access_point.a2a, None, "an MCP surface gets no block");
@@ -763,13 +823,13 @@ mod tests {
     async fn an_existing_a2a_proxy_surface_keeps_a2a_0_3_with_envelope_validation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(dir.path()).await;
-        let mut surfaces = vec![a2a_surface("s-proxy", "a2a-proxy://worker", None)];
+        let mut surfaces = listed(&store, vec![a2a_surface("s-proxy", "a2a-proxy://worker", None)]).await;
         let retired = RetiredA2aSwitches {
             validate_messages: Some(false),
             legacy_compatibility: None,
         };
 
-        carry_over_a2a_settings(&store, &mut surfaces, || Ok(retired)).await;
+        carry_over_a2a_settings(&store, &mut surfaces, true, || Ok(retired)).await;
 
         let expected = settings(&["0.3", "1.0"], A2aValidation::Envelope);
         assert_eq!(surfaces[0].access_point.a2a, Some(expected.clone()));
@@ -791,13 +851,13 @@ mod tests {
     async fn an_existing_a2a_proxy_surface_follows_the_retired_flag_turning_0_3_off() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(dir.path()).await;
-        let mut surfaces = vec![a2a_surface("s-proxy", "a2a-proxy://worker", None)];
+        let mut surfaces = listed(&store, vec![a2a_surface("s-proxy", "a2a-proxy://worker", None)]).await;
         let retired = RetiredA2aSwitches {
             validate_messages: None,
             legacy_compatibility: Some(false),
         };
 
-        carry_over_a2a_settings(&store, &mut surfaces, || Ok(retired)).await;
+        carry_over_a2a_settings(&store, &mut surfaces, true, || Ok(retired)).await;
 
         assert_eq!(surfaces[0].access_point.a2a, Some(settings(&["1.0"], A2aValidation::Envelope)));
     }
@@ -819,7 +879,7 @@ mod tests {
             ),
         ];
 
-        carry_over_a2a_settings(&store, &mut surfaces, || Ok(RetiredA2aSwitches::default())).await;
+        carry_over_a2a_settings(&store, &mut surfaces, true, || Ok(RetiredA2aSwitches::default())).await;
 
         assert_eq!(surfaces[0].access_point.a2a, Some(settings(&[], A2aValidation::Full)), "left as stored");
         assert_eq!(
@@ -891,7 +951,7 @@ mod tests {
             mcp_surface_with_mapping("s-mcp"),
         ];
 
-        carry_over_a2a_settings(&store, &mut surfaces, || panic!("the settings file must not be read")).await;
+        carry_over_a2a_settings(&store, &mut surfaces, true, || panic!("the settings file must not be read")).await;
     }
 
     #[tokio::test]
@@ -900,7 +960,8 @@ mod tests {
         let store = test_store(dir.path()).await;
         let mut surfaces = vec![a2a_surface("s-old", "https://a2a.internal/a2a", None)];
 
-        carry_over_a2a_settings(&store, &mut surfaces, || Err("settings.json: EOF while parsing".to_string())).await;
+        carry_over_a2a_settings(&store, &mut surfaces, true, || Err("settings.json: EOF while parsing".to_string()))
+            .await;
 
         assert_eq!(surfaces[0].access_point.a2a, None, "nothing is carried over");
         assert!(
@@ -920,7 +981,7 @@ mod tests {
         );
     }
 
-    struct FailingStore;
+    struct FailingStore(Vec<AgentSurface>);
 
     #[async_trait]
     impl AgentSurfaceStore for FailingStore {
@@ -933,13 +994,17 @@ mod tests {
 
         async fn get(
             &self,
-            _surface_id: &str,
+            surface_id: &str,
         ) -> anyhow::Result<Option<AgentSurface>> {
-            Ok(None)
+            Ok(self
+                .0
+                .iter()
+                .find(|surface| surface.surface_id == surface_id)
+                .cloned())
         }
 
         async fn list_all(&self) -> anyhow::Result<Vec<AgentSurface>> {
-            Ok(Vec::new())
+            Ok(self.0.clone())
         }
 
         async fn delete(
@@ -961,7 +1026,7 @@ mod tests {
             legacy_compatibility: Some(false),
         };
 
-        carry_over_a2a_settings(&FailingStore, &mut surfaces, || Ok(retired)).await;
+        carry_over_a2a_settings(&FailingStore(surfaces.clone()), &mut surfaces, true, || Ok(retired)).await;
 
         for surface in &surfaces {
             assert_eq!(
@@ -1064,11 +1129,11 @@ mod tests {
     async fn surfaces_that_lost_the_request_shape_check_are_stored_so_the_warning_is_logged_once() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(dir.path()).await;
-        let mut surfaces = vec![a2a_surface("alpha", "https://a2a.internal/a2a", None)];
+        let mut surfaces = listed(&store, vec![a2a_surface("alpha", "https://a2a.internal/a2a", None)]).await;
         let retired = RetiredA2aSwitches::default();
         assert_eq!(names_losing_request_shape_check(&retired, &surfaces), vec!["alpha"]);
 
-        carry_over_a2a_settings(&store, &mut surfaces, || Ok(retired)).await;
+        carry_over_a2a_settings(&store, &mut surfaces, true, || Ok(retired)).await;
 
         let stored = store
             .get("alpha")
@@ -1082,7 +1147,7 @@ mod tests {
                 .is_some()
         );
         let mut reloaded = vec![stored];
-        carry_over_a2a_settings(&store, &mut reloaded, || panic!("a later load gives no surface settings")).await;
+        carry_over_a2a_settings(&store, &mut reloaded, true, || panic!("a later load gives no surface settings")).await;
     }
 
     #[test]
@@ -1159,8 +1224,9 @@ mod tests {
             a2a_surface("s-old", "https://a2a.internal/old", None),
             mcp_surface_with_mapping("s-mcp"),
         ];
+        listed(&store, vec![surfaces[1].clone()]).await;
 
-        let given = carry_over_a2a_settings(&store, &mut surfaces, || Ok(RetiredA2aSwitches::default())).await;
+        let given = carry_over_a2a_settings(&store, &mut surfaces, true, || Ok(RetiredA2aSwitches::default())).await;
 
         assert_eq!(given, vec!["s-edited".to_string(), "s-old".to_string()]);
         assert_eq!(surfaces[0].access_point.a2a, Some(settings(&["1.0"], A2aValidation::Full)));
@@ -1174,13 +1240,79 @@ mod tests {
         assert_eq!(surfaces[1].access_point.a2a, Some(settings(&["0.3", "1.0"], A2aValidation::Envelope)));
     }
 
+    /// A surface deleted, or moved to another protocol, after it was listed is
+    /// not stored again from the listed copy.
+    #[tokio::test]
+    async fn a_surface_deleted_or_moved_to_another_protocol_meanwhile_is_not_stored_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut moved = mcp_surface_with_mapping("s-moved");
+        moved
+            .access_point
+            .header_metadata_mapping = None;
+        store
+            .save(&moved)
+            .await
+            .unwrap();
+        let mut surfaces = vec![
+            a2a_surface("s-deleted", "https://a2a.internal/deleted", None),
+            a2a_surface("s-moved", "https://a2a.internal/moved", None),
+        ];
+
+        let given = carry_over_a2a_settings(&store, &mut surfaces, true, || Ok(RetiredA2aSwitches::default())).await;
+
+        assert!(given.is_empty(), "{given:?}");
+        assert_eq!(surfaces.len(), 1, "the deleted surface is dropped from the list");
+        assert!(
+            store
+                .get("s-deleted")
+                .await
+                .unwrap()
+                .is_none(),
+            "a deleted surface is not stored again"
+        );
+        let stored = store
+            .get("s-moved")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_point.a2a, None, "the stored MCP surface is left as it is");
+        assert_eq!(stored.access_point.protocol, moved.access_point.protocol);
+        assert_eq!(
+            surfaces[0]
+                .access_point
+                .protocol,
+            moved.access_point.protocol,
+            "the listed copy is replaced by the stored one"
+        );
+    }
+
+    /// A Standby node gives the settings in memory and writes nothing.
+    #[tokio::test]
+    async fn without_persist_the_settings_are_given_in_memory_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut surfaces = listed(&store, vec![a2a_surface("s-old", "https://a2a.internal/a2a", None)]).await;
+
+        let given = carry_over_a2a_settings(&store, &mut surfaces, false, || Ok(RetiredA2aSwitches::default())).await;
+
+        assert_eq!(given, vec!["s-old".to_string()]);
+        assert_eq!(surfaces[0].access_point.a2a, Some(settings(&["0.3", "1.0"], A2aValidation::Envelope)));
+        let stored = store
+            .get("s-old")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_point.a2a, None, "nothing is written");
+    }
+
     #[tokio::test]
     async fn nothing_is_returned_when_every_surface_has_settings_or_the_settings_file_is_unreadable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(dir.path()).await;
         let mut unreadable = vec![a2a_surface("s-old", "https://a2a.internal/a", None)];
         assert!(
-            carry_over_a2a_settings(&store, &mut unreadable, || Err("settings.json: EOF".to_string()))
+            carry_over_a2a_settings(&store, &mut unreadable, true, || Err("settings.json: EOF".to_string()))
                 .await
                 .is_empty()
         );
@@ -1190,7 +1322,7 @@ mod tests {
             Some(serde_json::to_value(settings(&["1.0"], A2aValidation::Envelope)).unwrap()),
         )];
         assert!(
-            carry_over_a2a_settings(&store, &mut own, || panic!("not read"))
+            carry_over_a2a_settings(&store, &mut own, true, || panic!("not read"))
                 .await
                 .is_empty()
         );

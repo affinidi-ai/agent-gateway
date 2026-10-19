@@ -240,7 +240,7 @@ pub async fn process_payment(
                                 channel = channel_name,
                                 channel_id = channel_id,
                                 method = ?crate::a2a::clip_for_log(&method_str),
-                                reference = %reference,
+                                reference = ?crate::a2a::clip_for_log(&reference),
                                 "[mpp] Payment verified successfully"
                             );
 
@@ -309,7 +309,7 @@ pub async fn process_payment(
                         Err(e) => {
                             tracing::warn!(
                                 channel = channel_name,
-                                error = %e,
+                                error = ?e.to_string(),
                                 "[mpp] Payment proof verification failed"
                             );
 
@@ -358,7 +358,7 @@ pub async fn process_payment(
                 Err(e) => {
                     tracing::warn!(
                         channel = channel_name,
-                        error = %e,
+                        error = ?e.to_string(),
                         "[mpp] Payment verification failed"
                     );
 

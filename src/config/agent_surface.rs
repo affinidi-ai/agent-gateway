@@ -384,7 +384,7 @@ impl A2aAccessPointSettings {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self
             .accepted_versions
             .is_empty()
@@ -2013,16 +2013,19 @@ impl AgentSurface {
     }
 
     /// Whether `access_point.a2a.validation` applies to any request on this
-    /// surface: its own Target is not an A2A proxy, or a variant points the
-    /// Target at one that is not. A2A-proxy Targets always check the envelope only.
+    /// surface: its own Target is not an A2A proxy, or a variant, enabled or
+    /// not, points the Target at one that is not. A2A-proxy Targets always
+    /// check the envelope only.
     pub fn a2a_validation_applies(&self) -> bool {
         !self.is_a2a_proxy_target()
             || self
                 .variants
                 .iter()
                 .any(|variant| {
-                    self.resolve_variant(Some(&variant.alias))
-                        .is_ok_and(|resolved| !resolved.is_a2a_proxy_target())
+                    !self
+                        .variant_target(variant)
+                        .endpoint
+                        .starts_with(A2A_PROXY_ENDPOINT_PREFIX)
                 })
     }
 
@@ -4641,6 +4644,15 @@ mod a2a_settings_tests {
             .resolve_variant(Some("other"))
             .unwrap();
         assert_eq!(url_variant.a2a_settings(), effective(VERSIONS_0_3_ONLY, A2aValidation::Full));
+    }
+
+    #[test]
+    fn the_block_still_configures_a_disabled_url_variant_of_an_a2a_proxy_surface() {
+        let mut surface =
+            with_variant_target(surface("a2a", "a2a-proxy://worker", Some(settings(&["1.0"], "full"))), "http://agent");
+        surface.variants[0].enabled = false;
+        assert!(surface.a2a_validation_applies(), "the level comes back into use when the variant is enabled");
+        assert_eq!(surface.validate_a2a_settings(), Ok(()));
     }
 
     #[test]

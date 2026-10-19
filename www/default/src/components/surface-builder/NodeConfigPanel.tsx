@@ -4,6 +4,7 @@ import { AppButton } from '../shared/AppButton';
 import { CanvasNode, getIncompleteReason } from './SurfaceCanvas';
 import type { SurfaceNodeType } from './nodeTypes';
 import { registry, buildSurfaceContext } from './elements';
+import type { BaseSurfaceView } from './elements/types';
 import HelpBalloon from './HelpBalloon';
 import { shouldShowDependencyWarnings } from './dependencyWarningVisibility';
 
@@ -38,6 +39,8 @@ interface NodeConfigPanelProps {
    * clean on open.
    */
   hasAttemptedSave?: boolean;
+  /** The base surface, while the canvas shows a variant. */
+  base?: BaseSurfaceView;
 }
 
 const FALLBACK_LABEL = 'Element';
@@ -71,6 +74,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
   externalRevision = 0,
   replaceCommit,
   hasAttemptedSave = false,
+  base,
 }) => {
   const [panelWidth, setPanelWidth] = useState(() => {
     try {
@@ -139,7 +143,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
 
   const def = registry.get(node.type);
   const Panel = def?.ConfigPanel;
-  const ctx = buildSurfaceContext(protocol, allNodes);
+  const ctx = buildSurfaceContext(protocol, allNodes, base);
   const warnings = registry.getDependencyWarnings(node.type, node.config, ctx);
   const validationErrors = registry.getValidationErrors(node.type, node.config);
   const label = defLabel(node.type);
@@ -301,6 +305,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
                 : {}
             }
             hasAttemptedSave={hasAttemptedSave}
+            base={base}
           />
         )
       ) : node.type === 'local-gateway-hop' ? (

@@ -267,7 +267,12 @@ export function resolveVariant(base: any, overrides: SurfaceOverrides | undefine
       apIdentifiers[f] = baseAp[f];
     }
     out.access_point = { ...apIdentifiers, ...(overrides.access_point ?? {}) };
-    out.target = { ...(overrides.target ?? {}) };
+    // The gateway keeps the base endpoint when a complete override names none.
+    const baseEndpoint = (out.target as Record<string, unknown> | undefined)?.endpoint;
+    out.target = {
+      ...(baseEndpoint !== undefined ? { endpoint: baseEndpoint } : {}),
+      ...(overrides.target ?? {}),
+    };
     if (overrides.transit) {
       if (overrides.transit.disabled === true) {
         out.transit = undefined;

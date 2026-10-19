@@ -6,17 +6,15 @@ import RouteListenerSection, {
   ENTRY_POINT_URL_LABEL,
 } from '../_shared/RouteListenerSection';
 import { AgentCardLocationHelp, AGENT_CARD_EXPLAINER } from '../_shared/AgentCardLocationHelp';
-import { isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 import FieldHelp from '../../../shared/FieldHelp';
 import {
   A2A_PROXY_0_3_REASON,
   A2A_PROXY_SETTINGS,
   A2A_VALIDATION_OPTIONS,
   A2A_VERSIONS,
-  a2aProxyVersions,
+  a2aTargetView,
   isA2aValidation,
   selectedA2aValidation,
-  selectedA2aVersions,
 } from './a2aSettings';
 
 const AccessPointPanel: React.FC<ConfigPanelProps> = ({
@@ -27,14 +25,13 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
   allNodes,
   replaceCommit,
   hasAttemptedSave,
+  base,
 }) => {
   const isA2aLike = protocol === 'a2a' || protocol === 'ap2';
   const targetEndpoint = allNodes?.find(n => n.type === 'target')?.config?.endpoint;
-  // The gateway fixes an A2A proxy Target's versions and checks the envelope
-  // only, so the controls show those values and are locked.
-  const isA2aProxyTarget = isA2aProxyEndpoint(targetEndpoint);
-  const a2aVersions = isA2aProxyTarget ? a2aProxyVersions(config) : selectedA2aVersions(config);
-  const a2aValidation = isA2aProxyTarget
+  const a2aView = a2aTargetView(config, targetEndpoint, base);
+  const a2aVersions = a2aView.versions;
+  const a2aValidation = a2aView.envelopeOnly
     ? A2A_PROXY_SETTINGS.validation
     : selectedA2aValidation(config);
 
@@ -56,7 +53,7 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
       {isA2aLike && (
         <div className="config-section" data-testid="access-point-a2a-protocol">
           <label>A2A Protocol</label>
-          {isA2aProxyTarget && (
+          {a2aView.versionsFixed && (
             <Form.Text
               className="text-muted d-block mb-1"
               style={{ fontSize: '10px' }}
@@ -65,7 +62,19 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
               {a2aVersions.includes('0.3')
                 ? `${A2A_PROXY_0_3_REASON} `
                 : 'A surface with an A2A proxy accepts A2A 1.0 only. '}
-              These versions are fixed, and only the JSON-RPC envelope is checked.
+              {a2aView.envelopeOnly
+                ? 'These versions are fixed, and only the JSON-RPC envelope is checked.'
+                : 'The base Target is an A2A proxy, so these versions are fixed. Message validation applies to this Target, a URL.'}
+            </Form.Text>
+          )}
+          {a2aView.envelopeOnly && !a2aView.versionsFixed && (
+            <Form.Text
+              className="text-muted d-block mb-1"
+              style={{ fontSize: '10px' }}
+              data-testid="access-point-a2a-proxy-envelope-only"
+            >
+              This Target is an A2A proxy, so it checks only the JSON-RPC envelope. The versions
+              below are the surface&apos;s and apply to it too.
             </Form.Text>
           )}
           <Form.Group className="mb-2">
@@ -90,7 +99,7 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
                   data-testid={`access-point-a2a-version-${version}`}
                   label={`A2A ${version}`}
                   checked={a2aVersions.includes(version)}
-                  disabled={isA2aProxyTarget}
+                  disabled={a2aView.versionsFixed}
                   onChange={e => {
                     const next = e.target.checked
                       ? [...a2aVersions, version]
@@ -102,7 +111,7 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
                 />
               ))}
             </div>
-            {!isA2aProxyTarget && a2aVersions.length === 0 && (
+            {!a2aView.versionsFixed && a2aVersions.length === 0 && (
               <Form.Text
                 className="text-danger d-block"
                 style={{ fontSize: '10px' }}
@@ -137,7 +146,7 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
               id="ap-a2a-validation"
               data-testid="access-point-a2a-validation"
               value={a2aValidation}
-              disabled={isA2aProxyTarget}
+              disabled={a2aView.envelopeOnly}
               onChange={e => {
                 if (isA2aValidation(e.target.value)) {
                   updateFields({ a2a_validation: e.target.value });

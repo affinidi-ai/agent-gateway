@@ -1073,8 +1073,9 @@ fn patch_sets_a2a_settings(patch: &serde_json::Value) -> bool {
 /// was not sent.
 ///
 /// The accepted versions of a surface whose Target is an A2A proxy are fixed:
-/// the stored ones when the stored Target was already an A2A proxy, and
-/// `["1.0"]` on create or when the Target moves to an A2A proxy. A block that
+/// the stored ones when the stored Target was already an A2A proxy (the ones it
+/// is served with when the stored list is invalid), and `["1.0"]` on create or
+/// when the Target moves to an A2A proxy. A block that
 /// does not name `accepted_versions`, or carries the stored versions unchanged,
 /// takes the fixed ones; one that names other versions is refused.
 ///
@@ -1101,14 +1102,20 @@ fn normalize_a2a_settings(
     let fixed_versions = surface
         .is_a2a_proxy_target()
         .then(|| match existing {
-            Some(existing) if existing.is_a2a_proxy_target() => {
-                existing
-                    .access_point
-                    .a2a
-                    .clone()
-                    .unwrap_or_default()
+            Some(existing) if existing.is_a2a_proxy_target() => match stored {
+                Some(stored) if stored.validate().is_err() => existing
+                    .a2a_settings()
                     .accepted_versions
-            }
+                    .iter()
+                    .map(|version| version.to_string())
+                    .collect(),
+                _ => {
+                    stored
+                        .cloned()
+                        .unwrap_or_default()
+                        .accepted_versions
+                }
+            },
             _ => A2aAccessPointSettings::a2a_proxy().accepted_versions,
         });
     let validation_applies = surface.a2a_validation_applies();
@@ -1136,6 +1143,7 @@ fn normalize_a2a_settings(
         }
         if let Some(stored) = stored
             && stored.accepted_versions != fixed
+            && !existing.is_some_and(AgentSurface::is_a2a_proxy_target)
         {
             warn!(
                 surface = ?crate::a2a::clip_for_log(&surface_name),
@@ -2420,6 +2428,26 @@ mod validation_tests {
         named.target.endpoint = "a2a-proxy://worker".to_string();
         named.access_point.a2a = Some(block(serde_json::json!({ "accepted_versions": ["0.3", "1.0"] })));
         assert!(normalize_a2a_settings(&mut named, None).is_err(), "versions a caller names are still checked");
+    }
+
+    /// A hand-edited invalid version list is served as both versions, or as the
+    /// one valid version it names, and those become the fixed versions, so the
+    /// surface can be saved again.
+    #[test]
+    fn an_a2a_proxy_surface_with_an_invalid_stored_list_takes_the_versions_it_is_served_with() {
+        for (stored_versions, served) in
+            [(&[][..], &["0.3", "1.0"][..]), (&["9.9"][..], &["0.3", "1.0"][..]), (&["1.0", "9.9"][..], &["1.0"][..])]
+        {
+            let existing = stored_surface("a2a-proxy://worker", a2a_block(stored_versions, A2aValidation::Envelope));
+            let mut omitted = existing.clone();
+            omitted.access_point.a2a = None;
+            assert_eq!(normalize_a2a_settings(&mut omitted, Some(&existing)), Ok(()), "{stored_versions:?}");
+            assert_eq!(omitted.access_point.a2a, Some(a2a_block(served, A2aValidation::Envelope)));
+
+            let mut echoed = existing.clone();
+            assert_eq!(normalize_a2a_settings(&mut echoed, Some(&existing)), Ok(()), "{stored_versions:?}");
+            assert_eq!(echoed.access_point.a2a, Some(a2a_block(served, A2aValidation::Envelope)));
+        }
     }
 
     fn stored_surface(

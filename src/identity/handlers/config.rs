@@ -238,9 +238,12 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
                     .list_all()
                     .await?;
                 crate::surfaces::strip_unsupported_header_metadata_mappings(agent_surface_store, &mut channels).await?;
-                let given = crate::surfaces::carry_over_a2a_settings(agent_surface_store, &mut channels, || {
-                    crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config)
-                })
+                let given = crate::surfaces::carry_over_a2a_settings(
+                    agent_surface_store,
+                    &mut channels,
+                    !crate::server::mode::is_standby(),
+                    || crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config),
+                )
                 .await;
                 for surface in channels
                     .iter()

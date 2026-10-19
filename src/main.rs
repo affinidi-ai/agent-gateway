@@ -902,7 +902,10 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
         .context("Failed to load network config for duplicate-route detection")?;
     disable_duplicate_route_surfaces(&store, &mut channels, &network_config).await?;
     surfaces::strip_unsupported_header_metadata_mappings(&store, &mut channels).await?;
-    surfaces::carry_over_a2a_settings(&store, &mut channels, || surfaces::RetiredA2aSwitches::read(bootstrap)).await;
+    surfaces::carry_over_a2a_settings(&store, &mut channels, !crate::server::mode::is_standby(), || {
+        surfaces::RetiredA2aSwitches::read(bootstrap)
+    })
+    .await;
 
     info!("✅ Loaded {} surface(s) from local storage", channels.len());
 

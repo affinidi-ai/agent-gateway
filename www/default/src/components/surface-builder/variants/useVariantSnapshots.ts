@@ -7,6 +7,7 @@ import {
   type VariantEntryWire,
   type SurfaceOverrides,
 } from './resolve';
+import type { BaseSurfaceView } from '../elements/types';
 
 /**
  * Synthetic id used for the always-present "base" pseudo-variant. The
@@ -271,6 +272,25 @@ export interface UseVariantSnapshotsResult {
    * fact and feed it back into `nodesFromSurface`.
    */
   getSnapshot: (variantId: string) => any | undefined;
+  /**
+   * The base surface while a named variant is active, read from the base
+   * snapshot; `undefined` while the base is active, when the canvas is the base.
+   */
+  getBaseSurface: () => BaseSurfaceView | undefined;
+}
+
+/** The base Target endpoint and Access Point canvas config of a base snapshot. */
+export function baseSurfaceFromSnapshot(snapshot: any): BaseSurfaceView {
+  const nodes = snapshot?.canvas?.nodes;
+  const accessPoint = Array.isArray(nodes)
+    ? nodes.find((n: any) => n?.id === 'access-point')
+    : undefined;
+  return {
+    targetEndpoint: snapshot?.target?.endpoint,
+    ...(accessPoint?.config && typeof accessPoint.config === 'object'
+      ? { accessPointConfig: accessPoint.config }
+      : {}),
+  };
 }
 
 /**
@@ -396,6 +416,12 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
   const getSnapshot = useCallback((variantId: string): any | undefined => {
     return snapshotsRef.current[variantId];
   }, []);
+
+  const getBaseSurface = useCallback((): BaseSurfaceView | undefined => {
+    if (!activeVariantId || activeVariantId === BASE_VARIANT_ID) return undefined;
+    const base = snapshotsRef.current[BASE_VARIANT_ID];
+    return base ? baseSurfaceFromSnapshot(base) : undefined;
+  }, [activeVariantId]);
 
   const setCatalog = useCallback(
     (next: { variants: VariantMeta[]; defaultVariantId: string | null }) => {
@@ -574,6 +600,7 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
       buildVariantsWireSlice,
       signature,
       getSnapshot,
+      getBaseSurface,
     }),
     [
       variants,
@@ -586,6 +613,7 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
       buildVariantsWireSlice,
       signature,
       getSnapshot,
+      getBaseSurface,
     ]
   );
 }
