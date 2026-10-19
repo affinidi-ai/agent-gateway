@@ -21,8 +21,10 @@ changes:
       title: Give every integration message the event's name, summary and data
       description: >-
         Templates can use EVENT_NAME, EVENT_SUMMARY (one line on what happened) and EVENT_DATA
-        (the event's values, or the audit record, as JSON). A template that leaves fields out
-        gets the endpoint type's defaults, so an empty template sends a complete message.
+        (the event's values, or the audit record, as JSON). For webhook and stream endpoints a
+        field that is exactly ${EVENT_DATA} or ${AUDIT_RECORD} embeds the JSON object; Slack and
+        email send it as text. A template that leaves fields out gets the endpoint type's
+        defaults, so an empty template sends a complete message.
     - timestamp: '2026-10-14T09:03:25.000Z'
       title: List every event integrations can deliver in one catalog
       description: >-
@@ -50,14 +52,18 @@ changes:
         sends integrations.edit and deleting integrations.delete, instead of the MCP proxy
         permissions. The editors move to /integrations/new and /integrations/{id}, and the
         Audit page's Forward records starts an event set of every audit event.
-  fixed:
-    - timestamp: '2026-10-16T15:00:00.000Z'
-      title: Disable integration changes the gateway refuses without audit.view
+    - timestamp: '2026-10-19T09:00:00.000Z'
+      title: Manage Governance Audit forwarding with the integrations permissions alone
       description: >-
-        Without audit.view, the integration editor's Save and Send test for an integration
-        receiving audit events, the endpoint editor's Save for an endpoint such an integration
-        uses, and Delete for audit integrations and event sets are disabled with the reason,
-        instead of failing with 403 when clicked.
+        Every /v1/integrations route checks only integrations.view, integrations.edit or
+        integrations.delete, and all events are handled the same: event sets holding audit
+        events, the integrations delivering them and their endpoints are listed, read, changed,
+        deleted and test-sent like any other. Before, callers without audit.view did not see
+        audit integrations and could not change them. audit.view still guards the audit records
+        themselves. Every integrations.view holder, the user role by default, now sees every
+        endpoint's destination, the Governance Audit one included (secret fields are never
+        returned). See RBAC.md.
+  fixed:
     - timestamp: '2026-10-16T14:00:00.000Z'
       title: Report stored integration definitions that fail their checks at startup
       description: >-
@@ -135,6 +141,29 @@ changes:
         instead. POST /v1/integrations/test now takes an integration that joins an endpoint and
         an event set.
   security:
+    - timestamp: '2026-10-19T09:30:00.000Z'
+      title: Keep secret values and webhook URLs out of integration errors
+      description: >-
+        Saving an endpoint, test sends, the startup definition check and the migration report
+        no longer show the value of a referenced secret or a URL, such as a Slack webhook URL.
+        A failing $SECRET: reference is reported by field and secret id only, URL validation
+        messages name the host but never the URL, and Redis stream errors no longer repeat part
+        of the Redis URL.
+    - timestamp: '2026-10-19T09:20:00.000Z'
+      title: Render dashboard notifications as text, not HTML
+      description: >-
+        Dashboard toasts built their message and action label as HTML, so a name or server
+        error message containing markup, such as an integration endpoint name, could run script
+        in the browser of whoever saw the toast. Toasts now show all text literally.
+    - timestamp: '2026-10-19T09:10:00.000Z'
+      title: Document that integrations.edit can use and read every appliance secret
+      description: >-
+        An endpoint's $SECRET: reference is resolved by the gateway when it sends, without a
+        secrets permission, so whoever holds integrations.edit can point an endpoint at a host
+        of their choosing, send a test and receive the secret's value. Grant integrations.edit
+        only to roles that may read secrets; the defaults keep it and secrets.* administrator
+        only. Tenant-owned secrets never resolve for endpoints. RBAC.md and INTEGRATIONS.md say
+        so.
     - timestamp: '2026-10-15T13:20:00.000Z'
       title: Escape event values in HTML integration emails
       description: >-
@@ -164,12 +193,14 @@ changes:
         Standby migrates when promoted. Attachments to some gateways or connection points now
         receive every resource's events, custom _ variables and unfilled placeholders leave the
         templates, and endpoints failing the current checks are written disabled; the report
-        names each change. See the INTEGRATIONS upgrade section.
+        names each change. The old paths resolve against the config file's directory, and
+        while storage_paths.integrations is set, the new integration paths a config leaves
+        unset go beside it, so a config written for the previous version needs no change; set
+        them before removing the old keys. See the INTEGRATIONS upgrade section.
     - timestamp: '2026-10-15T08:16:21.000Z'
       title: ⭐ Manage integrations as an endpoint plus an event set
       description: >-
         /v1/integrations now keeps integrations that join one endpoint
         (/v1/integrations/endpoints: transport, destination, credentials) and one event set
         (/v1/integrations/event-sets: events picked from the whole catalog), with the template on
-        the integration. Categories and tenant owners are gone. Changing an event set that holds
-        audit events, an integration receiving them, or its endpoint needs audit.view as well.
+        the integration. Categories and tenant owners are gone.
