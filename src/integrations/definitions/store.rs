@@ -45,12 +45,14 @@ impl<T: Definition> DefinitionStore<T> {
         Ok(definitions)
     }
 
+    /// Writes the record through a temporary file and a rename, so a concurrent read sees the
+    /// previous record or the new one, never a partial file.
     pub async fn save(
         &self,
         definition: &T,
     ) -> Result<()> {
         self.storage
-            .save(definition)
+            .save_atomic(definition)
             .await
     }
 
