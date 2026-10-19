@@ -152,6 +152,7 @@ differ, repository documentation describes this source revision exactly.
 | Build and run this source locally | [`docs/development/GETTING_STARTED.md`](docs/development/GETTING_STARTED.md) |
 | Develop, debug, and test | [`docs/development/DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | Configure an appliance | [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md) |
+| Check infrastructure requirements for self-hosting | [`docs/DEPLOYMENT_REQUIREMENTS.md`](docs/DEPLOYMENT_REQUIREMENTS.md) |
 | Inspect revision-specific internals | [`docs/README.md`](docs/README.md) |
 | Contribute a change | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 | Deploy and operate a hosted appliance | [Hosted product documentation](https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/) |

@@ -153,6 +153,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Management RBAC                                                                | [`docs/RBAC.md`](docs/RBAC.md)                                       |
 | Configuration files and their effects                                          | [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md) |
 | Reload behaviour, server mode                                                  | [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md)       |
+| Self-hosting infrastructure requirements                                       | [`docs/DEPLOYMENT_REQUIREMENTS.md`](docs/DEPLOYMENT_REQUIREMENTS.md) |
 | Observability contracts, governance audit forwarding                           | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)                     |
 | Source auth, managed identity, Trust Recorder                                  | [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md)                         |
 | Credential providers, delegation vault, consent modes                          | [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md)     |
