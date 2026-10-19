@@ -15,7 +15,7 @@ use crate::integrations::publishers::reserved_header;
 use crate::integrations::runtime_variables::patterns;
 
 /// Audit delivery limits for a migrated audit integration: live kept no journal, and with no
-/// limits a record would be retried forever (Q10).
+/// limits a record would be retried forever.
 pub const AUDIT_DROP_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 pub const AUDIT_MAX_ATTEMPTS: u32 = 20;
 
@@ -29,7 +29,7 @@ pub struct Planned {
     pub id: String,
     pub name: String,
     pub endpoint: Endpoint,
-    /// None when live delivered it nothing, so only the endpoint is kept (Q5).
+    /// None when live delivered it nothing, so only the endpoint is kept.
     pub event_set: Option<EventSet>,
     pub integration: Option<Integration>,
     /// What changed for it, for the report; never a secret value.
@@ -330,7 +330,7 @@ fn slack_configuration(
 }
 
 /// Header names the gateway sets itself, values live skipped when sending, and placeholders
-/// the current publisher no longer fills (Q12) are removed; the report names the headers but
+/// the current publisher no longer fills are removed; the report names the headers but
 /// never their values.
 fn webhook_configuration(
     configuration: JsonValue,
@@ -428,7 +428,7 @@ fn default_template_notes(
 }
 
 /// What the report says about the attachments of `live`: identities it was attached to, which
-/// live never delivered to, and the values of custom variables, which are not migrated (Q4).
+/// live never delivered to, and the values of custom variables, which are not migrated.
 fn attachment_notes(
     live: &LegacyIntegration,
     records: &LegacyRecords,
@@ -656,7 +656,7 @@ mod tests {
                 .expect("integration")
                 .content,
             json!({"surface": "", "nested": [""]}),
-            "renamed, then removed: no gateway event fills SURFACE_ variables (Q11)"
+            "renamed, then removed: no gateway event fills SURFACE_ variables"
         );
     }
 

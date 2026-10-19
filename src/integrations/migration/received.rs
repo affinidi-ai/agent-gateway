@@ -321,7 +321,7 @@ mod tests {
     const REMOVED_AUDIT_EVENT: &str = "audit.pre_authorize_blocked";
 
     #[test]
-    fn the_baseline_events_are_in_the_catalog_except_the_one_removed_since() {
+    fn the_live_versions_events_are_in_the_catalog_except_the_one_removed_since() {
         let known: Vec<&str> = catalog()
             .iter()
             .map(|event| event.id.as_str())
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn an_audit_integration_receives_what_the_baseline_forwarded() {
+    fn an_audit_integration_receives_what_the_live_version_forwarded() {
         let records = LegacyRecords::default();
         let audit = live(Some("audit"));
 
@@ -503,7 +503,7 @@ mod tests {
             on.notes
                 .iter()
                 .any(|note| note.contains("auth_failed")),
-            "names the audit events added after the baseline: {:?}",
+            "names the audit events added after the live version: {:?}",
             on.notes
         );
     }

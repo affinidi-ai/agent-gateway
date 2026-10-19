@@ -14,7 +14,7 @@ use crate::config::StoragePaths;
 use crate::integrations::definitions::DefinitionStores;
 use crate::secrets::SecretsStore;
 
-/// Old directories are deleted this long after the migration renamed them (Q6).
+/// Old directories are deleted this long after the migration renamed them.
 pub const MIGRATED_RETENTION_DAYS: u64 = 30;
 
 /// Migrates the live records under `paths`, if there are any. `now` (unix seconds) names the

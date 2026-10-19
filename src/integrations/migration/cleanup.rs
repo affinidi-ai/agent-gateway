@@ -1,4 +1,4 @@
-//! Deletes the live directories the migration renamed, once they are old enough (Q6). They
+//! Deletes the live directories the migration renamed, once they are old enough. They
 //! may hold plain-text credentials, so they are not kept longer than a restore needs them.
 
 use std::path::PathBuf;

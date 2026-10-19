@@ -17,7 +17,7 @@ pub enum Outcome {
     Created,
     /// A definition with its id exists, from an earlier run or written since; left as it is.
     AlreadyPresent,
-    /// Live delivered it nothing, so there is no event set or integration (Q5).
+    /// Live delivered it nothing, so there is no event set or integration.
     None,
 }
 
@@ -27,7 +27,7 @@ pub struct ReportEntry {
     pub id: String,
     pub name: String,
     pub endpoint: Outcome,
-    /// Why the endpoint was written disabled: its configuration fails the current checks (Q9).
+    /// Why the endpoint was written disabled: its configuration fails the current checks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_disabled: Option<String>,
     pub event_set: Outcome,
@@ -62,7 +62,7 @@ impl From<Skipped> for SkippedEntry {
 
 /// Saves each planned definition whose id is not stored yet. An endpoint whose configuration
 /// fails the checks a save through the API runs is written disabled, so its destination and
-/// credentials are kept but nothing is sent (Q9).
+/// credentials are kept but nothing is sent.
 pub async fn apply(
     plan: MigrationPlan,
     stores: &DefinitionStores,

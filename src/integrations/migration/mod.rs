@@ -1,5 +1,5 @@
 //! A one-time move of the live version's integrations (`2470747`) onto endpoints, event sets
-//! and integrations. See `.plans/integrations-endpoints-event-sets.md`, stage 5.
+//! and integrations. See "Upgrading from the previous version" in `docs/INTEGRATIONS.md`.
 
 pub mod apply;
 pub mod cleanup;
