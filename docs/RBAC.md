@@ -88,17 +88,35 @@ both routers deny every request instead of serving unauthenticated. The built-in
 `payments.view` and `payments.retry` to `poweruser` and `payments.edit` / `payments.delete` to
 `administrator`; the base `user` role holds no payments permission.
 
-## Governance Audit integrations
+## Integrations
 
-The integration routes require `integrations.view` / `integrations.edit` / `integrations.delete`
-at the route and refuse every request without an RBAC guard. Changes that decide where audit
-records go also need `audit.view`, checked in the handler
-([`api/audit_access.rs`](../src/integrations/api/audit_access.rs)): creating, changing or
-deleting an event set that holds audit events (before or after the change), an integration whose
-event set holds them, and an endpoint such an integration delivers to. Without it the request is
-refused with `403` "Audit events need the audit.view permission". `gateways.edit` alone cannot
-reach one: integrations are not linked from gateways or connection points, and audit events
-reach them only through the audit journal.
+Every route under `/v1/integrations` needs one of `integrations.view` (lists, reads and the
+catalog), `integrations.edit` (creates, changes and test sends) or `integrations.delete`, and
+refuses every request without an RBAC guard ([`api/mod.rs`](../src/integrations/api/mod.rs)). No
+other permission is checked. The built-in defaults grant `integrations.view` to `user` and
+`integrations.edit` / `integrations.delete` to `administrator`.
+
+### Governance Audit integrations
+
+All events are handled the same. An event set holding audit events, an integration delivering
+them and its endpoint are listed, read, created, changed, deleted and test-sent under the same
+`integrations.*` permissions as any other definition; no integration route checks `audit.view`.
+`audit.view` guards the audit records themselves (the Audit page, the delegation-audit API and
+the log download), not where they are forwarded.
+
+This relaxes the previous release, in which a caller without `audit.view` did not see audit
+integrations (lists left them out and reads answered `404`) and could not change them. As a
+result:
+
+- Every holder of `integrations.view` sees every endpoint's destination, the Governance Audit
+  one included: webhook URLs, Kafka brokers and topics, SMTP hosts and recipients. Secret
+  fields, such as a Slack webhook URL, are never returned. With the default roles that is every
+  `user`.
+- Holding `integrations.edit` means deciding where audit records go: it can put audit events in
+  an event set and deliver them to any endpoint. Grant it with that in mind.
+
+`gateways.edit` alone cannot reach one: integrations are not linked from gateways or connection
+points, and audit events reach them only through the audit journal.
 See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
 ## Frontend use

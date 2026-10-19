@@ -204,8 +204,7 @@ sidebar item and the pages need `integrations.view`, the editors and test sends
   can be kept, replaced or cleared, or point to an appliance-wide secret with
   `$SECRET:<secret_id>`. A saved endpoint can send a test message.
 - **Event sets** pick events from the catalog, grouped by family and audit events by their
-  audit group, with search. Without `audit.view` the audit events are listed but cannot be
-  picked, and an event set that holds them cannot be saved.
+  audit group, with search. Audit events are picked and saved like any other.
 - **Integrations** join an endpoint and an event set and hold the template for the endpoint's
   type. The editor lists the variables the event set fills, refuses a template that uses
   others, sets the audit delivery limits when the event set holds audit events, and tests the
@@ -238,10 +237,13 @@ for the event `integration.test`. A test that reaches the destination returns
 
 Each route needs `integrations.view`, `integrations.edit` (including the tests), or
 `integrations.delete`, checked by the RBAC guard ([`api/mod.rs`](../src/integrations/api/mod.rs)).
-Mounted without a guard, every route above refuses the request with `403`. Creating, changing
-or deleting an event set that holds audit events, an integration whose event set holds them, or
-an endpoint such an integration delivers to also needs `audit.view` (`403` "Audit events need
-the audit.view permission" otherwise), since it decides where audit records go. Each create, change
+Mounted without a guard, every route above refuses the request with `403`. No route checks any
+other permission: an event set holding audit events, an integration delivering them and its
+endpoint are managed and tested like any other, and every `integrations.view` holder sees every
+endpoint's destination, including where Governance Audit records go. `audit.view` guards reading
+the audit records, not where they are forwarded; the previous release hid audit integrations
+from callers without it and needed it to change them (see
+[`RBAC.md`](RBAC.md#governance-audit-integrations)). Each create, change
 and delete is logged as `integrations.<endpoint|event_set|integration>.<created|updated|deleted>`
 with its id and the caller, and each test as `integrations.test_sent`; secret values are never
 logged.
