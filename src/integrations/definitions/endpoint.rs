@@ -105,19 +105,32 @@ impl Endpoint {
     /// The secret ids its secret fields and webhook header values reference, in the form
     /// `resolve_secret_references` resolves: the whole value is `$SECRET:<secret_id>`.
     pub fn secret_references(&self) -> Vec<&str> {
+        self.referencing_fields()
+            .into_iter()
+            .map(|(_, secret_id)| secret_id)
+            .collect()
+    }
+
+    /// Each secret field and webhook header whose value references a secret, named as an
+    /// error may show it, with the secret id.
+    fn referencing_fields(&self) -> Vec<(String, &str)> {
         let mut references = Vec::new();
         for field in self
             .endpoint_type
             .secret_fields()
         {
             match self.configuration.get(*field) {
-                Some(JsonValue::String(value)) => references.extend(value.strip_prefix(SECRET_REFERENCE_PREFIX)),
-                Some(JsonValue::Object(headers)) => references.extend(
-                    headers
-                        .values()
-                        .filter_map(JsonValue::as_str)
-                        .filter_map(|value| value.strip_prefix(SECRET_REFERENCE_PREFIX)),
+                Some(JsonValue::String(value)) => references.extend(
+                    value
+                        .strip_prefix(SECRET_REFERENCE_PREFIX)
+                        .map(|secret_id| (field.to_string(), secret_id)),
                 ),
+                Some(JsonValue::Object(headers)) => references.extend(headers.iter().filter_map(|(name, value)| {
+                    let secret_id = value
+                        .as_str()?
+                        .strip_prefix(SECRET_REFERENCE_PREFIX)?;
+                    Some((format!("the header {name}"), secret_id))
+                })),
                 _ => {}
             }
         }
@@ -138,14 +151,44 @@ impl Endpoint {
     }
 
     /// Checks the configuration the endpoint would send with, its secret references resolved,
-    /// as saving it does.
+    /// as saving it does. The publisher's reason is returned only when the referenced values
+    /// blanked give the same one, so it can neither hold nor depend on a secret; otherwise the
+    /// reason names the fields and secret ids alone.
     pub async fn validate_resolved(
         &self,
         secrets: Option<&dyn SecretsStore>,
     ) -> Result<(), String> {
         let mut resolved = self.clone();
         resolved.configuration = resolve_secret_references(self.endpoint_type, &self.configuration, secrets).await?;
-        resolved.validate_configuration()
+        let Err(reason) = resolved.validate_configuration() else {
+            return Ok(());
+        };
+        let references = self.referencing_fields();
+        if references.is_empty() {
+            return Err(reason);
+        }
+        let mut blanked = self.clone();
+        for value in secret_values_mut(self.endpoint_type, &mut blanked.configuration) {
+            if value.starts_with(SECRET_REFERENCE_PREFIX) {
+                value.clear();
+            }
+        }
+        if blanked
+            .validate_configuration()
+            .err()
+            .as_ref()
+            == Some(&reason)
+        {
+            return Err(reason);
+        }
+        let named: Vec<String> = references
+            .iter()
+            .map(|(field, secret_id)| format!("{field} from secret {secret_id}"))
+            .collect();
+        Err(match named.as_slice() {
+            [one] => format!("The value of {one} fails the endpoint checks"),
+            many => format!("The values of {} fail the endpoint checks", many.join(", ")),
+        })
     }
 }
 
@@ -161,23 +204,36 @@ pub async fn resolve_secret_references(
     store: Option<&dyn SecretsStore>,
 ) -> Result<JsonValue, String> {
     let mut resolved = configuration.clone();
-    let Some(fields) = resolved.as_object_mut() else {
-        return Ok(resolved);
-    };
-    for field in endpoint_type.secret_fields() {
-        match fields.get_mut(*field) {
-            Some(JsonValue::String(value)) => resolve_reference(value, store).await?,
-            Some(JsonValue::Object(headers)) => {
-                for header in headers.values_mut() {
-                    if let JsonValue::String(value) = header {
-                        resolve_reference(value, store).await?;
-                    }
-                }
-            }
-            _ => {}
-        }
+    for value in secret_values_mut(endpoint_type, &mut resolved) {
+        resolve_reference(value, store).await?;
     }
     Ok(resolved)
+}
+
+/// The text values of `configuration`'s secret fields and webhook headers.
+fn secret_values_mut(
+    endpoint_type: EndpointType,
+    configuration: &mut JsonValue,
+) -> Vec<&mut String> {
+    let Some(fields) = configuration.as_object_mut() else {
+        return Vec::new();
+    };
+    let secret_fields = endpoint_type.secret_fields();
+    fields
+        .iter_mut()
+        .filter(|(name, _)| secret_fields.contains(&name.as_str()))
+        .flat_map(|(_, value)| match value {
+            JsonValue::String(value) => vec![value],
+            JsonValue::Object(headers) => headers
+                .values_mut()
+                .filter_map(|header| match header {
+                    JsonValue::String(value) => Some(value),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// Replaces a `$SECRET:<secret_id>` `value` with the appliance-wide secret it names.
