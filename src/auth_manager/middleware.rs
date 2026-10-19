@@ -649,27 +649,6 @@ impl RbacGuard {
     {
         mr.layer(require_feature(self.storage.clone(), self.rbac_config.clone(), feature))
     }
-
-    /// Whether `user_id`, with the access token `pat` when there is one, holds `feature`: the
-    /// check a route gate makes, for handlers that need a second permission on some requests.
-    pub async fn allows(
-        &self,
-        user_id: &str,
-        pat: Option<&crate::auth_manager::pat::PatContext>,
-        feature: crate::rbac::Feature,
-    ) -> anyhow::Result<bool> {
-        let Some(user) = self
-            .storage
-            .load_user_by_id(user_id)
-            .await?
-        else {
-            return Ok(false);
-        };
-        Ok(self
-            .rbac_config
-            .has_permission(&user.role, &feature)
-            && pat_scope_allows(pat, &feature))
-    }
 }
 
 /// Refuses every request to a protected route that was mounted without an RBAC

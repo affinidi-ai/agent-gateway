@@ -32,7 +32,7 @@ pub fn router(
     use send_test::{test_draft, test_endpoint, test_integration};
 
     let gate = |route: MethodRouter, feature: Feature| -> MethodRouter { maybe_gate(guard.as_ref(), route, feature) };
-    let router = Router::new()
+    Router::new()
         .route("/v1/integrations", gate(get(list_integrations), Feature::IntegrationsView))
         .route("/v1/integrations", gate(post(create_integration), Feature::IntegrationsEdit))
         .route("/v1/integrations/{id}", gate(get(get_integration), Feature::IntegrationsView))
@@ -53,12 +53,7 @@ pub fn router(
         .route("/v1/integrations/event-sets/{id}", gate(put(update_event_set), Feature::IntegrationsEdit))
         .route("/v1/integrations/event-sets/{id}", gate(delete(delete_event_set), Feature::IntegrationsDelete))
         .layer(axum::middleware::from_fn(appliance_wide_only))
-        .layer(Extension(stores));
-    // Handlers check `audit.view` themselves for changes that touch audit events.
-    match guard {
-        Some(guard) => router.layer(Extension(guard)),
-        None => router,
-    }
+        .layer(Extension(stores))
 }
 
 pub type ApiError = (StatusCode, String);
@@ -197,7 +192,6 @@ async fn get_catalog() -> Json<Catalog> {
     })
 }
 
-pub mod audit_access;
 pub mod endpoints;
 pub mod event_sets;
 pub mod integrations;
@@ -290,6 +284,154 @@ mod tests {
 
         assert_eq!(tenant, StatusCode::FORBIDDEN);
         assert_eq!(scoped, StatusCode::FORBIDDEN);
+    }
+
+    /// Calls every route on an event set of `events`, an integration on it and its endpoint:
+    /// changes and test sends as `EDITOR`, reads as `VIEWER`, neither holding `audit.view`. Test
+    /// sends go through a stored Slack endpoint whose secret does not exist, so they fail with
+    /// `502` before anything leaves the gateway.
+    async fn manage(
+        f: &Fixture,
+        events: &[&str],
+    ) -> Vec<(&'static str, StatusCode)> {
+        use crate::integrations::definitions::Endpoint;
+        use serde_json::{Value as JsonValue, json};
+
+        let id = |body: &JsonValue| {
+            body["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let unreachable = Endpoint::new(
+            "Unreachable".to_string(),
+            String::new(),
+            EndpointType::Slack,
+            json!({"webhook_url": "$SECRET:never-stored"}),
+        );
+        f.stores
+            .endpoints
+            .save(&unreachable)
+            .await
+            .expect("endpoint");
+        let integration = |endpoint_id: &str, event_set_id: &str| {
+            json!({"name": "Forward", "endpoint_id": endpoint_id, "event_set_id": event_set_id, "content": {}})
+        };
+        let webhook = |url: &str| json!({"name": "SIEM", "configuration": {"url": url}, "status": "active"});
+        let mut statuses = Vec::new();
+
+        let (status, set) = f
+            .call(EDITOR, "POST", "/v1/integrations/event-sets", Some(json!({"name": "Set", "events": events})))
+            .await;
+        statuses.push(("create event set", status));
+        let mut new_endpoint = webhook("https://93.184.215.14/hook");
+        new_endpoint["type"] = json!("webhook");
+        let (status, endpoint) = f
+            .call(EDITOR, "POST", "/v1/integrations/endpoints", Some(new_endpoint))
+            .await;
+        statuses.push(("create endpoint", status));
+        let (status, created) = f
+            .call(EDITOR, "POST", "/v1/integrations", Some(integration(&id(&endpoint), &id(&set))))
+            .await;
+        statuses.push(("create integration", status));
+        let (status, on_unreachable) = f
+            .call(EDITOR, "POST", "/v1/integrations", Some(integration(&unreachable.id, &id(&set))))
+            .await;
+        statuses.push(("create integration on the unreachable endpoint", status));
+
+        let set_path = format!("/v1/integrations/event-sets/{}", id(&set));
+        let endpoint_path = format!("/v1/integrations/endpoints/{}", id(&endpoint));
+        let integration_path = format!("/v1/integrations/{}", id(&created));
+        for (what, list, item) in [
+            ("event set", "/v1/integrations/event-sets", &set_path),
+            ("endpoint", "/v1/integrations/endpoints", &endpoint_path),
+            ("integration", "/v1/integrations", &integration_path),
+        ] {
+            let (status, listed) = f
+                .call(VIEWER, "GET", list, None)
+                .await;
+            let (got, read) = f
+                .call(VIEWER, "GET", item, None)
+                .await;
+            let listed = listed
+                .as_array()
+                .is_some_and(|items| items.contains(&read));
+            statuses.push((what, if listed { status } else { StatusCode::NOT_FOUND }));
+            statuses.push((what, got));
+        }
+
+        let (status, _) = f
+            .call(EDITOR, "PUT", &set_path, Some(json!({"name": "Renamed", "events": events})))
+            .await;
+        statuses.push(("update event set", status));
+        let (status, _) = f
+            .call(EDITOR, "PUT", &endpoint_path, Some(webhook("https://93.184.215.14/other")))
+            .await;
+        statuses.push(("update endpoint", status));
+        let (status, _) = f
+            .call(EDITOR, "PUT", &integration_path, Some(integration(&id(&endpoint), &id(&set))))
+            .await;
+        statuses.push(("update integration", status));
+
+        let (status, _) = f
+            .call(EDITOR, "POST", &format!("/v1/integrations/{}/test", id(&on_unreachable)), None)
+            .await;
+        statuses.push(("test integration", status));
+        let (status, _) = f
+            .call(EDITOR, "POST", "/v1/integrations/test", Some(integration(&unreachable.id, &id(&set))))
+            .await;
+        statuses.push(("test draft", status));
+        let (status, _) = f
+            .call(EDITOR, "POST", &format!("/v1/integrations/endpoints/{}/test", unreachable.id), None)
+            .await;
+        statuses.push(("test endpoint", status));
+
+        for (what, path) in [
+            ("delete integration", integration_path),
+            ("delete integration on the unreachable endpoint", format!("/v1/integrations/{}", id(&on_unreachable))),
+            ("delete endpoint", endpoint_path),
+            ("delete unreachable endpoint", format!("/v1/integrations/endpoints/{}", unreachable.id)),
+            ("delete event set", set_path),
+        ] {
+            let (status, _) = f
+                .call(EDITOR, "DELETE", &path, None)
+                .await;
+            statuses.push((what, status));
+        }
+        statuses
+    }
+
+    #[tokio::test]
+    async fn audit_events_are_managed_with_the_integrations_permissions_alone() {
+        let expected = vec![
+            ("create event set", StatusCode::CREATED),
+            ("create endpoint", StatusCode::CREATED),
+            ("create integration", StatusCode::CREATED),
+            ("create integration on the unreachable endpoint", StatusCode::CREATED),
+            ("event set", StatusCode::OK),
+            ("event set", StatusCode::OK),
+            ("endpoint", StatusCode::OK),
+            ("endpoint", StatusCode::OK),
+            ("integration", StatusCode::OK),
+            ("integration", StatusCode::OK),
+            ("update event set", StatusCode::OK),
+            ("update endpoint", StatusCode::OK),
+            ("update integration", StatusCode::OK),
+            ("test integration", StatusCode::BAD_GATEWAY),
+            ("test draft", StatusCode::BAD_GATEWAY),
+            ("test endpoint", StatusCode::BAD_GATEWAY),
+            ("delete integration", StatusCode::NO_CONTENT),
+            ("delete integration on the unreachable endpoint", StatusCode::NO_CONTENT),
+            ("delete endpoint", StatusCode::NO_CONTENT),
+            ("delete unreachable endpoint", StatusCode::NO_CONTENT),
+            ("delete event set", StatusCode::NO_CONTENT),
+        ];
+
+        let gateway = manage(&Fixture::new().await, &["gateway.created"]).await;
+        let audit = manage(&Fixture::new().await, &["gateway.created", "audit.policy_decision"]).await;
+
+        assert_eq!(gateway, expected);
+        assert_eq!(audit, expected);
     }
 
     #[tokio::test]
