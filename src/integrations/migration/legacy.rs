@@ -317,9 +317,7 @@ mod tests {
                     .path()
                     .join("custom/old/definitions"),
                 triggers: PathBuf::from("/data/triggers"),
-                connection_points: root
-                    .path()
-                    .join("custom/cp"),
+                connection_points: root.path().join("custom/cp"),
             }
         );
         assert!(
@@ -338,9 +336,7 @@ mod tests {
     #[test]
     fn without_the_deprecated_keys_the_live_defaults_resolve_against_the_config_files_directory() {
         let root = tempfile::tempdir().expect("temp dir");
-        let config_dir = root
-            .path()
-            .join("config");
+        let config_dir = root.path().join("config");
 
         let defaults = super::super::config_in(&config_dir, "");
 

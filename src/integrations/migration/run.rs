@@ -388,18 +388,14 @@ mod tests {
     #[tokio::test]
     async fn a_config_file_elsewhere_with_relative_deprecated_keys_migrates_its_records() {
         let root = tempfile::tempdir().expect("temp dir");
-        let storage = root
-            .path()
-            .join("_storage");
+        let storage = root.path().join("_storage");
         seed_live_at(&LegacyPaths {
             definitions: storage.join("integrations/definitions"),
             triggers: storage.join("integrations/triggers"),
             connection_points: storage.join("connection_points"),
         });
         let config = super::super::config_in(
-            &root
-                .path()
-                .join("config"),
+            &root.path().join("config"),
             r#"
 connection_points = "../_storage/connection_points"
 integration_endpoints = "../_storage/integrations/endpoints"
@@ -437,9 +433,7 @@ integration_triggers = "../_storage/integrations/triggers"
     #[tokio::test]
     async fn a_config_file_elsewhere_without_the_deprecated_keys_migrates_from_lives_defaults_beside_it() {
         let root = tempfile::tempdir().expect("temp dir");
-        let config_dir = root
-            .path()
-            .join("config");
+        let config_dir = root.path().join("config");
         let storage = config_dir.join("_storage");
         seed_live_at(&LegacyPaths {
             definitions: storage.join("integrations/definitions"),
@@ -534,9 +528,7 @@ integration_triggers = "../_storage/integrations/triggers"
     #[tokio::test]
     async fn the_sweep_names_the_resolved_live_directory_it_did_not_find() {
         let root = tempfile::tempdir().expect("temp dir");
-        let config_dir = root
-            .path()
-            .join("config");
+        let config_dir = root.path().join("config");
         let config = super::super::config_in(&config_dir, "");
 
         let line = not_found_line(&config).await;
@@ -549,12 +541,7 @@ integration_triggers = "../_storage/integrations/triggers"
     #[tokio::test]
     async fn a_deprecated_key_naming_a_missing_directory_warns_with_the_resolved_path() {
         let root = tempfile::tempdir().expect("temp dir");
-        let config = super::super::config_in(
-            &root
-                .path()
-                .join("config"),
-            "integrations = \"../old/definitions\"",
-        );
+        let config = super::super::config_in(&root.path().join("config"), "integrations = \"../old/definitions\"");
 
         let line = not_found_line(&config).await;
 

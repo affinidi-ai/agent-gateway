@@ -262,11 +262,17 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let expired = NOW - MIGRATED_RETENTION_DAYS * DAY - 1;
         let cases = [
-            ("defaults", "", root.path().join("defaults/config/_storage/integrations")),
+            (
+                "defaults",
+                "",
+                root.path()
+                    .join("defaults/config/_storage/integrations"),
+            ),
             (
                 "keys",
                 "integrations = \"../_storage/integrations/definitions\"\nintegration_triggers = \"../_storage/integrations/triggers\"",
-                root.path().join("keys/_storage/integrations"),
+                root.path()
+                    .join("keys/_storage/integrations"),
             ),
         ];
         for (name, storage_paths, parent) in cases {

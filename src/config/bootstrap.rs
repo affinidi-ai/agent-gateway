@@ -171,8 +171,12 @@ impl BootstrapConfig {
                 *path = resolve_storage_path(path);
             }
             let paths = &mut config.storage_paths;
-            paths.legacy_integrations =
-                resolve_storage_path(paths.integrations.as_deref().unwrap_or(&paths.legacy_integrations));
+            paths.legacy_integrations = resolve_storage_path(
+                paths
+                    .integrations
+                    .as_deref()
+                    .unwrap_or(&paths.legacy_integrations),
+            );
             paths.legacy_integration_triggers = resolve_storage_path(
                 paths
                     .integration_triggers
