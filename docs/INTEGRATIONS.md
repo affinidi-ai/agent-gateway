@@ -324,8 +324,16 @@ endpoint, an event set and an integration, all three with the old integration's 
 - It reads `_storage/integrations/definitions` and `_storage/integrations/triggers`, or the
   deprecated `storage_paths.integrations` and `storage_paths.integration_triggers` when set.
   Like every other storage path, a relative path, the defaults included, is relative to the
-  config file's directory, not the working directory. Those keys are read for this only, log
-  a deprecation warning, and can be removed once migrated.
+  config file's directory, not the working directory. Those keys are read for this only and
+  log a deprecation warning.
+- When `storage_paths.integrations` is set, each of `integration_endpoints`,
+  `integration_event_sets` and `integration_definitions` that the config leaves unset goes
+  beside it: with the old example config, `../_storage/integrations/endpoints`,
+  `…/event_sets` and `…/integrations`. So a config written for the previous version keeps the
+  definitions with the rest of its storage, which matters in Docker, where the config
+  directory is mounted read-only. Before removing the deprecated keys, set those three keys to
+  the paths in use; otherwise they fall back to `_storage/integrations/…` under the config
+  directory.
 - When the old definitions directory is not there, the node logs
   `integrations.migration.not_found` with the path it looked in: INFO, as on a fresh install
   or once migrated, or WARN when `storage_paths.integrations` names it.
@@ -334,7 +342,8 @@ endpoint, an event set and an integration, all three with the old integration's 
   `integrations.migration.skipped`, and the end logs `integrations.migration.done`.
 - The report is `migration-report-<unix seconds>.json` in the directory holding
   `storage_paths.integration_definitions` (by default `_storage/integrations/` beside the
-  config file), with no secret, header or attachment value in it.
+  config file, or the directory holding the old definitions when only
+  `storage_paths.integrations` is set), with no secret, header or attachment value in it.
 - The two old directories are renamed to `<dir>.migrated-<unix seconds>`, which also keeps
   the migration from running again. They may hold credentials in plain text, so the Active
   node deletes them 30 days later, without a restart.
