@@ -84,7 +84,7 @@ pub fn read_optional_backup_manifest(zip_bytes: &[u8]) -> anyhow::Result<Option<
     let mut manifest = None;
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        if entry.name() != manifest_path {
+        if entry.name()? != manifest_path {
             continue;
         }
         if manifest.is_some() {
