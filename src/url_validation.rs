@@ -748,6 +748,65 @@ mod tests {
         must_allow("http://169.254.1.1/");
     }
 
+    // ── Error messages never repeat the URL ─────────────────────────────
+
+    const SECRET: &str = "s3cr3t-token";
+
+    fn every_validator(raw: &str) -> Vec<Result<Url, String>> {
+        vec![
+            validate_url_not_cloud_metadata(raw),
+            validate_resolved_url(raw),
+            validate_resolved_cloud_metadata_url(raw),
+            validate_webhook_url(raw),
+            validate_resolved_webhook_url(raw),
+        ]
+    }
+
+    #[test]
+    fn an_unparsable_url_is_refused_without_repeating_it() {
+        for result in every_validator(&format!("not a url {SECRET}")) {
+            let error = result.expect_err("refused");
+            assert!(error.starts_with("Invalid URL: "), "{error}");
+            assert!(!error.contains(SECRET), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_scheme_other_than_http_is_refused_without_repeating_it() {
+        for result in every_validator(&format!("{SECRET}:rest")) {
+            let error = result.expect_err("refused");
+            assert_eq!(error, "URL scheme must be http or https");
+        }
+    }
+
+    #[test]
+    fn a_blocked_host_is_named_without_the_path_or_query() {
+        let loopback = format!("http://127.0.0.1/services/{SECRET}?token={SECRET}");
+        let private = format!("http://10.0.0.1/services/{SECRET}?token={SECRET}");
+        for result in [
+            validate_url_not_cloud_metadata(&loopback),
+            validate_resolved_url(&loopback),
+            validate_webhook_url(&private),
+            validate_resolved_webhook_url(&private),
+        ] {
+            let error = result.expect_err("refused");
+            assert!(error.contains("URL host '"), "{error}");
+            assert!(!error.contains(SECRET), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_oauth_endpoint_outside_the_bdd_allowlist_is_refused_without_repeating_it() {
+        let error = validate_oauth_endpoint_url_inner(
+            &format!("http://127.0.0.1:8081/token?key={SECRET}"),
+            Some("http://127.0.0.1:8080/token"),
+        )
+        .expect_err("refused");
+
+        assert!(error.contains("is not in the BDD exact endpoint allowlist"), "{error}");
+        assert!(!error.contains(SECRET), "{error}");
+    }
+
     #[test]
     fn oauth_endpoint_blocks_loopback_by_default() {
         let result = validate_oauth_endpoint_url_inner("http://127.0.0.1:8080/token", None);
