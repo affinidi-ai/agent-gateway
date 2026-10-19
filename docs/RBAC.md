@@ -119,6 +119,18 @@ result:
 points, and audit events reach them only through the audit journal.
 See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
 
+### Secrets in endpoints
+
+`integrations.edit` can use, and therefore read, every appliance-wide secret. An endpoint's
+secret field can hold a `$SECRET:<secret_id>` reference, which the gateway resolves itself when it
+sends, so no `secrets.*` permission is checked. Creating an endpoint that holds a reference, or
+changing the destination of one that already does, then sending a test delivers the secret's
+value to a host the caller chooses. Grant `integrations.edit` only to roles that may read
+secrets. The built-in defaults keep `integrations.edit` and `secrets.*` administrator-only.
+Tenant-owned secrets never resolve for endpoints. A per-secret permission to use a secret without
+reading it is not available yet. See
+[`INTEGRATIONS.md`](INTEGRATIONS.md#endpoints-event-sets-and-integrations).
+
 ## Frontend use
 
 The dashboard stores the map in its permissions context and checks the exact feature key before

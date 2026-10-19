@@ -33,7 +33,14 @@ store, resolved at each delivery and shown in responses as written; a reference 
 resolve fails the delivery. Only a value that is the reference as a whole counts. Deleting a
 secret that an endpoint references is refused with `409` naming the endpoints; change or
 delete those endpoints first. Changing the secret's value is allowed, and the next delivery
-uses it. Webhook `headers` must be an object of header names to strings, and
+uses it. Only appliance-wide secrets resolve; a tenant-owned one never does. No `secrets.*`
+permission is checked when a reference is saved or resolved, so `integrations.edit` can use, and
+therefore read, every appliance-wide secret: pointing an endpoint that holds a reference at a
+host of the caller's choosing and sending a test delivers the value there. Grant
+`integrations.edit` only to roles that may read secrets; by default it and `secrets.*` are
+administrator-only (see [`RBAC.md`](RBAC.md#secrets-in-endpoints)). The dashboard's stored
+secret picker lists secrets only for callers with `secrets.view`, but a typed reference resolves
+regardless. Webhook `headers` must be an object of header names to strings, and
 each header value may be such a reference; the field as a whole cannot be one. It cannot set
 `Content-Type`, `X-Webhook-Timestamp` or `X-Webhook-Signature-256`, which the gateway sets on
 every delivery; an endpoint stored with one of them still sends each exactly once, the
