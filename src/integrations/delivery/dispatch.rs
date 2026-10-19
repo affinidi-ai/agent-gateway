@@ -609,18 +609,11 @@ mod tests {
         integration.content = content;
         let values = HashMap::from([("EVENT_DATA".to_string(), EVENT_DATA.to_string())]);
 
-        prepare(
-            &Route {
-                integration,
-                endpoint,
-            },
-            &values,
-            None,
-        )
-        .await
-        .expect("prepares")
-        .1
-        .content
+        prepare(&Route { integration, endpoint }, &values, None)
+            .await
+            .expect("prepares")
+            .1
+            .content
     }
 
     #[tokio::test]
@@ -633,25 +626,21 @@ mod tests {
     #[tokio::test]
     async fn email_sends_a_sole_event_data_body_as_text() {
         let plain = sole_event_data_field(EndpointType::Email, json!({"body": "${EVENT_DATA}"})).await;
-        let html =
-            sole_event_data_field(EndpointType::Email, json!({"body": "${EVENT_DATA}", "format": "html"})).await;
+        let html = sole_event_data_field(EndpointType::Email, json!({"body": "${EVENT_DATA}", "format": "html"})).await;
 
         assert_eq!(plain["body"], json!(EVENT_DATA));
-        assert_eq!(html["body"], json!(r#"{&quot;gateway_name&quot;:&quot;&lt;b&gt;edge&lt;/b&gt;&quot;,&quot;old_state&quot;:null}"#));
+        assert_eq!(
+            html["body"],
+            json!(r#"{&quot;gateway_name&quot;:&quot;&lt;b&gt;edge&lt;/b&gt;&quot;,&quot;old_state&quot;:null}"#)
+        );
     }
 
     #[tokio::test]
     async fn webhook_and_stream_still_embed_a_sole_event_data_field_as_json() {
         let embedded = json!({"data": {"gateway_name": "<b>edge</b>", "old_state": null}});
 
-        assert_eq!(
-            sole_event_data_field(EndpointType::Webhook, json!({"data": "${EVENT_DATA}"})).await,
-            embedded
-        );
-        assert_eq!(
-            sole_event_data_field(EndpointType::Stream, json!({"data": "${EVENT_DATA}"})).await,
-            embedded
-        );
+        assert_eq!(sole_event_data_field(EndpointType::Webhook, json!({"data": "${EVENT_DATA}"})).await, embedded);
+        assert_eq!(sole_event_data_field(EndpointType::Stream, json!({"data": "${EVENT_DATA}"})).await, embedded);
     }
 
     #[tokio::test]

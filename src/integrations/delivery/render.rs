@@ -189,10 +189,7 @@ mod tests {
         let template = json!({"data": "${EVENT_DATA}"});
 
         assert_eq!(render(&template, &data, Escaping::None, false), json!({"data": r#"{"name":"<b>"}"#}));
-        assert_eq!(
-            render(&template, &data, Escaping::SlackMrkdwn, false),
-            json!({"data": r#"{"name":"&lt;b&gt;"}"#})
-        );
+        assert_eq!(render(&template, &data, Escaping::SlackMrkdwn, false), json!({"data": r#"{"name":"&lt;b&gt;"}"#}));
         assert_eq!(
             render(&template, &data, Escaping::Html, false),
             json!({"data": "{&quot;name&quot;:&quot;&lt;b&gt;&quot;}"})

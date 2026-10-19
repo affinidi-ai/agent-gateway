@@ -112,7 +112,11 @@ pub fn validate_events(events: Vec<String>) -> Result<Vec<String>, EventSetError
     if events.is_empty() {
         return Err(EventSetError::Empty);
     }
-    let mut unique: Vec<String> = Vec::with_capacity(events.len().min(catalog().len()));
+    let mut unique: Vec<String> = Vec::with_capacity(
+        events
+            .len()
+            .min(catalog().len()),
+    );
     for event in events {
         if find_event(&event).is_none() {
             return Err(EventSetError::UnknownEvent(event));

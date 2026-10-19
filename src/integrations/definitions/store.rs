@@ -260,13 +260,9 @@ mod tests {
             })
             .collect();
 
-        writer
-            .await
-            .expect("writer");
+        writer.await.expect("writer");
         for reader in readers {
-            reader
-                .await
-                .expect("reader");
+            reader.await.expect("reader");
         }
     }
 }
