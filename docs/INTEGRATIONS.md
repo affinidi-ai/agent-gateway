@@ -52,7 +52,8 @@ gateway's value. An endpoint's `type` cannot change. Its configuration is checke
 its publisher when saved, so a webhook or Slack URL that fails the checks under _Outbound
 requests_ is refused with `400`.
 
-**Event sets** need at least one event, every one from the catalog; repeats are dropped.
+**Event sets** need at least one event, every one from the catalog; repeats are dropped. A
+request listing more events than the catalog holds is refused with `400`.
 
 **Integrations** need an existing endpoint and event set. Their template must be a JSON object
 whose variables some event of the event set fills, and the audit delivery limits are accepted
