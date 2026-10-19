@@ -1,6 +1,6 @@
 //! Sends a catalog event to every active integration whose event set holds it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,7 +36,7 @@ pub struct Route {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditReceiver {
     pub route: Route,
-    pub audit_events: Vec<String>,
+    pub audit_events: HashSet<String>,
 }
 
 /// A snapshot of the definitions, for routing events without reading them from disk.
@@ -104,7 +104,7 @@ impl Routes {
         &self,
         integration: &Integration,
     ) -> Option<AuditReceiver> {
-        let audit_events: Vec<String> = self
+        let audit_events: HashSet<String> = self
             .event_sets
             .get(&integration.event_set_id)?
             .events
@@ -764,7 +764,7 @@ mod tests {
                     integration: siem.clone(),
                     endpoint,
                 },
-                audit_events: vec!["policy_decision".to_string(), "trust_check".to_string()],
+                audit_events: HashSet::from(["policy_decision".to_string(), "trust_check".to_string()]),
             }]
         );
         assert_eq!(routes.audit_receiver(&siem.id), Some(receivers[0].clone()));

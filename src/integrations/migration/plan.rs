@@ -599,7 +599,7 @@ mod tests {
             .expect("event set");
         assert_eq!(event_set.id, ID);
         assert_eq!(event_set.name, "Ops events (migrated)");
-        assert_eq!(event_set.events, ["gateway.created"]);
+        assert_eq!(event_set.events, std::collections::HashSet::from(["gateway.created".to_string()]));
         let integration = planned
             .integration
             .expect("integration");

@@ -364,7 +364,11 @@ mod tests {
                 .await;
             let shown = all
                 .as_array()
-                .is_some_and(|items| items.contains(&one));
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item["id"] == one["id"])
+                });
             let listed = if shown {
                 listed
             } else {

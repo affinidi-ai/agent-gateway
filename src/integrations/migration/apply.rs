@@ -1,5 +1,6 @@
 //! Writes a migration plan to the definition stores and reports what it did.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -31,7 +32,7 @@ pub struct ReportEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_disabled: Option<String>,
     pub event_set: Outcome,
-    pub events: Vec<String>,
+    pub events: HashSet<String>,
     pub integration: Outcome,
     pub notes: Vec<String>,
 }
@@ -318,7 +319,7 @@ mod tests {
                 endpoint: Outcome::Created,
                 endpoint_disabled: None,
                 event_set: Outcome::Created,
-                events: vec!["gateway.created".to_string()],
+                events: HashSet::from(["gateway.created".to_string()]),
                 integration: Outcome::Created,
                 notes: vec!["Received gateway events only from gw-1".to_string()],
             }]

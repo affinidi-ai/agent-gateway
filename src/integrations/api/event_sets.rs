@@ -212,16 +212,20 @@ mod tests {
 
         let created = create(&f, &["gateway.created", "audit.policy_decision", "gateway.created"]).await;
 
-        assert_eq!(created["name"], "Ops events");
-        assert_eq!(created["events"], json!(["gateway.created", "audit.policy_decision"]));
+        let created: EventSet = serde_json::from_value(created).expect("event set");
+        assert_eq!(created.name, "Ops events");
+        assert_eq!(
+            created.events,
+            std::collections::HashSet::from(["gateway.created".to_string(), "audit.policy_decision".to_string()])
+        );
         let (_, read) = f
-            .call(VIEWER, "GET", &format!("/v1/integrations/event-sets/{}", id(&created)), None)
+            .call(VIEWER, "GET", &format!("/v1/integrations/event-sets/{}", created.id), None)
             .await;
-        assert_eq!(read, created);
+        assert_eq!(serde_json::from_value::<EventSet>(read).expect("event set"), created);
         let (_, listed) = f
             .call(VIEWER, "GET", "/v1/integrations/event-sets", None)
             .await;
-        assert_eq!(listed, json!([created]));
+        assert_eq!(serde_json::from_value::<Vec<EventSet>>(listed).expect("event sets"), [created]);
     }
 
     #[tokio::test]
@@ -290,7 +294,12 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{updated}");
         assert_eq!(updated["name"], "Gateways");
-        assert_eq!(updated["events"], json!(["gateway.created", "gateway.deleted"]));
+        assert_eq!(
+            serde_json::from_value::<EventSet>(updated.clone())
+                .expect("event set")
+                .events,
+            std::collections::HashSet::from(["gateway.created".to_string(), "gateway.deleted".to_string()])
+        );
         assert_eq!(updated["created_at"], created["created_at"]);
     }
 
@@ -322,7 +331,7 @@ mod tests {
             .await
             .expect("find")
             .expect("stored");
-        assert_eq!(stored.events, ["gateway.created"]);
+        assert_eq!(stored.events, std::collections::HashSet::from(["gateway.created".to_string()]));
     }
 
     #[tokio::test]

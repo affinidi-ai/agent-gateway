@@ -54,7 +54,7 @@ pub async fn test_endpoint(
     send(&route, &values, TEST_EVENT, &caller).await
 }
 
-/// Sends the integration's message for the first event of its event set, with sample values.
+/// Sends the integration's message for one event of its event set, with sample values.
 pub async fn test_integration(
     Extension(stores): Extension<Arc<DefinitionStores>>,
     caller: Option<Extension<AuthGuardOk>>,
@@ -86,9 +86,11 @@ async fn send_sample(
 ) -> Result<Json<TestResult>, ApiError> {
     let endpoint = load(&stores.endpoints, &integration.endpoint_id, "endpoint").await?;
     let event_set: EventSet = load(&stores.event_sets, &integration.event_set_id, "event set").await?;
+    // Any event of the set will do; the smallest id, so repeated tests send the same sample.
     let event = event_set
         .events
-        .first()
+        .iter()
+        .min()
         .and_then(|id| find_event(id))
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "The event set holds no known event".to_string()))?;
     let values = event_values(

@@ -204,7 +204,7 @@ mod tests {
         let mut stale = gateway_events();
         stale
             .events
-            .push("identity.created".to_string());
+            .insert("identity.created".to_string());
         let events = gateway_events();
         let orphan = integration("Orphan", &internal, "missing-set", json!({}));
         let unfilled = integration("Unfilled", &internal, &events.id, json!({"text": "${USERNAME}"}));

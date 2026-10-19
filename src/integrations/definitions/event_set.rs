@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -23,7 +23,7 @@ pub struct EventSet {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    pub events: Vec<String>,
+    pub events: HashSet<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -49,9 +49,7 @@ impl EventSet {
         &self,
         event_id: &str,
     ) -> bool {
-        self.events
-            .iter()
-            .any(|event| event == event_id)
+        self.events.contains(event_id)
     }
 
     pub fn has_audit_events(&self) -> bool {
@@ -107,20 +105,18 @@ fn collect_template_variables(
     }
 }
 
-/// `events` without repeats, in the order given, when every one is in the catalog.
-pub fn validate_events(events: Vec<String>) -> Result<Vec<String>, EventSetError> {
+/// The distinct `events`, when there is at least one and every one is in the catalog.
+pub fn validate_events(events: Vec<String>) -> Result<HashSet<String>, EventSetError> {
     if events.is_empty() {
         return Err(EventSetError::Empty);
     }
     // Sized by what it keeps, never by the caller's list: it grows to at most the catalog.
-    let mut unique: Vec<String> = Vec::new();
+    let mut unique = HashSet::new();
     for event in events {
         if find_event(&event).is_none() {
             return Err(EventSetError::UnknownEvent(event));
         }
-        if !unique.contains(&event) {
-            unique.push(event);
-        }
+        unique.insert(event);
     }
     Ok(unique)
 }
@@ -148,7 +144,7 @@ mod tests {
             .collect()
     }
 
-    fn unique(ids: &[&str]) -> BTreeSet<String> {
+    fn unique(ids: &[&str]) -> HashSet<String> {
         ids.iter()
             .map(|id| id.to_string())
             .collect()
@@ -175,11 +171,8 @@ mod tests {
 
         assert_eq!(one, other);
         let set = set(&["user.login", "gateway.created"]);
-        assert_eq!(
-            serde_json::to_value(&set).expect("json")["events"],
-            serde_json::json!(["gateway.created", "user.login"]),
-            "stored and returned in one stable order"
-        );
+        let stored: EventSet = serde_json::from_value(serde_json::to_value(&set).expect("json")).expect("event set");
+        assert_eq!(stored, set, "a stored set reads back as the same set");
     }
 
     #[test]
@@ -208,7 +201,12 @@ mod tests {
         longer.extend(every_event.iter().cloned());
         assert!(longer.len() > catalog().len());
 
-        assert_eq!(validate_events(longer), Ok(every_event.into_iter().collect()));
+        assert_eq!(
+            validate_events(longer),
+            Ok(every_event
+                .into_iter()
+                .collect())
+        );
     }
 
     #[test]
