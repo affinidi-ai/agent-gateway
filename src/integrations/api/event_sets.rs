@@ -234,6 +234,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_list_longer_than_the_catalog_is_refused() {
+        let f = Fixture::new().await;
+        let every_event: Vec<String> = crate::integrations::events::catalog()
+            .iter()
+            .map(|event| event.id.to_string())
+            .collect();
+        let mut too_many = every_event.clone();
+        too_many.push(every_event[0].clone());
+        let created = create(&f, &["gateway.created"]).await;
+        let item = format!("/v1/integrations/event-sets/{}", id(&created));
+
+        let (create_status, create_body) = f
+            .call(ADMIN, "POST", "/v1/integrations/event-sets", Some(json!({"name": "All", "events": too_many})))
+            .await;
+        let (update_status, _) = f
+            .call(ADMIN, "PUT", &item, Some(json!({"name": "All", "events": too_many})))
+            .await;
+        let (every_status, _) = f
+            .call(ADMIN, "POST", "/v1/integrations/event-sets", Some(json!({"name": "All", "events": every_event})))
+            .await;
+
+        assert_eq!(create_status, StatusCode::BAD_REQUEST, "{create_body}");
+        assert_eq!(
+            create_body,
+            json!(format!("An event set holds at most {} events", every_event.len()))
+        );
+        assert_eq!(update_status, StatusCode::BAD_REQUEST);
+        assert_eq!(every_status, StatusCode::CREATED, "every catalog event once fits");
+    }
+
+    #[tokio::test]
     async fn an_update_that_an_integration_still_fits_is_saved() {
         let f = Fixture::new().await;
         let created = create(&f, &["gateway.created"]).await;
