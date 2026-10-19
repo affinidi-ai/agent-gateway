@@ -148,8 +148,14 @@ mod tests {
             .collect()
     }
 
+    fn unique(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter()
+            .map(|id| id.to_string())
+            .collect()
+    }
+
     #[test]
-    fn a_new_event_set_keeps_its_events_in_order_without_repeats() {
+    fn a_new_event_set_holds_each_event_once() {
         let set = EventSet::new(
             "Ops".to_string(),
             String::new(),
@@ -157,16 +163,30 @@ mod tests {
         )
         .expect("valid set");
 
-        assert_eq!(set.events, ["gateway.created", "audit.policy_decision"]);
+        assert_eq!(set.events, unique(&["gateway.created", "audit.policy_decision"]));
         assert!(uuid::Uuid::parse_str(&set.id).is_ok());
         assert_eq!(set.created_at, set.updated_at);
+    }
+
+    #[test]
+    fn the_order_events_are_given_in_does_not_matter() {
+        let one = validate_events(events(&["user.login", "gateway.created"]));
+        let other = validate_events(events(&["gateway.created", "user.login", "user.login"]));
+
+        assert_eq!(one, other);
+        let set = set(&["user.login", "gateway.created"]);
+        assert_eq!(
+            serde_json::to_value(&set).expect("json")["events"],
+            serde_json::json!(["gateway.created", "user.login"]),
+            "stored and returned in one stable order"
+        );
     }
 
     #[test]
     fn mixes_audit_and_other_events() {
         assert_eq!(
             validate_events(events(&["user.login", "audit.trust_check", "x402.transaction.completed"])),
-            Ok(events(&["user.login", "audit.trust_check", "x402.transaction.completed"]))
+            Ok(unique(&["user.login", "audit.trust_check", "x402.transaction.completed"]))
         );
     }
 
@@ -174,7 +194,7 @@ mod tests {
     fn many_repeats_of_one_event_yield_one_event() {
         let repeated = vec!["gateway.created".to_string(); 10_000];
 
-        assert_eq!(validate_events(repeated), Ok(events(&["gateway.created"])));
+        assert_eq!(validate_events(repeated), Ok(unique(&["gateway.created"])));
     }
 
     #[test]
@@ -188,7 +208,22 @@ mod tests {
         longer.extend(every_event.iter().cloned());
         assert!(longer.len() > catalog().len());
 
-        assert_eq!(validate_events(longer), Ok(every_event));
+        assert_eq!(validate_events(longer), Ok(every_event.into_iter().collect()));
+    }
+
+    #[test]
+    fn a_stored_list_with_repeats_reads_as_a_set() {
+        let stored = serde_json::json!({
+            "id": "4b7d2c0e-8f7a-4f0e-9a51-0c1f3b2a6d10",
+            "name": "Ops",
+            "events": ["user.login", "gateway.created", "user.login"],
+            "created_at": "2026-10-15T00:00:00Z",
+            "updated_at": "2026-10-15T00:00:00Z"
+        });
+
+        let set: EventSet = serde_json::from_value(stored).expect("stored event set");
+
+        assert_eq!(set.events, unique(&["gateway.created", "user.login"]));
     }
 
     #[test]
