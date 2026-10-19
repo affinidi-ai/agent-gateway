@@ -59,8 +59,9 @@ dashboard: build it with Node 22 by running `www/default/build.sh`, and set the
   the architecture of the machine that builds it; CI also builds and runs the gateway on
   arm64.
 - **CPU and memory.**
-  - *Testing and evaluation:* a minimum host configuration of 2 vCPUs and 1 GiB of RAM,
-    with the Agent Gateway container limited to 512 MiB of RAM by default.
+  - *Testing and evaluation:* a minimum host configuration of 2 vCPUs and 1 GiB of RAM.
+    `make docker-run` limits the container to 512 MiB (override with `DOCKER_MEMORY`);
+    the image and `docker-compose.yml` set no limit, so set one yourself.
   - *Production:* a highly available Kubernetes deployment with multiple replicas,
     monitoring, and autoscaling enabled. Customers using our larger managed deployment
     sizes also benefit from a Multi-AZ architecture and AWS Fargate-backed infrastructure
