@@ -246,6 +246,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finding_never_shows_a_secret_or_a_slack_webhook_url() {
+        let slack = |webhook_url: &str| {
+            Endpoint::new("Ops Slack".to_string(), String::new(), EndpointType::Slack, json!({"webhook_url": webhook_url}))
+        };
+        let referenced = slack("$SECRET:slack-hook");
+        let plain = slack("hooks.slack.com/services/T0/B0/s3cr3t-plain");
+        let store = crate::integrations::definitions::test_secrets::Secrets(vec![(
+            "slack-hook",
+            None,
+            "not a url s3cr3t-stored",
+        )]);
+
+        let report = check_definitions(&[referenced, plain], &[], &[], Some(&store)).await;
+
+        let problems: Vec<&str> = report
+            .findings
+            .iter()
+            .map(|finding| finding.problem.as_str())
+            .collect();
+        assert_eq!(problems.len(), 2);
+        assert_eq!(problems[0], "The value of webhook_url from secret slack-hook fails the endpoint checks");
+        assert!(!problems[1].contains("s3cr3t-plain"), "{}", problems[1]);
+    }
+
+    #[tokio::test]
     async fn an_integration_whose_endpoint_is_gone_is_reported() {
         let gone = webhook("https://93.184.215.14/hook");
         let events = gateway_events();

@@ -228,6 +228,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_test_send_that_fails_never_shows_a_secret_or_a_slack_webhook_url() {
+        let f = Fixture::new()
+            .await
+            .with_secrets(Secrets(vec![("slack-hook", None, "not a url s3cr3t-stored")]));
+        for webhook_url in ["$SECRET:slack-hook", "hooks.slack.com/services/T0/B0/s3cr3t-plain"] {
+            let endpoint = Endpoint::new(
+                "Ops Slack".to_string(),
+                String::new(),
+                EndpointType::Slack,
+                json!({"webhook_url": webhook_url}),
+            );
+            f.stores
+                .endpoints
+                .save(&endpoint)
+                .await
+                .expect("endpoint");
+
+            let (status, body) = f
+                .call(ADMIN, "POST", &format!("/v1/integrations/endpoints/{}/test", endpoint.id), None)
+                .await;
+
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            let message = body
+                .as_str()
+                .expect("message");
+            assert!(message.contains("webhook_url rejected"), "{message}");
+            assert!(!message.contains("s3cr3t"), "{message}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_draft_is_checked_as_a_save_would_be() {
         let f = Fixture::new().await;
         let s = seeded(&f).await;

@@ -350,6 +350,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_report_never_shows_a_slack_webhook_url_that_fails_the_checks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stores = stores(dir.path()).await;
+        let mut planned = planned("https://93.184.215.14/hook", false);
+        planned.endpoint = Endpoint::new(
+            "Ops Slack".to_string(),
+            String::new(),
+            EndpointType::Slack,
+            json!({"webhook_url": "hooks.slack.com/services/T0/B0/s3cr3t-plain"}),
+        );
+        planned.endpoint.id = ID.to_string();
+
+        let report = apply(one(planned), &stores, None)
+            .await
+            .expect("applies");
+
+        let reason = report.integrations[0]
+            .endpoint_disabled
+            .clone()
+            .expect("reason");
+        assert!(reason.starts_with("webhook_url rejected: Invalid URL"), "{reason}");
+        let written = serde_json::to_string(&report).expect("serializes");
+        assert!(!written.contains("s3cr3t-plain"), "{written}");
+    }
+
+    #[tokio::test]
     async fn running_again_changes_nothing_already_written() {
         let dir = tempfile::tempdir().expect("temp dir");
         let stores = stores(dir.path()).await;

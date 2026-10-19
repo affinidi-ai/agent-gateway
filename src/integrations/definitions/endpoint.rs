@@ -242,6 +242,7 @@ impl Definition for Endpoint {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_secrets::Secrets;
     use super::*;
     use serde_json::json;
 
@@ -399,74 +400,6 @@ mod tests {
         );
     }
 
-    struct Secrets(Vec<(&'static str, Option<&'static str>, &'static str)>);
-
-    #[async_trait::async_trait]
-    impl SecretsStore for Secrets {
-        async fn create(
-            &self,
-            _request: crate::secrets::CreateSecretRequest,
-        ) -> anyhow::Result<crate::secrets::Secret> {
-            unimplemented!()
-        }
-
-        async fn get(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
-            unimplemented!()
-        }
-
-        async fn get_by_secret_id(
-            &self,
-            secret_id: &str,
-        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
-            let now = chrono::Utc::now();
-            Ok(self
-                .0
-                .iter()
-                .find(|(id, _, _)| *id == secret_id)
-                .map(|(id, tenant, value)| crate::secrets::Secret {
-                    id: format!("internal-{id}"),
-                    tenant_id: tenant.map(str::to_string),
-                    name: id.to_string(),
-                    secret_id: id.to_string(),
-                    description: None,
-                    value: value.to_string(),
-                    secret_type: "General".to_string(),
-                    tags: Vec::new(),
-                    created_at: now,
-                    updated_at: now,
-                }))
-        }
-
-        async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
-            unimplemented!()
-        }
-
-        async fn update(
-            &self,
-            _id: &str,
-            _request: crate::secrets::UpdateSecretRequest,
-        ) -> anyhow::Result<crate::secrets::Secret> {
-            unimplemented!()
-        }
-
-        async fn delete(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-
-        async fn find_by_tag(
-            &self,
-            _tag: &str,
-        ) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
-            unimplemented!()
-        }
-    }
-
     #[tokio::test]
     async fn resolves_secret_references_in_secret_fields_and_headers() {
         let store = Secrets(vec![("hook-signing", None, "s3cr3t"), ("ops-token", None, "Bearer abc")]);
@@ -518,6 +451,65 @@ mod tests {
                 .expect_err("fails");
             assert!(error.contains(reason), "{error}");
         }
+    }
+
+    const SECRET_VALUE: &str = "s3cr3t-value";
+
+    fn slack(webhook_url: &str) -> Endpoint {
+        Endpoint::new("Ops Slack".to_string(), String::new(), EndpointType::Slack, json!({"webhook_url": webhook_url}))
+    }
+
+    #[tokio::test]
+    async fn a_referenced_secret_failing_the_checks_is_named_but_never_shown() {
+        for value in ["not a url s3cr3t-value", "http://10.0.0.1/services/s3cr3t-value"] {
+            let store = Secrets(vec![("slack-hook", None, value)]);
+
+            let error = slack("$SECRET:slack-hook")
+                .validate_resolved(Some(&store))
+                .await
+                .expect_err("refused");
+
+            assert_eq!(error, "The value of webhook_url from secret slack-hook fails the endpoint checks");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_problem_the_secret_values_do_not_cause_is_reported_as_it_is() {
+        let store = Secrets(vec![("ops-token", None, SECRET_VALUE)]);
+        let mut endpoint = webhook();
+        endpoint.configuration = json!({
+            "url": "http://169.254.169.254/latest",
+            "headers": {"Authorization": "$SECRET:ops-token"}
+        });
+
+        let error = endpoint
+            .validate_resolved(Some(&store))
+            .await
+            .expect_err("refused");
+
+        assert!(error.contains("169.254.169.254"), "{error}");
+        assert!(!error.contains(SECRET_VALUE), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_plain_slack_url_failing_the_checks_is_never_shown() {
+        let error = slack(&format!("hooks.slack.com/services/T0/B0/{SECRET_VALUE}"))
+            .validate_resolved(None)
+            .await
+            .expect_err("refused");
+
+        assert!(error.starts_with("webhook_url rejected: Invalid URL: "), "{error}");
+        assert!(!error.contains(SECRET_VALUE), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_secret_is_named() {
+        let error = slack("$SECRET:slack-hook")
+            .validate_resolved(Some(&Secrets(Vec::new())))
+            .await
+            .expect_err("refused");
+
+        assert_eq!(error, "Secret 'slack-hook' not found");
     }
 
     #[test]
