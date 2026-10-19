@@ -138,26 +138,14 @@ pub struct LegacyPaths {
     pub connection_points: PathBuf,
 }
 
-const LIVE_DEFINITIONS: &str = "_storage/integrations/definitions";
-const LIVE_TRIGGERS: &str = "_storage/integrations/triggers";
-
 impl LegacyPaths {
     /// The deprecated `storage_paths.integrations` and `integration_triggers` when set,
-    /// otherwise live's defaults, and the connection points where they still are.
+    /// otherwise live's defaults, as resolved when the config file was loaded, and the
+    /// connection points where they still are.
     pub fn configured(paths: &crate::config::StoragePaths) -> Self {
         Self {
-            definitions: PathBuf::from(
-                paths
-                    .integrations
-                    .as_deref()
-                    .unwrap_or(LIVE_DEFINITIONS),
-            ),
-            triggers: PathBuf::from(
-                paths
-                    .integration_triggers
-                    .as_deref()
-                    .unwrap_or(LIVE_TRIGGERS),
-            ),
+            definitions: PathBuf::from(&paths.legacy_integrations),
+            triggers: PathBuf::from(&paths.legacy_integration_triggers),
             connection_points: PathBuf::from(&paths.connection_points),
         }
     }

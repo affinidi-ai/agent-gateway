@@ -170,6 +170,15 @@ impl BootstrapConfig {
             ] {
                 *path = resolve_storage_path(path);
             }
+            let paths = &mut config.storage_paths;
+            paths.legacy_integrations =
+                resolve_storage_path(paths.integrations.as_deref().unwrap_or(&paths.legacy_integrations));
+            paths.legacy_integration_triggers = resolve_storage_path(
+                paths
+                    .integration_triggers
+                    .as_deref()
+                    .unwrap_or(&paths.legacy_integration_triggers),
+            );
             config.storage_paths.webhooks = resolve_storage_path(&config.storage_paths.webhooks);
             config.storage_paths.vc_keys = resolve_storage_path(&config.storage_paths.vc_keys);
             config.storage_paths.metrics = resolve_storage_path(&config.storage_paths.metrics);

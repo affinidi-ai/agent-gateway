@@ -111,8 +111,18 @@ pub async fn migrate_on_activation(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
-    match migrate_from_live(&LegacyPaths::configured(storage_paths), report_dir, stores, secrets, &audit, now).await {
-        Ok(report) => report.is_some(),
+    let paths = LegacyPaths::configured(storage_paths);
+    match migrate_from_live(&paths, report_dir, stores, secrets, &audit, now).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            log_not_found(
+                &paths.definitions,
+                storage_paths
+                    .integrations
+                    .is_some(),
+            );
+            false
+        }
         Err(error) => {
             error!(
                 event = "integrations.migration.failed",
@@ -121,6 +131,29 @@ pub async fn migrate_on_activation(
             );
             false
         }
+    }
+}
+
+/// Names the live definitions directory the sweep did not find, so a wrong path is visible.
+/// Expected on a fresh install and after the migration, so INFO; a WARN when
+/// `storage_paths.integrations` named it, since the operator said the records are there.
+fn log_not_found(
+    definitions: &Path,
+    configured: bool,
+) {
+    let dir = definitions.display();
+    if configured {
+        warn!(
+            event = "integrations.migration.not_found",
+            dir = %dir,
+            "storage_paths.integrations names no directory; no integrations of the previous version to migrate"
+        );
+    } else {
+        info!(
+            event = "integrations.migration.not_found",
+            dir = %dir,
+            "No integrations of the previous version to migrate"
+        );
     }
 }
 

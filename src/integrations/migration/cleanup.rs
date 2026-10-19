@@ -239,16 +239,14 @@ mod tests {
             .path()
             .join("integrations");
         let paths = StoragePaths {
-            integrations: Some(
-                base.join("definitions")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            integration_triggers: Some(
-                base.join("triggers")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            legacy_integrations: base
+                .join("definitions")
+                .to_string_lossy()
+                .into_owned(),
+            legacy_integration_triggers: base
+                .join("triggers")
+                .to_string_lossy()
+                .into_owned(),
             ..StoragePaths::default()
         };
 
