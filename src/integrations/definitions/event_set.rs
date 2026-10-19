@@ -139,6 +139,7 @@ impl Definition for EventSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::events::catalog;
 
     fn events(ids: &[&str]) -> Vec<String> {
         ids.iter()
@@ -166,6 +167,27 @@ mod tests {
             validate_events(events(&["user.login", "audit.trust_check", "x402.transaction.completed"])),
             Ok(events(&["user.login", "audit.trust_check", "x402.transaction.completed"]))
         );
+    }
+
+    #[test]
+    fn many_repeats_of_one_event_yield_one_event() {
+        let repeated = vec!["gateway.created".to_string(); 10_000];
+
+        assert_eq!(validate_events(repeated), Ok(events(&["gateway.created"])));
+    }
+
+    #[test]
+    fn a_list_longer_than_the_catalog_is_accepted_after_removing_repeats() {
+        let every_event: Vec<String> = catalog()
+            .iter()
+            .map(|event| event.id.to_string())
+            .collect();
+        let mut longer = every_event.clone();
+        longer.extend(every_event.iter().cloned());
+        longer.extend(every_event.iter().cloned());
+        assert!(longer.len() > catalog().len());
+
+        assert_eq!(validate_events(longer), Ok(every_event));
     }
 
     #[test]
