@@ -176,7 +176,7 @@ assertions allow 180 seconds.
 You need Fabric only to connect your gateway to remote gateways. Gateway-to-gateway calls
 travel over DIDComm v2.1 through a mediator, which needs:
 
-- v0.17.0 or later
+- v0.33.1 or later, the version this source revision is built and tested against
   ([mediator reference](https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/reference/gateways/mediator/));
 - a public URL that both gateways can reach;
 - a Redis-compatible store, or its embedded Fjall store.
