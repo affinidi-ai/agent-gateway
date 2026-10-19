@@ -238,7 +238,7 @@ pub async fn prepare(
         )
         .context("No publisher for the endpoint type")?;
     let template = publisher.complete_template(&route.integration.content);
-    let content = render(&template, values, publisher.escaping(&template));
+    let content = render(&template, values, publisher.escaping(&template), publisher.embeds_json());
     let configuration = resolve_secret_references(route.endpoint.endpoint_type, &route.endpoint.configuration, secrets)
         .await
         .map_err(|reason| anyhow::anyhow!(reason))?;

@@ -146,8 +146,10 @@ variables for a template that needs them.
 Placeholders are filled in one pass
 ([`delivery/render.rs`](../src/integrations/delivery/render.rs)): a placeholder with no value
 becomes empty, and a substituted value is never scanned for placeholders again, so a username
-of `${SECRET}` stays literal. A string that is exactly `${EVENT_DATA}` or `${AUDIT_RECORD}` is
-embedded as a JSON value; inside other text it is inserted as JSON text.
+of `${SECRET}` stays literal. For `webhook` and `stream`, a string that is exactly
+`${EVENT_DATA}` or `${AUDIT_RECORD}` is embedded as a JSON value. Everywhere else, including
+`slack` and `email`, and inside other text, these JSON-valued variables are inserted as JSON
+text and escaped like any other value.
 
 Values, never the template, are escaped for the transport. Slack messages are sent as mrkdwn,
 with `&`, `<`, and `>` escaped, so caller-supplied text such as a JWT `name` claim cannot

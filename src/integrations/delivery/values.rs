@@ -133,7 +133,7 @@ fn summary(
         "mpp.challenge.issued" => "MPP payment requested for ${RESOURCE_URL} on surface ${SURFACE_NAME}",
         _ => return event.name.clone(),
     };
-    render(&serde_json::Value::String(template.to_string()), values, Escaping::None)
+    render(&serde_json::Value::String(template.to_string()), values, Escaping::None, false)
         .as_str()
         .unwrap_or_default()
         .to_string()
