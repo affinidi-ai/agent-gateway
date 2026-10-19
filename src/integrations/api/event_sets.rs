@@ -13,6 +13,7 @@ use super::{
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::integrations::definitions::event_set::validate_events;
 use crate::integrations::definitions::{EventSet, EventSetError};
+use crate::integrations::events::catalog;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +50,7 @@ pub async fn create_event_set(
     Json(request): Json<EventSetRequest>,
 ) -> Result<(StatusCode, Json<EventSet>), ApiError> {
     let (name, description) = validate_text(&request.name, &request.description)?;
+    within_catalog(&request.events)?;
     let event_set = EventSet::new(name, description, request.events).map_err(bad_events)?;
     save(&stores, &event_set).await?;
     info!(
@@ -69,6 +71,7 @@ pub async fn update_event_set(
 ) -> Result<Json<EventSet>, ApiError> {
     let mut event_set = load(&stores, &id).await?;
     let (name, description) = validate_text(&request.name, &request.description)?;
+    within_catalog(&request.events)?;
     event_set.events = validate_events(request.events).map_err(bad_events)?;
     event_set.name = name;
     event_set.description = description;
@@ -117,6 +120,15 @@ pub async fn delete_event_set(
     definitions_changed().await;
     info!(event = "integrations.event_set.deleted", event_set_id = %id, caller = caller_id(&caller));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Refuses a list longer than the catalog: an event set holds each catalog event at most once.
+fn within_catalog(events: &[String]) -> Result<(), ApiError> {
+    let most = catalog().len();
+    if events.len() > most {
+        return Err((StatusCode::BAD_REQUEST, format!("An event set holds at most {most} events")));
+    }
+    Ok(())
 }
 
 fn bad_events(error: EventSetError) -> ApiError {
@@ -256,10 +268,7 @@ mod tests {
             .await;
 
         assert_eq!(create_status, StatusCode::BAD_REQUEST, "{create_body}");
-        assert_eq!(
-            create_body,
-            json!(format!("An event set holds at most {} events", every_event.len()))
-        );
+        assert_eq!(create_body, json!(format!("An event set holds at most {} events", every_event.len())));
         assert_eq!(update_status, StatusCode::BAD_REQUEST);
         assert_eq!(every_status, StatusCode::CREATED, "every catalog event once fits");
     }
