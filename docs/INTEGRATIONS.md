@@ -319,13 +319,18 @@ endpoint, an event set and an integration, all three with the old integration's 
 **Where it reads and what it leaves.**
 - It reads `_storage/integrations/definitions` and `_storage/integrations/triggers`, or the
   deprecated `storage_paths.integrations` and `storage_paths.integration_triggers` when set.
-  Those keys are read for this only, log a deprecation warning, and can be removed once
-  migrated.
+  Like every other storage path, a relative path, the defaults included, is relative to the
+  config file's directory, not the working directory. Those keys are read for this only, log
+  a deprecation warning, and can be removed once migrated.
+- When the old definitions directory is not there, the node logs
+  `integrations.migration.not_found` with the path it looked in: INFO, as on a fresh install
+  or once migrated, or WARN when `storage_paths.integrations` names it.
 - Each integration logs `integrations.migration.integration`. A disabled endpoint logs
   `integrations.migration.endpoint_disabled`, an integration that cannot be migrated logs
   `integrations.migration.skipped`, and the end logs `integrations.migration.done`.
-- The report is `_storage/integrations/migration-report-<unix seconds>.json`, with no secret,
-  header or attachment value in it.
+- The report is `migration-report-<unix seconds>.json` in the directory holding
+  `storage_paths.integration_definitions` (by default `_storage/integrations/` beside the
+  config file), with no secret, header or attachment value in it.
 - The two old directories are renamed to `<dir>.migrated-<unix seconds>`, which also keeps
   the migration from running again. They may hold credentials in plain text, so the Active
   node deletes them 30 days later, without a restart.
