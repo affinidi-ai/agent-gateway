@@ -595,6 +595,65 @@ mod tests {
         assert_eq!(message.content, json!({"text": "*Gateway Created*\nGateway edge was created"}));
     }
 
+    const EVENT_DATA: &str = r#"{"gateway_name":"<b>edge</b>","old_state":null}"#;
+
+    async fn sole_event_data_field(
+        endpoint_type: EndpointType,
+        content: JsonValue,
+    ) -> JsonValue {
+        let s = seeded().await;
+        let mut endpoint = s.endpoint.clone();
+        endpoint.endpoint_type = endpoint_type;
+        endpoint.configuration = json!({});
+        let mut integration = integration_for("data", &endpoint, &s.gateway_events);
+        integration.content = content;
+        let values = HashMap::from([("EVENT_DATA".to_string(), EVENT_DATA.to_string())]);
+
+        prepare(
+            &Route {
+                integration,
+                endpoint,
+            },
+            &values,
+            None,
+        )
+        .await
+        .expect("prepares")
+        .1
+        .content
+    }
+
+    #[tokio::test]
+    async fn slack_sends_a_sole_event_data_field_as_escaped_text() {
+        let content = sole_event_data_field(EndpointType::Slack, json!({"text": "${EVENT_DATA}"})).await;
+
+        assert_eq!(content, json!({"text": r#"{"gateway_name":"&lt;b&gt;edge&lt;/b&gt;","old_state":null}"#}));
+    }
+
+    #[tokio::test]
+    async fn email_sends_a_sole_event_data_body_as_text() {
+        let plain = sole_event_data_field(EndpointType::Email, json!({"body": "${EVENT_DATA}"})).await;
+        let html =
+            sole_event_data_field(EndpointType::Email, json!({"body": "${EVENT_DATA}", "format": "html"})).await;
+
+        assert_eq!(plain["body"], json!(EVENT_DATA));
+        assert_eq!(html["body"], json!(r#"{&quot;gateway_name&quot;:&quot;&lt;b&gt;edge&lt;/b&gt;&quot;,&quot;old_state&quot;:null}"#));
+    }
+
+    #[tokio::test]
+    async fn webhook_and_stream_still_embed_a_sole_event_data_field_as_json() {
+        let embedded = json!({"data": {"gateway_name": "<b>edge</b>", "old_state": null}});
+
+        assert_eq!(
+            sole_event_data_field(EndpointType::Webhook, json!({"data": "${EVENT_DATA}"})).await,
+            embedded
+        );
+        assert_eq!(
+            sole_event_data_field(EndpointType::Stream, json!({"data": "${EVENT_DATA}"})).await,
+            embedded
+        );
+    }
+
     #[tokio::test]
     async fn an_unresolvable_secret_reference_fails_the_delivery() {
         let s = seeded().await;
