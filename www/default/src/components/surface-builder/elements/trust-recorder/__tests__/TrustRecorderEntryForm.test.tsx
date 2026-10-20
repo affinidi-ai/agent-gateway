@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, within, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, within, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import { apiClient } from '../../../../../api';
@@ -8,7 +8,10 @@ import TrustRecorderFullscreenPanel from '../TrustRecorderFullscreenPanel';
 import type { TrustRecorderEntry } from '../definition';
 import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../../SurfaceMetaContext';
 import { DOCS_URL } from '../../../../../config/docs';
+import { clearIssuersCache } from '../../../../../utils/issuersCache';
 import type { Authority, Issuer, TrustRegistry } from '../../../../../types';
+
+const flushPromises = () => act(() => new Promise<void>(resolve => setTimeout(resolve, 0)));
 
 jest.mock('../../../../../api', () => ({
   apiClient: {
@@ -423,6 +426,15 @@ describe('TrustRecorderEntryForm — custom resource row', () => {
 
 describe('TrustRecorderEntryForm — surface Issuer warning', () => {
   const WARNING = 'trust-recorder-entry-0-no-surface-issuer-warning';
+
+  beforeEach(() => {
+    clearIssuersCache();
+    (apiClient.listTrustRegistries as jest.Mock).mockResolvedValue([]);
+    (apiClient.listAuthorities as jest.Mock).mockResolvedValue([]);
+    (apiClient.listIssuers as jest.Mock).mockResolvedValue([
+      { id: 'issuer-1', name: 'Issuer One', did: 'did:web:one.example', created_at: '' },
+    ]);
+  });
   const surfaceEntry = () => baseEntry({ authority_did: '{{ surface.issuer_did }}' });
 
   function renderInSurface(props: Parameters<typeof TrustRecorderEntryForm>[0], issuerId: string) {
@@ -457,9 +469,20 @@ describe('TrustRecorderEntryForm — surface Issuer warning', () => {
     expect(screen.getByTestId(WARNING)).toBeInTheDocument();
   });
 
-  it('does not warn when the surface has an Issuer', () => {
+  it('does not warn when the surface has an Issuer that exists', async () => {
     renderInSurface(baseProps({ entry: surfaceEntry() }), 'issuer-1');
+    await waitFor(() => expect(apiClient.listIssuers).toHaveBeenCalled());
+    await flushPromises();
     expect(screen.queryByTestId(WARNING)).not.toBeInTheDocument();
+  });
+
+  it('warns that the Issuer no longer exists when the surface points at a deleted one', async () => {
+    renderInSurface(baseProps({ entry: surfaceEntry() }), 'issuer-gone');
+
+    const warning = await screen.findByTestId(WARNING);
+    expect(warning).toHaveTextContent("This surface's Issuer no longer exists");
+    expect(warning).toHaveTextContent('This entry uses the surface Issuer as its Authority');
+    expect(warning).toHaveTextContent('writes no records');
   });
 
   it('does not warn in Explicit DID mode even when the surface has no Issuer', () => {

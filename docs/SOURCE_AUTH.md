@@ -197,14 +197,16 @@ for the agent DID. Context is a snapshot taken at creation and is never rewritte
 reference field carries the current name. A naming failure never skips record creation.
 
 `authority_did` accepts the template `{{ surface.issuer_did }}`, resolved at write time
-to the surface's configured Issuer DID. When the surface has no issuer configured the
+to the surface's configured Issuer DID. When the surface has no issuer configured, or its
+issuer was deleted (deleting an Issuer does not check whether a surface still uses it), the
 template does not resolve and the entry is skipped with a warning rather than written
 with a placeholder.
 
 An entry's `issuer_did` is not a signer and does not set the authority. It is written as
 the `entity_id` of custom records whose `entity_target` is `issuer`, and nothing else. The
 dashboard warns on the Trust Recorder panel and on the entry while the surface has no Issuer
-selected and an entry's authority is the template, because that entry writes nothing. The
+selected, or its Issuer no longer exists, and an entry's authority is the template, because
+that entry writes nothing. The
 warning does not block saving, and it does not appear for entries with an explicit authority.
 
 ## Display names

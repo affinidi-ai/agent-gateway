@@ -12,7 +12,7 @@ import {
   usesSurfaceIssuer,
   type TrustRecorderEntry,
 } from './definition';
-import NoSurfaceIssuerWarning, { useSurfaceIssuerMissing } from './NoSurfaceIssuerWarning';
+import NoSurfaceIssuerWarning, { useSurfaceIssuerProblem } from './NoSurfaceIssuerWarning';
 
 interface TrustRecorderEntryFormProps {
   entry: TrustRecorderEntry;
@@ -57,7 +57,7 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
   saveAttempted = false,
 }) => {
   const tid = (suffix: string) => `trust-recorder-entry-${index}-${suffix}`;
-  const surfaceIssuerMissing = useSurfaceIssuerMissing();
+  const surfaceIssuerProblem = useSurfaceIssuerProblem();
   const hasCompleteCustomResource = entry.custom_resources.some(
     r =>
       r.action.trim().length > 0 && r.resource.trim().length > 0 && r.record_type.trim().length > 0
@@ -294,8 +294,11 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
                 <em> the verified identity credential issuer</em>. If the surface has no Issuer
                 configured, the entry is skipped (fail-safe) with a WARN.
               </Form.Text>
-              {surfaceIssuerMissing && (
-                <NoSurfaceIssuerWarning testid={tid('no-surface-issuer-warning')}>
+              {surfaceIssuerProblem && (
+                <NoSurfaceIssuerWarning
+                  testid={tid('no-surface-issuer-warning')}
+                  problem={surfaceIssuerProblem}
+                >
                   This entry uses the surface Issuer as its Authority, so it is skipped and writes
                   no records.
                 </NoSurfaceIssuerWarning>

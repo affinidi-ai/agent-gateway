@@ -2,8 +2,8 @@
  * Trust Recorder tests
  *
  * Asserts the recorder warns when its entries rely on the surface Issuer but
- * the surface has none selected, and explains how Issuer, Authority and Entity
- * relate.
+ * the surface has none selected or its Issuer no longer exists, and explains how
+ * Issuer, Authority and Entity relate.
  */
 
 import type {Page} from '@playwright/test';
@@ -48,11 +48,25 @@ function surfaceFixture(options: {issuerId?: string; authority: string}) {
     };
 }
 
+const ISSUER_FIXTURE = {
+    id: 'issuer-1',
+    name: 'Issuer One',
+    did: 'did:web:issuer-one.example',
+    created_at: '2026-01-01T00:00:00Z',
+};
+
 async function openRecorderPanel(
     page: Page,
-    options: {issuerId?: string; authority: string},
+    options: {issuerId?: string; authority: string; issuers?: Array<typeof ISSUER_FIXTURE>},
 ) {
     const fixture = surfaceFixture(options);
+    await page.route(/\/api\/v1\/issuers(\?.*)?$/, async (route) => {
+        if (route.request().method() === 'GET') {
+            await route.fulfill({json: options.issuers ?? []});
+        } else {
+            await route.fallback();
+        }
+    });
     await page.route(new RegExp(`/api/v1/surfaces/${SURFACE_ID}(\\?.*)?$`), async (route) => {
         if (route.request().method() === 'GET') {
             await route.fulfill({json: fixture});
@@ -82,13 +96,37 @@ test.describe('Trust Recorder — surface Issuer warning', () => {
         await captureFullPage(page, 'trust-recorder-entry-no-surface-issuer');
     });
 
-    test('does not warn when the surface has an Issuer', async ({page}) => {
-        await openRecorderPanel(page, {authority: SURFACE_ISSUER_TEMPLATE, issuerId: 'issuer-1'});
+    test('does not warn when the surface has an Issuer that exists', async ({page}) => {
+        await openRecorderPanel(page, {
+            authority: SURFACE_ISSUER_TEMPLATE,
+            issuerId: 'issuer-1',
+            issuers: [ISSUER_FIXTURE],
+        });
+        await expect(page.getByTestId('trust-recorder-panel-configure')).toBeVisible();
         await expect(page.getByTestId('trust-recorder-panel-no-surface-issuer-warning')).toBeHidden();
 
         await page.getByTestId('trust-recorder-panel-configure').click();
         await expect(page.getByTestId('trust-recorder-entry-0-form')).toBeVisible();
         await expect(page.getByTestId('trust-recorder-entry-0-no-surface-issuer-warning')).toBeHidden();
+    });
+
+    test('warns when the surface still points at an Issuer that was deleted', async ({page}) => {
+        await openRecorderPanel(page, {
+            authority: SURFACE_ISSUER_TEMPLATE,
+            issuerId: 'issuer-deleted',
+            issuers: [ISSUER_FIXTURE],
+        });
+
+        const panelWarning = page.getByTestId('trust-recorder-panel-no-surface-issuer-warning');
+        await expect(panelWarning).toBeVisible();
+        await expect(panelWarning).toContainText("This surface's Issuer no longer exists");
+        await expect(panelWarning).toContainText('no records are written');
+        await captureFullPage(page, 'trust-recorder-panel-deleted-surface-issuer');
+
+        await page.getByTestId('trust-recorder-panel-configure').click();
+        await expect(page.getByTestId('trust-recorder-entry-0-no-surface-issuer-warning')).toContainText(
+            "This surface's Issuer no longer exists",
+        );
     });
 
     test('does not warn when the entry names an explicit Authority', async ({page}) => {

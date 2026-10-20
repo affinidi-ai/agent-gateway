@@ -89,6 +89,10 @@ The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and r
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
+The Trust Recorder panel and its entries warn while an entry uses the surface Issuer as its
+Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
+
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 
 ## Architecture

@@ -119,8 +119,13 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
 - The sidebar panel and each entry in its fullscreen editor show the shared
   `NoSurfaceIssuerWarning` (`elements/trust-recorder/NoSurfaceIssuerWarning.tsx`, an
   `InfoBanner` warning variant, never the amber `alert-warning`, which fails contrast) while
-  `SurfaceMetaContext.issuerId` is empty and an entry's Authority is **Use surface Issuer**
-  (`usesSurfaceIssuer`). The backend skips such an entry and writes no records.
+  `SurfaceMetaContext.issuerId` is empty, or names an Issuer that is not in the Issuer list, and
+  an entry's Authority is **Use surface Issuer** (`usesSurfaceIssuer`). The backend skips such an
+  entry and writes no records. The title tells the two cases apart: "No Issuer is selected for
+  this surface" and "This surface's Issuer no longer exists".
+- `useSurfaceIssuerProblem` calls the shared Issuer list (`getIssuers`), and refetches it once
+  before reporting an Issuer as deleted. It stays quiet while the list loads and when it cannot
+  be loaded.
 - It is a warning, not save validation. It stays hidden for entries with an explicit
   Authority, and outside a surface editor, where there is no surface Issuer to check.
 - The entry **Issuer** is only the Entity of custom records whose Entity Target is Issuer DID.

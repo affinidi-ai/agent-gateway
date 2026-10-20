@@ -1,8 +1,14 @@
 import React from 'react';
-import { render, screen, within, fireEvent } from '@testing-library/react';
+import { act, render, screen, waitFor, within, fireEvent } from '@testing-library/react';
 import TrustRecorderPanel from '../trust-recorder/TrustRecorderPanel';
+import { getIssuers } from '../../../../utils/issuersCache';
 import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../SurfaceMetaContext';
 import { SURFACE_ISSUER_DID_TEMPLATE } from '../trust-recorder/definition';
+
+const flushPromises = () => act(() => new Promise<void>(resolve => setTimeout(resolve, 0)));
+
+jest.mock('../../../../utils/issuersCache', () => ({ getIssuers: jest.fn() }));
+const getIssuersMock = getIssuers as jest.Mock;
 
 const AP_SLOT = 'response:trust-recorder';
 
@@ -106,6 +112,11 @@ describe('TrustRecorderPanel — sidebar context block', () => {
 describe('TrustRecorderPanel — surface Issuer warning', () => {
   const WARNING = 'trust-recorder-panel-no-surface-issuer-warning';
 
+  beforeEach(() => {
+    getIssuersMock.mockReset();
+    getIssuersMock.mockResolvedValue([{ id: 'issuer-1' }]);
+  });
+
   function entry(authority_did: string) {
     return {
       trust_registry_id: 'tr-1',
@@ -130,21 +141,70 @@ describe('TrustRecorderPanel — surface Issuer warning', () => {
     );
   }
 
+  async function settled() {
+    await waitFor(() => expect(getIssuersMock).toHaveBeenCalled());
+    await flushPromises();
+  }
+
   it('warns that records are skipped when an entry uses the surface Issuer and none is selected', () => {
     renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] }, '');
 
     const warning = screen.getByTestId(WARNING);
     expect(warning).toHaveTextContent('No Issuer is selected for this surface');
     expect(warning).toHaveTextContent('no records are written');
+    expect(getIssuersMock).not.toHaveBeenCalled();
   });
 
-  it('stays quiet once the surface has an Issuer', () => {
+  it('stays quiet once the surface has an Issuer that exists', async () => {
     renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] }, 'issuer-1');
+    await settled();
     expect(screen.queryByTestId(WARNING)).toBeNull();
   });
 
-  it('stays quiet when every entry names an explicit Authority, since the surface Issuer is not needed', () => {
+  it('warns that the Issuer no longer exists when the surface points at a deleted one', async () => {
+    renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] }, 'issuer-gone');
+
+    const warning = await screen.findByTestId(WARNING);
+    expect(warning).toHaveTextContent("This surface's Issuer no longer exists");
+    expect(warning).toHaveTextContent('Select an existing Issuer');
+    expect(warning).toHaveTextContent('no records are written');
+  });
+
+  it('stays quiet while the Issuer list is loading and warns once it has loaded without the Issuer', async () => {
+    let resolveList!: (issuers: unknown[]) => void;
+    getIssuersMock.mockReturnValue(new Promise(resolve => (resolveList = resolve)));
+    renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] }, 'issuer-gone');
+
+    await waitFor(() => expect(getIssuersMock).toHaveBeenCalled());
+    expect(screen.queryByTestId(WARNING)).toBeNull();
+
+    await act(async () => resolveList([]));
+    expect(await screen.findByTestId(WARNING)).toHaveTextContent('no longer exists');
+  });
+
+  it('stays quiet when the Issuer list cannot be loaded', async () => {
+    getIssuersMock.mockRejectedValue(new Error('forbidden'));
+    renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] }, 'issuer-gone');
+
+    await settled();
+    expect(screen.queryByTestId(WARNING)).toBeNull();
+  });
+
+  it('rechecks with a fresh list before calling an Issuer deleted, so one created elsewhere is not flagged', async () => {
+    getIssuersMock.mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 'issuer-new' }]);
+    renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] }, 'issuer-new');
+
+    await waitFor(() => expect(getIssuersMock).toHaveBeenCalledWith({ refresh: true }));
+    await flushPromises();
+    expect(screen.queryByTestId(WARNING)).toBeNull();
+  });
+
+  it('stays quiet when every entry names an explicit Authority, since the surface Issuer is not needed', async () => {
     renderWithSurface({ entries: [entry('did:web:authority.example')] }, '');
+    expect(screen.queryByTestId(WARNING)).toBeNull();
+
+    renderWithSurface({ entries: [entry('did:web:authority.example')] }, 'issuer-gone');
+    await settled();
     expect(screen.queryByTestId(WARNING)).toBeNull();
   });
 
@@ -156,5 +216,6 @@ describe('TrustRecorderPanel — surface Issuer warning', () => {
   it('stays quiet outside a surface editor, where the Issuer is unknown', () => {
     renderWithSurface({ entries: [entry(SURFACE_ISSUER_DID_TEMPLATE)] });
     expect(screen.queryByTestId(WARNING)).toBeNull();
+    expect(getIssuersMock).not.toHaveBeenCalled();
   });
 });
