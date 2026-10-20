@@ -38,15 +38,24 @@ jobs:
               - 'src/**'
               - 'tests/**'
               - 'scripts/**'
+              - 'config/**'
+              - '.cargo/**'
+              - '.config/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Makefile'
+              - 'rustfmt.toml'
+              - '.github/workflows/ci.yml'
             frontend:
               - 'www/default/**'
+              - '.github/workflows/ci.yml'
             mcp:
               - 'src/mcp/**'
               - 'src/mcp_proxies/**'
+              - 'src/proxy/**'
+              - 'src/gateways/**'
               - 'scripts/mcp-conformance/**'
+              - '.github/workflows/ci.yml'
 
   frontend:
     name: Frontend - format, lint, test, build
@@ -63,7 +72,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: www/default/package-lock.json
 
@@ -193,6 +202,9 @@ jobs:
 
       - name: Prepare test environment
         run: make config-test
+
+      - name: Run mediator configuration fixtures
+        run: bash scripts/mediator/test-reconcile-mediator-config.sh
 
       # Compiling and running are separate steps so an OOM is attributable to
       # the build rather than to a test.
@@ -371,7 +383,10 @@ jobs:
     if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
     # Exercises the documented Linux quick start (build -> prepare env -> boot
     # -> GET /api/v1/health). Non-blocking: a failure here does not fail the run.
+    # Replace the line below with the commented one to make this job block merges; it
+    # is left advisory until that is decided.
     continue-on-error: true
+    # continue-on-error: false
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 

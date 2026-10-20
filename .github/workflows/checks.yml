@@ -70,10 +70,16 @@ jobs:
       ubuntu-rust-deps: "build-essential libdbus-1-dev libssl-dev libsasl2-dev libsasl2-modules cmake libcurl4-openssl-dev libxml2-dev libxmlsec1-dev xmlsec1 libclang-dev pkg-config protobuf-compiler"
 
   rust-scan:
+    # Fork and Dependabot pull requests do not receive the scanner secrets, and the
+    # reusable workflow requires them.
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')
     uses: affinidi/pipeline-security/.github/workflows/rust-scanner.yml@3aeeb2ceac5c60e12ebddf3ae7bdf9cae56c78b5 # main 2026-09-23
     with:
       repo-path: '.'
-    secrets: inherit
+    secrets:
+      SNYK_SCANNER_TOKEN: ${{ secrets.SNYK_SCANNER_TOKEN }}
+      SNYK_SCANNER_REGION: ${{ secrets.SNYK_SCANNER_REGION }}
+      SNYK_GLOBAL_POLICY: ${{ secrets.SNYK_GLOBAL_POLICY }}
 
   clippy-all-targets:
     name: Clippy - all targets
@@ -102,6 +108,9 @@ jobs:
 
       - name: Lint gateway binary
         run: cargo clippy --bin agent-gateway --all-features -- -D warnings
+
+      - name: Lint gateway unit tests
+        run: cargo clippy --bin agent-gateway --tests --all-features -- -D warnings
 
       - name: Lint g2g BDD target
         run: cargo clippy --test g2g_bdd --all-features -- -D warnings
