@@ -100,6 +100,18 @@ export function patchAccessPointCanvasNode(canvas: any, identifiers: Record<stri
  * showing a prefix/suffix that disagrees with the base-synced route and
  * let a later edit recompose `route` from the stale suffix.
  */
+/**
+ * The `a2a` block to sync onto a snapshot. A block without versions (an A2A
+ * proxy base Target's, which carries only the validation level) keeps the
+ * snapshot's own versions, so the stored fixed versions survive a switch.
+ */
+function a2aKeepingVersions(existing: any, incoming: unknown): { a2a?: unknown } {
+  if (!incoming || typeof incoming !== 'object') return {};
+  if (Array.isArray((incoming as any).accepted_versions)) return {};
+  if (!Array.isArray(existing?.accepted_versions)) return {};
+  return { a2a: { ...incoming, accepted_versions: existing.accepted_versions } };
+}
+
 export function syncAccessPointIdentifiers(
   snapshots: Record<string, any>,
   source: any
@@ -135,7 +147,14 @@ export function syncAccessPointIdentifiers(
     }
     let next = snap;
     if (hasSlice && snap.access_point && typeof snap.access_point === 'object') {
-      next = { ...next, access_point: { ...snap.access_point, ...identifiers } };
+      next = {
+        ...next,
+        access_point: {
+          ...snap.access_point,
+          ...identifiers,
+          ...a2aKeepingVersions(snap.access_point.a2a, identifiers.a2a),
+        },
+      };
     }
     if (hasCanvas) {
       const patchedCanvas = patchAccessPointCanvasNode(next.canvas, canvasIdentifiers);

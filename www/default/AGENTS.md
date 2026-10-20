@@ -358,7 +358,8 @@ The hidden file input is `data-testid="restore-file-input"`.
   the gateway's fixed versions, and `access-point-a2a-proxy-locked` gives the reason when they
   include 0.3: the versions the stored block of a surface loaded with an A2A proxy base Target is
   served with, or both when it has no block (`storedA2aProxyVersions`, kept on the node, and on the
-  base view's Access Point config, as `a2a_locked_versions`; never taken from a canvas blob alone),
+  base view's Access Point config, as `a2a_locked_versions`; never taken from a canvas blob alone;
+  `syncAccessPointIdentifiers` keeps a snapshot's versions when the synced block names none),
   and 1.0 only for a new surface or one whose base Target was just moved to a proxy. In a view whose Target is a URL it adds that message validation applies to this
   Target. The payload's `access_point.a2a` then carries only `validation`, so the gateway keeps its
   fixed versions; the page sets it to `envelope` on save when no variant points the Target at a URL

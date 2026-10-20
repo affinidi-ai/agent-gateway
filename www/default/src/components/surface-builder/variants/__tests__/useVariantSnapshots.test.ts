@@ -1,5 +1,6 @@
 import { registry } from '../../elements';
 import { act, renderHook } from '@testing-library/react';
+import { storedA2aProxyVersions } from '../../elements/access-point/a2aSettings';
 import {
   BASE_VARIANT_ID,
   baseSurfaceFromSnapshot,
@@ -93,6 +94,47 @@ describe('useVariantSnapshots', () => {
         target: { endpoint: 'https://agent' },
       }).accessPointConfig
     ).toBeUndefined();
+  });
+
+  it('keeps the stored fixed versions after switching from a URL default variant to base', () => {
+    const { result } = renderHook(() => useVariantSnapshots());
+    const payload = {
+      access_point: {
+        protocol: 'a2a',
+        route: '/a',
+        a2a: { accepted_versions: ['0.3', '1.0'], validation: 'envelope' },
+      },
+      target: { endpoint: 'a2a-proxy://worker' },
+      variants: [
+        {
+          id: 'url',
+          alias: 'url',
+          name: 'url',
+          overrides: { complete: true, target: { endpoint: 'https://agent' } },
+        },
+      ],
+      default_variant_id: 'url',
+    };
+    let active: any;
+    act(() => {
+      active = result.current.hydrateFromPayload(payload).activePayload;
+    });
+    expect(result.current.activeVariantId).toBe('url');
+    expect(result.current.getBaseSurface()?.accessPointConfig?.a2a_locked_versions).toEqual([
+      '0.3',
+      '1.0',
+    ]);
+
+    const live = {
+      ...active,
+      access_point: { ...active.access_point, a2a: { validation: 'full' } },
+    };
+    let base: any;
+    act(() => {
+      base = result.current.switchVariant(BASE_VARIANT_ID, live);
+    });
+    expect(storedA2aProxyVersions(base)).toEqual(['0.3', '1.0']);
+    expect(base.access_point.a2a.validation).toBe('full');
   });
 
   it('starts empty', () => {

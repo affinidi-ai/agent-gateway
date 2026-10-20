@@ -2579,6 +2579,18 @@ async fn a2a_settings_carried_over_on_reload_are_served() {
     })
     .await;
     let (admin, surfaces_dir, settings_dir) = paths.unwrap();
+    // Surface events received while the node is still activating are replayed
+    // once it is ready, which would overwrite what the reload below serves.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while admin
+        .get(format!("{}/api/v1/health", h.gateway_base))
+        .send()
+        .await
+        .map_or(true, |response| response.status() != 200)
+    {
+        assert!(tokio::time::Instant::now() < deadline, "the gateway never became ready to serve");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let mut listener = url::Url::parse(&h.gateway_base).unwrap();
     listener
         .set_host(Some("localhost"))
