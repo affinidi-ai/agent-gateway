@@ -311,7 +311,7 @@ pub(crate) mod tests {
                             .redact(&reason)
                             .into_owned();
                         assert_eq!(logged, reason, "mangled by the log redactor: {logged}");
-                        assert!(!reason.contains(TEST_SECRET), "{reason}");
+                        assert!(!reason.contains(TEST_SECRET), "the secret appears in the failure reason");
                     }
                     other => panic!("status {status}: {other:?}"),
                 }
@@ -377,7 +377,7 @@ pub(crate) mod tests {
         let url = "http://127.0.0.1:1/secret-path".to_string();
         match post_json(&url, "{}", Duration::from_secs(2), None).await {
             HookOutcome::Retry { reason } => {
-                assert!(!reason.contains("secret-path"), "{reason}");
+                assert!(!reason.contains("secret-path"), "the hook URL appears in the failure reason");
             }
             other => panic!("{other:?}"),
         }

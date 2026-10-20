@@ -222,8 +222,8 @@ mod tests {
     fn a_short_or_blank_secret_disables_the_hook() {
         for raw in ["", "   ", "too-short", &format!(" {} ", &SECRET[..31])] {
             let parsed = settings(&[(ENV_HOOK_URL, "http://127.0.0.1:1/h"), (ENV_HOOK_SECRET, raw)]);
-            assert!(parsed.hook_url.is_none(), "{raw:?}");
-            assert!(parsed.hook_secret.is_none(), "{raw:?}");
+            assert!(parsed.hook_url.is_none(), "a short or blank secret must disable the hook");
+            assert!(parsed.hook_secret.is_none(), "a short or blank secret must not be kept");
         }
     }
 
@@ -231,7 +231,7 @@ mod tests {
     fn the_secret_never_appears_in_debug_output() {
         let parsed = settings(&[(ENV_HOOK_URL, "http://127.0.0.1:1/h"), (ENV_HOOK_SECRET, SECRET)]);
         let debug = format!("{parsed:?} {:?}", parsed.hook_secret);
-        assert!(!debug.contains(SECRET), "{debug}");
+        assert!(!debug.contains(SECRET), "the secret appears in the Debug output");
         assert!(debug.contains("redacted"));
     }
 
