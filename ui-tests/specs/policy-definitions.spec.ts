@@ -38,20 +38,35 @@ test.describe('Policy definition editor — instructions panel', () => {
         await toggle.getByText('Policy Instructions & Examples').click();
         await expect(page.getByTestId('policy-instructions-body')).toBeVisible();
 
-        const box = await toggle.boundingBox();
-        expect(box).not.toBeNull();
-        await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height / 2);
+        const title = await page.getByTestId('policy-instructions-title').boundingBox();
+        const chevron = await page.getByTestId('policy-instructions-chevron').boundingBox();
+        const header = await toggle.boundingBox();
+        expect(title).not.toBeNull();
+        expect(chevron).not.toBeNull();
+        expect(header).not.toBeNull();
+
+        const titleEnd = title!.x + title!.width;
+        const emptyX = (titleEnd + chevron!.x) / 2;
+        expect(chevron!.x - titleEnd, 'the header must have empty space between the title and the arrow').toBeGreaterThan(40);
+        await page.mouse.click(emptyX, header!.y + header!.height / 2);
 
         await expect(toggle).toHaveAttribute('aria-expanded', 'false');
         await expect(page.getByTestId('policy-instructions-body')).toBeHidden();
     });
 
     test('still toggles from the chevron hint', async ({page}) => {
-        const toggle = page.getByTestId('policy-instructions-toggle');
-        await toggle.locator('.btn').click();
+        const chevron = page.getByTestId('policy-instructions-chevron');
+        await chevron.click();
         await expect(page.getByTestId('policy-instructions-body')).toBeVisible();
-        await toggle.locator('.btn').click();
+        await chevron.click();
         await expect(page.getByTestId('policy-instructions-body')).toBeHidden();
+    });
+
+    test('keeps the title a heading that holds the toggle button', async ({page}) => {
+        const heading = page.getByRole('heading', {name: 'Policy Instructions & Examples'});
+        await expect(heading).toBeVisible();
+        await expect(heading.getByRole('button')).toHaveAttribute('aria-expanded', 'false');
+        await expect(heading.getByRole('button')).toHaveAttribute('aria-controls', 'policyDefInstructions');
     });
 
     test('toggles from the keyboard', async ({page}) => {

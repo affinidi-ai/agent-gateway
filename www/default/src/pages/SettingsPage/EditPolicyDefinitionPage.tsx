@@ -448,33 +448,27 @@ const EditPolicyDefinitionPage: React.FC = () => {
           {/* Policy Instructions */}
           <div className="card shadow-sm mb-4 border-left-primary">
             <div className="card-body">
-              <div
-                className="d-flex justify-content-between align-items-center"
-                style={{ cursor: 'pointer' }}
-                role="button"
-                tabIndex={0}
-                aria-expanded={instructionsOpen}
-                aria-controls="policyDefInstructions"
-                data-testid="policy-instructions-toggle"
-                onClick={toggleInstructions}
-                onKeyDown={e => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    toggleInstructions();
-                  }
-                }}
-              >
-                <h6 className="font-weight-bold text-primary mb-0">
-                  <i className="fas fa-graduation-cap me-2"></i>
-                  Policy Instructions & Examples
-                </h6>
-                <span className="btn btn-sm btn-outline-primary" aria-hidden="true">
-                  <i
-                    className={`fas fa-chevron-${instructionsOpen ? 'up' : 'down'}`}
-                    data-testid="policy-instructions-chevron"
-                  ></i>
-                </span>
-              </div>
+              <h6 className="mb-0">
+                <button
+                  type="button"
+                  className="btn btn-link w-100 p-0 border-0 d-flex justify-content-between align-items-center text-decoration-none text-start fw-bold text-primary"
+                  aria-expanded={instructionsOpen}
+                  aria-controls="policyDefInstructions"
+                  data-testid="policy-instructions-toggle"
+                  onClick={toggleInstructions}
+                >
+                  <span data-testid="policy-instructions-title">
+                    <i className="fas fa-graduation-cap me-2"></i>
+                    Policy Instructions & Examples
+                  </span>
+                  <span className="btn btn-sm btn-outline-primary" aria-hidden="true">
+                    <i
+                      className={`fas fa-chevron-${instructionsOpen ? 'up' : 'down'}`}
+                      data-testid="policy-instructions-chevron"
+                    ></i>
+                  </span>
+                </button>
+              </h6>
 
               <div
                 className={`collapse${instructionsOpen ? ' show' : ''}`}

@@ -4,7 +4,7 @@ changes:
   changed:
     - timestamp: '2026-10-13T00:00:00.000Z'
       title: Expand Policy Instructions & Examples from anywhere on its header
-      description: On the Create Policy Definition page the instructions panel opened only from its small arrow button, so users missed the examples. Clicking the title, icon or empty header space now expands and collapses it, the header is keyboard operable with Enter or Space, and the arrow flips to show the state and stays as the visual hint.
+      description: On the Create Policy Definition page the instructions panel opened only from its small arrow button, so users missed the examples. Clicking the title, icon or empty header space now expands and collapses it, the title stays a heading with a full-width button inside it, so screen readers still announce it and Enter or Space toggle it, and the arrow flips to show the state and stays as the visual hint.
   fixed: []
   removed: []
   security: []

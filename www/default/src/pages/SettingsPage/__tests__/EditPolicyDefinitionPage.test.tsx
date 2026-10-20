@@ -1,5 +1,6 @@
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { PageTitleProvider } from '../../../context/PageTitleContext';
 import EditPolicyDefinitionPage from '../EditPolicyDefinitionPage';
@@ -90,10 +91,22 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
     expect(body()).not.toHaveClass('show');
   });
 
-  it('toggles when the header itself is clicked', () => {
+  it('toggles when the arrow is clicked', () => {
     renderCreateForm();
-    fireEvent.click(toggle());
+    fireEvent.click(screen.getByTestId('policy-instructions-chevron'));
     expect(body()).toHaveClass('show');
+  });
+
+  it('keeps the title a heading that holds the toggle button', () => {
+    renderCreateForm();
+    const heading = screen.getByRole('heading', { name: /Policy Instructions & Examples/i });
+    expect(heading).toContainElement(toggle());
+    expect(screen.getByRole('button', { name: /Policy Instructions & Examples/i })).toBe(toggle());
+  });
+
+  it('points the toggle at the body it expands', () => {
+    renderCreateForm();
+    expect(toggle()).toHaveAttribute('aria-controls', body().id);
   });
 
   it('flips the arrow to match the state', () => {
@@ -106,16 +119,18 @@ describe('EditPolicyDefinitionPage — instructions panel', () => {
     expect(chevron()).not.toHaveClass('fa-chevron-down');
   });
 
-  it('toggles from the keyboard with Enter and Space only', () => {
+  it('toggles from the keyboard with Enter and Space only', async () => {
+    const user = userEvent.setup();
     renderCreateForm();
+    toggle().focus();
 
-    fireEvent.keyDown(toggle(), { key: 'Enter' });
+    await user.keyboard('{Enter}');
     expect(toggle()).toHaveAttribute('aria-expanded', 'true');
 
-    fireEvent.keyDown(toggle(), { key: ' ' });
+    await user.keyboard(' ');
     expect(toggle()).toHaveAttribute('aria-expanded', 'false');
 
-    fireEvent.keyDown(toggle(), { key: 'a' });
+    await user.keyboard('a');
     expect(toggle()).toHaveAttribute('aria-expanded', 'false');
   });
 

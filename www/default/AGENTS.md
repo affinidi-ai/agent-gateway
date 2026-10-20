@@ -215,6 +215,16 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.
 
+## Policy definition editor
+
+The **Policy Instructions & Examples** panel on the Create Policy Definition page is collapsed
+by default. Its title is a heading holding one full-width button (`policy-instructions-toggle`,
+with `aria-expanded` and `aria-controls="policyDefInstructions"`), so the whole header row
+toggles, Enter and Space work natively, and screen readers still announce the heading. The
+title is `policy-instructions-title`, the arrow `policy-instructions-chevron` sits inside the
+button and flips with the state, and the body is `policy-instructions-body`. Build collapsible
+panels the same way, and do not put `role="button"` on a wrapper around a heading.
+
 ## MCP Proxy write warnings
 
 MCP Proxy create and update responses can carry `warnings`, for example when only the
