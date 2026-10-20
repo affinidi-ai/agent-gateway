@@ -6,7 +6,7 @@ import { DOCS_URL } from '../../../../config/docs';
 import { isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
 import {
   DEFAULT_A2A_SETTINGS,
-  servedA2aVersions,
+  storedA2aProxyVersions,
   a2aSettingsForPayload,
   baseTargetEndpoint,
   isA2aValidation,
@@ -129,10 +129,11 @@ export const accessPointDefinition: NodeDefinition = {
       c.a2a_validation = isA2aValidation(a2a?.validation)
         ? a2a.validation
         : DEFAULT_A2A_SETTINGS.validation;
+      const locked = storedA2aProxyVersions(payload);
       if (!isA2aProxyEndpoint(payload?.target?.endpoint)) {
         c.a2a_locked_versions = undefined;
-      } else if (versions || !a2a) {
-        c.a2a_locked_versions = servedA2aVersions(versions);
+      } else if (locked) {
+        c.a2a_locked_versions = locked;
       }
     }
     return c;

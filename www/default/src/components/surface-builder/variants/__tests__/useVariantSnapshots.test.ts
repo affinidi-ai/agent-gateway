@@ -2,6 +2,7 @@ import { registry } from '../../elements';
 import { act, renderHook } from '@testing-library/react';
 import {
   BASE_VARIANT_ID,
+  baseSurfaceFromSnapshot,
   patchAccessPointCanvasNode,
   syncAccessPointIdentifiers,
   useVariantSnapshots,
@@ -49,6 +50,49 @@ describe('useVariantSnapshots', () => {
       targetEndpoint: 'https://base/x',
       accessPointConfig: { a2a_locked_versions: ['0.3'] },
     });
+  });
+
+  it('takes the fixed versions of an A2A proxy base Target from the stored block, not the canvas blob', () => {
+    const proxyBase = (a2a: unknown, blob?: Record<string, unknown>) => ({
+      access_point: { protocol: 'a2a', ...(a2a === undefined ? {} : { a2a }) },
+      target: { endpoint: 'a2a-proxy://worker' },
+      ...(blob
+        ? {
+            canvas: {
+              version: 1,
+              nodes: [{ id: 'access-point', type: 'access-point', config: blob }],
+            },
+          }
+        : {}),
+    });
+    const locked = (snapshot: unknown) =>
+      baseSurfaceFromSnapshot(snapshot).accessPointConfig?.a2a_locked_versions;
+
+    expect(
+      locked(proxyBase({ accepted_versions: ['0.3', '1.0'], validation: 'envelope' }))
+    ).toEqual(['0.3', '1.0']);
+    expect(
+      locked(
+        proxyBase(
+          { accepted_versions: ['0.3', '1.0'], validation: 'envelope' },
+          {
+            route: '/a',
+            a2a_locked_versions: ['1.0'],
+          }
+        )
+      )
+    ).toEqual(['0.3', '1.0']);
+    expect(locked(proxyBase(undefined))).toEqual(['0.3', '1.0']);
+    expect(locked(proxyBase({ accepted_versions: ['9.9'] }))).toEqual(['0.3', '1.0']);
+    expect(locked(proxyBase({ validation: 'full' }, { a2a_locked_versions: ['0.3'] }))).toEqual([
+      '0.3',
+    ]);
+    expect(
+      baseSurfaceFromSnapshot({
+        access_point: { a2a: { accepted_versions: ['0.3'] } },
+        target: { endpoint: 'https://agent' },
+      }).accessPointConfig
+    ).toBeUndefined();
   });
 
   it('starts empty', () => {

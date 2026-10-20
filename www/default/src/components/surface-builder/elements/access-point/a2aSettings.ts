@@ -82,6 +82,19 @@ export const servedA2aVersions = (stored: unknown): string[] => {
   return named.length > 0 ? named : [...A2A_VERSIONS];
 };
 
+/**
+ * The fixed versions a stored surface payload shows for an A2A proxy Target:
+ * those its stored block is served with, or both when it has no block.
+ * `undefined` when the Target is not an A2A proxy, or the block names no
+ * versions (a dashboard payload, whose canvas blob carries them).
+ */
+export const storedA2aProxyVersions = (payload: any): string[] | undefined => {
+  if (!isA2aProxyEndpoint(payload?.target?.endpoint)) return undefined;
+  const a2a = payload?.access_point?.a2a;
+  if (a2a && !Array.isArray(a2a.accepted_versions)) return undefined;
+  return servedA2aVersions(a2a?.accepted_versions);
+};
+
 /** The node's validation level, or the default when unset. */
 export const selectedA2aValidation = (
   config: Record<string, unknown> | undefined

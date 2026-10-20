@@ -8,6 +8,7 @@ import {
   type SurfaceOverrides,
 } from './resolve';
 import type { BaseSurfaceView } from '../elements/types';
+import { storedA2aProxyVersions } from '../elements/access-point/a2aSettings';
 
 /**
  * Synthetic id used for the always-present "base" pseudo-variant. The
@@ -285,11 +286,15 @@ export function baseSurfaceFromSnapshot(snapshot: any): BaseSurfaceView {
   const accessPoint = Array.isArray(nodes)
     ? nodes.find((n: any) => n?.id === 'access-point')
     : undefined;
+  const blobConfig =
+    accessPoint?.config && typeof accessPoint.config === 'object' ? accessPoint.config : undefined;
+  const locked = storedA2aProxyVersions(snapshot);
+  const accessPointConfig = locked
+    ? { ...(blobConfig ?? {}), a2a_locked_versions: locked }
+    : blobConfig;
   return {
     targetEndpoint: snapshot?.target?.endpoint,
-    ...(accessPoint?.config && typeof accessPoint.config === 'object'
-      ? { accessPointConfig: accessPoint.config }
-      : {}),
+    ...(accessPointConfig ? { accessPointConfig } : {}),
   };
 }
 
