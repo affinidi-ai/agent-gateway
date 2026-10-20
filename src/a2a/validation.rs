@@ -5,45 +5,65 @@
 //! fields A2A itself requires on a request, so a malformed request is refused at
 //! the gateway instead of being forwarded to the managed agent.
 //!
-//! **Both protocol eras are accepted everywhere.** Where a field is spelled the
-//! same in v0.3 and v1.0 it is checked directly. Where the eras differ, the union
-//! of both spellings is accepted rather than picking a side, because the gateway
-//! serves callers of either era and must not reject one of them:
+//! **The spelling of the method picks the rules.** A v0.3 slash-form method
+//! (`message/send`, `tasks/get`) is checked against what A2A 0.3 defines, and a
+//! v1.0 PascalCase method (`SendMessage`, `GetTask`) against what A2A 1.0
+//! defines:
 //!
-//! - `role` is `"user"`/`"agent"` in v0.3 and `"ROLE_USER"`/`"ROLE_AGENT"` in v1.0.
-//! - A `Part` carries a `kind` discriminator in v0.3 and none in v1.0, where it is
-//!   a choice between `text`, `raw`, `url` and `data`. Exactly one content member
-//!   must be present in either era.
+//! - `role` is `user` or `agent` in 0.3, and `ROLE_USER` or `ROLE_AGENT` in 1.0.
+//! - A 0.3 `Part` carries one of `text`, `file` (with `bytes` or `uri`) or `data`,
+//!   and a `kind`, when present, names it; a 1.0 `Part` carries one of `text`,
+//!   `raw`, `url` or `data`.
+//! - A 0.3 message's `kind`, when present, is `message`.
+//! - `messageId` may be spelled `message_id` in 1.0, as proto JSON allows.
+//! - The `status` filter of a task listing names a lowercase state in 0.3
+//!   (`working`) and a `TASK_STATE_*` name in 1.0.
+//!
+//! **Fields a version does not define are ignored**, as A2A 1.0 §5.7 says
+//! implementations SHOULD: a `kind` on a 1.0 request, or the other version's
+//! part members, are not errors in themselves. A part whose only content is a
+//! member of the other version still fails, since it then carries none of its
+//! own version's, and the error points at the right member. The official SDKs
+//! are stricter and refuse unknown fields; the agent stays free to.
+//!
+//! The negotiated `A2A-Version` plays no part: version negotiation and shape
+//! validation are independent checks. A method outside the A2A method table is
+//! checked only for a structured `params`.
+//!
+//! `kind` is optional in 0.3 here, though the 0.3 JSON schema lists it, because
+//! the official 0.3 SDK accepts a message and parts without it. A message must
+//! carry at least one part in both versions.
 //!
 //! Task states are checked only where a **request** carries one, which is the
-//! optional `status` filter on `ListTasks`. The states that matter operationally
-//! travel on Task **responses** and on streaming events, and the gateway does not
-//! inspect either: it forwards responses untouched, which is what keeps it a
-//! proxy rather than a task engine.
+//! optional `status` filter on a task listing. The states that matter
+//! operationally travel on Task **responses** and on streaming events, and the
+//! gateway does not inspect either: it forwards responses untouched, which is
+//! what keeps it a proxy rather than a task engine.
 //!
 //! Identifier **format** is deliberately unchecked. A task identifier is required
-//! to be present and non-blank on the methods that carry one (`tasks/get`,
-//! `tasks/cancel`, `tasks/resubscribe` and their v1.0 spellings), because a
-//! request that forgot one is simply malformed, but nothing stricter is applied:
-//! A2A defines no format for these identifiers, so a shape rule would be an
+//! to be present and non-blank on the methods that carry one, because a request
+//! that forgot one is simply malformed, but nothing stricter is applied: A2A
+//! defines no format for these identifiers, so a shape rule would be an
 //! invention of ours that could refuse a conformant agent's ids. `contextId` is
-//! not checked at all, being optional in both eras.
+//! not checked at all, being optional in both versions.
 //!
-//! These run under the same `[a2a] validate_messages` setting as the envelope
-//! check, which is **on by default**, and they apply to **managed-agent targets
-//! only**. A request that fails them was already going to fail: a conformant
-//! agent refuses a message with no `messageId` too, just one hop later and with
-//! a vaguer error. Refusing here names the offending field and spares the agent
-//! the round trip. A surface whose target is `a2a-proxy://` is exempt, because
-//! the proxy is the implementation rather than a pass-through, so there is no
-//! downstream agent that would have refused the message and checking would only
-//! refuse callers that work today. The call site is in
+//! These run when a surface's `access_point.a2a.validation` is `full`; the
+//! default, `envelope`, checks only the JSON-RPC envelope. A request
+//! that fails them was already going to fail: a conformant agent refuses it too,
+//! just one hop later and with a vaguer error. Refusing here names the offending
+//! field and spares the agent the round trip.
+//! A surface whose target is `a2a-proxy://` never checks the shape, because the proxy
+//! is the implementation rather than a pass-through, so there is no downstream
+//! agent that would have refused the message and checking would only refuse
+//! callers that work today. The call site is in
 //! `src/proxy/handler.rs::proxy_handler_with_mcp_runtime`.
 //!
 //! The gateway stays a transparent proxy: this validates shape and never
 //! rewrites, normalises or fills in a request.
 
 use serde_json::Value;
+
+use crate::a2a::methods::MethodEra as Era;
 
 /// JSON-RPC 2.0 "Invalid params".
 pub const ERR_INVALID_PARAMS: i32 = -32602;
@@ -52,9 +72,6 @@ pub const ERR_INVALID_PARAMS: i32 = -32602;
 /// message's `parts` once this many are held, so the work, the error response
 /// and the log line stay bounded whatever the body size.
 pub const MAX_FIELD_ERRORS: usize = 20;
-
-/// Longest caller-supplied value echoed back in an error message, in chars.
-const MAX_ECHOED_CHARS: usize = 64;
 
 /// One field-level validation problem, reported in the error response `data`
 /// so a caller can fix the request without guessing which field was wrong.
@@ -103,33 +120,101 @@ impl FieldErrors {
 }
 
 /// Quote a caller-supplied value for an error message, escaped and cut to
-/// [`MAX_ECHOED_CHARS`] chars.
+/// [`crate::a2a::MAX_LOGGED_CHARS`] chars.
 fn echo(value: &str) -> String {
-    let mut chars = value.chars();
-    let head: String = chars
-        .by_ref()
-        .take(MAX_ECHOED_CHARS)
-        .collect();
-    if chars.next().is_some() {
-        format!("{head:?}…")
-    } else {
-        format!("{head:?}")
+    match crate::a2a::clip(value) {
+        (head, true) => format!("{head:?}…"),
+        (head, false) => format!("{head:?}"),
     }
 }
 
-/// True when the method is one that carries a `Message` in `params.message`,
-/// in either protocol era. Resolved through the canonical table so both the
-/// v0.3 slash-form and the v1.0 PascalCase spellings are recognised.
-fn is_message_carrying_method(method: &str) -> bool {
-    matches!(crate::a2a::canonical_method(method), "message/send" | "message/stream")
+/// Per-version rules: a request is checked against the A2A version its method
+/// is spelled in.
+impl Era {
+    fn label(self) -> &'static str {
+        match self {
+            Self::V0_3 => "A2A 0.3",
+            Self::V1_0 => "A2A 1.0",
+        }
+    }
+
+    fn roles(self) -> &'static [&'static str] {
+        match self {
+            Self::V0_3 => &["user", "agent"],
+            Self::V1_0 => &["ROLE_USER", "ROLE_AGENT"],
+        }
+    }
+
+    /// The content members a `Part` may carry; exactly one must be present.
+    fn part_members(self) -> &'static [&'static str] {
+        match self {
+            Self::V0_3 => &["text", "file", "data"],
+            Self::V1_0 => &["text", "raw", "url", "data"],
+        }
+    }
+
+    /// A pointer to this version's member for a member of the other version,
+    /// added to the error of a part that carries no member of its own version.
+    fn foreign_part_member(
+        self,
+        member: &str,
+    ) -> Option<&'static str> {
+        match (self, member) {
+            (Self::V0_3, "raw" | "url") => Some("use file, with bytes or uri"),
+            (Self::V1_0, "file") => Some("use raw or url"),
+            _ => None,
+        }
+    }
+
+    fn task_states(self) -> &'static [&'static str] {
+        match self {
+            Self::V0_3 => &[
+                "submitted",
+                "working",
+                "input-required",
+                "completed",
+                "canceled",
+                "failed",
+                "rejected",
+                "auth-required",
+                "unknown",
+            ],
+            Self::V1_0 => &[
+                "TASK_STATE_SUBMITTED",
+                "TASK_STATE_WORKING",
+                "TASK_STATE_INPUT_REQUIRED",
+                "TASK_STATE_COMPLETED",
+                "TASK_STATE_CANCELED",
+                "TASK_STATE_FAILED",
+                "TASK_STATE_REJECTED",
+                "TASK_STATE_AUTH_REQUIRED",
+                "TASK_STATE_UNSPECIFIED",
+            ],
+        }
+    }
 }
 
-/// Validate an A2A request beyond its JSON-RPC envelope.
+/// The rules a request is checked against: its version and its method as sent,
+/// which error messages name.
+#[derive(Clone, Copy)]
+struct Rules<'a> {
+    era: Era,
+    method: &'a str,
+}
+
+impl Rules<'_> {
+    fn context(&self) -> String {
+        format!("{} ({})", self.era.label(), self.method)
+    }
+}
+
+/// Validate an A2A request beyond its JSON-RPC envelope, against the rules of
+/// the A2A version its method is spelled in.
 ///
 /// Returns every problem found rather than the first, up to
 /// [`MAX_FIELD_ERRORS`], so a caller can fix the request in one pass. `Ok(())`
-/// means the request passed the era-agnostic checks; it does not mean the
-/// upstream agent will accept it.
+/// means the request passed these checks; it does not mean the upstream agent
+/// will accept it.
 ///
 /// The envelope itself (`jsonrpc`, `method`) is assumed already validated by
 /// [`crate::a2a::errors::validate_jsonrpc_value`]; a body without a string
@@ -146,26 +231,23 @@ pub fn validate_request_shape(json: &Value) -> Result<(), FieldErrors> {
     let mut errors = FieldErrors::default();
 
     // JSON-RPC 2.0 allows `params` to be omitted, but when present it must be a
-    // structured value. This holds for every method in both eras.
+    // structured value. This holds for every method.
     if let Some(params) = json.get("params")
         && !params.is_object()
         && !params.is_array()
     {
         errors.push("params", "must be an object or an array when present");
-        // Nothing further can be said about a malformed params container.
         return Err(errors);
     }
 
-    if is_message_carrying_method(method) {
-        validate_message_params(json, &mut errors);
-    }
-
-    if crate::a2a::canonical_method(method) == "tasks/list" {
-        validate_list_tasks_params(json, &mut errors);
-    }
-
-    if is_task_id_method(method) {
-        validate_task_id(json, &mut errors);
+    if let Some(era) = Era::of(method) {
+        let rules = Rules { era, method };
+        match crate::a2a::canonical_method(method) {
+            "message/send" | "message/stream" => validate_message_params(json, rules, &mut errors),
+            "tasks/list" => validate_list_tasks_params(json, rules, &mut errors),
+            "tasks/get" | "tasks/cancel" | "tasks/resubscribe" => validate_task_id(json, &mut errors),
+            _ => {}
+        }
     }
 
     if errors.errors.is_empty() {
@@ -175,10 +257,10 @@ pub fn validate_request_shape(json: &Value) -> Result<(), FieldErrors> {
     }
 }
 
-/// Checks for the methods that carry a `Message`: `message/send` and
-/// `message/stream`, in either era.
+/// Checks for the methods that carry a `Message` in `params.message`.
 fn validate_message_params(
     json: &Value,
+    rules: Rules<'_>,
     errors: &mut FieldErrors,
 ) {
     let Some(params) = json.get("params") else {
@@ -199,12 +281,19 @@ fn validate_message_params(
         return;
     };
 
-    // `messageId` is required in both eras. Proto-JSON also permits the
-    // original field name, so accept `message_id` rather than rejecting a
-    // request a compliant generated client may produce.
-    let message_id = message
-        .get("messageId")
-        .or_else(|| message.get("message_id"));
+    if rules.era == Era::V0_3
+        && let Some(kind) = message.get("kind")
+        && kind.as_str() != Some("message")
+    {
+        errors.push("params.message.kind", &format!("must be \"message\" in {}", rules.context()));
+    }
+
+    let message_id = match rules.era {
+        Era::V0_3 => message.get("messageId"),
+        Era::V1_0 => message
+            .get("messageId")
+            .or_else(|| message.get("message_id")),
+    };
     match message_id {
         None => errors.push("params.message.messageId", "is required"),
         Some(value) => match value.as_str() {
@@ -214,9 +303,8 @@ fn validate_message_params(
         },
     }
 
-    validate_role(message.get("role"), errors);
+    validate_role(message.get("role"), rules, errors);
 
-    // `parts` is required and must carry at least one entry in both eras.
     match message.get("parts") {
         None => errors.push("params.message.parts", "is required"),
         Some(value) => match value.as_array() {
@@ -225,7 +313,7 @@ fn validate_message_params(
                     if errors.truncated {
                         break;
                     }
-                    validate_part(part, index, errors);
+                    validate_part(part, index, rules, errors);
                 }
             }
             Some(_) => errors.push("params.message.parts", "must not be empty"),
@@ -234,20 +322,12 @@ fn validate_message_params(
     }
 }
 
-/// Methods whose request carries a task identifier in `params.id`.
-///
-/// The field is spelled `id` in both eras: v1.0 `GetTaskRequest` and
-/// `CancelTaskRequest` declare `string id` REQUIRED, and v0.3's `TaskIdParams`
-/// and `TaskQueryParams` use `id` too, so no per-era handling is needed.
-fn is_task_id_method(method: &str) -> bool {
-    matches!(crate::a2a::canonical_method(method), "tasks/get" | "tasks/cancel" | "tasks/resubscribe")
-}
-
 /// Check only that a task identifier is present and not blank.
 ///
-/// A2A does not define a format for these identifiers, so anything stricter
-/// would be a rule of our own invention that could refuse a conformant agent's
-/// ids. Presence is the useful check: it catches the request that forgot one.
+/// The field is `params.id` in both versions. A2A does not define a format for
+/// these identifiers, so anything stricter would be a rule of our own invention
+/// that could refuse a conformant agent's ids. Presence is the useful check: it
+/// catches the request that forgot one.
 fn validate_task_id(
     json: &Value,
     errors: &mut FieldErrors,
@@ -266,40 +346,13 @@ fn validate_task_id(
     }
 }
 
-/// Task states accepted on a request, across both eras.
-///
-/// A2A v1.0 serialises the proto `TaskState` enum by name; v0.3 used lowercase
-/// hyphenated strings, plus an `unknown` value v1.0 renamed to
-/// `TASK_STATE_UNSPECIFIED`. Both spellings are verified against the published
-/// `specification/a2a.proto` (v1.0.1) and `specification/json/a2a.json` (v0.3).
-const TASK_STATES: &[&str] = &[
-    // v0.3
-    "submitted",
-    "working",
-    "input-required",
-    "completed",
-    "canceled",
-    "failed",
-    "rejected",
-    "auth-required",
-    "unknown",
-    // v1.0
-    "TASK_STATE_SUBMITTED",
-    "TASK_STATE_WORKING",
-    "TASK_STATE_INPUT_REQUIRED",
-    "TASK_STATE_COMPLETED",
-    "TASK_STATE_CANCELED",
-    "TASK_STATE_FAILED",
-    "TASK_STATE_REJECTED",
-    "TASK_STATE_AUTH_REQUIRED",
-    "TASK_STATE_UNSPECIFIED",
-];
-
-/// `ListTasks` is the only request that carries a task state: an optional
-/// `status` filter. It is optional, so absence is fine; a value that names no
-/// task state is not, since the upstream would filter on something meaningless.
+/// A task listing is the only request that carries a task state: an optional
+/// `status` filter. Absence is fine; a value that names no task state of the
+/// method's version is not, since the upstream would filter on something
+/// meaningless.
 fn validate_list_tasks_params(
     json: &Value,
+    rules: Rules<'_>,
     errors: &mut FieldErrors,
 ) {
     let Some(status) = json
@@ -310,21 +363,29 @@ fn validate_list_tasks_params(
     };
 
     match status.as_str() {
-        Some(value) if TASK_STATES.contains(&value) => {}
+        Some(value)
+            if rules
+                .era
+                .task_states()
+                .contains(&value) => {}
         Some(_) => errors.push(
             "params.status",
-            "must be a task state such as working or completed (A2A 0.3) or TASK_STATE_WORKING (A2A 1.0)",
+            &format!(
+                "must be a task state of {}, such as {}",
+                rules.context(),
+                match rules.era {
+                    Era::V0_3 => "working or completed",
+                    Era::V1_0 => "TASK_STATE_WORKING or TASK_STATE_COMPLETED",
+                }
+            ),
         ),
         None => errors.push("params.status", "must be a string"),
     }
 }
 
-/// Roles accepted on a message, across both eras. v1.0 serialises the proto
-/// `Role` enum by name; v0.3 used the lowercase forms.
-const ROLES: &[&str] = &["user", "agent", "ROLE_USER", "ROLE_AGENT", "ROLE_UNSPECIFIED"];
-
 fn validate_role(
     role: Option<&Value>,
+    rules: Rules<'_>,
     errors: &mut FieldErrors,
 ) {
     let Some(role) = role else {
@@ -332,21 +393,21 @@ fn validate_role(
         return;
     };
     match role.as_str() {
-        Some(value) if ROLES.contains(&value) => {}
+        Some(value)
+            if rules
+                .era
+                .roles()
+                .contains(&value) => {}
         Some(_) => errors
-            .push("params.message.role", "must be one of user, agent (A2A 0.3) or ROLE_USER, ROLE_AGENT (A2A 1.0)"),
+            .push("params.message.role", &format!("must be {} in {}", rules.era.roles().join(" or "), rules.context())),
         None => errors.push("params.message.role", "must be a string"),
     }
 }
 
-/// The content members a `Part` may carry, across both eras: `text`, `data` and
-/// v0.3's `file` object, plus v1.0's `raw` and `url`. Exactly one must be
-/// present, since a Part holds one piece of content.
-const PART_CONTENT_MEMBERS: &[&str] = &["text", "file", "data", "raw", "url"];
-
 fn validate_part(
     part: &Value,
     index: usize,
+    rules: Rules<'_>,
     errors: &mut FieldErrors,
 ) {
     let field = |suffix: &str| format!("params.message.parts[{index}]{suffix}");
@@ -356,22 +417,44 @@ fn validate_part(
         return;
     };
 
-    let present: Vec<&str> = PART_CONTENT_MEMBERS
+    let present: Vec<&str> = rules
+        .era
+        .part_members()
         .iter()
         .copied()
         .filter(|member| part.contains_key(*member))
         .collect();
-
-    match present.len() {
-        1 => {}
-        0 => errors.push(&field(""), "must carry exactly one content member (text, file, data, raw or url)"),
+    match present.as_slice() {
+        [member] => validate_part_content(part, member, &field, rules, errors),
+        [] => {
+            let hints: Vec<String> = part
+                .keys()
+                .filter_map(|member| {
+                    rules
+                        .era
+                        .foreign_part_member(member)
+                        .map(|hint| format!("; {member} is not a part member there, {hint}"))
+                })
+                .collect();
+            errors.push(
+                &field(""),
+                &format!(
+                    "must carry exactly one content member ({}) in {}{}",
+                    rules
+                        .era
+                        .part_members()
+                        .join(", "),
+                    rules.context(),
+                    hints.concat()
+                ),
+            )
+        }
         _ => errors.push(&field(""), &format!("must carry exactly one content member, found {}", present.join(", "))),
     }
 
-    // v0.3 also tags the part with `kind`. When present it must agree with the
-    // member actually carried, otherwise the part describes itself incorrectly.
-    // v1.0 parts have no `kind` and are left alone.
-    if let Some(kind) = part.get("kind") {
+    if rules.era == Era::V0_3
+        && let Some(kind) = part.get("kind")
+    {
         match kind.as_str() {
             Some(kind) => {
                 if present.len() == 1 && present[0] != kind {
@@ -383,96 +466,375 @@ fn validate_part(
     }
 }
 
+/// The value of a part's one content member must have its version's type.
+fn validate_part_content(
+    part: &serde_json::Map<String, Value>,
+    member: &str,
+    field: &dyn Fn(&str) -> String,
+    rules: Rules<'_>,
+    errors: &mut FieldErrors,
+) {
+    let value = &part[member];
+    let path = field(&format!(".{member}"));
+    match (rules.era, member) {
+        (_, "text") | (Era::V1_0, "raw" | "url") if !value.is_string() => errors.push(&path, "must be a string"),
+        (Era::V0_3, "data") if !value.is_object() => errors.push(&path, "must be an object"),
+        (Era::V0_3, "file") => match value.as_object() {
+            None => errors.push(&path, "must be an object"),
+            Some(file) => match (file.get("bytes"), file.get("uri")) {
+                (Some(_), Some(_)) => errors.push(&path, "must carry bytes or uri, not both"),
+                (Some(content), None) | (None, Some(content)) if !content.is_string() => {
+                    errors.push(&path, "bytes or uri must be a string")
+                }
+                (None, None) => errors.push(&path, "must carry bytes or uri"),
+                _ => {}
+            },
+        },
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Wrap a message that already carries a valid `role`, so a test that is
-    /// about `messageId` or `parts` is not also failing on the role.
-    fn send_body(message: Value) -> Value {
-        let mut message = message;
-        if let Some(obj) = message.as_object_mut() {
-            obj.entry("role")
-                .or_insert_with(|| Value::String("user".into()));
-        }
-        raw_send_body(message)
+    fn request(
+        method: &str,
+        params: Value,
+    ) -> Value {
+        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
     }
 
-    fn raw_send_body(message: Value) -> Value {
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "message": message } })
+    fn send_v0_3(message: Value) -> Value {
+        request("message/send", json!({ "message": message }))
     }
 
-    fn valid_message() -> Value {
-        json!({ "role": "user", "messageId": "m-1", "parts": [{ "kind": "text", "text": "hi" }] })
+    fn send_v1_0(message: Value) -> Value {
+        request("SendMessage", json!({ "message": message }))
     }
 
-    fn fields(result: Result<(), FieldErrors>) -> Vec<String> {
+    fn valid_v0_3_message() -> Value {
+        json!({ "kind": "message", "role": "user", "messageId": "m-1", "parts": [{ "kind": "text", "text": "hi" }] })
+    }
+
+    fn valid_v1_0_message() -> Value {
+        json!({ "role": "ROLE_USER", "messageId": "m-1", "parts": [{ "text": "hi" }] })
+    }
+
+    fn with(
+        mut message: Value,
+        field: &str,
+        value: Value,
+    ) -> Value {
+        message[field] = value;
+        message
+    }
+
+    fn without(
+        mut message: Value,
+        field: &str,
+    ) -> Value {
+        message
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        message
+    }
+
+    fn errors(result: Result<(), FieldErrors>) -> Vec<(String, String)> {
         result
             .unwrap_err()
             .errors
             .into_iter()
-            .map(|e| e.field)
+            .map(|e| (e.field, e.message))
             .collect()
     }
 
+    fn fields(result: Result<(), FieldErrors>) -> Vec<String> {
+        errors(result)
+            .into_iter()
+            .map(|(field, _)| field)
+            .collect()
+    }
+
+    // ── A valid request in each version ──────────────────────────────────
+
     #[test]
-    fn accepts_a_valid_v0_3_send() {
-        assert!(validate_request_shape(&send_body(valid_message())).is_ok());
+    fn accepts_a_valid_request_in_each_version() {
+        assert_eq!(validate_request_shape(&send_v0_3(valid_v0_3_message())), Ok(()));
+        assert_eq!(validate_request_shape(&send_v1_0(valid_v1_0_message())), Ok(()));
+        for method in ["message/stream", "SendStreamingMessage"] {
+            let message = if method == "message/stream" {
+                valid_v0_3_message()
+            } else {
+                valid_v1_0_message()
+            };
+            assert_eq!(validate_request_shape(&request(method, json!({ "message": message }))), Ok(()), "{method}");
+        }
+    }
+
+    /// The official 0.3 SDK accepts a message and parts without `kind`, so a 0.3
+    /// request does not need it, although the 0.3 JSON schema lists it.
+    #[test]
+    fn a_v0_3_request_may_leave_out_kind() {
+        let message = json!({ "role": "agent", "messageId": "m-1", "parts": [{ "text": "hi" }] });
+        assert_eq!(validate_request_shape(&send_v0_3(message)), Ok(()));
+    }
+
+    /// The method's spelling alone picks the rules: nothing about the request,
+    /// such as an `A2A-Version` header, is consulted. Of the other version's
+    /// dialect, only what this version defines differently fails: the `role`
+    /// values. Its `kind` fields are unrecognized here and ignored.
+    #[test]
+    fn the_other_versions_dialect_fails_on_what_this_version_defines() {
+        assert_eq!(fields(validate_request_shape(&send_v1_0(valid_v0_3_message()))), vec!["params.message.role"]);
+        assert_eq!(fields(validate_request_shape(&send_v0_3(valid_v1_0_message()))), vec!["params.message.role"]);
+    }
+
+    // ── messageId ────────────────────────────────────────────────────────
+
+    #[test]
+    fn rejects_a_missing_empty_or_non_string_message_id_in_either_version() {
+        for (send, message) in
+            [(send_v0_3 as fn(Value) -> Value, valid_v0_3_message()), (send_v1_0, valid_v1_0_message())]
+        {
+            for bad in [None, Some(json!("  ")), Some(json!(7))] {
+                let message = match &bad {
+                    None => without(message.clone(), "messageId"),
+                    Some(value) => with(message.clone(), "messageId", value.clone()),
+                };
+                assert_eq!(fields(validate_request_shape(&send(message))), vec!["params.message.messageId"], "{bad:?}");
+            }
+        }
+    }
+
+    /// Proto JSON permits the original field name, so a 1.0 request may spell it
+    /// `message_id`. 0.3 has no proto form, so it may not.
+    #[test]
+    fn only_a_v1_0_request_may_spell_message_id_in_snake_case() {
+        let v1_0 = with(without(valid_v1_0_message(), "messageId"), "message_id", json!("m-1"));
+        assert_eq!(validate_request_shape(&send_v1_0(v1_0)), Ok(()));
+
+        let v0_3 = with(without(valid_v0_3_message(), "messageId"), "message_id", json!("m-1"));
+        assert_eq!(fields(validate_request_shape(&send_v0_3(v0_3))), vec!["params.message.messageId"]);
+    }
+
+    // ── role ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_v0_3_request_takes_the_v0_3_roles_only() {
+        for role in ["user", "agent"] {
+            assert_eq!(validate_request_shape(&send_v0_3(with(valid_v0_3_message(), "role", json!(role)))), Ok(()));
+        }
+        for role in ["ROLE_USER", "ROLE_AGENT", "wizard"] {
+            assert_eq!(
+                errors(validate_request_shape(&send_v0_3(with(valid_v0_3_message(), "role", json!(role))))),
+                vec![(
+                    "params.message.role".to_string(),
+                    "must be user or agent in A2A 0.3 (message/send)".to_string()
+                )],
+                "{role}"
+            );
+        }
     }
 
     #[test]
-    fn accepts_a_valid_v1_0_send() {
-        // v1.0: PascalCase method, part with no `kind`, ROLE_USER.
-        let body = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
-            "params": { "message": { "role": "ROLE_USER", "messageId": "m-1", "parts": [{ "text": "hi" }] } }
-        });
-        assert!(validate_request_shape(&body).is_ok());
+    fn a_v1_0_request_takes_the_v1_0_roles_only() {
+        for role in ["ROLE_USER", "ROLE_AGENT"] {
+            assert_eq!(validate_request_shape(&send_v1_0(with(valid_v1_0_message(), "role", json!(role)))), Ok(()));
+        }
+        for role in ["user", "agent", "ROLE_UNSPECIFIED"] {
+            assert_eq!(
+                errors(validate_request_shape(&send_v1_0(with(valid_v1_0_message(), "role", json!(role))))),
+                vec![(
+                    "params.message.role".to_string(),
+                    "must be ROLE_USER or ROLE_AGENT in A2A 1.0 (SendMessage)".to_string()
+                )],
+                "{role}"
+            );
+        }
     }
 
     #[test]
-    fn accepts_the_proto_json_message_id_spelling() {
-        let body = send_body(json!({ "message_id": "m-1", "parts": [{ "text": "hi" }] }));
-        assert!(validate_request_shape(&body).is_ok());
+    fn rejects_a_missing_or_non_string_role() {
+        assert_eq!(
+            fields(validate_request_shape(&send_v1_0(without(valid_v1_0_message(), "role")))),
+            vec!["params.message.role"]
+        );
+        assert_eq!(
+            fields(validate_request_shape(&send_v0_3(with(valid_v0_3_message(), "role", json!(1))))),
+            vec!["params.message.role"]
+        );
+    }
+
+    // ── message kind ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_v0_3_message_kind_must_be_message() {
+        assert_eq!(
+            errors(validate_request_shape(&send_v0_3(with(valid_v0_3_message(), "kind", json!("task"))))),
+            vec![("params.message.kind".to_string(), "must be \"message\" in A2A 0.3 (message/send)".to_string())]
+        );
+    }
+
+    /// A2A 1.0 has no `kind`, so it is an unrecognized field there and ignored,
+    /// whatever its value (A2A 1.0 §5.7).
+    #[test]
+    fn a_kind_on_a_v1_0_request_is_ignored() {
+        for kind in [json!("message"), json!("anything"), json!(3)] {
+            let message = with(valid_v1_0_message(), "kind", kind.clone());
+            let message = with(message, "parts", json!([{ "kind": kind, "text": "hi" }]));
+            assert_eq!(validate_request_shape(&send_v1_0(message)), Ok(()), "{kind}");
+        }
+    }
+
+    // ── parts ────────────────────────────────────────────────────────────
+
+    fn v0_3_part(part: Value) -> Value {
+        send_v0_3(with(valid_v0_3_message(), "parts", json!([part])))
+    }
+
+    fn v1_0_part(part: Value) -> Value {
+        send_v1_0(with(valid_v1_0_message(), "parts", json!([part])))
     }
 
     #[test]
-    fn rejects_a_missing_message_id() {
-        let body = send_body(json!({ "role": "user", "parts": [{ "text": "hi" }] }));
-        assert_eq!(fields(validate_request_shape(&body)), vec!["params.message.messageId"]);
+    fn rejects_missing_empty_or_non_array_parts_in_either_version() {
+        for parts in [None, Some(json!([])), Some(json!("hi"))] {
+            let v0_3 = match &parts {
+                None => without(valid_v0_3_message(), "parts"),
+                Some(value) => with(valid_v0_3_message(), "parts", value.clone()),
+            };
+            let v1_0 = match &parts {
+                None => without(valid_v1_0_message(), "parts"),
+                Some(value) => with(valid_v1_0_message(), "parts", value.clone()),
+            };
+            assert_eq!(fields(validate_request_shape(&send_v0_3(v0_3))), vec!["params.message.parts"], "{parts:?}");
+            assert_eq!(fields(validate_request_shape(&send_v1_0(v1_0))), vec!["params.message.parts"], "{parts:?}");
+        }
     }
 
     #[test]
-    fn rejects_an_empty_message_id() {
-        let body = send_body(json!({ "messageId": "  ", "parts": [{ "text": "hi" }] }));
-        assert_eq!(fields(validate_request_shape(&body)), vec!["params.message.messageId"]);
+    fn accepts_each_v0_3_part_shape() {
+        for part in [
+            json!({ "kind": "text", "text": "hi" }),
+            json!({ "kind": "file", "file": { "bytes": "aGk=", "name": "a.txt" } }),
+            json!({ "kind": "file", "file": { "uri": "https://example.com/a" } }),
+            json!({ "kind": "data", "data": { "a": 1 } }),
+            json!({ "text": "hi", "metadata": { "x": 1 } }),
+        ] {
+            assert_eq!(validate_request_shape(&v0_3_part(part.clone())), Ok(()), "{part}");
+        }
     }
 
     #[test]
-    fn rejects_a_non_string_message_id() {
-        let body = send_body(json!({ "messageId": 7, "parts": [{ "text": "hi" }] }));
-        assert_eq!(fields(validate_request_shape(&body)), vec!["params.message.messageId"]);
+    fn accepts_each_v1_0_part_shape() {
+        for part in [
+            json!({ "text": "hi" }),
+            json!({ "raw": "aGk=", "filename": "a.txt", "mediaType": "text/plain" }),
+            json!({ "url": "https://example.com/a" }),
+            json!({ "data": { "a": 1 } }),
+            json!({ "data": [1, 2] }),
+        ] {
+            assert_eq!(validate_request_shape(&v1_0_part(part.clone())), Ok(()), "{part}");
+        }
+    }
+
+    /// The other version's part members are unrecognized and ignored next to a
+    /// member of this version.
+    #[test]
+    fn the_other_versions_part_members_are_ignored_next_to_a_valid_one() {
+        assert_eq!(
+            validate_request_shape(&v0_3_part(json!({ "kind": "text", "text": "hi", "url": "https://x" }))),
+            Ok(())
+        );
+        assert_eq!(validate_request_shape(&v1_0_part(json!({ "text": "hi", "file": { "uri": "https://x" } }))), Ok(()));
+    }
+
+    /// A part whose only content is the other version's member carries none of
+    /// its own, so it fails, and the error points at the right member.
+    #[test]
+    fn a_part_with_only_the_other_versions_member_is_refused_with_a_pointer() {
+        assert_eq!(
+            errors(validate_request_shape(&v0_3_part(json!({ "raw": "aGk=" })))),
+            vec![(
+                "params.message.parts[0]".to_string(),
+                "must carry exactly one content member (text, file, data) in A2A 0.3 (message/send); raw is not a \
+                 part member there, use file, with bytes or uri"
+                    .to_string()
+            )]
+        );
+        assert_eq!(
+            errors(validate_request_shape(&v1_0_part(json!({ "file": { "uri": "https://example.com/a" } })))),
+            vec![(
+                "params.message.parts[0]".to_string(),
+                "must carry exactly one content member (text, raw, url, data) in A2A 1.0 (SendMessage); file is not a \
+                 part member there, use raw or url"
+                    .to_string()
+            )]
+        );
     }
 
     #[test]
-    fn rejects_missing_and_empty_parts() {
-        let missing = send_body(json!({ "messageId": "m-1" }));
-        assert_eq!(fields(validate_request_shape(&missing)), vec!["params.message.parts"]);
+    fn rejects_a_part_with_no_or_more_than_one_content_member() {
+        assert_eq!(
+            fields(validate_request_shape(&v1_0_part(json!({ "mediaType": "text/plain" })))),
+            vec!["params.message.parts[0]"]
+        );
+        let errs = errors(validate_request_shape(&v1_0_part(json!({ "text": "hi", "url": "https://example.com/a" }))));
+        assert_eq!(
+            errs,
+            vec![(
+                "params.message.parts[0]".to_string(),
+                "must carry exactly one content member, found text, url".to_string()
+            )]
+        );
+    }
 
-        let empty = send_body(json!({ "messageId": "m-1", "parts": [] }));
-        assert_eq!(fields(validate_request_shape(&empty)), vec!["params.message.parts"]);
+    #[test]
+    fn rejects_content_of_the_wrong_type() {
+        for (body, field) in [
+            (v0_3_part(json!({ "kind": "text", "text": 1 })), "params.message.parts[0].text"),
+            (v0_3_part(json!({ "kind": "data", "data": "x" })), "params.message.parts[0].data"),
+            (v0_3_part(json!({ "kind": "file", "file": "x" })), "params.message.parts[0].file"),
+            (v0_3_part(json!({ "kind": "file", "file": { "name": "a" } })), "params.message.parts[0].file"),
+            (
+                v0_3_part(json!({ "kind": "file", "file": { "bytes": "a", "uri": "b" } })),
+                "params.message.parts[0].file",
+            ),
+            (v0_3_part(json!({ "kind": "file", "file": { "uri": 3 } })), "params.message.parts[0].file"),
+            (v1_0_part(json!({ "text": 1 })), "params.message.parts[0].text"),
+            (v1_0_part(json!({ "raw": 1 })), "params.message.parts[0].raw"),
+            (v1_0_part(json!({ "url": {} })), "params.message.parts[0].url"),
+        ] {
+            assert_eq!(fields(validate_request_shape(&body)), vec![field], "{body}");
+        }
+    }
 
-        let not_array = send_body(json!({ "messageId": "m-1", "parts": "hi" }));
-        assert_eq!(fields(validate_request_shape(&not_array)), vec!["params.message.parts"]);
+    /// A 0.3 part that mislabels its own content is malformed even though each
+    /// half is individually well-formed.
+    #[test]
+    fn rejects_a_v0_3_kind_that_disagrees_with_the_content() {
+        assert_eq!(
+            errors(validate_request_shape(&v0_3_part(json!({ "kind": "file", "text": "hi" })))),
+            vec![("params.message.parts[0].kind".to_string(), "says \"file\" but the part carries 'text'".to_string())]
+        );
+    }
+
+    #[test]
+    fn reports_the_offending_part_by_index() {
+        let body =
+            send_v1_0(with(valid_v1_0_message(), "parts", json!([{ "text": "ok" }, { "text": "no", "data": {} }])));
+        assert_eq!(fields(validate_request_shape(&body)), vec!["params.message.parts[1]"]);
     }
 
     #[test]
     fn reports_every_problem_at_once() {
-        let body = send_body(json!({ "role": "user" }));
+        let body = send_v1_0(json!({ "role": "user" }));
         assert_eq!(
             fields(validate_request_shape(&body)),
-            vec!["params.message.messageId", "params.message.parts"],
+            vec!["params.message.messageId", "params.message.role", "params.message.parts"],
             "a caller should be able to fix the request in one pass"
         );
     }
@@ -481,120 +843,13 @@ mod tests {
     fn rejects_a_send_without_params_or_message() {
         let no_params = json!({ "jsonrpc": "2.0", "id": 1, "method": "SendMessage" });
         assert_eq!(fields(validate_request_shape(&no_params)), vec!["params"]);
-
-        let no_message = json!({ "jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {} });
-        assert_eq!(fields(validate_request_shape(&no_message)), vec!["params.message"]);
+        assert_eq!(fields(validate_request_shape(&request("message/send", json!({})))), vec!["params.message"]);
     }
 
     #[test]
     fn rejects_a_scalar_params_container_for_any_method() {
-        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": "nope" });
-        assert_eq!(fields(validate_request_shape(&body)), vec!["params"]);
-    }
-
-    // ── ListTasks status filter (the only task state a request carries) ──
-
-    #[test]
-    fn accepts_every_task_state_in_either_era() {
-        for state in [
-            "submitted",
-            "working",
-            "input-required",
-            "completed",
-            "canceled",
-            "failed",
-            "rejected",
-            "auth-required",
-            "unknown",
-            "TASK_STATE_SUBMITTED",
-            "TASK_STATE_WORKING",
-            "TASK_STATE_INPUT_REQUIRED",
-            "TASK_STATE_COMPLETED",
-            "TASK_STATE_CANCELED",
-            "TASK_STATE_FAILED",
-            "TASK_STATE_REJECTED",
-            "TASK_STATE_AUTH_REQUIRED",
-            "TASK_STATE_UNSPECIFIED",
-        ] {
-            for method in ["tasks/list", "ListTasks"] {
-                let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": { "status": state } });
-                assert!(validate_request_shape(&body).is_ok(), "{state} should be accepted on {method}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_status_filter_is_optional() {
-        for params in [json!({}), json!({ "contextId": "c-1" })] {
-            let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": params });
-            assert!(validate_request_shape(&body).is_ok());
-        }
-        let no_params = json!({ "jsonrpc": "2.0", "id": 1, "method": "ListTasks" });
-        assert!(validate_request_shape(&no_params).is_ok());
-    }
-
-    /// The v0.3 spelling is `canceled` with one l in both eras, so the common
-    /// misspelling must not silently filter on nothing.
-    #[test]
-    fn rejects_a_state_that_names_nothing() {
-        for bad in ["cancelled", "in-progress", "TASK_STATE_DONE", ""] {
-            let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": { "status": bad } });
-            assert_eq!(fields(validate_request_shape(&body)), vec!["params.status"], "{bad} should be refused");
-        }
-    }
-
-    #[test]
-    fn rejects_a_non_string_status() {
-        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": { "status": 3 } });
-        assert_eq!(fields(validate_request_shape(&body)), vec!["params.status"]);
-    }
-
-    /// The status filter belongs to ListTasks alone. On another method the same
-    /// field name is just an unknown field, and unknown fields pass through.
-    #[test]
-    fn a_status_field_on_another_method_is_not_constrained() {
-        let body = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "GetTask",
-            "params": { "id": "task-1", "status": "nonsense" }
-        });
-        assert!(validate_request_shape(&body).is_ok());
-    }
-
-    /// Push-notification methods stay unconstrained: their identifiers sit at
-    /// different paths and are not covered here.
-    #[test]
-    fn does_not_constrain_push_config_methods() {
-        for method in ["DeleteTaskPushNotificationConfig", "tasks/pushNotificationConfig/set"] {
-            let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": { "id": "t-1" } });
-            assert!(validate_request_shape(&body).is_ok(), "{method} should not be constrained");
-        }
-    }
-
-    // ── Task identifiers: presence only, both eras ───────────────────────
-
-    #[test]
-    fn accepts_a_task_id_on_either_era_spelling() {
-        for method in ["tasks/get", "GetTask", "tasks/cancel", "CancelTask", "tasks/resubscribe", "SubscribeToTask"] {
-            let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": { "id": "task-1" } });
-            assert!(validate_request_shape(&body).is_ok(), "{method} with an id should pass");
-        }
-    }
-
-    #[test]
-    fn rejects_a_missing_or_blank_task_id() {
-        for params in [json!({}), json!({ "id": "  " }), json!({ "id": 7 })] {
-            let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": params });
-            assert_eq!(fields(validate_request_shape(&body)), vec!["params.id"]);
-        }
-    }
-
-    /// A2A defines no format for task identifiers, so anything a caller chooses
-    /// is accepted. Validating a shape here would refuse conformant agents.
-    #[test]
-    fn does_not_impose_a_format_on_task_ids() {
-        for id in ["550e8400-e29b-41d4-a716-446655440000", "task_42", "a", "urn:x:1"] {
-            let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": { "id": id } });
-            assert!(validate_request_shape(&body).is_ok(), "{id} should be accepted");
+        for method in ["GetTask", "tasks/send", "custom/method"] {
+            assert_eq!(fields(validate_request_shape(&request(method, json!("nope")))), vec!["params"], "{method}");
         }
     }
 
@@ -602,110 +857,116 @@ mod tests {
     /// and ignored, and the gateway forwards the body unchanged.
     #[test]
     fn ignores_unknown_extension_fields() {
-        let body = send_body(json!({
-            "messageId": "m-1",
-            "parts": [{ "text": "hi" }],
-            "x-vendor-extension": { "anything": true }
-        }));
-        assert!(validate_request_shape(&body).is_ok());
+        let message = with(valid_v1_0_message(), "x-vendor-extension", json!({ "anything": true }));
+        assert_eq!(validate_request_shape(&send_v1_0(message)), Ok(()));
     }
 
-    // ── role (era-sensitive: both spellings accepted) ────────────────────
-
+    /// A method outside the A2A method table, such as the pre-0.2 `tasks/send`,
+    /// has no version to check against.
     #[test]
-    fn accepts_either_era_role_spelling() {
-        for role in ["user", "agent", "ROLE_USER", "ROLE_AGENT", "ROLE_UNSPECIFIED"] {
-            let body = raw_send_body(json!({ "role": role, "messageId": "m-1", "parts": [{ "text": "hi" }] }));
-            assert!(validate_request_shape(&body).is_ok(), "{role} should be accepted");
+    fn a_method_outside_the_a2a_table_is_not_constrained() {
+        for method in ["tasks/send", "custom/method"] {
+            assert_eq!(validate_request_shape(&request(method, json!({ "message": {} }))), Ok(()), "{method}");
         }
     }
 
-    #[test]
-    fn rejects_a_missing_or_bogus_role() {
-        let missing = raw_send_body(json!({ "messageId": "m-1", "parts": [{ "text": "hi" }] }));
-        assert_eq!(fields(validate_request_shape(&missing)), vec!["params.message.role"]);
-
-        let bogus = raw_send_body(json!({ "role": "wizard", "messageId": "m-1", "parts": [{ "text": "hi" }] }));
-        assert_eq!(fields(validate_request_shape(&bogus)), vec!["params.message.role"]);
-
-        let not_string = raw_send_body(json!({ "role": 1, "messageId": "m-1", "parts": [{ "text": "hi" }] }));
-        assert_eq!(fields(validate_request_shape(&not_string)), vec!["params.message.role"]);
-    }
-
-    // ── Part content: exactly one member, in either era ──────────────────
+    // ── Task listings: the status filter ─────────────────────────────────
 
     #[test]
-    fn accepts_every_single_member_part_shape() {
-        for part in [
-            json!({ "kind": "text", "text": "hi" }),            // v0.3 text
-            json!({ "kind": "file", "file": { "name": "a" } }), // v0.3 file
-            json!({ "kind": "data", "data": { "a": 1 } }),      // v0.3 data
-            json!({ "text": "hi" }),                            // v1.0 text
-            json!({ "url": "https://example.com/a" }),          // v1.0 url
-            json!({ "raw": "aGk=" }),                           // v1.0 raw
-            json!({ "data": { "a": 1 } }),                      // v1.0 data
-            json!({ "text": "hi", "mediaType": "text/plain" }), // non-content fields ignored
-        ] {
-            let body = send_body(json!({ "messageId": "m-1", "parts": [part.clone()] }));
-            assert!(validate_request_shape(&body).is_ok(), "{part} should be accepted");
+    fn a_task_listing_takes_the_states_of_its_methods_version() {
+        let v0_3 = Era::V0_3.task_states();
+        let v1_0 = Era::V1_0.task_states();
+        for state in v0_3 {
+            assert_eq!(validate_request_shape(&request("tasks/list", json!({ "status": state }))), Ok(()), "{state}");
+            assert_eq!(
+                fields(validate_request_shape(&request("ListTasks", json!({ "status": state })))),
+                vec!["params.status"],
+                "{state}"
+            );
         }
-    }
-
-    #[test]
-    fn rejects_a_part_with_no_content_member() {
-        let body = send_body(json!({ "messageId": "m-1", "parts": [{ "mediaType": "text/plain" }] }));
-        assert_eq!(fields(validate_request_shape(&body)), vec!["params.message.parts[0]"]);
-    }
-
-    #[test]
-    fn rejects_a_part_with_more_than_one_content_member() {
-        let body = send_body(json!({
-            "messageId": "m-1",
-            "parts": [{ "text": "hi", "url": "https://example.com/a" }]
-        }));
-        let errs = validate_request_shape(&body)
-            .unwrap_err()
-            .errors;
-        assert_eq!(errs[0].field, "params.message.parts[0]");
-        assert!(
-            errs[0]
-                .message
-                .contains("text")
-                && errs[0]
-                    .message
-                    .contains("url"),
-            "{}",
-            errs[0].message
+        for state in v1_0 {
+            assert_eq!(validate_request_shape(&request("ListTasks", json!({ "status": state }))), Ok(()), "{state}");
+            assert_eq!(
+                fields(validate_request_shape(&request("tasks/list", json!({ "status": state })))),
+                vec!["params.status"],
+                "{state}"
+            );
+        }
+        assert_eq!(
+            errors(validate_request_shape(&request("ListTasks", json!({ "status": "cancelled" })))),
+            vec![(
+                "params.status".to_string(),
+                "must be a task state of A2A 1.0 (ListTasks), such as TASK_STATE_WORKING or TASK_STATE_COMPLETED"
+                    .to_string()
+            )]
         );
     }
 
-    /// A v0.3 part that mislabels its own content is malformed even though each
-    /// half is individually well-formed.
     #[test]
-    fn rejects_a_kind_that_disagrees_with_the_content() {
-        let body = send_body(json!({ "messageId": "m-1", "parts": [{ "kind": "file", "text": "hi" }] }));
-        assert_eq!(fields(validate_request_shape(&body)), vec!["params.message.parts[0].kind"]);
+    fn the_status_filter_is_optional_and_must_be_a_string() {
+        for params in [json!({}), json!({ "contextId": "c-1" })] {
+            assert_eq!(validate_request_shape(&request("ListTasks", params)), Ok(()));
+        }
+        assert_eq!(validate_request_shape(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ListTasks" })), Ok(()));
+        assert_eq!(
+            fields(validate_request_shape(&request("tasks/list", json!({ "status": 3 })))),
+            vec!["params.status"]
+        );
+    }
+
+    /// The status filter belongs to task listings alone.
+    #[test]
+    fn a_status_field_on_another_method_is_not_constrained() {
+        assert_eq!(
+            validate_request_shape(&request("GetTask", json!({ "id": "task-1", "status": "nonsense" }))),
+            Ok(())
+        );
     }
 
     #[test]
-    fn reports_the_offending_part_by_index() {
-        let body = send_body(json!({
-            "messageId": "m-1",
-            "parts": [{ "text": "ok" }, { "text": "no", "data": {} }]
-        }));
-        assert_eq!(fields(validate_request_shape(&body)), vec!["params.message.parts[1]"]);
+    fn does_not_constrain_push_config_methods() {
+        for method in ["DeleteTaskPushNotificationConfig", "tasks/pushNotificationConfig/set"] {
+            assert_eq!(validate_request_shape(&request(method, json!({ "id": "t-1" }))), Ok(()), "{method}");
+        }
+    }
+
+    // ── Task identifiers: presence only ──────────────────────────────────
+
+    #[test]
+    fn accepts_a_task_id_in_either_version() {
+        for method in ["tasks/get", "GetTask", "tasks/cancel", "CancelTask", "tasks/resubscribe", "SubscribeToTask"] {
+            assert_eq!(validate_request_shape(&request(method, json!({ "id": "task-1" }))), Ok(()), "{method}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_missing_or_blank_task_id() {
+        for method in ["GetTask", "tasks/get"] {
+            for params in [json!({}), json!({ "id": "  " }), json!({ "id": 7 })] {
+                assert_eq!(fields(validate_request_shape(&request(method, params))), vec!["params.id"], "{method}");
+            }
+        }
+    }
+
+    /// A2A defines no format for task identifiers, so anything a caller chooses
+    /// is accepted.
+    #[test]
+    fn does_not_impose_a_format_on_task_ids() {
+        for id in ["550e8400-e29b-41d4-a716-446655440000", "task_42", "a", "urn:x:1"] {
+            assert_eq!(validate_request_shape(&request("GetTask", json!({ "id": id }))), Ok(()), "{id}");
+        }
     }
 
     /// A body the envelope layer will reject is left to that layer.
     #[test]
     fn defers_to_the_envelope_layer_when_method_is_absent() {
-        assert!(validate_request_shape(&json!({ "jsonrpc": "2.0", "id": 1 })).is_ok());
+        assert_eq!(validate_request_shape(&json!({ "jsonrpc": "2.0", "id": 1 })), Ok(()));
     }
 
     // ── Bounded errors: body size must not amplify the error ─────────────
 
     fn body_with_bad_parts(count: usize) -> Value {
-        send_body(json!({ "messageId": "m-1", "parts": vec![json!(0); count] }))
+        send_v1_0(with(valid_v1_0_message(), "parts", json!(vec![json!(0); count])))
     }
 
     #[test]
@@ -732,22 +993,14 @@ mod tests {
     }
 
     #[test]
-    fn a_short_list_is_complete_and_not_truncated() {
-        let errs = validate_request_shape(&send_body(json!({ "role": "user" }))).unwrap_err();
-        assert_eq!(errs.errors.len(), 2);
-        assert!(!errs.truncated);
-    }
-
-    #[test]
     fn bounds_and_escapes_a_huge_multibyte_kind() {
         let kind = "\u{1F600}\"".repeat(10_000);
-        let body = send_body(json!({ "messageId": "m-1", "parts": [{ "kind": kind, "text": "hi" }] }));
-        let errs = validate_request_shape(&body)
+        let errs = validate_request_shape(&v0_3_part(json!({ "kind": kind, "text": "hi" })))
             .unwrap_err()
             .errors;
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "params.message.parts[0].kind");
-        let expected_head = format!("{:?}…", "\u{1F600}\"".repeat(MAX_ECHOED_CHARS / 2));
+        let expected_head = format!("{:?}…", "\u{1F600}\"".repeat(crate::a2a::MAX_LOGGED_CHARS / 2));
         assert!(
             errs[0]
                 .message
@@ -771,14 +1024,5 @@ mod tests {
             "{}",
             errs[0].message
         );
-    }
-
-    #[test]
-    fn echoes_a_short_kind_in_full_without_an_ellipsis() {
-        let body = send_body(json!({ "messageId": "m-1", "parts": [{ "kind": "file", "text": "hi" }] }));
-        let errs = validate_request_shape(&body)
-            .unwrap_err()
-            .errors;
-        assert_eq!(errs[0].message, "says \"file\" but the part carries 'text'");
     }
 }

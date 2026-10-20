@@ -74,10 +74,14 @@ async fn start_gateway(
 ) -> GatewayHarness {
     let mock = MockServer::start_with_response(upstream_body).await;
     GatewayHarness::start_with_outbound_mock(mock, move |_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_outbound_channel()];
-        gw_config
-            .a2a
-            .validate_messages = validate_messages;
+        let mut surface = helpers::build_minimal_outbound_channel();
+        if !validate_messages {
+            surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
+                validation: crate::config::agent_surface::A2aValidation::Off,
+                ..Default::default()
+            });
+        }
+        gw_config.surfaces = vec![surface];
     })
     .await
 }

@@ -370,6 +370,7 @@ export function SurfaceBuilder<T extends SurfaceBuilderState>({
             externalRevision={externalRevision}
             replaceCommit={replaceCommit}
             hasAttemptedSave={hasAttemptedSave}
+            base={builder.baseSurface}
           />
         )}
       </div>

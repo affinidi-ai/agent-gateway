@@ -39,27 +39,6 @@ fn write_api_key_secret(
     });
 }
 
-fn configure_gateway_route_prefixes(
-    bootstrap: &crate::config::BootstrapConfig,
-    prefixes: &[(&str, &str, &str)],
-) {
-    let gateway_path = std::path::Path::new(&bootstrap.config_files.gateway);
-    let mut gateway_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(gateway_path).expect("read gateway network config"))
-            .expect("gateway network config JSON");
-    gateway_json["channels"] = serde_json::Value::Array(
-        prefixes
-            .iter()
-            .map(|(id, name, prefix)| json!({ "id": id, "name": name, "prefix": prefix }))
-            .collect(),
-    );
-    std::fs::write(
-        gateway_path,
-        serde_json::to_string_pretty(&gateway_json).expect("serialize gateway network config"),
-    )
-    .expect("write gateway network config");
-}
-
 fn write_entra_a2a_proxy_fixture(temp_dir: &std::path::Path) {
     let proxy_dir = temp_dir.join("a2a_proxies");
     std::fs::create_dir_all(&proxy_dir).expect("create A2A proxy fixture dir");
@@ -1149,6 +1128,121 @@ async fn inbound_a2a_identity_schema_violation_returns_422() {
     );
 }
 
+/// Inbound A2A: the inbound identity check and `full` request-shape validation
+/// apply together on a `SendMessage` caller. A valid 1.0 request with a valid
+/// identity reaches the agent with the identity binding; a 0.3 `role` is refused
+/// by the shape check; a request without the identity extension is refused by
+/// the identity check; and a `kind` that A2A 1.0 does not define is ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_identity_check_and_full_validation_apply_to_a_v1_caller() {
+    let agent_response = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "message": { "messageId": "msg-001", "role": "ROLE_AGENT", "parts": [{ "text": "ok" }] } }
+    });
+    let mock = MockServer::start_with_response(serde_json::to_string(&agent_response).unwrap()).await;
+
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        let mut surface = helpers::build_identity_channel();
+        let inbound_slot = serde_json::json!({
+            "type": "payload_extraction",
+            "meta_field": "agentIdentity",
+            "extension_rules": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "softwareInfo": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "x-identity": true },
+                                "version": { "type": "string", "x-identity": true }
+                            }
+                        },
+                        "cloudProvider": { "type": "string", "x-identity": true }
+                    }
+                }
+            }
+        });
+        surface.identity_slots.inbound = Some(serde_json::from_value(inbound_slot).unwrap());
+        surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
+            validation: crate::config::agent_surface::A2aValidation::Full,
+            ..Default::default()
+        });
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    let identity = json!({ "softwareInfo": { "name": "caller-agent", "version": "1.0" }, "cloudProvider": "local" });
+    let send = |message: serde_json::Value| {
+        let client = reqwest::Client::new();
+        let url = h.gateway_url.clone();
+        async move {
+            let resp = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("A2A-Version", "1.0")
+                .body(
+                    json!({ "jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": { "message": message } })
+                        .to_string(),
+                )
+                .send()
+                .await
+                .expect("inbound request failed");
+            let status = resp.status().as_u16();
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .expect("response body is not JSON");
+            (status, body)
+        }
+    };
+
+    let (status, body) = send(json!({
+        "role": "user", "messageId": "m-role", "parts": [{ "text": "hi" }],
+        "extensions": [AGENT_IDENTITY_URI], "metadata": { AGENT_IDENTITY_URI: identity.clone() }
+    }))
+    .await;
+    assert_eq!(status, 400, "a 0.3 role on SendMessage is refused by full validation: {body}");
+    assert_eq!(body["error"]["code"], -32602, "{body}");
+    assert_eq!(body["error"]["data"]["errors"][0]["field"], "params.message.role", "{body}");
+
+    let (status, body) = send(json!({ "role": "ROLE_USER", "messageId": "m-anon", "parts": [{ "text": "hi" }] })).await;
+    assert_eq!(status, 422, "a request without the identity extension is refused: {body}");
+    assert_eq!(body["code"], "identity_validation_failed", "{body}");
+    assert_eq!(body["slot"], "inbound_identity", "{body}");
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "no refused request may reach the agent"
+    );
+
+    let (status, body) = send(json!({
+        "role": "ROLE_USER", "messageId": "m-ok", "parts": [{ "kind": "text", "text": "hi" }],
+        "extensions": [AGENT_IDENTITY_URI], "metadata": { AGENT_IDENTITY_URI: identity }
+    }))
+    .await;
+    assert_eq!(status, 200, "a valid identity and a valid 1.0 request reach the agent: {body}");
+    let forwarded = h
+        .mock
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("the agent received the request");
+    let forwarded: serde_json::Value = serde_json::from_str(&forwarded.body).expect("forwarded body is JSON");
+    let extensions = forwarded["params"]["message"]["extensions"]
+        .as_array()
+        .expect("forwarded message keeps its extensions");
+    assert!(
+        extensions
+            .iter()
+            .any(|uri| uri.as_str() == Some(AGENT_IDENTITY_URI)),
+        "the caller's identity extension is forwarded: {forwarded}"
+    );
+    assert!(extensions.len() > 1, "the gateway adds its identity binding next to the caller's extension: {forwarded}");
+}
+
 /// Inbound A2A: a surface that configures ONLY a protected (MA→AP) Server
 /// Identity and NO inbound (CA→AP) identity MUST NOT validate a
 /// caller-supplied `agent-identity/v1` extension against the protected schema.
@@ -1498,7 +1592,7 @@ async fn a2a_proxy_entra_identity_matches_header_metadata_did() {
             "valid",
         );
         write_entra_a2a_proxy_fixture(temp_dir);
-        configure_gateway_route_prefixes(
+        helpers::configure_gateway_route_prefixes(
             bootstrap,
             &[("headers", "headers", "/headers"), ("proxy", "proxy", "/proxy")],
         );

@@ -10,27 +10,19 @@ const FORM = {
   agent_card_description: '',
 } as unknown as A2aProxyFormData;
 
-const renderTab = (legacyCompatibility: boolean) => {
-  render(
-    <AgentCardTab formData={FORM} onChange={jest.fn()} legacyCompatibility={legacyCompatibility} />
-  );
+const renderTab = () => {
+  render(<AgentCardTab formData={FORM} onChange={jest.fn()} />);
   fireEvent.click(screen.getByTestId('a2a-proxy-agent-card-intro-context-toggle'));
 };
 
 describe('AgentCardTab A2A version note', () => {
-  it('says the card also carries the 0.3 fields while legacy compatibility is on', () => {
-    renderTab(true);
-
-    expect(screen.getByTestId('a2a-proxy-agent-card-version')).toHaveTextContent(
-      'also carries the version 0.3 fields'
-    );
-  });
-
-  it('says the card is 1.0 only when legacy compatibility is off', () => {
-    renderTab(false);
+  it('says the card follows the surface versions and which reply each send method gets', () => {
+    renderTab();
 
     const note = screen.getByTestId('a2a-proxy-agent-card-version');
-    expect(note).toHaveTextContent('version 1.0 only');
-    expect(note).not.toHaveTextContent('0.3 fields');
+    expect(note).toHaveTextContent('lists the A2A versions accepted by the Agent Surface');
+    expect(note).toHaveTextContent('A2A 1.0 for a new surface');
+    expect(note).toHaveTextContent('Callers using message/send get A2A 0.3 replies');
+    expect(note).toHaveTextContent('those using SendMessage get A2A 1.0 replies');
   });
 });

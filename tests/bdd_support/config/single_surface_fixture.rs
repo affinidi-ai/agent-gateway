@@ -43,6 +43,7 @@ pub struct SurfaceConfigBuilder {
     pub target_trust_check_list: Vec<serde_json::Value>,
     pub transit_shared_policy: Option<RequestPolicyFixture>,
     pub mcp_http: Option<serde_json::Value>,
+    pub a2a_settings: Option<serde_json::Value>,
     /// Requests the Access Point admits per minute.
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
@@ -91,6 +92,7 @@ impl Default for SurfaceConfigBuilder {
             target_trust_check_list: Vec::new(),
             transit_shared_policy: None,
             mcp_http: None,
+            a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
         }

@@ -209,19 +209,59 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
             );
 
             async {
-                let agent_surface_store = crate::surfaces::FileSystemAgentSurfaceStore::new(std::path::PathBuf::from(
-                    &state
-                        .bootstrap_config
-                        .storage_paths
-                        .agent_surfaces,
-                ))
-                .await?;
+                // The server's shared store, refreshed from disk, so manual edits are picked up and the
+                // carry-over's re-read sees a surface saved through the API while the reload runs.
+                let fresh_store;
+                let agent_surface_store = match state
+                    .agent_surface_store
+                    .as_deref()
+                {
+                    Some(shared) => {
+                        shared
+                            .refresh_from_disk()
+                            .await?;
+                        shared
+                    }
+                    None => {
+                        fresh_store = crate::surfaces::FileSystemAgentSurfaceStore::new(std::path::PathBuf::from(
+                            &state
+                                .bootstrap_config
+                                .storage_paths
+                                .agent_surfaces,
+                        ))
+                        .await?;
+                        &fresh_store
+                    }
+                };
 
                 let mut channels: Vec<crate::config::agent_surface::AgentSurface> = agent_surface_store
                     .list_all()
                     .await?;
-                crate::surfaces::strip_unsupported_header_metadata_mappings(&agent_surface_store, &mut channels)
-                    .await?;
+                crate::surfaces::strip_unsupported_header_metadata_mappings(agent_surface_store, &mut channels).await?;
+                let given = crate::surfaces::carry_over_a2a_settings(
+                    agent_surface_store,
+                    &mut channels,
+                    !crate::server::mode::is_standby(),
+                    || crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config),
+                )
+                .await;
+                for surface in channels
+                    .iter()
+                    .filter(|surface| given.contains(&surface.surface_id))
+                {
+                    if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
+                        continue;
+                    }
+                    if let Err(error) = state
+                        .resolved_surface_cache
+                        .upsert(surface)
+                    {
+                        warn!(
+                            surface = %surface.surface_id,
+                            "Could not refresh the resolved-surface cache with the carried-over A2A settings: {error}"
+                        );
+                    }
+                }
                 info!("Reloaded {} surface(s) from local storage", channels.len());
 
                 let config = GatewayConfig {

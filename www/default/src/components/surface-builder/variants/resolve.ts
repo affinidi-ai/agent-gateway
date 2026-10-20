@@ -76,17 +76,20 @@ const SHARED_TRANSIT_FIELDS = [
 ] as const;
 
 /**
- * Access point URL identifier fields. These identify the listener and
- * route, so they are surface-level and MUST be identical across the base
- * surface and every variant — a variant can never carry a different URL.
- * They are never emitted as per-variant overrides: `computeOverridesFromPayload`
- * omits them and `resolveVariant` always sources them from base.
+ * Surface-level access point fields. The URL identifiers identify the
+ * listener and route, and `a2a` (accepted A2A versions and message
+ * validation) is surface-level on the backend, so all of them MUST be
+ * identical across the base surface and every variant — a variant can never
+ * carry a different URL or A2A settings. They are never emitted as
+ * per-variant overrides: `computeOverridesFromPayload` omits them and
+ * `resolveVariant` always sources them from base.
  */
 export const ACCESS_POINT_IDENTIFIER_FIELDS = [
   'listen_address',
   'route',
   'protocol',
   'name',
+  'a2a',
 ] as const;
 
 /**
@@ -102,6 +105,9 @@ export const ACCESS_POINT_CANVAS_IDENTIFIER_FIELDS = [
   ...ACCESS_POINT_IDENTIFIER_FIELDS,
   'route_prefix',
   'route_suffix',
+  'a2a_accepted_versions',
+  'a2a_validation',
+  'a2a_locked_versions',
 ] as const;
 
 export interface SurfaceOverrides {
@@ -261,7 +267,12 @@ export function resolveVariant(base: any, overrides: SurfaceOverrides | undefine
       apIdentifiers[f] = baseAp[f];
     }
     out.access_point = { ...apIdentifiers, ...(overrides.access_point ?? {}) };
-    out.target = { ...(overrides.target ?? {}) };
+    // The gateway keeps the base endpoint when a complete override names none.
+    const baseEndpoint = (out.target as Record<string, unknown> | undefined)?.endpoint;
+    out.target = {
+      ...(baseEndpoint !== undefined ? { endpoint: baseEndpoint } : {}),
+      ...(overrides.target ?? {}),
+    };
     if (overrides.transit) {
       if (overrides.transit.disabled === true) {
         out.transit = undefined;

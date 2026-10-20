@@ -29,6 +29,35 @@ fn a2a_request_body() -> serde_json::Value {
     })
 }
 
+/// `surface` with both versions and the given `access_point.a2a.validation`.
+fn with_validation(
+    mut surface: crate::config::agent_surface::AgentSurface,
+    validation: crate::config::agent_surface::A2aValidation,
+) -> crate::config::agent_surface::AgentSurface {
+    surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
+        validation,
+        ..Default::default()
+    });
+    surface
+}
+
+/// `surface` with full validation: the envelope and the A2A request shape.
+fn with_message_validation(
+    surface: crate::config::agent_surface::AgentSurface
+) -> crate::config::agent_surface::AgentSurface {
+    with_validation(surface, crate::config::agent_surface::A2aValidation::Full)
+}
+
+/// A managed-agent A2A surface that checks the envelope but not the request shape.
+fn surface_with_envelope_validation() -> crate::config::agent_surface::AgentSurface {
+    with_validation(helpers::build_minimal_channel(), crate::config::agent_surface::A2aValidation::Envelope)
+}
+
+/// A managed-agent A2A surface that validates nothing.
+fn surface_without_validation() -> crate::config::agent_surface::AgentSurface {
+    with_validation(helpers::build_minimal_channel(), crate::config::agent_surface::A2aValidation::Off)
+}
+
 /// Realistic A2A JSON-RPC response returned by the mock target.
 fn a2a_response_body() -> serde_json::Value {
     json!({
@@ -507,7 +536,7 @@ async fn inbound_a2a_tampered_jwt_signature_forwarded_without_policy() {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_invalid_json_rejected() {
     //
-    // Given — a plain A2A channel (validate_messages defaults to true)
+    // Given — a plain A2A channel, which checks the envelope by default
     //
     let h = GatewayHarness::start(|_, gw_config, _| {
         gw_config.surfaces = vec![helpers::build_minimal_channel()];
@@ -1272,7 +1301,7 @@ async fn inbound_a2a_malformed_message_rejected_before_forwarding() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -1324,7 +1353,7 @@ async fn inbound_a2a_v1_send_message_missing_required_fields_rejected() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -1368,6 +1397,78 @@ async fn inbound_a2a_v1_send_message_missing_required_fields_rejected() {
     );
 }
 
+/// With `full`, the spelling of the method picks the A2A version whose rules
+/// the request is checked against: `SendMessage` with a 0.3 `role` is refused,
+/// naming it, whatever `A2A-Version` says. The 0.3 `kind` on its part is a field
+/// A2A 1.0 does not define, so it is ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_full_validation_refuses_a_request_in_the_other_versions_dialect() {
+    let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
+    })
+    .await;
+    let mixed = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"user","messageId":"m-1","parts":[{"kind":"text","text":"hi"}]}}}"#;
+
+    for version in [Some("1.0"), Some("0.3"), None] {
+        let mut request = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .body(mixed);
+        if let Some(version) = version {
+            request = request.header("A2A-Version", version);
+        }
+        let resp = request
+            .send()
+            .await
+            .expect("request failed");
+        assert_eq!(resp.status(), 400, "{version:?}");
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("error body should be JSON");
+        assert_eq!(body["error"]["code"], -32602, "{version:?}: {body}");
+        let fields: Vec<&str> = body["error"]["data"]["errors"]
+            .as_array()
+            .expect("data.errors should be an array")
+            .iter()
+            .filter_map(|e| e["field"].as_str())
+            .collect();
+        assert_eq!(fields, vec!["params.message.role"], "{version:?}");
+    }
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "the upstream must never be contacted for a request refused at the gateway"
+    );
+}
+
+/// With `full`, a request that is valid for its method's version is forwarded
+/// whatever `A2A-Version` says: negotiation and shape validation are separate.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_full_validation_does_not_consult_the_negotiated_version() {
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
+    })
+    .await;
+    let v0_3_send = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","role":"user","messageId":"m-1","parts":[{"kind":"text","text":"hi"}]}}}"#;
+
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("A2A-Version", "1.0")
+        .body(v0_3_send)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200, "a valid 0.3 request passes shape validation under A2A-Version 1.0");
+    assert_mock_received_request(&h.mock, v0_3_send);
+}
+
 /// A body of many bad parts gets a bounded error: the list is capped and marked
 /// truncated, so request size does not amplify into response size.
 #[tokio::test(flavor = "multi_thread")]
@@ -1375,7 +1476,7 @@ async fn inbound_a2a_many_bad_parts_get_a_bounded_error() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![with_message_validation(helpers::build_minimal_channel())];
     })
     .await;
 
@@ -1445,66 +1546,136 @@ async fn inbound_a2a_well_formed_message_still_forwarded() {
 
 // ── Validation bypass ────────────────────────────────────────────────────────
 
-/// When `validate_messages` is set to `false`, malformed JSON-RPC requests are
-/// forwarded unmodified to the upstream agent instead of being rejected.
+/// With envelope validation, the default, a body with neither `jsonrpc` nor
+/// `method` is refused and never forwarded, though the request shape is not checked.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_validation_disabled_passes_malformed_through() {
-    //
-    // Given — channel with validate_messages disabled
-    //
-    let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
-
-    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config
-            .a2a
-            .validate_messages = false;
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+async fn inbound_a2a_envelope_is_checked_without_shape_validation() {
+    let h = GatewayHarness::start(|_, gw_config, _| {
+        gw_config.surfaces = vec![surface_with_envelope_validation()];
     })
     .await;
 
-    let client = reqwest::Client::new();
-
-    //
-    // When — send body that is NOT valid JSON-RPC (missing jsonrpc and method)
-    //
-    let resp = client
+    let resp = reqwest::Client::new()
         .post(&h.gateway_url)
         .header("content-type", "application/json")
         .body(r#"{"hello": "world"}"#)
         .send()
         .await
-        .expect("request with validation disabled failed");
+        .expect("request failed");
 
-    //
-    // Then — 200 OK, request forwarded despite invalid envelope
-    //
-    assert_eq!(
-        resp.status(),
-        200,
-        "with validate_messages=false, malformed request should be forwarded, got {}",
-        resp.status()
+    assert_eq!(resp.status(), 400, "a malformed envelope is refused with envelope validation");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("response is not JSON");
+    assert_eq!(body["error"]["code"], -32600, "got {body}");
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "the malformed request must not be forwarded"
     );
-
-    let received = h
-        .mock
-        .last_request_rx
-        .borrow()
-        .clone()
-        .expect("mock should have received the malformed request");
-    assert_eq!(received.body, r#"{"hello": "world"}"#);
 }
 
-/// With `validate_messages = false` the A2A message-shape check is skipped too, so
-/// a v1.0 `SendMessage` missing every required message field reaches the upstream.
+/// A JSON-RPC batch carries no single `method`, so policy could not match it on
+/// one. Envelope validation refuses it as an invalid request.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_batch_is_refused_with_envelope_validation() {
+    let h = GatewayHarness::start(|_, gw_config, _| {
+        gw_config.surfaces = vec![surface_with_envelope_validation()];
+    })
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("A2A-Version", "1.0")
+        .body(r#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t1"}}]"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 400, "a batch is refused");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("response is not JSON");
+    assert_eq!(body["error"]["code"], -32600, "got {body}");
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "the batch must not be forwarded"
+    );
+}
+
+/// With validation `off`, a body that is not valid JSON-RPC, a batch included,
+/// is forwarded unmodified for the agent to decide.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_validation_off_forwards_a_malformed_envelope() {
+    let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":null,"result":"ok"}"#).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![surface_without_validation()];
+    })
+    .await;
+
+    for request_str in
+        [r#"{"hello": "world"}"#, r#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t1"}}]"#]
+    {
+        let resp = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .body(request_str)
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), 200, "with validation off, {request_str} should be forwarded");
+        assert_mock_received_request(&h.mock, request_str);
+    }
+}
+
+/// Message-shape validation is off unless the surface turns it on, so a surface
+/// that stores no `access_point.a2a` forwards a malformed message whose envelope
+/// is valid.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_messages_are_not_validated_by_default() {
+    let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
+
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+    })
+    .await;
+
+    let request_str = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{}}}"#;
+    let resp = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .body(request_str)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200, "an unvalidated surface forwards the malformed message");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("response is not JSON");
+    assert_eq!(body["result"], "ok", "the upstream's response should come back, got {body}");
+    assert_mock_received_request(&h.mock, request_str);
+}
+
+/// With envelope validation the A2A message-shape check is skipped, so a
+/// v1.0 `SendMessage` with a valid envelope but missing every required message
+/// field reaches the upstream.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_validation_disabled_forwards_v1_message_missing_required_fields() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config
-            .a2a
-            .validate_messages = false;
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![surface_with_envelope_validation()];
     })
     .await;
 
@@ -1518,7 +1689,7 @@ async fn inbound_a2a_validation_disabled_forwards_v1_message_missing_required_fi
         .await
         .expect("request with validation disabled failed");
 
-    assert_eq!(resp.status(), 200, "with validate_messages=false the malformed message should be forwarded");
+    assert_eq!(resp.status(), 200, "without shape validation the malformed message should be forwarded");
     let body: serde_json::Value = resp
         .json()
         .await
@@ -1528,17 +1699,14 @@ async fn inbound_a2a_validation_disabled_forwards_v1_message_missing_required_fi
 }
 
 /// Version negotiation is not part of message validation: with
-/// `validate_messages = false` an unsupported `A2A-Version` is still refused with
+/// validation `off` an unsupported `A2A-Version` is still refused with
 /// -32009 and the upstream is never contacted.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_validation_disabled_still_rejects_unsupported_version() {
     let mock = MockServer::start_with_response(r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config
-            .a2a
-            .validate_messages = false;
-        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+        gw_config.surfaces = vec![surface_without_validation()];
     })
     .await;
 
@@ -1551,7 +1719,7 @@ async fn inbound_a2a_validation_disabled_still_rejects_unsupported_version() {
         .await
         .expect("request failed");
 
-    assert_eq!(resp.status(), 400, "an unsupported A2A-Version must be refused whatever validate_messages says");
+    assert_eq!(resp.status(), 400, "an unsupported A2A-Version must be refused whatever the validation level");
     let body: serde_json::Value = resp
         .json()
         .await
@@ -1653,6 +1821,119 @@ async fn inbound_mcp_body_on_a2a_access_point_rejected() {
     );
 }
 
+// ── Per-surface accepted versions ────────────────────────────────────────────
+
+/// The minimal surface accepting only `versions`, on `route`.
+fn surface_accepting(
+    route: &str,
+    versions: &[&str],
+) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = helpers::build_minimal_channel();
+    surface.name = format!("surface{}", route.replace('/', "-"));
+    surface.surface_id = surface.name.clone();
+    surface.access_point.route = route.to_string();
+    surface.access_point.a2a = Some(crate::config::agent_surface::A2aAccessPointSettings {
+        accepted_versions: versions
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
+        ..Default::default()
+    });
+    surface
+}
+
+async fn post_with_version(
+    url: &str,
+    version: Option<&str>,
+) -> (u16, serde_json::Value) {
+    let mut request = reqwest::Client::new()
+        .post(url)
+        .header("content-type", "application/json")
+        .json(&a2a_request_body());
+    if let Some(version) = version {
+        request = request.header("A2A-Version", version);
+    }
+    let response = request
+        .send()
+        .await
+        .expect("request failed");
+    let status = response.status().as_u16();
+    let text = response
+        .text()
+        .await
+        .expect("response body");
+    (status, serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+}
+
+/// A surface that accepts 1.0 only refuses v0.3, including a caller that sends
+/// no `A2A-Version` (which A2A defines as 0.3), and names only 1.0 as supported.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_1_0_only_surface_refuses_v0_3_and_lists_only_1_0() {
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![surface_accepting("/smoke", &["1.0"])];
+    })
+    .await;
+
+    for version in [None, Some("0.3")] {
+        let (status, body) = post_with_version(&h.gateway_url, version).await;
+        assert_eq!(status, 400, "{version:?}");
+        assert_eq!(body["error"]["code"], -32009, "{version:?}");
+        assert_eq!(body["error"]["data"]["requested"], "0.3");
+        assert_eq!(body["error"]["data"]["supported"], json!(["1.0"]));
+    }
+    assert!(
+        h.mock
+            .last_request_rx
+            .borrow()
+            .is_none(),
+        "a refused request never reaches the agent"
+    );
+
+    let (status, body) = post_with_version(&h.gateway_url, Some("1.0")).await;
+    assert_eq!(status, 200, "1.0 is served, got {body}");
+    assert_eq!(body["result"]["messageId"], "msg-resp-001");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_0_3_only_surface_refuses_v1_0() {
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
+        gw_config.surfaces = vec![surface_accepting("/smoke", &["0.3"])];
+    })
+    .await;
+
+    let (status, body) = post_with_version(&h.gateway_url, Some("1.0")).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], -32009);
+    assert_eq!(body["error"]["data"]["supported"], json!(["0.3"]));
+
+    let (status, body) = post_with_version(&h.gateway_url, None).await;
+    assert_eq!(status, 200, "an absent header is 0.3, which this surface serves, got {body}");
+}
+
+/// Accepted versions are per surface: two surfaces on one gateway negotiate
+/// the same request differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_surfaces_negotiate_with_their_own_accepted_versions() {
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, bootstrap| {
+        helpers::configure_gateway_route_prefixes(
+            bootstrap,
+            &[("smoke", "smoke", "/smoke"), ("v1only", "v1only", "/v1only")],
+        );
+        gw_config.surfaces = vec![surface_accepting("/smoke", &["0.3", "1.0"]), surface_accepting("/v1only", &["1.0"])];
+    })
+    .await;
+
+    let (status, body) = post_with_version(&h.gateway_url, None).await;
+    assert_eq!(status, 200, "the surface accepting both serves a header-less caller, got {body}");
+
+    let (status, body) = post_with_version(&format!("{}/v1only/rpc", h.gateway_base), None).await;
+    assert_eq!(status, 400, "the 1.0-only surface refuses the same caller, got {body}");
+    assert_eq!(body["error"]["data"]["supported"], json!(["1.0"]));
+}
+
 // ── Refusals ahead of delegated payment ──────────────────────────────────────
 
 const DELEGATION_MISCONFIGURED: &str = "payment delegation misconfigured";
@@ -1743,7 +2024,7 @@ async fn inbound_a2a_unsupported_version_refused_before_delegated_payment() {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_malformed_message_refused_before_delegated_payment() {
     let h = GatewayHarness::start(|_, gw_config, _| {
-        gw_config.surfaces = vec![agent_pay_surface("prepay-shape", None)];
+        gw_config.surfaces = vec![with_message_validation(agent_pay_surface("prepay-shape", None))];
     })
     .await;
 
@@ -1795,10 +2076,10 @@ async fn inbound_a2a_valid_request_reaches_delegated_payment() {
     assert!(body.contains(DELEGATION_MISCONFIGURED), "got {body}");
 }
 
-/// A `fabric://` target is never version-negotiated: an unsupported version
-/// still reaches the delegated payment step and is not counted as refused.
+/// A `fabric://` target is version-negotiated on the sending gateway, ahead of
+/// delegated payment and before the request is dispatched over the fabric.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_a2a_fabric_target_is_not_version_negotiated() {
+async fn inbound_a2a_fabric_target_is_version_negotiated_before_delegated_payment() {
     let channel = "prepay-fabric";
     let h = GatewayHarness::start(|_, gw_config, _| {
         gw_config.surfaces = vec![agent_pay_surface(channel, Some("fabric://unknown/ch"))];
@@ -1808,10 +2089,65 @@ async fn inbound_a2a_fabric_target_is_not_version_negotiated() {
 
     let (status, body) = post_a2a(&h, "2.0", serde_json::to_string(&a2a_request_body()).unwrap()).await;
 
-    assert_ne!(jsonrpc_error_code(&body), Some(-32009), "fabric targets must not be negotiated, got {body}");
-    assert_eq!(status, 502, "expected the delegation step to answer, got {status}: {body}");
+    assert_eq!(status, 400, "expected -32009 ahead of payment, got {status}: {body}");
+    assert_eq!(jsonrpc_error_code(&body), Some(-32009), "got {body}");
+    assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
+    assert_eq!(rejected_version_count(channel), rejected_before + 1, "the refusal is counted");
+}
+
+/// Starts a gateway with one delegated-payment `fabric://` surface at `validation`.
+async fn fabric_harness(validation: crate::config::agent_surface::A2aValidation) -> GatewayHarness {
+    GatewayHarness::start(move |_, gw_config, _| {
+        let surface = agent_pay_surface(&format!("fabric-{}", validation.as_str()), Some("fabric://unknown/ch"));
+        gw_config.surfaces = vec![with_validation(surface, validation)];
+    })
+    .await
+}
+
+const BATCH_REQUEST: &str = r#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t1"}}]"#;
+
+fn message_without_message_id() -> String {
+    let mut request = a2a_request_body();
+    request["params"]["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("messageId");
+    serde_json::to_string(&request).unwrap()
+}
+
+/// With the default envelope validation, a `fabric://` target refuses a batch
+/// before payment, but lets a message missing A2A fields through to payment.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_fabric_target_checks_the_envelope_by_default() {
+    let h = fabric_harness(crate::config::agent_surface::A2aValidation::Envelope).await;
+
+    let (status, body) = post_a2a(&h, "1.0", BATCH_REQUEST.to_string()).await;
+    assert_eq!((status, jsonrpc_error_code(&body)), (400, Some(-32600)), "a batch is refused: {body}");
+    assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
+
+    let (status, body) = post_a2a(&h, "1.0", message_without_message_id()).await;
+    assert_eq!(status, 502, "a malformed message reaches payment: {status} {body}");
     assert!(body.contains(DELEGATION_MISCONFIGURED), "got {body}");
-    assert_eq!(rejected_version_count(channel), rejected_before);
+}
+
+/// With `full` validation, a `fabric://` target also refuses a malformed message.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_fabric_target_checks_the_request_shape_when_full() {
+    let h = fabric_harness(crate::config::agent_surface::A2aValidation::Full).await;
+
+    let (status, body) = post_a2a(&h, "1.0", message_without_message_id()).await;
+    assert_eq!((status, jsonrpc_error_code(&body)), (400, Some(-32602)), "got {body}");
+    assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
+}
+
+/// With validation `off`, a `fabric://` target lets a batch through to payment.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_a2a_fabric_target_checks_nothing_when_off() {
+    let h = fabric_harness(crate::config::agent_surface::A2aValidation::Off).await;
+
+    let (status, body) = post_a2a(&h, "1.0", BATCH_REQUEST.to_string()).await;
+    assert_eq!(status, 502, "a batch reaches payment: {status} {body}");
+    assert!(body.contains(DELEGATION_MISCONFIGURED), "got {body}");
 }
 
 /// An `a2a-proxy://` target is version-negotiated, ahead of delegated payment.
@@ -1829,4 +2165,499 @@ async fn inbound_a2a_proxy_target_is_version_negotiated_before_delegated_payment
     assert_eq!(status, 400, "expected -32009 ahead of payment, got {status}: {body}");
     assert_eq!(jsonrpc_error_code(&body), Some(-32009), "got {body}");
     assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
+}
+
+// ── Surface elements added through the admin API ────────────────────────────
+
+const ELEMENTS_POLICY_ID: &str = "pol-no-task-cancel";
+
+const ELEMENTS_POLICY_REGO: &str = r#"package surface.policy
+
+default allow := true
+
+allow := false if input.a2a.method_canonical == "tasks/cancel"
+
+deny_reason := "task cancellation is not allowed on this surface" if input.a2a.method_canonical == "tasks/cancel"
+"#;
+
+/// Adding a policy and an inbound identity element to an A2A surface through
+/// the admin API, as the dashboard saves them, keeps the surface's A2A
+/// settings; switching its validation to `full` keeps both elements; and
+/// removing the identity element keeps the rest. Requests meet every element:
+/// the identity check, the per-version shape check, and the policy in either
+/// method spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_settings_survive_adding_policy_and_identity_elements_through_the_admin_api() {
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let mut client = None;
+    let h = GatewayHarness::start_with_mock(mock, |temp_dir, _, bootstrap| {
+        let dir = temp_dir.join("policy_definitions");
+        std::fs::create_dir_all(&dir).expect("create policy_definitions dir");
+        std::fs::write(
+            dir.join(format!("{ELEMENTS_POLICY_ID}.json")),
+            serde_json::json!({
+                "id": ELEMENTS_POLICY_ID, "name": "No task cancel", "description": "Denies task cancellation.",
+                "policy_type": "agent_surface", "policy": ELEMENTS_POLICY_REGO, "enabled": true,
+                "created_at": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .expect("write policy definition");
+        client = Some(helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.unwrap();
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let mut listener = url::Url::parse(&h.gateway_base).unwrap();
+    listener
+        .set_host(Some("localhost"))
+        .unwrap();
+    let listener = listener
+        .origin()
+        .ascii_serialization();
+    let send = |request: reqwest::RequestBuilder| async move {
+        let response = request
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or(serde_json::json!(null));
+        (status, body)
+    };
+    let a2a = |method: &str, version: Option<&str>, message: Option<serde_json::Value>| {
+        let params = match message {
+            Some(message) => serde_json::json!({ "message": message }),
+            None => serde_json::json!({ "id": "task-1" }),
+        };
+        let mut request = reqwest::Client::new()
+            .post(format!("{}/smoke/elements", h.gateway_base))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string());
+        if let Some(version) = version {
+            request = request.header("A2A-Version", version);
+        }
+        request
+    };
+    let with_identity = |mut message: serde_json::Value| {
+        message["extensions"] = serde_json::json!([ELEMENTS_IDENTITY_URI]);
+        message["metadata"] =
+            serde_json::json!({ ELEMENTS_IDENTITY_URI: { "agentIdentity": { "name": "caller-agent" } } });
+        message
+    };
+    let v1_message = |role: &str| serde_json::json!({ "role": role, "messageId": "m-1", "parts": [{ "text": "hi" }] });
+    let both_versions =
+        |validation: &str| serde_json::json!({ "accepted_versions": ["0.3", "1.0"], "validation": validation });
+
+    let (status, created) = send(
+        client
+            .post(&collection)
+            .json(&serde_json::json!({
+                "name": "elements", "status": "active",
+                "access_point": {"listen_address": listener, "route": "/smoke/elements", "protocol": "a2a"},
+                "target": {"endpoint": h.mock.url()}
+            })),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["access_point"]["a2a"], both_versions("envelope"));
+    let surface_url = format!(
+        "{collection}/{}",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+
+    // Add a policy and an inbound identity element, echoing the rest from GET.
+    let mut with_elements = created.clone();
+    with_elements["access_point"]["inbound_policy"] = serde_json::json!({ "policy_definition_id": ELEMENTS_POLICY_ID });
+    with_elements["identity_slots"]["inbound"] = serde_json::json!({
+        "type": "payload_extraction", "meta_field": "agentIdentity", "fields": ["agentIdentity.name"],
+        "json_schema": {"type": "object", "properties": {"agentIdentity": {"type": "object",
+            "properties": {"name": {"type": "string", "x-identity": true}}, "required": ["name"]}}}
+    });
+    let (status, put) = send(
+        client
+            .put(&surface_url)
+            .json(&with_elements),
+    )
+    .await;
+    assert_eq!(status, 200, "{put}");
+    assert_eq!(put["access_point"]["a2a"], both_versions("envelope"));
+    assert_eq!(put["access_point"]["inbound_policy"]["policy_definition_id"], ELEMENTS_POLICY_ID);
+    assert_eq!(put["identity_slots"]["inbound"]["type"], "payload_extraction");
+
+    // Switch validation to full; both elements stay.
+    let (status, patched) = send(
+        client
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&serde_json::json!({"access_point": {"a2a": {"validation": "full"}}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{patched}");
+    assert_eq!(patched["access_point"]["a2a"], both_versions("full"));
+    assert_eq!(patched["access_point"]["inbound_policy"]["policy_definition_id"], ELEMENTS_POLICY_ID);
+    assert_eq!(patched["identity_slots"]["inbound"]["type"], "payload_extraction");
+
+    let (status, body) = send(a2a("SendMessage", Some("1.0"), Some(with_identity(v1_message("ROLE_USER"))))).await;
+    assert_eq!(status, 200, "a valid identity and a valid 1.0 request are served: {body}");
+    let (status, body) = send(a2a(
+        "message/send",
+        None,
+        Some(with_identity(serde_json::json!({
+            "kind": "message", "role": "user", "messageId": "m-2", "parts": [{ "kind": "text", "text": "hi" }]
+        }))),
+    ))
+    .await;
+    assert_eq!(status, 200, "a valid identity and a valid 0.3 request are served: {body}");
+    let (status, body) = send(a2a("SendMessage", Some("1.0"), Some(v1_message("ROLE_USER")))).await;
+    assert_eq!((status, &body["code"]), (422, &serde_json::json!("identity_validation_failed")), "{body}");
+    let (status, body) = send(a2a("SendMessage", Some("1.0"), Some(with_identity(v1_message("user"))))).await;
+    assert_eq!((status, &body["error"]["code"]), (400, &serde_json::json!(-32602)), "{body}");
+    assert_eq!(body["error"]["data"]["errors"][0]["field"], "params.message.role");
+
+    // Remove the identity element; the policy and the A2A settings stay.
+    let (_, current) = send(client.get(&surface_url)).await;
+    let mut without_identity = current.clone();
+    without_identity["identity_slots"]["inbound"] = serde_json::Value::Null;
+    let (status, put) = send(
+        client
+            .put(&surface_url)
+            .json(&without_identity),
+    )
+    .await;
+    assert_eq!(status, 200, "{put}");
+    assert_eq!(put["access_point"]["a2a"], both_versions("full"));
+    assert_eq!(put["access_point"]["inbound_policy"]["policy_definition_id"], ELEMENTS_POLICY_ID);
+    assert!(put["identity_slots"]["inbound"].is_null(), "{put}");
+
+    for (method, version) in [("CancelTask", Some("1.0")), ("tasks/cancel", None)] {
+        let (status, body) = send(a2a(method, version, None)).await;
+        assert_eq!(status, 403, "the policy denies {method}: {body}");
+    }
+    let (status, body) = send(a2a("GetTask", Some("1.0"), None)).await;
+    assert_eq!(status, 200, "the policy allows GetTask: {body}");
+    let (status, body) = send(a2a("SendMessage", Some("1.0"), Some(v1_message("ROLE_USER")))).await;
+    assert_eq!(status, 200, "without the identity element a request needs no identity: {body}");
+}
+
+const ELEMENTS_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+
+// ── A2A validation off is for appliance-wide callers only ──────────────────
+
+/// Seed an administrator and an access token they own into the gateway's stores
+/// before it boots: with `resource_pattern`, a token scoped to tenant
+/// `tenant-a`'s surfaces; without one, a token scoped by its required
+/// `x-external-account` header alone. Returns a client that sends the token and
+/// the header.
+fn seed_scoped_access_token(
+    bootstrap: &crate::config::BootstrapConfig,
+    resource_pattern: Option<&str>,
+) -> reqwest::Client {
+    let now = chrono::Utc::now();
+    let owner = "tenant-token-owner";
+    let user: crate::auth::storage::UserData = serde_json::from_value(serde_json::json!({
+        "user_id": owner, "username": owner, "passkeys": [], "role": "administrator", "status": "approved",
+        "created_at": now, "updated_at": now
+    }))
+    .unwrap();
+    let passkeys = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .passkeys,
+    );
+    std::fs::create_dir_all(passkeys).unwrap();
+    std::fs::write(passkeys.join(format!("{owner}.json")), serde_json::to_vec(&user).unwrap()).unwrap();
+
+    let (id, secret) = crate::access_tokens::generate_token();
+    let token = crate::access_tokens::AccessToken {
+        id: id.clone(),
+        name: "tenant token".to_string(),
+        description: String::new(),
+        token_hash: crate::access_tokens::store::hash_secret(&secret),
+        user_id: owner.to_string(),
+        scopes: Vec::new(),
+        resource_pattern: resource_pattern.map(str::to_string),
+        required_headers: vec![crate::auth_manager::resource_scope::RequiredHeader {
+            name: "x-external-account".to_string(),
+            pattern: "tenant-a".to_string(),
+        }],
+        created_by: owner.to_string(),
+        parent_token_id: None,
+        delegation_depth: 0,
+        created_at: now,
+        last_used_at: None,
+        expires_at: None,
+        revoked_at: None,
+        rotation_generation: 0,
+        rotated_at: None,
+        rotated_by: None,
+    };
+    let tokens = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .secrets,
+    )
+    .parent()
+    .unwrap()
+    .join("access_tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    std::fs::write(tokens.join(format!("{id}.json")), serde_json::to_vec(&token).unwrap()).unwrap();
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).unwrap();
+    authorization.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    headers.insert("x-external-account", reqwest::header::HeaderValue::from_static("tenant-a"));
+    reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap()
+}
+
+/// A tenant access token cannot set an A2A surface's validation to `off`
+/// through the admin API, on create, PUT or merge PATCH, and neither can a token
+/// scoped by required headers alone, while both can choose another level; an
+/// appliance-wide caller can set `off`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_api() {
+    let mut clients = None;
+    let h = GatewayHarness::start(|_, _, bootstrap| {
+        let admin = helpers::configure_admin_api(bootstrap);
+        let tenant = seed_scoped_access_token(bootstrap, Some("TENANT:${x-external-account}:surfaces:.*"));
+        let header_scoped = seed_scoped_access_token(bootstrap, None);
+        clients = Some((admin, tenant, header_scoped));
+    })
+    .await;
+    let (admin, tenant, header_scoped) = clients.unwrap();
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let send = |request: reqwest::RequestBuilder| async move {
+        let response = request
+            .send()
+            .await
+            .expect("admin API request");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or(serde_json::json!(null));
+        (status, body)
+    };
+    let surface = |route: &str, validation: &str| {
+        serde_json::json!({
+            "name": route.trim_start_matches('/'), "status": "disabled",
+            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a",
+                             "a2a": {"validation": validation}},
+            "target": {"endpoint": "https://agent.example"}
+        })
+    };
+
+    let (status, body) = send(
+        tenant
+            .post(&collection)
+            .json(&surface("/tenant-off", "off")),
+    )
+    .await;
+    assert_eq!(status, 403, "create with off: {body}");
+    assert!(
+        body.to_string()
+            .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
+        "{body}"
+    );
+
+    let (status, body) = send(
+        header_scoped
+            .post(&collection)
+            .json(&surface("/header-off", "off")),
+    )
+    .await;
+    assert_eq!(status, 403, "a token scoped by required headers alone, create with off: {body}");
+    assert!(
+        body.to_string()
+            .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
+        "{body}"
+    );
+    let (status, body) = send(
+        header_scoped
+            .post(&collection)
+            .json(&surface("/header-envelope", "envelope")),
+    )
+    .await;
+    assert_eq!(status, 201, "a token scoped by required headers alone may choose another level: {body}");
+
+    let (status, created) = send(
+        tenant
+            .post(&collection)
+            .json(&surface("/tenant-envelope", "envelope")),
+    )
+    .await;
+    assert_eq!(status, 201, "a tenant may create with another level: {created}");
+    let surface_url = format!(
+        "{collection}/{}",
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+
+    let mut put_off = created.clone();
+    put_off["access_point"]["a2a"]["validation"] = serde_json::json!("off");
+    let (status, body) = send(
+        tenant
+            .put(&surface_url)
+            .json(&put_off),
+    )
+    .await;
+    assert_eq!(status, 403, "PUT with off: {body}");
+    assert!(
+        body.to_string()
+            .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
+        "{body}"
+    );
+
+    let (status, body) = send(
+        tenant
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&serde_json::json!({"access_point": {"a2a": {"validation": "off"}}})),
+    )
+    .await;
+    assert_eq!(status, 403, "merge PATCH with off: {body}");
+    assert!(
+        body.to_string()
+            .contains("only an appliance-wide administrator can set access_point.a2a.validation"),
+        "{body}"
+    );
+
+    let (status, body) = send(
+        tenant
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&serde_json::json!({"access_point": {"a2a": {"validation": "full"}}})),
+    )
+    .await;
+    assert_eq!(status, 200, "a tenant may choose another level: {body}");
+    assert_eq!(body["access_point"]["a2a"]["validation"], "full");
+
+    let (status, body) = send(
+        admin
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&serde_json::json!({"access_point": {"a2a": {"validation": "off"}}})),
+    )
+    .await;
+    assert_eq!(status, 200, "an appliance-wide caller may set off: {body}");
+    assert_eq!(body["access_point"]["a2a"]["validation"], "off");
+}
+
+/// Settings a configuration reload gives a stored surface without its own reach
+/// the traffic it serves: after the reload, the surface accepts what the
+/// carried settings say, not what the resolved-surface cache held before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_settings_carried_over_on_reload_are_served() {
+    let mut paths = None;
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        let admin = helpers::configure_admin_api(bootstrap);
+        paths = Some((
+            admin,
+            std::path::PathBuf::from(
+                &bootstrap
+                    .storage_paths
+                    .agent_surfaces,
+            ),
+            std::path::PathBuf::from(
+                &bootstrap
+                    .storage_paths
+                    .settings,
+            ),
+        ));
+    })
+    .await;
+    let (admin, surfaces_dir, settings_dir) = paths.unwrap();
+    // Surface events received while the node is still activating are replayed
+    // once it is ready, which would overwrite what the reload below serves.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while admin
+        .get(format!("{}/api/v1/health", h.gateway_base))
+        .send()
+        .await
+        .map_or(true, |response| response.status() != 200)
+    {
+        assert!(tokio::time::Instant::now() < deadline, "the gateway never became ready to serve");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut listener = url::Url::parse(&h.gateway_base).unwrap();
+    listener
+        .set_host(Some("localhost"))
+        .unwrap();
+    let response = admin
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&serde_json::json!({
+            "name": "reloaded", "status": "active",
+            "access_point": {"listen_address": listener.origin().ascii_serialization(), "route": "/smoke/reloaded",
+                             "protocol": "a2a"},
+            "target": {"endpoint": h.mock.url()}
+        }))
+        .send()
+        .await
+        .expect("create surface");
+    assert_eq!(response.status(), 201);
+    let created: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(created["access_point"]["a2a"]["accepted_versions"], serde_json::json!(["0.3", "1.0"]));
+
+    let send_without_version = || async {
+        reqwest::Client::new()
+            .post(format!("{}/smoke/reloaded", h.gateway_base))
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"m-1","parts":[{"kind":"text","text":"hi"}]}}}"#)
+            .send()
+            .await
+            .expect("request")
+    };
+    assert_eq!(
+        send_without_version()
+            .await
+            .status(),
+        200,
+        "the stored surface accepts A2A 0.3"
+    );
+
+    let surface_id = created["surface_id"]
+        .as_str()
+        .unwrap();
+    let stored_path = std::fs::read_dir(&surfaces_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| std::fs::read_to_string(path).is_ok_and(|content| content.contains(surface_id)))
+        .expect("stored surface file");
+    let mut stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
+    stored["access_point"]
+        .as_object_mut()
+        .unwrap()
+        .remove("a2a");
+    std::fs::write(&stored_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+    std::fs::create_dir_all(&settings_dir).unwrap();
+    std::fs::write(
+        settings_dir.join(crate::storage::settings_store::SETTINGS_FILE_NAME),
+        r#"{"feature_flags":{"a2a_legacy_compatibility":false}}"#,
+    )
+    .unwrap();
+
+    let reload = admin
+        .post(format!("{}/api/v1/config/reload", h.gateway_base))
+        .send()
+        .await
+        .expect("reload");
+    assert!(reload.status().is_success(), "reload: {}", reload.status());
+
+    let refused = send_without_version().await;
+    assert_eq!(refused.status(), 400, "the carried A2A 1.0-only settings are served");
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32009, "{body}");
+    assert_eq!(body["error"]["data"]["supported"], serde_json::json!(["1.0"]), "{body}");
 }

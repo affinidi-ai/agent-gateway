@@ -127,6 +127,20 @@ describe('resolveVariant', () => {
     });
   });
 
+  it('keeps the base endpoint when a complete override names none, as the gateway does', () => {
+    const base = { target: { endpoint: 'a2a-proxy://worker', auth: { kind: 'none' } } };
+    const out = resolveVariant(base, {
+      complete: true,
+      target: { auth: { kind: 'bearer' } },
+    } as any);
+    expect(out.target).toEqual({ endpoint: 'a2a-proxy://worker', auth: { kind: 'bearer' } });
+    const replaced = resolveVariant(base, {
+      complete: true,
+      target: { endpoint: 'https://v/y' },
+    } as any);
+    expect(replaced.target).toEqual({ endpoint: 'https://v/y' });
+  });
+
   it('drops transit entirely when overrides.transit.disabled is true', () => {
     const base = { transit: { points: [{ name: 'tp1' }], shared: { rate_limit: { rpm: 1 } } } };
     const out = resolveVariant(base, { transit: { disabled: true } });

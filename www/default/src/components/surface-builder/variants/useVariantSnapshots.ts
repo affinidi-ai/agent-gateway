@@ -7,6 +7,8 @@ import {
   type VariantEntryWire,
   type SurfaceOverrides,
 } from './resolve';
+import type { BaseSurfaceView } from '../elements/types';
+import { storedA2aProxyVersions } from '../elements/access-point/a2aSettings';
 
 /**
  * Synthetic id used for the always-present "base" pseudo-variant. The
@@ -98,6 +100,18 @@ export function patchAccessPointCanvasNode(canvas: any, identifiers: Record<stri
  * showing a prefix/suffix that disagrees with the base-synced route and
  * let a later edit recompose `route` from the stale suffix.
  */
+/**
+ * The `a2a` block to sync onto a snapshot. A block without versions (an A2A
+ * proxy base Target's, which carries only the validation level) keeps the
+ * snapshot's own versions, so the stored fixed versions survive a switch.
+ */
+function a2aKeepingVersions(existing: any, incoming: unknown): { a2a?: unknown } {
+  if (!incoming || typeof incoming !== 'object') return {};
+  if (Array.isArray((incoming as any).accepted_versions)) return {};
+  if (!Array.isArray(existing?.accepted_versions)) return {};
+  return { a2a: { ...incoming, accepted_versions: existing.accepted_versions } };
+}
+
 export function syncAccessPointIdentifiers(
   snapshots: Record<string, any>,
   source: any
@@ -133,7 +147,14 @@ export function syncAccessPointIdentifiers(
     }
     let next = snap;
     if (hasSlice && snap.access_point && typeof snap.access_point === 'object') {
-      next = { ...next, access_point: { ...snap.access_point, ...identifiers } };
+      next = {
+        ...next,
+        access_point: {
+          ...snap.access_point,
+          ...identifiers,
+          ...a2aKeepingVersions(snap.access_point.a2a, identifiers.a2a),
+        },
+      };
     }
     if (hasCanvas) {
       const patchedCanvas = patchAccessPointCanvasNode(next.canvas, canvasIdentifiers);
@@ -271,6 +292,29 @@ export interface UseVariantSnapshotsResult {
    * fact and feed it back into `nodesFromSurface`.
    */
   getSnapshot: (variantId: string) => any | undefined;
+  /**
+   * The base surface while a named variant is active, read from the base
+   * snapshot; `undefined` while the base is active, when the canvas is the base.
+   */
+  getBaseSurface: () => BaseSurfaceView | undefined;
+}
+
+/** The base Target endpoint and Access Point canvas config of a base snapshot. */
+export function baseSurfaceFromSnapshot(snapshot: any): BaseSurfaceView {
+  const nodes = snapshot?.canvas?.nodes;
+  const accessPoint = Array.isArray(nodes)
+    ? nodes.find((n: any) => n?.id === 'access-point')
+    : undefined;
+  const blobConfig =
+    accessPoint?.config && typeof accessPoint.config === 'object' ? accessPoint.config : undefined;
+  const locked = storedA2aProxyVersions(snapshot);
+  const accessPointConfig = locked
+    ? { ...(blobConfig ?? {}), a2a_locked_versions: locked }
+    : blobConfig;
+  return {
+    targetEndpoint: snapshot?.target?.endpoint,
+    ...(accessPointConfig ? { accessPointConfig } : {}),
+  };
 }
 
 /**
@@ -396,6 +440,12 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
   const getSnapshot = useCallback((variantId: string): any | undefined => {
     return snapshotsRef.current[variantId];
   }, []);
+
+  const getBaseSurface = useCallback((): BaseSurfaceView | undefined => {
+    if (!activeVariantId || activeVariantId === BASE_VARIANT_ID) return undefined;
+    const base = snapshotsRef.current[BASE_VARIANT_ID];
+    return base ? baseSurfaceFromSnapshot(base) : undefined;
+  }, [activeVariantId]);
 
   const setCatalog = useCallback(
     (next: { variants: VariantMeta[]; defaultVariantId: string | null }) => {
@@ -574,6 +624,7 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
       buildVariantsWireSlice,
       signature,
       getSnapshot,
+      getBaseSurface,
     }),
     [
       variants,
@@ -586,6 +637,7 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
       buildVariantsWireSlice,
       signature,
       getSnapshot,
+      getBaseSurface,
     ]
   );
 }
