@@ -1,0 +1,17 @@
+branch: fix/signed-release-commit
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Sign the release PR commit created by the Prepare release workflow
+      description: >-
+        Prepare release committed with git on the runner and pushed, so the release PR commit
+        was unsigned and could not be merged into main, which requires signed commits. It now
+        creates the commit through the GraphQL createCommitOnBranch API with the release App
+        token, so GitHub signs it and it shows as Verified. The release PR is titled
+        chore(release): prepare vX.Y.Z so its squash merge passes the conventional commit message
+        rule, and RELEASING.md explains that wording edits must be signed or made in the web editor.
+  removed: []
+  security: []
+  breaking: []
