@@ -213,6 +213,7 @@ pub struct ConnectionPointListenerManager {
     starting_listeners: Arc<Mutex<HashSet<String>>>,
     /// Notifies concurrent startup callers when an in-flight startup completes.
     starting_listeners_notify: Arc<Notify>,
+    event_hook: Option<Arc<crate::event_hook::EventHook>>,
 }
 
 /// Command to start a new listener
@@ -253,6 +254,7 @@ impl ConnectionPointListenerManager {
             listeners_active: Arc::new(AtomicBool::new(true)),
             starting_listeners: Arc::new(Mutex::new(HashSet::new())),
             starting_listeners_notify: Arc::new(Notify::new()),
+            event_hook: None,
         })
     }
 
@@ -339,6 +341,18 @@ impl ConnectionPointListenerManager {
     ) -> Self {
         self.bootstrap_config = Some(config);
         self
+    }
+
+    pub fn with_event_hook(
+        mut self,
+        hook: Arc<crate::event_hook::EventHook>,
+    ) -> Self {
+        self.event_hook = Some(hook);
+        self
+    }
+
+    pub(crate) fn event_hook(&self) -> Option<&Arc<crate::event_hook::EventHook>> {
+        self.event_hook.as_ref()
     }
 
     /// Set the network config (for DID domain and WebAuthn settings)
@@ -1542,7 +1556,14 @@ async fn persist_cp_runtime_status<CS: super::ConnectionPointStore>(
         Ok(Some(mut cp)) => {
             cp.runtime_status = Some(runtime.clone());
             if let Err(e) = store.update(&cp).await {
-                warn!("Failed to persist runtime status for connection point '{}': {}", connection_point_id, e);
+                if e.is::<super::ConnectionPointGone>() {
+                    debug!(
+                        "Connection point '{}' was deleted; its runtime status was not persisted",
+                        connection_point_id
+                    );
+                } else {
+                    warn!("Failed to persist runtime status for connection point '{}': {}", connection_point_id, e);
+                }
             }
         }
         Ok(None) => {}
@@ -1721,6 +1742,17 @@ async fn run_websocket_listener<CS: super::ConnectionPointStore + 'static>(
                 .send(client.clone())
                 .await;
             initial_client_sent = true;
+            if connection_point.is_announced()
+                && let Some(hook) = manager_weak
+                    .as_ref()
+                    .and_then(|weak| weak.upgrade())
+                    .and_then(|manager| manager.event_hook().cloned())
+            {
+                hook.emit(
+                    crate::event_hook::EventKind::Connected,
+                    crate::event_hook::ConnectionPointPayload::from_record(connection_point, Some(mediator_did)),
+                );
+            }
         } else if let Some(manager) = manager_weak
             .as_ref()
             .and_then(|weak| weak.upgrade())
@@ -1955,6 +1987,11 @@ async fn create_atm_instance(
         cache_config.as_ref(),
     )
     .await?;
+
+    #[cfg(test)]
+    if super::test_mediator::connects_offline(mediator_did) {
+        return Ok(client);
+    }
 
     client
         .enable_websocket()

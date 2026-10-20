@@ -202,8 +202,125 @@ timeout and redirects disabled, so a redirect cannot lead to an internal address
 
 These sinks do not use the pin-once primitive in [`src/egress.rs`](../src/egress.rs) that
 the forward legs use. The client resolves the host again when it connects, so the checked
-address and the connected address are not bound together. See
-[`POLICY.md`](POLICY.md#egress-and-ssrf-controls) for the sinks that are pinned.
+address and the connected address are not bound together. The [event hook](#event-hook) does
+use it. See [`POLICY.md`](POLICY.md#egress-and-ssrf-controls) for the sinks that are pinned.
+
+## Event hook
+
+The event hook is a notification the gateway sends to one external receiver whenever a
+Connection Point is created, connects or is deleted. The receiver is chosen by whoever deploys the
+gateway (the Deployment operator) and is typically a service running next to it. For example, it can
+register a Connection Point's DID on a mediator that only admits known DIDs, before the gateway
+first connects to that mediator. The hook is not a webhook integration: nothing is stored or
+editable through the dashboard or the management API. It is configured only through environment
+variables, every call is signed with the operator's key, every event carries a process-wide
+`sequence`, and it only ever sends the events below. With `AG_EVENT_HOOK_URL` unset the gateway
+behaves as if the feature did not exist: no calls and no background tasks.
+
+[`src/event_hook/`](../src/event_hook/mod.rs) is the implementation. The request goes through
+`egress::pinned_forward_client`: loopback and private addresses are allowed, cloud-metadata
+addresses are blocked, the resolved address is pinned and redirects are not followed.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AG_EVENT_HOOK_URL` | unset | Receiver endpoint, for example `http://127.0.0.1:8085/hooks/events`. Setting it turns the hook on. It must be an `http` or `https` URL with a host; anything else disables the hook with one error log. |
+| `AG_EVENT_HOOK_SECRET` | unset | HMAC key that signs every call, at least 32 characters after trimming whitespace. Read once at startup through the configuration loaders, like `AG_IDENTITY_HASH_PEPPER`: a plain value or an `env://`, `file://`, `aws_secrets://` or `aws_parameter_store://` reference ([`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#secret-references)). A value that is too short, or a reference that cannot be resolved, disables the hook with one error log that says which of the two it was. Never logged. With no secret the hook stays on and sends unsigned requests, with one startup `warn`. |
+| `AG_EVENT_HOOK_TIMEOUT_MS` | `5000` | HTTP timeout of one delivery attempt. No request waits on it. |
+
+**Events.** Every call is a `POST` with `Content-Type: application/json`. Only Connection Points created through the management API are announced: the temporary Connection Points of the pairing flow and other internally created records never produce `connected` or `deleted`, and a Connection Point stored before it recorded its `mediator_did` is not announced either.
+
+| `event` | Fires |
+| --- | --- |
+| `connection_point.creation_started` | When a Connection Point's DID has been minted, before the gateway first contacts the mediator. |
+| `connection_point.created` | Right after the Connection Point record is saved, before its listener starts. |
+| `connection_point.creation_failed` | When creation ends without a saved record after `creation_started`: an error, a panic, or the request being cancelled (for example the client disconnecting). Every `creation_started` is followed by exactly one of `created` or `creation_failed`. Both exist only once the DID is minted: a request that fails validation earlier emits nothing, and `creation_failed` carries no reason. |
+| `connection_point.connected` | After the Connection Point's listener makes its first successful mediator connection, each time the listener starts (boot, promotion to Active). Reconnects after a dropped socket do not repeat it, and every restart re-announces all live Connection Points. |
+| `connection_point.deleted` | After a Connection Point record has actually been deleted through the Connection Point store, which every deletion path shares: the API, expiry cleanup, system-record cleanup and a gateway delete. A record removed by hand from storage is not reported, and so is a deletion whose record could not be read just before it: the event cannot be built without the record, so the gateway logs a `warn` naming the Connection Point id and the delete still succeeds. |
+
+```json
+{
+  "event": "connection_point.created",
+  "event_id": "b4a782b8-f640-41cf-81ef-951898ca0a6f",
+  "sequence": 1781000000000001,
+  "timestamp": "2026-10-20T09:54:18.904121+00:00",
+  "connection_point": {
+    "id": "c0ffee00-1111-4222-8333-444455556666",
+    "name": "Support line",
+    "description": "Inbound support",
+    "gateway_id": "5b0e8f2a-1c3d-4e5f-8a9b-0c1d2e3f4a5b",
+    "mediator_id": "7d1c2b3a-4f5e-6a7b-8c9d-0e1f2a3b4c5d",
+    "mediator_did": "did:web:mediator.example.com",
+    "did": "did:peer:2.Vz6MkExample.Ez6LSExample.SeyJ0IjoiZG0ifQ",
+    "did_method": "peer",
+    "created_at": "2026-10-20T09:54:18.901857+00:00"
+  }
+}
+```
+
+`description` is omitted when empty. `created_at` is present on events built from a stored record
+(`created`, `connected`, `deleted`) and absent on `creation_started` and `creation_failed`, which
+happen before the record exists. `mediator_did` is stored on the Connection Point when it is
+created, so `deleted` still carries it after the mediator record is removed; a record created
+before that field existed has no `mediator_did` on `deleted`. `sequence` is a process-local
+counter seeded from the clock in microseconds, so it normally increases across restarts, but a clock stepped backwards across a restart can give the new process lower values than the previous one, so treat ordering across restarts as best-effort; `event_id` is
+unique per event and the same for its retries.
+
+**Signing.** With the secret set, every attempt carries a timestamp taken at send time:
+
+```
+X-Webhook-Timestamp: <unix seconds, decimal>
+X-Webhook-Signature-256: sha256=<lowercase hex HMAC-SHA256(secret, "{timestamp}.{raw request body}")>
+```
+
+These are the headers and scheme of the webhook publisher, built by the same function
+([`webhook_signing.rs`](../src/integrations/webhook_signing.rs)), so a receiver can share one
+verifier.
+
+**Delivery.** The hook is a notification. The gateway hands each event to its own background
+task and never waits for the receiver: a slow, down or rejecting receiver has no effect on
+Connection Point creation or deletion, their latency or their result. Delivery uses the schedule
+of integration publishes: the first attempt, then five retries after about 1, 2, 4, 8 and 16
+seconds with jitter. `2xx` accepts. A connection error, timeout, `408`, `425`, `429`, `5xx`, and
+also `401` and `403`, is retried, so a signing-key mismatch stays visible; the `warn` says which
+variable to check. Any other `4xx` is a permanent refusal: it is logged and dropped. An event
+that is still failing after the last retry is dropped with a `warn`. Deliveries are bounded by two
+pools so an unresponsive receiver cannot starve other background work: at most 64 `creation_started`,
+`created`, `creation_failed` and `deleted` deliveries in flight, and a separate 16 for `connected`.
+Beyond its pool an event is dropped with a `warn`. Because a restart announces one `connected` per
+Connection Point, a burst of them during a receiver outage cannot take permits from lifecycle events.
+
+Guarantees, stated plainly:
+
+- Nothing is persisted. An event not yet delivered when the gateway stops or restarts is lost
+  (at-most-once across restarts). The gateway announces `connection_point.connected` for every
+  Connection Point at listener start, which re-reports live Connection Points after a restart,
+  but a deletion lost that way is never reported, so a receiver needs its own reconcile for
+  orphans. The same holds for a `deleted` whose record could not be read, and for a `connected`
+  dropped because its pool was full.
+- Within a process an event is delivered at least once while retries last; a retried delivery may
+  arrive more than once.
+- Events are retried independently, so their delivery order across events is not guaranteed.
+  Receivers must order by `sequence` (or `timestamp`), be idempotent, and tolerate `created` or `connected`
+  arriving before `creation_started`.
+- `creation_started` is emitted before the first mediator contact but delivered in the
+  background, so it can still reach the receiver after the gateway's first call. Until mediator
+  calls are retried, a Connection Point on a mediator that only admits known DIDs can fail its
+  first mediator call with `403` if the receiver has not processed the event yet.
+
+**Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
+`did` field is logged like any DID and masked by the global log redactor. The URL, the secret and
+the signature are never logged.
+
+| Level | Line |
+| --- | --- |
+| `info` | `Event hook configured signed=false timeout_ms=5000` |
+| `warn` | `Event hook is enabled without a signing secret; requests are sent unsigned. Set AG_EVENT_HOOK_SECRET to sign them` |
+| `info` | `Event hook event delivered event="connection_point.creation_failed" sequence=1792490172201530 connection_point_id=4c747a16-5378-46f4-a73d-c3bf55d7fdd2 did=did:peer:2.<...> attempt=1` (`debug` for `connection_point.connected`) |
+| `warn` | `Event hook delivery failed event="connection_point.creation_started" sequence=1792490173523043 connection_point_id=9dd6556a-3b12-408d-82cf-87dba9cf34c4 did=did:peer:2.<...> attempt=1 error=hook answered 503 Service Unavailable` |
+| `warn` | `Event hook event dropped after the last retry event=... attempts=6 error=...` |
+| `warn` | `Event hook rejected an event; dropping it event="connection_point.creation_started" ... status=422 reason="not_eligible"` |
+| `warn` | `Event hook delivery pool is full; dropping the event` |
+| `warn` | `Connection point deleted, but its record could not be read first, so no connection_point.deleted event is sent connection_point_id=...` |
 
 ## Dashboard
 

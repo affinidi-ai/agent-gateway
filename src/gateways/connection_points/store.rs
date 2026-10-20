@@ -5,6 +5,10 @@ use async_trait::async_trait;
 
 use super::types::GatewayConnectionPoint;
 
+#[derive(Debug, thiserror::Error)]
+#[error("connection point {0} no longer exists")]
+pub struct ConnectionPointGone(pub String);
+
 /// Trait for storing and retrieving gateway connection points
 #[async_trait]
 pub trait ConnectionPointStore: Send + Sync {
@@ -29,7 +33,8 @@ pub trait ConnectionPointStore: Send + Sync {
         gateway_id: &str,
     ) -> Result<Vec<GatewayConnectionPoint>>;
 
-    /// Update a connection point
+    /// Creates the record when absent, except that a recently deleted id fails
+    /// with [`ConnectionPointGone`] so a late write cannot resurrect it.
     async fn update(
         &self,
         connection_point: &GatewayConnectionPoint,

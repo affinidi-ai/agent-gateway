@@ -108,6 +108,12 @@ pub struct GatewayConnectionPoint {
     /// recorded a state; omitted from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<crate::comm::connection_health::ConnectionRuntimeStatus>,
+    /// DID of the mediator this connection point was created on. Only the
+    /// management API records it, which makes it the marker for connection
+    /// points the event hook announces; it also keeps hook events correct
+    /// after the mediator record is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mediator_did: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -153,7 +159,12 @@ impl GatewayConnectionPoint {
             enabled: true,
             did_method: ConnectionPointDidMethod::default(),
             runtime_status: None,
+            mediator_did: None,
         }
+    }
+
+    pub fn is_announced(&self) -> bool {
+        self.mediator_did.is_some()
     }
 
     /// The id of the invitation message the mediator serves for this connection point.

@@ -630,6 +630,7 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
     #[cfg(feature = "didwebvh")] Extension(identity_store): Extension<
         Option<std::sync::Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>,
     >,
+    Extension(event_hook): Extension<Option<Arc<crate::event_hook::EventHook>>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(req): Json<CreateConnectionPointRequest>,
@@ -745,6 +746,17 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
     info!("✓ Generated connection point DID: {}", connection_point_did);
     info!("✓ Generated {} key(s) for connection point", cp_secrets.len());
 
+    let minted = crate::event_hook::ConnectionPointPayload::minted(
+        &temp_cp_id,
+        &req.name,
+        &req.description,
+        &req.gateway_id,
+        &req.mediator_id,
+        &mediator.did,
+        &connection_point_did,
+    );
+    let creation = crate::event_hook::CreationGuard::start(event_hook.clone(), minted);
+
     // Calculate expiry time (default 24 hours if not specified)
     let expiry_seconds = req
         .expiry_seconds
@@ -845,6 +857,7 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
 
     // Override the generated ID with our temp_cp_id to match where keys were stored
     connection_point.id = temp_cp_id;
+    connection_point.mediator_did = Some(mediator.did.clone());
 
     // Apply DID method preference
     connection_point.did_method = req
@@ -860,6 +873,7 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
             error!("Failed to create connection point: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create connection point: {}", e))
         })?;
+    creation.created(crate::event_hook::ConnectionPointPayload::from_record(&connection_point, Some(&mediator.did)));
 
     info!(
         "Connection point created successfully: ID={}, Gateway={}, Mediator={}, OOB_ID={}, URL={}",
@@ -1017,6 +1031,11 @@ async fn create_oob_invitation(
     info!("  Goal: {}", goal);
     info!("  Expiry: {:?}", expiry);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    #[cfg(test)]
+    if let Some(outcome) = super::test_mediator::oob_invitation(mediator_did) {
+        return outcome;
+    }
 
     // Initialize TDK Shared State with default configuration
     // Note: In production, this should be initialized once at startup and reused
@@ -1233,9 +1252,16 @@ pub async fn use_connection_point<S: ConnectionPointStore>(
     store
         .update(&connection_point)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
+        .map_err(update_error)?;
 
     Ok(Json(connection_point))
+}
+
+fn update_error(error: anyhow::Error) -> (StatusCode, String) {
+    if error.is::<super::ConnectionPointGone>() {
+        return (StatusCode::NOT_FOUND, "Connection point not found".to_string());
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", error))
 }
 
 /// Request body for updating connection point basic information
@@ -1285,7 +1311,7 @@ pub async fn update_connection_point<S: ConnectionPointStore>(
     store
         .update(&connection_point)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
+        .map_err(update_error)?;
 
     // Update listener name if it changed
     if name_changed
@@ -1363,7 +1389,7 @@ pub async fn update_connection_point_exposed_channels<S: ConnectionPointStore>(
     store
         .update(&connection_point)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
+        .map_err(update_error)?;
 
     if connection_point
         .exposed_channels
@@ -1596,7 +1622,7 @@ pub async fn reconnect_connection_point<P: ConnectionPointStore, M: MediatorStor
     cp_store
         .update(&connection_point)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update connection point: {}", e)))?;
+        .map_err(update_error)?;
 
     // Restart the listener on this node (safe if it is not currently running).
     let _ = listener_manager
@@ -1769,9 +1795,43 @@ pub async fn serve_connection_point_did_witness<P: ConnectionPointStore>(
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_connection_point_identity_webvh, load_connection_point_secrets};
+    use super::{generate_connection_point_identity_webvh, load_connection_point_secrets, update_error};
+    use crate::gateways::connection_points::ConnectionPointStore;
     use axum::http::StatusCode;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn updating_a_connection_point_deleted_meanwhile_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::gateways::connection_points::FileSystemConnectionPointStore::new(tmp.path().join("cps"))
+            .await
+            .unwrap();
+        let cp = connection_point_for("gw-1");
+        store
+            .create(&cp)
+            .await
+            .unwrap();
+        store
+            .delete(&cp.id)
+            .await
+            .unwrap();
+
+        let error = store
+            .update(&cp)
+            .await
+            .map_err(update_error)
+            .unwrap_err();
+
+        assert_eq!(error, (StatusCode::NOT_FOUND, "Connection point not found".to_string()));
+    }
+
+    #[test]
+    fn other_update_failures_stay_internal_errors() {
+        let (status, body) = update_error(anyhow::anyhow!("disk full"));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("disk full"));
+    }
 
     // === Connection Point Identity Tests ===
     /// key_0.json, key_1.json, key_2.json must be written to the storage directory.
@@ -2358,7 +2418,8 @@ mod tests {
             .layer(Extension(Arc::new(listener_manager)))
             .layer(Extension(None::<Arc<crate::integrations::FileSystemNotificationStore>>))
             .layer(Extension(None::<Arc<dyn crate::storage::DidLogStorage>>))
-            .layer(Extension(None::<Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>));
+            .layer(Extension(None::<Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>))
+            .layer(Extension(None::<Arc<crate::event_hook::EventHook>>));
         if let Some(tenant) = tenant {
             router = router.layer(Extension(tenant));
         }

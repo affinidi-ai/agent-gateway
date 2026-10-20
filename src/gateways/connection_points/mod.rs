@@ -5,6 +5,8 @@ pub mod handlers;
 pub mod message_processor;
 pub mod messages;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_mediator;
 pub mod types;
 pub mod webhook;
 pub mod ws_listener;
@@ -20,6 +22,6 @@ pub use message_processor::{
     init_transaction_store, init_trust_registry_listener_manager, init_vc_issuer, init_ws_state,
 };
 pub use messages::{MessageStore, ReceivedMessage};
-pub use store::ConnectionPointStore;
+pub use store::{ConnectionPointGone, ConnectionPointStore};
 pub use types::ConnectionPointType;
 pub use ws_listener::{ConnectionPointListenerManager, ConnectionStatus};

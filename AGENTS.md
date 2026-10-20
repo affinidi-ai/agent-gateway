@@ -162,7 +162,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Source auth, managed identity, Trust Recorder                                  | [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md)                         |
 | Credential providers, delegation vault, consent modes                          | [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md)     |
 | Terms, acceptance, consent-pending sessions                                    | [`docs/TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md)             |
-| Integrations, events, notifications                                            | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)                       |
+| Integrations, events, notifications, the event hook                            | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)                       |
 
 # Ways of working
 

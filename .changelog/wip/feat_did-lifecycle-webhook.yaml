@@ -1,0 +1,17 @@
+branch: feat/did-lifecycle-webhook
+changes:
+  added:
+    - timestamp: '2026-10-20T00:00:00.000Z'
+      title: Notify a receiver of Connection Point events through an event hook
+      description: When AG_EVENT_HOOK_URL is set, the gateway POSTs JSON events to that endpoint for each Connection Point - connection_point.creation_started (DID minted, before the first mediator contact), created, creation_failed (also when the request is cancelled), connected (first mediator connection of each listener start) and deleted (every deletion path). Each event is delivered from its own background task and never delays or fails the request; it is retried like an integration publish (five retries after about 1, 2, 4, 8 and 16 seconds, including on 401 and 403) and then dropped, and a permanent 4xx is logged and dropped. Lifecycle events and connected use separate delivery pools so a restart burst of connected cannot starve them. Nothing is persisted, so events not yet delivered are lost on restart. AG_EVENT_HOOK_SECRET (at least 32 characters, plain or an env://, file:// or aws_secrets:// reference) signs every call with X-Webhook-Timestamp and X-Webhook-Signature-256, and AG_EVENT_HOOK_TIMEOUT_MS (default 5000) bounds one attempt. Only Connection Points created through the management API are announced, and the hook URL must be an http or https URL with a host. creation_started and creation_failed exist only once the DID is minted, and creation_failed carries no reason. connected fires on a listener's first connection after each start, and every restart re-announces live Connection Points. Delivery order across events is not guaranteed, so receivers must order by the clock-seeded sequence (best-effort across restarts, since a backwards clock step can lower it) and be idempotent. A stored Connection Point now records the mediator_did it was created on. See docs/INTEGRATIONS.md.
+  changed:
+    - timestamp: '2026-10-20T00:00:00.000Z'
+      title: Share webhook signing between integrations and the event hook
+      description: Real webhook integration deliveries, the dashboard's Test notifier action and the event hook now compute the X-Webhook-Signature-256 value through one shared function. Signatures are unchanged.
+  fixed:
+    - timestamp: '2026-10-20T00:00:00.000Z'
+      title: Stop a deleted Connection Point from reappearing after deletion
+      description: A listener shutting down while its Connection Point was being deleted could write its runtime status back and recreate the record, which then counted against the appliance limit and was reloaded at restart. Updating a Connection Point this gateway deleted moments ago is now refused, and creates, updates and deletes of one Connection Point are serialised. A management request that updates a Connection Point deleted at the same moment now returns 404 Not Found instead of 500.
+  removed: []
+  security: []
+  breaking: []

@@ -252,6 +252,9 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
   remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
   construction, resolve/pin on `spawn_blocking` off the async runtime).
+- `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
+  the operator-configured `AG_EVENT_HOOK_URL` ([`INTEGRATIONS.md`](INTEGRATIONS.md#event-hook)):
+  loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
   (`src/proxy/handler.rs::fetch_agent_card_from_surface_target`), so the
