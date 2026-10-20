@@ -100,13 +100,6 @@ impl EventHook {
         kind: EventKind,
         connection_point: ConnectionPointPayload,
     ) {
-        let event = HookEvent {
-            event: kind,
-            event_id: uuid::Uuid::new_v4().to_string(),
-            sequence: self.next_sequence(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            connection_point,
-        };
         let (pool, capacity) = match kind {
             EventKind::Connected => (&self.connected_permits, MAX_IN_FLIGHT_CONNECTED_DELIVERIES),
             _ => (&self.lifecycle_permits, MAX_IN_FLIGHT_LIFECYCLE_DELIVERIES),
@@ -117,8 +110,7 @@ impl EventHook {
         else {
             warn!(
                 event = kind.as_str(),
-                sequence = event.sequence,
-                connection_point_id = %event.connection_point.id,
+                connection_point_id = %connection_point.id,
                 capacity,
                 "Event hook delivery pool is full; dropping the event"
             );
@@ -127,11 +119,17 @@ impl EventHook {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             warn!(
                 event = kind.as_str(),
-                sequence = event.sequence,
-                connection_point_id = %event.connection_point.id,
+                connection_point_id = %connection_point.id,
                 "Event hook has no async runtime to deliver on; dropping the event"
             );
             return;
+        };
+        let event = HookEvent {
+            event: kind,
+            event_id: uuid::Uuid::new_v4().to_string(),
+            sequence: self.next_sequence(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            connection_point,
         };
         let hook = self.clone();
         runtime.spawn(async move {
@@ -177,6 +175,33 @@ impl CreationGuard {
             hook.emit(EventKind::CreationStarted, minted.clone());
         }
         Self { hook, minted, armed: true }
+    }
+
+    /// Runs `create` to completion on its own task and reports `created` when it
+    /// succeeds, so dropping the caller mid-write cannot report `creation_failed`
+    /// for a record that was stored. A failure drops the guard and reports
+    /// `creation_failed`.
+    pub async fn complete<T, E, F>(
+        self,
+        create: F,
+        saved: ConnectionPointPayload,
+    ) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        let task = tokio::spawn(async move {
+            let outcome = create.await;
+            if outcome.is_ok() {
+                self.created(saved);
+            }
+            outcome
+        });
+        match task.await {
+            Ok(outcome) => outcome,
+            Err(join) => std::panic::resume_unwind(join.into_panic()),
+        }
     }
 
     pub fn created(
@@ -353,6 +378,28 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(5)).await;
         let restarted = self::hook("http://127.0.0.1:1/hook".into(), None);
         assert!(restarted.next_sequence() > second, "a new process starts above the old one");
+    }
+
+    #[tokio::test]
+    async fn events_dropped_before_scheduling_take_no_sequence_number() {
+        let hook = EventHook::with_capacity(
+            EventHookSettings {
+                hook_url: Some("http://127.0.0.1:1/hook".into()),
+                ..EventHookSettings::default()
+            },
+            0,
+            0,
+        )
+        .unwrap();
+        for _ in 0..4 {
+            hook.emit(EventKind::Connected, payload());
+            hook.emit(EventKind::Deleted, payload());
+        }
+        assert_eq!(
+            hook.sequence
+                .load(Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]
@@ -626,6 +673,47 @@ mod tests {
         );
         wait_for(&captured, 2).await;
         assert!(kinds(&captured).contains(&"connection_point.creation_failed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_completed_write_reports_created_even_when_the_caller_is_dropped() {
+        let (url, captured) = serve(204, "").await;
+        let hook = hook(url, None);
+        let wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = wrote.clone();
+        let caller = CreationGuard::start(Some(hook), payload()).complete(
+            async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                flag.store(true, Ordering::SeqCst);
+                Ok::<_, String>(())
+            },
+            payload(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), caller)
+                .await
+                .is_err()
+        );
+        wait_for(&captured, 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(wrote.load(Ordering::SeqCst));
+        let mut seen = kinds(&captured);
+        seen.sort();
+        assert_eq!(seen, vec!["connection_point.created", "connection_point.creation_started"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_reports_creation_failed_and_returns_the_error() {
+        let (url, captured) = serve(204, "").await;
+        let hook = hook(url, None);
+        let outcome = CreationGuard::start(Some(hook), payload())
+            .complete(async { Err::<(), _>("disk full") }, payload())
+            .await;
+        assert_eq!(outcome, Err("disk full"));
+        wait_for(&captured, 2).await;
+        let mut seen = kinds(&captured);
+        seen.sort();
+        assert_eq!(seen, vec!["connection_point.creation_failed", "connection_point.creation_started"]);
     }
 
     #[tokio::test]

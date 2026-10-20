@@ -234,8 +234,8 @@ addresses are blocked, the resolved address is pinned and redirects are not foll
 | `connection_point.creation_started` | When a Connection Point's DID has been minted, before the gateway first contacts the mediator. |
 | `connection_point.created` | Right after the Connection Point record is saved, before its listener starts. |
 | `connection_point.creation_failed` | When creation ends without a saved record after `creation_started`: an error, a panic, or the request being cancelled (for example the client disconnecting). Every `creation_started` is followed by exactly one of `created` or `creation_failed`. Both exist only once the DID is minted: a request that fails validation earlier emits nothing, and `creation_failed` carries no reason. |
-| `connection_point.connected` | After the Connection Point's listener makes its first successful mediator connection, each time the listener starts (boot, promotion to Active). Reconnects after a dropped socket do not repeat it, and every restart re-announces all live Connection Points. |
-| `connection_point.deleted` | After a Connection Point record has actually been deleted through the Connection Point store, which every deletion path shares: the API, expiry cleanup, system-record cleanup and a gateway delete. A record removed by hand from storage is not reported, and so is a deletion whose record could not be read just before it: the event cannot be built without the record, so the gateway logs a `warn` naming the Connection Point id and the delete still succeeds. |
+| `connection_point.connected` | After the Connection Point's listener makes its first successful mediator connection, each time the listener starts (boot, promotion to Active). The payload is read from the stored record at that moment, so a rename made while the listener connected is reflected, and nothing is sent when the record was deleted meanwhile. Reconnects after a dropped socket do not repeat it, and every restart re-announces all live Connection Points. |
+| `connection_point.deleted` | After a Connection Point record has actually been deleted through the Connection Point store: the API delete and expiry cleanup. Deleting a gateway does not delete its User Connection Points, so it emits nothing for them. A record removed by hand from storage is not reported, and neither is a deletion whose record could not be read just before it: the event cannot be built without the record, so the gateway logs a `warn` naming the Connection Point id and the delete still succeeds. |
 
 ```json
 {
@@ -262,7 +262,7 @@ addresses are blocked, the resolved address is pinned and redirects are not foll
 happen before the record exists. `mediator_did` is stored on the Connection Point when it is
 created, so `deleted` still carries it after the mediator record is removed; a record created
 before that field existed has no `mediator_did` on `deleted`. `sequence` is a process-local
-counter seeded from the clock in microseconds, so it normally increases across restarts, but a clock stepped backwards across a restart can give the new process lower values than the previous one, so treat ordering across restarts as best-effort; `event_id` is
+counter seeded from the clock in microseconds, so it normally increases across restarts, but a clock stepped backwards across a restart can give the new process lower values than the previous one, so treat ordering across restarts as best-effort. `sequence` is for ordering only: an event dropped because its pool is full or because no runtime is available takes no number, but the clock reseed after a restart can skip numbers, so receivers must not treat gaps as errors or as lost events; `event_id` is
 unique per event and the same for its retries.
 
 **Signing.** With the secret set, every attempt carries a timestamp taken at send time:
@@ -282,7 +282,7 @@ Connection Point creation or deletion, their latency or their result. Delivery u
 of integration publishes: the first attempt, then five retries after about 1, 2, 4, 8 and 16
 seconds with jitter. `2xx` accepts. A connection error, timeout, `408`, `425`, `429`, `5xx`, and
 also `401` and `403`, is retried, so a signing-key mismatch stays visible; the `warn` says which
-variable to check. Any other `4xx` is a permanent refusal: it is logged and dropped. An event
+variable to check. Any other `4xx` is a permanent refusal: it is logged and dropped. A `3xx` is also a permanent refusal, because redirects are never followed; the `warn` tells the operator to set `AG_EVENT_HOOK_URL` to the final URL. An event
 that is still failing after the last retry is dropped with a `warn`. Deliveries are bounded by two
 pools so an unresponsive receiver cannot starve other background work: at most 64 `creation_started`,
 `created`, `creation_failed` and `deleted` deliveries in flight, and a separate 16 for `connected`.

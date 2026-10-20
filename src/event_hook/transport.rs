@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 
-use super::config::{ENV_HOOK_SECRET, HookSecret};
+use super::config::{ENV_HOOK_SECRET, ENV_HOOK_URL, HookSecret};
 
 const REJECTION_BODY_LIMIT: usize = 4 * 1024;
 const REASON_MAX_LEN: usize = 64;
@@ -83,6 +83,14 @@ async fn classify(
             format!("the receiver requires a signature; set `{ENV_HOOK_SECRET}` to the key the receiver verifies with")
         };
         return HookOutcome::retry(format!("hook answered {status}: {hint}"));
+    }
+    if status.is_redirection() {
+        return HookOutcome::Rejected {
+            status: status.as_u16(),
+            reason: Some(format!(
+                "the receiver answered with a redirect; redirects are not followed, set `{ENV_HOOK_URL}` to the final URL"
+            )),
+        };
     }
     if is_retryable(status) {
         return HookOutcome::retry(format!("hook answered {status}"));
@@ -248,6 +256,27 @@ pub(crate) mod tests {
                 matches!(outcome, HookOutcome::Rejected { status: got, .. } if got == status),
                 "status {status}: {outcome:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_are_permanent_rejections_with_a_redactor_safe_hint() {
+        for status in [301u16, 302, 307, 308] {
+            let (url, captured) = serve(status, "").await;
+            match post_json(&url, "{}", Duration::from_secs(5), None).await {
+                HookOutcome::Rejected { status: got, reason } => {
+                    assert_eq!(got, status);
+                    let reason = reason.expect("a hint");
+                    assert!(reason.contains("redirects are not followed"), "{reason}");
+                    assert!(reason.contains("AG_EVENT_HOOK_URL"), "{reason}");
+                    let logged = example_redactor()
+                        .redact(&reason)
+                        .into_owned();
+                    assert_eq!(logged, reason, "mangled by the log redactor: {logged}");
+                }
+                other => panic!("status {status}: {other:?}"),
+            }
+            assert_eq!(captured.lock().unwrap().len(), 1);
         }
     }
 

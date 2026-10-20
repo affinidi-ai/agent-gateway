@@ -22,6 +22,6 @@ pub use message_processor::{
     init_transaction_store, init_trust_registry_listener_manager, init_vc_issuer, init_ws_state,
 };
 pub use messages::{MessageStore, ReceivedMessage};
-pub use store::{ConnectionPointGone, ConnectionPointStore};
+pub use store::ConnectionPointStore;
 pub use types::ConnectionPointType;
 pub use ws_listener::{ConnectionPointListenerManager, ConnectionStatus};

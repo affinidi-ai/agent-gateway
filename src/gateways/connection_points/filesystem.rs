@@ -16,74 +16,6 @@ pub struct FileSystemConnectionPointStore {
     storage: Box<dyn StorageBackend<GatewayConnectionPoint>>,
     event_hook: std::sync::OnceLock<std::sync::Arc<crate::event_hook::EventHook>>,
     id_locks: dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
-    deleted: std::sync::Mutex<RecentlyDeleted>,
-}
-
-const DELETED_MEMORY_CAPACITY: usize = 1024;
-const DELETED_MEMORY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-
-struct RecentlyDeleted {
-    entries: std::collections::VecDeque<(String, std::time::Instant)>,
-    capacity: usize,
-    ttl: std::time::Duration,
-}
-
-impl RecentlyDeleted {
-    fn new(
-        capacity: usize,
-        ttl: std::time::Duration,
-    ) -> Self {
-        Self {
-            entries: std::collections::VecDeque::new(),
-            capacity,
-            ttl,
-        }
-    }
-
-    fn expire(
-        &mut self,
-        now: std::time::Instant,
-    ) {
-        while self
-            .entries
-            .front()
-            .is_some_and(|(_, at)| now.duration_since(*at) >= self.ttl)
-        {
-            self.entries.pop_front();
-        }
-    }
-
-    fn record(
-        &mut self,
-        id: &str,
-        now: std::time::Instant,
-    ) {
-        self.expire(now);
-        self.entries
-            .push_back((id.to_string(), now));
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
-        }
-    }
-
-    fn contains(
-        &mut self,
-        id: &str,
-        now: std::time::Instant,
-    ) -> bool {
-        self.expire(now);
-        self.entries
-            .iter()
-            .any(|(entry, _)| entry == id)
-    }
-
-    fn forget(
-        &mut self,
-        id: &str,
-    ) {
-        self.entries
-            .retain(|(entry, _)| entry != id);
-    }
 }
 
 struct IdLockGuard<'a> {
@@ -116,7 +48,6 @@ impl FileSystemConnectionPointStore {
             storage,
             event_hook: std::sync::OnceLock::new(),
             id_locks: dashmap::DashMap::new(),
-            deleted: std::sync::Mutex::new(RecentlyDeleted::new(DELETED_MEMORY_CAPACITY, DELETED_MEMORY_TTL)),
         })
     }
 
@@ -136,12 +67,6 @@ impl FileSystemConnectionPointStore {
             .clone();
         guard.guard = Some(lock.lock_owned().await);
         guard
-    }
-
-    fn deleted_memory(&self) -> std::sync::MutexGuard<'_, RecentlyDeleted> {
-        self.deleted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn set_event_hook(
@@ -307,10 +232,7 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
             .lock_id(&connection_point.id)
             .await;
         self.save_and_revoke(connection_point)
-            .await?;
-        self.deleted_memory()
-            .forget(&connection_point.id);
-        Ok(())
+            .await
     }
 
     async fn get(
@@ -361,14 +283,28 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         let _guard = self
             .lock_id(&connection_point.id)
             .await;
-        if self
-            .deleted_memory()
-            .contains(&connection_point.id, std::time::Instant::now())
-        {
-            return Err(super::store::ConnectionPointGone(connection_point.id.clone()).into());
-        }
         self.save_and_revoke(connection_point)
             .await
+    }
+
+    async fn update_if_exists(
+        &self,
+        connection_point: &GatewayConnectionPoint,
+    ) -> Result<bool> {
+        let _guard = self
+            .lock_id(&connection_point.id)
+            .await;
+        if self
+            .storage
+            .get(&connection_point.id)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.save_and_revoke(connection_point)
+            .await?;
+        Ok(true)
     }
 
     async fn delete(
@@ -380,8 +316,6 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
         self.storage
             .delete(id)
             .await?;
-        self.deleted_memory()
-            .record(id, std::time::Instant::now());
         if let Some(hook) = self.event_hook.get() {
             match &previous {
                 Ok(Some(record)) if record.is_announced() => hook.emit(
@@ -539,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_update_after_a_delete_does_not_resurrect_the_record() {
+    async fn update_if_exists_after_a_delete_does_not_resurrect_the_record() {
         let dir = TempDir::new().unwrap();
         let cps = dir.path().join("cps");
         let store = FileSystemConnectionPointStore::new(cps.clone())
@@ -560,16 +494,12 @@ mod tests {
             .await
             .unwrap();
 
-        let refusal = store
-            .update(&stale)
-            .await
-            .expect_err("updating a deleted record is refused");
-        assert_eq!(
-            refusal
-                .downcast_ref::<super::super::store::ConnectionPointGone>()
-                .map(|gone| gone.0.as_str()),
-            Some(cp.id.as_str()),
-            "the refusal is the typed 'gone' error"
+        assert!(
+            !store
+                .update_if_exists(&stale)
+                .await
+                .unwrap(),
+            "nothing is written for a deleted record"
         );
         assert!(
             store
@@ -599,7 +529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_updates_and_a_delete_leave_the_record_gone() {
+    async fn concurrent_conditional_updates_and_a_delete_leave_the_record_gone() {
         let dir = TempDir::new().unwrap();
         let store = std::sync::Arc::new(
             FileSystemConnectionPointStore::new(dir.path().join("cps"))
@@ -617,7 +547,9 @@ mod tests {
             let cp = cp.clone();
             updaters.push(tokio::spawn(async move {
                 for _ in 0..20 {
-                    let _ = store.update(&cp).await;
+                    let _ = store
+                        .update_if_exists(&cp)
+                        .await;
                     tokio::task::yield_now().await;
                 }
             }));
@@ -639,7 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn updating_an_existing_record_still_persists_the_change() {
+    async fn update_if_exists_writes_an_existing_record() {
         let dir = TempDir::new().unwrap();
         let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
             .await
@@ -650,10 +582,12 @@ mod tests {
             .await
             .unwrap();
         cp.name = "renamed".to_string();
-        store
-            .update(&cp)
-            .await
-            .unwrap();
+        assert!(
+            store
+                .update_if_exists(&cp)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get(&cp.id)
@@ -848,7 +782,6 @@ mod tests {
             storage: Box::new(UnreadableStorage(inner.storage)),
             event_hook: std::sync::OnceLock::new(),
             id_locks: dashmap::DashMap::new(),
-            deleted: std::sync::Mutex::new(RecentlyDeleted::new(DELETED_MEMORY_CAPACITY, DELETED_MEMORY_TTL)),
         };
         store.set_event_hook(hook_for(url));
 
@@ -969,31 +902,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creating_a_deleted_id_again_lifts_the_update_refusal() {
-        let dir = TempDir::new().unwrap();
-        let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
-            .await
-            .unwrap();
-        let cp = sample_cp();
-        store
-            .create(&cp)
-            .await
-            .unwrap();
-        store
-            .delete(&cp.id)
-            .await
-            .unwrap();
-        store
-            .create(&cp)
-            .await
-            .unwrap();
-        store
-            .update(&cp)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn a_held_lock_on_one_id_does_not_block_another_and_is_released_afterwards() {
         let dir = TempDir::new().unwrap();
         let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
@@ -1069,21 +977,5 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-    }
-
-    #[test]
-    fn recently_deleted_ids_expire_and_are_bounded() {
-        let start = std::time::Instant::now();
-        let mut memory = RecentlyDeleted::new(2, std::time::Duration::from_secs(10));
-        memory.record("a", start);
-        assert!(memory.contains("a", start + std::time::Duration::from_secs(9)));
-        assert!(!memory.contains("a", start + std::time::Duration::from_secs(10)));
-
-        memory.record("a", start);
-        memory.record("b", start);
-        memory.record("c", start);
-        assert!(!memory.contains("a", start), "the oldest entry is evicted past the capacity");
-        assert!(memory.contains("b", start));
-        assert!(memory.contains("c", start));
     }
 }

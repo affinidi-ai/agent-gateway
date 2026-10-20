@@ -1555,19 +1555,43 @@ async fn persist_cp_runtime_status<CS: super::ConnectionPointStore>(
     {
         Ok(Some(mut cp)) => {
             cp.runtime_status = Some(runtime.clone());
-            if let Err(e) = store.update(&cp).await {
-                if e.is::<super::ConnectionPointGone>() {
-                    debug!(
-                        "Connection point '{}' was deleted; its runtime status was not persisted",
-                        connection_point_id
-                    );
-                } else {
-                    warn!("Failed to persist runtime status for connection point '{}': {}", connection_point_id, e);
+            match store
+                .update_if_exists(&cp)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => debug!(
+                    "Connection point '{}' record no longer exists; its runtime status was not persisted",
+                    connection_point_id
+                ),
+                Err(e) => {
+                    warn!("Failed to persist runtime status for connection point '{}': {}", connection_point_id, e)
                 }
             }
         }
         Ok(None) => {}
         Err(e) => warn!("Failed to load connection point '{}' for runtime status persist: {}", connection_point_id, e),
+    }
+}
+
+/// The stored record to announce in place of the listener's start-time
+/// snapshot, or `None` when it was deleted while the listener connected.
+async fn current_announced_record<CS: super::ConnectionPointStore>(
+    cp_store: &Option<Arc<CS>>,
+    snapshot: &GatewayConnectionPoint,
+) -> Option<GatewayConnectionPoint> {
+    let Some(store) = cp_store else {
+        return Some(snapshot.clone());
+    };
+    match store.get(&snapshot.id).await {
+        Ok(Some(current)) => current
+            .is_announced()
+            .then_some(current),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("Failed to reload connection point '{}' for its connected event: {}", snapshot.id, e);
+            Some(snapshot.clone())
+        }
     }
 }
 
@@ -1747,10 +1771,11 @@ async fn run_websocket_listener<CS: super::ConnectionPointStore + 'static>(
                     .as_ref()
                     .and_then(|weak| weak.upgrade())
                     .and_then(|manager| manager.event_hook().cloned())
+                && let Some(current) = current_announced_record(&cp_store, connection_point).await
             {
                 hook.emit(
                     crate::event_hook::EventKind::Connected,
-                    crate::event_hook::ConnectionPointPayload::from_record(connection_point, Some(mediator_did)),
+                    crate::event_hook::ConnectionPointPayload::from_record(&current, Some(mediator_did)),
                 );
             }
         } else if let Some(manager) = manager_weak
@@ -5547,5 +5572,113 @@ mod restart_listener_tests {
             .await;
 
         assert_eq!(result.err().as_deref(), Some("Connection point 'cp-1' has no running listener; not restarting it"));
+    }
+}
+
+#[cfg(test)]
+mod connected_event_tests {
+    use std::sync::Arc;
+
+    use super::{current_announced_record, persist_cp_runtime_status};
+    use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
+    use crate::gateways::connection_points::{ConnectionPointStore, FileSystemConnectionPointStore};
+
+    fn announced_cp() -> GatewayConnectionPoint {
+        let mut cp = GatewayConnectionPoint::new(
+            "gw-1".to_string(),
+            "did:example:mediator".to_string(),
+            "did:example:cp".to_string(),
+            "CP".to_string(),
+            "desc".to_string(),
+            "oob-1".to_string(),
+            "https://oob.example".to_string(),
+            serde_json::json!({}),
+            None,
+            ConnectionPointType::User,
+            "secret".to_string(),
+        );
+        cp.mediator_did = Some("did:example:mediator".to_string());
+        cp
+    }
+
+    async fn store_with(
+        cp: &GatewayConnectionPoint
+    ) -> (tempfile::TempDir, Option<Arc<FileSystemConnectionPointStore>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
+            .await
+            .unwrap();
+        store
+            .create(cp)
+            .await
+            .unwrap();
+        (dir, Some(Arc::new(store)))
+    }
+
+    #[tokio::test]
+    async fn a_record_deleted_while_connecting_is_not_announced() {
+        let cp = announced_cp();
+        let (_dir, store) = store_with(&cp).await;
+        store
+            .as_ref()
+            .unwrap()
+            .delete(&cp.id)
+            .await
+            .unwrap();
+
+        assert!(
+            current_announced_record(&store, &cp)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_announced_record_is_the_current_one() {
+        let cp = announced_cp();
+        let (_dir, store) = store_with(&cp).await;
+        let mut renamed = cp.clone();
+        renamed.name = "renamed".to_string();
+        store
+            .as_ref()
+            .unwrap()
+            .update(&renamed)
+            .await
+            .unwrap();
+
+        let current = current_announced_record(&store, &cp)
+            .await
+            .unwrap();
+
+        assert_eq!(current.name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn persisting_runtime_status_does_not_recreate_a_deleted_record() {
+        let cp = announced_cp();
+        let (_dir, store) = store_with(&cp).await;
+        let runtime = crate::comm::connection_health::ConnectionRuntimeStatus::default();
+        persist_cp_runtime_status(&store, &cp.id, &runtime).await;
+        let live = store.as_ref().unwrap();
+        assert!(
+            live.get(&cp.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .runtime_status
+                .is_some()
+        );
+        live.delete(&cp.id)
+            .await
+            .unwrap();
+
+        persist_cp_runtime_status(&store, &cp.id, &runtime).await;
+
+        assert!(
+            live.get(&cp.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

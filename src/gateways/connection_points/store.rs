@@ -5,10 +5,6 @@ use async_trait::async_trait;
 
 use super::types::GatewayConnectionPoint;
 
-#[derive(Debug, thiserror::Error)]
-#[error("connection point {0} no longer exists")]
-pub struct ConnectionPointGone(pub String);
-
 /// Trait for storing and retrieving gateway connection points
 #[async_trait]
 pub trait ConnectionPointStore: Send + Sync {
@@ -33,12 +29,30 @@ pub trait ConnectionPointStore: Send + Sync {
         gateway_id: &str,
     ) -> Result<Vec<GatewayConnectionPoint>>;
 
-    /// Creates the record when absent, except that a recently deleted id fails
-    /// with [`ConnectionPointGone`] so a late write cannot resurrect it.
+    /// Update a connection point, creating the record when it is absent
     async fn update(
         &self,
         connection_point: &GatewayConnectionPoint,
     ) -> Result<()>;
+
+    /// Update a connection point only when its record still exists, returning
+    /// whether it was written. A record deleted in the meantime is not recreated.
+    /// The default checks then writes; stores that can make the two atomic override it.
+    async fn update_if_exists(
+        &self,
+        connection_point: &GatewayConnectionPoint,
+    ) -> Result<bool> {
+        if self
+            .get(&connection_point.id)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.update(connection_point)
+            .await?;
+        Ok(true)
+    }
 
     /// Delete a connection point
     async fn delete(
