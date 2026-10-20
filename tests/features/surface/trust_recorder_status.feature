@@ -44,6 +44,18 @@ Feature: Trust Recorder status on the Identities dashboard
     Then the admin API response status is 200
     And the Managed Agent identity shows Trust Recorder status "not_attempted"
 
+  Scenario: Changing a surface's Trust Recorder clears its status until the next response
+    Given A2A surface "oxygen" is defined for route "/oxygen" with managed agent "bravo" as its target
+    And the surface has managed identity enabled
+    And managed agent "bravo" response contains the agent-identity extension
+    And the surface has a Trust Recorder for trust registry "missing-registry" with issuer "did:web:example.com:issuer"
+    And the caller has sent a request to the surface
+    And within ten seconds the Managed Agent identity has shown Trust Recorder status "skipped"
+    And surface "oxygen" later gets a Trust Recorder for an unconnected trust registry with issuer "did:web:example.com:issuer"
+    When the operator reads the Identities dashboard
+    Then the admin API response status is 200
+    And the Managed Agent identity shows Trust Recorder status "not_attempted"
+
   Scenario: A surface without a Trust Recorder shows no recorder status
     Given A2A surface "oxygen" is defined for route "/oxygen" with managed agent "bravo" as its target
     And the surface has managed identity enabled

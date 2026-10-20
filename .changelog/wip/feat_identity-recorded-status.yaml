@@ -3,7 +3,7 @@ changes:
   added:
     - timestamp: '2026-10-16T00:00:00Z'
       title: Show the Trust Recorder status on identities and the recorder panel
-      description: The Identities page now shows a Recorded, Partly recorded, Failed, Skipped or Not attempted yet chip for each managed agent whose surface has a Trust Recorder, with a tooltip naming the registry, the reason and the record counts, and a Recorder filter. The Trust Recorder panel shows a Last outcome row. The status is the recorder's last known outcome, kept per surface and agent, saved only when it changes, and follows live updates. It carries codes, counts and times only, never registry error text.
+      description: The Identities page now shows a Recorded, Partly recorded, Failed, Skipped or Not attempted yet chip for each managed agent whose surface has a Trust Recorder, with a tooltip naming the registry, the reason and the record counts, and a Recorder filter. The Trust Recorder panel shows a Last outcome row. The status is the recorder's last known outcome, kept per surface and agent, saved only when it changes, cleared when the surface is deleted or its Trust Recorder entries change, and follows live updates. It carries codes, counts and times only, never registry error text.
   changed: []
   fixed: []
   removed: []

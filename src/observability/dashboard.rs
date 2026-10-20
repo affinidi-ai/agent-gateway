@@ -2775,6 +2775,7 @@ mod tests {
                     "did:example:oxygen",
                     vec![EntryStatus::from_counts("tr-1", 1, 1, 0, None)],
                     Utc::now(),
+                    Utc::now(),
                 )
                 .await
                 .unwrap();
@@ -2783,6 +2784,7 @@ mod tests {
                     "helium",
                     "did:example:helium",
                     vec![EntryStatus::from_counts("tr-1", 0, 0, 1, None)],
+                    Utc::now(),
                     Utc::now(),
                 )
                 .await

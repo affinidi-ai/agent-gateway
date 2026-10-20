@@ -133,11 +133,10 @@ fn recorder_state_and_reason(status: &Value) -> (Option<&str>, Option<&str>) {
     )
 }
 
-#[then(expr = "within ten seconds the Managed Agent identity shows Trust Recorder status {string} because {string}")]
-async fn managed_identity_shows_recorder_status_because(
+async fn wait_for_managed_recorder_status(
     world: &mut SurfaceWorld,
-    expected_state: String,
-    expected_reason: String,
+    expected_state: &str,
+    expected_reason: Option<&str>,
 ) {
     ensure_admin_session(world).await;
     let mut observed = Value::Null;
@@ -154,12 +153,30 @@ async fn managed_identity_shows_recorder_status_because(
             .get("trust_recorder")
             .cloned()
             .unwrap_or(Value::Null);
-        if recorder_state_and_reason(&observed) == (Some(expected_state.as_str()), Some(expected_reason.as_str())) {
+        let (state, reason) = recorder_state_and_reason(&observed);
+        if state == Some(expected_state) && (expected_reason.is_none() || reason == expected_reason) {
             return;
         }
         tokio::time::sleep(RECORDER_STATUS_POLL_INTERVAL).await;
     }
     panic!("expected Trust Recorder status {expected_state:?} because {expected_reason:?}, last observed: {observed}");
+}
+
+#[given(expr = "within ten seconds the Managed Agent identity has shown Trust Recorder status {string}")]
+async fn managed_identity_has_shown_recorder_status(
+    world: &mut SurfaceWorld,
+    expected_state: String,
+) {
+    wait_for_managed_recorder_status(world, &expected_state, None).await;
+}
+
+#[then(expr = "within ten seconds the Managed Agent identity shows Trust Recorder status {string} because {string}")]
+async fn managed_identity_shows_recorder_status_because(
+    world: &mut SurfaceWorld,
+    expected_state: String,
+    expected_reason: String,
+) {
+    wait_for_managed_recorder_status(world, &expected_state, Some(&expected_reason)).await;
 }
 
 #[then(expr = "the Managed Agent identity shows Trust Recorder status {string}")]
