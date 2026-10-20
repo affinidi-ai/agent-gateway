@@ -13,7 +13,7 @@ const MIN_SECRET_CHARS: usize = 32;
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 5_000;
 
 /// HMAC key for signing hook requests. Never printed.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct HookSecret(String);
 
 impl HookSecret {
@@ -36,7 +36,7 @@ impl std::fmt::Debug for HookSecret {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct EventHookSettings {
     pub hook_url: Option<String>,
     pub hook_timeout: Duration,
@@ -53,8 +53,34 @@ impl Default for EventHookSettings {
     }
 }
 
-fn is_http_url(raw: &str) -> bool {
-    url::Url::parse(raw).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some())
+#[derive(Debug, PartialEq, Eq)]
+enum HookTarget {
+    Invalid,
+    InsecureRemote,
+    Loopback,
+    SecureRemote,
+}
+
+fn classify_target(raw: &str) -> HookTarget {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return HookTarget::Invalid;
+    };
+    let secure = match parsed.scheme() {
+        "http" => false,
+        "https" => true,
+        _ => return HookTarget::Invalid,
+    };
+    let loopback = match parsed.host() {
+        None => return HookTarget::Invalid,
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+    };
+    match (loopback, secure) {
+        (true, _) => HookTarget::Loopback,
+        (false, true) => HookTarget::SecureRemote,
+        (false, false) => HookTarget::InsecureRemote,
+    }
 }
 
 impl EventHookSettings {
@@ -102,10 +128,27 @@ impl EventHookSettings {
             },
         };
         let mut hook_url = text(ENV_HOOK_URL);
-        if let Some(raw) = hook_url.as_deref()
-            && !is_http_url(raw)
-        {
-            error!("{ENV_HOOK_URL} must be an http or https URL with a host; the event hook is disabled");
+        let mut secret_required = false;
+        if let Some(raw) = hook_url.as_deref() {
+            match classify_target(raw) {
+                HookTarget::Loopback => {}
+                HookTarget::SecureRemote => secret_required = true,
+                HookTarget::Invalid => {
+                    error!("{ENV_HOOK_URL} must be an http or https URL with a host; the event hook is disabled");
+                    hook_url = None;
+                }
+                HookTarget::InsecureRemote => {
+                    error!(
+                        "{ENV_HOOK_URL} uses http for a host that is not loopback; use https, or http only for localhost, 127.0.0.0/8 or ::1; the event hook is disabled"
+                    );
+                    hook_url = None;
+                }
+            }
+        }
+        if secret_required && secret.is_none() {
+            error!(
+                "{ENV_HOOK_URL} points at a host that is not loopback, which requires {ENV_HOOK_SECRET}; the event hook is disabled"
+            );
             hook_url = None;
         }
         let hook_secret = match secret.filter(|_| hook_url.is_some()) {
@@ -152,7 +195,10 @@ mod tests {
     #[test]
     fn no_env_means_disabled_with_defaults() {
         let parsed = settings(&[]);
-        assert_eq!(parsed, EventHookSettings::default());
+        let defaults = EventHookSettings::default();
+        assert_eq!(parsed.hook_url, defaults.hook_url);
+        assert_eq!(parsed.hook_timeout, defaults.hook_timeout);
+        assert!(parsed.hook_secret.is_none());
         assert!(parsed.hook_url.is_none());
         assert_eq!(parsed.hook_timeout, Duration::from_secs(5));
     }
@@ -175,7 +221,7 @@ mod tests {
     fn only_http_and_https_urls_with_a_host_are_accepted() {
         for valid in ["http://127.0.0.1:8085/h", "https://hooks.example.com/events"] {
             assert_eq!(
-                settings(&[(ENV_HOOK_URL, valid)])
+                settings(&[(ENV_HOOK_URL, valid), (ENV_HOOK_SECRET, SECRET)])
                     .hook_url
                     .as_deref(),
                 Some(valid)
@@ -190,10 +236,10 @@ mod tests {
             "not a url",
         ] {
             assert!(
-                settings(&[(ENV_HOOK_URL, invalid)])
+                settings(&[(ENV_HOOK_URL, invalid), (ENV_HOOK_SECRET, SECRET)])
                     .hook_url
                     .is_none(),
-                "{invalid:?}"
+                "an invalid URL was accepted"
             );
         }
     }
@@ -307,6 +353,141 @@ mod tests {
             assert_eq!(short.matches("ERROR").count(), 1, "{short}");
             assert!(short.contains("at least 32 characters"), "{short}");
             assert!(!short.contains("could not be loaded"), "{short}");
+        });
+    }
+
+    const LOOPBACK_URLS: [&str; 8] = [
+        "http://localhost/h",
+        "http://127.0.0.1:8085/h",
+        "http://127.9.9.9/h",
+        "http://[::1]:8085/h",
+        "HTTP://LOCALHOST:9/h",
+        "http://user:pw@127.0.0.1:9/h",
+        "https://localhost/h",
+        "https://[::1]/h",
+    ];
+
+    #[test]
+    fn loopback_hosts_work_over_http_with_and_without_a_secret() {
+        for url in LOOPBACK_URLS {
+            let unsigned = settings(&[(ENV_HOOK_URL, url)]);
+            assert!(unsigned.hook_url.is_some(), "a loopback URL without a secret was rejected");
+            assert!(unsigned.hook_secret.is_none());
+            let signed = settings(&[(ENV_HOOK_URL, url), (ENV_HOOK_SECRET, SECRET)]);
+            assert!(signed.hook_url.is_some(), "a loopback URL with a secret was rejected");
+            assert!(signed.hook_secret.is_some());
+        }
+    }
+
+    #[test]
+    fn http_to_a_non_loopback_host_is_rejected_with_and_without_a_secret() {
+        for url in [
+            "http://example.com/h",
+            "HTTP://EXAMPLE.COM/h",
+            "http://user:pw@example.com:8080/h",
+            "http://10.0.0.5/h",
+            "http://localhost.example.com/h",
+            "http://localhost./h",
+            "http://[::2]/h",
+            "http://0.0.0.0/h",
+        ] {
+            assert!(
+                settings(&[(ENV_HOOK_URL, url)])
+                    .hook_url
+                    .is_none(),
+                "an insecure remote URL was accepted"
+            );
+            assert!(
+                settings(&[(ENV_HOOK_URL, url), (ENV_HOOK_SECRET, SECRET)])
+                    .hook_url
+                    .is_none(),
+                "an insecure remote URL with a secret was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn https_to_a_non_loopback_host_requires_a_secret() {
+        for url in ["https://example.com/h", "HTTPS://EXAMPLE.COM:8443/h", "https://user:pw@example.com/h"] {
+            let signed = settings(&[(ENV_HOOK_URL, url), (ENV_HOOK_SECRET, SECRET)]);
+            assert!(signed.hook_url.is_some(), "https with a secret was rejected");
+            assert!(signed.hook_secret.is_some());
+            assert!(
+                settings(&[(ENV_HOOK_URL, url)])
+                    .hook_url
+                    .is_none(),
+                "https without a secret was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_host_with_an_unresolvable_secret_is_disabled() {
+        let parsed = EventHookSettings::from_resolved(
+            |name| (name == ENV_HOOK_URL).then(|| "https://example.com/h".to_string()),
+            Some(Err("boom".to_string())),
+        );
+        assert!(parsed.hook_url.is_none());
+    }
+
+    #[test]
+    fn the_rejection_errors_name_the_rule_and_never_the_url_or_secret() {
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(
+                &mut self,
+                buf: &[u8],
+            ) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Sink(logs.clone()))
+            .with_ansi(false)
+            .finish();
+        let read = || String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            settings(&[(ENV_HOOK_URL, "http://sensitive-host.example/private-path"), (ENV_HOOK_SECRET, SECRET)]);
+            let insecure = read();
+            assert_eq!(
+                insecure
+                    .matches("ERROR")
+                    .count(),
+                1,
+                "{insecure}"
+            );
+            assert!(insecure.contains("uses http for a host that is not loopback"), "{insecure}");
+            assert!(!insecure.contains("sensitive-host") && !insecure.contains("private-path"), "{insecure}");
+            assert!(!insecure.contains(SECRET), "{insecure}");
+            logs.lock().unwrap().clear();
+            settings(&[(ENV_HOOK_URL, "https://sensitive-host.example/private-path")]);
+            let unsigned = read();
+            assert_eq!(
+                unsigned
+                    .matches("ERROR")
+                    .count(),
+                1,
+                "{unsigned}"
+            );
+            assert!(unsigned.contains("requires AG_EVENT_HOOK_SECRET"), "{unsigned}");
+            assert!(!unsigned.contains("sensitive-host") && !unsigned.contains("private-path"), "{unsigned}");
         });
     }
 }

@@ -36,23 +36,13 @@ pub trait ConnectionPointStore: Send + Sync {
     ) -> Result<()>;
 
     /// Update a connection point only when its record still exists, returning
-    /// whether it was written. A record deleted in the meantime is not recreated.
-    /// The default checks then writes; stores that can make the two atomic override it.
+    /// whether it was written. A record deleted in the meantime is not recreated,
+    /// so implementations must make the existence check and the write atomic
+    /// with respect to `delete` for the same id.
     async fn update_if_exists(
         &self,
         connection_point: &GatewayConnectionPoint,
-    ) -> Result<bool> {
-        if self
-            .get(&connection_point.id)
-            .await?
-            .is_none()
-        {
-            return Ok(false);
-        }
-        self.update(connection_point)
-            .await?;
-        Ok(true)
-    }
+    ) -> Result<bool>;
 
     /// Delete a connection point
     async fn delete(

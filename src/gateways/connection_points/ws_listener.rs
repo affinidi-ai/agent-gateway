@@ -4690,6 +4690,13 @@ mod tests {
             unreachable!("admission only reads its Connection Point")
         }
 
+        async fn update_if_exists(
+            &self,
+            _: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<bool> {
+            unreachable!("admission only reads its Connection Point")
+        }
+
         async fn delete(
             &self,
             _: &str,

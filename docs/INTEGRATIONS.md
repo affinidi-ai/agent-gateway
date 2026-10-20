@@ -213,7 +213,7 @@ gateway (the Deployment operator) and is typically a service running next to it.
 register a Connection Point's DID on a mediator that only admits known DIDs, before the gateway
 first connects to that mediator. The hook is not a webhook integration: nothing is stored or
 editable through the dashboard or the management API. It is configured only through environment
-variables, every call is signed with the operator's key, every event carries a process-wide
+variables, calls are signed with the operator's key whenever `AG_EVENT_HOOK_SECRET` is set (the secret is optional only for a loopback receiver), every event carries a process-wide
 `sequence`, and it only ever sends the events below. With `AG_EVENT_HOOK_URL` unset the gateway
 behaves as if the feature did not exist: no calls and no background tasks.
 
@@ -223,8 +223,8 @@ addresses are blocked, the resolved address is pinned and redirects are not foll
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `AG_EVENT_HOOK_URL` | unset | Receiver endpoint, for example `http://127.0.0.1:8085/hooks/events`. Setting it turns the hook on. It must be an `http` or `https` URL with a host; anything else disables the hook with one error log. |
-| `AG_EVENT_HOOK_SECRET` | unset | HMAC key that signs every call, at least 32 characters after trimming whitespace. Read once at startup through the configuration loaders, like `AG_IDENTITY_HASH_PEPPER`: a plain value or an `env://`, `file://`, `aws_secrets://` or `aws_parameter_store://` reference ([`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#secret-references)). A value that is too short, or a reference that cannot be resolved, disables the hook with one error log that says which of the two it was. Never logged. With no secret the hook stays on and sends unsigned requests, with one startup `warn`. |
+| `AG_EVENT_HOOK_URL` | unset | Receiver endpoint, for example `http://127.0.0.1:8085/hooks/events`. Setting it turns the hook on. It must be an `https` URL with a host and needs `AG_EVENT_HOOK_SECRET`. `http` is accepted only for a loopback host (`localhost`, any `127.0.0.0/8` address, `::1`), and only there is the secret optional. The host name is checked as written, with no DNS lookup, so any name other than `localhost` counts as non-loopback. Anything else (an unparsable URL, `http` to another host, `https` to another host without a secret) disables the hook with one error log that names the failed rule and never the URL. |
+| `AG_EVENT_HOOK_SECRET` | unset | HMAC key that signs every call when set, at least 32 characters after trimming whitespace. Read once at startup through the configuration loaders, like `AG_IDENTITY_HASH_PEPPER`: a plain value or an `env://`, `file://`, `aws_secrets://` or `aws_parameter_store://` reference ([`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#secret-references)). A value that is too short, or a reference that cannot be resolved, disables the hook with one error log that says which of the two it was. Never logged. With no secret the hook stays on and sends unsigned requests, with one startup `warn`, but only for a loopback receiver; any other host without a secret disables the hook. |
 | `AG_EVENT_HOOK_TIMEOUT_MS` | `5000` | HTTP timeout of one delivery attempt. No request waits on it. |
 
 **Events.** Every call is a `POST` with `Content-Type: application/json`. Only Connection Points created through the management API are announced: the temporary Connection Points of the pairing flow and other internally created records never produce `connected` or `deleted`, and a Connection Point stored before it recorded its `mediator_did` is not announced either.
@@ -274,7 +274,19 @@ X-Webhook-Signature-256: sha256=<lowercase hex HMAC-SHA256(secret, "{timestamp}.
 
 These are the headers and scheme of the webhook publisher, built by the same function
 ([`webhook_signing.rs`](../src/integrations/webhook_signing.rs)), so a receiver can share one
-verifier.
+verifier. Without a secret (allowed only for a loopback receiver) neither header is sent.
+
+Because the hook and the webhook integrations sign requests the same way, a message signed
+for one would verify at the other if they shared a key. They must use separate keys.
+
+A receiver should:
+
+- reject a request with a missing or malformed signature header whenever a key is configured;
+- compare signatures in constant time;
+- reject a timestamp older or newer than a window it chooses (60 seconds is a reasonable
+  default), because the timestamp is signed;
+- treat events as at-least-once and handle them idempotently;
+- use a separate key per receiver.
 
 **Delivery.** The hook is a notification. The gateway hands each event to its own background
 task and never waits for the receiver: a slow, down or rejecting receiver has no effect on
