@@ -1,0 +1,21 @@
+branch: feat/release_hardening
+changes:
+  added:
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Publish GitHub Releases with a prebuilt Linux binary
+      description: >-
+        A manual Prepare release workflow bumps the version, builds the changelog and opens a
+        reviewed release pull request. Merging it tags the commit and creates a GitHub Release
+        whose notes are the reviewed changelog text, with the agent-gateway binary, a SHA256
+        checksum and a build-provenance attestation.
+    - timestamp: '2026-10-13T00:00:00.000Z'
+      title: Publish a multi-arch container image to GHCR
+      description: >-
+        Each release tag builds linux/amd64 and linux/arm64 images, boot-probes both, and
+        publishes one multi-arch manifest to ghcr.io/affinidi-ai/agent-gateway tagged X.Y.Z, X.Y
+        and latest, with an attested build provenance.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
