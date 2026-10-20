@@ -1,0 +1,20 @@
+branch: fix/system-metrics-persist-interval
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-20T15:20:08Z'
+      title: Persist system metrics history every 5 minutes instead of every 5 seconds
+      description: >-
+        The CPU and memory history behind the dashboard system metrics view was
+        rewritten in full to _storage/system_metrics/system_metrics.json after
+        every 5-second sample. Once the 24-hour buffer filled, each instance
+        rewrote about 3.8 MB twelve times a minute (about 65 GB a day), which is
+        costly on network-backed storage billed per GB written. Samples are
+        still collected every 5 seconds and served from memory, but the history
+        is now written at most once every 5 minutes, via a temp file and rename
+        so a crash mid-write can no longer leave a truncated file. Up to 5
+        minutes of history can be lost if the process exits between writes.
+  removed: []
+  security: []
+  breaking: []
