@@ -126,13 +126,51 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           branch="release/${TAG}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "${branch}"
+          base="$(git rev-parse HEAD)"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${branch}" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${branch}" \
+              -f sha="${base}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/heads/${branch}" -f sha="${base}" >/dev/null
+          fi
+
           git add Cargo.toml Cargo.lock CHANGELOG.md .changelog
-          git commit -m "chore(release): prepare ${TAG}"
-          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"
-          git -c "http.extraheader=${auth_header}" push --force origin "HEAD:${branch}"
+          git diff --cached --name-status --no-renames -z HEAD > "${RUNNER_TEMP}/changes"
+          BRANCH="${branch}" BASE="${base}" python3 - "${RUNNER_TEMP}/changes" > "${RUNNER_TEMP}/commit.json" <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          fields = Path(sys.argv[1]).read_bytes().decode().split('\0')
+          additions, deletions = [], []
+          for status, path in zip(fields[0::2], fields[1::2]):
+              if status == 'D':
+                  deletions.append({'path': path})
+              else:
+                  contents = base64.b64encode(Path(path).read_bytes()).decode()
+                  additions.append({'path': path, 'contents': contents})
+
+          query = '''mutation($input: CreateCommitOnBranchInput!) {
+            createCommitOnBranch(input: $input) { commit { oid } }
+          }'''
+          tag = os.environ['TAG']
+          json.dump({'query': query, 'variables': {'input': {
+              'branch': {
+                  'repositoryNameWithOwner': os.environ['GITHUB_REPOSITORY'],
+                  'branchName': os.environ['BRANCH'],
+              },
+              'message': {'headline': f'chore(release): prepare {tag}'},
+              'expectedHeadOid': os.environ['BASE'],
+              'fileChanges': {'additions': additions, 'deletions': deletions},
+          }}}, sys.stdout)
+          PY
+          # Committing through the GraphQL API lets GitHub sign the commit as the release App;
+          # a commit made on the runner and pushed would be unsigned.
+          gh api graphql --input "${RUNNER_TEMP}/commit.json" \
+            --jq '.data.createCommitOnBranch.commit.oid'
 
           fragment_count="$(find ".changelog/history/${VERSION}" -maxdepth 1 -name '*.yaml' | wc -l | tr -d ' ')"
           {
@@ -146,9 +184,9 @@ jobs:
             echo "- [ ] Edit release wording in this PR if needed."
             echo "- [ ] Confirm \`Cargo.toml\` and \`Cargo.lock\` both use ${VERSION}."
             echo
-            echo "Merging this PR tags the reviewed merge commit, builds the release binary, and creates the GitHub Release."
+            echo "Squash-merging this PR tags the reviewed commit, builds the release binary, and creates the GitHub Release."
             echo
           } > "${RUNNER_TEMP}/body.md"
 
-          url="$(gh pr create --base main --head "${branch}" --title "Release ${TAG}" --body-file "${RUNNER_TEMP}/body.md")"
+          url="$(gh pr create --base main --head "${branch}" --title "chore(release): prepare ${TAG}" --body-file "${RUNNER_TEMP}/body.md")"
           echo "Release PR: ${url}" >> "${GITHUB_STEP_SUMMARY}"
