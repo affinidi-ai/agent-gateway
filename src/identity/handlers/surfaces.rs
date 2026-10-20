@@ -1412,9 +1412,35 @@ async fn validate_and_save_surface(
         crate::trust_registries::reference_fields::spawn_surface_rename_publish(surface.clone());
     }
 
+    if existing.is_some_and(|existing| trust_recorder_changed(existing, &surface))
+        && let Some(recorder_status) = global_store()
+    {
+        recorder_status
+            .clear_surface(&surface.surface_id)
+            .await;
+    }
+
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 
     Ok(surface)
+}
+
+/// Whether an edit added, removed or changed the entries of the surface's Trust Recorder.
+/// No recorder and a recorder without entries are the same.
+fn trust_recorder_changed(
+    before: &AgentSurface,
+    after: &AgentSurface,
+) -> bool {
+    let entries = |surface: &AgentSurface| {
+        serde_json::to_value(
+            surface
+                .trust_recorder()
+                .map(|recorder| recorder.entries.as_slice())
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default()
+    };
+    entries(before) != entries(after)
 }
 
 /// Per RFC 7396 the media type for a JSON Merge Patch body MUST be
@@ -1612,7 +1638,7 @@ pub async fn delete_surface(
 
             if let Some(recorder_status) = global_store() {
                 recorder_status
-                    .remove_surface(&surface_id)
+                    .clear_surface(&surface_id)
                     .await;
             }
             apply_surface_change(&state, SurfaceChange::Delete(&surface_id)).await;
@@ -3673,5 +3699,76 @@ mod tenancy_tests {
     fn an_appliance_wide_caller_writes_any_surface() {
         assert!(surface_writable(None, "operator-surface", None, None));
         assert!(surface_writable(Some("tenant-a"), "boris-s1", None, None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{TrustRecorderConfig, TrustRecorderEntry};
+
+    fn entry(registry: &str) -> TrustRecorderEntry {
+        TrustRecorderEntry {
+            trust_registry_id: registry.into(),
+            issuer_did: "did:example:issuer".into(),
+            authority_did: "did:example:authority".into(),
+            include_owned_agent: true,
+            custom_resources: vec![],
+        }
+    }
+
+    fn surface_recording(registries: &[&str]) -> AgentSurface {
+        let mut surface = AgentSurface::default();
+        surface
+            .access_point
+            .trust_recorder = Some(TrustRecorderConfig {
+            entries: registries
+                .iter()
+                .map(|registry| entry(registry))
+                .collect(),
+        });
+        surface
+    }
+
+    #[test]
+    fn an_unchanged_recorder_is_not_a_change() {
+        assert!(!trust_recorder_changed(&surface_recording(&["tr-1"]), &surface_recording(&["tr-1"])));
+        assert!(!trust_recorder_changed(&AgentSurface::default(), &AgentSurface::default()));
+    }
+
+    #[test]
+    fn no_recorder_and_a_recorder_without_entries_are_the_same() {
+        assert!(!trust_recorder_changed(&AgentSurface::default(), &surface_recording(&[])));
+        assert!(!trust_recorder_changed(&surface_recording(&[]), &AgentSurface::default()));
+    }
+
+    #[test]
+    fn adding_removing_or_changing_entries_is_a_change() {
+        assert!(trust_recorder_changed(&AgentSurface::default(), &surface_recording(&["tr-1"])));
+        assert!(trust_recorder_changed(&surface_recording(&["tr-1"]), &AgentSurface::default()));
+        assert!(trust_recorder_changed(&surface_recording(&["tr-1"]), &surface_recording(&["tr-2"])));
+        assert!(trust_recorder_changed(&surface_recording(&["tr-1"]), &surface_recording(&["tr-1", "tr-2"])));
+    }
+
+    #[test]
+    fn an_edit_to_an_entry_field_is_a_change() {
+        let before = surface_recording(&["tr-1"]);
+        let mut after = surface_recording(&["tr-1"]);
+        after
+            .access_point
+            .trust_recorder
+            .as_mut()
+            .unwrap()
+            .entries[0]
+            .authority_did = "did:example:other".into();
+        assert!(trust_recorder_changed(&before, &after));
+    }
+
+    #[test]
+    fn changes_outside_the_recorder_are_not_a_change() {
+        let before = surface_recording(&["tr-1"]);
+        let mut after = surface_recording(&["tr-1"]);
+        after.name = "renamed".into();
+        assert!(!trust_recorder_changed(&before, &after));
     }
 }

@@ -234,7 +234,11 @@ Statuses are stored in `_storage/trust_recorder_status/`, beside the identities 
 without a `[storage_paths]` key, so a backup of `_storage` includes them. The recorder runs on
 every response, so a status is written only when the outcome changes. The attempt time is
 held in memory and, after a restart, shows the time of the last change until the next
-attempt. Deleting a surface removes its statuses.
+attempt. Deleting a surface, or adding, removing or changing the entries of its Trust Recorder,
+clears its statuses, so they show Not attempted yet until the next response. The outcome of a
+run that began before the clear is dropped, so a run still waiting on a trust registry cannot
+bring a cleared status back. A storage failure is logged as a warning and the status reads as
+missing.
 
 Managed identities whose surface has a Trust Recorder carry `trust_recorder` in the identity
 list (`/v1/dashboard/stats` and its live updates), which also pushes an identity whose outcome

@@ -454,6 +454,7 @@ pub fn spawn_trust_recorder(
     let issuer_id = surface.issuer_id.clone();
     let surface_id = surface.surface_id.clone();
     let tenant_id = surface.tenant_id.clone();
+    let started_at = chrono::Utc::now();
     tokio::spawn(async move {
         let Some(store) = tr_manager.store().await else {
             return;
@@ -472,7 +473,7 @@ pub fn spawn_trust_recorder(
         .await;
         if let Some(status_store) = global_store()
             && let Err(e) = status_store
-                .record(&surface_id, &did, entries, chrono::Utc::now())
+                .record(&surface_id, &did, entries, started_at, chrono::Utc::now())
                 .await
         {
             warn!(surface_id = %surface_id, error = %e, "Trust Recorder: failed to store status");
@@ -1209,7 +1210,7 @@ mod tests {
                 let writer = ScriptedWriter::new(vec![outcome]);
                 let statuses = write_entries(&writer, &[ready(entry)], "did:example:agent", None).await;
                 status_store
-                    .record("surface-1", "did:example:agent", statuses, at)
+                    .record("surface-1", "did:example:agent", statuses, at, at)
                     .await
                     .unwrap()
             }

@@ -14,6 +14,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
+use tracing::warn;
 
 use crate::storage::filesystem::{StorableEntity, StorageBackend, cached_storage};
 
@@ -194,9 +195,13 @@ fn record_key(
     format!("{digest:x}")
 }
 
+/// How long a cleared surface is remembered, which only has to outlast one recorder run.
+const CLEARED_MEMORY: chrono::Duration = chrono::Duration::hours(1);
+
 pub struct TrustRecorderStatusStore {
     backend: Box<dyn StorageBackend<StatusRecord>>,
     last_attempts: DashMap<String, DateTime<Utc>>,
+    cleared_surfaces: DashMap<String, DateTime<Utc>>,
 }
 
 impl TrustRecorderStatusStore {
@@ -204,6 +209,7 @@ impl TrustRecorderStatusStore {
         Ok(Self {
             backend: cached_storage(dir, "trust recorder status").await?,
             last_attempts: DashMap::new(),
+            cleared_surfaces: DashMap::new(),
         })
     }
 
@@ -212,18 +218,32 @@ impl TrustRecorderStatusStore {
         Self {
             backend: crate::storage::filesystem::in_memory_storage(),
             last_attempts: DashMap::new(),
+            cleared_surfaces: DashMap::new(),
         }
     }
 
-    /// Returns `true` when the outcome differs from the stored one and was persisted.
+    #[cfg(test)]
+    fn with_backend(backend: Box<dyn StorageBackend<StatusRecord>>) -> Self {
+        Self {
+            backend,
+            last_attempts: DashMap::new(),
+            cleared_surfaces: DashMap::new(),
+        }
+    }
+
+    /// Stores the outcome of a recorder run that began at `started_at`. Returns `true`
+    /// when the outcome differs from the stored one and was persisted. An outcome of a
+    /// run that began before its surface was cleared is dropped, so a run still waiting on
+    /// a trust registry cannot bring back a status for a deleted or reconfigured surface.
     pub async fn record(
         &self,
         surface_id: &str,
         agent_did: &str,
         entries: Vec<EntryStatus>,
+        started_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<bool> {
-        if entries.is_empty() {
+        if entries.is_empty() || self.cleared_since(surface_id, started_at) {
             return Ok(false);
         }
         let key = record_key(surface_id, agent_did);
@@ -240,13 +260,19 @@ impl TrustRecorderStatusStore {
         }
         self.backend
             .save(&StatusRecord {
-                id: key,
+                id: key.clone(),
                 surface_id: surface_id.to_string(),
                 agent_did: agent_did.to_string(),
                 status,
                 changed_at: now.to_rfc3339(),
             })
             .await?;
+        if self.cleared_since(surface_id, started_at) {
+            self.last_attempts
+                .remove(&key);
+            self.delete_record(&key).await;
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -256,12 +282,13 @@ impl TrustRecorderStatusStore {
         agent_did: &str,
     ) -> Option<RecorderStatus> {
         let key = record_key(surface_id, agent_did);
-        let record = self
-            .backend
-            .get(&key)
-            .await
-            .ok()
-            .flatten()?;
+        let record = match self.backend.get(&key).await {
+            Ok(record) => record?,
+            Err(e) => {
+                warn!(surface_id = %surface_id, error = %e, "Trust Recorder status store: reading a status failed");
+                return None;
+            }
+        };
         Some(self.with_last_attempt(record))
     }
 
@@ -269,11 +296,7 @@ impl TrustRecorderStatusStore {
         &self,
         surface_id: &str,
     ) -> Option<RecorderStatus> {
-        let records = self
-            .backend
-            .list_all()
-            .await
-            .ok()?;
+        let records = self.list_records().await?;
         records
             .into_iter()
             .filter(|r| r.surface_id == surface_id)
@@ -288,7 +311,7 @@ impl TrustRecorderStatusStore {
         &self,
         since: DateTime<Utc>,
     ) -> HashSet<String> {
-        let Ok(records) = self.backend.list_all().await else {
+        let Some(records) = self.list_records().await else {
             return HashSet::new();
         };
         records
@@ -300,11 +323,17 @@ impl TrustRecorderStatusStore {
             .collect()
     }
 
-    pub async fn remove_surface(
+    /// Drops every status of the surface, and the outcome of any run that began before now.
+    pub async fn clear_surface(
         &self,
         surface_id: &str,
     ) {
-        let Ok(records) = self.backend.list_all().await else {
+        let now = Utc::now();
+        self.cleared_surfaces
+            .retain(|_, cleared_at| now - *cleared_at < CLEARED_MEMORY);
+        self.cleared_surfaces
+            .insert(surface_id.to_string(), now);
+        let Some(records) = self.list_records().await else {
             return;
         };
         for record in records
@@ -313,10 +342,37 @@ impl TrustRecorderStatusStore {
         {
             self.last_attempts
                 .remove(&record.id);
-            let _ = self
-                .backend
-                .delete(&record.id)
+            self.delete_record(&record.id)
                 .await;
+        }
+    }
+
+    fn cleared_since(
+        &self,
+        surface_id: &str,
+        since: DateTime<Utc>,
+    ) -> bool {
+        self.cleared_surfaces
+            .get(surface_id)
+            .is_some_and(|cleared_at| *cleared_at >= since)
+    }
+
+    async fn list_records(&self) -> Option<Vec<StatusRecord>> {
+        match self.backend.list_all().await {
+            Ok(records) => Some(records),
+            Err(e) => {
+                warn!(error = %e, "Trust Recorder status store: listing statuses failed");
+                None
+            }
+        }
+    }
+
+    async fn delete_record(
+        &self,
+        id: &str,
+    ) {
+        if let Err(e) = self.backend.delete(id).await {
+            warn!(error = %e, "Trust Recorder status store: deleting a status failed");
         }
     }
 
@@ -481,7 +537,7 @@ mod tests {
         let store = TrustRecorderStatusStore::in_memory();
         assert!(
             store
-                .record("surface-1", "did:example:agent", vec![written("tr-1", 1, 0)], at(0))
+                .record("surface-1", "did:example:agent", vec![written("tr-1", 1, 0)], at(0), at(0))
                 .await
                 .unwrap()
         );
@@ -499,7 +555,7 @@ mod tests {
     async fn status_is_scoped_to_the_surface_and_the_agent() {
         let store = TrustRecorderStatusStore::in_memory();
         store
-            .record("surface-1", "did:example:agent", vec![written("tr-1", 1, 0)], at(0))
+            .record("surface-1", "did:example:agent", vec![written("tr-1", 1, 0)], at(0), at(0))
             .await
             .unwrap();
 
@@ -523,14 +579,14 @@ mod tests {
         let entries = vec![written("tr-1", 0, 1)];
         assert!(
             store
-                .record("surface-1", "did:example:agent", entries.clone(), at(0))
+                .record("surface-1", "did:example:agent", entries.clone(), at(0), at(0))
                 .await
                 .unwrap()
         );
 
         assert!(
             !store
-                .record("surface-1", "did:example:agent", entries, at(60))
+                .record("surface-1", "did:example:agent", entries, at(60), at(60))
                 .await
                 .unwrap()
         );
@@ -552,13 +608,19 @@ mod tests {
     async fn a_changed_outcome_is_persisted_and_reported_as_changed() {
         let store = TrustRecorderStatusStore::in_memory();
         store
-            .record("surface-1", "did:example:agent", vec![written("tr-1", 1, 0)], at(0))
+            .record("surface-1", "did:example:agent", vec![written("tr-1", 1, 0)], at(0), at(0))
             .await
             .unwrap();
 
         assert!(
             store
-                .record("surface-1", "did:example:agent", vec![failed("tr-1", RecorderReason::NoResponse)], at(60),)
+                .record(
+                    "surface-1",
+                    "did:example:agent",
+                    vec![failed("tr-1", RecorderReason::NoResponse)],
+                    at(60),
+                    at(60),
+                )
                 .await
                 .unwrap()
         );
@@ -581,7 +643,7 @@ mod tests {
         let store = TrustRecorderStatusStore::in_memory();
         assert!(
             !store
-                .record("surface-1", "did:example:agent", vec![], at(0))
+                .record("surface-1", "did:example:agent", vec![], at(0), at(0))
                 .await
                 .unwrap()
         );
@@ -597,15 +659,15 @@ mod tests {
     async fn the_latest_status_of_a_surface_is_the_one_attempted_most_recently() {
         let store = TrustRecorderStatusStore::in_memory();
         store
-            .record("surface-1", "did:example:old", vec![written("tr-1", 1, 0)], at(0))
+            .record("surface-1", "did:example:old", vec![written("tr-1", 1, 0)], at(0), at(0))
             .await
             .unwrap();
         store
-            .record("surface-1", "did:example:new", vec![failed("tr-1", RecorderReason::Rejected)], at(120))
+            .record("surface-1", "did:example:new", vec![failed("tr-1", RecorderReason::Rejected)], at(120), at(120))
             .await
             .unwrap();
         store
-            .record("surface-2", "did:example:other", vec![written("tr-1", 1, 0)], at(300))
+            .record("surface-2", "did:example:other", vec![written("tr-1", 1, 0)], at(300), at(300))
             .await
             .unwrap();
 
@@ -628,13 +690,13 @@ mod tests {
         let store = TrustRecorderStatusStore::in_memory();
         for (surface, did) in [("s1", "did:a"), ("s1", "did:b"), ("s2", "did:a")] {
             store
-                .record(surface, did, vec![written("tr-1", 1, 0)], at(0))
+                .record(surface, did, vec![written("tr-1", 1, 0)], at(0), at(0))
                 .await
                 .unwrap();
         }
 
         store
-            .remove_surface("s1")
+            .clear_surface("s1")
             .await;
         assert!(
             store
@@ -667,7 +729,7 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .record("surface-1", "did:example:agent", vec![written("tr-1", 2, 0)], at(0))
+                .record("surface-1", "did:example:agent", vec![written("tr-1", 2, 0)], at(0), at(0))
                 .await
                 .unwrap();
         }
@@ -689,7 +751,7 @@ mod tests {
         let store = TrustRecorderStatusStore::in_memory();
         let did = "did:web:gw.example.com:ids:../../etc/passwd";
         store
-            .record("surface/with:odd chars", did, vec![written("tr-1", 1, 0)], at(0))
+            .record("surface/with:odd chars", did, vec![written("tr-1", 1, 0)], at(0), at(0))
             .await
             .unwrap();
         assert!(
@@ -703,6 +765,257 @@ mod tests {
         assert!(
             key.chars()
                 .all(|c| c.is_ascii_hexdigit())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_began_before_its_surface_was_cleared_is_dropped() {
+        let store = TrustRecorderStatusStore::in_memory();
+        let started_at = Utc::now();
+        store
+            .clear_surface("s1")
+            .await;
+
+        let stored = store
+            .record("s1", "did:a", vec![written("tr-1", 1, 0)], started_at, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(!stored);
+        assert!(
+            store
+                .status_for("s1", "did:a")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_begins_after_the_clear_is_recorded() {
+        let store = TrustRecorderStatusStore::in_memory();
+        store
+            .clear_surface("s1")
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let stored = store
+            .record("s1", "did:a", vec![written("tr-1", 1, 0)], Utc::now(), Utc::now())
+            .await
+            .unwrap();
+
+        assert!(stored);
+        assert!(
+            store
+                .status_for("s1", "did:a")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_surface_does_not_hold_back_runs_of_other_surfaces() {
+        let store = TrustRecorderStatusStore::in_memory();
+        let started_at = Utc::now();
+        store
+            .clear_surface("s1")
+            .await;
+
+        assert!(
+            store
+                .record("s2", "did:a", vec![written("tr-1", 1, 0)], started_at, Utc::now())
+                .await
+                .unwrap()
+        );
+    }
+
+    struct ScriptedBackend {
+        inner: Box<dyn StorageBackend<StatusRecord>>,
+        fail_reads: Arc<std::sync::atomic::AtomicBool>,
+        fail_deletes: Arc<std::sync::atomic::AtomicBool>,
+        pause_save: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    }
+
+    impl ScriptedBackend {
+        fn new() -> Self {
+            Self {
+                inner: crate::storage::filesystem::in_memory_storage(),
+                fail_reads: Arc::default(),
+                fail_deletes: Arc::default(),
+                pause_save: None,
+            }
+        }
+
+        fn failing(flag: &std::sync::atomic::AtomicBool) -> Result<()> {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("disk unavailable");
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend<StatusRecord> for ScriptedBackend {
+        async fn save(
+            &self,
+            entity: &StatusRecord,
+        ) -> Result<()> {
+            if let Some((saving, proceed)) = &self.pause_save {
+                saving.notify_one();
+                proceed.notified().await;
+            }
+            self.inner.save(entity).await
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<StatusRecord>> {
+            Self::failing(&self.fail_reads)?;
+            self.inner.get(id).await
+        }
+
+        async fn list_all(&self) -> Result<Vec<StatusRecord>> {
+            Self::failing(&self.fail_reads)?;
+            self.inner.list_all().await
+        }
+
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<()> {
+            Self::failing(&self.fail_deletes)?;
+            self.inner.delete(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_outcome_saved_while_its_surface_is_being_cleared_is_removed_again() {
+        let saving = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let mut backend = ScriptedBackend::new();
+        backend.pause_save = Some((saving.clone(), proceed.clone()));
+        let store = Arc::new(TrustRecorderStatusStore::with_backend(Box::new(backend)));
+
+        let started_at = Utc::now();
+        let run = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .record("s1", "did:a", vec![written("tr-1", 1, 0)], started_at, Utc::now())
+                    .await
+            })
+        };
+        saving.notified().await;
+        store
+            .clear_surface("s1")
+            .await;
+        proceed.notify_one();
+
+        assert!(!run.await.unwrap().unwrap());
+        assert!(
+            store
+                .status_for("s1", "did:a")
+                .await
+                .is_none()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+    }
+
+    fn warnings(captured: &Captured) -> Vec<String> {
+        captured
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, message)| message.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_failing_disk_is_logged_and_reads_as_missing_instead_of_as_not_attempted_silently() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let captured = Captured::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let backend = ScriptedBackend::new();
+        let (fail_reads, fail_deletes) = (backend.fail_reads.clone(), backend.fail_deletes.clone());
+        let store = TrustRecorderStatusStore::with_backend(Box::new(backend));
+        store
+            .record("s1", "did:a", vec![written("tr-1", 1, 0)], at(0), at(0))
+            .await
+            .unwrap();
+
+        fail_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store
+                .status_for("s1", "did:a")
+                .await
+                .is_none()
+        );
+        assert!(
+            store
+                .latest_for_surface("s1")
+                .await
+                .is_none()
+        );
+        assert!(
+            store
+                .changed_dids_since(at(-60))
+                .await
+                .is_empty()
+        );
+        store
+            .clear_surface("s1")
+            .await;
+        assert_eq!(
+            warnings(&captured),
+            vec![
+                "Trust Recorder status store: reading a status failed",
+                "Trust Recorder status store: listing statuses failed",
+                "Trust Recorder status store: listing statuses failed",
+                "Trust Recorder status store: listing statuses failed",
+            ]
+        );
+
+        fail_reads.store(false, std::sync::atomic::Ordering::SeqCst);
+        fail_deletes.store(true, std::sync::atomic::Ordering::SeqCst);
+        store
+            .clear_surface("s1")
+            .await;
+        assert_eq!(
+            warnings(&captured)
+                .last()
+                .map(String::as_str),
+            Some("Trust Recorder status store: deleting a status failed")
         );
     }
 }
