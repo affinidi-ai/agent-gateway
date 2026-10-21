@@ -16,5 +16,14 @@ changes:
         so a crash mid-write can no longer leave a truncated file. Up to 5
         minutes of history can be lost if the process exits between writes.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-21T08:07:05Z'
+      title: Update rustls-webpki and webpki roots to reject distrusted emSign intermediates
+      description: >-
+        Bumps the transitive rustls-webpki dependency from 0.103.15 to 0.103.16
+        and webpki-roots and webpki-root-certs from 1.0.8 to 1.0.10. The older
+        versions could accept certificate paths through distrusted emSign
+        intermediates whose private keys are now publicly known
+        (RUSTSEC-2026-0381, RUSTSEC-2026-0382, RUSTSEC-2026-0383). Restores a
+        passing cargo audit.
   breaking: []
