@@ -36,7 +36,6 @@ pub struct IdentityApiState {
     pub issuer_store: Option<Arc<crate::issuers::FileSystemIssuerStore>>,
     pub trust_registry_store: Option<Arc<crate::trust_registries::FileSystemTrustRegistryStore>>,
     pub authority_store: Option<Arc<crate::authorities::FileSystemAuthorityStore>>,
-    pub integration_store: Option<Arc<crate::storage::IntegrationStorage>>,
     pub mcp_proxy_store: Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
     pub a2a_proxy_store: Option<Arc<crate::a2a_proxies::FileSystemA2aProxyStore>>,
     pub secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>>,

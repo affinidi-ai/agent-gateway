@@ -15,6 +15,7 @@ impl StreamPublisher for RedisPublisher {
         event: &Value,
         config: &Value,
         integration_id: &str,
+        _endpoint_id: &str,
     ) -> Result<()> {
         let redis_url = config
             .get("redis_url")
@@ -25,7 +26,10 @@ impl StreamPublisher for RedisPublisher {
 
         use redis::AsyncCommands;
 
-        let client = redis::Client::open(redis_url).context("Failed to create Redis client")?;
+        // The URL can hold a password, and the error's detail can repeat part of it.
+        let client = redis::Client::open(redis_url).map_err(|error| {
+            anyhow::anyhow!("Failed to create Redis client: the Redis URL is not usable ({:?})", error.kind())
+        })?;
 
         let mut con = client
             .get_multiplexed_async_connection()
@@ -45,37 +49,28 @@ impl StreamPublisher for RedisPublisher {
         info!("Successfully published event to Redis Stream '{}'", topic);
         Ok(())
     }
+}
 
-    async fn test_connection(
-        &self,
-        topic: &str,
-        event: &Value,
-        config: &Value,
-    ) -> Result<String> {
-        let redis_url = config
-            .get("redis_url")
-            .and_then(|v| v.as_str())
-            .context("Redis URL is required")?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-        info!("Testing Redis Streams connection for stream '{}'", topic);
-
-        use redis::AsyncCommands;
-
-        let client = redis::Client::open(redis_url).context("Failed to create Redis client")?;
-
-        let mut con = client
-            .get_multiplexed_async_connection()
+    #[tokio::test]
+    async fn a_redis_url_it_cannot_use_is_refused_without_repeating_it() {
+        let error = RedisPublisher
+            .publish(
+                "events",
+                &json!({}),
+                &json!({"redis_url": "redis://cache.example.com/?protocol=s3cr3t-value"}),
+                "integration",
+                "endpoint",
+            )
             .await
-            .context("Failed to connect to Redis")?;
+            .expect_err("refused");
 
-        let event_json = serde_json::to_string(event).context("Failed to serialize event")?;
-
-        let _stream_id: String = con
-            .xadd(topic, "*", &[("data", event_json.as_str())])
-            .await
-            .context("Failed to add test event to Redis Stream")?;
-
-        info!("Test event sent to Redis Stream '{}' successfully", topic);
-        Ok(format!("Test event sent to Redis Stream '{}' successfully", topic))
+        let message = format!("{error:#}");
+        assert!(message.starts_with("Failed to create Redis client"), "{message}");
+        assert!(!message.contains("s3cr3t-value"), "{message}");
     }
 }
