@@ -48,15 +48,12 @@ pub fn should_require_payment(
                 return false;
             }
 
-            let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
-                return false;
+            let (json, method) = match crate::x402::middleware::a2a_filter_input(body_bytes) {
+                crate::x402::middleware::A2aFilterInput::Empty => return false,
+                crate::x402::middleware::A2aFilterInput::Unmatchable(_) => return true,
+                crate::x402::middleware::A2aFilterInput::Method { json, method } => (json, method),
             };
-            let Some(method) = json
-                .get("method")
-                .and_then(|m| m.as_str())
-            else {
-                return false;
-            };
+            let method = method.as_str();
 
             let normalized = crate::x402::middleware::normalize_a2a_method(method);
 
@@ -171,7 +168,7 @@ pub async fn process_payment(
             let payer = cred.source.clone();
             tracing::info!(
                 channel = channel_name,
-                method = %method_str,
+                method = ?crate::a2a::clip_for_log(&method_str),
                 "[mpp] Verifying payment credential"
             );
 
@@ -191,7 +188,7 @@ pub async fn process_payment(
                                 let err_msg = "Payment settlement already consumed (replay detected)".to_string();
                                 tracing::warn!(
                                     channel = channel_name,
-                                    method = %method_str,
+                                    method = ?crate::a2a::clip_for_log(&method_str),
                                     "[mpp] Rejected replayed payment settlement"
                                 );
 
@@ -242,8 +239,8 @@ pub async fn process_payment(
                             tracing::info!(
                                 channel = channel_name,
                                 channel_id = channel_id,
-                                method = %method_str,
-                                reference = %reference,
+                                method = ?crate::a2a::clip_for_log(&method_str),
+                                reference = ?crate::a2a::clip_for_log(&reference),
                                 "[mpp] Payment verified successfully"
                             );
 
@@ -312,7 +309,7 @@ pub async fn process_payment(
                         Err(e) => {
                             tracing::warn!(
                                 channel = channel_name,
-                                error = %e,
+                                error = ?e.to_string(),
                                 "[mpp] Payment proof verification failed"
                             );
 
@@ -361,7 +358,7 @@ pub async fn process_payment(
                 Err(e) => {
                     tracing::warn!(
                         channel = channel_name,
-                        error = %e,
+                        error = ?e.to_string(),
                         "[mpp] Payment verification failed"
                     );
 
@@ -547,5 +544,24 @@ mod tests {
         assert!(result.is_err());
         let response = result.unwrap_err();
         assert_eq!(response.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
+    }
+
+    /// As for x402: with A2A method filters configured, a body the filters cannot
+    /// be matched against is charged; a request without a body is not.
+    #[test]
+    fn a2a_method_filters_charge_a_body_without_a_string_method() {
+        let mut config = test_config();
+        config.a2a_method_filters = Some(vec![crate::config::types::A2AMethodFilter {
+            method: "CancelTask".to_string(),
+            message_patterns: vec![],
+        }]);
+        let requires = |body: &[u8]| should_require_payment(&config, &ChannelProtocol::A2a, body, None);
+
+        assert!(requires(br#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t"}}]"#), "a batch");
+        assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":7}"#), "a non-string method");
+        assert!(requires(b"not json"), "a body that is not JSON");
+        assert!(!requires(b""), "no body");
+        assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t"}}"#));
+        assert!(!requires(br#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t"}}"#));
     }
 }

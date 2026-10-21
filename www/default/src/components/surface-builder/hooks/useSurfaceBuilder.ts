@@ -3,6 +3,7 @@ import { useHistory } from './useHistory';
 import { registry, buildCanvasBlob, buildSurfaceContext } from '../elements';
 import type { CanvasNode, DropContext } from '../SurfaceCanvas';
 import type { SurfaceNodeType } from '../nodeTypes';
+import type { BaseSurfaceView } from '../elements/types';
 import { showToast } from '../../../utils/toaster';
 import { deriveEdges } from '../elements/edges/deriveEdges';
 import { synthesizeFabricCanvasNodes } from '../elements/synthesizeFabric';
@@ -332,6 +333,12 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
      * until the page-level save handler assembles the payload.
      */
     getProtocol?: () => string | undefined;
+    /**
+     * Returns the base surface while the canvas shows a variant, so
+     * surface-level settings that follow the base Target are checked and
+     * built from it. Returns `undefined` in the base view.
+     */
+    getBaseSurface?: () => BaseSurfaceView | undefined;
   }
 ) {
   const {
@@ -1058,8 +1065,9 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
    * saving with unmet dependencies produces a surface the runtime
    * will reject (or silently mis-route) at the first request.
    */
+  const baseSurface = options?.getBaseSurface?.();
   const dependencyErrors: Array<{ nodeId: string; nodeType: string; message: string }> = (() => {
-    const ctx = buildSurfaceContext(options?.getProtocol?.(), state.nodes);
+    const ctx = buildSurfaceContext(options?.getProtocol?.(), state.nodes, baseSurface);
     const out: Array<{ nodeId: string; nodeType: string; message: string }> = [];
     for (const n of state.nodes) {
       if (n.type === 'surface') continue;
@@ -1103,6 +1111,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
         allNodes: state.nodes,
         nodesOfType: type => state.nodes.filter(n => n.type === type),
         firstNodeOfType: type => state.nodes.find(n => n.type === type),
+        base: options?.getBaseSurface?.(),
       });
       payload.canvas = buildCanvasBlob(state.nodes, {
         // Prefer the history-tracked size on state so undo/redo and a
@@ -1154,6 +1163,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
     hasIncompleteNodes,
     hasDependencyErrors,
     dependencyErrors,
+    baseSurface,
     setMultiSelection,
     multiSelectedIds,
   };

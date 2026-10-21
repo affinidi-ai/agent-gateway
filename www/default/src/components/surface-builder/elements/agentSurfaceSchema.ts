@@ -59,6 +59,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'access_point.trust_recorder',
   'access_point.publish_to_did_document',
   'access_point.terminate_trace_id',
+  'access_point.a2a',
   'access_point.supported_extensions',
   'access_point.agent_card_path',
   'access_point.response_custom_metadata',

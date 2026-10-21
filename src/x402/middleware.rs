@@ -94,7 +94,7 @@ pub(crate) fn mcp_requires_payment(
     };
 
     if method != "tools/call" {
-        info!("[{tag}] MCP method '{method}' is not tools/call → no payment");
+        info!("[{tag}] MCP method {:?} is not tools/call → no payment", crate::a2a::clip_for_log(&method));
         return false;
     }
     let Some(name) = tool_name else {
@@ -103,7 +103,7 @@ pub(crate) fn mcp_requires_payment(
     };
 
     let requires = triggers.requires_payment(&name);
-    info!("[{tag}] MCP tool '{name}' triggers={triggers:?} requires_payment={requires}");
+    info!("[{tag}] MCP tool {:?} triggers={triggers:?} requires_payment={requires}", crate::a2a::clip_for_log(&name));
     requires
 }
 
@@ -173,31 +173,27 @@ pub fn should_require_payment(
                 return false;
             };
 
-            // Parse JSON-RPC request
-            let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
-                // If we can't parse the request and filters are configured,
-                // fail open (no payment) since we can't match against any filter
-                // This allows non-JSON-RPC requests (like GET requests) to pass through
-                info!("[x402] A2A/AP2 payment NOT required: failed to parse body as JSON (cannot match filters)");
-                return false;
+            let (json, method) = match a2a_filter_input(body_bytes) {
+                A2aFilterInput::Empty => {
+                    info!("[x402] A2A/AP2 payment NOT required: empty body (no method to match filters)");
+                    return false;
+                }
+                A2aFilterInput::Unmatchable(reason) => {
+                    info!("[x402] A2A/AP2 payment required: {reason}, so method filters cannot be matched");
+                    return true;
+                }
+                A2aFilterInput::Method { json, method } => (json, method),
             };
+            let method = method.as_str();
+            let logged_method = crate::a2a::clip_for_log(method);
 
-            let Some(method) = json
-                .get("method")
-                .and_then(|m| m.as_str())
-            else {
-                // No method field - this is not a JSON-RPC request
-                info!("[x402] A2A/AP2 payment NOT required: no method field in request (cannot match filters)");
-                return false;
-            };
-
-            info!("[x402] A2A/AP2 JSON-RPC method: {}", method);
+            info!("[x402] A2A/AP2 JSON-RPC method: {:?}", logged_method);
 
             // Normalize method name to support both JSON-RPC and gRPC variants
             // JSON-RPC: message/send, message/stream, tasks/cancel
             // gRPC: SendMessage, SendStreamingMessage, CancelTask
             let normalized_method = normalize_a2a_method(method);
-            info!("[x402] A2A/AP2 normalized method: {}", normalized_method);
+            info!("[x402] A2A/AP2 normalized method: {:?}", crate::a2a::clip_for_log(&normalized_method));
 
             // Handle new method filters
             if let Some(filters) = method_filters {
@@ -213,59 +209,58 @@ pub fn should_require_payment(
                         .is_empty()
                     {
                         // No patterns means match all requests for this method
-                        info!("[x402] A2A/AP2 payment required: method '{}' matches (no message patterns)", method);
+                        info!(
+                            "[x402] A2A/AP2 payment required: method {:?} matches (no message patterns)",
+                            logged_method
+                        );
                         return true;
                     }
 
                     // Check if this method has message content to match against
-                    let message_content =
-                        if normalized_method == "message/send" || normalized_method == "message/stream" {
-                            // Extract message text from params.message.parts[].text
-                            let content = extract_a2a_message_text(&json);
-                            if let Some(ref text) = content {
-                                info!(
-                                    "[x402] A2A/AP2 extracted message content for method '{}' (length: {} chars): '{}'",
-                                    method,
-                                    text.len(),
-                                    truncate_at_char_boundary(text, 200)
-                                );
-                            } else {
-                                info!("[x402] A2A/AP2 failed to extract message content for method '{}'", method);
-                            }
-                            content
-                        } else {
-                            // Other methods don't have message content to filter on
+                    let message_content = if normalized_method == "message/send"
+                        || normalized_method == "message/stream"
+                    {
+                        // Extract message text from params.message.parts[].text
+                        let content = extract_a2a_message_text(&json);
+                        if let Some(ref text) = content {
                             info!(
-                                "[x402] A2A/AP2 payment required: method '{}' matches (no message content to filter)",
-                                method
+                                "[x402] A2A/AP2 extracted message content for method {:?} (length: {} chars)",
+                                logged_method,
+                                text.len()
                             );
-                            return true;
-                        };
+                        } else {
+                            info!("[x402] A2A/AP2 failed to extract message content for method {:?}", logged_method);
+                        }
+                        content
+                    } else {
+                        // Other methods don't have message content to filter on
+                        info!(
+                            "[x402] A2A/AP2 payment required: method {:?} matches (no message content to filter)",
+                            logged_method
+                        );
+                        return true;
+                    };
 
                     let Some(content) = message_content else {
                         // No message content found, require payment to be safe
                         info!(
-                            "[x402] A2A/AP2 payment required: method '{}' matches but no message content found",
-                            method
+                            "[x402] A2A/AP2 payment required: method {:?} matches but no message content found",
+                            logged_method
                         );
                         return true;
                     };
 
                     // Check if message content matches any pattern
                     for pattern in &filter.message_patterns {
-                        info!(
-                            "[x402] A2A/AP2 checking pattern '{}' against message content (first 200 chars): '{}'",
-                            pattern,
-                            truncate_at_char_boundary(&content, 200)
-                        );
+                        info!("[x402] A2A/AP2 checking pattern '{}' against message content", pattern);
                         // Escape pattern to treat it as literal text match
                         let escaped_pattern = regex::escape(pattern);
                         match regex::Regex::new(&escaped_pattern) {
                             Ok(re) => {
                                 if re.is_match(&content) {
                                     info!(
-                                        "[x402] A2A/AP2 payment required: method '{}' and message matches pattern '{}'\nMessage: {}",
-                                        method, pattern, content
+                                        "[x402] A2A/AP2 payment required: method {:?} and message matches pattern '{}'",
+                                        logged_method, pattern
                                     );
                                     return true;
                                 } else {
@@ -282,14 +277,14 @@ pub fn should_require_payment(
                     }
 
                     info!(
-                        "[x402] A2A/AP2 payment NOT required: method '{}' matches but message doesn't match any pattern",
-                        method
+                        "[x402] A2A/AP2 payment NOT required: method {:?} matches but message doesn't match any pattern",
+                        logged_method
                     );
                     return false; // Method matches but message doesn't match any pattern
                 }
 
                 // No filter matched
-                info!("[x402] A2A/AP2 payment NOT required: method '{}' not in configured filters", method);
+                info!("[x402] A2A/AP2 payment NOT required: method {:?} not in configured filters", logged_method);
                 return false;
             }
 
@@ -299,8 +294,8 @@ pub fn should_require_payment(
                     .iter()
                     .any(|m| normalize_a2a_method(m) == normalized_method);
                 info!(
-                    "[x402] A2A/AP2 payment required={}: method '{}' (legacy mode, configured methods: {:?})",
-                    requires_payment, method, methods
+                    "[x402] A2A/AP2 payment required={}: method {:?} (legacy mode, configured methods: {:?})",
+                    requires_payment, logged_method, methods
                 );
                 return requires_payment;
             }
@@ -350,10 +345,10 @@ pub async fn process_payment(
                 Ok((payload, correlation_id)) => {
                     channel_info!(
                         channel_id,
-                        "Payment verified successfully correlation_id={} network={} amount={}",
+                        "Payment verified successfully correlation_id={} network={:?} amount={:?}",
                         correlation_id,
-                        payload.network(),
-                        payload.amount()
+                        crate::a2a::clip_for_log(payload.network()),
+                        crate::a2a::clip_for_log(payload.amount())
                     );
 
                     // Settlement gating is driven by X402SettlementMode — see
@@ -374,7 +369,7 @@ pub async fn process_payment(
                         Err(e) => {
                             tracing::warn!(
                                 channel = channel_name,
-                                error = %e,
+                                error = ?e.to_string(),
                                 "Failed to create payment response"
                             );
                             Ok(None)
@@ -570,9 +565,9 @@ async fn dispatch_settlement(
                 Ok(Err(e)) => {
                     channel_warn!(
                         channel_id,
-                        "Immediate settlement failed correlation_id={} error={}",
+                        "Immediate settlement failed correlation_id={} error={:?}",
                         correlation_id,
-                        e
+                        e.to_string()
                     );
                     Err(super::create_invalid_payment_response(&format!("Payment settlement failed: {e}")))
                 }
@@ -607,12 +602,46 @@ async fn dispatch_settlement(
                 )
                 .await
                 {
-                    channel_warn!(&channel_id_clone, "Deferred settlement failed error={}", e);
+                    channel_warn!(&channel_id_clone, "Deferred settlement failed error={:?}", e.to_string());
                 }
             });
             Ok(false)
         }
         X402SettlementMode::None => Ok(false),
+    }
+}
+
+/// What an A2A request body gives x402 and MPP method filters to match.
+#[derive(Debug)]
+pub enum A2aFilterInput {
+    /// No body, as on a GET: there is no method, and nothing is charged.
+    Empty,
+    /// A body the filters cannot be matched against, charged rather than let
+    /// through free: on the inbound path only when the surface's A2A validation
+    /// is `off`, and on the fabric receiving gateway, which checks payment
+    /// without an envelope check, at any level.
+    Unmatchable(&'static str),
+    /// A JSON-RPC request with a string `method`.
+    Method { json: serde_json::Value, method: String },
+}
+
+/// Classify an A2A request body for x402 and MPP method filters.
+pub fn a2a_filter_input(body_bytes: &[u8]) -> A2aFilterInput {
+    if body_bytes.is_empty() {
+        return A2aFilterInput::Empty;
+    }
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+        return A2aFilterInput::Unmatchable("body is not JSON");
+    };
+    match json
+        .get("method")
+        .and_then(|method| method.as_str())
+    {
+        Some(method) => {
+            let method = method.to_string();
+            A2aFilterInput::Method { json, method }
+        }
+        None => A2aFilterInput::Unmatchable("no string method"),
     }
 }
 
@@ -626,21 +655,6 @@ pub fn normalize_a2a_method(method: &str) -> String {
     // v0.3 slash-form. This is internal gating only; it does not change the method
     // exposed to policy, which stays exactly as the caller sent it.
     crate::a2a::canonical_method(method).to_string()
-}
-
-/// Longest prefix of `text` that is at most `max_bytes` long and ends on a char boundary.
-fn truncate_at_char_boundary(
-    text: &str,
-    max_bytes: usize,
-) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let end = (0..=max_bytes)
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
-    &text[..end]
 }
 
 /// Extract message text content from A2A SendMessage/SendStreamingMessage request
@@ -920,6 +934,29 @@ mod settlement_gating_tests {
 #[cfg(test)]
 mod a2a_method_gating_tests {
     use super::*;
+
+    #[test]
+    fn a2a_filter_input_classifies_each_kind_of_body() {
+        assert!(matches!(a2a_filter_input(b""), A2aFilterInput::Empty));
+        assert!(matches!(a2a_filter_input(b"not json"), A2aFilterInput::Unmatchable("body is not JSON")));
+        for unmatchable in [
+            r#"[{"jsonrpc":"2.0","id":1,"method":"message/send"}]"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":7}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+        ] {
+            assert!(
+                matches!(a2a_filter_input(unmatchable.as_bytes()), A2aFilterInput::Unmatchable("no string method")),
+                "{unmatchable}"
+            );
+        }
+        match a2a_filter_input(br#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{}}"#) {
+            A2aFilterInput::Method { json, method } => {
+                assert_eq!(method, "SendMessage");
+                assert_eq!(json["params"], serde_json::json!({}));
+            }
+            other => panic!("expected a method, got {other:?}"),
+        }
+    }
     use crate::config::types::A2AMethodFilter;
 
     fn legacy_config(methods: &[&str]) -> X402Config {
@@ -984,21 +1021,6 @@ mod a2a_method_gating_tests {
     }
 
     #[test]
-    fn truncate_at_char_boundary_backs_off_inside_multibyte_char() {
-        let text = format!("a{}", "é".repeat(150));
-        assert!(!text.is_char_boundary(200));
-        let truncated = truncate_at_char_boundary(&text, 200);
-        assert_eq!(truncated.len(), 199);
-        assert_eq!(truncated, format!("a{}", "é".repeat(99)));
-    }
-
-    #[test]
-    fn truncate_at_char_boundary_returns_short_text_unchanged() {
-        assert_eq!(truncate_at_char_boundary("héllo", 200), "héllo");
-        assert_eq!(truncate_at_char_boundary("", 200), "");
-    }
-
-    #[test]
     fn message_pattern_filter_handles_multibyte_message_longer_than_log_limit() {
         let config = X402Config {
             a2a_method_filters: Some(vec![A2AMethodFilter {
@@ -1020,5 +1042,27 @@ mod a2a_method_gating_tests {
         assert!(should_require_payment(&config, &ChannelProtocol::A2a, &body(&text), None));
         let free = format!("a{}", "é".repeat(150));
         assert!(!should_require_payment(&config, &ChannelProtocol::A2a, &body(&free), None));
+    }
+
+    /// With A2A method filters configured, a body the filters cannot be matched
+    /// against is charged instead of let through free; a request without a body
+    /// is still not charged.
+    #[test]
+    fn a2a_method_filters_charge_a_body_without_a_string_method() {
+        let config = X402Config {
+            a2a_method_filters: Some(vec![A2AMethodFilter {
+                method: "CancelTask".to_string(),
+                message_patterns: vec![],
+            }]),
+            ..Default::default()
+        };
+        let requires = |body: &[u8]| should_require_payment(&config, &ChannelProtocol::A2a, body, None);
+
+        assert!(requires(br#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t"}}]"#), "a batch");
+        assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":7}"#), "a non-string method");
+        assert!(requires(b"not json"), "a body that is not JSON");
+        assert!(!requires(b""), "no body");
+        assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","params":{"id":"t"}}"#));
+        assert!(!requires(br#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t"}}"#));
     }
 }

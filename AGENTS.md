@@ -97,7 +97,7 @@ Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI pa
 the inbound, outbound, and fabric paths, the system invariants, and a module map
 covering every entry in `src/`. Read it before changing anything on the request path.
 
-Four things are worth knowing before you open it.
+Five things are worth knowing before you open it.
 
 **The Agent Surface is the routing unit.** `AgentSurface`
 ([`src/config/agent_surface.rs`](src/config/agent_surface.rs)) carries one Access Point,
@@ -128,6 +128,13 @@ alongside `2024-11-05`. Resolve versions through `runtime_policy_for` /
 `admission_policy_for_target` ([`src/mcp/request_validation.rs`](src/mcp/request_validation.rs)),
 never an appliance-wide constant. See [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md).
 
+**A2A versions and message validation are set per surface.** An A2A Access Point's
+`access_point.a2a` lists its accepted versions (`0.3` and `1.0` by default) and its
+`validation` level: `off`, `envelope` (the JSON-RPC envelope, the default) or `full` (also the
+A2A request shape). An `a2a-proxy://` surface's versions are fixed (`1.0` only when new; existing ones keep theirs), and it always checks `envelope`. Read them through `AgentSurface::a2a_settings`
+([`src/config/agent_surface.rs`](src/config/agent_surface.rs)), never a global flag. See
+[`docs/PROTOCOLS.md`](docs/PROTOCOLS.md#a2a-surface-settings).
+
 ### Where the detail lives
 
 Do not summarise these here. Update the owning document in the same change as the code.
@@ -146,6 +153,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Management RBAC                                                                | [`docs/RBAC.md`](docs/RBAC.md)                                       |
 | Configuration files and their effects                                          | [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md) |
 | Reload behaviour, server mode                                                  | [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md)       |
+| Self-hosting infrastructure requirements                                       | [`docs/DEPLOYMENT_REQUIREMENTS.md`](docs/DEPLOYMENT_REQUIREMENTS.md) |
 | Observability contracts, governance audit forwarding                           | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)                     |
 | Source auth, managed identity, Trust Recorder                                  | [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md)                         |
 | Credential providers, delegation vault, consent modes                          | [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md)     |

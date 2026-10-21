@@ -141,14 +141,6 @@ changes:
         instead. POST /v1/integrations/test now takes an integration that joins an endpoint and
         an event set.
   security:
-    - timestamp: '2026-10-19T11:45:00.000Z'
-      title: Upgrade zip to 9.0.5 to clear RUSTSEC-2026-0367, 0368 and 0369
-      description: >-
-        zip 8.6.0 carried three advisories about archive extraction preserving SUID/SGID bits
-        and following symbolic links outside the destination. The gateway never used that
-        extraction; backup and restore read each entry themselves. Version 9 also fails reads
-        that exceed an entry's declared size, and a restore now refuses an archive whose entry
-        names are not valid UTF-8.
     - timestamp: '2026-10-19T09:30:00.000Z'
       title: Keep secret values and webhook URLs out of integration errors
       description: >-

@@ -7,8 +7,8 @@ is no manual version bump and no tag created by hand.
 
 ## Required environment and secrets
 
-Both workflows run under the `release` GitHub Environment and need a GitHub App token to open
-the release PR and push the tag:
+Both workflows run under the `release` GitHub Environment and need a GitHub App token to create
+the release branch, commit and PR, and to push the tag:
 
 | Secret                  | Purpose                                                            |
 | ------------------------ | ------------------------------------------------------------------ |
@@ -60,20 +60,31 @@ It then:
 3. Bumps `Cargo.toml` and `Cargo.lock` to that version.
 4. Folds every fragment into a new `CHANGELOG.md` section and archives the fragments under
    `.changelog/history/<version>/`.
-5. Opens a `release/vX.Y.Z` pull request with a review checklist.
+5. Commits those changes to `release/vX.Y.Z` through the GitHub GraphQL API
+   (`createCommitOnBranch`), so GitHub signs the commit as the release App and it shows as
+   Verified, then opens a pull request titled `chore(release): prepare vX.Y.Z` from that branch
+   with a review checklist. An existing `release/vX.Y.Z` branch is force-reset to `main` first,
+   discarding anything on it.
 
 Review that PR like any other change: edit the rendered `CHANGELOG.md` section if the wording
-needs work, confirm `Cargo.toml` and `Cargo.lock` both show the new version, then merge it.
+needs work, confirm `Cargo.toml` and `Cargo.lock` both show the new version, then squash-merge
+it. `main` requires signed commits and every branch requires conventional commit messages, and an
+unsigned commit on the release branch blocks the merge even though GitHub signs the squash commit.
+Make wording edits in GitHub's web editor, which signs them, or push them as signed commits, with
+a conventional message such as `docs(release): reword vX.Y.Z notes`. The squash merge takes the
+PR title as its message, so keep it in the `chore(release): …` form if you edit it.
 
 ## Publish release
 
-Merging a `release/vX.Y.Z` PR triggers "Publish release" automatically; it does not run for any
-other push to `main`, even one that happens to touch `Cargo.toml` or `CHANGELOG.md` (detected
-from the merge commit's message, so an unrelated merge cannot publish). It then:
+Squash-merging a `release/vX.Y.Z` PR triggers "Publish release" automatically; it does not run
+for any other push to `main`, even one that happens to touch `Cargo.toml` or `CHANGELOG.md` (it
+looks up the pull request associated with the pushed commit and publishes only when its head
+branch starts with `release/` and its base is `main`, so an unrelated merge cannot publish). It
+then:
 
 1. Checks out the exact commit that triggered the run (not whatever `main`'s tip is by the time
    the job starts), so the binary it builds always matches the commit it tags.
-2. Builds the release binary (`cargo build --release --bin agent-gateway`).
+2. Builds the release binary (`cargo build --release --locked --bin agent-gateway`).
 3. Tags that commit `vX.Y.Z` and pushes the tag. Re-running the job after a partial failure does
    not fail on "tag already exists": it skips re-tagging if the tag already points at the same
    commit, and only errors if it points somewhere else.

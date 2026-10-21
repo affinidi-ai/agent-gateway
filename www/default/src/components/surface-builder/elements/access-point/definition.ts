@@ -3,6 +3,15 @@ import type { NodeDefinition } from '../types';
 import { normalizeRoute } from '../validators';
 import AccessPointPanel from './AccessPointPanel';
 import { DOCS_URL } from '../../../../config/docs';
+import { isA2aProxyEndpoint } from '../_shared/a2aProxyEndpoint';
+import {
+  DEFAULT_A2A_SETTINGS,
+  storedA2aProxyVersions,
+  a2aSettingsForPayload,
+  baseTargetEndpoint,
+  isA2aValidation,
+  selectedA2aVersions,
+} from './a2aSettings';
 
 export const accessPointDefinition: NodeDefinition = {
   type: 'access-point',
@@ -42,6 +51,19 @@ export const accessPointDefinition: NodeDefinition = {
   requires: {},
   incompleteReason: config => (!config.route ? 'Route path is required' : null),
   validate: () => [],
+  featureDependencies: [
+    {
+      description: 'An A2A surface accepts at least one A2A version',
+      // The gateway fixes the versions of a surface whose base Target is an
+      // A2A proxy, so its locked checkboxes never block a save.
+      condition: (_config, ctx) =>
+        (ctx.protocol === 'a2a' || ctx.protocol === 'ap2') &&
+        !isA2aProxyEndpoint(baseTargetEndpoint(ctx.base, ctx.target?.endpoint)),
+      check: config => selectedA2aVersions(config).length > 0,
+      severity: 'error',
+      message: 'Select at least one supported A2A version',
+    },
+  ],
   help: {
     title: 'Access Point',
     docLink: DOCS_URL.accessPointElement,
@@ -66,7 +88,7 @@ export const accessPointDefinition: NodeDefinition = {
   /**
    * Flatten the wire shape back into the flat panel fields.
    */
-  configFromPayload: slice => {
+  configFromPayload: (slice, payload) => {
     const c: any = { ...slice };
     delete c.caller_context;
     // `trust_check_list` is owned by the separate `trust-check` canvas
@@ -89,6 +111,30 @@ export const accessPointDefinition: NodeDefinition = {
     delete c.header_metadata_mapping;
     if (Array.isArray(slice?.supported_extensions)) {
       c.supported_extensions = slice.supported_extensions.slice();
+    }
+    // Assigned rather than deleted, so the canvas-blob overlay, which fills
+    // only missing keys, cannot bring back a stale copy.
+    c.a2a = undefined;
+    if (slice?.protocol === 'a2a' || slice?.protocol === 'ap2') {
+      const a2a = slice?.a2a;
+      // A block without versions comes from a dashboard payload whose base
+      // Target is an A2A proxy; the versions then come from the canvas blob
+      // built with it.
+      const versions: string[] | undefined = Array.isArray(a2a?.accepted_versions)
+        ? a2a.accepted_versions
+        : undefined;
+      if (versions || !a2a) {
+        c.a2a_accepted_versions = (versions ?? DEFAULT_A2A_SETTINGS.accepted_versions).slice();
+      }
+      c.a2a_validation = isA2aValidation(a2a?.validation)
+        ? a2a.validation
+        : DEFAULT_A2A_SETTINGS.validation;
+      const locked = storedA2aProxyVersions(payload);
+      if (!isA2aProxyEndpoint(payload?.target?.endpoint)) {
+        c.a2a_locked_versions = undefined;
+      } else if (locked) {
+        c.a2a_locked_versions = locked;
+      }
     }
     return c;
   },
@@ -153,6 +199,12 @@ export const accessPointDefinition: NodeDefinition = {
     }
     if (typeof c.name === 'string' && c.name.trim()) {
       ap.name = c.name.trim();
+    }
+    if (ap.protocol === 'a2a' || ap.protocol === 'ap2') {
+      ap.a2a = a2aSettingsForPayload(
+        c,
+        baseTargetEndpoint(ctx.base, ctx.firstNodeOfType('target')?.config?.endpoint)
+      );
     }
     return [{ path: 'access_point', value: ap }];
   },

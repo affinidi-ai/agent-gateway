@@ -29,6 +29,7 @@ adds procedures for deploying and operating an appliance, operator guides, and F
 | [Configuration files](CONFIGURATION_REFERENCE.md)     | What each configuration file controls and the effect of its fields                       |
 | [Configuration reload](CONFIGURATION_RELOAD.md)       | Reload locking, listener lifecycle, server mode, fallback behavior, and `[a2a]` settings |
 | [Example configuration](../config/examples/README.md) | The example files, what each maps to, and which are record fragments                     |
+| [Deployment requirements](DEPLOYMENT_REQUIREMENTS.md) | Build, host, storage, network, egress, secrets and Fabric for self-hosting               |
 
 ## Implementation References
 

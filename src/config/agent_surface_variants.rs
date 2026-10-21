@@ -786,6 +786,22 @@ impl AgentSurface {
         Ok(resolved)
     }
 
+    /// The Target `variant` points at, whether or not the variant is enabled.
+    pub fn variant_target(
+        &self,
+        variant: &SurfaceVariant,
+    ) -> Target {
+        let mut target = self.target.clone();
+        if let Some(overrides) = variant
+            .overrides
+            .target
+            .clone()
+        {
+            overrides.apply(&mut target, variant.overrides.complete);
+        }
+        target
+    }
+
     /// Return the alias of the default variant, if any. Returns `None`
     /// when the surface has no variants or `default_variant_id` is unset
     /// or doesn't match.
@@ -882,6 +898,7 @@ mod tests {
                 response_custom_metadata: None,
                 didwebvh_identity: None,
                 terminate_trace_id: false,
+                a2a: None,
             },
             target: Target {
                 endpoint: "https://prod.example.com".to_string(),

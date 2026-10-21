@@ -19,6 +19,7 @@ import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDisca
 import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
+import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -202,6 +203,11 @@ const SurfaceDetailPage: React.FC = () => {
   // scheduleSnap / applySnapshot handlers are still constructed
   // below (they need `buildPayload` etc.) and reach back via the
   // forward refs above.
+  // Per-variant canvas snapshot manager. Hydrates from
+  // `payload.variants[]` on load, swaps the canvas state when the
+  // user picks a different variant in the widget dropdown, and
+  // produces the `variants[]` wire slice on save.
+  const variantSnapshots = useVariantSnapshots();
   const fullHistory = useSurfaceHistory();
   fullHistoryRef.current = fullHistory;
   const builder = useSurfaceBuilder<DetailBuilderState>(
@@ -216,6 +222,7 @@ const SurfaceDetailPage: React.FC = () => {
           : null,
       getCanvasView: () => canvasViewRef.current,
       getProtocol: () => protocol,
+      getBaseSurface: () => variantSnapshots.getBaseSurface(),
       // Page-level full-surface ring buffer drives undo/redo. The
       // inner `useHistory` past/future stacks are dead code in this
       // hook instance — the page captures a snapshot of the full
@@ -247,11 +254,6 @@ const SurfaceDetailPage: React.FC = () => {
     bumpResetView,
   } = builder;
 
-  // Per-variant canvas snapshot manager. Hydrates from
-  // `payload.variants[]` on load, swaps the canvas state when the
-  // user picks a different variant in the widget dropdown, and
-  // produces the `variants[]` wire slice on save.
-  const variantSnapshots = useVariantSnapshots();
   // Pull stable callback references out so effects/useCallbacks can
   // depend on them without re-firing on every snapshot state change
   // (the hook's return object is fresh per render via useMemo).
@@ -316,6 +318,7 @@ const SurfaceDetailPage: React.FC = () => {
       allNodes: nodes,
       nodesOfType: type => nodes.filter(n => n.type === type),
       firstNodeOfType: type => nodes.find(n => n.type === type),
+      base: { targetEndpoint: surfaceMeta.target?.endpoint },
     });
     const savedSize = hydration.surfaceSize;
     const savedView = hydration.view;
@@ -1215,6 +1218,7 @@ const SurfaceDetailPage: React.FC = () => {
         .filter(Boolean);
       payload.status = status;
       payload.issuer_id = issuerId.trim() || undefined;
+      payload = withA2aValidationSettled(payload);
       const updated = await apiClient.updateSurface(surfaceId, payload);
       setSurface(updated);
       setJsonOverride(null);

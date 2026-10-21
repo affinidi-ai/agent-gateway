@@ -13,7 +13,7 @@ jest.mock('../../../utils/toaster', () => ({
 }));
 
 const SETTINGS = {
-  feature_flags: { a2a_legacy_compatibility: false },
+  feature_flags: { metrics: false },
 } as unknown as Settings;
 
 const renderTab = (settings: Settings = SETTINGS) =>
@@ -27,31 +27,32 @@ const renderTab = (settings: Settings = SETTINGS) =>
   );
 
 describe('SystemTab feature flags', () => {
-  it.each(['metrics', 'a2a_legacy_compatibility', 'agent_pay_delegation'])(
-    'names the %s switch after its flag',
-    flag => {
-      renderTab();
+  it.each(['metrics', 'agent_pay_delegation'])('names the %s switch after its flag', flag => {
+    renderTab();
 
-      expect(screen.getByRole('switch', { name: flag })).toBe(
-        screen.getByTestId(`settings-flag-${flag}`)
-      );
-    }
-  );
+    expect(screen.getByRole('switch', { name: flag })).toBe(
+      screen.getByTestId(`settings-flag-${flag}`)
+    );
+  });
 
   it('reflects the flag state on the named switch', () => {
     renderTab();
 
-    expect(screen.getByRole('switch', { name: 'metrics' })).toBeChecked();
-    expect(screen.getByRole('switch', { name: 'a2a_legacy_compatibility' })).not.toBeChecked();
+    expect(screen.getByRole('switch', { name: 'metrics' })).not.toBeChecked();
+    expect(screen.getByRole('switch', { name: 'agent_pay_delegation' })).not.toBeChecked();
   });
 
-  it('shows A2A legacy compatibility on when the flag is unset', () => {
+  // Accepted A2A versions are set per A2A surface, on its Access Point.
+  it('has no A2A legacy compatibility switch', () => {
     renderTab({ feature_flags: {} } as unknown as Settings);
 
-    expect(screen.getByRole('switch', { name: 'a2a_legacy_compatibility' })).toBeChecked();
+    expect(screen.queryByTestId('settings-flag-a2a_legacy_compatibility')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('switch', { name: 'a2a_legacy_compatibility' })
+    ).not.toBeInTheDocument();
   });
 
-  it('turns A2A legacy compatibility off with an explicit false', async () => {
+  it('turns a flag on with an explicit true', async () => {
     const updateSettings = jest.fn().mockResolvedValue(undefined);
     render(
       <SystemTab
@@ -62,11 +63,11 @@ describe('SystemTab feature flags', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('switch', { name: 'a2a_legacy_compatibility' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'agent_pay_delegation' }));
 
     await waitFor(() =>
       expect(updateSettings).toHaveBeenCalledWith({
-        feature_flags: { a2a_legacy_compatibility: false },
+        feature_flags: { agent_pay_delegation: true },
       })
     );
   });

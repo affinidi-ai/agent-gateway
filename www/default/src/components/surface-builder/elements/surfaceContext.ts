@@ -1,6 +1,6 @@
 import type { CanvasNode } from '../SurfaceCanvas';
 import { registry } from './registry';
-import type { Protocol, SurfaceContext } from './types';
+import type { BaseSurfaceView, Protocol, SurfaceContext } from './types';
 
 /**
  * Build a `SurfaceContext` from the canvas node list.
@@ -8,7 +8,8 @@ import type { Protocol, SurfaceContext } from './types';
  */
 export function buildSurfaceContext(
   protocol: string | undefined,
-  allNodes: CanvasNode[] | undefined
+  allNodes: CanvasNode[] | undefined,
+  base?: BaseSurfaceView
 ): SurfaceContext {
   const nodes = allNodes ?? [];
   const accessPoint = nodes.find(n => n.type === 'access-point');
@@ -20,5 +21,6 @@ export function buildSurfaceContext(
     target: target?.config ?? {},
     transitPoints: transitPoints.map(t => t.config ?? {}),
     allNodes: nodes,
+    ...(base ? { base } : {}),
   };
 }
