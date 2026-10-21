@@ -34,16 +34,6 @@ export const LAPTOP_VIEWPORTS = [
 
 type ViewportName = `${number}x${number}`;
 
-/**
- * Page and viewport pairs that fail on the current layout. A listed pair is
- * expected to fail its layout assertions; it must still render every listed
- * test id, and it fails the run if it starts passing.
- */
-export const EXPECTED_FAILURES: ReadonlyArray<{page: string; viewport: ViewportName}> = [];
-
-const isExpectedFailure = (pageId: string, viewport: ViewportName) =>
-    EXPECTED_FAILURES.some(pair => pair.page === pageId && pair.viewport === viewport);
-
 /** Wait for web fonts and for any smooth scroll the page started to come to rest. */
 async function settle(page: Page): Promise<void> {
     await page.evaluate(async () => {
@@ -115,10 +105,6 @@ for (const size of LAPTOP_VIEWPORTS) {
 
                 for (const testId of [...entry.testIds, ...entry.actions]) {
                     await expect(byTestId(page, testId), `${testId} is attached`).toBeAttached();
-                }
-
-                if (isExpectedFailure(entry.id, viewport)) {
-                    test.fail();
                 }
 
                 await expectNoSidewaysScroll(page);

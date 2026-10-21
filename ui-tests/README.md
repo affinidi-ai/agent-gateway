@@ -198,11 +198,6 @@ requests of those pages through `page.route` with rows whose DIDs, URLs and name
 80 characters, and the Audit Log with a full page of 50 entries and pagination. Every
 other request reaches the real gateway; nothing is written through the API.
 
-`EXPECTED_FAILURES` in the spec lists the page and viewport pairs that fail on the current
-layout. A listed pair calls `test.fail()` after its test ids are found attached, so a
-missing element still fails, and a listed pair that starts passing fails the run. Remove
-a pair from the list when its layout is fixed.
-
 Set `AG_LAYOUT_SCREENSHOT_DIR` to save a viewport-sized screenshot of every test,
 `<page>__<width>x<height>.png`, before any assertion runs, plus a full-page
 `<page>__<width>x<height>__full.png` for `audit` and `audit-selected`:
