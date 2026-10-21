@@ -179,7 +179,11 @@ A test fails when:
 - a list table scrolls sideways inside its box (a `.table-responsive` whose `scrollWidth` is more than 1px above its `clientWidth`; the message names the table's nearest test id);
 - a primary action is not visible, lies outside the viewport once scrolled into view, is
   cut by an ancestor whose overflow is not `visible`, or is not the topmost element at its
-  centre.
+  centre;
+- on Tasks the tag filter row starts above the bottom of the title row, or `tasks-refresh-button`
+  ends more than 32px from the header's right edge (`helpers/layout-page-checks.ts`);
+- on Metrics a `text.node-label` of the request flow chart has more than 25 characters or lies
+  horizontally outside the chart's `svg`.
 
 The spec also runs an Audit Log layout test at each viewport, measured from the DOM with
 `helpers/layout-audit.ts`. Where the Audit Log stacks (below 1440px wide: 1280x720 and 1366x768) it

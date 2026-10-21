@@ -18,6 +18,7 @@ import {expect, test} from '../helpers/fixtures';
 import {byTestId, expectActionReachable, expectNoSidewaysScroll, expectNoTableSidewaysScroll} from '../helpers/layout-assertions';
 import {measureAuditLayout, measureBelowTopbar} from '../helpers/layout-audit';
 import {installLayoutFixtures} from '../helpers/layout-fixtures';
+import {measureFlowLabels, measureTasksHeader} from '../helpers/layout-page-checks';
 import {LAYOUT_PAGES, LayoutPage} from '../helpers/layout-pages';
 
 const BASE_URL = process.env.AG_BASE_URL || 'http://localhost:8080';
@@ -38,9 +39,7 @@ type ViewportName = `${number}x${number}`;
  * expected to fail its layout assertions; it must still render every listed
  * test id, and it fails the run if it starts passing.
  */
-export const EXPECTED_FAILURES: ReadonlyArray<{page: string; viewport: ViewportName}> = [
-    {page: 'identities', viewport: '1280x720'},
-];
+export const EXPECTED_FAILURES: ReadonlyArray<{page: string; viewport: ViewportName}> = [];
 
 const isExpectedFailure = (pageId: string, viewport: ViewportName) =>
     EXPECTED_FAILURES.some(pair => pair.page === pageId && pair.viewport === viewport);
@@ -198,5 +197,56 @@ for (const size of LAPTOP_VIEWPORTS) {
                 expect(after.scrollY, 'selecting an entry does not scroll the page').toBe(before);
             });
         }
+    });
+}
+
+/** The flow chart cuts a long label to this many characters, ending in "...". */
+const MAX_FLOW_LABEL_CHARS = 25;
+
+/** The Refresh button sits at the right end of the Tasks header, inside its padding. */
+const REFRESH_RIGHT_MARGIN_PX = 32;
+
+const TASKS_PAGE = LAYOUT_PAGES.find(entry => entry.id === 'tasks');
+const METRICS_PAGE = LAYOUT_PAGES.find(entry => entry.id === 'metrics');
+
+for (const size of LAPTOP_VIEWPORTS) {
+    const viewport: ViewportName = `${size.width}x${size.height}`;
+
+    test.describe(`Page layout at ${viewport}`, () => {
+        test.use({viewport: {width: size.width, height: size.height}});
+
+        test.beforeEach(async ({page}) => {
+            await prepareLaptopPage(page);
+        });
+
+        test(`tasks puts the tag filter under the title and Refresh at the right end at ${viewport}`, async ({page}) => {
+            if (!TASKS_PAGE) throw new Error('the page inventory has no tasks entry');
+            await openPage(page, TASKS_PAGE);
+            await page.locator('[data-testid^="tasks-tag-filter-"]').first().waitFor({state: 'visible'});
+            await settle(page);
+            const header = await measureTasksHeader(page);
+            expect(header.filterRowTop, 'the tag filter row starts below the title row').toBeGreaterThanOrEqual(
+                header.titleRowBottom - TOLERANCE_PX,
+            );
+            expect(
+                header.headerRight - header.refreshRight,
+                'the Refresh button ends at the right end of the header',
+            ).toBeLessThanOrEqual(REFRESH_RIGHT_MARGIN_PX);
+        });
+
+        test(`metrics keeps every flow chart label short and inside the chart at ${viewport}`, async ({page}) => {
+            if (!METRICS_PAGE) throw new Error('the page inventory has no metrics entry');
+            await openPage(page, METRICS_PAGE);
+            await page.locator('text.node-label').first().waitFor({state: 'attached'});
+            await settle(page);
+            const chart = await measureFlowLabels(page);
+            expect(chart.labels.length, 'the flow chart draws node labels').toBeGreaterThan(0);
+            const long = chart.labels.filter(label => label.text.length > MAX_FLOW_LABEL_CHARS).map(label => label.text);
+            expect(long, `labels over ${MAX_FLOW_LABEL_CHARS} characters`).toEqual([]);
+            const outside = chart.labels
+                .filter(label => label.left < chart.chartLeft - TOLERANCE_PX || label.right > chart.chartRight + TOLERANCE_PX)
+                .map(label => label.text);
+            expect(outside, 'labels outside the chart').toEqual([]);
+        });
     });
 }
