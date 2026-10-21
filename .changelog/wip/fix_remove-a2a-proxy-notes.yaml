@@ -7,9 +7,10 @@ changes:
       description: >-
         The Managed Agent panel no longer shows the A2A version and identity notes when its
         Target is an A2A proxy. The A2A proxy's Agent Card tab now gives a shorter explanation:
-        by default the card lists A2A 1.0 and callers must send the A2A-Version 1.0 header, the
-        exposing surface's A2A settings are locked with envelope-only validation, and callers
-        should use A2A 1.0 methods such as SendMessage.
+        the card lists the versions the exposing surface accepts, as its Access Point shows them; a
+        new surface whose Target is the proxy accepts only A2A 1.0, so its callers send the
+        A2A-Version 1.0 header and use A2A 1.0 methods such as SendMessage; and requests to the
+        proxy are checked only for the JSON-RPC envelope.
   fixed: []
   removed: []
   security: []

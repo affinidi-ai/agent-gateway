@@ -16,24 +16,31 @@ const renderTab = () => {
 };
 
 describe('AgentCardTab A2A version note', () => {
-  it('says the card lists A2A 1.0 by default and the surface settings are locked', () => {
+  it('says the card lists the exposing surface versions shown on its Access Point', () => {
     renderTab();
 
-    const note = screen.getByTestId('a2a-proxy-agent-card-version');
-    expect(note).toHaveTextContent('By default, the card lists A2A 1.0');
-    expect(note).toHaveTextContent('Callers must send the A2A-Version: 1.0 header');
-    expect(note).toHaveTextContent('should use A2A 1.0 methods such as SendMessage');
-    expect(note).toHaveTextContent("That surface's A2A settings are locked");
-    expect(note).toHaveTextContent('only the JSON-RPC envelope is checked');
+    expect(screen.getByTestId('a2a-proxy-agent-card-version')).toHaveTextContent(
+      'The card lists the A2A versions accepted by the Agent Surface that exposes this proxy, as shown on its Access Point.'
+    );
   });
 
-  it('does not describe A2A 0.3 surfaces or replies', () => {
+  it('limits the A2A 1.0 header requirement to a new surface', () => {
     renderTab();
 
     const note = screen.getByTestId('a2a-proxy-agent-card-version');
-    expect(note).not.toHaveTextContent('created as an A2A 0.3 proxy');
-    expect(note).not.toHaveTextContent('0.3');
-    expect(note).not.toHaveTextContent('message/send');
-    expect(screen.queryByTestId('a2a-proxy-agent-card-locked')).not.toBeInTheDocument();
+    expect(note).toHaveTextContent(
+      'A new surface whose Target is this proxy accepts only A2A 1.0, so its callers must send the A2A-Version: 1.0 header'
+    );
+    expect(note).toHaveTextContent('should use A2A 1.0 methods such as SendMessage');
+    expect(note).not.toHaveTextContent('By default');
+    expect(note).not.toHaveTextContent('locked');
+  });
+
+  it('says requests are checked only for the JSON-RPC envelope', () => {
+    renderTab();
+
+    expect(screen.getByTestId('a2a-proxy-agent-card-version')).toHaveTextContent(
+      'Requests to this proxy are checked only for a valid JSON-RPC envelope.'
+    );
   });
 });

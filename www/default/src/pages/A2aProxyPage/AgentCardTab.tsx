@@ -25,10 +25,11 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ formData, onChange }) => {
           doesn&apos;t publish one, so the proxy generates it.
         </p>
         <p data-testid="a2a-proxy-agent-card-version">
-          By default, the card lists A2A 1.0, the version accepted by the Agent Surface that exposes
-          this proxy. Callers must send the <code>A2A-Version: 1.0</code> header and should use A2A
-          1.0 methods such as <code>SendMessage</code>. That surface&apos;s A2A settings are locked,
-          and only the JSON-RPC envelope is checked.
+          The card lists the A2A versions accepted by the Agent Surface that exposes this proxy, as
+          shown on its Access Point. A new surface whose Target is this proxy accepts only A2A 1.0,
+          so its callers must send the <code>A2A-Version: 1.0</code> header and should use A2A 1.0
+          methods such as <code>SendMessage</code>. Requests to this proxy are checked only for a
+          valid JSON-RPC envelope.
         </p>
         <p className="mb-0">
           Leave the fields below blank to reuse that surface&apos;s name and description.

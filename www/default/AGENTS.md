@@ -370,11 +370,13 @@ The hidden file input is `data-testid="restore-file-input"`.
   the surface's versions.
 - When the Managed Agent element targets an A2A proxy, its panel shows only the A2A Proxy select;
   the version note lives on the A2A proxy's **Agent Card** tab.
-- The A2A proxy **Agent Card** tab (`a2a-proxy-agent-card-version`) states that, by default, the
-  generated card lists A2A 1.0 (the exposing surface's versions); that callers must send the
-  `A2A-Version: 1.0` header and should use A2A 1.0 methods such as `SendMessage`; and that the
-  surface's A2A settings are locked with only the JSON-RPC envelope checked. It does not follow
-  `[a2a] default_version` and mentions neither surfaces that also accept 0.3 nor 0.3 replies.
+- The A2A proxy **Agent Card** tab (`a2a-proxy-agent-card-version`) states that the generated
+  card lists the versions the exposing surface accepts, as its Access Point shows them; that a new
+  surface whose Target is the proxy accepts only A2A 1.0, so its callers must send the
+  `A2A-Version: 1.0` header and should use A2A 1.0 methods such as `SendMessage`; and that requests
+  to the proxy are checked only for the JSON-RPC envelope. The header requirement is stated for a
+  new surface only, because a variant with a URL base Target, or an older surface, can accept other
+  versions. It does not follow `[a2a] default_version`.
 
 ## Governance Audit integrations
 
