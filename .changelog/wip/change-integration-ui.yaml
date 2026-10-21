@@ -141,14 +141,13 @@ changes:
         instead. POST /v1/integrations/test now takes an integration that joins an endpoint and
         an event set.
   security:
-    - timestamp: '2026-10-19T11:45:00.000Z'
-      title: Upgrade zip to 9.0.5 to clear RUSTSEC-2026-0367, 0368 and 0369
+    - timestamp: '2026-10-21T12:00:00.000Z'
+      title: Upgrade rustls-webpki and webpki roots to clear three distrust advisories
       description: >-
-        zip 8.6.0 carried three advisories about archive extraction preserving SUID/SGID bits
-        and following symbolic links outside the destination. The gateway never used that
-        extraction; backup and restore read each entry themselves. Version 9 also fails reads
-        that exceed an entry's declared size, and a restore now refuses an archive whose entry
-        names are not valid UTF-8.
+        rustls-webpki 0.103.15 could accept certificates through distrusted intermediates
+        (RUSTSEC-2026-0382), and webpki-roots and webpki-root-certs 1.0.8 still trusted
+        distrusted emSign intermediates (RUSTSEC-2026-0381, RUSTSEC-2026-0383). They are now
+        0.103.16 and 1.0.10, and the dependency audit passes again.
     - timestamp: '2026-10-19T09:30:00.000Z'
       title: Keep secret values and webhook URLs out of integration errors
       description: >-
@@ -199,9 +198,11 @@ changes:
         directories to <dir>.migrated-<unix seconds>, deleted 30 days later as they may hold
         plain-text credentials. Upgrade both nodes of a pair before the Active node starts; a
         Standby migrates when promoted. Attachments to some gateways or connection points now
-        receive every resource's events, custom _ variables and unfilled placeholders leave the
-        templates, and endpoints failing the current checks are written disabled; the report
-        names each change. The old paths resolve against the config file's directory, and
+        receive every resource's events, every tenant's included. Tenant-owned integrations
+        become appliance-wide and are written disabled, since enabled they would receive every
+        tenant's events; review each before enabling it. Custom _ variables and unfilled
+        placeholders leave the templates, and endpoints failing the current checks are written
+        disabled; the report names each change. The old paths resolve against the config file's directory, and
         while storage_paths.integrations is set, the new integration paths a config leaves
         unset go beside it, so a config written for the previous version needs no change; set
         them before removing the old keys. See the INTEGRATIONS upgrade section.

@@ -745,8 +745,6 @@ export interface FeatureFlags {
    *  surfaces already configured to delegate payment continue to work
    *  and remain editable regardless of this flag. */
   agent_pay_delegation?: boolean;
-  /** Accept A2A protocol version 0.3 alongside 1.0. Absent means enabled. */
-  a2a_legacy_compatibility?: boolean;
   /** Experimental per-gateway mediator choice. Default off (treated as `false`
    *  when undefined); set explicitly to `true` to enable. When on, the Connect
    *  via OOB wizard shows the mediator picker and the API accepts

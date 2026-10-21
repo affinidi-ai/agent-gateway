@@ -366,7 +366,7 @@ mod tests {
                     .unwrap()
                     .name()
                     .unwrap()
-                    .to_string()
+                    .into_owned()
             })
             .collect();
 

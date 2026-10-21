@@ -1,12 +1,17 @@
 import React from 'react';
-import { render, screen, within, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, within, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import { apiClient } from '../../../../../api';
 import TrustRecorderEntryForm from '../TrustRecorderEntryForm';
 import TrustRecorderFullscreenPanel from '../TrustRecorderFullscreenPanel';
 import type { TrustRecorderEntry } from '../definition';
+import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../../SurfaceMetaContext';
+import { DOCS_URL } from '../../../../../config/docs';
+import { clearIssuersCache } from '../../../../../utils/issuersCache';
 import type { Authority, Issuer, TrustRegistry } from '../../../../../types';
+
+const flushPromises = () => act(() => new Promise<void>(resolve => setTimeout(resolve, 0)));
 
 jest.mock('../../../../../api', () => ({
   apiClient: {
@@ -416,5 +421,161 @@ describe('TrustRecorderEntryForm — custom resource row', () => {
     expect(column('resource')).toHaveStyle({ flex: '1 1 0', minWidth: '0' });
     expect(column('target')).toHaveStyle({ flex: '0 0 140px' });
     expect(column('record-type')).toHaveStyle({ flex: '0 0 150px' });
+  });
+});
+
+describe('TrustRecorderEntryForm — surface Issuer warning', () => {
+  const WARNING = 'trust-recorder-entry-0-no-surface-issuer-warning';
+
+  beforeEach(() => {
+    clearIssuersCache();
+    (apiClient.listTrustRegistries as jest.Mock).mockResolvedValue([]);
+    (apiClient.listAuthorities as jest.Mock).mockResolvedValue([]);
+    (apiClient.listIssuers as jest.Mock).mockResolvedValue([
+      { id: 'issuer-1', name: 'Issuer One', did: 'did:web:one.example', created_at: '' },
+    ]);
+  });
+  const surfaceEntry = () => baseEntry({ authority_did: '{{ surface.issuer_did }}' });
+
+  function renderInSurface(props: Parameters<typeof TrustRecorderEntryForm>[0], issuerId: string) {
+    const meta = { issuerId } as unknown as SurfaceMetaValue;
+    return render(
+      <MemoryRouter>
+        <SurfaceMetaProvider value={meta}>
+          <TrustRecorderEntryForm {...props} />
+        </SurfaceMetaProvider>
+      </MemoryRouter>
+    );
+  }
+
+  it('warns under Use surface Issuer when the surface has no Issuer', () => {
+    renderInSurface(baseProps({ entry: surfaceEntry() }), '');
+
+    const warning = screen.getByTestId(WARNING);
+    expect(warning).toHaveTextContent('No Issuer is selected for this surface');
+    expect(warning).toHaveTextContent('This entry uses the surface Issuer as its Authority');
+    expect(warning).toHaveTextContent('writes no records');
+  });
+
+  it('treats a template padded with whitespace as Use surface Issuer, as the backend does', () => {
+    renderInSurface(
+      baseProps({ entry: baseEntry({ authority_did: '  {{ surface.issuer_did }}\n' }) }),
+      ''
+    );
+
+    expect(
+      screen.getByTestId('trust-recorder-entry-0-authority-mode-surface-issuer-radio')
+    ).toBeChecked();
+    expect(screen.getByTestId(WARNING)).toBeInTheDocument();
+  });
+
+  it('does not warn when the surface has an Issuer that exists', async () => {
+    renderInSurface(baseProps({ entry: surfaceEntry() }), 'issuer-1');
+    await waitFor(() => expect(apiClient.listIssuers).toHaveBeenCalled());
+    await flushPromises();
+    expect(screen.queryByTestId(WARNING)).not.toBeInTheDocument();
+  });
+
+  it('warns that the Issuer no longer exists when the surface points at a deleted one', async () => {
+    renderInSurface(baseProps({ entry: surfaceEntry() }), 'issuer-gone');
+
+    const warning = await screen.findByTestId(WARNING);
+    expect(warning).toHaveTextContent("This surface's Issuer no longer exists");
+    expect(warning).toHaveTextContent('This entry uses the surface Issuer as its Authority');
+    expect(warning).toHaveTextContent('writes no records');
+  });
+
+  it('does not warn in Explicit DID mode even when the surface has no Issuer', () => {
+    renderInSurface(
+      baseProps({ entry: baseEntry({ authority_did: 'did:web:authority.example' }) }),
+      ''
+    );
+    expect(screen.queryByTestId(WARNING)).not.toBeInTheDocument();
+  });
+
+  it('does not warn outside a surface editor', () => {
+    renderForm(baseProps({ entry: surfaceEntry() }));
+    expect(screen.queryByTestId(WARNING)).not.toBeInTheDocument();
+  });
+
+  it('shows the warning as soon as the operator switches to Use surface Issuer', () => {
+    const updateEntry = jest.fn();
+    const { rerender } = renderInSurface(baseProps({ entry: baseEntry(), updateEntry }), '');
+    expect(screen.queryByTestId(WARNING)).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByTestId('trust-recorder-entry-0-authority-mode-surface-issuer-radio')
+    );
+    expect(updateEntry).toHaveBeenCalledWith(0, { authority_did: '{{ surface.issuer_did }}' });
+
+    rerender(
+      <MemoryRouter>
+        <SurfaceMetaProvider value={{ issuerId: '' } as unknown as SurfaceMetaValue}>
+          <TrustRecorderEntryForm {...baseProps({ entry: surfaceEntry(), updateEntry })} />
+        </SurfaceMetaProvider>
+      </MemoryRouter>
+    );
+    expect(screen.getByTestId(WARNING)).toBeInTheDocument();
+  });
+});
+
+describe('TrustRecorderEntryForm — Issuer wording', () => {
+  it('describes the entry Issuer as the Entity of Issuer DID records, not as a signer', () => {
+    renderForm(baseProps());
+    const form = screen.getByTestId('trust-recorder-entry-0-form');
+    expect(form).toHaveTextContent('Recorded as the Entity of custom records');
+    expect(form).toHaveTextContent('It does not sign records or set the Authority.');
+    expect(form).not.toHaveTextContent('signs the records');
+  });
+
+  it('words the missing-Issuer validation without claiming the Issuer signs', () => {
+    renderForm(baseProps({ entry: baseEntry({ issuer_did: '' }), saveAttempted: true } as any));
+    expect(screen.getByText('Select an Issuer for this entry.')).toBeInTheDocument();
+  });
+});
+
+describe('TrustRecorderFullscreenPanel — Issuer, Authority and Entity explainer', () => {
+  function renderPanel() {
+    (apiClient.listTrustRegistries as jest.Mock).mockResolvedValue([]);
+    (apiClient.listIssuers as jest.Mock).mockResolvedValue([]);
+    (apiClient.listAuthorities as jest.Mock).mockResolvedValue([]);
+    return render(
+      <MemoryRouter>
+        <TrustRecorderFullscreenPanel
+          config={{}}
+          updateField={jest.fn()}
+          updateFields={jest.fn()}
+        />
+      </MemoryRouter>
+    );
+  }
+
+  it('is collapsed by default and opens on demand', async () => {
+    renderPanel();
+    await waitFor(() => expect(apiClient.listIssuers).toHaveBeenCalled());
+
+    const toggle = screen.getByTestId('trust-recorder-fullscreen-context-toggle');
+    expect(toggle).toHaveTextContent('How do Issuer, Authority and Entity relate?');
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByTestId('trust-recorder-fullscreen-context-body')).toBeNull();
+
+    fireEvent.click(toggle);
+    const body = screen.getByTestId('trust-recorder-fullscreen-context-body');
+    for (const term of ['Authority', 'Entity', 'Issuer (this entry)', 'Surface Issuer']) {
+      expect(within(body).getByText(term)).toBeInTheDocument();
+    }
+    expect(body).toHaveTextContent('no records are written');
+  });
+
+  it('links to the Trust Recorder guide in a new tab', async () => {
+    renderPanel();
+    await waitFor(() => expect(apiClient.listIssuers).toHaveBeenCalled());
+    fireEvent.click(screen.getByTestId('trust-recorder-fullscreen-context-toggle'));
+
+    const link = screen.getByTestId('trust-recorder-fullscreen-context-doclink');
+    expect(link).toHaveAttribute('href', DOCS_URL.trustElements);
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    expect(link).toHaveTextContent('Read the Trust Recorder guide');
   });
 });

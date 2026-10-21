@@ -121,6 +121,32 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
 
+## Trust Recorder
+
+- The sidebar panel and each entry in its fullscreen editor show the shared
+  `NoSurfaceIssuerWarning` (`elements/trust-recorder/NoSurfaceIssuerWarning.tsx`, an
+  `InfoBanner` warning variant, never the amber `alert-warning`, which fails contrast) while
+  `SurfaceMetaContext.issuerId` is empty, or names an Issuer that is not in the Issuer list, and
+  an entry's Authority is **Use surface Issuer** (`usesSurfaceIssuer`). The backend skips such an
+  entry and writes no records. The title tells the two cases apart: "No Issuer is selected for
+  this surface" and "This surface's Issuer no longer exists".
+- `useSurfaceIssuerProblem` calls the shared Issuer list (`getIssuers`), and refetches it once
+  before reporting an Issuer as deleted. It stays quiet while the list loads and when it cannot
+  be loaded.
+- It is a warning, not save validation. It stays hidden for entries with an explicit
+  Authority, and outside a surface editor, where there is no surface Issuer to check.
+- The entry **Issuer** is only the Entity of custom records whose Entity Target is Issuer DID.
+  Never describe it as signing records or setting the Authority.
+- The fullscreen editor opens with a collapsed `InfoBanner` explaining Authority, Entity, the
+  entry Issuer and the surface Issuer, linked to the Trust elements guide.
+
+| Element                            | Test id                                                                                                                           |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Panel warning                      | `trust-recorder-panel-no-surface-issuer-warning`                                                                                  |
+| Entry warning                      | `trust-recorder-entry-<index>-no-surface-issuer-warning`                                                                          |
+| Explainer toggle, body, guide link | `trust-recorder-fullscreen-context-toggle`, `trust-recorder-fullscreen-context-body`, `trust-recorder-fullscreen-context-doclink` |
+| Canvas node, by element type       | `surface-node-<type>`, for example `surface-node-trust-recorder`                                                                  |
+
 ## Access Tokens page
 
 Management personal access tokens live in the Secrets page's **Access Tokens** tab.
@@ -222,6 +248,16 @@ Keep labels associated, timestamps exact, and clipboard failures visible.
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.
 
+## Policy definition editor
+
+The **Policy Instructions & Examples** panel on the Create Policy Definition page is collapsed
+by default. Its title is a heading holding one full-width button (`policy-instructions-toggle`,
+with `aria-expanded` and `aria-controls="policyDefInstructions"`), so the whole header row
+toggles, Enter and Space work natively, and screen readers still announce the heading. The
+title is `policy-instructions-title`, the arrow `policy-instructions-chevron` sits inside the
+button and flips with the state, and the body is `policy-instructions-body`. Build collapsible
+panels the same way, and do not put `role="button"` on a wrapper around a heading.
+
 ## MCP Proxy write warnings
 
 MCP Proxy create and update responses can carry `warnings`, for example when only the
@@ -251,9 +287,9 @@ unnamed filter, and surface links in the `useIdentityRows` hook, and the row par
   copy button are the primary line, with no placeholder chip. While a caller name
   lookup is pending (`display_name_pending`), a muted "resolving…" line sits above the
   DID. A name conflict shows the DID as primary with a "name conflict" marker beside it.
-  A verified agent name renders as `local · host` with a verified marker, and a
-  caller's Agent Card name (`agent_card`) and a managed agent's target Agent Card name
-  (`target_agent_card`) are both marked unverified. A surface name shows no badge.
+  A verified agent name renders as `local · host` with a verified marker. A caller's
+  Agent Card name (`agent_card`), a managed agent's target Agent Card name
+  (`target_agent_card`) and a surface name show no badge.
 - The unnamed filter and its count include only rows with no name and no pending lookup.
 - The **Origin** column holds the origin badge (Managed Agent or External Caller), or
   LOCAL/REMOTE for records without an origin, plus a VERIFIED badge where it applies.
@@ -265,7 +301,7 @@ unnamed filter, and surface links in the `useIdentityRows` hook, and the row par
 | Element                                       | Test id                                                                                                                            |
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Identity row                                  | `identities-row-<did>`                                                                                                             |
-| Name, pending, conflict, verified, unverified | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`, `identities-name-unverified` |
+| Name, pending, conflict, verified             | `identities-name`, `identities-name-pending`, `identities-name-conflict`, `identities-name-verified`                               |
 | Copy DID                                      | `identities-copy-did-button`                                                                                                       |
 | Origin badge                                  | `identities-origin-<origin>`                                                                                                       |
 | Surface link, credential principal            | `identities-surface-link`, `identities-credential-principal`                                                                       |
@@ -324,11 +360,6 @@ Settings → **System** → **Feature Flags** is a table of the shared `FeatureF
 - The switch carries `data-testid="settings-flag-<flag>"`, `role="switch"`, and
   `aria-labelledby` pointing at the row's flag-name cell, so its accessible name is the
   flag key.
-- `a2a_legacy_compatibility` is default on, and every reader uses
-  `isA2aLegacyCompatibilityOn` (`utils/a2aLegacyCompatibility.ts`), where unset counts as
-  on, the gateway's rule. On, surfaces accept A2A 1.0 and 0.3 and generated agent cards list
-  both. Off, they serve 1.0 only, and a 0.3 or version-less call gets an
-  unsupported-version error.
 - `mediator_federation` is default off and experimental. On, the Connect via OOB wizard's
   details step (`gateway-add-via-oob/EnterDetailsStep.tsx`) shows a mediator picker
   (`wizard-oob-acceptor-mediator`) that lists only mediators with `status === 'active'` and
@@ -350,10 +381,48 @@ The hidden file input is `data-testid="restore-file-input"`.
   known A2A method in either spelling (v0.3 slash-form or v1.0 PascalCase) or a
   `params.message` envelope is A2A; any other JSON-RPC method is MCP.
 - The A2A method table mirrors `src/a2a/methods.rs`. Keep them in step.
-- The A2A proxy **Agent Card** tab (`a2a-proxy-agent-card-version`) states that the
-  generated card is A2A 1.0 and, following the current `a2a_legacy_compatibility` value,
-  that it also carries the 0.3 fields (on) or is 1.0 only (off). It does not follow
-  `[a2a] default_version`.
+- A2A versions and message validation are per surface, not feature flags. The Access Point
+  panel of an A2A or AP2 surface has an **A2A Protocol** section (`access-point-a2a-protocol`): a
+  checkbox per version (`access-point-a2a-version-0.3`, `-1.0`, both checked by default) and a
+  **Message validation** dropdown (`access-point-a2a-validation`) with **Off**, **JSON-RPC
+  envelope** (the default) and **Envelope + A2A fields**, each with field help. Keep the option
+  labels short: the sidebar is narrow, and the field help explains each level, including that only
+  an appliance-wide administrator can choose Off (the API refuses it from tenant-scoped tokens). The node keeps
+  them flat as `a2a_accepted_versions` and `a2a_validation`; `access-point/a2aSettings.ts` maps
+  them to and from the payload's `access_point.a2a`, which every A2A and AP2 save sends.
+- With no version checked, the section shows `access-point-a2a-versions-error` and a
+  blocking dependency error stops the save.
+- The versions follow the base Target, as the gateway decides them; the validation lock follows
+  the Target in view. Panels and the save gate read the base from `base` (`BaseSurfaceView` in
+  `elements/types.ts`: the base snapshot's Target endpoint and Access Point canvas config, given
+  only while a named variant is active, from `useVariantSnapshots().getBaseSurface()`); without it
+  the Target in view is the base. `a2aTargetView` in `access-point/a2aSettings.ts` decides both.
+- When the base Target is an `a2a-proxy://` endpoint, the version checkboxes are disabled and show
+  the gateway's fixed versions, and `access-point-a2a-proxy-locked` gives the reason when they
+  include 0.3: the versions the stored block of a surface loaded with an A2A proxy base Target is
+  served with, or both when it has no block (`storedA2aProxyVersions`, kept on the node, and on the
+  base view's Access Point config, as `a2a_locked_versions`; never taken from a canvas blob alone;
+  `syncAccessPointIdentifiers` keeps a snapshot's versions when the synced block names none),
+  and 1.0 only for a new surface or one whose base Target was just moved to a proxy. In a view whose Target is a URL it adds that message validation applies to this
+  Target. The payload's `access_point.a2a` then carries only `validation`, so the gateway keeps its
+  fixed versions; the page sets it to `envelope` on save when no variant points the Target at a URL
+  (`withA2aValidationSettled`). The at-least-one-version save gate does not apply.
+- When the Target in view is an `a2a-proxy://` endpoint, **Message validation** is disabled at
+  **JSON-RPC envelope**. If the base Target is a URL, the versions stay editable and
+  `access-point-a2a-proxy-envelope-only` says that this Target checks only the envelope and takes
+  the surface's versions.
+- When the Managed Agent element targets an A2A proxy, its panel shows
+  `managed-agent-a2a-proxy-protocol-hint`, built from the versions the gateway serves (those the
+  Access Point shows): a heading naming them (`managed-agent-a2a-proxy-versions`, such as "Accepts
+  A2A 1.0 only" or "Accepts A2A 0.3 and 1.0"); for an A2A proxy base Target that accepts 0.3, the
+  reason (`managed-agent-a2a-proxy-0-3-reason`: it was created as an A2A 0.3 proxy and keeps 0.3
+  for its existing callers, while new surfaces accept 1.0 only); then one short line each for the
+  header callers send, the reply per method (`SendMessage` 1.0, `message/send` 0.3), envelope-only
+  validation, and either that the versions are fixed (A2A proxy base Target) or that they are the
+  surface's, set in the Access Point (URL base Target).
+- The A2A proxy **Agent Card** tab (`a2a-proxy-agent-card-version`) states that the generated
+  card lists the versions the exposing surface accepts (1.0 by default) and which reply each send
+  method gets. It does not follow `[a2a] default_version`.
 
 ## Integrations
 
@@ -414,9 +483,13 @@ identities: an integration receives every event of its event set, from every res
 - `-stored-secret-select` picks an appliance-wide secret instead (`hooks/useApplianceSecrets.ts`),
   saved as `$SECRET:<secret_id>`. Webhook headers have no picker, because only header values
   resolve references; they are written inside the JSON.
-- `buildConfiguration` leaves kept secrets out, so the gateway keeps them, and sends a cleared
-  one as `null`. It also sends `null` for a stored secret the form now hides, such as the SASL
-  password once SASL is switched off, so no unseen credential stays stored.
+- A stored reference counts as a stored secret (`form.stored`, not the endpoint's `secrets`
+  list, which leaves references out), so it also gets Keep and, when optional, Clear.
+- `buildConfiguration` leaves kept secrets out, so the gateway keeps them. On an update it sends
+  `null` for a stored secret that is cleared or left empty, such as a reference set to "None, type
+  a value", since the gateway keeps one that is left out. It also sends `null` for a stored secret
+  the form now hides, such as the SASL password once SASL is switched off, so no unseen credential
+  stays stored.
 
 ### Event set editor
 

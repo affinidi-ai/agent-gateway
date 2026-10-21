@@ -4,6 +4,13 @@ Feature: A2A proxy endpoint targets a non-A2A managed agent
   while the proxy adapts text-only A2A message/send requests to the configured
   Target service and returns A2A responses.
 
+  An A2A-proxy surface accepts the A2A versions its settings name, and its card
+  lists them. One stored without settings, as before per-surface A2A settings,
+  accepts 0.3 and 1.0; one created now accepts 1.0 only unless asked otherwise.
+  A caller using message/send reads the A2A 0.3 reply and one using SendMessage
+  reads the 1.0 reply. It checks only the JSON-RPC envelope, not the A2A message
+  shape. Unless a scenario says otherwise, its requests send A2A-Version 1.0.
+
   Background:
     Given non-A2A managed agent "bravo" is available
     And A2A proxy "worker" targets non-A2A managed agent "bravo"
@@ -28,20 +35,28 @@ Feature: A2A proxy endpoint targets a non-A2A managed agent
     And the A2A response is a JSON-RPC invalid params error
     And non-A2A managed agent "bravo" was not called
 
+  Scenario: A surface that accepts A2A 1.0 only refuses a caller that does not negotiate it
+    Given the surface accepts A2A versions "1.0"
+    When the caller sends an A2A message/send request to surface "alpha" without an A2A-Version header
+    Then the response status is 400
+    And the response is a JSON-RPC error with code -32009
+    And the response error lists only the supported versions "1.0"
+    And non-A2A managed agent "bravo" was not called
+
   Scenario: Unsupported A2A methods are rejected before the Target service is called
     When the caller sends A2A method "tasks/get" to surface "alpha"
     Then the response status is 200
     And the A2A response is a JSON-RPC method not found error
     And non-A2A managed agent "bravo" was not called
 
-  # Note: the proxy ACCEPTING the v1.0 `SendMessage` spelling (so it does not
-  # contradict the protocolVersion 1.0 its synthesized card advertises) is covered
-  # by unit tests on `is_supported_proxy_method`. It is not asserted here because
-  # the positive Direct Line path needs outbound dialling to a loopback Target,
-  # which the egress policy blocks in this harness — the reason the other positive
-  # proxy scenarios above do not execute either.
+  # Note: a served message/send (the A2A 0.3 reply, also without an A2A-Version
+  # header) and a served SendMessage (the 1.0 reply) are covered by the A2A proxy
+  # component tests. They are not asserted here because the positive Direct Line
+  # path needs outbound dialling to a loopback Target, which the egress policy
+  # blocks in this harness — the reason the other positive proxy scenarios do not
+  # execute either.
 
-  Scenario Outline: An unsupported method stays refused whatever version is negotiated
+  Scenario Outline: An unsupported method stays refused whatever spelling is used
     # Negotiating 1.0 must not unlock an operation the proxy cannot serve.
     When the caller sends A2A method "<method>" to surface "alpha" with header "A2A-Version" set to "<version>"
     Then the response status is 200
@@ -51,7 +66,7 @@ Feature: A2A proxy endpoint targets a non-A2A managed agent
     Examples:
       | method               | version |
       | GetTask              | 1.0     |
-      | tasks/get            | 0.3     |
+      | tasks/get            | 1.0     |
       | GetExtendedAgentCard | 1.0     |
 
   Scenario Outline: Methods the proxy cannot serve are refused in either era
@@ -71,26 +86,38 @@ Feature: A2A proxy endpoint targets a non-A2A managed agent
       | agent/getAuthenticatedExtendedCard |
       | GetExtendedAgentCard               |
 
-  Scenario: The synthesized agent card is a valid A2A v1.0 document
+  Scenario: The synthesized agent card of a surface that accepts A2A 1.0 only is a 1.0 document
     # v1.0 collapses the transports into an ordered supportedInterfaces array and
-    # renames or removes several v0.x fields. The legacy fields stay dual-emitted
-    # so a v0.3 client can still reach the endpoint during the deprecation window.
+    # renames or removes several v0.x fields. A surface that accepts 1.0 only has
+    # one 1.0 interface and none of the v0.3 fields.
+    Given the surface accepts A2A versions "1.0"
     When the caller fetches the agent card for surface "alpha"
     Then the response status is 200
-    And the agent card at "/protocolVersion" is "1.0"
     And the agent card at "/supportedInterfaces/0/protocolBinding" is "JSONRPC"
     And the agent card at "/supportedInterfaces/0/protocolVersion" is "1.0"
+    And the agent card at "/supportedInterfaces/1" is absent
     And the agent card at "/provider/organization" is "Affinidi"
     And the agent card at "/capabilities/extendedAgentCard" is "false"
-    # Renamed or relocated by v1.0. The v0.3 spellings are emitted alongside
-    # while legacy compatibility is on, so a v0.3 reader gets a usable card.
-    And the agent card at "/agentProvider/organization" is "Affinidi"
-    And the agent card at "/supportsAuthenticatedExtendedCard" is "false"
+    # The v0.3 fields, including the top-level version 1.0 moved onto each interface.
+    And the agent card at "/protocolVersion" is absent
+    And the agent card at "/url" is absent
+    And the agent card at "/preferredTransport" is absent
+    And the agent card at "/agentProvider" is absent
+    And the agent card at "/supportsAuthenticatedExtendedCard" is absent
     # Removed outright by v1.0 with no successor, so it is not resurrected.
     And the agent card at "/capabilities/stateTransitionHistory" is absent
     And the agent card at "/supportedInterfaces/0/transport" is absent
-    # Dual-emitted legacy fields for v0.3 readers.
+
+  Scenario: The synthesized agent card of a surface stored without A2A settings also serves A2A 0.3
+    # A surface from before per-surface A2A settings keeps accepting 0.3, so its
+    # card lists both versions and keeps the v0.3 fields a 0.3 caller reads.
+    When the caller fetches the agent card for surface "alpha"
+    Then the response status is 200
+    And the agent card at "/supportedInterfaces/0/protocolVersion" is "1.0"
+    And the agent card at "/supportedInterfaces/1/protocolVersion" is "0.3"
     And the agent card at "/preferredTransport" is "JSONRPC"
+    And the agent card at "/agentProvider/organization" is "Affinidi"
+    And the agent card url points to the surface Access Point
 
   Scenario: Disabled A2A proxy endpoints return a clear Target error
     Given A2A proxy "worker" is disabled

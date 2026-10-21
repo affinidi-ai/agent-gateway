@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { apiClient } from '../../../../api';
 import { AppButton } from '../../../shared/AppButton';
+import InfoBanner from '../../../shared/InfoBanner';
+import { DOCS_URL } from '../../../../config/docs';
 import type { Authority, Issuer, TrustRegistry } from '../../../../types';
 import { getAuthorities } from '../../../../utils/authoritiesCache';
 import type { ConfigPanelProps } from '../types';
@@ -262,6 +264,40 @@ const TrustRecorderFullscreenPanel: React.FC<ConfigPanelProps> = ({
           </strong>
         </div>
       </div>
+
+      <InfoBanner
+        title="How do Issuer, Authority and Entity relate?"
+        testIdPrefix="trust-recorder-fullscreen"
+        className="mb-4"
+        docLink={DOCS_URL.trustElements}
+        docLinkLabel="Read the Trust Recorder guide"
+      >
+        <dl className="mb-0">
+          <dt>Authority</dt>
+          <dd>
+            The trust anchor that asserts every record this entry writes. Pick an Authority or an
+            Issuer, or <em>Use surface Issuer</em> to assert with the Issuer selected in the Surface
+            settings.
+          </dd>
+          <dt>Entity</dt>
+          <dd>
+            Who a record is about: the agent&apos;s DID (the built-in <code>ownedAgent</code>{' '}
+            triple, and custom records with Entity Target <em>Agent DID</em>) or this entry&apos;s
+            Issuer (custom records with Entity Target <em>Issuer DID</em>).
+          </dd>
+          <dt>Issuer (this entry)</dt>
+          <dd>
+            Only the DID recorded as the Entity of <em>Issuer DID</em> custom records. It does not
+            sign records or set the Authority.
+          </dd>
+          <dt>Surface Issuer</dt>
+          <dd>
+            The Issuer chosen in the Surface settings. It matters only when an entry&apos;s
+            Authority is <em>Use surface Issuer</em>. With none selected, that entry is skipped and
+            no records are written.
+          </dd>
+        </dl>
+      </InfoBanner>
 
       <div className="card shadow mb-4">
         <div className="card-header py-3 d-flex align-items-center justify-content-between">

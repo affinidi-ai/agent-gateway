@@ -7,8 +7,6 @@ import { EndpointForm, FieldSpec, SecretEdit, visibleFields } from './endpointFi
 interface EndpointConfigFieldsProps {
   type: EndpointType;
   form: EndpointForm;
-  /** The secret fields the gateway holds a value for. */
-  storedSecrets: string[];
   /** Stored secrets a secret field may reference. */
   secretOptions: SecretOption[];
   disabled?: boolean;
@@ -22,7 +20,6 @@ const inputId = (field: FieldSpec) => `endpoint-${field.name}`;
 const EndpointConfigFields: React.FC<EndpointConfigFieldsProps> = ({
   type,
   form,
-  storedSecrets,
   secretOptions,
   disabled = false,
   onValue,
@@ -38,7 +35,7 @@ const EndpointConfigFields: React.FC<EndpointConfigFieldsProps> = ({
             id={id}
             label={field.label}
             edit={form.secrets[field.name] ?? { state: 'set', value: '' }}
-            stored={storedSecrets.includes(field.name)}
+            stored={form.stored.includes(field.name)}
             required={field.required}
             multiline={field.kind === 'secret-json'}
             placeholder={field.placeholder}

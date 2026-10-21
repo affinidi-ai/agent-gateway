@@ -197,9 +197,17 @@ for the agent DID. Context is a snapshot taken at creation and is never rewritte
 reference field carries the current name. A naming failure never skips record creation.
 
 `authority_did` accepts the template `{{ surface.issuer_did }}`, resolved at write time
-to the surface's configured Issuer DID. When the surface has no issuer configured the
+to the surface's configured Issuer DID. When the surface has no issuer configured, or its
+issuer was deleted (deleting an Issuer does not check whether a surface still uses it), the
 template does not resolve and the entry is skipped with a warning rather than written
 with a placeholder.
+
+An entry's `issuer_did` is not a signer and does not set the authority. It is written as
+the `entity_id` of custom records whose `entity_target` is `issuer`, and nothing else. The
+dashboard warns on the Trust Recorder panel and on the entry while the surface has no Issuer
+selected, or its Issuer no longer exists, and an entry's authority is the template, because
+that entry writes nothing. The
+warning does not block saving, and it does not appear for entries with an explicit authority.
 
 ## Display names
 
@@ -215,7 +223,7 @@ name is ever published with the DID as the name.
 
 The managed agent's display name is its surface name. On A2A and AP2 surfaces with an
 `http` or `https` target, the dashboard shows the `name` in the target's Agent Card
-instead, marked unverified (see [Agent Card names](#agent-card-names)). Each identity record carries an
+instead (see [Agent Card names](#agent-card-names)). Each identity record carries an
 origin (`managed` or `external_caller`), stamped when the gateway issues the DID. The
 origin follows the identity slot the DID came from, not the request leg: on a surface
 with no inbound slot, an inbound request that derives the DID from the protected slot
@@ -236,7 +244,7 @@ shows a name conflict.
 
 The Agent Card name ([`target_card_names.rs`](../src/identity/target_card_names.rs))
 is dashboard-only. It applies to every managed-identity mode, and the Identities page
-shows it in place of the surface name with an "unverified" marker. The card is read from
+shows it in place of the surface name. The card is read from
 `<target endpoint>/.well-known/agent-card.json`, then `/.well-known/agent.json`, or from
 the target origin plus the access point's `agent_card_path` when that is set. Surfaces of
 other protocols, such as MCP, and targets with another scheme, such as `fabric://`, are
@@ -302,7 +310,7 @@ this order:
 1. A verified agent name: a `host/@local` entry in the caller's `alsoKnownAs` that the
    DID resolver verifies back to the same DID. At most four entries are tried. Their
    egress controls are in [`POLICY.md`](POLICY.md#agent-name-resolution).
-2. The `name` of the caller's Agent Card, marked unverified. The card is found through a
+2. The `name` of the caller's Agent Card, which is not verified. The card is found through a
    DID-document service of type `AgentCard` or `A2AAgentCard`, or whose id ends in
    `#agent-card`. It is fetched under the strict egress policy with a 5-second timeout
    and a 64 KiB limit.

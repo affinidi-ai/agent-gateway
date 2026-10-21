@@ -335,6 +335,8 @@ impl BootstrapConfig {
                 .map_err(|error| anyhow::anyhow!("Invalid [mcp.continuations] config: {error}"))?;
         }
 
+        integration_stores_apart_from_the_deprecated_ones(&self.storage_paths)?;
+
         // Validate TLS certificate paths
         if !self.tls.cert_path.exists() {
             anyhow::bail!("TLS certificate file not found: {:?}", self.tls.cert_path);
@@ -352,7 +354,9 @@ impl BootstrapConfig {
 /// `integrations` directory, when that key is set. A config written for the version before
 /// endpoints and event sets sets `integrations` (`../_storage/integrations/definitions` in the
 /// example) but none of the new keys, whose defaults would otherwise resolve under the config
-/// directory: read-only in Docker, and outside the persisted storage elsewhere.
+/// directory: read-only in Docker, and outside the persisted storage elsewhere. A key whose
+/// folder there is one of the deprecated directories (`integrations = "/data/integrations"`)
+/// takes the key's name as its folder instead, so it never reads the previous version's records.
 fn place_unset_integration_keys_beside_the_deprecated_one(
     raw: &str,
     paths: &mut StoragePaths,
@@ -360,6 +364,15 @@ fn place_unset_integration_keys_beside_the_deprecated_one(
     let Some(deprecated) = paths.integrations.clone() else {
         return;
     };
+    let triggers = paths
+        .integration_triggers
+        .clone()
+        .unwrap_or_else(|| {
+            paths
+                .legacy_integration_triggers
+                .clone()
+        });
+    let deprecated_dirs = [lexically_normalized(Path::new(&deprecated)), lexically_normalized(Path::new(&triggers))];
     let parent = Path::new(&deprecated)
         .parent()
         .unwrap_or(Path::new(""));
@@ -382,12 +395,78 @@ fn place_unset_integration_keys_beside_the_deprecated_one(
         ("integration_definitions", &mut paths.integration_definitions, "integrations"),
     ] {
         if !is_set(key) {
-            *path = parent
-                .join(folder)
+            let beside = parent.join(folder);
+            let place = if deprecated_dirs.contains(&lexically_normalized(&beside)) {
+                parent.join(key)
+            } else {
+                beside
+            };
+            *path = place
                 .to_string_lossy()
                 .into_owned();
         }
     }
+}
+
+/// Refuses an integration store that is, or sits inside, a directory the migration reads the
+/// previous version's integrations from. The store would read the old records, which it cannot
+/// parse, so listing integrations (and with it the audit pipeline) fails; and the migration
+/// renames that directory, taking the store with it.
+fn integration_stores_apart_from_the_deprecated_ones(paths: &StoragePaths) -> anyhow::Result<()> {
+    let deprecated_dirs =
+        [("integrations", &paths.legacy_integrations), ("integration_triggers", &paths.legacy_integration_triggers)];
+    for (key, store) in [
+        ("integration_endpoints", &paths.integration_endpoints),
+        ("integration_event_sets", &paths.integration_event_sets),
+        ("integration_definitions", &paths.integration_definitions),
+    ] {
+        let store_dir = comparable_path(store);
+        for (deprecated_key, deprecated) in deprecated_dirs {
+            if store_dir.starts_with(comparable_path(deprecated)) {
+                anyhow::bail!(
+                    "storage_paths.{key} ({store}) is, or is inside, the directory of the previous version's storage_paths.{deprecated_key} ({deprecated}). Give it a directory of its own."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `path` with `.` and `..` resolved without the filesystem; a `..` above a relative start is kept.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => match normalized
+                .components()
+                .next_back()
+            {
+                Some(std::path::Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(std::path::Component::RootDir | std::path::Component::Prefix(_)) => {}
+                _ => normalized.push(".."),
+            },
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// `path` as the filesystem names it: its longest existing ancestor canonicalized (symbolic links
+/// resolved) and the rest normalized lexically, so two spellings of one directory compare equal.
+fn comparable_path(path: &str) -> PathBuf {
+    let normalized = lexically_normalized(Path::new(path));
+    for ancestor in normalized.ancestors() {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            return match normalized.strip_prefix(ancestor) {
+                Ok(rest) if !rest.as_os_str().is_empty() => canonical.join(rest),
+                _ => canonical,
+            };
+        }
+    }
+    normalized
 }
 
 /// Return true when the raw TOML config text mentions the legacy
@@ -636,6 +715,65 @@ key_path = "key.pem"
         assert_eq!(paths.integration_endpoints, default("endpoints"));
         assert_eq!(paths.integration_event_sets, default("event_sets"));
         assert_eq!(paths.integration_definitions, default("integrations"));
+    }
+
+    #[test]
+    fn an_unset_key_whose_place_is_a_deprecated_directory_is_named_after_the_key() {
+        let (dir, paths) = storage_paths_of("integrations = \"../_storage/integrations\"");
+        let storage = |folder: &str| {
+            dir.path()
+                .join("_storage")
+                .join(folder)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(paths.legacy_integrations, storage("integrations"));
+        assert_eq!(paths.integration_definitions, storage("integration_definitions"));
+        assert_eq!(paths.integration_endpoints, storage("endpoints"));
+        assert_eq!(paths.integration_event_sets, storage("event_sets"));
+        assert!(integration_stores_apart_from_the_deprecated_ones(&paths).is_ok());
+
+        let (_dir, paths) =
+            storage_paths_of("integrations = \"/old/definitions\"\nintegration_triggers = \"/old/endpoints\"");
+        assert_eq!(paths.integration_endpoints, "/old/integration_endpoints");
+    }
+
+    #[test]
+    fn an_integration_store_on_a_deprecated_directory_is_refused() {
+        let (_dir, paths) = storage_paths_of(
+            "integrations = \"/data/integrations\"\nintegration_definitions = \"/data/integrations/\"",
+        );
+
+        let error = integration_stores_apart_from_the_deprecated_ones(&paths)
+            .expect_err("the new store would read the old records")
+            .to_string();
+        assert!(error.contains("storage_paths.integration_definitions"), "{error}");
+        assert!(error.contains("storage_paths.integrations"), "{error}");
+    }
+
+    #[test]
+    fn an_integration_store_inside_a_deprecated_directory_is_refused() {
+        let (_dir, paths) = storage_paths_of(
+            "integration_triggers = \"/data/triggers\"\nintegration_event_sets = \"/data/triggers/../triggers/event_sets\"",
+        );
+
+        let error = integration_stores_apart_from_the_deprecated_ones(&paths)
+            .expect_err("migrating would move the new store with the old directory")
+            .to_string();
+        assert!(error.contains("storage_paths.integration_event_sets"), "{error}");
+        assert!(error.contains("storage_paths.integration_triggers"), "{error}");
+    }
+
+    #[test]
+    fn default_and_example_integration_paths_are_apart() {
+        let (_dir, defaults) = storage_paths_of("");
+        assert!(integration_stores_apart_from_the_deprecated_ones(&defaults).is_ok());
+
+        let (_dir, example) = storage_paths_of(
+            "integrations = \"../_storage/integrations/definitions\"\nintegration_triggers = \"../_storage/integrations/triggers\"",
+        );
+        assert!(integration_stores_apart_from_the_deprecated_ones(&example).is_ok());
     }
 
     #[test]

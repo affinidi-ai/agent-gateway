@@ -488,7 +488,8 @@ require everyone to accept it again. See [`TERMS_AND_CONSENT.md`](TERMS_AND_CONS
 Agent Gateway ships as an appliance. It is most commonly run as a managed appliance
 hosted by Affinidi, and can also be run in your own infrastructure. From this repository
 it builds and runs locally as a single binary; see
-[`development/GETTING_STARTED.md`](development/GETTING_STARTED.md).
+[`development/GETTING_STARTED.md`](development/GETTING_STARTED.md). For what your own
+infrastructure must provide, see [`DEPLOYMENT_REQUIREMENTS.md`](DEPLOYMENT_REQUIREMENTS.md).
 
 ### Secrets and encryption at rest
 

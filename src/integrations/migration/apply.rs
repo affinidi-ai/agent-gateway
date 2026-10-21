@@ -34,6 +34,9 @@ pub struct ReportEntry {
     pub event_set: Outcome,
     pub events: HashSet<String>,
     pub integration: Outcome,
+    /// Why the integration was written disabled whatever its live status: it belonged to a tenant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_disabled: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -108,6 +111,15 @@ pub async fn apply(
                 "A migrated endpoint fails the current checks and was written disabled"
             );
         }
+        if let Some(reason) = &entry.integration_disabled {
+            warn!(
+                event = "integrations.migration.integration_disabled",
+                integration_id = %entry.id,
+                name = %entry.name,
+                reason = %reason,
+                "A migrated integration of a tenant was written disabled"
+            );
+        }
         report
             .integrations
             .push(entry);
@@ -126,6 +138,7 @@ async fn apply_one(
         mut endpoint,
         event_set,
         integration,
+        integration_disabled,
         notes,
     } = planned;
     let mut endpoint_disabled = None;
@@ -202,6 +215,7 @@ async fn apply_one(
         endpoint_disabled,
         event_set: event_set_outcome,
         events,
+        integration_disabled: integration_disabled.filter(|_| integration_outcome == Outcome::Created),
         integration: integration_outcome,
         notes,
     })
@@ -267,6 +281,7 @@ mod tests {
             endpoint,
             event_set,
             integration,
+            integration_disabled: None,
             notes: vec!["Received gateway events only from gw-1".to_string()],
         }
     }
@@ -321,6 +336,7 @@ mod tests {
                 event_set: Outcome::Created,
                 events: HashSet::from(["gateway.created".to_string()]),
                 integration: Outcome::Created,
+                integration_disabled: None,
                 notes: vec!["Received gateway events only from gw-1".to_string()],
             }]
         );
@@ -348,6 +364,44 @@ mod tests {
             .expect("reason");
         assert!(reason.contains("169.254.169.254"), "{reason}");
         assert_eq!(report.integrations[0].integration, Outcome::Created, "the integration is kept");
+    }
+
+    #[tokio::test]
+    async fn an_integration_planned_disabled_is_reported_with_the_reason_when_written() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stores = stores(dir.path()).await;
+        let disabled = || {
+            let mut planned = planned("https://93.184.215.14/hook", true);
+            if let Some(integration) = planned.integration.as_mut() {
+                integration.status = Status::Disabled;
+            }
+            planned.integration_disabled = Some("It belonged to the tenant team-a".to_string());
+            planned
+        };
+
+        let report = apply(one(disabled()), &stores, None)
+            .await
+            .expect("applies");
+
+        let integration = stores
+            .integrations
+            .find(ID)
+            .await
+            .expect("reads")
+            .expect("integration");
+        assert_eq!(integration.status, Status::Disabled);
+        assert_eq!(
+            report.integrations[0]
+                .integration_disabled
+                .as_deref(),
+            Some("It belonged to the tenant team-a")
+        );
+
+        let again = apply(one(disabled()), &stores, None)
+            .await
+            .expect("applies again");
+        assert_eq!(again.integrations[0].integration, Outcome::AlreadyPresent);
+        assert_eq!(again.integrations[0].integration_disabled, None, "nothing was written this time");
     }
 
     #[tokio::test]

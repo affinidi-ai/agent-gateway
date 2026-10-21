@@ -32,6 +32,9 @@ pub struct Planned {
     /// None when live delivered it nothing, so only the endpoint is kept.
     pub event_set: Option<EventSet>,
     pub integration: Option<Integration>,
+    /// Why the integration is written disabled whatever its live status: it belonged to a
+    /// tenant, and integrations are now appliance-wide.
+    pub integration_disabled: Option<String>,
     /// What changed for it, for the report; never a secret value.
     pub notes: Vec<String>,
 }
@@ -121,6 +124,7 @@ fn plan_one(
             endpoint,
             event_set: None,
             integration: None,
+            integration_disabled: None,
             notes,
         });
     }
@@ -154,11 +158,25 @@ fn plan_one(
     let mut integration =
         Integration::new(name.clone(), live.description.clone(), live.id.clone(), live.id.clone(), content);
     integration.id = live.id.clone();
-    integration.status = if live.status == "active" {
+    // Live delivered a tenant's integration only the events of the gateways and connection
+    // points linked to it, all its tenant's or appliance-wide. Its event set now receives them
+    // from every tenant, so it is never enabled without an administrator choosing to.
+    let integration_disabled = live
+        .tenant_id
+        .as_ref()
+        .map(|tenant| {
+            format!(
+                "It belonged to the tenant {tenant}. Integrations are now appliance-wide, so enabled it would receive every tenant's events; review it before enabling it"
+            )
+        });
+    integration.status = if live.status == "active" && integration_disabled.is_none() {
         Status::Active
     } else {
         Status::Disabled
     };
+    if integration_disabled.is_some() {
+        notes.push("Its integration is written disabled: enabled, it would receive every tenant's events".to_string());
+    }
     stamp(&mut integration.created_at, &mut integration.updated_at, live);
     if event_set.has_audit_events() {
         if live.audit_events.is_empty() {
@@ -182,6 +200,7 @@ fn plan_one(
         endpoint,
         event_set: Some(event_set),
         integration: Some(integration),
+        integration_disabled,
         notes,
     })
 }
@@ -832,12 +851,32 @@ mod tests {
     }
 
     #[test]
-    fn a_tenants_integration_becomes_appliance_wide_and_its_audit_one_keeps_only_the_endpoint() {
+    fn a_tenants_integration_is_written_disabled_and_its_audit_one_keeps_only_the_endpoint() {
         let mut gateway = slack(json!({"text": "hi"}));
         gateway.tenant_id = Some("team-a".to_string());
         let planned = only(&plan(&attached_to_gateway(gateway, &[]), &no_audit())).clone();
-        assert!(planned.integration.is_some());
-        assert!(noted(&planned, "team-a"), "{:?}", planned.notes);
+        let integration = planned
+            .integration
+            .clone()
+            .expect("integration");
+        assert_eq!(integration.status, Status::Disabled, "enabled, it would receive every tenant's events");
+        let reason = planned
+            .integration_disabled
+            .clone()
+            .expect("reason");
+        assert!(reason.contains("team-a") && reason.contains("every tenant"), "{reason}");
+        assert!(noted(&planned, "written disabled"), "{:?}", planned.notes);
+        assert_eq!(planned.endpoint.status, Status::Active, "no integration delivers to it while disabled");
+
+        let operators = only(&plan(&attached_to_gateway(slack(json!({"text": "hi"})), &[]), &no_audit())).clone();
+        assert_eq!(
+            operators
+                .integration
+                .expect("integration")
+                .status,
+            Status::Active
+        );
+        assert_eq!(operators.integration_disabled, None);
 
         let mut audit = live("webhook", "audit", json!({"url": "https://93.184.215.14/hook"}), json!({}));
         audit.tenant_id = Some("team-a".to_string());
@@ -855,6 +894,7 @@ mod tests {
                     .is_none()
         );
         assert!(noted(&endpoint_only, "only its endpoint"), "{:?}", endpoint_only.notes);
+        assert_eq!(endpoint_only.integration_disabled, None);
     }
 
     #[test]

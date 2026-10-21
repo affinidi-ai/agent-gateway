@@ -74,6 +74,8 @@ const EditPolicyDefinitionPage: React.FC = () => {
   const [policyErrors, setPolicyErrors] = useState<string[]>([]);
   const [packageMismatch, setPackageMismatch] = useState<string | null>(null);
   const [versionRefreshKey, setVersionRefreshKey] = useState(0);
+  const [instructionsOpen, setInstructionsOpen] = useState(false);
+  const toggleInstructions = useCallback(() => setInstructionsOpen(open => !open), []);
 
   useEffect(() => {
     if (!isCreateMode && id) {
@@ -446,23 +448,33 @@ const EditPolicyDefinitionPage: React.FC = () => {
           {/* Policy Instructions */}
           <div className="card shadow-sm mb-4 border-left-primary">
             <div className="card-body">
-              <div className="d-flex justify-content-between align-items-center">
-                <h6 className="font-weight-bold text-primary mb-0">
-                  <i className="fas fa-graduation-cap me-2"></i>
-                  Policy Instructions & Examples
-                </h6>
+              <h6 className="mb-0">
                 <button
-                  className="btn btn-sm btn-outline-primary"
                   type="button"
-                  data-bs-toggle="collapse"
-                  data-bs-target="#policyDefInstructions"
-                  aria-expanded="false"
+                  className="btn btn-link w-100 p-0 border-0 d-flex justify-content-between align-items-center text-decoration-none text-start fw-bold text-primary"
+                  aria-expanded={instructionsOpen}
+                  aria-controls="policyDefInstructions"
+                  data-testid="policy-instructions-toggle"
+                  onClick={toggleInstructions}
                 >
-                  <i className="fas fa-chevron-down"></i>
+                  <span data-testid="policy-instructions-title">
+                    <i className="fas fa-graduation-cap me-2"></i>
+                    Policy Instructions & Examples
+                  </span>
+                  <span className="btn btn-sm btn-outline-primary" aria-hidden="true">
+                    <i
+                      className={`fas fa-chevron-${instructionsOpen ? 'up' : 'down'}`}
+                      data-testid="policy-instructions-chevron"
+                    ></i>
+                  </span>
                 </button>
-              </div>
+              </h6>
 
-              <div className="collapse" id="policyDefInstructions">
+              <div
+                className={`collapse${instructionsOpen ? ' show' : ''}`}
+                id="policyDefInstructions"
+                data-testid="policy-instructions-body"
+              >
                 <p className="text-gray-800 mb-3 mt-3">
                   Write Rego policies to control access based on JWT claims, HTTP context, and
                   routing information.
