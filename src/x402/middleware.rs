@@ -2,9 +2,7 @@
 
 use std::sync::Arc;
 
-use super::{
-    PaymentChallenge, PaymentError, PaymentPayload, create_payment_response, settle_payment, verify_payment,
-};
+use super::{PaymentChallenge, PaymentError, PaymentPayload, create_payment_response, settle_payment, verify_payment};
 use crate::config::types::{
     ChannelProtocol, McpPaymentTriggers, X402Config, X402PaymentRequirement, X402SettlementMode,
 };
@@ -897,10 +895,9 @@ mod settlement_gating_tests {
         .await;
 
         match result.expect_err("self-payment must not be granted") {
-            PaymentError::Invalid(message) => assert_eq!(
-                message,
-                "Payment does not match any payment requirement issued for this resource"
-            ),
+            PaymentError::Invalid(message) => {
+                assert_eq!(message, "Payment does not match any payment requirement issued for this resource")
+            }
             other => panic!("expected an invalid payment, got {other:?}"),
         }
         let transactions = store.list_all().await;

@@ -23,10 +23,7 @@ pub enum PaymentError {
     /// The credential failed verification; `challenges` are fresh ones to
     /// retry with.
     #[error("payment verification failed: {detail}")]
-    VerificationFailed {
-        detail: String,
-        challenges: Vec<MppChallenge>,
-    },
+    VerificationFailed { detail: String, challenges: Vec<MppChallenge> },
     /// The surface's MPP configuration cannot issue challenges or verify
     /// credentials, e.g. an unresolvable `$SECRET:` reference. The detail,
     /// which may name a secret id, is logged where it happens and never sent.

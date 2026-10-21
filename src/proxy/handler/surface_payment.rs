@@ -491,10 +491,7 @@ pub(crate) enum SurfacePaymentError {
     /// Both rails are offered: x402's challenge, plus MPP's when they could be
     /// issued.
     #[error("payment required")]
-    Required {
-        x402: crate::x402::PaymentChallenge,
-        mpp: Vec<crate::mpp::MppChallenge>,
-    },
+    Required { x402: crate::x402::PaymentChallenge, mpp: Vec<crate::mpp::MppChallenge> },
     #[error("Payment continuation unavailable")]
     ContinuationUnavailable,
     #[error("Payment continuation expired or invalid")]
@@ -832,7 +829,12 @@ mod tests {
                 process_local(&surface, services(), &headers, body.clone(), None, "/mcp", Some(&evidence)).await;
             match result {
                 Err(error @ (SurfacePaymentError::ContinuationInvalid | SurfacePaymentError::ContinuationMismatch)) => {
-                    assert!(error.to_string().contains(expected), "{error}")
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(expected),
+                        "{error}"
+                    )
                 }
                 other => panic!("invalid evidence must be rejected, got {:?}", other.err()),
             }
@@ -898,7 +900,12 @@ mod tests {
         };
         let required = |x402, mpp| payment_required(x402, mpp, "Paid", "paid", "/mcp", &services);
 
-        assert!(required(None, None).await.is_none(), "no rail offered, nothing to pay");
+        assert!(
+            required(None, None)
+                .await
+                .is_none(),
+            "no rail offered, nothing to pay"
+        );
         assert!(matches!(
             required(Some(&x402), None).await,
             Some(SurfacePaymentError::X402(crate::x402::PaymentError::Required(_)))
@@ -912,7 +919,15 @@ mod tests {
         };
         let response = rendered(both).await;
         assert_eq!(response.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
-        assert!(response.headers().contains_key(x402_headers.payment_required.as_str()));
+        assert!(
+            response
+                .headers()
+                .contains_key(
+                    x402_headers
+                        .payment_required
+                        .as_str()
+                )
+        );
         assert!(
             response.headers()["www-authenticate"]
                 .to_str()

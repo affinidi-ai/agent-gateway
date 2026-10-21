@@ -1550,7 +1550,9 @@ async fn process_get_surfaces_response(message: &ReceivedMessage) -> ProcessingR
 }
 
 /// The x402 header names the sending gateway uses, from the message context.
-fn fabric_x402_headers(message_context: &std::collections::HashMap<String, Value>) -> crate::config::types::X402Headers {
+fn fabric_x402_headers(
+    message_context: &std::collections::HashMap<String, Value>
+) -> crate::config::types::X402Headers {
     let Some(headers_json) = message_context.get("x402_headers") else {
         return crate::config::types::X402Headers::default();
     };
@@ -1578,7 +1580,8 @@ async fn verify_payment_fabric(
     body_bytes: &[u8],
     path: &str,
     x402_headers: &crate::config::types::X402Headers,
-) -> Result<Option<crate::surface_context::PaymentContext>, crate::proxy::handler::surface_payment::SurfacePaymentError> {
+) -> Result<Option<crate::surface_context::PaymentContext>, crate::proxy::handler::surface_payment::SurfacePaymentError>
+{
     let surface_protocol = surface.channel_protocol();
     let x402_required = surface
         .x402_config()
@@ -1707,8 +1710,10 @@ async fn process_modern_payment_fabric(
     body: bytes::Bytes,
     path: &str,
     evidence: Option<&crate::mcp::continuations::protected::ContinuationPayment>,
-) -> Result<crate::proxy::handler::surface_payment::SurfacePayment, crate::proxy::handler::surface_payment::SurfacePaymentError>
-{
+) -> Result<
+    crate::proxy::handler::surface_payment::SurfacePayment,
+    crate::proxy::handler::surface_payment::SurfacePaymentError,
+> {
     use crate::proxy::handler::surface_payment::{LocalPaymentServices, process_local};
 
     process_local(
