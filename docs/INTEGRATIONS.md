@@ -315,9 +315,10 @@ Guarantees, stated plainly:
   Receivers must order by `sequence` (or `timestamp`), be idempotent, and tolerate `created` or `connected`
   arriving before `creation_started`.
 - `creation_started` is emitted before the first mediator contact but delivered in the
-  background, so it can still reach the receiver after the gateway's first call. Until mediator
-  calls are retried, a Connection Point on a mediator that only admits known DIDs can fail its
-  first mediator call with `403` if the receiver has not processed the event yet.
+  background, so it can still reach the receiver after the gateway's first call. The gateway does
+  not retry that call, so a Connection Point on a mediator that only admits known DIDs fails with
+  a `500` when the mediator answers `403` because the receiver has not processed the event yet,
+  and creating it again mints a new DID.
 
 **Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
 `did` field is logged like any DID and masked by the global log redactor. The URL, the secret and

@@ -48,13 +48,13 @@ impl HookReply {
 
 #[derive(Clone)]
 struct HookState {
-    calls: Arc<Mutex<Vec<(Value, HeaderMap)>>>,
+    calls: Arc<Mutex<Vec<(String, HeaderMap)>>>,
     reply: HookReply,
 }
 
 struct MockHook {
     url: String,
-    calls: Arc<Mutex<Vec<(Value, HeaderMap)>>>,
+    calls: Arc<Mutex<Vec<(String, HeaderMap)>>>,
 }
 
 impl MockHook {
@@ -73,7 +73,7 @@ impl MockHook {
                                 .calls
                                 .lock()
                                 .unwrap()
-                                .push((serde_json::from_str(&body).unwrap(), headers));
+                                .push((body, headers));
                             tokio::time::sleep(state.reply.delay).await;
                             (StatusCode::from_u16(state.reply.status).unwrap(), axum::Json(state.reply.body))
                         },
@@ -108,7 +108,7 @@ impl MockHook {
             .lock()
             .unwrap()
             .iter()
-            .map(|(event, _)| event.clone())
+            .map(|(body, _)| serde_json::from_str(body).unwrap())
             .collect()
     }
 
@@ -588,26 +588,17 @@ async fn with_a_secret_every_event_is_signed_and_a_401_is_retried() {
         .lock()
         .unwrap()
         .clone();
+    assert!(!calls.is_empty());
     for (body, headers) in calls {
         let timestamp = headers["x-webhook-timestamp"]
             .to_str()
             .unwrap();
-        let expected = crate::integrations::webhook_signing::sign_timestamped_payload(
-            SECRET,
-            timestamp,
-            body.to_string().as_bytes(),
-        );
-        assert!(expected.is_ok());
+        let expected =
+            crate::integrations::webhook_signing::sign_timestamped_payload(SECRET, timestamp, body.as_bytes()).unwrap();
         let signature = headers["x-webhook-signature-256"]
             .to_str()
             .unwrap();
-        assert_eq!(
-            signature
-                .strip_prefix("sha256=")
-                .expect("sha256= prefix")
-                .len(),
-            64
-        );
+        assert_eq!(signature, format!("sha256={expected}"), "the signature does not match the received body");
     }
 }
 
