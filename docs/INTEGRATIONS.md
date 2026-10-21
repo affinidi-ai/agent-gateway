@@ -303,7 +303,8 @@ endpoint, an event set and an integration, all three with the old integration's 
 
 **What changes, for each integration the report names:**
 - **Scope:** an integration attached to some gateways or connection points now receives the
-  event from all of them. A tenant-owned integration becomes appliance-wide.
+  event from all of them, every tenant's included. A tenant-owned integration becomes
+  appliance-wide, and its tenant's tokens can no longer reach it.
 - **Templates:**
   - `${CHANNEL_*}` becomes `${SURFACE_*}`.
   - Custom `_` variables and variables that no event of its set fills are removed. Attachment
@@ -317,8 +318,14 @@ endpoint, an event set and an integration, all three with the old integration's 
   - Kinesis `access_key` and `secret_key`, which nothing read;
   - webhook headers the gateway sets itself, or whose value is not text;
   - `pre_authorize_blocked`, which no longer exists.
-- **Disabled:** an endpoint that fails the current checks, such as a URL now refused, is
-  written disabled with the reason.
+- **Disabled:**
+  - an endpoint that fails the current checks, such as a URL now refused, is written disabled
+    with the reason;
+  - a tenant-owned integration is written disabled whatever its status, since enabled it would
+    receive every tenant's events instead of only those of the gateways and connection points
+    linked to it. The report gives the reason and the node logs
+    `integrations.migration.integration_disabled`. Review its destination before enabling it.
+    Its endpoint keeps its status, since no integration delivers to it while it is disabled.
 - **Audit:** audit records are now journaled and retried. Audit events added since the
   previous version are not selected.
 
@@ -346,7 +353,8 @@ endpoint, an event set and an integration, all three with the old integration's 
   `integrations.migration.not_found` with the path it looked in: INFO, as on a fresh install
   or once migrated, or WARN when `storage_paths.integrations` names it.
 - Each integration logs `integrations.migration.integration`. A disabled endpoint logs
-  `integrations.migration.endpoint_disabled`, an integration that cannot be migrated logs
+  `integrations.migration.endpoint_disabled`, a tenant's integration written disabled logs
+  `integrations.migration.integration_disabled`, an integration that cannot be migrated logs
   `integrations.migration.skipped`, and the end logs `integrations.migration.done`.
 - The report is `migration-report-<unix seconds>.json` in the directory holding
   `storage_paths.integration_definitions` (by default `_storage/integrations/` beside the
