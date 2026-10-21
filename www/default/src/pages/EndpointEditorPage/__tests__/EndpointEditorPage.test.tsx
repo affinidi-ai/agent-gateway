@@ -254,6 +254,55 @@ describe('a stored endpoint', () => {
     );
   });
 
+  test('a secret reference set to none is sent as null', async () => {
+    mocked.getEndpoint.mockResolvedValue(
+      stored({
+        type: 'webhook',
+        configuration: {
+          url: 'https://ops.example.com/hook',
+          method: 'POST',
+          signing_secret: '$SECRET:slack-hook',
+        },
+        secrets: [],
+      })
+    );
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('https://ops.example.com/hook');
+
+    fireEvent.change(screen.getByTestId('endpoint-signing_secret-stored-secret-select'), {
+      target: { value: '' },
+    });
+    fireEvent.click(screen.getByTestId('endpoint-save-button'));
+
+    await waitFor(() =>
+      expect(mocked.updateEndpoint).toHaveBeenCalledWith(
+        'e1',
+        expect.objectContaining({
+          configuration: {
+            url: 'https://ops.example.com/hook',
+            method: 'POST',
+            signing_secret: null,
+          },
+        })
+      )
+    );
+  });
+
+  test('a secret reference can be kept, and an optional one cleared', async () => {
+    mocked.getEndpoint.mockResolvedValue(
+      stored({
+        type: 'webhook',
+        configuration: { url: 'https://ops.example.com/hook', signing_secret: '$SECRET:slack-hook' },
+        secrets: [],
+      })
+    );
+    renderEditor('/integrations/endpoints/e1');
+    await screen.findByDisplayValue('https://ops.example.com/hook');
+
+    fireEvent.click(screen.getByTestId('endpoint-signing_secret-keep-button'));
+    expect(screen.getByTestId('endpoint-signing_secret-clear-button')).toBeInTheDocument();
+  });
+
   test('switching SASL off clears the stored SASL password instead of keeping it unseen', async () => {
     mocked.getEndpoint.mockResolvedValue(
       stored({

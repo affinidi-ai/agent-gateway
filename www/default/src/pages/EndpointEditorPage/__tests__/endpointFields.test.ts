@@ -162,6 +162,37 @@ describe('buildConfiguration', () => {
     });
   });
 
+  test('a secret reference changed to none is sent as null', () => {
+    const form = initialForm(
+      'webhook',
+      stored({
+        type: 'webhook',
+        configuration: { url: 'https://ops.example.com/hook', signing_secret: '$SECRET:hook-signing' },
+      })
+    );
+    form.secrets.signing_secret = { state: 'set', value: '' };
+
+    expect(buildConfiguration('webhook', form, true)).toEqual({
+      url: 'https://ops.example.com/hook',
+      method: 'POST',
+      signing_secret: null,
+    });
+  });
+
+  test('an optional stored secret replaced with nothing is sent as null', () => {
+    const form = initialForm(
+      'webhook',
+      stored({
+        type: 'webhook',
+        configuration: { url: 'https://ops.example.com/hook' },
+        secrets: ['signing_secret'],
+      })
+    );
+    form.secrets.signing_secret = { state: 'set', value: '  ' };
+
+    expect(buildConfiguration('webhook', form, true)).toMatchObject({ signing_secret: null });
+  });
+
   test('webhook headers are sent as an object', () => {
     const form = initialForm('webhook');
     form.values.url = 'https://ops.example.com/hook';
