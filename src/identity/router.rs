@@ -1448,7 +1448,8 @@ pub fn create_identity_api_router(
                 .layer(Extension(listener_mgr))
                 .layer(Extension(msg_store))
                 .layer(Extension(surface_store_for_connection_points))
-                .layer(Extension(notification_store.clone()));
+                .layer(Extension(notification_store.clone()))
+                .layer(Extension(state.event_hook.clone()));
 
             #[cfg(feature = "didwebvh")]
             let router = router

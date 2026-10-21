@@ -614,7 +614,7 @@ pub async fn get_connection_point<S: ConnectionPointStore>(
 }
 
 /// Create a new connection point (OOB invitation)
-pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M: MediatorStore>(
+pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: GatewayStore, M: MediatorStore>(
     Extension(pub_store): Extension<std::sync::Arc<P>>,
     Extension(gateway_store): Extension<std::sync::Arc<G>>,
     Extension(mediator_store): Extension<std::sync::Arc<M>>,
@@ -630,6 +630,7 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
     #[cfg(feature = "didwebvh")] Extension(identity_store): Extension<
         Option<std::sync::Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>,
     >,
+    Extension(event_hook): Extension<Option<Arc<crate::event_hook::EventHook>>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(req): Json<CreateConnectionPointRequest>,
@@ -745,6 +746,17 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
     info!("✓ Generated connection point DID: {}", connection_point_did);
     info!("✓ Generated {} key(s) for connection point", cp_secrets.len());
 
+    let minted = crate::event_hook::ConnectionPointPayload::minted(
+        &temp_cp_id,
+        &req.name,
+        &req.description,
+        &req.gateway_id,
+        &req.mediator_id,
+        &mediator.did,
+        &connection_point_did,
+    );
+    let creation = crate::event_hook::CreationGuard::start(event_hook.clone(), minted);
+
     // Calculate expiry time (default 24 hours if not specified)
     let expiry_seconds = req
         .expiry_seconds
@@ -845,6 +857,7 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
 
     // Override the generated ID with our temp_cp_id to match where keys were stored
     connection_point.id = temp_cp_id;
+    connection_point.mediator_did = Some(mediator.did.clone());
 
     // Apply DID method preference
     connection_point.did_method = req
@@ -853,8 +866,11 @@ pub async fn create_connection_point<P: ConnectionPointStore, G: GatewayStore, M
 
     debug!("Creating connection point with ID: {}", connection_point.id);
 
-    pub_store
-        .create(&connection_point)
+    let saved = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, Some(&mediator.did));
+    let record = connection_point.clone();
+    let store = pub_store.clone();
+    creation
+        .complete(async move { store.create(&record).await }, saved)
         .await
         .map_err(|e| {
             error!("Failed to create connection point: {}", e);
@@ -1017,6 +1033,11 @@ async fn create_oob_invitation(
     info!("  Goal: {}", goal);
     info!("  Expiry: {:?}", expiry);
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    #[cfg(test)]
+    if let Some(outcome) = super::test_mediator::oob_invitation(mediator_did) {
+        return outcome;
+    }
 
     // Initialize TDK Shared State with default configuration
     // Note: In production, this should be initialized once at startup and reused
@@ -2358,7 +2379,8 @@ mod tests {
             .layer(Extension(Arc::new(listener_manager)))
             .layer(Extension(None::<Arc<crate::integrations::FileSystemNotificationStore>>))
             .layer(Extension(None::<Arc<dyn crate::storage::DidLogStorage>>))
-            .layer(Extension(None::<Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>));
+            .layer(Extension(None::<Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>))
+            .layer(Extension(None::<Arc<crate::event_hook::EventHook>>));
         if let Some(tenant) = tenant {
             router = router.layer(Extension(tenant));
         }

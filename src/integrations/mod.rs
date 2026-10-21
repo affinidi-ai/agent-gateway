@@ -23,6 +23,7 @@ pub mod stream_publishers;
 pub mod trust_registry_integration_triggers;
 pub mod types;
 pub mod user_integration_triggers;
+pub mod webhook_signing;
 pub mod x402_integration_triggers;
 
 pub use filesystem::FileSystemNotificationStore;

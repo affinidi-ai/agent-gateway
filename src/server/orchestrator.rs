@@ -1345,6 +1345,7 @@ pub async fn run_axum_proxy(
             sts_client_store: None,
             resolved_surface_cache: resolved_surface_cache.clone(),
             surface_template_store: surface_template_store.clone(),
+            event_hook: None,
 
             // DID:webvh fields (will be initialized later if feature is enabled)
             #[cfg(feature = "didwebvh")]
@@ -1557,6 +1558,18 @@ pub async fn run_axum_proxy(
                     None
                 }
             };
+
+        #[cfg(test)]
+        let event_hook = match crate::event_hook::test_settings::get(
+            &bootstrap_config
+                .storage_paths
+                .gateways,
+        ) {
+            Some(settings) => crate::event_hook::EventHook::new(settings),
+            None => build_event_hook().await,
+        };
+        #[cfg(not(test))]
+        let event_hook = build_event_hook().await;
 
         let mediator_store: Option<Arc<crate::mediators::FileSystemMediatorStore>> =
             match crate::mediators::FileSystemMediatorStore::new(PathBuf::from(
@@ -2137,6 +2150,10 @@ pub async fn run_axum_proxy(
         identity_state.gateway_store = gateway_store.clone();
         identity_state.connection_point_store = connection_point_store.clone();
         identity_state.mediator_store = mediator_store.clone();
+        identity_state.event_hook = event_hook.clone();
+        if let (Some(hook), Some(store)) = (event_hook.as_ref(), connection_point_store.as_ref()) {
+            store.set_event_hook(hook.clone());
+        }
         identity_state.issuer_store = issuer_store.clone();
         identity_state.trust_registry_store = trust_registry_store.clone();
         identity_state.authority_store = authority_store.clone();
@@ -2477,6 +2494,9 @@ pub async fn run_axum_proxy(
             }
             manager = manager.with_bootstrap_config(bootstrap_config.clone());
             manager = manager.with_network_config(Arc::new(network_config.clone()));
+            if let Some(hook) = event_hook.as_ref() {
+                manager = manager.with_event_hook(hook.clone());
+            }
 
             if crate::server::mode::is_standby() {
                 manager.deactivate();
@@ -4232,6 +4252,10 @@ pub async fn run_axum_proxy(
     }
 
     Ok(())
+}
+
+async fn build_event_hook() -> Option<Arc<crate::event_hook::EventHook>> {
+    crate::event_hook::EventHook::new(crate::event_hook::EventHookSettings::from_env().await)
 }
 
 /// Re-derive the config + policy planes from shared storage when this node is
