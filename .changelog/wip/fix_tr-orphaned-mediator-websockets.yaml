@@ -1,0 +1,19 @@
+branch: fix/tr-orphaned-mediator-websockets
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-21T00:00:00.000Z'
+      title: Stop trust registry reconnects from leaving duplicate mediator sessions
+      description: >-
+        Reconnecting a trust registry, from the dashboard, at startup or after a stale
+        connection, left the previous connection's mediator websocket running. It kept
+        reconnecting under the same DID and fought the new connection, so the mediator
+        closed one with "A new duplicate websocket connection for this DID" and the
+        trust registry ended up Failed. Replaced and removed connections are now shut
+        down, including when the gateway steps down to Standby, and stale connection
+        recovery reuses a connection another request has already replaced instead of
+        tearing it down.
+  removed: []
+  security: []
+  breaking: []
