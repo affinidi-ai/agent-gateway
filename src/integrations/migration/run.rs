@@ -94,7 +94,7 @@ pub async fn migrate_on_activation(
         if value.is_some() {
             warn!(
                 key = %format!("storage_paths.{key}"),
-                "Deprecated: used only to migrate integrations from the previous version. Once migrated, set storage_paths.integration_endpoints, integration_event_sets and integration_definitions to the paths in use, then remove it"
+                "Deprecated: used only to migrate integrations from the previous version. Once migrated, set storage_paths.integration_endpoints, integration_event_sets and integration_definitions to the directories they use now, never to the previous version's directories, then remove it"
             );
         }
     }
