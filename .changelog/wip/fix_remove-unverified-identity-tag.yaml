@@ -12,5 +12,12 @@ changes:
         keep their verified marker.
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-21T00:00:00.000Z'
+      title: Update TLS certificate dependencies in Cargo.lock
+      description: >-
+        Bumps rustls-webpki to 0.103.16 (could accept distrusted intermediates,
+        rustls/webpki#546), and webpki-roots and webpki-root-certs to 1.0.10
+        (bundled roots trusted distrusted emSign intermediates,
+        rustls/webpki-roots#133). Fixes the failing Rust dependency audit.
   breaking: []
