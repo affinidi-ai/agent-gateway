@@ -26,6 +26,7 @@ use crate::server::ConnectionGuard;
 use crate::state::{MultiSurfaceProxyState, ProxyState};
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
+mod a2a_stream;
 pub(crate) mod surface_payment;
 
 /// Lazy-initialized SSE session manager for MCP proxy:// channels.
@@ -1430,6 +1431,78 @@ fn hold_connection_for_body(
     response: axum::response::Response,
 ) -> axum::response::Response {
     crate::mcp::modern_sse::observe_response(response, move |_| connection_guard.release())
+}
+
+/// Releases the connection and records the request's bytes and connection
+/// metric once a streamed response body ends, fails or is dropped. A body that
+/// did not end cleanly counts as an error.
+fn streamed_response_completion(
+    state: &ProxyState,
+    mut guard: ConnectionGuard,
+    status: StatusCode,
+    source: String,
+    identity: Option<String>,
+    trace: String,
+    start_time: std::time::Instant,
+    request_bytes: u64,
+) -> impl FnOnce(crate::mcp::modern_sse::ResponseOutcome) + Send + 'static {
+    let metrics = state.metrics_store.clone();
+    let monitor = state.task_monitor.clone();
+    let task_id = state.task_id.clone();
+    let surface_id = state
+        .surface
+        .surface_id
+        .clone();
+    let target = state
+        .surface
+        .target
+        .endpoint
+        .clone();
+    let variant = state
+        .active_variant_alias
+        .clone();
+    move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
+        let latency = start_time
+            .elapsed()
+            .as_millis() as u64;
+        tokio::spawn(async move {
+            guard.decrement().await;
+            if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
+                monitor
+                    .record_bytes(&task_id, outcome.bytes, request_bytes)
+                    .await;
+                if !outcome.completed || outcome.failed {
+                    monitor
+                        .increment_errors(&task_id)
+                        .await;
+                }
+            }
+            if let Some(metrics) = metrics {
+                let result = if outcome.completed && !outcome.failed && status.is_success() {
+                    crate::metrics::ConnectionStatus::Success
+                } else {
+                    crate::metrics::ConnectionStatus::Failed
+                };
+                metrics
+                    .record_connection_with_ucp(
+                        surface_id,
+                        source,
+                        target,
+                        result,
+                        Some(latency),
+                        identity,
+                        crate::metrics::ConnectionDirection::Request,
+                        trace,
+                        None,
+                        None,
+                        None,
+                        latency,
+                        variant,
+                    )
+                    .await;
+            }
+        });
+    }
 }
 
 /// The facts for a request refused while routing to `surface`: its trace id
@@ -2924,14 +2997,17 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.target.endpoint,
             uri.path(),
         );
-    // A compressed extended card cannot be rewritten, so the Target is asked for
-    // an uncompressed one. The same headers are forwarded to fabric targets.
+    let a2a_method = a2a_context
+        .as_ref()
+        .and_then(|context| context.method.as_deref())
+        .filter(|_| is_a2a_surface);
+    let is_a2a_stream_request = a2a_method.is_some_and(crate::a2a::is_streaming_method);
+    // A compressed extended card or event stream cannot be rewritten, so the
+    // Target is asked for an uncompressed one. The same headers are forwarded to
+    // fabric targets.
     if is_rest_extended_card_request
-        || (is_a2a_surface
-            && a2a_context
-                .as_ref()
-                .and_then(|context| context.method.as_deref())
-                .is_some_and(crate::a2a::is_extended_agent_card_method))
+        || is_a2a_stream_request
+        || a2a_method.is_some_and(crate::a2a::is_extended_agent_card_method)
     {
         headers.insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
     }
@@ -7142,6 +7218,29 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
+    // An A2A event stream may outlast the request timeout: the call is bounded
+    // by the stream lifetime on top of it, and the stream itself by the limits
+    // in `a2a_stream::stream_limits`.
+    if is_a2a_stream_request {
+        let request_secs = state
+            .surface
+            .timeout()
+            .map_or(
+                state
+                    .config
+                    .a2a
+                    .timeout_seconds,
+                |timeout| timeout.request_secs,
+            );
+        upstream_req = upstream_req.timeout(std::time::Duration::from_secs(
+            state
+                .config
+                .a2a
+                .stream_max_lifetime_secs
+                .saturating_add(request_secs),
+        ));
+    }
+
     // Get circuit breaker if configured
     let circuit_breaker = if state
         .surface
@@ -7619,6 +7718,107 @@ async fn proxy_handler_with_mcp_runtime(
             }
         }
 
+        // An A2A event stream is forwarded event by event, each event checked
+        // as a non-streaming reply would be. Agent cards keep their own path.
+        let is_agent_card_fetch = crate::proxy::paths::is_well_known_agent_card_path(uri.path())
+            || is_rest_extended_card_request
+            || extended_card_rpc_id.is_some();
+        if is_a2a_surface
+            && !is_agent_card_fetch
+            && upstream_response
+                .status()
+                .is_success()
+            && crate::a2a::streaming::is_event_stream(upstream_response.headers())
+        {
+            info!(
+                channel = channel_name,
+                "Upstream A2A agent responded with an event stream — forwarding it event by event"
+            );
+            let status = upstream_response.status();
+            let mut stream_headers = upstream_response
+                .headers()
+                .clone();
+            if let Some(payment_header) = &payment_response_header {
+                let name = axum::http::HeaderName::from_bytes(
+                    state
+                        .config
+                        .x402_headers
+                        .payment_response
+                        .as_bytes(),
+                );
+                let value = axum::http::HeaderValue::from_str(payment_header);
+                let (Ok(name), Ok(value)) = (name, value) else {
+                    return Err(create_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid payment response header",
+                    ));
+                };
+                stream_headers.insert(name, value);
+            }
+            for (name, values) in &delegation_receipt_headers {
+                let name = axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated receipt header name")
+                })?;
+                for value in values {
+                    let value = axum::http::HeaderValue::from_str(value).map_err(|_| {
+                        create_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Invalid delegated receipt header value",
+                        )
+                    })?;
+                    stream_headers.append(name.clone(), value);
+                }
+            }
+            let request = a2a_stream::StreamRequest {
+                channel_name: channel_name.to_string(),
+                trace_id: trace_id.clone(),
+                http_method: method.to_string(),
+                path: uri.path().to_string(),
+                status,
+                authenticated_identity: authenticated_identity.clone(),
+                request_identity: identity_result
+                    .as_ref()
+                    .map(|result| ProtectedAgentIdentity::Managed {
+                        did: result.did.clone(),
+                        identity_fields: result.identity_fields.clone(),
+                    }),
+                request_agent_did: request_agent_did.clone(),
+                request_user_hash: request_user_hash.clone(),
+                policy_caller: crate::proxy::response_policy::CallerContext {
+                    did: agent_context
+                        .as_ref()
+                        .and_then(|context| context.did.clone()),
+                    identity_source: caller_identity_source.clone(),
+                    dna_uai: agent_context
+                        .as_ref()
+                        .and_then(|context| context.agent_dna.as_ref())
+                        .map(|dna| dna.uai.clone()),
+                },
+            };
+            let complete = streamed_response_completion(
+                &state,
+                connection_guard,
+                status,
+                source_addr.clone(),
+                identity_hash.clone(),
+                trace_id.clone(),
+                start_time,
+                body_bytes.len() as u64,
+            );
+            let limits = a2a_stream::stream_limits(&state.config.a2a, state.surface.timeout());
+            let processor = a2a_stream::AccessPointEvents::new(state.clone(), request);
+            return Ok(crate::a2a::streaming::event_stream_response(
+                upstream_response.bytes_stream(),
+                status,
+                &stream_headers,
+                limits,
+                crate::a2a::streaming::request_id(&body_bytes),
+                channel_name.to_string(),
+                processor,
+                complete,
+            ));
+        }
+
         let status = upstream_response.status();
         let response_headers = upstream_response
             .headers()
@@ -7665,69 +7865,16 @@ async fn proxy_handler_with_mcp_runtime(
     let modern_completion = modern_upstream
         .as_ref()
         .map(|upstream| {
-            let status = upstream.status();
-            let mut guard = std::mem::replace(&mut connection_guard, ConnectionGuard::new(None, None));
-            let metrics = state.metrics_store.clone();
-            let monitor = state.task_monitor.clone();
-            let task_id = state.task_id.clone();
-            let surface_id = state
-                .surface
-                .surface_id
-                .clone();
-            let target = state
-                .surface
-                .target
-                .endpoint
-                .clone();
-            let source = source_addr.clone();
-            let identity = identity_hash.clone();
-            let trace = trace_id.clone();
-            let variant = state
-                .active_variant_alias
-                .clone();
-            let request_bytes = body_bytes.len() as u64;
-            move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
-                let latency = start_time
-                    .elapsed()
-                    .as_millis() as u64;
-                tokio::spawn(async move {
-                    guard.decrement().await;
-                    if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
-                        monitor
-                            .record_bytes(&task_id, outcome.bytes, request_bytes)
-                            .await;
-                        if !outcome.completed || outcome.failed {
-                            monitor
-                                .increment_errors(&task_id)
-                                .await;
-                        }
-                    }
-                    if let Some(metrics) = metrics {
-                        let result = if outcome.completed && !outcome.failed && status.is_success() {
-                            crate::metrics::ConnectionStatus::Success
-                        } else {
-                            crate::metrics::ConnectionStatus::Failed
-                        };
-                        metrics
-                            .record_connection_with_ucp(
-                                surface_id,
-                                source,
-                                target,
-                                result,
-                                Some(latency),
-                                identity,
-                                crate::metrics::ConnectionDirection::Request,
-                                trace,
-                                None,
-                                None,
-                                None,
-                                latency,
-                                variant,
-                            )
-                            .await;
-                    }
-                });
-            }
+            streamed_response_completion(
+                &state,
+                std::mem::replace(&mut connection_guard, ConnectionGuard::new(None, None)),
+                upstream.status(),
+                source_addr.clone(),
+                identity_hash.clone(),
+                trace_id.clone(),
+                start_time,
+                body_bytes.len() as u64,
+            )
         });
     let discovery_support = crate::mcp::modern::ForwardingSupport {
         versions: mcp_versions,

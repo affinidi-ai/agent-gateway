@@ -1,0 +1,30 @@
+branch: feat/a2a-sse-streaming
+changes:
+  added:
+    - timestamp: '2026-10-21T00:00:00.000Z'
+      title: ⭐ Stream A2A responses event by event on surfaces with a direct Target
+      description: >-
+        When a direct A2A or AP2 Target answers SendStreamingMessage (message/stream) or
+        SubscribeToTask (tasks/resubscribe) with text/event-stream, the gateway now forwards
+        each event as it arrives, in order, instead of reading the whole stream and returning
+        it at the end. Each event gets the checks a non-streaming reply gets: an identity
+        claim is resolved and replaced by the signed agent-identity-credential, response
+        custom metadata is added, and the response extension rules and response policy run
+        on it. An event that fails a check is not sent; the stream ends with a JSON-RPC error
+        event whose data.code names the cause, since the status has already been sent. The
+        stream closes when the Target closes it, so terminal and interrupted task states
+        reach the caller as sent. A slow caller slows the Target instead of filling a buffer.
+        fabric:// surfaces and Transit Points still buffer the stream.
+    - timestamp: '2026-10-21T00:00:00.000Z'
+      title: Bound A2A event streams with the new [a2a] stream_max_lifetime_secs
+      description: >-
+        A forwarded A2A event stream may run for [a2a] stream_max_lifetime_secs (default 3600,
+        1 to 86400), no longer the 30-second request timeout. The gap between events is bounded
+        by the surface's networking.timeout.idle_secs, as the Surface Builder's Idle timeout help
+        now says, and one event by [a2a] max_body_size; a stream that passes a limit ends with an
+        error event.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -629,7 +629,9 @@ where
     response
 }
 
-fn copy_response_headers(
+/// Copies the end-to-end upstream headers onto a streamed response and marks it
+/// `cache-control: no-store`.
+pub(crate) fn copy_response_headers(
     response: &mut axum::response::Response,
     headers: &axum::http::HeaderMap,
 ) {

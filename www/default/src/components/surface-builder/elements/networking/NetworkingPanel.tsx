@@ -52,8 +52,9 @@ const NetworkingPanel: React.FC<ConfigPanelProps> = ({ config, updateField, erro
             testId="field-help-networking-idle-timeout-seconds"
             ariaLabel="About Idle timeout (seconds)"
           >
-            How long the target can pause partway through a non-streaming response before the
-            gateway stops waiting and returns a timeout.
+            How long the target can pause partway through a non-streaming response, or between two
+            events of an A2A stream, before the gateway stops waiting and ends the response with a
+            timeout.
           </FieldHelp>
         </div>
         <Form.Control

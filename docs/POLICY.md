@@ -425,7 +425,9 @@ and on response policies, and logged at `WARN`. The engine's error text stays in
 it is not put in the audit record or the response to the caller.
 
 Response policies record every outcome: `allow` when the response is passed on, `deny` when it is
-blocked, and `error` when the policy could not decide.
+blocked, and `error` when the policy could not decide. On an A2A event stream the policy is
+evaluated on every event, and the stream records one `allow` (on its first event) plus the `deny`
+or `error` that ends it; see [Event streams](PROTOCOLS.md#event-streams).
 
 MCP tool gating that takes tools out of a `tools/list` response is recorded as one decision with
 scope `mcp_tool_list` and decision `allow` (the list itself was served). `removed_tools` lists the
