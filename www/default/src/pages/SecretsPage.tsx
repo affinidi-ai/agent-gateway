@@ -470,7 +470,10 @@ const SecretsPage: React.FC = () => {
                           <td>
                             {secret.tags.length > 0 ? (
                               secret.tags.map(tag => (
-                                <span key={tag} className="badge text-bg-secondary me-1">
+                                <span
+                                  key={tag}
+                                  className="badge text-wrap text-break text-bg-secondary me-1"
+                                >
                                   {tag}
                                 </span>
                               ))
@@ -919,7 +922,10 @@ const SecretsPage: React.FC = () => {
                           <td>
                             {cert.tags.length > 0 ? (
                               cert.tags.map(tag => (
-                                <span key={tag} className="badge text-bg-secondary me-1">
+                                <span
+                                  key={tag}
+                                  className="badge text-wrap text-break text-bg-secondary me-1"
+                                >
                                   {tag}
                                 </span>
                               ))

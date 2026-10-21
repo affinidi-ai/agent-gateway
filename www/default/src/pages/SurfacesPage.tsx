@@ -356,7 +356,7 @@ const SurfaceList: React.FC<SurfaceListProps> = ({
                               return (
                                 <span
                                   key={tag}
-                                  className={`badge me-1 ${isOnboarding ? 'text-bg-warning' : 'text-bg-secondary'}`}
+                                  className={`badge text-wrap text-break me-1 ${isOnboarding ? 'text-bg-warning' : 'text-bg-secondary'}`}
                                   style={{ fontSize: '0.65rem' }}
                                   title={
                                     isOnboarding

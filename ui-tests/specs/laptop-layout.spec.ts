@@ -3,9 +3,9 @@
  *
  * Runs every dashboard page of the inventory (`helpers/layout-pages.ts`) at
  * every common laptop viewport, with the sidebar expanded, and fails when the
- * page scrolls sideways or a primary action is out of reach: not visible,
- * outside the viewport once scrolled into view, cut by a clipping ancestor,
- * or covered by another element.
+ * page or a list table scrolls sideways or a primary action is out of reach:
+ * not visible, outside the viewport once scrolled into view, cut by a
+ * clipping ancestor, or covered by another element.
  *
  * Set `AG_LAYOUT_SCREENSHOT_DIR` to also save `<page>__<w>x<h>.png` (and a
  * `__full.png` full-page shot for the Audit Log) before any assertion.
@@ -15,7 +15,7 @@ import fs from 'fs';
 import path from 'path';
 import type {Page} from '@playwright/test';
 import {expect, test} from '../helpers/fixtures';
-import {byTestId, expectActionReachable, expectNoSidewaysScroll} from '../helpers/layout-assertions';
+import {byTestId, expectActionReachable, expectNoSidewaysScroll, expectNoTableSidewaysScroll} from '../helpers/layout-assertions';
 import {measureAuditLayout, measureBelowTopbar} from '../helpers/layout-audit';
 import {installLayoutFixtures} from '../helpers/layout-fixtures';
 import {LAYOUT_PAGES, LayoutPage} from '../helpers/layout-pages';
@@ -39,7 +39,6 @@ type ViewportName = `${number}x${number}`;
  * test id, and it fails the run if it starts passing.
  */
 export const EXPECTED_FAILURES: ReadonlyArray<{page: string; viewport: ViewportName}> = [
-    {page: 'surfaces', viewport: '1280x720'},
     {page: 'identities', viewport: '1280x720'},
 ];
 
@@ -124,6 +123,7 @@ for (const size of LAPTOP_VIEWPORTS) {
                 }
 
                 await expectNoSidewaysScroll(page);
+                await expectNoTableSidewaysScroll(page);
                 for (const testId of entry.actions) {
                     await expectActionReachable(page, testId);
                 }

@@ -538,6 +538,19 @@ _Viewport-filling master/detail_ in `dashboard.css`).
   filter change do not scroll, and side by side selecting never scrolls. Clicking the
   detail title scrolls back to the entry, which lands fully below the topbar.
 
+### List tables
+
+List pages show their rows in a `.table-responsive` table (Surfaces, MCP Proxies, Secrets,
+Certificates). No list table scrolls sideways at a laptop viewport, so every column keeps
+room for its text.
+
+- Badges in table cells wrap. Bootstrap sets `white-space: nowrap` on `.badge`, so one long
+  tag or owner name fixes a column at its full length and squeezes or pushes out the
+  others. Add `text-wrap text-break` to a badge that shows a user-supplied value (tags,
+  owner names) so it wraps inside its cell and the full value stays readable. Short badges
+  still sit on one line.
+- Do not truncate such a value to make it fit; wrap it.
+
 ## Validation
 
 After frontend edits, prefer these checks when relevant:

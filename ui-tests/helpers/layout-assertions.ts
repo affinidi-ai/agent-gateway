@@ -1,6 +1,6 @@
 /**
- * Layout checks for the laptop layout spec: no sideways page scroll, and a
- * primary action a user can see and click without the page cutting it off.
+ * Layout checks for the laptop layout spec: no sideways page scroll, no list
+ * table that scrolls sideways inside its box, and a primary action a user can see and click without the page cutting it off.
  */
 
 import {expect, Locator, Page} from '@playwright/test';
@@ -28,6 +28,23 @@ export async function expectNoSidewaysScroll(page: Page): Promise<void> {
     expect(scrollWidth, `page scrolls sideways: scrollWidth ${scrollWidth} > clientWidth ${clientWidth}`).toBeLessThanOrEqual(
         clientWidth,
     );
+}
+
+/**
+ * No list table scrolls sideways: every `.table-responsive` on the page is at
+ * most as wide as its box, give or take a pixel of rounding.
+ */
+export async function expectNoTableSidewaysScroll(page: Page): Promise<void> {
+    const wide = await page.evaluate(tolerance => {
+        const describe = (node: Element) => {
+            const owner = node.closest('[data-testid]') ?? node.querySelector('[data-testid]');
+            return owner ? `[data-testid="${owner.getAttribute('data-testid')}"]` : 'a .table-responsive without a test id';
+        };
+        return Array.from(document.querySelectorAll('.table-responsive'))
+            .filter(box => box.scrollWidth > box.clientWidth + tolerance)
+            .map(box => `${describe(box)} scrolls sideways: scrollWidth ${box.scrollWidth} > clientWidth ${box.clientWidth}`);
+    }, EDGE_TOLERANCE_PX);
+    expect(wide, 'no list table scrolls sideways').toEqual([]);
 }
 
 interface ReachabilityReport {

@@ -176,6 +176,7 @@ A test fails when:
 
 - a listed test id is not attached;
 - the page scrolls sideways (`document.documentElement.scrollWidth` above `clientWidth`);
+- a list table scrolls sideways inside its box (a `.table-responsive` whose `scrollWidth` is more than 1px above its `clientWidth`; the message names the table's nearest test id);
 - a primary action is not visible, lies outside the viewport once scrolled into view, is
   cut by an ancestor whose overflow is not `visible`, or is not the topmost element at its
   centre.
