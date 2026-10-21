@@ -341,10 +341,11 @@ const EditGatewayPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-gateway-editor">
       <div className="mb-3">
         <button
           className="btn btn-sm btn-secondary"
+          data-testid="gateway-editor-back-button"
           onClick={() => navigate('/connections?tab=gateways')}
         >
           <i className="fas fa-arrow-left"></i>
@@ -423,6 +424,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && (
               <button
                 className={`btn btn-sm btn-primary me-2 ${saving ? 'disabled' : ''}`}
+                data-testid="gateway-editor-save-button"
                 onClick={handleSubmit}
                 disabled={saving}
               >
@@ -433,6 +435,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && !isSelfGateway && (
               <button
                 className={`btn btn-sm btn-outline-danger me-2 ${saving ? 'disabled' : ''}`}
+                data-testid="gateway-editor-delete-button"
                 onClick={handleDelete}
                 disabled={saving}
                 title="Delete this gateway"
@@ -452,6 +455,7 @@ const EditGatewayPage: React.FC = () => {
             {/* Overview Tab */}
             <Tab
               eventKey="overview"
+              tabAttrs={{ 'data-testid': 'gateway-editor-overview-tab-trigger' }}
               title={
                 <>
                   <i className="fas fa-info-circle"></i> Overview
@@ -478,6 +482,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && form.gateway_type === 'remote' && (
               <Tab
                 eventKey="publishing"
+                tabAttrs={{ 'data-testid': 'gateway-editor-publishing-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-filter"></i> Publishing
@@ -501,6 +506,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && form.gateway_type === 'remote' && (
               <Tab
                 eventKey="remote"
+                tabAttrs={{ 'data-testid': 'gateway-editor-remote-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-network-wired"></i> Remote
@@ -521,6 +527,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && (
               <Tab
                 eventKey="integrations"
+                tabAttrs={{ 'data-testid': 'gateway-editor-integrations-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-plug"></i> Integrations
@@ -542,6 +549,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && (
               <Tab
                 eventKey="global-policy"
+                tabAttrs={{ 'data-testid': 'gateway-editor-global-policy-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-shield-alt"></i> Global Policy

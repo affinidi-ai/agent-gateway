@@ -527,6 +527,7 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
             <select
               className="form-select form-select-sm"
               style={{ width: '180px' }}
+              data-testid="credential-audit-event-filter"
               value={eventFilter}
               onChange={e => setEventFilter(e.target.value)}
             >
@@ -543,6 +544,7 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
             variant="primary"
             size="md"
             className="shadow-sm"
+            data-testid="credential-audit-refresh-button"
             onClick={() => loadAudit(page, searchTerm || undefined)}
             iconStart={<i className="fas fa-sync-alt me-1" aria-hidden="true" />}
           >
@@ -602,6 +604,7 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
                   {filteredEvents.map((evt, idx) => (
                     <React.Fragment key={`${evt.timestamp}-${idx}`}>
                       <tr
+                        data-testid={`credential-audit-row-${idx}`}
                         onClick={() => setExpandedIdx(expandedIdx === idx ? null : idx)}
                         style={{ cursor: 'pointer' }}
                         className={expandedIdx === idx ? 'table-active' : ''}
@@ -615,6 +618,7 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
                         <td>
                           {evt.provider_id ? (
                             <Link
+                              data-testid={`credential-audit-provider-link-${idx}`}
                               to={`/credential-providers/${encodeURIComponent(evt.provider_id)}`}
                               onClick={e => e.stopPropagation()}
                               title={evt.provider_id}

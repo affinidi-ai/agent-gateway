@@ -268,7 +268,7 @@ const TasksPage: React.FC = () => {
   );
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-tasks">
       <div className="card shadow mb-4">
         <div className="card-header py-3">
           <div className="d-flex justify-content-between align-items-center">
@@ -283,6 +283,7 @@ const TasksPage: React.FC = () => {
                 variant="primary"
                 size="md"
                 className="me-2 shadow-sm"
+                data-testid="tasks-refresh-button"
                 onClick={() => window.location.reload()}
                 iconStart={<i className="fas fa-sync-alt fa-sm" aria-hidden="true" />}
               >
@@ -303,6 +304,7 @@ const TasksPage: React.FC = () => {
                     key={tag}
                     className={`badge ${active ? 'text-bg-primary' : 'text-bg-light'}`}
                     style={{ fontSize: '0.75rem', cursor: 'pointer' }}
+                    data-testid={`tasks-tag-filter-${tag}`}
                     onClick={() => toggleTag(tag)}
                     title={active ? `Remove '${tag}' filter` : `Filter to '${tag}'`}
                   >
@@ -316,6 +318,7 @@ const TasksPage: React.FC = () => {
                   size="sm"
                   className="p-0 ms-2"
                   style={{ fontSize: '0.75rem', textDecoration: 'none' }}
+                  data-testid="tasks-clear-tags-button"
                   onClick={clearTags}
                 >
                   Clear
@@ -466,6 +469,7 @@ const TasksPage: React.FC = () => {
                             backgroundColor: 'rgba(74, 144, 226, 0.06)',
                             cursor: 'pointer',
                           }}
+                          data-testid={`tasks-group-row-${groupKey}`}
                           onClick={() => toggleGroup(groupKey)}
                         >
                           <td colSpan={10}>

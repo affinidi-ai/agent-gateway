@@ -157,6 +157,7 @@ const IntegrationsPage: React.FC = () => {
               variant="primary"
               size="md"
               className="shadow-sm"
+              data-testid="integrations-add-button"
               onClick={e =>
                 guard('integrations', () => navigate('/integrations/integrations/wizard'), e)
               }
@@ -205,6 +206,7 @@ const IntegrationsPage: React.FC = () => {
               <tbody>
                 {filteredIntegrations.map(integration => (
                   <tr
+                    data-testid={`integrations-row-${integration.id}`}
                     key={integration.id}
                     onClick={() => navigate(`/integrations/integrations/${integration.id}`)}
                     style={{ cursor: 'pointer' }}
@@ -254,6 +256,7 @@ const IntegrationsPage: React.FC = () => {
                           onClick={e => handleTestIntegration(e, integration)}
                           disabled={testingNotifierId === integration.id}
                           title="Test"
+                          data-testid={`integrations-test-button-${integration.id}`}
                           aria-label={`Test integration ${integration.name}`}
                         >
                           {testingNotifierId === integration.id ? (
@@ -275,11 +278,13 @@ const IntegrationsPage: React.FC = () => {
                           navigate(`/integrations/integrations/${integration.id}`);
                         }}
                         title="Edit"
+                        data-testid={`integrations-edit-button-${integration.id}`}
                         aria-label={`Edit integration ${integration.name}`}
                       >
                         <i className="fas fa-edit" aria-hidden="true"></i>
                       </AppButton>
                       <DeleteButton
+                        data-testid={`integrations-delete-button-${integration.id}`}
                         onDelete={() => handleDeleteIntegration(integration.id)}
                         className="btn-sm"
                         title="Delete integration"
@@ -296,12 +301,13 @@ const IntegrationsPage: React.FC = () => {
   );
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-integrations">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div>
           <SearchInput
             value={searchTerm}
             onChange={setSearchTerm}
+            data-testid="integrations-search-input"
             placeholder="Filter Integrations...."
           />
         </div>

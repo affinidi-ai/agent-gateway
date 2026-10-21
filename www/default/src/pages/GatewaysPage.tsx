@@ -407,6 +407,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                   <AppButton
                     variant="primary"
                     size="md"
+                    data-testid="gateways-add-button"
                     onClick={e =>
                       guard('connections.gateways', () => navigate('/gateways/connect'), e)
                     }
@@ -451,6 +452,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                   <tbody>
                     {filteredGateways.map(gateway => (
                       <tr
+                        data-testid={`gateways-row-${gateway.id}`}
                         key={gateway.id}
                         onClick={() => {
                           if (
@@ -551,6 +553,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                     size="sm"
                                     className="me-1"
                                     title="Approve Gateway Connection"
+                                    data-testid={`gateways-approve-button-${gateway.id}`}
                                     aria-label={`Approve gateway ${gateway.name}`}
                                     onClick={e => {
                                       e.stopPropagation();
@@ -578,6 +581,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                       size="sm"
                                       onClick={e => handlePingGateway(gateway.id, gateway.name, e)}
                                       disabled={pingStatus[gateway.id] === 'pinging'}
+                                      data-testid={`gateways-ping-button-${gateway.id}`}
                                       aria-label={`Ping gateway ${gateway.name}`}
                                     >
                                       {pingStatus[gateway.id] === 'pinging' ? (
@@ -603,6 +607,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                       style={{ marginLeft: '10px' }}
                                       title="Edit Gateway"
                                       className="me-1"
+                                      data-testid={`gateways-edit-button-${gateway.id}`}
                                       aria-label={`Edit gateway ${gateway.name}`}
                                       onClick={() => navigate(`/gateways/${gateway.id}`)}
                                     >
@@ -614,6 +619,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                             {hasPermission('gateways.delete') &&
                               gateway.gateway_type !== 'self' && (
                                 <DeleteButton
+                                  data-testid={`gateways-delete-button-${gateway.id}`}
                                   onDelete={() => handleDeleteGateway(gateway.id)}
                                   className="btn-sm"
                                   title="Delete Gateway"
@@ -650,6 +656,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                   <AppButton
                     variant="primary"
                     size="md"
+                    data-testid="connection-points-add-button"
                     onClick={e =>
                       guard('connections.connectionpoints', () => navigate('/gateways/publish'), e)
                     }
@@ -714,6 +721,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
 
                       return (
                         <tr
+                          data-testid={`connection-points-row-${connectionPoint.id}`}
                           key={connectionPoint.id}
                           onClick={() => navigate(`/connection-points/${connectionPoint.id}`)}
                           style={{ cursor: 'pointer' }}
@@ -788,6 +796,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                     navigate(`/connection-points/${connectionPoint.id}`)
                                   }
                                   title="Edit Connection Point"
+                                  data-testid={`connection-points-edit-button-${connectionPoint.id}`}
                                   aria-label={`Edit connection point ${connectionPoint.name}`}
                                 >
                                   <i className="fas fa-edit" aria-hidden="true"></i>
@@ -804,6 +813,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                       handleReconnectConnectionPoint(connectionPoint.id, e)
                                     }
                                     title="Retry connection now"
+                                    data-testid={`connection-points-retry-button-${connectionPoint.id}`}
                                     aria-label={`Retry connection point ${connectionPoint.name}`}
                                   >
                                     <i className="fas fa-sync-alt" aria-hidden="true"></i>
@@ -815,6 +825,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                 style={{ marginLeft: '10px' }}
                                 onClick={() => handleCopyUrl(connectionPoint.oob_url)}
                                 title="Copy Connection Point Link"
+                                data-testid={`connection-points-copy-link-button-${connectionPoint.id}`}
                                 aria-label={`Copy link for ${connectionPoint.name}`}
                               >
                                 <i className="fas fa-link" aria-hidden="true"></i>
@@ -826,6 +837,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   style={{ marginLeft: '10px' }}
                                   onClick={() => handleCopySecret(connectionPoint.secret!)}
                                   title="Copy Connection Point Secret"
+                                  data-testid={`connection-points-copy-secret-button-${connectionPoint.id}`}
                                   aria-label={`Copy secret for ${connectionPoint.name}`}
                                 >
                                   <i className="fas fa-key" aria-hidden="true"></i>
@@ -833,6 +845,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                               )}
                               {hasPermission('gateways.delete') && (
                                 <DeleteButton
+                                  data-testid={`connection-points-delete-button-${connectionPoint.id}`}
                                   onDelete={() => handleDeleteConnectionPoint(connectionPoint.id)}
                                   className="btn-sm"
                                   title="Delete connection point"

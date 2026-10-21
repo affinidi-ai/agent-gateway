@@ -142,10 +142,11 @@ const SurfacesPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-surfaces">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div className="d-flex align-items-center">
           <SearchInput
+            data-testid="surfaces-search-input"
             value={searchTerm}
             onChange={setSearchTerm}
             placeholder="Filter Surfaces..."
@@ -265,11 +266,13 @@ const SurfaceList: React.FC<SurfaceListProps> = ({
               className={`fas fa-clock ${recentOnly ? 'text-primary' : 'text-muted'}`}
               style={{ cursor: 'pointer', fontSize: '1.2rem' }}
               onClick={onToggleRecent}
+              data-testid="surfaces-recent-toggle"
               title={recentOnly ? 'Show all surfaces' : 'Show only surfaces active last 5 minutes'}
             ></i>
             {canEdit && (
               <>
                 <AppButton
+                  data-testid="surfaces-add-button"
                   variant="primary"
                   size="md"
                   className="shadow-sm"
@@ -321,6 +324,7 @@ const SurfaceList: React.FC<SurfaceListProps> = ({
                   return (
                     <tr
                       key={surface.surface_id}
+                      data-testid={`surfaces-row-${surface.surface_id}`}
                       style={{ cursor: 'pointer', opacity: isInactive ? 0.55 : undefined }}
                       onClick={() => onOpen(surface)}
                     >

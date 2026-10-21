@@ -652,9 +652,14 @@ const AddIntegrationWizardPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-integration-wizard">
       <div className="mb-3">
-        <button className="btn btn-sm btn-secondary" onClick={handleCancel} disabled={isSubmitting}>
+        <button
+          className="btn btn-sm btn-secondary"
+          data-testid="integration-wizard-back-button"
+          onClick={handleCancel}
+          disabled={isSubmitting}
+        >
           <i className="fas fa-arrow-left"></i>
         </button>
       </div>
@@ -953,6 +958,7 @@ const AddIntegrationWizardPage: React.FC = () => {
                     <button
                       type="button"
                       className="btn btn-outline-secondary"
+                      data-testid="integration-wizard-clear-button"
                       onClick={handleClear}
                       disabled={isSubmitting || !isModified}
                       title="Clear form"
@@ -961,6 +967,7 @@ const AddIntegrationWizardPage: React.FC = () => {
                       Clear
                     </button>
                     <button
+                      data-testid="wizard-submit"
                       type="submit"
                       className="btn btn-primary"
                       disabled={isSubmitting || hasMissingVariables}

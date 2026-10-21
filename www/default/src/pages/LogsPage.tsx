@@ -49,7 +49,7 @@ const LogsPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-logs">
       <div className="row">
         <div className="col-12">
           <LogsViewer
@@ -71,6 +71,7 @@ const LogsPage: React.FC = () => {
                 size="md"
                 loading={isDownloading}
                 loadingLabel="Downloading..."
+                data-testid="logs-download-button"
                 onClick={handleDownloadLogs}
                 iconStart={
                   <i

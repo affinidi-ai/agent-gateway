@@ -119,10 +119,11 @@ const EditMediatorPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-mediator-editor">
       <div className="mb-3">
         <button
           className="btn btn-sm btn-secondary"
+          data-testid="mediator-editor-back-button"
           onClick={() => navigate('/connections?tab=mediators')}
         >
           <i className="fas fa-arrow-left"></i>
@@ -235,6 +236,7 @@ const EditMediatorPage: React.FC = () => {
                 type="button"
                 variant="secondary"
                 size="md"
+                data-testid="mediator-editor-cancel-button"
                 onClick={() => navigate('/connections?tab=mediators')}
                 disabled={saving}
                 iconStart={<i className="fas fa-times"></i>}
@@ -243,11 +245,17 @@ const EditMediatorPage: React.FC = () => {
               </AppButton>
               <div className="d-flex gap-2">
                 {isEditMode && (
-                  <DeleteButton onDelete={handleDelete} disabled={saving} variant="danger">
+                  <DeleteButton
+                    data-testid="mediator-editor-delete-button"
+                    onDelete={handleDelete}
+                    disabled={saving}
+                    variant="danger"
+                  >
                     Delete
                   </DeleteButton>
                 )}
                 <AppButton
+                  data-testid="mediator-editor-save-button"
                   type="submit"
                   variant="primary"
                   size="md"

@@ -136,9 +136,14 @@ ui-tests/
 │   ├── channels.spec.ts      # Channel management tests
 │   ├── api-keys.spec.ts      # API Keys page tests
 │   ├── credentials.spec.ts   # Outbound Credentials tests
-│   └── accessibility.spec.ts # WCAG accessibility tests
+│   ├── accessibility.spec.ts # WCAG accessibility tests
+│   └── laptop-layout.spec.ts # Every page at every laptop viewport (layout)
 ├── helpers/                  # Test utilities
 │   ├── test-auth.ts          # Authentication helpers
+│   ├── fixtures.ts           # Shared `test`/`expect` with the session bridge
+│   ├── layout-pages.ts       # Page inventory for the laptop layout spec
+│   ├── layout-fixtures.ts    # Long-identifier list fixtures (page.route)
+│   ├── layout-assertions.ts  # Sideways-scroll and action reachability checks
 │   ├── screenshots.ts        # Screenshot utilities
 │   ├── wait.ts               # Custom wait functions
 │   └── index.ts              # Helper exports
@@ -154,6 +159,43 @@ ui-tests/
 ├── playwright.config.ts      # Playwright configuration
 ├── package.json              # Dependencies
 └── tsconfig.json             # TypeScript config
+```
+
+## Laptop Layout Spec
+
+`specs/laptop-layout.spec.ts` opens every page of the inventory in
+`helpers/layout-pages.ts` at 1280x720, 1366x768, 1536x864, 1440x900 and 1920x1080, with
+the sidebar expanded, and runs one test per page and viewport. The inventory covers every
+sidebar destination and each of its tabs, `/profile`, every create or wizard route without
+a record id, and `audit-selected` (the Audit Log with its first entry selected). Each entry
+names its page root, the test ids that mark its data, and its primary actions: header
+actions, save, cancel and back, wizard navigation, search and filter controls, tab
+triggers, and the action buttons of the first row.
+
+A test fails when:
+
+- a listed test id is not attached;
+- the page scrolls sideways (`document.documentElement.scrollWidth` above `clientWidth`);
+- a primary action is not visible, lies outside the viewport once scrolled into view, is
+  cut by an ancestor whose overflow is not `visible`, or is not the topmost element at its
+  centre.
+
+A fresh test-mode gateway has empty lists, so `helpers/layout-fixtures.ts` answers the list
+requests of those pages through `page.route` with rows whose DIDs, URLs and names run past
+80 characters, and the Audit Log with a full page of 50 entries and pagination. Every
+other request reaches the real gateway; nothing is written through the API.
+
+`EXPECTED_FAILURES` in the spec lists the page and viewport pairs that fail on the current
+layout. A listed pair calls `test.fail()` after its test ids are found attached, so a
+missing element still fails, and a listed pair that starts passing fails the run. Remove
+a pair from the list when its layout is fixed.
+
+Set `AG_LAYOUT_SCREENSHOT_DIR` to save a viewport-sized screenshot of every test,
+`<page>__<width>x<height>.png`, before any assertion runs, plus a full-page
+`<page>__<width>x<height>__full.png` for `audit` and `audit-selected`:
+
+```bash
+AG_LAYOUT_SCREENSHOT_DIR="$PWD/ui-tests/test_results/layout-screens" make ui-test
 ```
 
 ## Test Authentication
