@@ -256,7 +256,8 @@ function parseHeaders(text: string): Record<string, string> | null {
 
 /**
  * The configuration to send. Hidden and empty optional fields are left out; a kept secret is
- * left out so the gateway keeps it, and a cleared one is sent as null when `updating`.
+ * left out so the gateway keeps it. When `updating`, a stored secret that is cleared or left
+ * empty is sent as null, since one left out would be kept.
  */
 export function buildConfiguration(
   type: EndpointType,
@@ -277,11 +278,14 @@ export function buildConfiguration(
   for (const field of visible) {
     if (field.secret) {
       const edit = form.secrets[field.name];
-      if (edit?.state === 'clear' && updating) {
-        configuration[field.name] = null;
-      } else if (edit?.state === 'set' && edit.value.trim()) {
+      if (edit?.state === 'set' && edit.value.trim()) {
         const text = edit.value.trim();
         configuration[field.name] = field.kind === 'secret-json' ? parseHeaders(text) : text;
+      } else if (
+        updating &&
+        (edit?.state === 'clear' || (edit?.state === 'set' && form.stored.includes(field.name)))
+      ) {
+        configuration[field.name] = null;
       }
       continue;
     }

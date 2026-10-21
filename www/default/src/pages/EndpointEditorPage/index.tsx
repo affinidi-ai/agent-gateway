@@ -279,7 +279,6 @@ const EndpointEditorPage: React.FC = () => {
             <EndpointConfigFields
               type={type}
               form={form}
-              storedSecrets={stored?.secrets ?? []}
               secretOptions={secretOptions}
               onValue={(field, value) => {
                 setForm(current => ({ ...current, values: { ...current.values, [field]: value } }));

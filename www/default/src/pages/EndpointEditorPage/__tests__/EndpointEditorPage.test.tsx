@@ -292,7 +292,10 @@ describe('a stored endpoint', () => {
     mocked.getEndpoint.mockResolvedValue(
       stored({
         type: 'webhook',
-        configuration: { url: 'https://ops.example.com/hook', signing_secret: '$SECRET:slack-hook' },
+        configuration: {
+          url: 'https://ops.example.com/hook',
+          signing_secret: '$SECRET:slack-hook',
+        },
         secrets: [],
       })
     );

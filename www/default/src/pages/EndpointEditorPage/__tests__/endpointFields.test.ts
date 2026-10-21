@@ -167,7 +167,10 @@ describe('buildConfiguration', () => {
       'webhook',
       stored({
         type: 'webhook',
-        configuration: { url: 'https://ops.example.com/hook', signing_secret: '$SECRET:hook-signing' },
+        configuration: {
+          url: 'https://ops.example.com/hook',
+          signing_secret: '$SECRET:hook-signing',
+        },
       })
     );
     form.secrets.signing_secret = { state: 'set', value: '' };
