@@ -191,9 +191,11 @@ changes:
         directories to <dir>.migrated-<unix seconds>, deleted 30 days later as they may hold
         plain-text credentials. Upgrade both nodes of a pair before the Active node starts; a
         Standby migrates when promoted. Attachments to some gateways or connection points now
-        receive every resource's events, custom _ variables and unfilled placeholders leave the
-        templates, and endpoints failing the current checks are written disabled; the report
-        names each change. The old paths resolve against the config file's directory, and
+        receive every resource's events, every tenant's included. Tenant-owned integrations
+        become appliance-wide and are written disabled, since enabled they would receive every
+        tenant's events; review each before enabling it. Custom _ variables and unfilled
+        placeholders leave the templates, and endpoints failing the current checks are written
+        disabled; the report names each change. The old paths resolve against the config file's directory, and
         while storage_paths.integrations is set, the new integration paths a config leaves
         unset go beside it, so a config written for the previous version needs no change; set
         them before removing the old keys. See the INTEGRATIONS upgrade section.
