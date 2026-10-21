@@ -3223,9 +3223,7 @@ async fn enrich_and_evaluate_surface_policies(
                         policy_content_hash: channel_opa_hash.as_deref(),
                         ..Default::default()
                     });
-                    return Err(ForwardRefusal::SurfacePolicyDenied {
-                        reason: decision.reason,
-                    });
+                    return Err(ForwardRefusal::SurfacePolicyDenied { reason: decision.reason });
                 }
                 Err(e) => {
                     channel_warn!(config_id, "GW2: Surface-level OPA policy evaluation error (denying request): {}", e);
@@ -10612,9 +10610,7 @@ mod tests {
     }
 
     /// The forward-response a failed Target body read answers with.
-    async fn forward_error_of(
-        result: Result<String, crate::proxy::upstream_body::UpstreamBodyError>
-    ) -> (u64, String) {
+    async fn forward_error_of(result: Result<String, crate::proxy::upstream_body::UpstreamBodyError>) -> (u64, String) {
         let error = match result {
             Ok(body) => panic!("expected a failed read, got {body:?}"),
             Err(error) => error,

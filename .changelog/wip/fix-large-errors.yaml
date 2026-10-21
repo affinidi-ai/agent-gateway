@@ -1,0 +1,16 @@
+branch: fix-large-errors
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-21T16:10:00.000Z'
+      title: Report refusals as typed errors instead of prepared responses
+      description: >-
+        Consent ticket checks, credential provider reference checks, token refresh storage and
+        the fabric sender, envelope, policy and Target body checks now return an error that
+        names why a request was refused, and the response is built from it in one place. The
+        statuses and bodies callers receive are unchanged. Clippy 1.98 no longer flags these
+        functions for returning a large error.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

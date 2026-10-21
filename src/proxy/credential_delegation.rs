@@ -1814,10 +1814,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let Err(error) = vault
-            .update(refreshed)
-            .await
-        else {
+        let Err(error) = vault.update(refreshed).await else {
             panic!("a provider response must not revive revoked authorization");
         };
         let rejected = refreshed_token_rejected(&binding, &provider, &error);
@@ -1844,10 +1841,7 @@ mod tests {
             .unwrap();
         let mut refreshed = token.clone();
         refreshed.access_token = "persisted-provider-credential".into();
-        let Ok(stored) = vault
-            .update(refreshed)
-            .await
-        else {
+        let Ok(stored) = vault.update(refreshed).await else {
             panic!("an unchanged authorization must accept its refreshed token");
         };
         assert_eq!(stored.access_token, "persisted-provider-credential");

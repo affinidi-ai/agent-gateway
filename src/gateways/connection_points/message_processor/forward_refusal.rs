@@ -37,7 +37,9 @@ impl ForwardRefusal {
             Self::ChannelNotExposed => forbidden("Channel is not exposed to sender"),
             Self::AppliancePolicyDenied => forbidden("Request blocked by appliance-wide policy"),
             Self::GatewayPolicyDenied | Self::GatewayPolicyError => forbidden("Request blocked by gateway policy"),
-            Self::SurfacePolicyDenied { reason } => build_surface_policy_denied_forward_body(request_body, reason.as_deref()),
+            Self::SurfacePolicyDenied { reason } => {
+                build_surface_policy_denied_forward_body(request_body, reason.as_deref())
+            }
             Self::SurfacePolicyError => build_surface_policy_denied_forward_body(request_body, None),
             Self::TargetBody(error) => {
                 let (status, message) = error.status_and_message();
@@ -72,10 +74,7 @@ mod tests {
             .into_forward_response(request_body)
             .await
         {
-            ProcessingResult::RequiresResponse {
-                response_type,
-                response_body,
-            } => {
+            ProcessingResult::RequiresResponse { response_type, response_body } => {
                 assert_eq!(response_type, MessageType::ForwardResponse.to_string());
                 response_body
             }
