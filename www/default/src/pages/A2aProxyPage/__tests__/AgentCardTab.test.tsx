@@ -16,23 +16,24 @@ const renderTab = () => {
 };
 
 describe('AgentCardTab A2A version note', () => {
-  it('says the card follows the surface versions and which reply each send method gets', () => {
+  it('says the card lists A2A 1.0 by default and the surface settings are locked', () => {
     renderTab();
 
     const note = screen.getByTestId('a2a-proxy-agent-card-version');
-    expect(note).toHaveTextContent('lists the A2A versions accepted by the Agent Surface');
-    expect(note).toHaveTextContent('A2A 1.0 for a new surface');
-    expect(note).toHaveTextContent('Callers using message/send get A2A 0.3 replies');
-    expect(note).toHaveTextContent('those using SendMessage get A2A 1.0 replies');
+    expect(note).toHaveTextContent('By default, the card lists A2A 1.0');
+    expect(note).toHaveTextContent('Callers must send the A2A-Version: 1.0 header');
+    expect(note).toHaveTextContent('should use A2A 1.0 methods such as SendMessage');
+    expect(note).toHaveTextContent("That surface's A2A settings are locked");
+    expect(note).toHaveTextContent('only the JSON-RPC envelope is checked');
   });
 
-  it('says the exposing surface has locked A2A settings', () => {
+  it('does not describe A2A 0.3 surfaces or replies', () => {
     renderTab();
 
-    const note = screen.getByTestId('a2a-proxy-agent-card-locked');
-    expect(note).toHaveTextContent('its versions are fixed');
-    expect(note).toHaveTextContent('only the JSON-RPC envelope is checked');
-    expect(note).toHaveTextContent('callers must send A2A-Version: 1.0');
-    expect(note).toHaveTextContent('A surface created as an A2A 0.3 proxy keeps accepting 0.3');
+    const note = screen.getByTestId('a2a-proxy-agent-card-version');
+    expect(note).not.toHaveTextContent('created as an A2A 0.3 proxy');
+    expect(note).not.toHaveTextContent('0.3');
+    expect(note).not.toHaveTextContent('message/send');
+    expect(screen.queryByTestId('a2a-proxy-agent-card-locked')).not.toBeInTheDocument();
   });
 });

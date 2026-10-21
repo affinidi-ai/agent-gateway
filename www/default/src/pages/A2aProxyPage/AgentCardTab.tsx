@@ -21,24 +21,17 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ formData, onChange }) => {
         docLink={DOCS_URL.proxies}
       >
         <p>
-          Some backends (like this one) don&apos;t publish their own agent card, a small public
-          profile describing what an agent can do. This proxy generates one automatically.
+          An agent card is a small public profile that describes what an agent can do. This backend
+          doesn&apos;t publish one, so the proxy generates it.
         </p>
         <p data-testid="a2a-proxy-agent-card-version">
-          The generated card lists the A2A versions accepted by the Agent Surface that exposes this
-          proxy: A2A 1.0 for a new surface, and 0.3 as well for an existing surface that accepts it.
-          Callers using <code>message/send</code> get A2A 0.3 replies, and those using{' '}
-          <code>SendMessage</code> get A2A 1.0 replies.
-        </p>
-        <p data-testid="a2a-proxy-agent-card-locked">
-          That surface&apos;s A2A settings are locked: its versions are fixed, and only the JSON-RPC
-          envelope is checked, not the A2A message fields. On an A2A 1.0 surface, callers must send{' '}
-          <code>A2A-Version: 1.0</code>, and a request without it is refused. A surface created as
-          an A2A 0.3 proxy keeps accepting 0.3, and a request without the header is read as 0.3.
+          By default, the card lists A2A 1.0, the version accepted by the Agent Surface that exposes
+          this proxy. Callers must send the <code>A2A-Version: 1.0</code> header and should use A2A
+          1.0 methods such as <code>SendMessage</code>. That surface&apos;s A2A settings are locked,
+          and only the JSON-RPC envelope is checked.
         </p>
         <p className="mb-0">
-          Leave the fields below blank to reuse the name and description of the Agent Surface that
-          exposes this proxy.
+          Leave the fields below blank to reuse that surface&apos;s name and description.
         </p>
       </InfoBanner>
 

@@ -6,9 +6,10 @@ changes:
       title: Move the A2A proxy version notes to the A2A proxy's Agent Card tab
       description: >-
         The Managed Agent panel no longer shows the A2A version and identity notes when its
-        Target is an A2A proxy. The A2A proxy's Agent Card tab now explains that the exposing
-        surface's A2A settings are locked, with fixed versions, envelope-only validation and the
-        A2A-Version header callers must send.
+        Target is an A2A proxy. The A2A proxy's Agent Card tab now gives a shorter explanation:
+        by default the card lists A2A 1.0 and callers must send the A2A-Version 1.0 header, the
+        exposing surface's A2A settings are locked with envelope-only validation, and callers
+        should use A2A 1.0 methods such as SendMessage.
   fixed: []
   removed: []
   security: []
