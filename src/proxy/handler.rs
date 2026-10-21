@@ -747,7 +747,6 @@ pub async fn handle_agent_card(
                         .unwrap(),
                     &channel_name,
                     config_id,
-                    &state.config.x402_headers,
                     resource_url,
                     state
                         .listener_manager
@@ -761,7 +760,7 @@ pub async fn handle_agent_card(
                 .await
                 {
                     Ok(_) => {}
-                    Err(err_response) => return Err(err_response),
+                    Err(error) => return Err(error.render(&state.config.x402_headers)),
                 }
             } else if mpp_required && mpp_credential.is_some() {
                 // Client sent MPP credential → verify via MPP
@@ -796,7 +795,6 @@ pub async fn handle_agent_card(
                             .unwrap(),
                         &channel_name,
                         config_id,
-                        &state.config.x402_headers,
                         resource_url,
                         state
                             .listener_manager
@@ -808,7 +806,8 @@ pub async fn handle_agent_card(
                             .clone(),
                     )
                     .await
-                    .unwrap_err();
+                    .unwrap_err()
+                    .render(&state.config.x402_headers);
                     if mpp_required {
                         // Both enabled → add MPP challenge headers to x402 response
                         crate::mpp::fire_challenge_issued_events(
@@ -3227,7 +3226,6 @@ async fn proxy_handler_with_mcp_runtime(
                         .unwrap(),
                     &channel_name,
                     config_id,
-                    &state.config.x402_headers,
                     &resource_url,
                     state
                         .listener_manager
@@ -3239,6 +3237,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .clone(),
                 )
                 .await
+                .map_err(|error| error.render(&state.config.x402_headers))
                 {
                     Ok(response_header) => {
                         body_bytes = modified_body.into();
@@ -3337,7 +3336,6 @@ async fn proxy_handler_with_mcp_runtime(
                             .unwrap(),
                         &channel_name,
                         config_id,
-                        &state.config.x402_headers,
                         &resource_url,
                         state
                             .listener_manager
@@ -3349,7 +3347,8 @@ async fn proxy_handler_with_mcp_runtime(
                             .clone(),
                     )
                     .await
-                    .unwrap_err();
+                    .unwrap_err()
+                    .render(&state.config.x402_headers);
                     if mpp_required {
                         crate::mpp::fire_challenge_issued_events(
                             config_id,

@@ -554,7 +554,6 @@ pub(crate) async fn process_local(
             config,
             name,
             id,
-            services.x402_headers,
             resource_url,
             services
                 .listener_manager
@@ -563,7 +562,8 @@ pub(crate) async fn process_local(
                 .transaction_store
                 .clone(),
         )
-        .await?;
+        .await
+        .map_err(|error| error.render(services.x402_headers))?;
         payment.body = modified.into();
         payment.consumed = true;
         payment.context = Some(PaymentContext {
@@ -598,7 +598,6 @@ pub(crate) async fn process_local(
             config,
             name,
             id,
-            services.x402_headers,
             resource_url,
             services
                 .listener_manager
@@ -608,7 +607,8 @@ pub(crate) async fn process_local(
                 .clone(),
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .render(services.x402_headers);
         return Err(if let Some(config) = mpp {
             crate::mpp::fire_challenge_issued_events(
                 id,

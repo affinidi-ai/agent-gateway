@@ -1643,9 +1643,6 @@ async fn verify_payment_fabric(
             &x402_effective_policy.unwrap(),
             channel_id,
             config_id,
-            x402_headers_extracted
-                .as_ref()
-                .unwrap(),
             path,
             None,
             get_transaction_store(),
@@ -1659,9 +1656,16 @@ async fn verify_payment_fabric(
                     response_header,
                 }))
             }
-            Err(err_response) => {
+            Err(error) => {
                 channel_warn!(config_id, "Payment verification failed for fabric-forwarded request");
-                Err(axum_response_to_forward_result(err_response).await)
+                Err(axum_response_to_forward_result(
+                    error.render(
+                        x402_headers_extracted
+                            .as_ref()
+                            .unwrap(),
+                    ),
+                )
+                .await)
             }
         }
     } else if mpp_required && mpp_credential.is_some() {
@@ -1694,15 +1698,17 @@ async fn verify_payment_fabric(
                 &x402_effective_policy.unwrap(),
                 channel_id,
                 config_id,
-                x402_headers_extracted
-                    .as_ref()
-                    .unwrap(),
                 path,
                 None,
                 get_transaction_store(),
             )
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .render(
+                x402_headers_extracted
+                    .as_ref()
+                    .unwrap(),
+            );
             if mpp_required {
                 crate::mpp::fire_challenge_issued_events(config_id, channel_id, path, get_mpp_transaction_store());
                 crate::mpp::errors::add_mpp_challenges_to_response_resolved(
