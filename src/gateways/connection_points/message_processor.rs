@@ -853,8 +853,8 @@ async fn process_connection_setup(message: &ReceivedMessage) -> ProcessingResult
 
     // Only a sender that proved control of its channel_did on a live
     // invitation may add to the seen set.
-    if let Err(refused) = admit_pairing_envelope(message) {
-        return refused;
+    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message) {
+        return pairing_envelope_refusal(message, rejection);
     }
 
     info!("✓ Acceptor temporary DID: {}", acceptor_temporary_did);
@@ -1127,8 +1127,8 @@ async fn process_connection_accepted(message: &ReceivedMessage) -> ProcessingRes
         }
     };
 
-    if let Err(refused) = admit_pairing_envelope(message) {
-        return refused;
+    if let Err(rejection) = super::envelope_replay::admit_pairing_message(message) {
+        return pairing_envelope_refusal(message, rejection);
     }
 
     info!("✓ Inviter temporary DID: {}", inviter_temporary_did);
@@ -1821,23 +1821,15 @@ fn refused_forward_response(
     })
 }
 
-/// Refuses a `forward-request` envelope that is expired, malformed in time or
-/// already processed. Runs after the sender is authorized so only registered
-/// peers can populate the seen set.
+/// How a `forward-request` envelope that is expired, malformed in time or
+/// already processed is answered. Admission runs after the sender is
+/// authorized so only registered peers can populate the seen set.
 ///
 /// A duplicate is dropped without a reply. The mediator re-delivers a message
 /// that was not deleted after dispatch (a reconnect mid-dispatch, a first run
 /// still in progress), and a `forward-response` threaded to the original id
 /// would reach the sender before, or instead of, the real one; the sender's
 /// waiter keeps only the first reply.
-#[allow(clippy::result_large_err)] // ProcessingResult carries a streaming Response
-fn admit_forward_request_envelope(message: &ReceivedMessage) -> Result<(), ProcessingResult> {
-    super::envelope_replay::admit_forward_request(message)
-        .map_err(|rejection| forward_request_envelope_refusal(message, rejection))
-}
-
-/// A duplicate gets no reply, since a reply threaded to the original id would
-/// displace the real response at the sender.
 fn forward_request_envelope_refusal(
     message: &ReceivedMessage,
     rejection: super::envelope_replay::EnvelopeRejection,
@@ -1895,23 +1887,23 @@ pub(crate) async fn forward_request_refusal_before_dispatch(
         .map(|rejection| forward_request_envelope_refusal(message, rejection))
 }
 
-/// Refuses a pairing envelope that is expired or already processed.
-/// `connection-setup` runs it after proving control of its `channel_did` on a
-/// live invitation; `connection-accepted` runs it once its sender and
+/// How a pairing envelope that is expired or already processed fails.
+/// `connection-setup` admits it after proving control of its `channel_did` on
+/// a live invitation; `connection-accepted` admits it once its sender and
 /// `channel_did` are present, before its issuer attestation is verified.
-#[allow(clippy::result_large_err)] // ProcessingResult carries a streaming Response
-fn admit_pairing_envelope(message: &ReceivedMessage) -> Result<(), ProcessingResult> {
-    super::envelope_replay::admit_pairing_message(message).map_err(|rejection| {
-        warn!(
-            from = ?message.from_did,
-            message_id = %message.didcomm_message_id,
-            message_type = %message.message_type,
-            "Refusing pairing envelope: {rejection}"
-        );
-        ProcessingResult::Failed {
-            reason: format!("Envelope refused: {rejection}"),
-        }
-    })
+fn pairing_envelope_refusal(
+    message: &ReceivedMessage,
+    rejection: super::envelope_replay::EnvelopeRejection,
+) -> ProcessingResult {
+    warn!(
+        from = ?message.from_did,
+        message_id = %message.didcomm_message_id,
+        message_type = %message.message_type,
+        "Refusing pairing envelope: {rejection}"
+    );
+    ProcessingResult::Failed {
+        reason: format!("Envelope refused: {rejection}"),
+    }
 }
 
 /// An identity presentation is attributed to the sending gateway only when its
@@ -4001,8 +3993,8 @@ async fn process_forward_request_with_mcp_runtime(
     if let Err(refused) = authorize_fabric_sender(message, channel_id, None).await {
         return refused;
     }
-    if let Err(refused) = admit_forward_request_envelope(message) {
-        return refused;
+    if let Err(rejection) = super::envelope_replay::admit_forward_request(message) {
+        return forward_request_envelope_refusal(message, rejection);
     }
 
     // Extract request details
@@ -10876,19 +10868,38 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
 
-        assert!(admit_forward_request_envelope(&msg).is_ok());
+        use crate::gateways::connection_points::envelope_replay::{EnvelopeRejection, admit_forward_request};
+
+        assert!(admit_forward_request(&msg).is_ok());
+        let duplicate = admit_forward_request(&msg).unwrap_err();
+        assert!(matches!(duplicate, EnvelopeRejection::Duplicate { .. }), "{duplicate}");
         assert!(
-            matches!(admit_forward_request_envelope(&msg), Err(ProcessingResult::ProcessedNoResponse)),
+            matches!(forward_request_envelope_refusal(&msg, duplicate), ProcessingResult::ProcessedNoResponse),
             "a duplicate must produce no ForwardResponse"
         );
 
         let mut expired = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
         expired.expires_time = Some(crate::gateways::connection_points::envelope_replay::now_secs() - 1);
-        match admit_forward_request_envelope(&expired) {
-            Err(ProcessingResult::RequiresResponse { response_body, .. }) => {
+        let rejection = admit_forward_request(&expired).unwrap_err();
+        assert!(matches!(rejection, EnvelopeRejection::Expired { .. }), "{rejection}");
+        match forward_request_envelope_refusal(&expired, rejection) {
+            ProcessingResult::RequiresResponse { response_body, .. } => {
                 assert_eq!(response_body["status"], 504, "{response_body}");
             }
             other => panic!("expected a 504 ForwardResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refused_pairing_envelope_fails_with_the_rejection() {
+        use crate::gateways::connection_points::envelope_replay::EnvelopeRejection;
+
+        let temp = tempfile::tempdir().unwrap();
+        let msg = make_forward_request_msg(temp.path(), Some("did:web:peer.example"), "surface-1");
+        let rejection = EnvelopeRejection::MissingExpiry;
+        match pairing_envelope_refusal(&msg, rejection.clone()) {
+            ProcessingResult::Failed { reason } => assert_eq!(reason, format!("Envelope refused: {rejection}")),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
@@ -11028,7 +11039,7 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(admit_forward_request_envelope(&fresh).is_ok());
+        assert!(crate::gateways::connection_points::envelope_replay::admit_forward_request(&fresh).is_ok());
         // A redelivery of an admitted request gets no reply at all.
         assert!(matches!(refusal(fresh).await, Some(ProcessingResult::ProcessedNoResponse)));
 
