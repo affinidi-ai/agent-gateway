@@ -1312,6 +1312,13 @@ select.dropdown-styling option {
   border-radius: var(--radius-sm);
 }
 
+/* The Identities table has ten columns: its cells use Bootstrap's own table-sm horizontal padding so the table fits its box at 1280px wide */
+.table-sm.identities-table > thead > tr > th,
+.table-sm.identities-table > tbody > tr > td {
+  padding-right: 0.25rem;
+  padding-left: 0.25rem;
+}
+
 /* Modern Buttons */
 .btn {
   font-weight: 600;

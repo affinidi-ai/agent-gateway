@@ -455,7 +455,7 @@ const IdentitiesPage: React.FC = () => {
                       </div>
                     ) : (
                       <div className="table-responsive">
-                        <table className="table table-hover table-sm">
+                        <table className="table table-hover table-sm identities-table">
                           <thead>
                             <tr>
                               <th>{hasNamingMetadata ? 'Identity' : 'DID'}</th>

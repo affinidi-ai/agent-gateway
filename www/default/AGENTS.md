@@ -551,6 +551,27 @@ room for its text.
   still sit on one line.
 - Do not truncate such a value to make it fit; wrap it.
 
+### Page headers and charts
+
+- **Tasks header**: the shared `.card-header.py-3` is a centred flex row, which would put the
+  tag filter row beside the title. The Tasks header adds `flex-column align-items-stretch`,
+  so the filter row sits under the title row and Refresh stays at the header's right end.
+  The shared rule is unchanged.
+- **Metrics flow chart labels**: node labels are at most 25 characters. A source, identity
+  or target label longer than that is cut to 22 characters plus `...` by `cutLabel` in
+  `MetricsFlowVisualization.tsx`, so a long DID cannot run across its neighbours or past the
+  chart edge; `Anonymous` is unchanged and the hover tooltip shows the full value.
+- **Identities table**: ten columns, so `.identities-table` (`dashboard.css`) keeps
+  Bootstrap's `table-sm` horizontal cell padding (0.25rem) instead of the 0.75rem of the
+  shared `.table-sm` rules. The table fits its box at 1280px wide with every row action
+  inside it; the DID keeps its title and copy button.
+- **Connection Points actions**: the row actions sit in a 6rem wide wrapping block (two
+  buttons per line) with no left margins, so the Actions column stays near 120px and the
+  Name and Mediator columns keep their room. Add a new row action inside that block.
+- **Credential Audit columns**: only Time, Event and the chevron column keep a fixed width.
+  Intent takes what its content needs, and its badge wraps (`text-wrap text-break`), so
+  Downstream Provider and Agent Surface keep room for their linked names.
+
 ## Validation
 
 After frontend edits, prefer these checks when relevant:

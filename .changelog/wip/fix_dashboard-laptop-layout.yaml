@@ -18,6 +18,16 @@ changes:
         now wrap inside their table cell instead of widening the column. The lists no longer
         scroll sideways on laptop screens, the Name and Description columns keep their
         width, and every row action stays on screen.
+    - timestamp: '2026-10-21T16:02:23Z'
+      title: Fit the Identities, Connection Points, Credential Audit, Metrics and Tasks pages on laptop screens
+      description: >-
+        The Identities table no longer scrolls sideways at 1280px wide, so every row action stays
+        reachable. Connection Points show their four actions in a compact block, and Credential
+        Audit gives its Downstream Provider and Agent Surface columns room, so names no longer
+        wrap into tall rows. A long identity in the Metrics flow chart is cut to 22 characters
+        plus "..." like the source and target labels, so it no longer runs over its neighbours;
+        hover shows the full identity. On Tasks the tag filter sits under the title and Refresh
+        stays at the right end of the header.
   removed: []
   security: []
   breaking: []

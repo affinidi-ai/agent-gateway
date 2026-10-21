@@ -195,7 +195,7 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
     const label = [method, tool].filter(Boolean).join(':');
     return (
       <span
-        className="badge text-bg-dark"
+        className="badge text-bg-dark text-wrap text-break"
         title={protocol ? `${protocol} → ${label}` : label}
         style={{ fontFamily: 'var(--bs-font-monospace)', fontSize: '0.7rem' }}
       >
@@ -593,7 +593,7 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
                   <tr>
                     <th style={{ width: '160px' }}>Time</th>
                     <th style={{ width: '130px' }}>Event</th>
-                    <th style={{ width: '180px' }}>Intent</th>
+                    <th>Intent</th>
                     <th>Caller Context</th>
                     <th>Downstream Provider</th>
                     <th>Agent Surface</th>

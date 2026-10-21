@@ -748,7 +748,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   e.stopPropagation();
                                   navigate('/connections?tab=mediators');
                                 }}
-                                className="p-0 align-baseline text-primary"
+                                className="p-0 align-baseline text-primary text-start"
                               >
                                 {mediator.name}
                               </AppButton>
@@ -787,7 +787,10 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                             )}
                           </td>
                           <td className="align-middle">
-                            <div className="d-flex flex-column flex-lg-row gap-2 align-items-start align-items-lg-center">
+                            <div
+                              className="d-flex flex-wrap gap-2 align-items-center"
+                              style={{ width: '6rem' }}
+                            >
                               {hasPermission('gateways.edit') && (
                                 <AppButton
                                   variant="outline-primary"
@@ -808,7 +811,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   <AppButton
                                     variant="outline-secondary"
                                     size="sm"
-                                    style={{ marginLeft: '10px' }}
                                     onClick={e =>
                                       handleReconnectConnectionPoint(connectionPoint.id, e)
                                     }
@@ -822,7 +824,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                               <AppButton
                                 variant="secondary"
                                 size="sm"
-                                style={{ marginLeft: '10px' }}
                                 onClick={() => handleCopyUrl(connectionPoint.oob_url)}
                                 title="Copy Connection Point Link"
                                 data-testid={`connection-points-copy-link-button-${connectionPoint.id}`}
@@ -834,7 +835,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                 <AppButton
                                   variant="secondary"
                                   size="sm"
-                                  style={{ marginLeft: '10px' }}
                                   onClick={() => handleCopySecret(connectionPoint.secret!)}
                                   title="Copy Connection Point Secret"
                                   data-testid={`connection-points-copy-secret-button-${connectionPoint.id}`}
@@ -849,7 +849,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   onDelete={() => handleDeleteConnectionPoint(connectionPoint.id)}
                                   className="btn-sm"
                                   title="Delete connection point"
-                                  style={{ marginLeft: '10px' }}
                                 />
                               )}
                             </div>
