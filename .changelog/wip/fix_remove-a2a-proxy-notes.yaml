@@ -1,0 +1,15 @@
+branch: fix/remove-a2a-proxy-notes
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-21T12:18:44Z'
+      title: Move the A2A proxy version notes to the A2A proxy's Agent Card tab
+      description: >-
+        The Managed Agent panel no longer shows the A2A version and identity notes when its
+        Target is an A2A proxy. The A2A proxy's Agent Card tab now explains that the exposing
+        surface's A2A settings are locked, with fixed versions, envelope-only validation and the
+        A2A-Version header callers must send.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

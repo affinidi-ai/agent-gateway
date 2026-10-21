@@ -30,6 +30,12 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ formData, onChange }) => {
           Callers using <code>message/send</code> get A2A 0.3 replies, and those using{' '}
           <code>SendMessage</code> get A2A 1.0 replies.
         </p>
+        <p data-testid="a2a-proxy-agent-card-locked">
+          That surface&apos;s A2A settings are locked: its versions are fixed, and only the JSON-RPC
+          envelope is checked, not the A2A message fields. On an A2A 1.0 surface, callers must send{' '}
+          <code>A2A-Version: 1.0</code>, and a request without it is refused. A surface created as
+          an A2A 0.3 proxy keeps accepting 0.3, and a request without the header is read as 0.3.
+        </p>
         <p className="mb-0">
           Leave the fields below blank to reuse the name and description of the Agent Surface that
           exposes this proxy.

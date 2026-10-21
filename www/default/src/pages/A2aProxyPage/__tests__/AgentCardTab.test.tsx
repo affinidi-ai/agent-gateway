@@ -25,4 +25,14 @@ describe('AgentCardTab A2A version note', () => {
     expect(note).toHaveTextContent('Callers using message/send get A2A 0.3 replies');
     expect(note).toHaveTextContent('those using SendMessage get A2A 1.0 replies');
   });
+
+  it('says the exposing surface has locked A2A settings', () => {
+    renderTab();
+
+    const note = screen.getByTestId('a2a-proxy-agent-card-locked');
+    expect(note).toHaveTextContent('its versions are fixed');
+    expect(note).toHaveTextContent('only the JSON-RPC envelope is checked');
+    expect(note).toHaveTextContent('callers must send A2A-Version: 1.0');
+    expect(note).toHaveTextContent('A surface created as an A2A 0.3 proxy keeps accepting 0.3');
+  });
 });

@@ -368,18 +368,14 @@ The hidden file input is `data-testid="restore-file-input"`.
   **JSON-RPC envelope**. If the base Target is a URL, the versions stay editable and
   `access-point-a2a-proxy-envelope-only` says that this Target checks only the envelope and takes
   the surface's versions.
-- When the Managed Agent element targets an A2A proxy, its panel shows
-  `managed-agent-a2a-proxy-protocol-hint`, built from the versions the gateway serves (those the
-  Access Point shows): a heading naming them (`managed-agent-a2a-proxy-versions`, such as "Accepts
-  A2A 1.0 only" or "Accepts A2A 0.3 and 1.0"); for an A2A proxy base Target that accepts 0.3, the
-  reason (`managed-agent-a2a-proxy-0-3-reason`: it was created as an A2A 0.3 proxy and keeps 0.3
-  for its existing callers, while new surfaces accept 1.0 only); then one short line each for the
-  header callers send, the reply per method (`SendMessage` 1.0, `message/send` 0.3), envelope-only
-  validation, and either that the versions are fixed (A2A proxy base Target) or that they are the
-  surface's, set in the Access Point (URL base Target).
+- When the Managed Agent element targets an A2A proxy, its panel shows only the A2A Proxy select;
+  the version and identity notes live on the A2A proxy's **Agent Card** tab.
 - The A2A proxy **Agent Card** tab (`a2a-proxy-agent-card-version`) states that the generated
   card lists the versions the exposing surface accepts (1.0 by default) and which reply each send
-  method gets. It does not follow `[a2a] default_version`.
+  method gets. It does not follow `[a2a] default_version`. Below it, `a2a-proxy-agent-card-locked`
+  says the exposing surface's A2A settings are locked: fixed versions, envelope-only validation,
+  `A2A-Version: 1.0` required on a 1.0 surface, and 0.3 kept (no header read as 0.3) on a surface
+  created as an A2A 0.3 proxy.
 
 ## Governance Audit integrations
 
