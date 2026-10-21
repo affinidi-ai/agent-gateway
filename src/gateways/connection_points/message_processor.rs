@@ -16,6 +16,9 @@ use crate::proxy::protocol_router::join_endpoint_path;
 use crate::surfaces::AgentSurfaceStore;
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
+mod forward_refusal;
+use forward_refusal::ForwardRefusal;
+
 /// Global metrics store for GW2 - set during initialization
 static GLOBAL_METRICS_STORE: OnceCell<Arc<crate::metrics::MetricsStore>> = OnceCell::const_new();
 
@@ -1879,8 +1882,12 @@ pub(crate) async fn forward_request_refusal_before_dispatch(
             response_body: serde_json::json!({ "error": "Missing channel_id in forward-request", "status": 400 }),
         });
     }
-    if let Err(refused) = authorize_fabric_sender(message, channel_id, gateways).await {
-        return Some(refused);
+    if let Err(refusal) = authorize_fabric_sender(message, channel_id, gateways).await {
+        return Some(
+            refusal
+                .into_forward_response(&[])
+                .await,
+        );
     }
     super::envelope_replay::check_forward_request(message)
         .err()
@@ -2382,7 +2389,7 @@ async fn evaluate_gateway_policy_for_fabric(
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
     source_auth_context: Option<&crate::surface_context::SourceAuthContext>,
     mcp_context: Option<&crate::surface_context::McpContext>,
-) -> Result<(), ProcessingResult> {
+) -> Result<(), ForwardRefusal> {
     // Appliance-wide (global) gateway policy — enforced deny-overrides ahead of
     // the per-gateway policy, evaluated on every fabric request (public
     // discovery reads included, as on the direct path) regardless of the
@@ -2431,14 +2438,7 @@ async fn evaluate_gateway_policy_for_fabric(
         });
         if !gd.allow {
             info!(channel = config_id, "[GW-POLICY] GW2 fabric path: blocked by appliance-wide gateway policy");
-            return Err(ProcessingResult::RequiresResponse {
-                response_type: MessageType::ForwardResponse.to_string(),
-                response_body: serde_json::json!({
-                    "status": 403,
-                    "body": r#"{"error":"Forbidden","message":"Request blocked by appliance-wide policy"}"#,
-                    "error": "Request blocked by appliance-wide policy",
-                }),
-            });
+            return Err(ForwardRefusal::AppliancePolicyDenied);
         }
     }
 
@@ -2523,14 +2523,7 @@ async fn evaluate_gateway_policy_for_fabric(
                     policy_content_hash: gw_policy_hash.as_deref(),
                     ..Default::default()
                 });
-                return Err(ProcessingResult::RequiresResponse {
-                    response_type: MessageType::ForwardResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "status": 403,
-                        "body": r#"{"error":"Forbidden","message":"Request blocked by gateway policy"}"#,
-                        "error": "Request blocked by gateway policy",
-                    }),
-                });
+                return Err(ForwardRefusal::GatewayPolicyDenied);
             }
             Err(e) => {
                 info!(channel = config_id, "[GW-POLICY] GW2: gateway-level policy evaluation error (denying): {}", e);
@@ -2604,7 +2597,7 @@ fn fabric_surface_policies(
 
 /// Injects custom metadata and trust registry extensions into the request body,
 /// then evaluates surface-level OPA policies. Returns the (potentially modified)
-/// body bytes on allow, or a deny `ProcessingResult`.
+/// body bytes on allow, or why the request was refused.
 async fn enrich_and_evaluate_surface_policies(
     appliance_policy: Option<&crate::policies::GlobalPolicyManager>,
     surface_policy: Option<&crate::policies::SurfacePolicyManager>,
@@ -2613,7 +2606,7 @@ async fn enrich_and_evaluate_surface_policies(
     config_id: &str,
     method: &str,
     path: &str,
-    body_bytes: bytes::Bytes,
+    original_caller_body: &bytes::Bytes,
     headers: Option<&serde_json::Map<String, Value>>,
     from_did: Option<String>,
     payment_context: Option<crate::surface_context::PaymentContext>,
@@ -2627,21 +2620,21 @@ async fn enrich_and_evaluate_surface_policies(
     mcp_binding: Option<&crate::surface_context::IdentityBindingContext>,
     peer_issuers: &crate::gateways::types::PeerIssuers,
     mcp_context: Option<&crate::surface_context::McpContext>,
-) -> Result<bytes::Bytes, ProcessingResult> {
-    let mut body_bytes = body_bytes;
+) -> Result<bytes::Bytes, ForwardRefusal> {
     // Caller-leg Trust Check stage runs further down (post-identity);
     // gateway OPA on GW2 already ran in `evaluate_gateway_policy_for_fabric`
     // and never sees caller-leg results.
     let mut trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext> = None;
 
-    // Snapshot the caller's ORIGINAL body bytes before any GW2-side mutation
-    // (custom metadata / trust-registry injection below). The caller-leg agent
-    // context (esp. `provider_did`) is extracted from the caller's
-    // trust-registry extension in `metadata`, which a later GW2 injection could
-    // overwrite — so the caller Trust Check seam parses these pre-injection
-    // bytes. `Bytes::clone` is a cheap refcount bump. Mirrors the direct-inbound
-    // path, which builds the caller agent context from the pre-injection body.
-    let original_caller_body = body_bytes.clone();
+    // `original_caller_body` stays the caller's ORIGINAL body; GW2-side
+    // mutation (custom metadata / trust-registry injection below) works on this
+    // copy. The caller-leg agent context (esp. `provider_did`) is extracted from
+    // the caller's trust-registry extension in `metadata`, which a later GW2
+    // injection could overwrite — so the caller Trust Check seam parses the
+    // pre-injection bytes. `Bytes::clone` is a cheap refcount bump. Mirrors the
+    // direct-inbound path, which builds the caller agent context from the
+    // pre-injection body.
+    let mut body_bytes = original_caller_body.clone();
 
     // Inject custom metadata if enabled on THIS gateway (GW2)
     if let Some(custom_metadata) = surface.custom_metadata()
@@ -2737,7 +2730,7 @@ async fn enrich_and_evaluate_surface_policies(
             if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
                 probe_input.mcp = mcp_context
                     .cloned()
-                    .or_else(|| crate::mcp::build_mcp_context(&original_caller_body));
+                    .or_else(|| crate::mcp::build_mcp_context(original_caller_body));
             }
             // Populate `input.agent` for caller-leg templates (esp.
             // `{{ input.agent.provider_did }}`). `provider_did`/`authority_did`
@@ -2747,7 +2740,7 @@ async fn enrich_and_evaluate_surface_policies(
             // fabric-receive path left `input.agent` empty and every
             // provider_did template failed with TEMPLATE_RESOLUTION_FAILED,
             // while the direct-inbound path worked (it sets `probe_input.agent`).
-            let caller_body_json: Option<serde_json::Value> = serde_json::from_slice(&original_caller_body).ok();
+            let caller_body_json: Option<serde_json::Value> = serde_json::from_slice(original_caller_body).ok();
             probe_input.agent = Some(
                 crate::policies::build_agent_context_for_protocol(
                     surface.channel_protocol(),
@@ -3024,7 +3017,7 @@ async fn enrich_and_evaluate_surface_policies(
                         .map(Arc::new)
                 });
             let binding_result = crate::protocols::extensions::extract_identity_binding_vp(
-                &original_caller_body,
+                original_caller_body,
                 &surface.channel_protocol(),
                 &binding_selector,
                 config_id,
@@ -3052,7 +3045,7 @@ async fn enrich_and_evaluate_surface_policies(
             if let Ok(Some(ref binding)) = binding_result
                 && crate::delegation_vault::audit::identity_binding_vp_audit_enabled()
                 && let Some(vp_jwt) = crate::protocols::extensions::extract_identity_binding_vp_jwt(
-                    &original_caller_body,
+                    original_caller_body,
                     &surface.channel_protocol(),
                 )
             {
@@ -3161,10 +3154,7 @@ async fn enrich_and_evaluate_surface_policies(
             });
             if !gd.allow {
                 channel_info!(config_id, "GW2: blocked by appliance-wide surface policy");
-                return Err(ProcessingResult::RequiresResponse {
-                    response_type: MessageType::ForwardResponse.to_string(),
-                    response_body: build_surface_policy_denied_forward_body(&body_bytes, gd.reason.as_deref()),
-                });
+                return Err(ForwardRefusal::SurfacePolicyDenied { reason: gd.reason });
             }
         }
 
@@ -3173,7 +3163,6 @@ async fn enrich_and_evaluate_surface_policies(
         if let Some(Err(error)) = policies.surface {
             channel_warn!(config_id, "GW2: OPA is enabled but no compiled policy can run — denying request");
             return Err(fabric_surface_policy_error(
-                &body_bytes,
                 error,
                 crate::observability::PolicyDecisionEvent {
                     scope: crate::observability::PolicyScope::Surface,
@@ -3234,18 +3223,13 @@ async fn enrich_and_evaluate_surface_policies(
                         policy_content_hash: channel_opa_hash.as_deref(),
                         ..Default::default()
                     });
-                    return Err(ProcessingResult::RequiresResponse {
-                        response_type: MessageType::ForwardResponse.to_string(),
-                        response_body: build_surface_policy_denied_forward_body(
-                            &body_bytes,
-                            decision.reason.as_deref(),
-                        ),
+                    return Err(ForwardRefusal::SurfacePolicyDenied {
+                        reason: decision.reason,
                     });
                 }
                 Err(e) => {
                     channel_warn!(config_id, "GW2: Surface-level OPA policy evaluation error (denying request): {}", e);
                     return Err(fabric_surface_policy_error(
-                        &body_bytes,
                         crate::observability::PolicyEvaluationError::EvaluationError,
                         crate::observability::PolicyDecisionEvent {
                             scope: crate::observability::PolicyScope::Surface,
@@ -3309,15 +3293,16 @@ where
 /// Buffer a legacy Target response for the ForwardResponse, bounded by size and
 /// idle time like the direct path; the forward client's own timeout still caps
 /// the whole exchange. An SSE response is reduced to its final JSON-RPC
-/// response. A failed read answers `502`/`504` rather than passing the Target's
-/// status on with an empty body.
+/// response. A failed read is refused with `ForwardRefusal::TargetBody`, which
+/// answers `502`/`504` rather than passing the Target's status on with an
+/// empty body.
 async fn read_forward_target_body(
     response: reqwest::Response,
     is_sse_response: bool,
     request: &[u8],
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
     config_id: &str,
-) -> Result<String, ProcessingResult> {
+) -> Result<String, crate::proxy::upstream_body::UpstreamBodyError> {
     let body_error = if is_sse_response {
         channel_info!(config_id, "GW2: Upstream responded with SSE — consuming stream for final response");
         match crate::mcp::sse_transport::consume_sse_response(response, request, limits).await {
@@ -3335,8 +3320,7 @@ async fn read_forward_target_body(
         }
     };
     channel_warn!(config_id, "GW2: Failed to read upstream response: {}", body_error);
-    let (status, message) = body_error.status_and_message();
-    Err(axum_response_to_forward_result(crate::a2a::create_error_response(status, message)).await)
+    Err(body_error)
 }
 
 async fn axum_response_to_forward_result(response: axum::http::Response<axum::body::Body>) -> ProcessingResult {
@@ -3563,20 +3547,10 @@ async fn authorize_fabric_sender(
     message: &ReceivedMessage,
     channel_id: &str,
     gateways: Option<&crate::gateways::FileSystemGatewayStore>,
-) -> Result<(), ProcessingResult> {
-    let refuse = |error: &str| ProcessingResult::RequiresResponse {
-        response_type: MessageType::ForwardResponse.to_string(),
-        response_body: serde_json::json!({
-            "status": 403,
-            "body": serde_json::json!({ "error": "Forbidden", "message": error }).to_string(),
-            "error": error,
-        }),
-    };
-    const UNREGISTERED: &str = "Sender is not a registered gateway";
-
+) -> Result<(), ForwardRefusal> {
     let Some(from_did) = message.from_did.as_deref() else {
         warn!("Refusing forward-request without a sender DID");
-        return Err(refuse(UNREGISTERED));
+        return Err(ForwardRefusal::UnregisteredSender);
     };
     let lookup = if let Some(gateways) = gateways {
         gateways
@@ -3591,7 +3565,7 @@ async fn authorize_fabric_sender(
             }
             Err(e) => {
                 warn!("Refusing forward-request from {}: {}", from_did, e);
-                return Err(refuse(UNREGISTERED));
+                return Err(ForwardRefusal::UnregisteredSender);
             }
         }
     };
@@ -3602,7 +3576,7 @@ async fn authorize_fabric_sender(
                     "Refusing forward-request from gateway {} ({}): channel {} is not exposed to it",
                     gateway.id, from_did, channel_id
                 );
-                return Err(refuse("Channel is not exposed to sender"));
+                return Err(ForwardRefusal::ChannelNotExposed);
             }
             // A tenant-owned peer must not reach another tenant's surface, even
             // in `all` mode. A surface that
@@ -3622,7 +3596,7 @@ async fn authorize_fabric_sender(
                         "Refusing forward-request from gateway {} ({}): channel {} belongs to another tenant",
                         gateway.id, from_did, channel_id
                     );
-                    return Err(refuse("Channel is not exposed to sender"));
+                    return Err(ForwardRefusal::ChannelNotExposed);
                 }
             }
             Ok(())
@@ -3632,15 +3606,15 @@ async fn authorize_fabric_sender(
                 "Refusing forward-request from gateway {} ({}): status is {:?}, not active",
                 gateway.id, from_did, gateway.status
             );
-            Err(refuse(UNREGISTERED))
+            Err(ForwardRefusal::UnregisteredSender)
         }
         Ok(None) => {
             warn!("Refusing forward-request from unregistered sender {}", from_did);
-            Err(refuse(UNREGISTERED))
+            Err(ForwardRefusal::UnregisteredSender)
         }
         Err(e) => {
             warn!("Refusing forward-request from {}: gateway lookup failed: {}", from_did, e);
-            Err(refuse(UNREGISTERED))
+            Err(ForwardRefusal::UnregisteredSender)
         }
     }
 }
@@ -3990,8 +3964,10 @@ async fn process_forward_request_with_mcp_runtime(
         };
     }
 
-    if let Err(refused) = authorize_fabric_sender(message, channel_id, None).await {
-        return refused;
+    if let Err(refusal) = authorize_fabric_sender(message, channel_id, None).await {
+        return refusal
+            .into_forward_response(&[])
+            .await;
     }
     if let Err(rejection) = super::envelope_replay::admit_forward_request(message) {
         return forward_request_envelope_refusal(message, rejection);
@@ -4623,7 +4599,7 @@ async fn process_forward_request_with_mcp_runtime(
         }
     }
 
-    if let Err(result) = evaluate_gateway_policy_for_fabric(
+    if let Err(refusal) = evaluate_gateway_policy_for_fabric(
         GLOBAL_APPLIANCE_POLICY_MANAGER
             .get()
             .map(Arc::as_ref),
@@ -4639,7 +4615,9 @@ async fn process_forward_request_with_mcp_runtime(
     )
     .await
     {
-        return result;
+        return refusal
+            .into_forward_response(&body_bytes)
+            .await;
     }
 
     let payment_context = if modern_request.is_some() { None } else { match Box::pin(verify_payment_fabric(
@@ -4753,7 +4731,7 @@ async fn process_forward_request_with_mcp_runtime(
         config_id,
         method,
         path,
-        body_bytes,
+        &body_bytes,
         headers.as_ref(),
         message.from_did.clone(),
         payment_context.clone(),
@@ -4771,7 +4749,13 @@ async fn process_forward_request_with_mcp_runtime(
     .await
     {
         Ok(bytes) => bytes,
-        Err(result) => return result,
+        // Enrichment adds metadata only, so the caller's request carries the
+        // JSON-RPC id and tool name a denial answers with.
+        Err(refusal) => {
+            return refusal
+                .into_forward_response(&body_bytes)
+                .await;
+        }
     };
 
     // MCP Tool Gating — G2G `tools/call` gate. Runs after the surface OPA gate
@@ -5857,7 +5841,7 @@ async fn process_forward_request_with_mcp_runtime(
             } else {
                 match read_forward_target_body(response, is_sse_response, &body_bytes, fabric_body_limits(&surface), config_id).await {
                     Ok(body) => (None, body),
-                    Err(result) => return result,
+                    Err(error) => return ForwardRefusal::from(error).into_forward_response(&body_bytes).await,
                 }
             };
             let channel_id_owned = channel_id.to_string();
@@ -7524,36 +7508,25 @@ fn filter_mcp_tools_list_for_fabric(
 
 /// The gateway policy could not decide: record the `error` decision and
 /// block. The engine's error text is logged by the caller, never sent back.
-fn fabric_gateway_policy_error(event: crate::observability::PolicyDecisionEvent<'_>) -> ProcessingResult {
+fn fabric_gateway_policy_error(event: crate::observability::PolicyDecisionEvent<'_>) -> ForwardRefusal {
     crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
         ..event
     });
-    ProcessingResult::RequiresResponse {
-        response_type: MessageType::ForwardResponse.to_string(),
-        response_body: serde_json::json!({
-            "status": 403,
-            "body": r#"{"error":"Forbidden","message":"Request blocked by gateway policy"}"#,
-            "error": "Request blocked by gateway policy",
-        }),
-    }
+    ForwardRefusal::GatewayPolicyError
 }
 
 /// The surface policy could not run or decide: record the `error` decision
 /// and send the generic denial. Any engine error text is logged by the caller.
 fn fabric_surface_policy_error(
-    body_bytes: &[u8],
     error: crate::observability::PolicyEvaluationError,
     event: crate::observability::PolicyDecisionEvent<'_>,
-) -> ProcessingResult {
+) -> ForwardRefusal {
     crate::observability::record_policy_decision(crate::observability::PolicyDecisionEvent {
         error: Some(error),
         ..event
     });
-    ProcessingResult::RequiresResponse {
-        response_type: MessageType::ForwardResponse.to_string(),
-        response_body: build_surface_policy_denied_forward_body(body_bytes, None),
-    }
+    ForwardRefusal::SurfacePolicyError
 }
 
 /// An MCP tool policy could not run or decide: record the `error` decision
@@ -9434,7 +9407,7 @@ mod tests {
         })
         .await;
         assert_error_decision(&decisions, "gateway", "evaluation_error");
-        assert!(forward_response_body(&result).contains("Request blocked by gateway policy"));
+        assert!(matches!(result, ForwardRefusal::GatewayPolicyError), "{result:?}");
     }
 
     #[tokio::test]
@@ -9442,7 +9415,6 @@ mod tests {
         let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"message/send"}"#);
         let (result, decisions) = collect_policy_decisions(|| {
             fabric_surface_policy_error(
-                &body,
                 crate::observability::PolicyEvaluationError::EvaluationError,
                 crate::observability::PolicyDecisionEvent {
                     scope: crate::observability::PolicyScope::Surface,
@@ -9452,17 +9424,20 @@ mod tests {
         })
         .await;
         assert_error_decision(&decisions, "surface", "evaluation_error");
-        let response = forward_response_body(&result);
+        assert!(matches!(result, ForwardRefusal::SurfacePolicyError), "{result:?}");
+        let response = forward_response_body(
+            &result
+                .into_forward_response(&body)
+                .await,
+        );
         assert!(response.contains("Agent trust policy denied the request"));
         assert!(!response.contains("evaluation error"), "no engine detail for the caller: {response}");
     }
 
     #[tokio::test]
     async fn fabric_surface_policy_error_records_why_the_policy_could_not_run() {
-        let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"message/send"}"#);
         let (_, decisions) = collect_policy_decisions(|| {
             fabric_surface_policy_error(
-                &body,
                 crate::observability::PolicyEvaluationError::PolicyNotCompiled,
                 crate::observability::PolicyDecisionEvent {
                     scope: crate::observability::PolicyScope::Surface,
@@ -9590,7 +9565,7 @@ mod tests {
             "gated",
             "POST",
             "/rpc",
-            bytes::Bytes::from_static(GATED_BODY),
+            &bytes::Bytes::from_static(GATED_BODY),
             None,
             Some("did:web:peer.example".into()),
             None,
@@ -9613,6 +9588,12 @@ mod tests {
                 matches!(event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
             })
             .collect();
+        let result = match result {
+            Ok(bytes) => Ok(bytes),
+            Err(refusal) => Err(refusal
+                .into_forward_response(GATED_BODY)
+                .await),
+        };
         (result, decisions)
     }
 
@@ -10630,9 +10611,19 @@ mod tests {
         );
     }
 
-    fn forward_error_of(result: Result<String, ProcessingResult>) -> (u64, String) {
-        match result {
-            Err(ProcessingResult::RequiresResponse { response_type, response_body }) => {
+    /// The forward-response a failed Target body read answers with.
+    async fn forward_error_of(
+        result: Result<String, crate::proxy::upstream_body::UpstreamBodyError>
+    ) -> (u64, String) {
+        let error = match result {
+            Ok(body) => panic!("expected a failed read, got {body:?}"),
+            Err(error) => error,
+        };
+        match ForwardRefusal::from(error)
+            .into_forward_response(b"")
+            .await
+        {
+            ProcessingResult::RequiresResponse { response_type, response_body } => {
                 assert_eq!(response_type, MessageType::ForwardResponse.to_string());
                 (
                     response_body["status"]
@@ -10680,7 +10671,7 @@ mod tests {
         let result =
             read_forward_target_body(response, false, b"", limits(100, Some(PATIENT), PATIENT), "surface-1").await;
 
-        let (status, body) = forward_error_of(result);
+        let (status, body) = forward_error_of(result).await;
         assert_eq!(status, 502);
         assert!(body.contains("Upstream response too large"), "{body}");
     }
@@ -10700,7 +10691,7 @@ mod tests {
         )
         .await;
 
-        let (status, body) = forward_error_of(result);
+        let (status, body) = forward_error_of(result).await;
         assert_eq!(status, 504);
         assert!(body.contains("Upstream response timed out"), "{body}");
     }
@@ -10725,7 +10716,7 @@ mod tests {
         let result =
             read_forward_target_body(response, true, b"", limits(event.len(), Some(PATIENT), PATIENT), "surface-1")
                 .await;
-        let (status, body) = forward_error_of(result);
+        let (status, body) = forward_error_of(result).await;
         assert_eq!(status, 502);
         assert!(body.contains("Upstream response too large"), "{body}");
     }
@@ -10946,12 +10937,10 @@ mod tests {
                 None,
             )
             .await;
-            match result {
-                Err(ProcessingResult::RequiresResponse { response_body, .. }) => {
-                    assert_eq!(response_body["status"], 403, "{method} {path}")
-                }
-                other => panic!("{method} {path}: expected the appliance-wide deny, got {other:?}"),
-            }
+            assert!(
+                matches!(result, Err(ForwardRefusal::AppliancePolicyDenied)),
+                "{method} {path}: expected the appliance-wide deny, got {result:?}"
+            );
         }
     }
 
@@ -11201,12 +11190,8 @@ mod tests {
             let message = make_forward_request_msg(temp.path(), Some(did), channel);
             match authorize_fabric_sender(&message, channel, None).await {
                 Ok(()) => assert!(admitted, "{did} reached {channel}"),
-                Err(ProcessingResult::RequiresResponse { response_body, .. }) => {
-                    assert!(!admitted, "{did} was refused {channel}: {response_body}");
-                    assert_eq!(response_body["status"], 403);
-                    assert_eq!(response_body["error"], "Channel is not exposed to sender");
-                }
-                Err(other) => panic!("expected a 403 ForwardResponse, got {other:?}"),
+                Err(ForwardRefusal::ChannelNotExposed) => assert!(!admitted, "{did} was refused {channel}"),
+                Err(other) => panic!("expected ChannelNotExposed, got {other:?}"),
             }
         }
 
