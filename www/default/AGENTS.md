@@ -447,9 +447,13 @@ identities: an integration receives every event of its event set, from every res
 - `-stored-secret-select` picks an appliance-wide secret instead (`hooks/useApplianceSecrets.ts`),
   saved as `$SECRET:<secret_id>`. Webhook headers have no picker, because only header values
   resolve references; they are written inside the JSON.
-- `buildConfiguration` leaves kept secrets out, so the gateway keeps them, and sends a cleared
-  one as `null`. It also sends `null` for a stored secret the form now hides, such as the SASL
-  password once SASL is switched off, so no unseen credential stays stored.
+- A stored reference counts as a stored secret (`form.stored`, not the endpoint's `secrets`
+  list, which leaves references out), so it also gets Keep and, when optional, Clear.
+- `buildConfiguration` leaves kept secrets out, so the gateway keeps them. On an update it sends
+  `null` for a stored secret that is cleared or left empty, such as a reference set to "None, type
+  a value", since the gateway keeps one that is left out. It also sends `null` for a stored secret
+  the form now hides, such as the SASL password once SASL is switched off, so no unseen credential
+  stays stored.
 
 ### Event set editor
 
