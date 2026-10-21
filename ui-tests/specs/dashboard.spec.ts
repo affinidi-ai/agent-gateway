@@ -33,6 +33,10 @@ test.describe('Dashboard', () => {
     });
 
     test('loads without console errors or failed network requests', async ({page}) => {
+        // Let the first load's requests finish, so the reload below does not
+        // abort them and only the reloaded page is checked.
+        await page.waitForLoadState('networkidle');
+
         const consoleErrors: string[] = [];
         const failedRequests: string[] = [];
 

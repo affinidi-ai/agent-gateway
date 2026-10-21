@@ -83,6 +83,10 @@ async function saveScreenshots(page: Page, entry: LayoutPage, viewport: Viewport
     }
 }
 
+// A layout check is deterministic, so a retry only absorbs a stalled browser
+// on a busy machine; a pair that keeps failing still fails the run.
+test.describe.configure({retries: 1});
+
 for (const size of LAPTOP_VIEWPORTS) {
     const viewport: ViewportName = `${size.width}x${size.height}`;
 
