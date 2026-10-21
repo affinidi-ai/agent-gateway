@@ -36,9 +36,18 @@ export async function expectNoSidewaysScroll(page: Page): Promise<void> {
  */
 export async function expectNoTableSidewaysScroll(page: Page): Promise<void> {
     const wide = await page.evaluate(tolerance => {
+        // List tables carry no test id of their own, so name the nearest ancestor that has one,
+        // the table's position among that ancestor's tables and its column headers.
         const describe = (node: Element) => {
-            const owner = node.closest('[data-testid]') ?? node.querySelector('[data-testid]');
-            return owner ? `[data-testid="${owner.getAttribute('data-testid')}"]` : 'a .table-responsive without a test id';
+            const owner = node.closest('[data-testid]');
+            const scope = owner ? `[data-testid="${owner.getAttribute('data-testid')}"]` : 'a .table-responsive without a test id';
+            const siblings = owner === node ? [node] : Array.from((owner ?? document).querySelectorAll('.table-responsive'));
+            const columns = Array.from(node.querySelectorAll('thead th'))
+                .map(th => th.textContent?.trim())
+                .filter(Boolean)
+                .slice(0, 4)
+                .join(', ');
+            return `table ${siblings.indexOf(node) + 1} of ${siblings.length} in ${scope} (columns: ${columns || 'none'})`;
         };
         return Array.from(document.querySelectorAll('.table-responsive'))
             .filter(box => box.scrollWidth > box.clientWidth + tolerance)
