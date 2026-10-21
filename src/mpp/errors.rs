@@ -119,31 +119,47 @@ fn configuration_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Payment configuration error").into_response()
 }
 
-/// Add MPP WWW-Authenticate challenge headers to an existing 402 response.
+/// The MPP challenges offered next to x402's in a combined 402.
 ///
-/// Used to create combined x402+MPP 402 responses when both payment protocols
-/// are enabled. The x402 body and headers are preserved; MPP challenge headers
-/// are appended so clients can choose either protocol.
-pub fn add_mpp_challenges_to_response(
-    response: Response,
+/// `config`'s `$SECRET:` references are resolved first: each challenge's HMAC
+/// is signed with `config.secret_key` as given, so an unresolved
+/// `$SECRET:<id>` would be misread as a literal (or `$ENV_VAR`) value and
+/// produce a challenge verification can never accept. None are offered when
+/// the secrets cannot be resolved or the challenges generated.
+pub async fn combined_challenges(
     config: &MppConfig,
     resource_url: &str,
-) -> Response {
-    let challenges = match generate_challenges(config, resource_url) {
-        Ok(c) => c,
+    secrets_store: &Option<std::sync::Arc<dyn crate::secrets::SecretsStore>>,
+) -> Vec<MppChallenge> {
+    let resolved = match super::secrets::resolve_config_secrets(config, secrets_store).await {
+        Ok(resolved) => resolved,
         Err(e) => {
-            tracing::warn!("[mpp] Failed to generate combined challenges: {}", e);
-            return response;
+            tracing::error!("[mpp] Failed to resolve config secrets for combined challenge: {}", e);
+            return Vec::new();
         }
     };
+    generate_challenges(&resolved, resource_url).unwrap_or_else(|e| {
+        tracing::warn!("[mpp] Failed to generate combined challenges: {}", e);
+        Vec::new()
+    })
+}
 
+/// Add MPP WWW-Authenticate challenge headers to another protocol's 402.
+///
+/// Used for combined x402+MPP 402 responses when both payment protocols are
+/// enabled. The x402 body and headers are preserved; MPP challenge headers
+/// are appended so clients can choose either protocol.
+pub fn append_challenges(
+    response: Response,
+    challenges: &[MppChallenge],
+) -> Response {
     if challenges.is_empty() {
         return response;
     }
 
     let (mut parts, body) = response.into_parts();
 
-    for challenge in &challenges {
+    for challenge in challenges {
         let header_value = format_www_authenticate(challenge);
         if let Ok(hv) = axum::http::HeaderValue::from_str(&header_value) {
             parts
@@ -164,30 +180,6 @@ pub fn add_mpp_challenges_to_response(
     }
 
     Response::from_parts(parts, body)
-}
-
-/// Resolve `config`'s `$SECRET:` references, then add MPP WWW-Authenticate
-/// challenge headers to an existing 402 response.
-///
-/// Every combined x402+MPP challenge path must go through this instead of
-/// `add_mpp_challenges_to_response` directly: that function signs each
-/// challenge's HMAC with `config.secret_key` as given, so an unresolved
-/// `$SECRET:<id>` reference is misread as a literal (or `$ENV_VAR`) value and
-/// produces a challenge signed with an empty/wrong key that verification can
-/// never accept.
-pub async fn add_mpp_challenges_to_response_resolved(
-    response: Response,
-    config: &MppConfig,
-    resource_url: &str,
-    secrets_store: &Option<std::sync::Arc<dyn crate::secrets::SecretsStore>>,
-) -> Response {
-    match super::secrets::resolve_config_secrets(config, secrets_store).await {
-        Ok(resolved) => add_mpp_challenges_to_response(response, &resolved, resource_url),
-        Err(e) => {
-            tracing::error!("[mpp] Failed to resolve config secrets for combined challenge: {}", e);
-            response
-        }
-    }
 }
 
 #[cfg(test)]
@@ -332,7 +324,7 @@ mod tests {
             .body(Body::from(x402_body))
             .unwrap();
 
-        let combined = add_mpp_challenges_to_response(x402_response, &config, "/test");
+        let combined = append_challenges(x402_response, &combined_challenges(&config, "/test", &None).await);
 
         // Status should be 402
         assert_eq!(combined.status(), StatusCode::PAYMENT_REQUIRED);
@@ -388,7 +380,7 @@ mod tests {
             .body(Body::from("test"))
             .unwrap();
 
-        let combined = add_mpp_challenges_to_response(response, &config, "/test");
+        let combined = append_challenges(response, &combined_challenges(&config, "/test", &None).await);
 
         // Existing Cache-Control should be preserved (not overwritten)
         let cache = combined

@@ -382,17 +382,24 @@ pub async fn process_payment(
                 }
             }
         }
-        None => {
-            let challenge = PaymentChallenge {
-                resource_url: resource_url.to_string(),
-                accepts: issued_payment_requirements(config).await,
-            };
-
-            emit_challenge_issued_audit(channel_name, channel_id);
-
-            Err(PaymentError::Required(challenge))
-        }
+        None => Err(PaymentError::Required(challenge(config, channel_name, channel_id, resource_url).await)),
     }
+}
+
+/// The challenge for a request that presented no signature, recording that
+/// it was issued.
+pub async fn challenge(
+    config: &X402Config,
+    channel_name: &str,
+    channel_id: &str,
+    resource_url: &str,
+) -> PaymentChallenge {
+    let challenge = PaymentChallenge {
+        resource_url: resource_url.to_string(),
+        accepts: issued_payment_requirements(config).await,
+    };
+    emit_challenge_issued_audit(channel_name, channel_id);
+    challenge
 }
 
 /// Lowercase the asset and recipient of an EVM (`eip155:*`) requirement; EVM hex addresses are

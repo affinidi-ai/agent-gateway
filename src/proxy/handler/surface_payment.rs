@@ -442,7 +442,28 @@ pub(super) async fn process(
 ) -> Result<SurfacePayment, Response> {
     process_local(
         &state.surface,
-        LocalPaymentServices {
+        LocalPaymentServices::of(state).await,
+        headers,
+        body,
+        mcp_context,
+        resource_url,
+        evidence,
+    )
+    .await
+    .map_err(|error| error.render(&state.config.x402_headers))
+}
+
+pub(crate) struct LocalPaymentServices<'services> {
+    pub x402_headers: &'services crate::config::types::X402Headers,
+    pub listener_manager: Option<std::sync::Arc<crate::gateways::ConnectionPointListenerManager>>,
+    pub transaction_store: Option<std::sync::Arc<crate::x402::TransactionStore>>,
+    pub mpp_transaction_store: Option<std::sync::Arc<crate::mpp::transaction_store::MppTransactionStore>>,
+    pub secrets_store: &'services Option<std::sync::Arc<dyn crate::secrets::SecretsStore>>,
+}
+
+impl<'services> LocalPaymentServices<'services> {
+    pub(super) async fn of(state: &'services ProxyState) -> Self {
+        Self {
             x402_headers: &state.config.x402_headers,
             listener_manager: state
                 .listener_manager
@@ -456,22 +477,98 @@ pub(super) async fn process(
                 .mpp_transaction_store
                 .clone(),
             secrets_store: &state.secrets_store,
-        },
-        headers,
-        body,
-        mcp_context,
-        resource_url,
-        evidence,
-    )
-    .await
+        }
+    }
 }
 
-pub(crate) struct LocalPaymentServices<'services> {
-    pub x402_headers: &'services crate::config::types::X402Headers,
-    pub listener_manager: Option<std::sync::Arc<crate::gateways::ConnectionPointListenerManager>>,
-    pub transaction_store: Option<std::sync::Arc<crate::x402::TransactionStore>>,
-    pub mpp_transaction_store: Option<std::sync::Arc<crate::mpp::transaction_store::MppTransactionStore>>,
-    pub secrets_store: &'services Option<std::sync::Arc<dyn crate::secrets::SecretsStore>>,
+/// Why a surface's local payment gate did not grant the request.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SurfacePaymentError {
+    #[error(transparent)]
+    X402(#[from] crate::x402::PaymentError),
+    #[error(transparent)]
+    Mpp(#[from] crate::mpp::PaymentError),
+    /// Both rails are offered: x402's challenge, plus MPP's when they could be
+    /// issued.
+    #[error("payment required")]
+    Required {
+        x402: crate::x402::PaymentChallenge,
+        mpp: Vec<crate::mpp::MppChallenge>,
+    },
+    #[error("Payment continuation unavailable")]
+    ContinuationUnavailable,
+    #[error("Payment continuation expired or invalid")]
+    ContinuationInvalid,
+    #[error("Payment continuation does not match this paywall")]
+    ContinuationMismatch,
+}
+
+impl SurfacePaymentError {
+    /// The HTTP answer; an x402 challenge goes in `x402_headers`'
+    /// payment-required header.
+    pub(crate) fn render(
+        self,
+        x402_headers: &crate::config::types::X402Headers,
+    ) -> Response {
+        use axum::http::StatusCode;
+
+        let status = match self {
+            Self::X402(error) => return error.render(x402_headers),
+            Self::Mpp(error) => return error.into_response(),
+            Self::Required { x402, mpp } => {
+                return crate::mpp::append_challenges(x402.render(&x402_headers.payment_required), &mpp);
+            }
+            Self::ContinuationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ContinuationInvalid | Self::ContinuationMismatch => StatusCode::FORBIDDEN,
+        };
+        crate::a2a::create_error_response(status, &self.to_string())
+    }
+}
+
+/// The refusal for a request that presented no payment credential: x402's
+/// challenge, plus MPP's when both rails are offered, or MPP's alone. Each
+/// challenge is recorded as issued. `None` when no rail is offered, so there
+/// is nothing to pay.
+pub(crate) async fn payment_required(
+    x402: Option<&crate::config::types::X402Config>,
+    mpp: Option<&crate::mpp::MppConfig>,
+    channel_name: &str,
+    channel_id: &str,
+    resource_url: &str,
+    services: &LocalPaymentServices<'_>,
+) -> Option<SurfacePaymentError> {
+    let Some(x402) = x402 else {
+        return Some(
+            crate::mpp::challenge(
+                mpp?,
+                channel_name,
+                channel_id,
+                resource_url,
+                services
+                    .mpp_transaction_store
+                    .clone(),
+                services.secrets_store,
+            )
+            .await
+            .into(),
+        );
+    };
+    let challenge = crate::x402::challenge(x402, channel_name, channel_id, resource_url).await;
+    let Some(mpp) = mpp else {
+        return Some(crate::x402::PaymentError::Required(challenge).into());
+    };
+    crate::mpp::fire_challenge_issued_events(
+        channel_id,
+        channel_name,
+        resource_url,
+        services
+            .mpp_transaction_store
+            .clone(),
+    );
+    Some(SurfacePaymentError::Required {
+        x402: challenge,
+        mpp: crate::mpp::combined_challenges(mpp, resource_url, services.secrets_store).await,
+    })
 }
 
 pub(crate) async fn process_local(
@@ -482,7 +579,7 @@ pub(crate) async fn process_local(
     mcp_context: Option<&McpContext>,
     resource_url: &str,
     evidence: Option<&crate::mcp::continuations::protected::ContinuationPayment>,
-) -> Result<SurfacePayment, Response> {
+) -> Result<SurfacePayment, SurfacePaymentError> {
     let inspected = LocalPayment::inspect(
         surface,
         headers,
@@ -509,20 +606,11 @@ pub(crate) async fn process_local(
     if let Some(evidence) = evidence {
         use crate::mcp::continuations::protected::ContinuationPayment;
 
-        let now = crate::proxy::credential_delegation::modern::now_secs().map_err(|_| {
-            crate::a2a::create_error_response(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "Payment continuation unavailable",
-            )
-        })?;
+        let now = crate::proxy::credential_delegation::modern::now_secs()
+            .map_err(|_| SurfacePaymentError::ContinuationUnavailable)?;
         evidence
             .validate(now)
-            .map_err(|_| {
-                crate::a2a::create_error_response(
-                    axum::http::StatusCode::FORBIDDEN,
-                    "Payment continuation expired or invalid",
-                )
-            })?;
+            .map_err(|_| SurfacePaymentError::ContinuationInvalid)?;
         match evidence {
             ContinuationPayment::X402 { receipt, .. } if x402.is_some() => {
                 payment.context = Some(PaymentContext {
@@ -533,12 +621,7 @@ pub(crate) async fn process_local(
             ContinuationPayment::Mpp { receipt, .. } if mpp.is_some() => {
                 payment.mpp_receipt = receipt.clone();
             }
-            _ => {
-                return Err(crate::a2a::create_error_response(
-                    axum::http::StatusCode::FORBIDDEN,
-                    "Payment continuation does not match this paywall",
-                ));
-            }
+            _ => return Err(SurfacePaymentError::ContinuationMismatch),
         }
         payment.consumed = true;
         return Ok(payment);
@@ -565,8 +648,7 @@ pub(crate) async fn process_local(
                 .transaction_store
                 .clone(),
         )
-        .await
-        .map_err(|error| error.render(services.x402_headers))?;
+        .await?;
         payment.body = modified.into();
         payment.consumed = true;
         payment.context = Some(PaymentContext {
@@ -590,66 +672,15 @@ pub(crate) async fn process_local(
                 .clone(),
             services.secrets_store,
         )
-        .await
-        .map_err(IntoResponse::into_response)?;
+        .await?;
         payment.body = modified.into();
         payment.consumed = true;
         return Ok(payment);
     }
-    if let Some(config) = x402 {
-        let response = crate::x402::process_payment(
-            None,
-            config,
-            name,
-            id,
-            resource_url,
-            services
-                .listener_manager
-                .clone(),
-            services
-                .transaction_store
-                .clone(),
-        )
-        .await
-        .unwrap_err()
-        .render(services.x402_headers);
-        return Err(if let Some(config) = mpp {
-            crate::mpp::fire_challenge_issued_events(
-                id,
-                name,
-                resource_url,
-                services
-                    .mpp_transaction_store
-                    .clone(),
-            );
-            crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                response,
-                config,
-                resource_url,
-                services.secrets_store,
-            )
-            .await
-        } else {
-            response
-        });
+    match payment_required(x402, mpp, name, id, resource_url, &services).await {
+        Some(error) => Err(error),
+        None => Ok(payment),
     }
-    if let Some(config) = mpp {
-        return Err(crate::mpp::process_payment(
-            None,
-            config,
-            name,
-            id,
-            resource_url,
-            services
-                .mpp_transaction_store
-                .clone(),
-            services.secrets_store,
-        )
-        .await
-        .unwrap_err()
-        .into_response());
-    }
-    Ok(payment)
 }
 
 #[cfg(test)]
@@ -779,27 +810,32 @@ mod tests {
             mpp_transaction_store: None,
             secrets_store: &secrets,
         };
-        for evidence in [
-            ContinuationPayment::X402 {
-                receipt: None,
-                verified_at: now - 60,
-                expires_at: now,
-            },
-            ContinuationPayment::Mpp {
-                receipt: Some("receipt".into()),
-                verified_at: now,
-                expires_at: now + 60,
-            },
+        for (evidence, expected) in [
+            (
+                ContinuationPayment::X402 {
+                    receipt: None,
+                    verified_at: now - 60,
+                    expires_at: now,
+                },
+                "expired or invalid",
+            ),
+            (
+                ContinuationPayment::Mpp {
+                    receipt: Some("receipt".into()),
+                    verified_at: now,
+                    expires_at: now + 60,
+                },
+                "does not match this paywall",
+            ),
         ] {
             let result =
                 process_local(&surface, services(), &headers, body.clone(), None, "/mcp", Some(&evidence)).await;
-            assert_eq!(
-                result
-                    .err()
-                    .expect("invalid evidence must be rejected")
-                    .status(),
-                axum::http::StatusCode::FORBIDDEN
-            );
+            match result {
+                Err(error @ (SurfacePaymentError::ContinuationInvalid | SurfacePaymentError::ContinuationMismatch)) => {
+                    assert!(error.to_string().contains(expected), "{error}")
+                }
+                other => panic!("invalid evidence must be rejected, got {:?}", other.err()),
+            }
         }
         let evidence = ContinuationPayment::X402 {
             receipt: Some("saved-receipt".into()),
@@ -808,7 +844,7 @@ mod tests {
         };
         let reused = process_local(&surface, services(), &headers, body.clone(), None, "/mcp", Some(&evidence))
             .await
-            .unwrap_or_else(|response| panic!("valid evidence rejected: {}", response.status()));
+            .unwrap_or_else(|error| panic!("valid evidence rejected: {error:?}"));
         assert!(reused.consumed);
         assert_eq!(
             reused
@@ -820,13 +856,91 @@ mod tests {
         );
         surface.target.payment_policy = None;
         let result = process_local(&surface, services(), &headers, body, None, "/mcp", Some(&evidence)).await;
-        assert_eq!(
-            result
-                .err()
-                .expect("removed paywall must not accept evidence")
-                .status(),
-            axum::http::StatusCode::FORBIDDEN
+        assert!(
+            matches!(result, Err(SurfacePaymentError::ContinuationMismatch)),
+            "removed paywall must not accept evidence"
         );
+    }
+
+    fn mpp_config() -> crate::mpp::MppConfig {
+        serde_json::from_value(json!({
+            "enabled": true,
+            "realm": "gateway.example",
+            "secret_key": "dGVzdC1zZWNyZXQtMzItYnl0ZXMtbG9uZyEhISEhISE=",
+            "payment_methods": [{
+                "method": "tempo", "intent": "charge", "currency": "usd",
+                "recipient": "0xrecipient", "amount": "1.00"
+            }]
+        }))
+        .unwrap()
+    }
+
+    async fn rendered(error: SurfacePaymentError) -> Response {
+        let headers = crate::config::types::X402Headers::default();
+        error.render(&headers)
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_credential_gets_each_offered_rails_challenge() {
+        let x402 = crate::config::types::X402Config {
+            enabled: true,
+            ..Default::default()
+        };
+        let mpp = mpp_config();
+        let secrets = None;
+        let x402_headers = crate::config::types::X402Headers::default();
+        let services = LocalPaymentServices {
+            x402_headers: &x402_headers,
+            listener_manager: None,
+            transaction_store: None,
+            mpp_transaction_store: None,
+            secrets_store: &secrets,
+        };
+        let required = |x402, mpp| payment_required(x402, mpp, "Paid", "paid", "/mcp", &services);
+
+        assert!(required(None, None).await.is_none(), "no rail offered, nothing to pay");
+        assert!(matches!(
+            required(Some(&x402), None).await,
+            Some(SurfacePaymentError::X402(crate::x402::PaymentError::Required(_)))
+        ));
+        assert!(matches!(
+            required(None, Some(&mpp)).await,
+            Some(SurfacePaymentError::Mpp(crate::mpp::PaymentError::Required(_)))
+        ));
+        let Some(both @ SurfacePaymentError::Required { .. }) = required(Some(&x402), Some(&mpp)).await else {
+            panic!("both rails must be offered together");
+        };
+        let response = rendered(both).await;
+        assert_eq!(response.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
+        assert!(response.headers().contains_key(x402_headers.payment_required.as_str()));
+        assert!(
+            response.headers()["www-authenticate"]
+                .to_str()
+                .unwrap()
+                .starts_with("Payment id=\"")
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn continuation_refusals_render_their_status() {
+        for (error, status) in [
+            (SurfacePaymentError::ContinuationUnavailable, axum::http::StatusCode::SERVICE_UNAVAILABLE),
+            (SurfacePaymentError::ContinuationInvalid, axum::http::StatusCode::FORBIDDEN),
+            (SurfacePaymentError::ContinuationMismatch, axum::http::StatusCode::FORBIDDEN),
+        ] {
+            let message = error.to_string();
+            let response = rendered(error).await;
+            assert_eq!(response.status(), status);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["detail"], message);
+        }
     }
 
     #[test]

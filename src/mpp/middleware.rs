@@ -393,33 +393,32 @@ pub async fn process_payment(
         }
         None => {
             tracing::info!(channel = channel_name, "[mpp] No payment credential — returning 402 challenge");
-
-            // Record challenge in transaction store
-            if let Some(ref store) = transaction_store {
-                let store = store.clone();
-                let ch_id = channel_id.to_string();
-                let ch_name = channel_name.to_string();
-                let r_url = resource_url.to_string();
-                let trace_id = trace_id.clone();
-                tokio::spawn(async move {
-                    let _ = store
-                        .record_challenge_issued(&ch_id, &ch_name, &r_url, trace_id)
-                        .await;
-                });
-            }
-
-            // Fire integration event for challenge issuance
-            let ch_id = channel_id.to_string();
-            let ch_name = channel_name.to_string();
-            let r_url = resource_url.to_string();
-            tokio::spawn(async move {
-                crate::integrations::mpp_integration_triggers::trigger_mpp_challenge_issued(&ch_id, &ch_name, &r_url)
-                    .await;
-            });
-
+            fire_challenge_issued_events(channel_id, channel_name, resource_url, transaction_store);
             Err(PaymentError::required(config, resource_url))
         }
     }
+}
+
+/// The challenges for a request that presented no credential, recording that
+/// they were issued.
+pub async fn challenge(
+    config: &MppConfig,
+    channel_name: &str,
+    channel_id: &str,
+    resource_url: &str,
+    transaction_store: Option<std::sync::Arc<super::transaction_store::MppTransactionStore>>,
+    secrets_store: &Option<std::sync::Arc<dyn crate::secrets::SecretsStore>>,
+) -> PaymentError {
+    let config = match super::secrets::resolve_config_secrets(config, secrets_store).await {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            tracing::error!(channel = channel_name, error = %e, "[mpp] Failed to resolve config secrets");
+            return PaymentError::Configuration;
+        }
+    };
+    tracing::info!(channel = channel_name, "[mpp] No payment credential — returning 402 challenge");
+    fire_challenge_issued_events(channel_id, channel_name, resource_url, transaction_store);
+    PaymentError::required(&config, resource_url)
 }
 
 #[cfg(test)]

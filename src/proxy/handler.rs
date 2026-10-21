@@ -783,75 +783,24 @@ pub async fn handle_agent_card(
                     Ok(_) => {}
                     Err(error) => return Err(error.into_response()),
                 }
-            } else {
+            } else if let Some(error) = surface_payment::payment_required(
                 // No credential → return 402 (combined if both protocols enabled)
-                let err_response = if x402_required {
-                    // Build x402 402 (includes payment requirements normalization)
-                    let x402_resp = crate::x402::process_payment(
-                        None,
-                        state
-                            .surface
-                            .x402_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        resource_url,
-                        state
-                            .listener_manager
-                            .read()
-                            .await
-                            .clone(),
-                        state
-                            .transaction_store
-                            .clone(),
-                    )
-                    .await
-                    .unwrap_err()
-                    .render(&state.config.x402_headers);
-                    if mpp_required {
-                        // Both enabled → add MPP challenge headers to x402 response
-                        crate::mpp::fire_challenge_issued_events(
-                            config_id,
-                            &channel_name,
-                            resource_url,
-                            state
-                                .mpp_transaction_store
-                                .clone(),
-                        );
-                        crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                            x402_resp,
-                            state
-                                .surface
-                                .mpp_config()
-                                .unwrap(),
-                            resource_url,
-                            &state.secrets_store,
-                        )
-                        .await
-                    } else {
-                        x402_resp
-                    }
-                } else {
-                    // Only MPP → standard MPP 402
-                    crate::mpp::process_payment(
-                        None,
-                        state
-                            .surface
-                            .mpp_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        resource_url,
-                        state
-                            .mpp_transaction_store
-                            .clone(),
-                        &state.secrets_store,
-                    )
-                    .await
-                    .unwrap_err()
-                    .into_response()
-                };
-                return Err(err_response);
+                state
+                    .surface
+                    .x402_config()
+                    .filter(|_| x402_required),
+                state
+                    .surface
+                    .mpp_config()
+                    .filter(|_| mpp_required),
+                &channel_name,
+                config_id,
+                resource_url,
+                &surface_payment::LocalPaymentServices::of(&state).await,
+            )
+            .await
+            {
+                return Err(error.render(&state.config.x402_headers));
             }
         }
     }
@@ -3324,73 +3273,24 @@ async fn proxy_handler_with_mcp_runtime(
                         return Err(error.into_response());
                     }
                 }
-            } else {
+            } else if let Some(error) = surface_payment::payment_required(
                 // No credential → return 402 (combined if both protocols enabled)
+                state
+                    .surface
+                    .x402_config()
+                    .filter(|_| x402_required),
+                state
+                    .surface
+                    .mpp_config()
+                    .filter(|_| mpp_required),
+                &channel_name,
+                config_id,
+                &resource_url,
+                &surface_payment::LocalPaymentServices::of(&state).await,
+            )
+            .await
+            {
                 channel_warn!(config_id, "❌ Payment required for fabric request");
-
-                let err_response = if x402_required {
-                    let x402_resp = crate::x402::process_payment(
-                        None,
-                        state
-                            .surface
-                            .x402_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        &resource_url,
-                        state
-                            .listener_manager
-                            .read()
-                            .await
-                            .clone(),
-                        state
-                            .transaction_store
-                            .clone(),
-                    )
-                    .await
-                    .unwrap_err()
-                    .render(&state.config.x402_headers);
-                    if mpp_required {
-                        crate::mpp::fire_challenge_issued_events(
-                            config_id,
-                            &channel_name,
-                            &resource_url,
-                            state
-                                .mpp_transaction_store
-                                .clone(),
-                        );
-                        crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                            x402_resp,
-                            state
-                                .surface
-                                .mpp_config()
-                                .unwrap(),
-                            &resource_url,
-                            &state.secrets_store,
-                        )
-                        .await
-                    } else {
-                        x402_resp
-                    }
-                } else {
-                    crate::mpp::process_payment(
-                        None,
-                        state
-                            .surface
-                            .mpp_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        &resource_url,
-                        state
-                            .mpp_transaction_store
-                            .clone(),
-                        &state.secrets_store,
-                    )
-                    .await
-                    .unwrap_err()
-                    .into_response()
-                };
 
                 if let Some(ref metrics) = state.metrics_store {
                     let latency_ms = start_time
@@ -3431,7 +3331,7 @@ async fn proxy_handler_with_mcp_runtime(
                 connection_guard
                     .decrement()
                     .await;
-                return Err(err_response);
+                return Err(error.render(&state.config.x402_headers));
             }
         }
     }

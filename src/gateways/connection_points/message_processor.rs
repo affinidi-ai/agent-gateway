@@ -1549,6 +1549,25 @@ async fn process_get_surfaces_response(message: &ReceivedMessage) -> ProcessingR
     ProcessingResult::ProcessedNoResponse
 }
 
+/// The x402 header names the sending gateway uses, from the message context.
+fn fabric_x402_headers(message_context: &std::collections::HashMap<String, Value>) -> crate::config::types::X402Headers {
+    let Some(headers_json) = message_context.get("x402_headers") else {
+        return crate::config::types::X402Headers::default();
+    };
+    let header = |name: &str, default: &str| {
+        headers_json
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
+    };
+    crate::config::types::X402Headers {
+        payment_signature: header("payment_signature", "PAYMENT-SIGNATURE"),
+        payment_required: header("payment_required", "PAYMENT-REQUIRED"),
+        payment_response: header("payment_response", "PAYMENT-RESPONSE"),
+    }
+}
+
 /// Payment verification for fabric-forwarded requests (x402, MPP, or both).
 /// Extracted from `process_forward_request` to reduce async state-machine size.
 async fn verify_payment_fabric(
@@ -1558,8 +1577,8 @@ async fn verify_payment_fabric(
     headers: Option<&serde_json::Map<String, Value>>,
     body_bytes: &[u8],
     path: &str,
-    message_context: &std::collections::HashMap<String, Value>,
-) -> Result<Option<crate::surface_context::PaymentContext>, ProcessingResult> {
+    x402_headers: &crate::config::types::X402Headers,
+) -> Result<Option<crate::surface_context::PaymentContext>, crate::proxy::handler::surface_payment::SurfacePaymentError> {
     let surface_protocol = surface.channel_protocol();
     let x402_required = surface
         .x402_config()
@@ -1572,45 +1591,14 @@ async fn verify_payment_fabric(
         return Ok(None);
     }
 
-    // Extract x402 context if needed
-    let (payment_signature, x402_effective_policy, x402_headers_extracted) = if x402_required {
-        let payment_policy = surface.x402_config().unwrap();
-
-        let effective_policy = std::borrow::Cow::Borrowed(payment_policy);
-
-        // Extract x402 headers from message context
-        let x402_headers = if let Some(headers_json) = message_context.get("x402_headers") {
-            let payment_signature_header = headers_json
-                .get("payment_signature")
-                .and_then(|v| v.as_str())
-                .unwrap_or("PAYMENT-SIGNATURE");
-            let payment_required_header = headers_json
-                .get("payment_required")
-                .and_then(|v| v.as_str())
-                .unwrap_or("PAYMENT-REQUIRED");
-            let payment_response_header = headers_json
-                .get("payment_response")
-                .and_then(|v| v.as_str())
-                .unwrap_or("PAYMENT-RESPONSE");
-
-            crate::config::types::X402Headers {
-                payment_signature: payment_signature_header.to_string(),
-                payment_required: payment_required_header.to_string(),
-                payment_response: payment_response_header.to_string(),
-            }
-        } else {
-            crate::config::types::X402Headers::default()
-        };
-
-        // Extract payment signature from DIDComm headers
-        let payment_signature = headers
+    // Extract payment signature from DIDComm headers
+    let payment_signature = if x402_required {
+        headers
             .and_then(|h| h.get(&x402_headers.payment_signature))
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        (payment_signature, Some(effective_policy), Some(x402_headers))
+            .map(|s| s.to_string())
     } else {
-        (None, None, None)
+        None
     };
 
     // Extract MPP credential from DIDComm headers
@@ -1628,19 +1616,19 @@ async fn verify_payment_fabric(
         None
     };
 
-    if x402_required && payment_signature.is_some() {
+    if let Some(config) = surface
+        .x402_config()
+        .filter(|_| x402_required && payment_signature.is_some())
+    {
         channel_info!(
             config_id,
             "Checking x402 payment - has_signature: true, header_name: {}",
-            x402_headers_extracted
-                .as_ref()
-                .map(|h| h.payment_signature.as_str())
-                .unwrap_or("?")
+            x402_headers.payment_signature
         );
 
         match crate::x402::process_payment(
             payment_signature,
-            &x402_effective_policy.unwrap(),
+            config,
             channel_id,
             config_id,
             path,
@@ -1658,14 +1646,7 @@ async fn verify_payment_fabric(
             }
             Err(error) => {
                 channel_warn!(config_id, "Payment verification failed for fabric-forwarded request");
-                Err(axum_response_to_forward_result(
-                    error.render(
-                        x402_headers_extracted
-                            .as_ref()
-                            .unwrap(),
-                    ),
-                )
-                .await)
+                Err(error.into())
             }
         }
     } else if mpp_required && mpp_credential.is_some() {
@@ -1686,57 +1667,36 @@ async fn verify_payment_fabric(
             }
             Err(error) => {
                 channel_warn!(config_id, "MPP verification failed for fabric-forwarded request");
-                Err(axum_response_to_forward_result(axum::response::IntoResponse::into_response(error)).await)
+                Err(error.into())
             }
         }
     } else {
         channel_warn!(config_id, "Payment required for fabric-forwarded request");
-
-        let err_response = if x402_required {
-            let x402_resp = crate::x402::process_payment(
-                None,
-                &x402_effective_policy.unwrap(),
-                channel_id,
-                config_id,
-                path,
-                None,
-                get_transaction_store(),
-            )
-            .await
-            .unwrap_err()
-            .render(
-                x402_headers_extracted
-                    .as_ref()
-                    .unwrap(),
-            );
-            if mpp_required {
-                crate::mpp::fire_challenge_issued_events(config_id, channel_id, path, get_mpp_transaction_store());
-                crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                    x402_resp,
-                    surface.mpp_config().unwrap(),
-                    path,
-                    &get_secrets_store(),
-                )
-                .await
-            } else {
-                x402_resp
-            }
-        } else {
-            let error = crate::mpp::process_payment(
-                None,
-                surface.mpp_config().unwrap(),
-                channel_id,
-                config_id,
-                path,
-                get_mpp_transaction_store(),
-                &get_secrets_store(),
-            )
-            .await
-            .unwrap_err();
-            axum::response::IntoResponse::into_response(error)
+        let secrets_store = get_secrets_store();
+        let services = crate::proxy::handler::surface_payment::LocalPaymentServices {
+            x402_headers,
+            listener_manager: None,
+            transaction_store: get_transaction_store(),
+            mpp_transaction_store: get_mpp_transaction_store(),
+            secrets_store: &secrets_store,
         };
-
-        Err(axum_response_to_forward_result(err_response).await)
+        match crate::proxy::handler::surface_payment::payment_required(
+            surface
+                .x402_config()
+                .filter(|_| x402_required),
+            surface
+                .mpp_config()
+                .filter(|_| mpp_required),
+            channel_id,
+            config_id,
+            path,
+            &services,
+        )
+        .await
+        {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1747,10 +1707,11 @@ async fn process_modern_payment_fabric(
     body: bytes::Bytes,
     path: &str,
     evidence: Option<&crate::mcp::continuations::protected::ContinuationPayment>,
-) -> Result<crate::proxy::handler::surface_payment::SurfacePayment, ProcessingResult> {
+) -> Result<crate::proxy::handler::surface_payment::SurfacePayment, crate::proxy::handler::surface_payment::SurfacePaymentError>
+{
     use crate::proxy::handler::surface_payment::{LocalPaymentServices, process_local};
 
-    match process_local(
+    process_local(
         surface,
         LocalPaymentServices {
             x402_headers,
@@ -1766,10 +1727,6 @@ async fn process_modern_payment_fabric(
         evidence,
     )
     .await
-    {
-        Ok(payment) => Ok(payment),
-        Err(response) => Err(axum_response_to_forward_result(response).await),
-    }
 }
 
 /// Extract caller identity from inbound fabric request (VP, extensions, MCP _meta).
@@ -4625,20 +4582,23 @@ async fn process_forward_request_with_mcp_runtime(
             .await;
     }
 
-    let payment_context = if modern_request.is_some() { None } else { match Box::pin(verify_payment_fabric(
-        &surface,
-        channel_id,
-        config_id,
-        headers.as_ref(),
-        &body_bytes,
-        path,
-        &message.context,
-    ))
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(result) => return result,
-    }};
+    let payment_context = if modern_request.is_some() { None } else {
+        let x402_headers = fabric_x402_headers(&message.context);
+        match Box::pin(verify_payment_fabric(
+            &surface,
+            channel_id,
+            config_id,
+            headers.as_ref(),
+            &body_bytes,
+            path,
+            &x402_headers,
+        ))
+        .await
+        {
+            Ok(ctx) => ctx,
+            Err(error) => return axum_response_to_forward_result(error.render(&x402_headers)).await,
+        }
+    };
 
     let managed_id = surface.managed_identity();
     // Prefer an explicit `extension_rules`; otherwise synthesise one from the
@@ -4865,7 +4825,7 @@ async fn process_forward_request_with_mcp_runtime(
                     return axum_response_to_forward_result(ModernDelegationError::Unpaid.response(request)).await;
                 };
                 return match Box::pin(process_modern_payment_fabric(&surface, config, headers, body_bytes, path, None)).await {
-                    Err(result) => result,
+                    Err(error) => axum_response_to_forward_result(error.render(config)).await,
                     Ok(_) => axum_response_to_forward_result(ModernDelegationError::Unpaid.response(request)).await,
                 };
             }
@@ -4917,7 +4877,7 @@ async fn process_forward_request_with_mcp_runtime(
                 body_bytes = payment.body;
                 receipt
             }
-            Err(result) => return result,
+            Err(error) => return axum_response_to_forward_result(error.render(config)).await,
         }
     } else { None };
 
