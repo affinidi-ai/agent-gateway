@@ -1,4 +1,7 @@
-use axum::{http::HeaderMap, response::Response};
+use axum::{
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+};
 use bytes::Bytes;
 
 use crate::state::ProxyState;
@@ -587,7 +590,8 @@ pub(crate) async fn process_local(
                 .clone(),
             services.secrets_store,
         )
-        .await?;
+        .await
+        .map_err(IntoResponse::into_response)?;
         payment.body = modified.into();
         payment.consumed = true;
         return Ok(payment);
@@ -642,7 +646,8 @@ pub(crate) async fn process_local(
             services.secrets_store,
         )
         .await
-        .unwrap_err());
+        .unwrap_err()
+        .into_response());
     }
     Ok(payment)
 }

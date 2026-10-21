@@ -1684,9 +1684,9 @@ async fn verify_payment_fabric(
                 channel_info!(config_id, "MPP payment verified for fabric-forwarded request");
                 Ok(None)
             }
-            Err(err_response) => {
+            Err(error) => {
                 channel_warn!(config_id, "MPP verification failed for fabric-forwarded request");
-                Err(axum_response_to_forward_result(err_response).await)
+                Err(axum_response_to_forward_result(axum::response::IntoResponse::into_response(error)).await)
             }
         }
     } else {
@@ -1722,7 +1722,7 @@ async fn verify_payment_fabric(
                 x402_resp
             }
         } else {
-            crate::mpp::process_payment(
+            let error = crate::mpp::process_payment(
                 None,
                 surface.mpp_config().unwrap(),
                 channel_id,
@@ -1732,7 +1732,8 @@ async fn verify_payment_fabric(
                 &get_secrets_store(),
             )
             .await
-            .unwrap_err()
+            .unwrap_err();
+            axum::response::IntoResponse::into_response(error)
         };
 
         Err(axum_response_to_forward_result(err_response).await)

@@ -12,115 +12,110 @@ use axum::{
 use serde_json::json;
 
 use super::challenge::{format_www_authenticate, generate_challenges};
-use super::types::{MppConfig, MppProblemDetails};
+use super::types::{MppChallenge, MppConfig, MppProblemDetails};
 
-/// Create a 402 Payment Required response with MPP WWW-Authenticate challenges.
-///
-/// Per the spec:
-/// - Each payment method gets its own `WWW-Authenticate: Payment` header
-/// - Body is RFC 9457 Problem Details JSON
-/// - Must include `Cache-Control: no-store`
-pub fn create_mpp_402_response(
-    config: &MppConfig,
-    resource_url: &str,
-) -> Response {
-    let challenges = match generate_challenges(config, resource_url) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("[mpp] Failed to generate challenges: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to generate payment challenges: {}", e))
-                .into_response();
-        }
-    };
-
-    if challenges.is_empty() {
-        tracing::error!("[mpp] No payment methods configured");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "No payment methods configured").into_response();
-    }
-
-    // Build the problem details body
-    let first_challenge_id = challenges[0].id.clone();
-    let problem = MppProblemDetails {
-        problem_type: "https://paymentauth.org/problems/payment-required".to_string(),
-        title: "Payment Required".to_string(),
-        status: 402,
-        detail: "Payment is required.".to_string(),
-        challenge_id: Some(first_challenge_id),
-    };
-
-    let body = match serde_json::to_string(&problem) {
-        Ok(j) => j,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to serialize problem details: {}", e))
-                .into_response();
-        }
-    };
-
-    // Build response with multiple WWW-Authenticate headers
-    let mut response = Response::builder()
-        .status(StatusCode::PAYMENT_REQUIRED)
-        .header("Content-Type", "application/problem+json")
-        .header("Cache-Control", "no-store");
-
-    for challenge in &challenges {
-        let header_value = format_www_authenticate(challenge);
-        response = response.header("WWW-Authenticate", header_value);
-    }
-
-    response
-        .body(axum::body::Body::from(body))
-        .unwrap_or_else(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to build response: {}", e)).into_response()
-        })
+/// Why an MPP payment did not grant the request.
+#[derive(Debug, thiserror::Error)]
+pub enum PaymentError {
+    /// No credential was presented: pay one of `challenges`.
+    #[error("payment required")]
+    Required(Vec<MppChallenge>),
+    /// The credential failed verification; `challenges` are fresh ones to
+    /// retry with.
+    #[error("payment verification failed: {detail}")]
+    VerificationFailed {
+        detail: String,
+        challenges: Vec<MppChallenge>,
+    },
+    /// The surface's MPP configuration cannot issue challenges or verify
+    /// credentials, e.g. an unresolvable `$SECRET:` reference. The detail,
+    /// which may name a secret id, is logged where it happens and never sent.
+    #[error("payment configuration error")]
+    Configuration,
 }
 
-/// Create a 402 response for a verification failure (fresh challenge + error).
-///
-/// Per the spec, verification failures return 402 with a fresh challenge and
-/// appropriate problem type.
-pub fn create_mpp_verification_failed_response(
-    config: &MppConfig,
-    resource_url: &str,
-    detail: &str,
-) -> Response {
-    let challenges = generate_challenges(config, resource_url).unwrap_or_default();
-
-    let problem = MppProblemDetails {
-        problem_type: "https://paymentauth.org/problems/verification-failed".to_string(),
-        title: "Payment Verification Failed".to_string(),
-        status: 402,
-        detail: detail.to_string(),
-        challenge_id: challenges
-            .first()
-            .map(|c| c.id.clone()),
-    };
-
-    let body = serde_json::to_string(&problem).unwrap_or_else(|_| {
-        json!({"type": "https://paymentauth.org/problems/verification-failed", "status": 402}).to_string()
-    });
-
-    let mut response = Response::builder()
-        .status(StatusCode::PAYMENT_REQUIRED)
-        .header("Content-Type", "application/problem+json")
-        .header("Cache-Control", "no-store");
-
-    for challenge in &challenges {
-        let header_value = format_www_authenticate(challenge);
-        response = response.header("WWW-Authenticate", header_value);
+impl PaymentError {
+    /// Fresh challenges for `config`'s payment methods, or `Configuration`
+    /// when none can be issued.
+    pub fn required(
+        config: &MppConfig,
+        resource_url: &str,
+    ) -> Self {
+        match generate_challenges(config, resource_url) {
+            Ok(challenges) if !challenges.is_empty() => Self::Required(challenges),
+            Ok(_) => {
+                tracing::error!("[mpp] No payment methods configured");
+                Self::Configuration
+            }
+            Err(error) => {
+                tracing::error!("[mpp] Failed to generate challenges: {}", error);
+                Self::Configuration
+            }
+        }
     }
 
-    response
-        .body(axum::body::Body::from(body))
-        .unwrap_or_else(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to build response: {}", e)).into_response()
-        })
+    /// Per the spec, a verification failure carries fresh challenges.
+    pub fn verification_failed(
+        config: &MppConfig,
+        resource_url: &str,
+        detail: &str,
+    ) -> Self {
+        Self::VerificationFailed {
+            detail: detail.to_string(),
+            challenges: generate_challenges(config, resource_url).unwrap_or_default(),
+        }
+    }
 }
 
-/// Create a 500 response for a secret-resolution failure (e.g. a `$SECRET:`
-/// reference that can't be resolved). The detail is intentionally omitted
-/// from the response body — it may name a secret id — and is expected to
-/// have already been logged server-side by the caller.
-pub fn secret_resolution_error_response() -> Response {
+/// A 402 Payment Required per the spec: a `WWW-Authenticate: Payment` header
+/// per challenge, an RFC 9457 Problem Details body and `Cache-Control:
+/// no-store`.
+impl IntoResponse for PaymentError {
+    fn into_response(self) -> Response {
+        let (problem_type, title, detail, challenges) = match self {
+            Self::Required(challenges) => (
+                "https://paymentauth.org/problems/payment-required",
+                "Payment Required",
+                "Payment is required.".to_string(),
+                challenges,
+            ),
+            Self::VerificationFailed { detail, challenges } => (
+                "https://paymentauth.org/problems/verification-failed",
+                "Payment Verification Failed",
+                detail,
+                challenges,
+            ),
+            Self::Configuration => return configuration_error(),
+        };
+        let problem = MppProblemDetails {
+            problem_type: problem_type.to_string(),
+            title: title.to_string(),
+            status: 402,
+            detail,
+            challenge_id: challenges
+                .first()
+                .map(|challenge| challenge.id.clone()),
+        };
+        let body = serde_json::to_string(&problem)
+            .unwrap_or_else(|_| json!({"type": problem_type, "status": 402}).to_string());
+
+        let mut response = Response::builder()
+            .status(StatusCode::PAYMENT_REQUIRED)
+            .header("Content-Type", "application/problem+json")
+            .header("Cache-Control", "no-store");
+        for challenge in &challenges {
+            response = response.header("WWW-Authenticate", format_www_authenticate(challenge));
+        }
+        response
+            .body(axum::body::Body::from(body))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "[mpp] Failed to build the payment challenge response");
+                configuration_error()
+            })
+    }
+}
+
+fn configuration_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Payment configuration error").into_response()
 }
 
@@ -230,9 +225,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_mpp_402_response() {
+    async fn a_payment_required_renders_a_402_with_a_challenge_per_method() {
         let config = test_config();
-        let response = create_mpp_402_response(&config, "/api/resource");
+        let error = PaymentError::required(&config, "/api/resource");
+        assert!(matches!(&error, PaymentError::Required(challenges) if challenges.len() == 1), "{error:?}");
+        let response = error.into_response();
 
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
 
@@ -281,11 +278,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_mpp_verification_failed_response() {
+    async fn a_verification_failure_renders_a_402_with_fresh_challenges() {
         let config = test_config();
-        let response = create_mpp_verification_failed_response(&config, "/api/resource", "Invalid payment proof");
+        let response =
+            PaymentError::verification_failed(&config, "/api/resource", "Invalid payment proof").into_response();
 
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(
+            response
+                .headers()
+                .get("WWW-Authenticate")
+                .is_some()
+        );
 
         let body_bytes = Body::new(response.into_body())
             .collect()
@@ -295,6 +299,24 @@ mod tests {
         let body: MppProblemDetails = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body.problem_type, "https://paymentauth.org/problems/verification-failed");
         assert_eq!(body.detail, "Invalid payment proof");
+        assert!(body.challenge_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_configuration_without_payment_methods_answers_a_generic_500() {
+        let mut config = test_config();
+        config.payment_methods.clear();
+        let error = PaymentError::required(&config, "/api/resource");
+        assert!(matches!(error, PaymentError::Configuration), "{error:?}");
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body_bytes = Body::new(response.into_body())
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body_bytes[..], b"Payment configuration error");
     }
 
     #[tokio::test]

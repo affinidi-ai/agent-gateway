@@ -781,7 +781,7 @@ pub async fn handle_agent_card(
                 .await
                 {
                     Ok(_) => {}
-                    Err(err_response) => return Err(err_response),
+                    Err(error) => return Err(error.into_response()),
                 }
             } else {
                 // No credential → return 402 (combined if both protocols enabled)
@@ -849,6 +849,7 @@ pub async fn handle_agent_card(
                     )
                     .await
                     .unwrap_err()
+                    .into_response()
                 };
                 return Err(err_response);
             }
@@ -3315,12 +3316,12 @@ async fn proxy_handler_with_mcp_runtime(
                         mpp_receipt_header = receipt_header;
                         body_bytes = modified_body.into();
                     }
-                    Err(err_response) => {
+                    Err(error) => {
                         channel_warn!(config_id, "❌ MPP payment verification failed for fabric request");
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(err_response);
+                        return Err(error.into_response());
                     }
                 }
             } else {
@@ -3388,6 +3389,7 @@ async fn proxy_handler_with_mcp_runtime(
                     )
                     .await
                     .unwrap_err()
+                    .into_response()
                 };
 
                 if let Some(ref metrics) = state.metrics_store {
