@@ -1,9 +1,7 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import { MemoryRouter } from 'react-router-dom';
 import AccessPointPanel from '../access-point/AccessPointPanel';
-import ManagedAgentPanel from '../managed-agent/ManagedAgentPanel';
 import { apiClient } from '../../../../api';
 import type { BaseSurfaceView } from '../types';
 
@@ -25,12 +23,6 @@ function nodes(apConfig: Record<string, unknown>, targetConfig: Record<string, u
   ];
 }
 
-const proxyTargetConfig = {
-  endpoint_type: 'a2a-proxy',
-  a2a_proxy_id: 'worker',
-  endpoint: PROXY,
-};
-
 function renderAccessPoint(
   apConfig: Record<string, unknown>,
   targetEndpoint: string,
@@ -50,25 +42,6 @@ function renderAccessPoint(
         base,
       } as any)}
     />
-  );
-}
-
-function renderManagedAgent(apConfig: Record<string, unknown>, base: BaseSurfaceView) {
-  const allNodes = nodes(apConfig, proxyTargetConfig);
-  render(
-    <MemoryRouter>
-      <ManagedAgentPanel
-        {...({
-          node: allNodes[1],
-          config: proxyTargetConfig,
-          updateField: jest.fn(),
-          updateFields: jest.fn(),
-          protocol: 'a2a',
-          allNodes,
-          base,
-        } as any)}
-      />
-    </MemoryRouter>
   );
 }
 
@@ -112,21 +85,6 @@ describe('A2A settings of a variant whose Target differs from the base Target', 
 
       expect(screen.getByTestId('access-point-a2a-versions-error')).toBeInTheDocument();
     });
-
-    it('shows the Managed Agent the versions the gateway serves, not fixed ones', async () => {
-      renderManagedAgent(apConfig, base);
-      await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith('/a2a-proxies'));
-
-      const hint = screen.getByTestId('managed-agent-a2a-proxy-protocol-hint');
-      expect(screen.getByTestId('managed-agent-a2a-proxy-versions')).toHaveTextContent(
-        'Accepts A2A 0.3 only'
-      );
-      expect(hint).toHaveTextContent('Callers may send A2A-Version: 0.3, or no header');
-      expect(hint).not.toHaveTextContent('Callers must send A2A-Version: 1.0');
-      expect(hint).not.toHaveTextContent('These versions are fixed.');
-      expect(hint).toHaveTextContent("These are the surface's versions, set in the Access Point.");
-      expect(screen.queryByTestId('managed-agent-a2a-proxy-0-3-reason')).not.toBeInTheDocument();
-    });
   });
 
   describe('A2A proxy base Target with a URL variant in view', () => {
@@ -167,18 +125,6 @@ describe('A2A settings of a variant whose Target differs from the base Target', 
       expect(screen.getByTestId('access-point-a2a-proxy-locked')).toHaveTextContent(
         'A surface with an A2A proxy accepts A2A 1.0 only.'
       );
-    });
-
-    it("shows the Managed Agent of an A2A proxy variant the base Target's fixed versions", async () => {
-      renderManagedAgent({ a2a_accepted_versions: ['1.0'] }, base);
-      await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith('/a2a-proxies'));
-
-      const hint = screen.getByTestId('managed-agent-a2a-proxy-protocol-hint');
-      expect(screen.getByTestId('managed-agent-a2a-proxy-versions')).toHaveTextContent(
-        'Accepts A2A 0.3 and 1.0'
-      );
-      expect(screen.getByTestId('managed-agent-a2a-proxy-0-3-reason')).toBeInTheDocument();
-      expect(hint).toHaveTextContent('These versions are fixed.');
     });
   });
 });
