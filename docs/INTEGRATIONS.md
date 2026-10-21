@@ -333,9 +333,15 @@ endpoint, an event set and an integration, all three with the old integration's 
   beside it: with the old example config, `../_storage/integrations/endpoints`,
   `…/event_sets` and `…/integrations`. So a config written for the previous version keeps the
   definitions with the rest of its storage, which matters in Docker, where the config
-  directory is mounted read-only. Before removing the deprecated keys, set those three keys to
-  the paths in use; otherwise they fall back to `_storage/integrations/…` under the config
-  directory.
+  directory is mounted read-only. A key whose folder there would be one of the old directories
+  takes the key's name as its folder instead: with `integrations = "/data/integrations"`, the
+  definitions go to `/data/integration_definitions`. Before removing the deprecated keys, set
+  those three keys to the directories they use now; otherwise they fall back to
+  `_storage/integrations/…` under the config directory.
+- The node refuses to start when `integration_endpoints`, `integration_event_sets` or
+  `integration_definitions` is one of the old directories, or sits inside one. The new store
+  would read the old records, which it cannot parse, and the migration renames the old
+  directories with whatever they hold. The error names both keys.
 - When the old definitions directory is not there, the node logs
   `integrations.migration.not_found` with the path it looked in: INFO, as on a fresh install
   or once migrated, or WARN when `storage_paths.integrations` names it.
