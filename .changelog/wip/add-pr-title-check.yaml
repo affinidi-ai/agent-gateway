@@ -1,0 +1,17 @@
+branch: add-pr-title-check
+changes:
+  added:
+    - timestamp: '2026-10-21T15:27:53Z'
+      title: Check that pull request titles follow Conventional Commits
+      description: >-
+        Squash merges use the pull request title as the commit message on main, so a new pr-title
+        workflow checks the title with the Validate PR title job and fails when it does not follow
+        Conventional Commits, for example feat: or fix(ci):. The description after the type must be
+        at least 5 characters, the same minimum as the organization commit message rule. The job
+        runs again when the title is edited, so fixing a title clears the failure without a new
+        push.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
