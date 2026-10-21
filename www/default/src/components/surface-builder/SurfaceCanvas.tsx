@@ -2589,6 +2589,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       .attr('class', 'node')
       .attr('data-node-id', d => d.id)
       .attr('data-node-type', d => d.type)
+      .attr('data-testid', d => `surface-node-${d.type}`)
       .style('cursor', d => {
         if (d.type === 'surface') return 'pointer';
         return 'pointer';
