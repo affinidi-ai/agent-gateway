@@ -13,6 +13,41 @@ use tracing::{debug, info, warn};
 
 pub use config::{EventHookSettings, HookSecret};
 
+/// Per-gateway hook settings for in-process gateways in component tests, keyed
+/// by the gateway's storage directory, so no test has to touch the process
+/// environment.
+#[cfg(test)]
+pub(crate) mod test_settings {
+    use super::EventHookSettings;
+
+    fn registry() -> &'static dashmap::DashMap<String, EventHookSettings> {
+        static SETTINGS: std::sync::OnceLock<dashmap::DashMap<String, EventHookSettings>> = std::sync::OnceLock::new();
+        SETTINGS.get_or_init(dashmap::DashMap::new)
+    }
+
+    pub(crate) struct Registration(String);
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            registry().remove(&self.0);
+        }
+    }
+
+    pub(crate) fn install(
+        key: &str,
+        settings: EventHookSettings,
+    ) -> Registration {
+        registry().insert(key.to_string(), settings);
+        Registration(key.to_string())
+    }
+
+    pub(crate) fn get(key: &str) -> Option<EventHookSettings> {
+        registry()
+            .get(key)
+            .map(|settings| settings.clone())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     pub(crate) use super::transport::tests::{Captured, serve};

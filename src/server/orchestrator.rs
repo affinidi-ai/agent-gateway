@@ -1559,6 +1559,16 @@ pub async fn run_axum_proxy(
                 }
             };
 
+        #[cfg(test)]
+        let event_hook = match crate::event_hook::test_settings::get(
+            &bootstrap_config
+                .storage_paths
+                .gateways,
+        ) {
+            Some(settings) => crate::event_hook::EventHook::new(settings),
+            None => build_event_hook().await,
+        };
+        #[cfg(not(test))]
         let event_hook = build_event_hook().await;
 
         let mediator_store: Option<Arc<crate::mediators::FileSystemMediatorStore>> =

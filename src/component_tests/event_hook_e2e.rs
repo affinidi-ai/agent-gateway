@@ -196,46 +196,11 @@ impl FakeMediator {
     }
 }
 
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// The gateway reads the hook settings from the environment once at startup;
-/// callers hold `ENV_LOCK` from here until the gateway is up.
-fn apply_env(settings: Option<&EventHookSettings>) {
-    unsafe {
-        match settings {
-            Some(settings) => {
-                std::env::set_var(
-                    "AG_EVENT_HOOK_URL",
-                    settings
-                        .hook_url
-                        .clone()
-                        .unwrap(),
-                );
-                std::env::set_var(
-                    "AG_EVENT_HOOK_TIMEOUT_MS",
-                    settings
-                        .hook_timeout
-                        .as_millis()
-                        .to_string(),
-                );
-                match settings.hook_secret.as_ref() {
-                    Some(secret) => std::env::set_var("AG_EVENT_HOOK_SECRET", secret.expose()),
-                    None => std::env::remove_var("AG_EVENT_HOOK_SECRET"),
-                }
-            }
-            None => {
-                for name in ["AG_EVENT_HOOK_URL", "AG_EVENT_HOOK_TIMEOUT_MS", "AG_EVENT_HOOK_SECRET"] {
-                    std::env::remove_var(name);
-                }
-            }
-        }
-    }
-}
-
 struct Api {
     harness: GatewayHarness,
     client: reqwest::Client,
     connection_points_dir: std::path::PathBuf,
+    _hook_settings: Option<crate::event_hook::test_settings::Registration>,
 }
 
 impl Api {
@@ -247,13 +212,20 @@ impl Api {
         settings: Option<EventHookSettings>,
         tweak: impl FnOnce(&mut crate::config::BootstrapConfig),
     ) -> Self {
-        let _env = ENV_LOCK.lock().await;
-        apply_env(settings.as_ref());
         let mut client = None;
+        let mut registration = None;
         let mut connection_points_dir = std::path::PathBuf::new();
         let harness = GatewayHarness::start(|_, _, bootstrap| {
             client = Some(configure_admin_api(bootstrap));
             tweak(bootstrap);
+            registration = settings.map(|settings| {
+                crate::event_hook::test_settings::install(
+                    &bootstrap
+                        .storage_paths
+                        .gateways,
+                    settings,
+                )
+            });
             connection_points_dir = bootstrap
                 .storage_paths
                 .connection_points
@@ -261,11 +233,11 @@ impl Api {
                 .into();
         })
         .await;
-        apply_env(None);
         Self {
             harness,
             client: client.unwrap(),
             connection_points_dir,
+            _hook_settings: registration,
         }
     }
 
@@ -364,12 +336,12 @@ impl Api {
     }
 }
 
-async fn eventually(
+async fn eventually<F: std::future::Future<Output = bool>>(
     description: &str,
-    mut condition: impl FnMut() -> bool,
+    mut condition: impl FnMut() -> F,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while !condition() {
+    while !condition().await {
         assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {description}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -422,7 +394,7 @@ async fn a_failed_creation_reports_started_then_failed_and_never_created() {
     assert_eq!(status, 500, "{body}");
     assert!(is_oob_failure(&body), "{body}");
 
-    eventually("the started and failed events", || hook.events().len() >= 2).await;
+    eventually("the started and failed events", || std::future::ready(hook.events().len() >= 2)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let events = hook.events();
     let started = events
@@ -502,11 +474,7 @@ async fn deleting_a_connection_point_reports_deleted_with_its_did_and_mediator()
     )
     .unwrap();
     let path = format!("/connection-points/{}", record.id);
-    eventually("the stored record to be picked up", || {
-        std::thread::sleep(Duration::from_millis(50));
-        futures::executor::block_on(api.get(&path)).0 == 200
-    })
-    .await;
+    eventually("the stored record to be picked up", || async { api.get(&path).await.0 == 200 }).await;
 
     let response = api
         .client
@@ -515,7 +483,7 @@ async fn deleting_a_connection_point_reports_deleted_with_its_did_and_mediator()
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 204);
-    eventually("the deleted event", || !hook.events().is_empty()).await;
+    eventually("the deleted event", || std::future::ready(!hook.events().is_empty())).await;
     let event = hook.events()[0].clone();
     assert_eq!(event["event"], "connection_point.deleted");
     let cp = &event["connection_point"];
@@ -553,11 +521,13 @@ async fn a_retryable_answer_is_retried_and_leaves_creation_unaffected() {
     assert_eq!(status, 500, "{body}");
     assert!(is_oob_failure(&body), "{body}");
     eventually("the started event to be retried", || {
-        hook.events()
-            .iter()
-            .filter(|event| event["event"] == "connection_point.creation_started")
-            .count()
-            >= 2
+        std::future::ready(
+            hook.events()
+                .iter()
+                .filter(|event| event["event"] == "connection_point.creation_started")
+                .count()
+                >= 2,
+        )
     })
     .await;
 }
@@ -576,11 +546,13 @@ async fn with_a_secret_every_event_is_signed_and_a_401_is_retried() {
     assert_eq!(status, 500, "{body}");
     assert!(is_oob_failure(&body), "an auth failure never fails creation: {body}");
     eventually("the first event to be retried after the 401", || {
-        hook.events()
-            .iter()
-            .filter(|event| event["event"] == "connection_point.creation_started")
-            .count()
-            >= 2
+        std::future::ready(
+            hook.events()
+                .iter()
+                .filter(|event| event["event"] == "connection_point.creation_started")
+                .count()
+                >= 2,
+        )
     })
     .await;
     let calls = hook
@@ -623,7 +595,7 @@ async fn a_hook_that_never_answers_does_not_slow_or_change_creation() {
     assert_eq!(status, 500, "{body}");
     assert!(is_oob_failure(&body), "{body}");
     assert!(elapsed < Duration::from_secs(5), "the request waited for the hook: {elapsed:?}");
-    eventually("the hook to be called in the background", || !hook.events().is_empty()).await;
+    eventually("the hook to be called in the background", || std::future::ready(!hook.events().is_empty())).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -640,7 +612,7 @@ async fn a_permanent_rejection_is_dropped_without_a_retry_and_does_not_affect_cr
         .await;
     assert_eq!(status, 500, "{body}");
     assert!(is_oob_failure(&body), "{body}");
-    eventually("the hook to be told", || hook.events().len() >= 2).await;
+    eventually("the hook to be told", || std::future::ready(hook.events().len() >= 2)).await;
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(hook.events().len(), 2, "each rejected event is sent once");
 }
@@ -656,7 +628,7 @@ async fn a_successful_creation_reports_started_then_created_with_the_final_recor
         .await;
     assert_eq!(status, 200, "{body}");
 
-    eventually("started, created and connected", || hook.events().len() >= 3).await;
+    eventually("started, created and connected", || std::future::ready(hook.events().len() >= 3)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let events = hook.events_in_order();
     assert_eq!(
@@ -708,7 +680,7 @@ async fn a_failed_invitation_reports_started_then_failed_and_never_created() {
     assert_eq!(status, 500, "{body}");
     assert!(is_oob_failure(&body), "{body}");
 
-    eventually("started and failed", || hook.events().len() >= 2).await;
+    eventually("started and failed", || std::future::ready(hook.events().len() >= 2)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         event_names(&hook.events_in_order()),
@@ -727,9 +699,11 @@ async fn the_whole_lifecycle_is_reported_in_order_for_one_did() {
         .await;
     assert_eq!(status, 200, "{body}");
     eventually("connected", || {
-        hook.events()
-            .iter()
-            .any(|event| event["event"] == "connection_point.connected")
+        std::future::ready(
+            hook.events()
+                .iter()
+                .any(|event| event["event"] == "connection_point.connected"),
+        )
     })
     .await;
 
@@ -741,9 +715,11 @@ async fn the_whole_lifecycle_is_reported_in_order_for_one_did() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 204);
     eventually("deleted", || {
-        hook.events()
-            .iter()
-            .any(|event| event["event"] == "connection_point.deleted")
+        std::future::ready(
+            hook.events()
+                .iter()
+                .any(|event| event["event"] == "connection_point.deleted"),
+        )
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -776,5 +752,38 @@ async fn the_whole_lifecycle_is_reported_in_order_for_one_did() {
     for event in &events {
         assert_eq!(&event["connection_point"]["did"], did);
         assert_eq!(event["connection_point"]["id"], body["connection_point"]["id"]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_gateways_each_report_only_to_their_own_hook() {
+    let hook_a = MockHook::start(HookReply::accept()).await;
+    let hook_b = MockHook::start(HookReply::accept()).await;
+    let (api_a, api_b, api_off) =
+        tokio::join!(Api::start(Some(hook_a.settings())), Api::start(Some(hook_b.settings())), Api::start(None));
+    let (mediator_a, mediator_b, mediator_off) =
+        tokio::join!(FakeMediator::start(), FakeMediator::start(), FakeMediator::start());
+    let (a, b, off) = tokio::join!(
+        api_a.create_connection_point(&mediator_a),
+        api_b.create_connection_point(&mediator_b),
+        api_off.create_connection_point(&mediator_off)
+    );
+    for (status, body) in [a, b, off] {
+        assert_eq!(status, 500, "{body}");
+    }
+
+    eventually("both hooks to be told", || {
+        std::future::ready(hook_a.events().len() >= 2 && hook_b.events().len() >= 2)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (hook, mediator) in [(&hook_a, &mediator_a), (&hook_b, &mediator_b)] {
+        let events = hook.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|event| event["connection_point"]["mediator_did"] == mediator.did())
+        );
     }
 }
