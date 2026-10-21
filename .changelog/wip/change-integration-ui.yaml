@@ -141,6 +141,13 @@ changes:
         instead. POST /v1/integrations/test now takes an integration that joins an endpoint and
         an event set.
   security:
+    - timestamp: '2026-10-21T12:00:00.000Z'
+      title: Upgrade rustls-webpki and webpki roots to clear three distrust advisories
+      description: >-
+        rustls-webpki 0.103.15 could accept certificates through distrusted intermediates
+        (RUSTSEC-2026-0382), and webpki-roots and webpki-root-certs 1.0.8 still trusted
+        distrusted emSign intermediates (RUSTSEC-2026-0381, RUSTSEC-2026-0383). They are now
+        0.103.16 and 1.0.10, and the dependency audit passes again.
     - timestamp: '2026-10-19T09:30:00.000Z'
       title: Keep secret values and webhook URLs out of integration errors
       description: >-
