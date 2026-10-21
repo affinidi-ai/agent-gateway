@@ -511,6 +511,33 @@ events on the gateway, connection point, user, and identity pages.
   success. Save buttons are `user-integrations-save-button` and
   `identity-integrations-save-button`.
 
+## Laptop layouts
+
+Pages must stay usable at the common laptop viewports, 1280x720 to 1920x1080 with the
+sidebar expanded; `ui-tests/specs/laptop-layout.spec.ts` checks each page at five of them.
+
+### Audit Log
+
+The Audit Log is a list of entries and a detail panel (`pages/AuditPage/`, rules under
+_Viewport-filling master/detail_ in `dashboard.css`).
+
+- **Side by side** from 1440px wide: the page fills the viewport between the topbar and
+  the footer, so the document does not scroll, and the list and the evidence body scroll
+  inside their panels. The card body is a two-column grid (`.audit-shell` is
+  `display: contents`): the "About the Audit Log" banner sits above the list in the left
+  column and the detail panel takes the full height of the right one, so at 1536x864 the
+  list and the evidence body are each still at least 300px tall.
+- **Stacked** below 1440px wide (`@media (max-width: 1439.98px)`): there the two panels
+  are too narrow to read (about 510px each at 1366px, each entry over 230px tall). The
+  list sits above the detail and the page scrolls as one: no scroll box inside the page
+  and no overlay drawer.
+- **Scroll on select**: while stacked, selecting an entry smooth-scrolls the page so the
+  detail panel starts just below the fixed topbar (`scroll-margin-top`). `AuditPage`
+  decides "stacked" from the computed `flex-direction` of `.audit-shell` at click time,
+  so the breakpoint lives only in CSS. The default selection on load, a page change and a
+  filter change do not scroll, and side by side selecting never scrolls. Clicking the
+  detail title scrolls back to the entry, which lands fully below the topbar.
+
 ## Validation
 
 After frontend edits, prefer these checks when relevant:

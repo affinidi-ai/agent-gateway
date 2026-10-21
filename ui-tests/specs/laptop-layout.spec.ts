@@ -16,6 +16,7 @@ import path from 'path';
 import type {Page} from '@playwright/test';
 import {expect, test} from '../helpers/fixtures';
 import {byTestId, expectActionReachable, expectNoSidewaysScroll} from '../helpers/layout-assertions';
+import {measureAuditLayout, measureBelowTopbar} from '../helpers/layout-audit';
 import {installLayoutFixtures} from '../helpers/layout-fixtures';
 import {LAYOUT_PAGES, LayoutPage} from '../helpers/layout-pages';
 
@@ -59,6 +60,18 @@ async function settle(page: Page): Promise<void> {
     });
 }
 
+/** Expand the sidebar and answer the list requests with the layout fixtures. */
+async function prepareLaptopPage(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+        try {
+            window.localStorage.removeItem('dashboard-sidebar-collapsed');
+        } catch {
+            // Storage is unavailable on about:blank.
+        }
+    });
+    await installLayoutFixtures(page);
+}
+
 async function openPage(page: Page, entry: LayoutPage): Promise<void> {
     await page.goto(`${BASE_URL}${entry.route}`);
     const [root, ...data] = entry.testIds;
@@ -94,14 +107,7 @@ for (const size of LAPTOP_VIEWPORTS) {
         test.use({viewport: {width: size.width, height: size.height}});
 
         test.beforeEach(async ({page}) => {
-            await page.addInitScript(() => {
-                try {
-                    window.localStorage.removeItem('dashboard-sidebar-collapsed');
-                } catch {
-                    // Storage is unavailable on about:blank.
-                }
-            });
-            await installLayoutFixtures(page);
+            await prepareLaptopPage(page);
         });
 
         for (const entry of LAYOUT_PAGES) {
@@ -121,6 +127,75 @@ for (const size of LAPTOP_VIEWPORTS) {
                 for (const testId of entry.actions) {
                     await expectActionReachable(page, testId);
                 }
+            });
+        }
+    });
+}
+
+/**
+ * The Audit Log stacks the list above the detail, and the page scrolls as
+ * one, where two panels side by side would be too narrow to read;
+ * elsewhere the panels sit side by side and fill the page height.
+ */
+const AUDIT_STACKED: ReadonlySet<ViewportName> = new Set<ViewportName>(['1280x720', '1366x768']);
+
+/** Height a side-by-side panel needs to show its content readably. */
+const MIN_PANEL_HEIGHT_PX = 300;
+
+/** Sub-pixel rounding allowance for scroll and edge comparisons. */
+const TOLERANCE_PX = 1;
+
+const AUDIT_PAGE = LAYOUT_PAGES.find(entry => entry.id === 'audit');
+
+for (const size of LAPTOP_VIEWPORTS) {
+    const viewport: ViewportName = `${size.width}x${size.height}`;
+    const stacked = AUDIT_STACKED.has(viewport);
+
+    test.describe(`Audit Log layout at ${viewport}`, () => {
+        test.use({viewport: {width: size.width, height: size.height}});
+
+        test.beforeEach(async ({page}) => {
+            await prepareLaptopPage(page);
+            if (!AUDIT_PAGE) throw new Error('the page inventory has no audit entry');
+            await openPage(page, AUDIT_PAGE);
+        });
+
+        if (stacked) {
+            test(`audit stacks the list above the detail at ${viewport}`, async ({page}) => {
+                const layout = await measureAuditLayout(page);
+                expect(layout.shellDirection, '.audit-shell is a column').toBe('column');
+                expect(layout.list.bottom, 'the list ends above the detail panel').toBeLessThanOrEqual(layout.detail.top + TOLERANCE_PX);
+                expect(layout.selfScrollers, 'no element of the page scrolls by itself').toEqual([]);
+                expect(layout.scrollY, 'the page opens at the top').toBe(0);
+
+                await page.getByTestId('audit-item-3').click();
+                await settle(page);
+                const detail = await measureBelowTopbar(page, 'audit-detail-panel');
+                expect(detail.box.top, 'the detail panel starts below the topbar').toBeGreaterThanOrEqual(detail.topbarBottom - TOLERANCE_PX);
+                expect(detail.box.top, 'the detail panel starts in the top half of the viewport').toBeLessThanOrEqual(detail.viewportHeight / 2);
+
+                await page.getByTestId('audit-detail-title').click();
+                await settle(page);
+                const item = await measureBelowTopbar(page, 'audit-item-3');
+                expect(item.box.top, 'the selected entry starts below the topbar').toBeGreaterThanOrEqual(item.topbarBottom - TOLERANCE_PX);
+                expect(item.box.bottom, 'the selected entry ends inside the viewport').toBeLessThanOrEqual(item.viewportHeight + TOLERANCE_PX);
+            });
+        } else {
+            test(`audit keeps the list and detail side by side at ${viewport}`, async ({page}) => {
+                const layout = await measureAuditLayout(page);
+                expect(layout.shellDirection, '.audit-shell is a row').toBe('row');
+                expect(
+                    layout.documentScrollHeight,
+                    `the page scrolls: scrollHeight ${layout.documentScrollHeight} > clientHeight ${layout.documentClientHeight}`,
+                ).toBeLessThanOrEqual(layout.documentClientHeight);
+                expect(layout.list.height, 'the list region is tall enough to read').toBeGreaterThanOrEqual(MIN_PANEL_HEIGHT_PX);
+                expect(layout.drawerBody.height, 'the evidence body is tall enough to read').toBeGreaterThanOrEqual(MIN_PANEL_HEIGHT_PX);
+
+                const before = layout.scrollY;
+                await page.getByTestId('audit-item-3').click();
+                await settle(page);
+                const after = await measureAuditLayout(page);
+                expect(after.scrollY, 'selecting an entry does not scroll the page').toBe(before);
             });
         }
     });

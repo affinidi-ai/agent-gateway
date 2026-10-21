@@ -21,6 +21,7 @@ const AuditPage: React.FC = () => {
     return acc;
   }, {});
   const listRef = useRef<HTMLDivElement>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
 
   const selectedIdx = audit.expandedIdx ?? 0;
   const selectedEntry = audit.filteredEntries[selectedIdx] ?? null;
@@ -33,6 +34,17 @@ const AuditPage: React.FC = () => {
   const scrollSelectedIntoView = () => {
     const node = listRef.current?.querySelector(`[data-testid="audit-item-${selectedIdx}"]`);
     node?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+  };
+
+  // When the layout stacks the list above the detail (the shell is a column),
+  // bring the detail panel into view; side by side it is already on screen.
+  const selectEntry = (idx: number) => {
+    audit.setExpandedIdx(idx);
+    const shell = shellRef.current;
+    if (shell && window.getComputedStyle(shell).flexDirection === 'column') {
+      const panel = shell.querySelector('[data-testid="audit-detail-panel"]');
+      panel?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+    }
   };
 
   return (
@@ -86,13 +98,13 @@ const AuditPage: React.FC = () => {
 
         <div className="card-body audit-card-body">
           <AuditInfoBanner open={infoOpen} onToggle={() => setInfoOpen(o => !o)} />
-          <div className="audit-shell">
+          <div className="audit-shell" ref={shellRef}>
             <div className="audit-shell-list" ref={listRef}>
               <AuditList
                 isLoading={audit.isLoading}
                 filteredEntries={audit.filteredEntries}
                 selectedIdx={selectedIdx}
-                onSelect={audit.setExpandedIdx}
+                onSelect={selectEntry}
                 page={audit.page}
                 totalPages={audit.totalPages}
                 onPageChange={changePage}

@@ -1,0 +1,83 @@
+/**
+ * DOM measurements for the Audit Log checks of the laptop layout spec: how
+ * the list and detail panels are laid out, which elements scroll by
+ * themselves, and where an element sits relative to the fixed topbar.
+ */
+
+import type {Page} from '@playwright/test';
+
+export interface Box {
+    top: number;
+    bottom: number;
+    height: number;
+}
+
+export interface AuditLayout {
+    /** Computed `flex-direction` of `.audit-shell`: `column` when stacked. */
+    shellDirection: string;
+    list: Box;
+    detail: Box;
+    /** The evidence body inside the detail panel. */
+    drawerBody: Box;
+    scrollY: number;
+    documentScrollHeight: number;
+    documentClientHeight: number;
+    viewportHeight: number;
+    /** Bottom edge of the fixed topbar, in viewport pixels. */
+    topbarBottom: number;
+    /** Elements in the page that scroll vertically by themselves. */
+    selfScrollers: string[];
+}
+
+/** Measure the Audit Log page as it is on screen now. */
+export async function measureAuditLayout(page: Page): Promise<AuditLayout> {
+    return page.evaluate(() => {
+        const box = (selector: string) => {
+            const el = document.querySelector(selector);
+            if (!el) throw new Error(`${selector} is not on the page`);
+            const r = el.getBoundingClientRect();
+            return {top: r.top, bottom: r.bottom, height: r.height};
+        };
+        const describe = (node: Element) => {
+            const id = node.getAttribute('data-testid');
+            const cls = typeof node.className === 'string' && node.className ? `.${node.className.trim().split(/\s+/).join('.')}` : '';
+            return id ? `[data-testid="${id}"]` : `${node.tagName.toLowerCase()}${cls}`;
+        };
+        const root = document.querySelector('[data-testid="page-audit"]');
+        if (!root) throw new Error('page-audit is not on the page');
+        const selfScrollers = [root, ...Array.from(root.querySelectorAll('*'))]
+            .filter(el => {
+                const overflowY = getComputedStyle(el).overflowY;
+                return (overflowY === 'auto' || overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 1;
+            })
+            .map(el => `${describe(el)} (scrollHeight ${el.scrollHeight}, clientHeight ${el.clientHeight})`);
+        const shell = document.querySelector('.audit-shell');
+        if (!shell) throw new Error('.audit-shell is not on the page');
+        const topbar = document.querySelector('.topbar');
+        return {
+            shellDirection: getComputedStyle(shell).flexDirection,
+            list: box('.audit-shell-list'),
+            detail: box('[data-testid="audit-detail-panel"]'),
+            drawerBody: box('.audit-drawer-body'),
+            scrollY: window.scrollY,
+            documentScrollHeight: document.documentElement.scrollHeight,
+            documentClientHeight: document.documentElement.clientHeight,
+            viewportHeight: window.innerHeight,
+            topbarBottom: topbar ? topbar.getBoundingClientRect().bottom : 0,
+            selfScrollers,
+        };
+    });
+}
+
+/** Where a test id sits in the viewport and where the fixed topbar ends. */
+export async function measureBelowTopbar(page: Page, testId: string): Promise<{box: Box; topbarBottom: number; viewportHeight: number}> {
+    return page.getByTestId(testId).evaluate((el: Element) => {
+        const r = el.getBoundingClientRect();
+        const topbar = document.querySelector('.topbar');
+        return {
+            box: {top: r.top, bottom: r.bottom, height: r.height},
+            topbarBottom: topbar ? topbar.getBoundingClientRect().bottom : 0,
+            viewportHeight: window.innerHeight,
+        };
+    });
+}

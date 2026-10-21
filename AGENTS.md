@@ -75,6 +75,8 @@ Frontend work spans two concerns:
 
 For frontend work under `www/default/` (the current dashboard shipped to users), use the scoped frontend instructions at [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+Laptop viewport rules (the Audit Log stacking breakpoint and scroll on select) live under _Laptop layouts_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#laptop-layouts).
+
 The Surface Builder's **Send delegated credentials over Fabric** switch is per route
 (Managed Agent or Transit Point), off by default, and shown only for a `fabric://` route on
 a surface with credential bindings; see _Surface Builder_ in
