@@ -58,10 +58,6 @@ export const showToast = (
     label = 'Error!';
   }
 
-  const actionHtml = options.action
-    ? `<div style="margin-top: 6px;"><a href="#" id="app-toast-action" style="font-size: 0.9em; color: ${borderColor}; font-weight: 600; text-decoration: underline; cursor: pointer; position: relative; z-index: 1100;">${options.action.label}</a></div>`
-    : '';
-
   const isDark = document.body.classList.contains('dark-theme');
   const bgColor = isDark ? 'rgba(15, 23, 42, 0.85)' : 'rgba(255, 255, 255, 0.95)';
   const borderRing = isDark
@@ -70,6 +66,9 @@ export const showToast = (
   const textColor = isDark ? '#f1f5f9' : 'inherit';
   const closeColor = isDark ? '#94a3b8' : UI_COLORS.neutralMuted;
 
+  // The template below holds only constants (classes, colours, the type's label). The caller's
+  // `text` and the action label are attached afterwards as text nodes, never parsed as HTML,
+  // because toasts carry user-controlled names and server error messages.
   toast.innerHTML = `
     <div class="alert ${alertClass} alert-dismissible fade show" style="
       position: fixed; 
@@ -93,26 +92,37 @@ export const showToast = (
         </div>
         <div class="flex-grow-1">
           <strong>${label}</strong><br/>
-          <span style="font-size: 0.9em;">${text}</span>${actionHtml}
         </div>
       </div>
-      <button type="button" class="close" onclick="document.getElementById('app-toast').remove()" title="Close notification" style="position: absolute; top: 10px; right: 15px; z-index: 1000; background: transparent; border: none;">
+      <button type="button" class="close" title="Close notification" style="position: absolute; top: 10px; right: 15px; z-index: 1000; background: transparent; border: none;">
         <span style="font-size: 1.2em; color: ${closeColor};">&times;</span>
       </button>
     </div>
   `;
 
-  // Add to page
-  document.body.appendChild(toast);
+  const body = toast.querySelector<HTMLElement>('.flex-grow-1');
+  if (body) {
+    const message = document.createElement('span');
+    message.style.fontSize = '0.9em';
+    message.textContent = text;
+    body.appendChild(message);
 
-  // Wire the action link if one was provided. Query inside the toast (not
-  // document) so a previous toast's lingering id can't shadow ours, and
-  // attach via mousedown so the listener fires before any auto-remove
-  // timers or focus-loss handlers can swallow the click.
-  if (options.action) {
-    const link = toast.querySelector<HTMLAnchorElement>('#app-toast-action');
-    const action = options.action;
-    if (link) {
+    if (options.action) {
+      const action = options.action;
+      const wrapper = document.createElement('div');
+      wrapper.style.marginTop = '6px';
+
+      const link = document.createElement('a');
+      link.href = '#';
+      link.id = 'app-toast-action';
+      link.setAttribute(
+        'style',
+        `font-size: 0.9em; color: ${borderColor}; font-weight: 600; text-decoration: underline; cursor: pointer; position: relative; z-index: 1100;`
+      );
+      link.textContent = action.label;
+
+      // Attach via mousedown as well as click so the listener fires before any
+      // auto-remove timers or focus-loss handlers can swallow the click.
       const fire = (e: Event) => {
         e.preventDefault();
         e.stopPropagation();
@@ -124,8 +134,18 @@ export const showToast = (
       };
       link.addEventListener('click', fire);
       link.addEventListener('mousedown', fire);
+
+      wrapper.appendChild(link);
+      body.appendChild(wrapper);
     }
   }
+
+  toast
+    .querySelector('button.close')
+    ?.addEventListener('click', () => document.getElementById('app-toast')?.remove());
+
+  // Add to page
+  document.body.appendChild(toast);
 
   // Auto-remove with different timers based on type and options
   if (options.autoRemove && type !== 'loading') {
@@ -189,7 +209,7 @@ export const showUndoToast = ({
       <div style="height:1.5em;"></div>
       <div style="display:flex;align-items:center;gap:10px;padding:0 12px;font-size:0.9em;">
         <i class="fas fa-exclamation-triangle" style="color:${accent};flex-shrink:0;"></i>
-        <span style="flex:1;">${message}</span>
+        <span id="app-toast-message" style="flex:1;"></span>
         <span id="app-toast-undo-mount" style="flex-shrink:0;"></span>
         <button id="app-toast-close" type="button" title="Dismiss"
                 style="flex-shrink:0;background:transparent;border:none;
@@ -199,6 +219,9 @@ export const showUndoToast = ({
       </div>
       <div style="height:1.5em;"></div>
     </div>`;
+  // `message` is attached as text, never parsed as HTML.
+  const messageEl = toast.querySelector<HTMLElement>('#app-toast-message');
+  if (messageEl) messageEl.textContent = message;
   document.body.appendChild(toast);
 
   let undoRoot: Root | null = null;

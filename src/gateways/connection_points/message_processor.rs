@@ -338,8 +338,19 @@ pub async fn init_secrets_store(store: Arc<dyn crate::secrets::SecretsStore>) {
     info!("GW2: Global secrets store initialized for credential delegation");
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// The secrets store [`get_secrets_store`] returns inside a test's scope, instead of the
+    /// global one, which is set once per process.
+    pub(crate) static TEST_SECRETS_STORE: Arc<dyn crate::secrets::SecretsStore>;
+}
+
 /// Get the global secrets store.
 pub(crate) fn get_secrets_store() -> Option<Arc<dyn crate::secrets::SecretsStore>> {
+    #[cfg(test)]
+    if let Ok(store) = TEST_SECRETS_STORE.try_with(Arc::clone) {
+        return Some(store);
+    }
     GLOBAL_SECRETS_STORE
         .get()
         .cloned()

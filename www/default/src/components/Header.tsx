@@ -108,8 +108,6 @@ const Header: React.FC<HeaderProps> = ({ onLogout }) => {
         return 'Dashboard';
       case '/identities':
         return `${TITLE_PREFIX}Identities`;
-      case '/identities/integrations':
-        return `${TITLE_PREFIX}Identity Integrations`;
       case '/surfaces':
         return `${TITLE_PREFIX}Agent Surfaces`;
       case '/connections':

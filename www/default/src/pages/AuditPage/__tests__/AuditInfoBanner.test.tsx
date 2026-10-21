@@ -21,11 +21,13 @@ describe('AuditInfoBanner', () => {
     expect(body).toHaveTextContent('while VP Auditing is enabled');
   });
 
-  it('says each Governance Audit integration receives its own events, at least once', () => {
+  it('says each integration receives the audit events of its event set, at least once', () => {
     render(<AuditInfoBanner open onToggle={jest.fn()} />);
 
     const body = screen.getByTestId('audit-about-body');
-    expect(body).toHaveTextContent('receives the events selected for it');
+    expect(body).toHaveTextContent('an event set that holds audit events');
+    expect(body).not.toHaveTextContent('category');
+    expect(body).toHaveTextContent('receives the audit events of its event set');
     expect(body).toHaveTextContent('independently of this log');
     expect(body).toHaveTextContent('at least once');
     expect(body).toHaveTextContent('deduplicate on event_id');

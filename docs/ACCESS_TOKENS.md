@@ -142,10 +142,10 @@ already `"off"`; it may choose any other level. See
 | --- | --- | --- |
 | Policy definitions, Agent Surfaces, MCP Proxies, A2A Proxies | Yes | No, including surface `PATCH` and variant writes |
 | `/v1/policy-assignments` | Yes | No |
-| JWT verification strategies, Secrets, Certificates, Credential Providers, STS clients, Mediators, Authorities, Issuers, Trust Registries, Surface Templates, Integrations | Yes | No, `403` on update and delete, issuer trust-registry registration retry, trust registry reconnect, and triggering an Integration (`POST /v1/integrations/{id}/trigger` and the multi-trigger) |
+| JWT verification strategies, Secrets, Certificates, Credential Providers, STS clients, Mediators, Authorities, Issuers, Trust Registries, Surface Templates | Yes | No, `403` on update and delete, issuer trust-registry registration retry, and trust registry reconnect |
 | API keys of a global Agent Surface | List and read | No, `403` on create, revoke, rotate, and delete |
-| Appliance-wide Gateway records (peer gateways) | Yes | No, `403` on update, exposure, policy, delete, issuer, `POST /v1/gateways/{id}/approve` and `PUT /v1/gateways/{id}/integrations` |
-| User and identity event integrations (`/v1/users/integrations`, `/v1/identities/integrations`) | No, `403` on `GET` | No, `403` on `PUT`; these mappings describe the whole appliance, so a tenant or resource-scoped PAT can neither read nor change them |
+| Appliance-wide Gateway records (peer gateways) | Yes | No, `403` on update, exposure, policy, delete, issuer, and `POST /v1/gateways/{id}/approve` |
+| Integrations, their endpoints and event sets (`/v1/integrations`) | No, `403` | No, `403`; integrations describe the whole appliance, so a tenant or resource-scoped PAT can neither read nor change them, and none can be given a tenant owner |
 | Connection Points of an appliance-wide Gateway | List, read, metrics and messages | No, `403` on create, update, delete, exposed surfaces, use, reconnect, and marking or deleting messages. Connection Points are created only on the appliance's own Gateway, which is appliance-wide, so a tenant PAT cannot create Connection Points |
 
 Peers that arrive through the inbound Fabric handshake are always appliance-wide, so a tenant

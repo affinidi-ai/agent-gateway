@@ -10,6 +10,8 @@ mod pulsar;
 mod redis_streams;
 
 pub use kafka::{KafkaPublisher, invalidate_producer as invalidate_kafka_producer};
+#[cfg(test)]
+pub(crate) use kafka::{has_cached_producer as has_cached_kafka_producer, warm_producer as warm_kafka_producer};
 pub use kinesis::KinesisPublisher;
 pub use pulsar::PulsarPublisher;
 pub use redis_streams::RedisPublisher;
@@ -17,13 +19,15 @@ pub use redis_streams::RedisPublisher;
 /// Trait for stream publishing implementations
 #[async_trait]
 pub trait StreamPublisher: Send + Sync {
-    /// Publish an event to the stream
+    /// Publish an event to the stream for `integration_id`, through the endpoint `endpoint_id`,
+    /// which owns any connection kept between events.
     async fn publish(
         &self,
         topic: &str,
         event: &Value,
         config: &Value,
         integration_id: &str,
+        endpoint_id: &str,
     ) -> Result<()>;
 
     /// Publish multiple events as a batch (optional optimization)
@@ -34,25 +38,18 @@ pub trait StreamPublisher: Send + Sync {
         events: &[Value],
         config: &Value,
         integration_id: &str,
+        endpoint_id: &str,
     ) -> Result<Vec<Result<()>>> {
         // Default implementation: publish sequentially
         let mut results = Vec::new();
         for event in events {
             let result = self
-                .publish(topic, event, config, integration_id)
+                .publish(topic, event, config, integration_id, endpoint_id)
                 .await;
             results.push(result);
         }
         Ok(results)
     }
-
-    /// Test the connection and configuration
-    async fn test_connection(
-        &self,
-        topic: &str,
-        event: &Value,
-        config: &Value,
-    ) -> Result<String>;
 }
 
 /// Registry for managing stream publishers

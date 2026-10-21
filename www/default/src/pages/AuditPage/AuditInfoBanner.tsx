@@ -40,9 +40,10 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
         </p>
         <p className="mb-2">
           To send audit records to Kafka, Kinesis, Pulsar, Redis Streams, a webhook, email, or
-          Slack, add an integration in the <strong>Governance Audit</strong> category. Each
-          integration receives the events selected for it, independently of this log and of VP
-          Auditing. Delivery is at least once, so receivers deduplicate on <code>event_id</code>.
+          Slack, add an integration with an event set that holds audit events, under{' '}
+          <strong>Integrations</strong>. Each integration receives the audit events of its event
+          set, independently of this log and of VP Auditing. Delivery is at least once, so receivers
+          deduplicate on <code>event_id</code>.
         </p>
         <p className="mb-1 fw-semibold">Categories</p>
         <ul className="mb-0 ps-3">

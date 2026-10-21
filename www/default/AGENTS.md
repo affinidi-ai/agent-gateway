@@ -35,6 +35,13 @@ Applies to:
 8. Header topbar controls must use the shared topbar action button pattern, a single
    reusable component plus shared CSS state rules, rather than ad-hoc per-button markup.
 
+## Toasts
+
+`showToast` and `showUndoToast` (`utils/toaster.ts`) render the message and the action label as
+text (`textContent`), never as HTML, so a name or a server error message in a toast cannot run
+script. Pass plain text only: markup such as `<b>` shows literally, and callers must not
+escape the text themselves.
+
 ## Test identifiers
 
 Every new interactive element ships with a `data-testid`. Tests under `ui-tests/specs/`
@@ -165,7 +172,7 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
   invalid (a resource pattern or required header the form rejects, or a refused expiry) the
   copy still happens and a `warning` toast says the opened form will not create a token until
   they are fixed; missing fields and scopes the operator cannot grant do not warn. The toast
-  text never repeats what was typed (toasts render HTML). In edit mode it sits beside
+  text never repeats what was typed. In edit mode it sits beside
   **Revoke token** and the link carries no expiry.
 - A successful create replaces the editor with the secret page. The secret isn't rendered:
   the field shows a masked placeholder and **Copy** puts the real value on the clipboard.
@@ -210,8 +217,8 @@ Management personal access tokens live in the Secrets page's **Access Tokens** t
 
 ### Advanced resource scoping
 
-- Uses the same collapsed shadow-card, header, and chevron pattern as **About User
-  Integrations**.
+- Uses the same collapsed shadow-card, header, and chevron pattern as **About the Audit
+  Log** (`pages/AuditPage/AuditInfoBanner.tsx`).
 - Keeps the shared `required_headers` and `resource_pattern` fields, and enforces Agent
   Gateway's canonical values: blank is appliance-wide, and every nonblank pattern is
   `TENANT:${one-header}:<bounded-resource-selector>` with every alternative starting in a
@@ -417,135 +424,126 @@ The hidden file input is `data-testid="restore-file-input"`.
   card lists the versions the exposing surface accepts (1.0 by default) and which reply each send
   method gets. It does not follow `[a2a] default_version`.
 
-## Governance Audit integrations
+## Integrations
 
-### Category and type
+An integration joins one **endpoint** (where to deliver) and one **event set** (which events)
+with a template. Integrations are not attached to gateways, connection points, users or
+identities: an integration receives every event of its event set, from every resource.
 
-- The **Governance Audit** category (`audit`) is offered in the Add and Edit integration
-  category selects only to users with `audit.view` (`selectableCategories` in
-  `utils/auditIntegrations.ts`), for every integration type: Email and Slack are allowed
-  and send one message per record. Choosing it never changes the selected type.
-- Choosing it shows the shared **Governance Audit** card
-  (`components/integrations/AuditIntegrationCard.tsx`, `integration-audit-card`) at the
-  top of the right column. For Stream and Webhook (`AUDIT_PAYLOAD_TYPES`, the types with a
-  JSON payload), the card's **Use audit record
-  template** action (`integration-audit-template-button`) replaces the payload with the
-  audit template (routing fields plus `record: ${AUDIT_RECORD}`), which is the `audit`
-  category's Stream/Webhook sample (see [Starting content](#starting-content)).
-- The card states that only the selected events are sent, whether or not the VP Audit Log
-  keeps them (`integration-audit-scope-note`), and that delivery is at least once, so
-  receivers deduplicate on `event_id`, with a stuck destination catching up in order, and
-  that disabling the integration pauses it, letting go of what it has not received, so once
-  re-enabled it receives only new records (`integration-audit-delivery-note`).
+### API and permissions
 
-### Events to send
+- Every call to `/v1/integrations` goes through `src/integrationsApi.ts`, which types each
+  route. Do not call `apiClient` for integrations directly. `getCatalog()` loads the event
+  catalog once and adopts the gateway's placeholder syntax (`setVariablePattern` in
+  `utils/templateVariables.ts`).
+- Routes live in `pages/integrationRoutes.tsx`: `/integrations` needs `integrations.view`;
+  `/integrations/new`, `/integrations/:id`, `/integrations/endpoints/new|:id` and
+  `/integrations/event-sets/new|:id` need `integrations.edit`. The sidebar item needs
+  `integrations.view`.
+- In the lists, Add, Test and Edit need `integrations.edit`, and Delete `integrations.delete`.
+- Audit events are handled like every other event. No integrations page, editor or list control
+  checks `audit.view`, and none is disabled or annotated because an event set, integration or
+  endpoint involves audit events; the gateway checks only `integrations.*` there.
+  `holdsAuditEvents` (`utils/auditIntegrations.ts`) decides behaviour only: the Event Sets tab's
+  `audit` badge, the event set editor's audit journal note, and the integration editor's
+  **Delivery limits**. The Audit page's own `audit.view` checks (sidebar, route, Credentials
+  page tab) are separate and stay.
 
-- The Add wizard and Edit page show **Events to send**
-  (`components/integrations/AuditEventsSection.tsx`, `integration-audit-events`) in the main
-  form, above the action buttons, only for the `audit` category. It is bound to the
-  integration's `audit_events`, and `audit_events` is sent only for that category.
-- It renders `components/integrations/AuditEventPicker.tsx` with the test id prefix
-  `integration-audit`: `integration-audit-picker`, one group toggle per group
-  (`integration-audit-group-<group>`, checked, unchecked or indeterminate) and one toggle
-  per event (`integration-audit-event-<event>`). Groups, labels and descriptions come from
-  `GET /v1/settings/audit-events` (`apiClient.getAuditEventCatalog`), never a hard-coded
-  list. Selected names the catalogue does not list are kept.
-- With nothing selected, saving is allowed and `integration-audit-events-empty` warns that
-  the integration will receive nothing. When the catalogue cannot be loaded,
-  `integration-audit-events-error` says so, no toggles are shown and saving keeps the stored
-  selection.
-- Below it, **Delivery limits**
-  (`components/integrations/AuditDeliveryLimitsSection.tsx`, `integration-audit-limits`), also
-  only for the `audit` category, has two optional number fields with the placeholder
-  **Never**: **Give up on a record after … attempts** (`integration-audit-max-attempts-input`,
-  bound to `audit_max_attempts`) and **Skip records older than … seconds**
-  (`integration-audit-drop-after-input`, bound to `audit_drop_after_secs`). Empty means no
-  limit. A value that is not a whole number of 1 or more is marked invalid
-  (`integration-audit-max-attempts-error`, `integration-audit-drop-after-error`) and blocks
-  saving with a message naming the field. Both are sent only for the `audit` category: the
-  Add wizard leaves an empty one out, and the Edit page loads the stored values and sends an
-  emptied one as `null`, which clears it. The helpers live in `utils/auditIntegrations.ts`.
-- Settings › Security › VP Audit uses the same picker with the prefix `vp-audit` under
-  **Events to keep**, bound to the settings' `audit_events`. Its `vp-audit-scope-note` says
-  those settings control the VP Audit Log only, and `vp-audit-catalog-error` replaces the
-  picker when the catalogue cannot be loaded.
+### Integrations page
 
-### Query parameters
+- `pages/IntegrationsPage/` (`page-integrations`) has three tabs: Integrations, Endpoints and
+  Event Sets (`integrations-tab-integrations`, `integrations-tab-endpoints`,
+  `integrations-tab-event-sets`). The tab is kept in `?tab=` (`integrations`, `endpoints`,
+  `event-sets`), and an unknown value opens Integrations. Only the active tab is mounted.
+- `useIntegrationDefinitions` loads integrations, endpoints and event sets together, so each
+  tab can name the others. One filter box serves all three tabs.
+- Rows are `integration-row-<id>`, `endpoint-row-<id>` and `event-set-row-<id>`. Inside a
+  row, the buttons are `<area>-test-button`, `<area>-edit-button` and `<area>-delete-button`
+  (`integration`, `endpoint`, `event-set`; event sets have no test). The add buttons are
+  `integrations-add-button`, `endpoints-add-button` and `event-sets-add-button`.
+- An endpoint or event set in use cannot be deleted. Its Delete button is disabled, with the
+  integrations using it in the title. A refusal from the gateway shows as an error toast.
 
-The Add wizard honours `?category=` and `?type=` once permissions have loaded, and never
-overrides a category the user already picked. A requested category the user can't choose
-shows the `integration-category-unavailable` warning instead of silently falling back.
+### Endpoint editor
+
+- `pages/EndpointEditorPage/` (`page-endpoint-editor`): `/integrations/endpoints/new`
+  (`?type=` preselects a type) and `/integrations/endpoints/:id`. The type is chosen once
+  (`endpoint-type-select`) and fixed after.
+- The fields of each type come from `ENDPOINT_FIELDS` in `endpointFields.ts`, which lists only
+  what the gateway's publishers read: email `cc` and `bcc`; Slack `bot_name` and
+  `icon_emoji`, no channel; stream SASL only for Kafka, no AWS keys. Each field is
+  `endpoint-<field>-input`; the others are `endpoint-name-input`, `endpoint-active-switch`,
+  `endpoint-save-button` and `endpoint-cancel-button`.
+- **Send test** (`endpoint-test-button`) tests the saved endpoint, so it is disabled while
+  there are unsaved changes.
+- Secret fields use `components/integrations/SecretInput.tsx`, and a stored value is never
+  shown. A stored secret is kept by default and can be replaced or, when optional, cleared:
+  `endpoint-<field>-replace-button`, `-clear-button`, `-undo-button`, `-keep-button` and
+  `-input`.
+- `-stored-secret-select` picks an appliance-wide secret instead (`hooks/useApplianceSecrets.ts`),
+  saved as `$SECRET:<secret_id>`. Webhook headers have no picker, because only header values
+  resolve references; they are written inside the JSON.
+- A stored reference counts as a stored secret (`form.stored`, not the endpoint's `secrets`
+  list, which leaves references out), so it also gets Keep and, when optional, Clear.
+- `buildConfiguration` leaves kept secrets out, so the gateway keeps them. On an update it sends
+  `null` for a stored secret that is cleared or left empty, such as a reference set to "None, type
+  a value", since the gateway keeps one that is left out. It also sends `null` for a stored secret
+  the form now hides, such as the SASL password once SASL is switched off, so no unseen credential
+  stays stored.
+
+### Event set editor
+
+- `pages/EventSetEditorPage/` (`page-event-set-editor`): `/integrations/event-sets/new` and
+  `/integrations/event-sets/:id`.
+- Events are picked from the whole catalog with `components/integrations/GroupedEventPicker.tsx`,
+  using the prefix `event-set`: `event-set-search-input`, `event-set-group-<group>` and
+  `event-set-event-<event id>`. Families come from the catalog, and audit events are grouped
+  further by their audit group.
+- `?preset=audit` starts a new event set named **Governance Audit** with every audit event
+  picked.
+- Events the catalog no longer lists are shown, each with an `event-set-remove-<event>-button`,
+  since the gateway refuses to save them. The other ids are `event-set-name-input`,
+  `event-set-save-button` and `event-set-cancel-button`.
+- `components/integrations/AuditEventPicker.tsx` is a thin wrapper over the same picker, for
+  Settings › Security › VP Audit. There it uses the prefix `vp-audit`, the catalog from
+  `GET /v1/settings/audit-events`, `vp-audit-scope-note` and `vp-audit-catalog-error`.
+
+### Integration editor
+
+- `pages/IntegrationEditorPage/` (`page-integration-editor`): `/integrations/new` and
+  `/integrations/:id`. Its ids are `integration-name-input`, `integration-endpoint-select`,
+  `integration-event-set-select`, `integration-active-switch`, `integration-save-button`,
+  `integration-cancel-button` and `integration-test-button`.
+- `TemplateEditor.tsx` shows the template fields of the endpoint type, from `templateModel.ts`,
+  with the gateway's defaults as placeholders. Each field is `template-<field>-input`.
+- The template editor also lists the variables the chosen event set fills. Each one is a
+  `template-insert-<NAME>-button` that inserts the variable where the cursor is.
+- Choosing an endpoint of another type starts the template over.
+- **Delivery limits** (`components/integrations/AuditDeliveryLimitsSection.tsx`,
+  `integration-audit-limits`, `integration-audit-max-attempts-input`,
+  `integration-audit-drop-after-input`) appear only when the event set holds audit events.
+  Their helpers live in `utils/auditIntegrations.ts`.
+- Save and **Send test** share one check, `problem()`: missing fields, a payload that is not a
+  JSON object, variables no event of the set fills, or invalid limits. Send test is disabled
+  with the same reason Save gives, and posts the integration as it stands on screen
+  (`testDraftIntegration`).
+- `${APPLIANCE_ID}` is filled by the gateway from the **Appliance ID** in Settings › System
+  Settings (`settings-appliance-id-input`), and is empty while none is set.
 
 ### Audit Log header
 
-The Audit Log header shows `audit-forward-button` beside Refresh for users with
-`integrations.view`, only when `/integrations/config` offers the `audit` category.
-
-- **Forwarding to N integration(s)** counts active `audit` integrations without a
-  `tenant_id` whose `audit_events` is not empty, the ones that receive records, and opens
-  the Integrations list (`useAuditForwarding`).
-- When active appliance-wide `audit` integrations select no events, the button shows a
-  warning icon (`audit-forward-no-events-warning`) and its tooltip says how many select no
-  events and receive nothing.
-- When VP Auditing is disabled in Settings › Security, the label is unchanged and the
-  tooltip says the VP Audit Log keeps nothing while integrations still receive the events
-  selected for them.
-- With none receiving, users with `integrations.edit` get **Forward records**, which opens
-  the wizard at `?category=audit&type=stream`.
-- The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says the log keeps the events
-  selected under Settings › Security › VP Audit while VP Auditing is enabled, and that each
-  Governance Audit integration receives its own selected events independently of the log,
-  at least once, so receivers deduplicate on `event_id`.
-
-### Starting content
-
-- Integration starting content comes from `utils/integrationSamples.ts`, never from
-  hard-coded samples in the forms.
-- `buildIntegrationSamples` builds, for the selected category, the Stream/Webhook JSON
-  payload, the Email subject and body, and the Slack message text from the backend
-  runtime-variable catalogue (`GET /integrations/runtime-variables`: the general
-  variables plus the category's own), so a sample only uses variables that category can
-  substitute. `audit` keeps its curated full-record JSON payload, and Email and Slack
-  leave out `AUDIT_RECORD` and `AUDIT_VP_JWT`. `user` has a curated minimal JSON payload
-  (`appliance_id`, `event_type`, `timestamp`, and the user's id, role and status) so names,
-  emails and the state blocks leave the appliance only when an operator adds them.
-- Every sample leads with `appliance_id: ${APPLIANCE_ID}`. The backend fills it on every
-  delivery from the **Appliance ID** in Settings › System Settings (`appliance_id`,
-  `settings-appliance-id-input`, e.g. the appliance's Agent Watch id), never from event or
-  caller values, and leaves it unfilled while none is set. It is never the appliance DID
-  and is independent of any Kafka topic name. `GET /integrations/runtime-variables`
-  returns the set value as its `example`, and saving settings clears the cached catalogue.
-- The Add wizard and Edit page apply it through `hooks/useIntegrationSamples.ts`. When the
-  category changes, each type's content that is empty or still the previous category's
-  sample (compared ignoring key order, since the gateway stores payloads with keys sorted)
-  is replaced with the new sample, and edited content is kept.
-- The Edit page starts only after the integration has loaded, so stored content is never
-  replaced on open.
-
-## Attaching integrations to events
-
-`components/connection-points/IntegrationsStep.tsx` attaches integrations to a resource's
-events on the gateway, connection point, user, and identity pages.
-
-- Choosing an integration in the selector (`data-testid="integrations-step-select"`)
-  attaches it at once with its template's custom (`_`-prefixed) variables set empty, opens
-  its card, and drops it from the selector. Event checkboxes carry
-  `data-testid="integration-<index>-event-<event type>"`.
-- Missing custom variables are judged against the integration's template, not only the
-  stored values.
-- `requireEventTypes` (user and identity pages) blocks saving until every attached
-  integration names an event, matching the API, which refuses a new mapping without one.
-- One attachability rule drives both the selector and the stored list: an integration of the
-  page's category or `general` can be attached, an uncategorised one only on resource pages,
-  and with `applianceWide` (user and identity pages, mirroring the API) never an uncategorised
-  or tenant-owned one. A stored mapping whose integration is missing or not attachable renders
-  as a `NOT AVAILABLE` row (`data-testid="integration-<index>-unavailable"`) with its id and a
-  Remove button, and blocks saving until removed. Stored mappings are never dropped without
-  the operator removing them.
-- The user and identity pages show a failed load as an error with no editor, so an empty
-  list can never be saved over the stored mappings, and a failed save as an error, never as
-  success. Save buttons are `user-integrations-save-button` and
-  `identity-integrations-save-button`.
+- The Audit Log header shows `audit-forward-button` to users with `integrations.view`. It
+  counts the active integrations, with an active endpoint, whose event set holds audit
+  events (`useAuditForwarding`), and opens `/integrations`.
+- Integrations with audit events that are disabled, or whose endpoint is, add a warning icon
+  (`audit-forward-paused-warning`) and a tooltip.
+- When VP Auditing is off, the tooltip says the VP Audit Log keeps nothing while integrations
+  still receive the audit events of their event sets.
+- When none receive records, users with `integrations.edit` get **Forward records**, which
+  opens `/integrations/event-sets/new?preset=audit`.
+- The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says each integration with an
+  event set holding audit events receives them independently of the log, at least once, so
+  receivers deduplicate on `event_id`.
 
 ## Validation
 
