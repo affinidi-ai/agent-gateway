@@ -63,7 +63,10 @@ struct CachedEntries {
 ///
 /// A failing or slow directory never fails the caller: it keeps serving the
 /// last list it answered, retrying every 30 s, or an empty list if it has never
-/// answered. A successful answer, even an empty one, replaces the list.
+/// answered. A successful answer, even an empty one, replaces the list. An
+/// expired list that was once answered successfully is returned at once while
+/// one background task refreshes it; only a directory that has never answered
+/// makes a caller wait, bounded by the request timeout.
 ///
 /// At startup the directory may need time to answer its first request, or
 /// answer that it is unavailable. A background task asks again every 2 s for up
@@ -78,6 +81,18 @@ pub struct MediatorDirectory {
     refresh: Mutex<()>,
     warming_up: AtomicBool,
     loaded: AtomicBool,
+    refreshing: AtomicBool,
+}
+
+/// Clears the single-flight flag when the refresh task ends, however it ends.
+struct RefreshFlag(Arc<MediatorDirectory>);
+
+impl Drop for RefreshFlag {
+    fn drop(&mut self) {
+        self.0
+            .refreshing
+            .store(false, Ordering::SeqCst);
+    }
 }
 
 /// What the gateway knows about whether the directory lists a mediator: it has
@@ -106,16 +121,74 @@ impl MediatorDirectory {
         secret: Option<HookSecret>,
         timeout: Duration,
     ) -> Self {
+        Self::with_timeouts(url, secret, timeout, timeout.max(STARTUP_REQUEST_TIMEOUT))
+    }
+
+    fn with_timeouts(
+        url: String,
+        secret: Option<HookSecret>,
+        timeout: Duration,
+        startup_timeout: Duration,
+    ) -> Self {
         Self {
             url,
             timeout,
-            startup_timeout: timeout.max(STARTUP_REQUEST_TIMEOUT),
+            startup_timeout,
             secret,
             cache: Mutex::new(None),
             refresh: Mutex::new(()),
             warming_up: AtomicBool::new(false),
             loaded: AtomicBool::new(false),
+            refreshing: AtomicBool::new(false),
         }
+    }
+
+    /// Refreshes an expired list that was answered before in one background
+    /// task, whatever the number of callers asking meanwhile.
+    fn refresh_in_background(self: &Arc<Self>) {
+        if self
+            .refreshing
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let directory = Arc::clone(self);
+        tokio::spawn(async move {
+            let _flag = RefreshFlag(directory.clone());
+            let _refresh = directory.refresh.lock().await;
+            if directory.is_fresh().await {
+                return;
+            }
+            match tokio::time::timeout(directory.timeout, directory.fetch(directory.timeout)).await {
+                Ok(Ok(entries)) => {
+                    directory
+                        .apply_success(entries)
+                        .await
+                }
+                Ok(Err(reason)) => {
+                    warn!("Mediator directory unavailable: {reason}");
+                    directory.keep_current().await;
+                }
+                Err(_) => {
+                    warn!("Mediator directory did not answer within {:?}", directory.timeout);
+                    directory.keep_current().await;
+                }
+            }
+        });
+    }
+
+    async fn is_fresh(&self) -> bool {
+        self.cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|cached| cached.fetched_at.elapsed() < cached.ttl)
+    }
+
+    async fn keep_current(&self) {
+        let current = self.cached_or_empty().await;
+        self.store(current, RETRY_TTL)
+            .await;
     }
 
     fn start_warmup(
@@ -196,7 +269,7 @@ impl MediatorDirectory {
     /// other callers get the previous list, or wait for the fetch when there is
     /// none yet, and then use its result. During the startup warm-up nobody
     /// waits: callers get the list the warm-up has so far.
-    pub async fn entries(&self) -> Vec<DirectoryEntry> {
+    pub async fn entries(self: &Arc<Self>) -> Vec<DirectoryEntry> {
         let stale = {
             let cache = self.cache.lock().await;
             match cache.as_ref() {
@@ -210,6 +283,12 @@ impl MediatorDirectory {
             .load(Ordering::SeqCst)
         {
             return stale.unwrap_or_default();
+        }
+        if self.has_loaded()
+            && let Some(entries) = stale.clone()
+        {
+            self.refresh_in_background();
+            return entries;
         }
         let _refresh = match self.refresh.try_lock() {
             Ok(guard) => guard,
@@ -306,7 +385,7 @@ impl MediatorDirectory {
     }
 
     pub async fn find(
-        &self,
+        self: &Arc<Self>,
         id: &str,
     ) -> Option<DirectoryEntry> {
         self.entries()
@@ -326,6 +405,20 @@ impl MediatorDirectory {
         let response: DirectoryResponse =
             serde_json::from_slice(&body).map_err(|e| format!("invalid directory response: {e}"))?;
         Ok(sanitize_entries(response.items))
+    }
+
+    #[cfg(test)]
+    async fn settle(&self) {
+        for _ in 0..200 {
+            if !self
+                .refreshing
+                .load(Ordering::SeqCst)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the background refresh did not finish");
     }
 
     #[cfg(test)]
@@ -398,8 +491,8 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    fn directory(url: String) -> MediatorDirectory {
-        MediatorDirectory::with_timeout(url, None, Duration::from_secs(3))
+    fn directory(url: String) -> Arc<MediatorDirectory> {
+        Arc::new(MediatorDirectory::with_timeout(url, None, Duration::from_secs(3)))
     }
 
     async fn serve_with(handler: axum::routing::MethodRouter) -> String {
@@ -463,7 +556,8 @@ mod tests {
         let secret = uuid::Uuid::new_v4()
             .simple()
             .to_string();
-        let directory = MediatorDirectory::with_timeout(url, HookSecret::new(&secret), Duration::from_secs(3));
+        let directory =
+            Arc::new(MediatorDirectory::with_timeout(url, HookSecret::new(&secret), Duration::from_secs(3)));
         let first = directory.entries().await;
         let second = directory.entries().await;
         assert_eq!(first, second);
@@ -548,7 +642,7 @@ mod tests {
             "{}"
         }))
         .await;
-        let directory = MediatorDirectory::with_timeout(url, None, Duration::from_millis(300));
+        let directory = Arc::new(MediatorDirectory::with_timeout(url, None, Duration::from_millis(300)));
         let started = Instant::now();
         assert!(
             directory
@@ -572,7 +666,7 @@ mod tests {
             }
         }))
         .await;
-        let directory = Arc::new(directory(url));
+        let directory = directory(url);
         let callers: Vec<_> = (0..5)
             .map(|_| {
                 let directory = directory.clone();
@@ -656,6 +750,8 @@ mod tests {
         );
         healthy.store(false, Ordering::SeqCst);
         directory.expire_cache().await;
+        directory.entries().await;
+        directory.settle().await;
         assert!(
             directory
                 .entries()
@@ -684,7 +780,7 @@ mod tests {
             }
         }))
         .await;
-        let directory = Arc::new(directory(url));
+        let directory = directory(url);
         directory.start_warmup(Duration::from_millis(50), Duration::from_secs(10));
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -730,7 +826,7 @@ mod tests {
             }
         }))
         .await;
-        let directory = Arc::new(directory(url));
+        let directory = directory(url);
         directory.start_warmup(Duration::from_millis(30), Duration::from_millis(150));
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
@@ -756,9 +852,8 @@ mod tests {
             r#"{"items":[{"did":"did:web:m.example","name":"Shared"}]}"#
         }))
         .await;
-        let mut slow = MediatorDirectory::with_timeout(url, None, Duration::from_millis(100));
-        slow.startup_timeout = Duration::from_secs(5);
-        let directory = Arc::new(slow);
+        let directory =
+            Arc::new(MediatorDirectory::with_timeouts(url, None, Duration::from_millis(100), Duration::from_secs(5)));
         assert!(
             directory
                 .entries()
@@ -820,7 +915,7 @@ mod tests {
             r#"{"items":[{"did":"did:web:m.example","name":"Shared"}]}"#
         }))
         .await;
-        let directory = Arc::new(directory(url));
+        let directory = directory(url);
         let fetching = {
             let directory = directory.clone();
             tokio::spawn(async move { directory.entries().await })
@@ -880,6 +975,7 @@ mod tests {
         state.store(1, Ordering::SeqCst);
         directory.expire_cache().await;
         directory.entries().await;
+        directory.settle().await;
         assert_eq!(
             directory
                 .listing("did:web:m.example")
@@ -891,6 +987,7 @@ mod tests {
         state.store(2, Ordering::SeqCst);
         directory.expire_cache().await;
         directory.entries().await;
+        directory.settle().await;
         assert_eq!(
             directory
                 .listing("did:web:m.example")
@@ -898,6 +995,108 @@ mod tests {
             Listing::NotListed,
             "a successful empty answer lists nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_list_is_returned_at_once_while_one_slow_refresh_runs() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let url = serve_with(axum::routing::get(move || {
+            let counter = counter.clone();
+            async move {
+                let call = counter.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    r#"{"items":[{"did":"did:web:old.example","name":"Old"}]}"#
+                } else {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    r#"{"items":[{"did":"did:web:new.example","name":"New"}]}"#
+                }
+            }
+        }))
+        .await;
+        let directory = directory(url);
+        assert_eq!(directory.entries().await[0].did, "did:web:old.example");
+        directory.expire_cache().await;
+
+        let started = Instant::now();
+        let callers: Vec<_> = (0..5)
+            .map(|_| {
+                let directory = directory.clone();
+                tokio::spawn(async move { directory.entries().await })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.await.unwrap()[0].did, "did:web:old.example", "the stale list is served");
+        }
+        assert!(started.elapsed() < Duration::from_millis(300), "no caller waits for the refresh");
+
+        directory.settle().await;
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one refresh for all callers");
+        assert_eq!(directory.entries().await[0].did, "did:web:new.example", "the refresh result is used next");
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_never_answered_makes_a_caller_wait_for_the_first_answer() {
+        let url = serve_with(axum::routing::get(|| async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            r#"{"items":[{"did":"did:web:m.example","name":"Shared"}]}"#
+        }))
+        .await;
+        let directory = directory(url);
+        let started = Instant::now();
+        let listed = directory.entries().await;
+        assert_eq!(listed.len(), 1);
+        assert!(started.elapsed() >= Duration::from_millis(150), "a cold directory is waited for");
+    }
+
+    #[tokio::test]
+    async fn the_refresh_flag_is_cleared_even_when_the_refresh_task_panics() {
+        let directory = directory("http://127.0.0.1:9/directory".to_string());
+        directory
+            .refreshing
+            .store(true, Ordering::SeqCst);
+        let guarded = directory.clone();
+        let task = tokio::spawn(async move {
+            let _flag = RefreshFlag(guarded);
+            panic!("the refresh task failed");
+        });
+        assert!(task.await.is_err());
+        assert!(
+            !directory
+                .refreshing
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_waited_for_the_lock_skips_the_fetch_when_the_cache_became_fresh() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let url = serve_with(axum::routing::get(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                r#"{"items":[{"did":"did:web:m.example","name":"Shared"}]}"#
+            }
+        }))
+        .await;
+        let directory = directory(url);
+        directory.entries().await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        directory.expire_cache().await;
+
+        let held = directory.refresh.lock().await;
+        directory.refresh_in_background();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        directory
+            .apply_success(vec![DirectoryEntry {
+                did: "did:web:m.example".into(),
+                name: "Shared".into(),
+            }])
+            .await;
+        drop(held);
+        directory.settle().await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the queued refresh saw a fresh cache and did not fetch");
     }
 
     #[tokio::test]

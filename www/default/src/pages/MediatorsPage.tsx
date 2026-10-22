@@ -10,7 +10,11 @@ import { DeleteButton } from '../components/shared/DeleteButton';
 import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
-import { isProvidedMediator, isUnstoredDirectoryMediator } from '../utils/mediators';
+import {
+  isProvidedMediator,
+  isUnstoredDirectoryMediator,
+  mediatorPageRows,
+} from '../utils/mediators';
 
 interface Mediator {
   id: string;
@@ -90,7 +94,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
       setLoading(true);
       setError(null);
       const response = await apiClient.get('/mediators');
-      setMediators(response.data);
+      setMediators(mediatorPageRows(response.data));
     } catch (err: any) {
       setError(err.message || 'Failed to load mediators');
     } finally {

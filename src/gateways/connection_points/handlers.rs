@@ -713,7 +713,6 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
 
     let via_directory = crate::event_hook::is_directory_mediator_id(&req.mediator_id);
     let mut pending_mediator = None;
-    let mut directory_use = None;
     let mediator = if via_directory {
         match crate::mediators::handlers::resolve_directory_mediator(
             mediator_store.as_ref(),
@@ -725,10 +724,7 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
         )
         .await?
         {
-            crate::mediators::handlers::DirectoryMediator::Stored(mediator, usage) => {
-                directory_use = Some(usage);
-                mediator
-            }
+            crate::mediators::handlers::DirectoryMediator::Stored(mediator) => mediator,
             crate::mediators::handlers::DirectoryMediator::Pending(mediator) => {
                 pending_mediator = Some(mediator.clone());
                 mediator
@@ -955,45 +951,38 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
 
     debug!("Creating connection point with ID: {}", connection_point.id);
 
-    let mut created_mediator = None;
     if let Some(pending) = pending_mediator {
-        let (stored, created, usage) = crate::mediators::handlers::store_pending_directory_mediator(
+        let stored = crate::mediators::handlers::store_pending_directory_mediator(
             mediator_store.as_ref(),
+            notif_store.as_ref(),
             pending,
             gateway.tenant_id.as_deref(),
             &context,
             &scope,
         )
         .await?;
-        directory_use = Some(usage);
-        connection_point.mediator_id = stored.id.clone();
-        if created {
-            created_mediator = Some(stored);
-        }
+        connection_point.mediator_id = stored.id;
+    }
+
+    if mediator_store
+        .get(&connection_point.mediator_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()).into());
     }
 
     let saved = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, Some(&mediator.did));
     let record = connection_point.clone();
     let store = pub_store.clone();
-    if let Err(e) = creation
+    creation
         .complete(async move { store.create(&record).await }, saved)
         .await
-    {
-        error!("Failed to create connection point: {}", e);
-        if let Some(created) = &created_mediator {
-            crate::mediators::handlers::roll_back_directory_mediator(
-                mediator_store.as_ref(),
-                pub_store.as_ref(),
-                created,
-            )
-            .await;
-        }
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create connection point: {}", e)).into());
-    }
-    drop(directory_use);
-    if let (Some(created), Some(notif)) = (&created_mediator, notif_store.as_ref()) {
-        crate::mediators::handlers::announce_mediator_created(notif, created);
-    }
+        .map_err(|e| {
+            error!("Failed to create connection point: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create connection point: {}", e))
+        })?;
 
     info!(
         "Connection point created successfully: ID={}, Gateway={}, Mediator={}, OOB_ID={}, URL={}",

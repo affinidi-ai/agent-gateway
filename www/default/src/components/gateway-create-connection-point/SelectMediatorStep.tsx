@@ -4,6 +4,7 @@ import { topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../shared/AppButton';
 import { CopyButton } from '../shared/CopyButton';
 import { Link } from '../shared/Link';
+import { dropdownMediators } from '../../utils/mediators';
 import { initialMediatorSelection, MediatorOption } from './mediatorOptions';
 
 interface SelectMediatorStepProps {
@@ -32,7 +33,9 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
       setError('');
       const response = await apiClient.get('/mediators/compatible');
       // Backend returns array directly, not wrapped in object
-      const mediatorsList: MediatorOption[] = Array.isArray(response.data) ? response.data : [];
+      const mediatorsList: MediatorOption[] = dropdownMediators(
+        Array.isArray(response.data) ? response.data : []
+      );
       setMediators(mediatorsList);
       setSelectedMediator(initialMediatorSelection(mediatorsList, initialMediatorId));
     } catch (err: unknown) {

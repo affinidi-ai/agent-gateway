@@ -389,8 +389,9 @@ counts as unavailable, and the gateway lists only its stored mediators. Entries 
 use: at most 50, a well-formed `did:` DID of at most 1024 bytes, a non-empty `name` of at most 200
 characters with control characters replaced by spaces and whitespace collapsed, duplicates by DID
 dropped. The list is cached for 5
-minutes after a non-empty answer and 30 seconds after an empty or failed one, and a failed refresh
-keeps serving the last good list.
+minutes after a non-empty answer and 30 seconds after an empty or failed one. Once the directory has answered, an
+expired list is returned at once while one background task refreshes it, so no caller waits, and a
+failed refresh keeps serving the last good list.
 
 **Startup.** A directory may need time to answer its first request, or answer `503` until it can.
 Right after start the gateway therefore asks every 2 seconds, in the background, for up to 30
@@ -407,32 +408,42 @@ Creating a Connection Point with a `directory:` id before the directory has answ
 header, because the gateway cannot tell yet whether the id was ever offered. Once the directory has
 answered, an id it does not list is `404 Mediator not found`.
 
-A directory entry is listed with the id `directory:<16 hex characters>` (stable per DID), its `name`,
-`provided: true`, no description and no identity on the mediator. The wizard pre-selects the first
-`provided` mediator when no other choice was made; nothing else marks it. It is read-only: it cannot be
-fetched, edited, deleted or pinged by that id. Creating a Connection Point with that `mediator_id`
-turns it into a stored record the first time: the gateway resolves the mediator's DID document,
-mints its own identity on it like `POST /v1/mediators` does, and stores it with `provided: true`.
-That path needs no `mediators.edit` permission and the record does not count toward the
-`connections.mediators` limit. The caller's resource scope is checked against the `directory:` id,
-as in the list. The record's id is fixed by the DID (and the token's tenant), so every event of the
-Connection Point, `creation_started` included, carries the id the record is stored under. The record
-is stored just before the Connection Point is saved and removed again if saving fails; a request
-that fails earlier (an unresolvable DID document answers `502`, a mediator that refuses the DID
-fails the creation) stores nothing. Later requests for the same entry reuse the record, which the
-list shows in place of the entry. A mediator an operator stored for the same DID always wins: it
-is listed as it is, without `provided`, and the entry is not listed. A stored provided record is
-listed under the entry's current `name`. Among
-several records for one DID, an operator's comes first, then the oldest. A stored provided record cannot be
-changed through the API: `PUT /v1/mediators/<id>` answers `409`, and so does `DELETE` while a
-Connection Point or a running request uses the record. Once nothing uses it, `DELETE` removes it, and
-the next Connection Point created on the entry stores it again from the directory, which is how a
-stale record (for example one whose DID the directory dropped) is refreshed or cleaned up. A stored
-provided record is also subject to the caller's mediator resource scope, by its own id, like any
-mediator. A record is reused only
-when the gateway of the new Connection Point may reference it, so each tenant gets its own, and the
-list shows one row per DID. A record that a failed request created is removed again unless another
-request or a stored Connection Point uses it.
+A directory entry is always listed with the id `directory:<16 hex characters>` (stable per DID), its
+`name`, `provided: true`, no description and no identity on the mediator. The wizard pre-selects the
+first `provided` mediator when no other choice was made; nothing else marks it. The entry is
+read-only: it cannot be fetched, edited, deleted or pinged by that id. Creating a Connection Point
+with that `mediator_id` turns it into a stored record the first time: the gateway resolves the
+mediator's DID document, mints its own identity on it like `POST /v1/mediators` does, and stores it
+with `provided: true`. That path needs no `mediators.edit` permission and the record does not count
+toward the `connections.mediators` limit. The caller's resource scope is checked against the
+`directory:` id. The record's id is fixed by the DID (and the token's tenant), so every event of the
+Connection Point, `creation_started` included, carries the id the record is stored under. The
+record is stored just before the Connection Point is saved, under a lock per DID, and it stays if
+saving then fails: it is read-only and reused by the next attempt. The mediator created
+notification fires when it is stored. A request that fails earlier (an unresolvable DID document
+answers `502`, a mediator that refuses the DID fails the creation) stores nothing. A record is
+reused only when the gateway of the new Connection Point may reference it, so each tenant gets its
+own, and a mediator an operator added for the same DID is never used for a `directory:` id: it is
+listed as its own row next to the entry.
+
+The list returns every directory entry first, then every stored record the caller may use,
+operator-added and provided alike, one row per record id: a Connection Point keeps the id of the
+record it was created on, so that record stays listed while the directory still offers its DID. The
+dashboard shows each mediator once: the Create Connection Point dropdown offers a directory mediator
+only as its `directory:` entry, and the Mediators page shows the stored record when one exists for the
+DID and the entry otherwise. A stored provided record cannot be changed through the API: `PUT
+/v1/mediators/<id>` answers `409`. `DELETE` answers `409` too, with a message saying it is still
+offered by the directory or used by a connection point, until the directory has answered
+successfully without its DID and no stored Connection Point uses it. Then `DELETE` removes it, and
+the next Connection Point created on the entry, if the directory offers it again, stores it fresh.
+That is how a stale provided mediator is cleaned up or refreshed. The check and the removal hold
+the same per-DID lock as the creation, and the record is read again under it, so a creation cannot
+start using the record meanwhile. A stored provided record also follows the caller's mediator
+resource scope, by its own id, like any mediator. A record already stored under the id a
+`directory:` entry would get, which the caller may not use, fails the creation with `404` before
+anything is sent or created. One narrow window remains: if a stale record is deleted after a creation
+checked that it still exists, just before the Connection Point is saved, that Connection Point refers
+to a missing mediator.
 
 **Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
 `did` field is logged like any DID and masked by the global log redactor. The URL, the secret and
