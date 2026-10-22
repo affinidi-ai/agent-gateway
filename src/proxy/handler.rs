@@ -7218,10 +7218,10 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
-    // An A2A event stream may outlast the request timeout: the call is bounded
-    // by the stream lifetime on top of it, and the stream itself by the limits
-    // in `a2a_stream::stream_limits`.
-    if is_a2a_stream_request {
+    // An A2A event stream may outlast the request timeout: its headers must
+    // arrive within it, the call is bounded by the stream lifetime on top of
+    // it, and the stream itself by the limits in `a2a_stream::stream_limits`.
+    let a2a_stream_header_timeout = if is_a2a_stream_request {
         let request_secs = state
             .surface
             .timeout()
@@ -7239,7 +7239,10 @@ async fn proxy_handler_with_mcp_runtime(
                 .stream_max_lifetime_secs
                 .saturating_add(request_secs),
         ));
-    }
+        Some(std::time::Duration::from_secs(request_secs))
+    } else {
+        None
+    };
 
     // Get circuit breaker if configured
     let circuit_breaker = if state
@@ -7343,7 +7346,7 @@ async fn proxy_handler_with_mcp_runtime(
         if let Some(retry_config) = state
             .surface
             .retry()
-            .filter(|_| modern_request.is_none())
+            .filter(|_| modern_request.is_none() && !is_a2a_stream_request)
         {
             let mut attempt = 0;
             let mut _last_error = None;
@@ -7488,6 +7491,12 @@ async fn proxy_handler_with_mcp_runtime(
             .await
             .map_err(|_| {
                 create_error_response(StatusCode::GATEWAY_TIMEOUT, "Modern MCP upstream response headers timed out")
+            })??
+    } else if let Some(header_timeout) = a2a_stream_header_timeout {
+        tokio::time::timeout(header_timeout, send_response)
+            .await
+            .map_err(|_| {
+                create_error_response(StatusCode::GATEWAY_TIMEOUT, "A2A upstream response headers timed out")
             })??
     } else {
         send_response.await?

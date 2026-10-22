@@ -581,9 +581,10 @@ stream ends when the Target's does, so a terminal state (`TASK_STATE_COMPLETED`,
 `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, `TASK_STATE_REJECTED`) or an interrupted one
 (`TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_AUTH_REQUIRED`) reaches the caller as the Target sent it,
 and a clean end adds nothing. For a streaming method the Gateway asks the Target for an uncompressed
-body (`Accept-Encoding: identity`), and bounds the call by `[a2a] stream_max_lifetime_secs` on top
-of the request timeout; the stream's own limits are in
-[Upstream Response Bounds](#upstream-response-bounds).
+body (`Accept-Encoding: identity`) and sends the call once, whatever the surface's `retry` policy.
+The Target must send its response headers within the request timeout, or the caller gets HTTP `504`,
+and the call is bounded by `[a2a] stream_max_lifetime_secs` on top of the request timeout; the
+stream's own limits are in [Upstream Response Bounds](#upstream-response-bounds).
 
 Each event's data must be a JSON object, the JSON-RPC response that carries the event. Before the
 checks run, a v1.0 `StreamResponse` member (`task`, `message`, `statusUpdate` or `artifactUpdate`)
@@ -723,8 +724,9 @@ An A2A event stream from a direct Target (see [Event streams](#event-streams)) i
 a time. One event, as received and after the checks, may hold up to `[a2a] max_body_size`, and the
 stream ends with an error event when the Target sends nothing for the surface's
 `networking.timeout.idle_secs` (default 60 s; `0` leaves only the lifetime) or is still streaming at
-`[a2a] stream_max_lifetime_secs` (default 3600 s, at most 86400 s). The call to the Target is
-bounded by that lifetime plus the request timeout, which also bounds the wait for its headers.
+`[a2a] stream_max_lifetime_secs` (default 3600 s, at most 86400 s). The Target must send its
+headers within the request timeout, and the call to it is bounded by that lifetime plus the request
+timeout.
 
 The gateway holds at most 10,000 Legacy SSE sessions (`GET /sse` on `proxy://` and `fabric://`
 surfaces, and on standalone MCP proxies). A `GET /sse` beyond that, after sessions whose client has

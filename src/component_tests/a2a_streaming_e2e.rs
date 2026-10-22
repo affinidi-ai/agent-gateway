@@ -4,8 +4,10 @@
 //! has its events forwarded one at a time and in order, each checked as a
 //! non-streaming reply would be. A response policy deny or an identity claim
 //! that cannot be resolved ends the stream with a JSON-RPC error event; a Target
-//! that closes its stream closes the caller's.
+//! that closes its stream closes the caller's. The Target must send its headers
+//! within the request timeout, and a streaming call is never retried.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -157,6 +159,12 @@ fn write_no_secrets_policy(temp_dir: &std::path::Path) {
         .to_string(),
     )
     .expect("write policy definition");
+}
+
+fn surface_with_networking(networking: Value) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = helpers::build_minimal_channel();
+    surface.target.networking = Some(serde_json::from_value(networking).expect("networking config"));
+    surface
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -461,4 +469,53 @@ async fn a_json_reply_to_a_streaming_method_stays_json() {
     );
     let body: Value = response.json().await.unwrap();
     assert_eq!(body, reply);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_that_sends_no_headers_times_out_at_the_request_timeout() {
+    let (mock, _gate) = MockServer::start_paused("{}").await;
+    let h = GatewayHarness::start_with_mock(mock, |_, config, _| {
+        config.surfaces = vec![surface_with_networking(json!({ "timeout": { "request_secs": 1 } }))];
+    })
+    .await;
+
+    let started = Instant::now();
+    let response = tokio::time::timeout(STALL_BUDGET, send_streaming_message(&h))
+        .await
+        .expect("the gateway stops waiting for the Target's headers");
+
+    assert_eq!(response.status(), 504);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streaming_call_is_sent_once_whatever_the_retry_policy() {
+    let mock =
+        MockServer::start_with_finished_stream("text/event-stream", vec![(Duration::ZERO, event(completed(None)))])
+            .await;
+    let h = GatewayHarness::start_with_mock(mock, |_, config, _| {
+        config.surfaces = vec![surface_with_networking(json!({ "retry": {
+            "max_attempts": 2, "initial_backoff_ms": 10, "max_backoff_ms": 10, "retryable_status_codes": [200]
+        } }))];
+    })
+    .await;
+
+    let response = send_streaming_message(&h).await;
+    let (events, ended) = read_events(response, Instant::now(), |_| false).await;
+
+    assert!(ended);
+    assert_eq!(state_of(&events[0].1), Some("TASK_STATE_COMPLETED"));
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(Ordering::SeqCst),
+        1,
+        "a status the retry policy lists does not resend a streaming call"
+    );
 }
