@@ -594,11 +594,11 @@ afterwards. The checks are those a non-streaming reply gets on the Access Point,
 | Check | On each event |
 | --- | --- |
 | Protected and external identity | Resolved when the event claims an identity: a message that declares `agent-identity/v1` or `agent-identity-credential/v1`, or an identity payload where [backend identity](#backend-identity-in-task-artifacts) is read (a status message, a message, or an artifact, including the single `artifact` of an artifact update). An event without a claim is not resolved and nothing is signed for it. A slot that derives identity from a credential (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) is resolved once, on the first event. A claim that cannot be resolved falls back to the request-path identity when there is one, and ends the stream otherwise. A slot that reads identity from the response (`from_payload`) also needs the stream to claim it: see the end-of-stream check below. |
-| Trust Recorder | Once per resolved DID |
 | Response custom metadata | Injected into the event's `result`, which for a v1.0 event is the member's payload |
 | Agent identity credential | Replaces the raw extension where the event's message declares it, as on a non-streaming reply |
 | Response extension rules | Run on the event |
 | Response policy | Evaluated on the event as it will be sent: `input.response.body` is the event, `content_type` is `text/event-stream`, and `is_error` is true for a JSON-RPC error event. One allow decision is recorded per stream, plus the deny that ends it. |
+| Trust Recorder | Once per resolved DID, for the first event that resolved it and passed every check above |
 
 The serverIdentity presentation a non-streaming reply gets when the caller declares the credential
 extension is not added to events, and payload capture and UCP operation inference do not run on

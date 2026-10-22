@@ -91,7 +91,8 @@ pub trait EventProcessor: Send + 'static {
         event: Value,
     ) -> impl Future<Output = Result<Value, StreamStop>> + Send;
 
-    /// Admits the rewritten event exactly as it will be sent.
+    /// Admits the rewritten event exactly as it will be sent. An admitted event
+    /// is sent.
     fn admit(
         &mut self,
         event: &Value,
@@ -241,14 +242,14 @@ async fn forward_event<Processor: EventProcessor>(
         .rewrite(message)
         .await?;
     rewrap_stream_response(&mut message, member);
-    forwarding
-        .processor
-        .admit(&message)
-        .await?;
     let data = message.to_string();
     if data.len() > forwarding.max_event_bytes {
         return Err(EVENT_TOO_LARGE);
     }
+    forwarding
+        .processor
+        .admit(&message)
+        .await?;
     Ok(Event::default()
         .event(event.event)
         .data(data))
@@ -306,6 +307,7 @@ mod tests {
         refuse_rewrite: Option<&'static str>,
         refuse_admit: Option<&'static str>,
         refuse_finish: bool,
+        pad_rewrite: usize,
     }
 
     impl Recorder {
@@ -317,6 +319,7 @@ mod tests {
                     refuse_rewrite: None,
                     refuse_admit: None,
                     refuse_finish: false,
+                    pad_rewrite: 0,
                 },
                 recorded,
             )
@@ -350,6 +353,9 @@ mod tests {
                 .and_then(Value::as_object_mut)
             {
                 result.insert("seen".to_string(), json!(true));
+                if self.pad_rewrite > 0 {
+                    result.insert("pad".to_string(), json!("x".repeat(self.pad_rewrite)));
+                }
             }
             Ok(event)
         }
@@ -690,6 +696,19 @@ mod tests {
         let forwarded = body_events(response).await;
         assert_eq!(forwarded.len(), 1);
         assert_eq!(error_code(&forwarded[0].1), "upstream_event_too_large");
+    }
+
+    #[tokio::test]
+    async fn an_event_the_checks_grow_past_the_cap_is_not_admitted() {
+        let (mut processor, recorded) = Recorder::new();
+        processor.pad_rewrite = 5000;
+        let (response, _) = respond(futures::stream::iter(chunks(&task_events()[..1])), processor);
+        let forwarded = body_events(response).await;
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(error_code(&forwarded[0].1), "upstream_event_too_large");
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.rewritten.len(), 1);
+        assert!(recorded.admitted.is_empty(), "only an event that will be sent is admitted");
     }
 
     #[tokio::test]

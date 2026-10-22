@@ -5,7 +5,8 @@
 //! an identity, response custom metadata, response extension rules and the
 //! response policy. Identity a slot derives from a credential is resolved once
 //! per stream; identity read from the body is resolved on each event that claims
-//! one. The Trust Recorder runs once per resolved DID.
+//! one. The Trust Recorder runs once per resolved DID, when an event that
+//! resolved it passes every check.
 //!
 //! A stream that delivered results without any event resolving the identity a
 //! slot reads from the body ends with an identity error after its last event,
@@ -76,6 +77,9 @@ pub(super) struct AccessPointEvents {
     request: StreamRequest,
     /// The last protected identity resolved in this stream.
     protected_identity: Option<ProtectedAgentIdentity>,
+    /// The managed DID the event being checked resolved, recorded once the
+    /// event is admitted.
+    event_did: Option<String>,
     external_resolved: bool,
     delivered_result: bool,
     recorded_dids: HashSet<String>,
@@ -91,6 +95,7 @@ impl AccessPointEvents {
             state,
             request,
             protected_identity: None,
+            event_did: None,
             external_resolved: false,
             delivered_result: false,
             recorded_dids: HashSet::new(),
@@ -166,18 +171,8 @@ impl AccessPointEvents {
             },
         };
         self.protected_identity = Some(identity.clone());
-        if let ProtectedAgentIdentity::Managed { did, .. } = &identity
-            && self
-                .recorded_dids
-                .insert(did.clone())
-        {
-            crate::trust_registry_verification::spawn_trust_recorder(
-                &self.state.surface,
-                did,
-                self.state
-                    .trust_registry_listener_manager
-                    .clone(),
-            );
+        if let ProtectedAgentIdentity::Managed { did, .. } = &identity {
+            self.event_did = Some(did.clone());
         }
         Ok(identity)
     }
@@ -381,6 +376,88 @@ impl AccessPointEvents {
             })
     }
 
+    fn record_admitted_identity(&mut self) {
+        if let Some(did) = self.event_did.take()
+            && self
+                .recorded_dids
+                .insert(did.clone())
+        {
+            crate::trust_registry_verification::spawn_trust_recorder(
+                &self.state.surface,
+                &did,
+                self.state
+                    .trust_registry_listener_manager
+                    .clone(),
+            );
+        }
+    }
+
+    async fn check_response_policy(
+        &mut self,
+        event: &Value,
+    ) -> Result<(), StreamStop> {
+        let state = &self.state;
+        let (Some(policy_id), Some(policy_manager)) = (
+            state
+                .surface
+                .response_policy_definition_id(),
+            state.policy_manager.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let input = ResponsePolicyInput {
+            response: ResponseContext {
+                status_code: self.request.status.as_u16(),
+                body: Some(event.clone()),
+                content_type: Some(mime::TEXT_EVENT_STREAM.to_string()),
+                is_error: self
+                    .request
+                    .status
+                    .is_client_error()
+                    || self
+                        .request
+                        .status
+                        .is_server_error()
+                    || event
+                        .get("error")
+                        .is_some_and(|error| !error.is_null()),
+                method: None,
+            },
+            caller: self
+                .request
+                .policy_caller
+                .clone(),
+            surface: SurfaceContext {
+                id: state
+                    .surface
+                    .surface_id
+                    .clone(),
+                name: self
+                    .request
+                    .channel_name
+                    .clone(),
+                protocol: self.protocol(),
+            },
+            metadata: None,
+        };
+        let decision = crate::proxy::response_policy::evaluate_response_policy(
+            policy_manager,
+            &format!("response:{policy_id}"),
+            input,
+        );
+        if !decision.allow {
+            self.record_response_policy_decision(policy_id, policy_manager, decision)
+                .await;
+            return Err(RESPONSE_BLOCKED);
+        }
+        if !self.policy_allow_recorded {
+            self.record_response_policy_decision(policy_id, policy_manager, decision)
+                .await;
+            self.policy_allow_recorded = true;
+        }
+        Ok(())
+    }
+
     async fn record_response_policy_decision(
         &self,
         policy_id: &str,
@@ -471,65 +548,9 @@ impl EventProcessor for AccessPointEvents {
         &mut self,
         event: &Value,
     ) -> Result<(), StreamStop> {
-        let state = &self.state;
-        let (Some(policy_id), Some(policy_manager)) = (
-            state
-                .surface
-                .response_policy_definition_id(),
-            state.policy_manager.as_ref(),
-        ) else {
-            return Ok(());
-        };
-        let input = ResponsePolicyInput {
-            response: ResponseContext {
-                status_code: self.request.status.as_u16(),
-                body: Some(event.clone()),
-                content_type: Some(mime::TEXT_EVENT_STREAM.to_string()),
-                is_error: self
-                    .request
-                    .status
-                    .is_client_error()
-                    || self
-                        .request
-                        .status
-                        .is_server_error()
-                    || event
-                        .get("error")
-                        .is_some_and(|error| !error.is_null()),
-                method: None,
-            },
-            caller: self
-                .request
-                .policy_caller
-                .clone(),
-            surface: SurfaceContext {
-                id: state
-                    .surface
-                    .surface_id
-                    .clone(),
-                name: self
-                    .request
-                    .channel_name
-                    .clone(),
-                protocol: self.protocol(),
-            },
-            metadata: None,
-        };
-        let decision = crate::proxy::response_policy::evaluate_response_policy(
-            policy_manager,
-            &format!("response:{policy_id}"),
-            input,
-        );
-        if !decision.allow {
-            self.record_response_policy_decision(policy_id, policy_manager, decision)
-                .await;
-            return Err(RESPONSE_BLOCKED);
-        }
-        if !self.policy_allow_recorded {
-            self.record_response_policy_decision(policy_id, policy_manager, decision)
-                .await;
-            self.policy_allow_recorded = true;
-        }
+        self.check_response_policy(event)
+            .await?;
+        self.record_admitted_identity();
         Ok(())
     }
 
@@ -618,5 +639,138 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    const AGENT_DID: &str = "did:web:agent.example";
+    const NO_SECRETS_REGO: &str = r#"package surface.policy
+
+default allow := true
+
+allow := false if contains(input.response.body.result.text, "SECRET")
+"#;
+
+    fn events_with_a_static_agent_and_a_response_policy() -> AccessPointEvents {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "stream-surface", "name": "Stream Surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:9/a2a", "response_policy": {"policy_definition_id": "no-secrets"}},
+            "identity_slots": {"protected": {"type": "static", "did": AGENT_DID}}
+        }))
+        .unwrap();
+        let policy_manager = crate::policies::SurfacePolicyManager::new();
+        policy_manager
+            .load_policy_text("response:no-secrets", NO_SECRETS_REGO)
+            .unwrap();
+        let network = serde_json::from_value(serde_json::json!({
+            "did": {"domain": "gateway.example"},
+            "webauthn": {"rp_id": "gateway.example", "external_origin": "https://gateway.example"},
+            "integration": {"types": [], "categories": []},
+            "listeners": [], "routes": {}
+        }))
+        .unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [], "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        let state = ProxyState {
+            config: std::sync::Arc::new(config),
+            network_config: std::sync::Arc::new(network),
+            client: reqwest::Client::new(),
+            metrics_store: None,
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_monitor: None,
+            task_id: None,
+            ws_state: None,
+            listener_manager: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            secrets_store: None,
+            certificates_store: None,
+            vc_issuer: None,
+            policy_manager: Some(std::sync::Arc::new(policy_manager)),
+            gateway_policy_manager: None,
+            didauth_session_store: std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            transaction_store: None,
+            mpp_transaction_store: None,
+            trust_registry_listener_manager: None,
+            source_auth_middleware: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_identity_store: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_log_manager: None,
+            credential_provider_store: None,
+            delegation_vault_store: None,
+            gateway_base_url: None,
+            transit_token_issuer: None,
+            mcp_proxy_store: None,
+            a2a_proxy_store: None,
+            active_variant_alias: None,
+            active_variant_id: None,
+            variant_resolution_error: None,
+            surface: std::sync::Arc::new(surface),
+        };
+        AccessPointEvents::new(
+            state,
+            StreamRequest {
+                channel_name: "Stream Surface".into(),
+                trace_id: "trace-1".into(),
+                http_method: "POST".into(),
+                path: "/a2a".into(),
+                status: StatusCode::OK,
+                authenticated_identity: None,
+                request_identity: None,
+                request_agent_did: None,
+                request_user_hash: None,
+                policy_caller: CallerContext {
+                    did: None,
+                    identity_source: None,
+                    dna_uai: None,
+                },
+            },
+        )
+    }
+
+    async fn check_event(
+        events: &mut AccessPointEvents,
+        text: &str,
+    ) -> Result<(), StreamStop> {
+        let event = events
+            .rewrite(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "text": text } }))
+            .await?;
+        events.admit(&event).await
+    }
+
+    #[tokio::test]
+    async fn an_event_the_response_policy_denies_leaves_its_identity_unrecorded() {
+        let mut events = events_with_a_static_agent_and_a_response_policy();
+
+        assert_eq!(check_event(&mut events, "the SECRET plan").await, Err(RESPONSE_BLOCKED));
+
+        assert!(
+            matches!(&events.protected_identity, Some(ProtectedAgentIdentity::Managed { did, .. }) if did == AGENT_DID),
+            "the event resolved the agent"
+        );
+        assert!(
+            events
+                .recorded_dids
+                .is_empty(),
+            "the Trust Recorder is not run for an event that is not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admitted_event_records_its_identity_once() {
+        let mut events = events_with_a_static_agent_and_a_response_policy();
+
+        assert_eq!(check_event(&mut events, "working").await, Ok(()));
+        assert_eq!(check_event(&mut events, "done").await, Ok(()));
+
+        assert_eq!(events.recorded_dids, HashSet::from([AGENT_DID.to_string()]));
+        assert_eq!(events.event_did, None);
     }
 }
