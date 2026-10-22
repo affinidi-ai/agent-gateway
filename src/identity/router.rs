@@ -1553,11 +1553,13 @@ pub fn create_identity_api_router(
     } else {
         Router::new()
     };
-    let mediator_router = mediator_router.layer(Extension(
-        state
-            .mediator_directory
-            .clone(),
-    ));
+    let mediator_router = mediator_router
+        .layer(Extension(
+            state
+                .mediator_directory
+                .clone(),
+        ))
+        .layer(Extension(Some(pending_connection_store.clone())));
 
     // Reuse the agents-api TR listener manager for issuer trust registry registration
     let issuer_tr_listener_manager = agents_api_listener_manager;

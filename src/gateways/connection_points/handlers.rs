@@ -711,6 +711,19 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
 
     info!("Gateway '{}' validated (DID: {})", gateway.name, gateway.did);
 
+    // The new connection point id is checked against the resource scope before anything is stored
+    let temp_cp_id = uuid::Uuid::new_v4().to_string();
+    if !scope_allows_resource(
+        resource_scope(&scope),
+        tenant_context(&context),
+        ResourceKind::ConnectionPoints,
+        &temp_cp_id,
+    ) {
+        return Err(
+            (StatusCode::FORBIDDEN, "Connection point is outside this token's permitted scope".to_string()).into()
+        );
+    }
+
     let via_directory = crate::event_hook::is_directory_mediator_id(&req.mediator_id);
     let mediator = if via_directory {
         match crate::mediators::handlers::resolve_directory_mediator(
@@ -765,19 +778,6 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
 
     info!("Mediator '{}' validated (DID: {})", mediator.name, mediator.did);
 
-    // Generate unique DID and keys for this connection point
-    // Each connection point gets its own DID to avoid duplicate WebSocket connections
-    let temp_cp_id = uuid::Uuid::new_v4().to_string();
-    if !scope_allows_resource(
-        resource_scope(&scope),
-        tenant_context(&context),
-        ResourceKind::ConnectionPoints,
-        &temp_cp_id,
-    ) {
-        return Err(
-            (StatusCode::FORBIDDEN, "Connection point is outside this token's permitted scope".to_string()).into()
-        );
-    }
     let storage_path = std::path::Path::new(
         &bootstrap_config
             .storage_paths
@@ -2550,6 +2550,143 @@ mod tests {
             create_on_appliance_gateway(None).await,
             (StatusCode::NOT_FOUND, 0),
             "an appliance-wide caller passes the ownership check and stops at the missing mediator"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_denied_the_new_connection_point_id_is_refused_before_any_mediator_record_is_stored() {
+        use crate::gateways::FileSystemConnectionPointStore;
+        use crate::gateways::connection_points::ConnectionPointStore;
+        use crate::gateways::store::GatewayStore;
+        use crate::gateways::types::GatewayType;
+        use crate::mediators::{FileSystemMediatorStore, MediatorStore};
+        use axum::Extension;
+        use tower::ServiceExt;
+
+        let did = "did:web:scope-order.example";
+        let (url, _) = crate::event_hook::tests_support::serve(
+            200,
+            Box::leak(
+                serde_json::json!({"items": [{"did": did, "name": "Shared"}]})
+                    .to_string()
+                    .into_boxed_str(),
+            ),
+        )
+        .await;
+        let settings = crate::event_hook::EventHookSettings {
+            directory_url: Some(url),
+            ..crate::event_hook::EventHookSettings::default()
+        };
+        let directory = crate::event_hook::MediatorDirectory::new(&settings).unwrap();
+        directory.entries().await;
+        let directory_id = crate::event_hook::DirectoryEntry {
+            did: did.into(),
+            name: "Shared".into(),
+        }
+        .id();
+
+        let dir = tempfile::tempdir().unwrap();
+        let gateways = Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                dir.path().join("gateways"),
+                Some("did:web:self.example".to_string()),
+            )
+            .await
+            .unwrap(),
+        );
+        let appliance = gateways
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|gateway| gateway.gateway_type == GatewayType::SelfGateway)
+            .unwrap();
+        let points = Arc::new(
+            FileSystemConnectionPointStore::new(dir.path().join("points"))
+                .await
+                .unwrap(),
+        );
+        let mediators = Arc::new(
+            FileSystemMediatorStore::new(dir.path().join("mediators"))
+                .await
+                .unwrap(),
+        );
+        let (vc_issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let (listener_manager, _listener_dir) = crate::gateways::test_helpers::test_listener_manager(dir.path()).await;
+        let bootstrap: crate::config::BootstrapConfig = toml::from_str(
+            "backup_encryption_key = \"env://UNUSED\"\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n",
+        )
+        .unwrap();
+        let network: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+        }))
+        .unwrap();
+        let scope =
+            crate::auth_manager::pat::PatResourceScope(Arc::new(regex::Regex::new(r"\Adirectory:.*\z").unwrap()));
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/connection-points",
+                axum::routing::post(
+                    super::create_connection_point::<
+                        FileSystemConnectionPointStore,
+                        crate::gateways::FileSystemGatewayStore,
+                        FileSystemMediatorStore,
+                    >,
+                ),
+            )
+            .layer(Extension(points.clone()))
+            .layer(Extension(gateways))
+            .layer(Extension(mediators.clone()))
+            .layer(Extension(Arc::new(vc_issuer)))
+            .layer(Extension(Arc::new(crate::config::GatewayConfig::default_config())))
+            .layer(Extension(Arc::new(bootstrap)))
+            .layer(Extension(Arc::new(network)))
+            .layer(Extension(Arc::new(listener_manager)))
+            .layer(Extension(None::<Arc<crate::integrations::FileSystemNotificationStore>>))
+            .layer(Extension(None::<Arc<dyn crate::storage::DidLogStorage>>))
+            .layer(Extension(None::<Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>))
+            .layer(Extension(None::<Arc<crate::event_hook::EventHook>>))
+            .layer(Extension(Some(directory)))
+            .layer(Extension(scope));
+        let body = serde_json::json!({
+            "gateway_id": appliance.id,
+            "mediator_id": directory_id,
+            "name": "Scoped point",
+            "description": "",
+            "secret": "secret",
+        });
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/connection-points")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            mediators
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused request stores no mediator record, so no created notification can follow"
+        );
+        assert!(
+            points
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

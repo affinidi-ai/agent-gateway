@@ -315,7 +315,6 @@ impl PendingConnectionStore {
     }
 
     /// List all pending connections
-    #[allow(dead_code)]
     pub async fn list_all(&self) -> Vec<PendingOOBConnection> {
         self.connections
             .list_all()
