@@ -319,7 +319,7 @@ async fn a_response_policy_deny_ends_the_stream_with_an_error_event() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_claim_on_a_stream_event_is_replaced_by_a_credential() {
-    let mock = MockServer::start_with_streamed_body(
+    let mock = MockServer::start_with_finished_stream(
         "text/event-stream",
         vec![
             (Duration::ZERO, event(working())),
@@ -333,9 +333,10 @@ async fn an_identity_claim_on_a_stream_event_is_replaced_by_a_credential() {
     .await;
 
     let response = send_streaming_message(&h).await;
-    let (events, _) = read_events(response, Instant::now(), is_completion_or_error).await;
+    let (events, ended) = read_events(response, Instant::now(), |_| false).await;
 
-    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(ended);
+    assert_eq!(events.len(), 2, "a stream whose claim resolved ends without an error event: {events:?}");
     assert_eq!(events[0].1["result"], working(), "an event without a claim is forwarded unchanged");
     let message = &events[1].1["result"]["statusUpdate"]["status"]["message"];
     assert_eq!(message["extensions"], json!([AGENT_IDENTITY_CREDENTIAL_URI]), "{message}");
@@ -357,6 +358,55 @@ async fn an_identity_claim_on_a_stream_event_is_replaced_by_a_credential() {
             .is_some_and(|vp| !vp.is_empty()),
         "{credential}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_that_never_claims_the_agent_identity_ends_with_an_identity_error() {
+    let mock = MockServer::start_with_finished_stream(
+        "text/event-stream",
+        vec![
+            (Duration::ZERO, event(submitted())),
+            (Duration::ZERO, event(working())),
+            (Duration::ZERO, event(artifact("draft"))),
+            (Duration::ZERO, event(completed(None))),
+        ],
+    )
+    .await;
+    let h = GatewayHarness::start_with_mock(mock, |_, config, _| {
+        config.surfaces = vec![helpers::build_identity_channel()];
+    })
+    .await;
+
+    let response = send_streaming_message(&h).await;
+    let (events, ended) = read_events(response, Instant::now(), |_| false).await;
+
+    assert!(ended);
+    assert_eq!(events.len(), 5, "{events:?}");
+    assert_eq!(state_of(&events[3].1), Some("TASK_STATE_COMPLETED"), "every event is delivered first");
+    let error = &events[4].1;
+    assert_eq!(error["id"], 1);
+    assert_eq!(error_code(error), Some("identity_extension_missing"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_that_only_reports_an_error_gets_no_identity_error() {
+    let agent_error = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32001, "message": "Task not found" } });
+    let mock = MockServer::start_with_finished_stream(
+        "text/event-stream",
+        vec![(Duration::ZERO, format!("data: {agent_error}\n\n"))],
+    )
+    .await;
+    let h = GatewayHarness::start_with_mock(mock, |_, config, _| {
+        config.surfaces = vec![helpers::build_identity_channel()];
+    })
+    .await;
+
+    let response = send_streaming_message(&h).await;
+    let (events, ended) = read_events(response, Instant::now(), |_| false).await;
+
+    assert!(ended);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].1, agent_error, "the agent's own error is the only event");
 }
 
 #[tokio::test(flavor = "multi_thread")]

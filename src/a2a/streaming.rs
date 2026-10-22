@@ -8,7 +8,8 @@
 //!
 //! The status and headers are sent before the first event, so a failure after
 //! that cannot change them. It ends the stream with a JSON-RPC error event
-//! instead, and the upstream connection is dropped.
+//! instead, and the upstream connection is dropped. A stream the upstream ends
+//! cleanly gets one last check, whose refusal follows the last event.
 
 use std::fmt::Display;
 use std::future::Future;
@@ -95,6 +96,10 @@ pub trait EventProcessor: Send + 'static {
         &mut self,
         event: &Value,
     ) -> impl Future<Output = Result<(), StreamStop>> + Send;
+
+    /// Checks the stream as a whole once the upstream ends it cleanly. A refusal
+    /// is sent after the last event.
+    fn finish(&mut self) -> impl Future<Output = Result<(), StreamStop>> + Send;
 }
 
 /// Whether a response's `Content-Type` is `text/event-stream`, whatever its
@@ -187,12 +192,20 @@ where
 {
     futures::stream::unfold(Some((Box::pin(decode_events(source, limits)), forwarding)), |state| async move {
         let (mut events, mut forwarding) = state?;
-        let forwarded = match events.next().await? {
-            Ok(event) => forward_event(event, &mut forwarding).await,
-            Err(error) => {
+        let forwarded = match events.next().await {
+            Some(Ok(event)) => forward_event(event, &mut forwarding).await,
+            Some(Err(error)) => {
                 warn!(channel = forwarding.channel_name, %error, "Reading the upstream A2A event stream failed");
                 Err(StreamStop::from_read(&error))
             }
+            None => match forwarding
+                .processor
+                .finish()
+                .await
+            {
+                Ok(()) => return None,
+                Err(stop) => Err(stop),
+            },
         };
         match forwarded {
             Ok(event) => Some((Ok(event), Some((events, forwarding)))),
@@ -292,6 +305,7 @@ mod tests {
         recorded: Arc<Mutex<Recorded>>,
         refuse_rewrite: Option<&'static str>,
         refuse_admit: Option<&'static str>,
+        refuse_finish: bool,
     }
 
     impl Recorder {
@@ -302,6 +316,7 @@ mod tests {
                     recorded: Arc::clone(&recorded),
                     refuse_rewrite: None,
                     refuse_admit: None,
+                    refuse_finish: false,
                 },
                 recorded,
             )
@@ -359,6 +374,14 @@ mod tests {
                 .admitted
                 .push(event.clone());
             Ok(())
+        }
+
+        async fn finish(&mut self) -> Result<(), StreamStop> {
+            if self.refuse_finish {
+                Err(REFUSED)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -607,6 +630,37 @@ mod tests {
                     .contains("TASK_STATE_COMPLETED"))
         );
         assert_eq!(error_code(&forwarded[3].1), "refused");
+    }
+
+    #[tokio::test]
+    async fn a_refused_finish_follows_the_last_event_of_a_clean_end() {
+        let events = task_events();
+        let (mut processor, _) = Recorder::new();
+        processor.refuse_finish = true;
+        let (response, outcome) = respond(futures::stream::iter(chunks(&events)), processor);
+        let forwarded = body_events(response).await;
+
+        assert_eq!(forwarded.len(), 5, "every event is sent before the refusal");
+        assert_eq!(forwarded[3].1["result"]["statusUpdate"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(forwarded[4].1["id"], "req-1");
+        assert_eq!(error_code(&forwarded[4].1), "refused");
+        let outcome = outcome
+            .lock()
+            .unwrap()
+            .unwrap();
+        assert!(outcome.completed && outcome.failed, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn finish_is_not_consulted_when_the_stream_ends_early() {
+        let mut source = chunks(&task_events()[..1]);
+        source.push(Err(std::io::Error::other("connection reset")));
+        let (mut processor, _) = Recorder::new();
+        processor.refuse_finish = true;
+        let (response, _) = respond(futures::stream::iter(source), processor);
+        let forwarded = body_events(response).await;
+        assert_eq!(forwarded.len(), 2);
+        assert_eq!(error_code(&forwarded[1].1), "upstream_stream_failed", "only the read failure is reported");
     }
 
     #[tokio::test]

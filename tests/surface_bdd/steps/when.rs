@@ -1542,6 +1542,58 @@ async fn request_sent_to_surface(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![]).await;
 }
 
+#[when("the caller sends a streaming message to the surface")]
+async fn caller_sends_streaming_message(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    let url = format!(
+        "http://127.0.0.1:{}{}/foo",
+        world
+            .infra
+            .as_ref()
+            .unwrap()
+            .gateway_port,
+        world.surface_config.route
+    );
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "bdd-stream",
+        "method": "SendStreamingMessage",
+        "params": { "message": { "messageId": "bdd-message", "role": "ROLE_USER", "parts": [{ "text": "hello" }] } }
+    });
+    world.sent_body = Some(body.clone());
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("accept", "text/event-stream")
+        .header("A2A-Version", "1.0")
+        .json(&body)
+        .send()
+        .await
+        .expect("send a streaming message to the gateway");
+    let status = response.status().as_u16();
+    let headers = collect_headers(response.headers());
+    let raw = tokio::time::timeout(std::time::Duration::from_secs(30), response.text())
+        .await
+        .expect("the event stream ends");
+    world.a2a_stream_ended = raw.is_ok();
+    world.a2a_stream_events = raw
+        .unwrap_or_default()
+        .split("\n\n")
+        .map(crate::bdd_support::sse_client::parse_sse_frame)
+        .filter(|(_, data)| !data.is_empty())
+        .map(|(_, data)| serde_json::from_str(&data).expect("every stream event is JSON"))
+        .collect();
+    world.caller_response = Some(RecordedResponse {
+        status,
+        headers,
+        body: world
+            .a2a_stream_events
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+    });
+    record_mock_observation(world).await;
+}
+
 #[when("the caller sends a request to the surface without a token")]
 async fn request_without_token(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![]).await;

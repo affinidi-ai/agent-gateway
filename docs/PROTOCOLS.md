@@ -589,7 +589,7 @@ afterwards. The checks are those a non-streaming reply gets on the Access Point,
 
 | Check | On each event |
 | --- | --- |
-| Protected and external identity | Resolved when the event claims an identity: a message that declares `agent-identity/v1` or `agent-identity-credential/v1`, or an identity payload where [backend identity](#backend-identity-in-task-artifacts) is read (a status message, a message, or an artifact, including the single `artifact` of an artifact update). An event without a claim is not resolved and nothing is signed for it. A slot that derives identity from a credential (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) is resolved once, on the first event. A claim that cannot be resolved falls back to the request-path identity when there is one, and ends the stream otherwise. |
+| Protected and external identity | Resolved when the event claims an identity: a message that declares `agent-identity/v1` or `agent-identity-credential/v1`, or an identity payload where [backend identity](#backend-identity-in-task-artifacts) is read (a status message, a message, or an artifact, including the single `artifact` of an artifact update). An event without a claim is not resolved and nothing is signed for it. A slot that derives identity from a credential (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) is resolved once, on the first event. A claim that cannot be resolved falls back to the request-path identity when there is one, and ends the stream otherwise. A slot that reads identity from the response (`from_payload`) also needs the stream to claim it: see the end-of-stream check below. |
 | Trust Recorder | Once per resolved DID |
 | Response custom metadata | Injected into the event's `result`, which for a v1.0 event is the member's payload |
 | Agent identity credential | Replaces the raw extension where the event's message declares it, as on a non-streaming reply |
@@ -614,13 +614,22 @@ data: {"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Response blocked
 | --- | --- |
 | `response_policy_denied` | The response policy denied the event |
 | `response_extension_rejected` | The event failed the response extension rules |
-| `identity_extension_missing`, `identity_invalid_response`, `identity_validation_failed`, `identity_did_failed` | The event's identity claim could not be resolved, and the request path resolved no identity |
+| `identity_extension_missing`, `identity_invalid_response`, `identity_validation_failed`, `identity_did_failed` | The event's identity claim could not be resolved, and the request path resolved no identity; `identity_extension_missing` also follows the last event of a stream that never claimed one (see below) |
 | `upstream_event_invalid` | The event's data is not a JSON object |
 | `upstream_event_too_large` | The event is larger than `[a2a] max_body_size` |
 | `upstream_stream_idle` | The Target sent nothing for the idle timeout |
 | `upstream_stream_lifetime` | The stream reached `[a2a] stream_max_lifetime_secs` |
 | `upstream_stream_failed` | Reading from the Target failed |
 | `stream_event_rewrite_failed` | A check produced an event that is not JSON |
+
+When the Target ends its stream cleanly, one check runs on the stream as a whole. A reply without
+an identity claim is refused on a slot that reads identity from the response, so a stream that
+delivered at least one result is refused too when none of its events resolved an identity for
+that slot. The refusal is an `identity_extension_missing` error event sent after the last event;
+the caller has already received the events, unsigned, but sees the stream fail rather than end
+cleanly. The protected slot is exempt when the request path resolved an identity, as on a
+non-streaming reply, and the external slot is checked only when it is configured. A stream that
+carried only JSON-RPC error events delivered no result and is not refused.
 
 A `fabric://` surface and a Transit Point do not stream; see [Current limitations](#current-limitations).
 

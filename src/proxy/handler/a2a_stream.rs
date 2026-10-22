@@ -6,6 +6,11 @@
 //! response policy. Identity a slot derives from a credential is resolved once
 //! per stream; identity read from the body is resolved on each event that claims
 //! one. The Trust Recorder runs once per resolved DID.
+//!
+//! A stream that delivered results without any event resolving the identity a
+//! slot reads from the body ends with an identity error after its last event,
+//! as a non-streaming reply without a claim is refused. The protected slot is
+//! exempt when the request path resolved an identity.
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -69,8 +74,10 @@ pub(super) struct StreamRequest {
 pub(super) struct AccessPointEvents {
     state: ProxyState,
     request: StreamRequest,
+    /// The last protected identity resolved in this stream.
     protected_identity: Option<ProtectedAgentIdentity>,
     external_resolved: bool,
+    delivered_result: bool,
     recorded_dids: HashSet<String>,
     policy_allow_recorded: bool,
 }
@@ -85,6 +92,7 @@ impl AccessPointEvents {
             request,
             protected_identity: None,
             external_resolved: false,
+            delivered_result: false,
             recorded_dids: HashSet::new(),
             policy_allow_recorded: false,
         }
@@ -157,9 +165,7 @@ impl AccessPointEvents {
                 }
             },
         };
-        if !reads_body {
-            self.protected_identity = Some(identity.clone());
-        }
+        self.protected_identity = Some(identity.clone());
         if let ProtectedAgentIdentity::Managed { did, .. } = &identity
             && self
                 .recorded_dids
@@ -436,6 +442,7 @@ impl EventProcessor for AccessPointEvents {
             .get("result")
             .is_some_and(|result| !result.is_null())
         {
+            self.delivered_result = true;
             let claims_identity = crate::a2a::response_claims_identity(&mut event);
             let body = to_body(&event);
             let identity = self
@@ -522,6 +529,42 @@ impl EventProcessor for AccessPointEvents {
             self.record_response_policy_decision(policy_id, policy_manager, decision)
                 .await;
             self.policy_allow_recorded = true;
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<(), StreamStop> {
+        if !self.delivered_result {
+            return Ok(());
+        }
+        let surface = &self.state.surface;
+        if crate::proxy::backend_identity::slot_reads_response_body(surface, IdentitySlot::Protected)
+            && self
+                .request
+                .request_identity
+                .is_none()
+            && self
+                .protected_identity
+                .is_none()
+        {
+            warn!(channel = self.request.channel_name, "A2A event stream ended without the protected agent's identity");
+            return Err(StreamStop::new(
+                crate::a2a::ERR_IDENTITY_EXTENSION_MISSING,
+                "Stream ended without the protected agent's identity",
+            ));
+        }
+        if self
+            .state
+            .external_selector
+            .is_some()
+            && crate::proxy::backend_identity::slot_reads_response_body(surface, IdentitySlot::External)
+            && !self.external_resolved
+        {
+            warn!(channel = self.request.channel_name, "A2A event stream ended without the external agent's identity");
+            return Err(StreamStop::new(
+                crate::a2a::ERR_IDENTITY_EXTENSION_MISSING,
+                "Stream ended without the external agent's identity",
+            ));
         }
         Ok(())
     }

@@ -13,8 +13,11 @@ changes:
         on it. An event that fails a check is not sent; the stream ends with a JSON-RPC error
         event whose data.code names the cause, since the status has already been sent. The
         stream closes when the Target closes it, so terminal and interrupted task states
-        reach the caller as sent. A slow caller slows the Target instead of filling a buffer.
-        fabric:// surfaces and Transit Points still buffer the stream.
+        reach the caller as sent. On a surface that reads the agent's identity from its
+        response, a stream that delivers results without any event claiming that identity
+        ends with an identity_extension_missing error event after its last event, since a
+        non-streaming reply without a claim is refused. A slow caller slows the Target instead
+        of filling a buffer. fabric:// surfaces and Transit Points still buffer the stream.
     - timestamp: '2026-10-21T00:00:00.000Z'
       title: Bound A2A event streams with the new [a2a] stream_max_lifetime_secs
       description: >-
