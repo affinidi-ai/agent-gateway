@@ -35,26 +35,13 @@ pub async fn post_json(
             Ok(Err(e)) => return HookOutcome::retry(e.to_string()),
             Err(e) => return HookOutcome::retry(format!("egress task failed: {e}")),
         };
-    let mut request = client
+    let request = client
         .post(target.url)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
-    if let Some(secret) = secret {
-        let timestamp = chrono::Utc::now()
-            .timestamp()
-            .to_string();
-        match crate::integrations::webhook_signing::sign_timestamped_payload(
-            secret.expose(),
-            &timestamp,
-            body.as_bytes(),
-        ) {
-            Ok(signature) => {
-                request = request
-                    .header("X-Webhook-Timestamp", timestamp)
-                    .header("X-Webhook-Signature-256", format!("sha256={signature}"));
-            }
-            Err(e) => return HookOutcome::retry(format!("cannot sign request: {e:#}")),
-        }
-    }
+    let request = match sign_request(request, secret, body.as_bytes()) {
+        Ok(request) => request,
+        Err(reason) => return HookOutcome::retry(reason),
+    };
     match request
         .body(body.to_string())
         .send()
@@ -64,6 +51,51 @@ pub async fn post_json(
         Err(e) => HookOutcome::retry(format!("request failed: {}", e.without_url())),
         Ok(response) => classify(response, secret.is_some()).await,
     }
+}
+
+fn sign_request(
+    request: reqwest::RequestBuilder,
+    secret: Option<&HookSecret>,
+    body: &[u8],
+) -> Result<reqwest::RequestBuilder, String> {
+    let Some(secret) = secret else {
+        return Ok(request);
+    };
+    let timestamp = chrono::Utc::now()
+        .timestamp()
+        .to_string();
+    let signature = crate::integrations::webhook_signing::sign_timestamped_payload(secret.expose(), &timestamp, body)
+        .map_err(|e| format!("cannot sign request: {e:#}"))?;
+    Ok(request
+        .header("X-Webhook-Timestamp", timestamp)
+        .header("X-Webhook-Signature-256", format!("sha256={signature}")))
+}
+
+/// GETs `url` through the same pinned client as [`post_json`], signing the
+/// empty body when a secret is set, and returns the status and at most
+/// `limit` bytes of the body. The URL stays out of every error.
+pub async fn get_limited(
+    url: &str,
+    timeout: Duration,
+    secret: Option<&HookSecret>,
+    limit: usize,
+) -> Result<(StatusCode, Vec<u8>), String> {
+    let raw_url = url.to_string();
+    let (client, target) = tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&raw_url, timeout))
+        .await
+        .map_err(|e| format!("egress task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+    let request = sign_request(client.get(target.url), secret, b"")?;
+    let mut response = request
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {}", e.without_url()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Ok((status, Vec::new()));
+    }
+    let body = read_limited(&mut response, limit).await?;
+    Ok((status, body))
 }
 
 async fn classify(

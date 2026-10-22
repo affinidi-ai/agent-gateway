@@ -128,6 +128,69 @@ impl MockHook {
     }
 }
 
+struct MockDirectory {
+    url: String,
+    secret: String,
+    calls: Arc<Mutex<Vec<HeaderMap>>>,
+}
+
+impl MockDirectory {
+    async fn start(
+        status: u16,
+        body: Value,
+    ) -> Self {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        let app = Router::new().route(
+            "/directory/mediators",
+            axum::routing::get(move |headers: HeaderMap| {
+                let sink = sink.clone();
+                let body = body.clone();
+                async move {
+                    sink.lock()
+                        .unwrap()
+                        .push(headers);
+                    (StatusCode::from_u16(status).unwrap(), axum::Json(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        Self {
+            url: format!("http://{addr}/directory/mediators"),
+            secret: uuid::Uuid::new_v4()
+                .simple()
+                .to_string(),
+            calls,
+        }
+    }
+
+    fn settings(&self) -> EventHookSettings {
+        EventHookSettings {
+            directory_url: Some(self.url.clone()),
+            hook_secret: crate::event_hook::HookSecret::new(&self.secret),
+            ..EventHookSettings::default()
+        }
+    }
+}
+
+fn directory_items(mediator: &FakeMediator) -> Value {
+    json!({"items": [{
+        "did": mediator.did(),
+        "name": "Shared mediator",
+        "description": "ignored",
+        "badge": "ignored",
+        "warning": "ignored"
+    }]})
+}
+
 fn dead_hook_url() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener
@@ -239,6 +302,45 @@ impl Api {
             connection_points_dir,
             _hook_settings: registration,
         }
+    }
+
+    async fn start_listing(
+        mediator: &FakeMediator,
+        hook: &MockHook,
+    ) -> (Self, MockDirectory) {
+        install_directory_mediator_document(mediator);
+        let directory = MockDirectory::start(200, directory_items(mediator)).await;
+        let mut settings = hook.settings();
+        settings.directory_url = Some(directory.url.clone());
+        (Self::start(Some(settings)).await, directory)
+    }
+
+    async fn create_on_directory_mediator(
+        &self,
+        mediator: &FakeMediator,
+    ) -> (u16, Value) {
+        let (status, listed) = self.get("/mediators").await;
+        assert_eq!(status, 200, "{listed}");
+        let mediator_id = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["did"] == json!(mediator.did()))
+            .and_then(|item| item["id"].as_str())
+            .unwrap()
+            .to_string();
+        self.post(
+            "/connection-points",
+            &json!({
+                "gateway_id": self_gateway_id(self).await,
+                "mediator_id": mediator_id,
+                "name": "cp",
+                "description": "cp",
+                "secret": "s3cret",
+                "did_method": "peer"
+            }),
+        )
+        .await
     }
 
     fn url(
@@ -686,6 +788,543 @@ async fn a_failed_invitation_reports_started_then_failed_and_never_created() {
         event_names(&hook.events_in_order()),
         ["connection_point.creation_started", "connection_point.creation_failed"]
     );
+}
+
+fn quick_retry(attempts: u32) -> crate::gateways::connection_points::first_call_retry::FirstCallRetry {
+    crate::gateways::connection_points::first_call_retry::FirstCallRetry {
+        attempts,
+        delay: Duration::from_millis(5),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_first_call_is_retried_with_the_same_did_and_creation_succeeds() {
+    let hook = MockHook::start(HookReply::accept()).await;
+    let mediator = FakeMediator::start_resolvable().await;
+    let (api, _directory) = Api::start_listing(&mediator, &hook).await;
+    crate::gateways::connection_points::test_mediator::install_refusing(
+        &mediator.did(),
+        fake_invitation(),
+        2,
+        quick_retry(5),
+    );
+    let (status, body) = api
+        .create_on_directory_mediator(&mediator)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(crate::gateways::connection_points::test_mediator::first_calls(&mediator.did()), 3);
+
+    eventually("started, created and connected", || std::future::ready(hook.events().len() >= 3)).await;
+    let events = hook.events_in_order();
+    assert_eq!(
+        event_names(&events),
+        ["connection_point.creation_started", "connection_point.created", "connection_point.connected"]
+    );
+    assert_eq!(events[0]["connection_point"]["did"], events[1]["connection_point"]["did"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_call_refused_beyond_the_retries_reports_started_then_failed() {
+    let hook = MockHook::start(HookReply::accept()).await;
+    let mediator = FakeMediator::start_resolvable().await;
+    let (api, _directory) = Api::start_listing(&mediator, &hook).await;
+    crate::gateways::connection_points::test_mediator::install_refusing(
+        &mediator.did(),
+        fake_invitation(),
+        99,
+        quick_retry(2),
+    );
+    let (status, body) = api
+        .create_on_directory_mediator(&mediator)
+        .await;
+    assert_eq!(status, 500, "{body}");
+    assert!(is_oob_failure(&body), "{body}");
+    assert_eq!(crate::gateways::connection_points::test_mediator::first_calls(&mediator.did()), 3);
+
+    eventually("started and failed", || std::future::ready(hook.events().len() >= 2)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        event_names(&hook.events_in_order()),
+        ["connection_point.creation_started", "connection_point.creation_failed"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_for_an_operator_added_mediator_is_never_retried() {
+    let hook = MockHook::start(HookReply::accept()).await;
+    let api = Api::start(Some(hook.settings())).await;
+    let mediator = FakeMediator::start_resolvable().await;
+    crate::gateways::connection_points::test_mediator::install_refusing(
+        &mediator.did(),
+        fake_invitation(),
+        99,
+        quick_retry(5),
+    );
+    let (status, body) = api
+        .create_connection_point(&mediator)
+        .await;
+    assert_eq!(status, 500, "{body}");
+    assert!(is_oob_failure(&body), "{body}");
+    assert!(
+        !body
+            .to_string()
+            .contains("no longer offered"),
+        "{body}"
+    );
+    assert_eq!(crate::gateways::connection_points::test_mediator::first_calls(&mediator.did()), 1);
+
+    eventually("started and failed", || std::future::ready(hook.events().len() >= 2)).await;
+    assert_eq!(
+        event_names(&hook.events_in_order()),
+        ["connection_point.creation_started", "connection_point.creation_failed"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_retries_a_refused_first_call_fails_at_once() {
+    let hook = MockHook::start(HookReply::accept()).await;
+    let mediator = FakeMediator::start_resolvable().await;
+    let (api, _directory) = Api::start_listing(&mediator, &hook).await;
+    crate::gateways::connection_points::test_mediator::install_refusing(
+        &mediator.did(),
+        fake_invitation(),
+        1,
+        quick_retry(0),
+    );
+    let (status, body) = api
+        .create_on_directory_mediator(&mediator)
+        .await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(crate::gateways::connection_points::test_mediator::first_calls(&mediator.did()), 1);
+}
+
+fn install_directory_mediator_document(mediator: &FakeMediator) {
+    crate::mediators::utils::test_documents::install(
+        &mediator.did(),
+        mediator.create_request()["did_document"].clone(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_mediators_are_listed_with_a_signed_request_as_provided_and_without_extra_fields() {
+    let mediator = FakeMediator::start_resolvable().await;
+    let directory = MockDirectory::start(200, directory_items(&mediator)).await;
+    let api = Api::start(Some(directory.settings())).await;
+
+    let (status, listed) = api.get("/mediators").await;
+    assert_eq!(status, 200, "{listed}");
+    let items = listed.as_array().unwrap();
+    assert_eq!(items.len(), 1, "{listed}");
+    assert!(
+        items[0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("directory:")
+    );
+    assert_eq!(items[0]["did"], mediator.did());
+    assert_eq!(items[0]["provided"], true);
+    assert_eq!(items[0]["name"], "Shared mediator");
+    assert_eq!(items[0]["description"], "");
+    for key in ["badge", "warning"] {
+        assert!(items[0].get(key).is_none(), "{key} is not part of a mediator");
+    }
+    assert_eq!(items[0]["registered"], false);
+
+    let headers = directory
+        .calls
+        .lock()
+        .unwrap()[0]
+        .clone();
+    let timestamp = headers["x-webhook-timestamp"]
+        .to_str()
+        .unwrap();
+    let expected =
+        crate::integrations::webhook_signing::sign_timestamped_payload(&directory.secret, timestamp, b"").unwrap();
+    assert_eq!(
+        headers["x-webhook-signature-256"]
+            .to_str()
+            .unwrap(),
+        format!("sha256={expected}")
+    );
+
+    let (status, compatible) = api
+        .get("/mediators/compatible")
+        .await;
+    assert_eq!(status, 200, "{compatible}");
+    assert_eq!(
+        compatible
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_directory_the_mediator_list_is_the_stored_records_only() {
+    let api = Api::start(None).await;
+    let mediator = FakeMediator::start().await;
+    assert_eq!(
+        api.post("/mediators", &mediator.create_request())
+            .await
+            .0,
+        200
+    );
+    let (status, listed) = api.get("/mediators").await;
+    assert_eq!(status, 200, "{listed}");
+    let items = listed.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0]
+            .get("provided")
+            .is_none(),
+        "provided must not appear without a directory"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_directory_leaves_the_stored_mediators_listed() {
+    let directory = MockDirectory::start(503, Value::Null).await;
+    let api = Api::start(Some(directory.settings())).await;
+    let mediator = FakeMediator::start().await;
+    assert_eq!(
+        api.post("/mediators", &mediator.create_request())
+            .await
+            .0,
+        200
+    );
+    let (status, listed) = api.get("/mediators").await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        listed[0]
+            .get("provided")
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn creating_a_connection_point_on_a_directory_mediator_stores_one_provided_record() {
+    let mediator = FakeMediator::start_resolvable().await;
+    install_directory_mediator_document(&mediator);
+    Api::install_fake_mediator(&mediator, fake_invitation());
+    let directory = MockDirectory::start(200, directory_items(&mediator)).await;
+    let api = Api::start(Some(directory.settings())).await;
+    let (status, listed) = api.get("/mediators").await;
+    assert_eq!(status, 200, "{listed}");
+    let directory_id = listed[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, gateways) = api.get("/gateways").await;
+    assert_eq!(status, 200, "{gateways}");
+    let gateway_id = gateways
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gateway| gateway["gateway_type"] == "self")
+        .and_then(|gateway| gateway["id"].as_str())
+        .unwrap()
+        .to_string();
+    let request = json!({
+        "gateway_id": gateway_id,
+        "mediator_id": directory_id,
+        "name": "cp",
+        "description": "cp",
+        "secret": "s3cret",
+        "did_method": "peer"
+    });
+
+    for _ in 0..2 {
+        let (status, body) = api
+            .post("/connection-points", &request)
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_ne!(body["connection_point"]["mediator_id"], json!(directory_id), "{body}");
+    }
+
+    let (status, listed) = api.get("/mediators").await;
+    assert_eq!(status, 200, "{listed}");
+    let items = listed.as_array().unwrap();
+    assert_eq!(items.len(), 1, "both connection points share one stored record: {listed}");
+    assert!(
+        !items[0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("directory:")
+    );
+    assert_eq!(items[0]["provided"], true);
+    assert_eq!(items[0]["name"], "Shared mediator");
+    assert_eq!(items[0]["registered"], true);
+}
+
+async fn self_gateway_id(api: &Api) -> String {
+    let (status, gateways) = api.get("/gateways").await;
+    assert_eq!(status, 200, "{gateways}");
+    gateways
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gateway| gateway["gateway_type"] == "self")
+        .and_then(|gateway| gateway["id"].as_str())
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_event_for_a_directory_mediator_carries_the_id_of_the_stored_record() {
+    let mediator = FakeMediator::start_resolvable().await;
+    install_directory_mediator_document(&mediator);
+    Api::install_fake_mediator(&mediator, fake_invitation());
+    let hook = MockHook::start(HookReply::accept()).await;
+    let directory = MockDirectory::start(200, directory_items(&mediator)).await;
+    let mut settings = hook.settings();
+    settings.directory_url = Some(directory.url.clone());
+    let api = Api::start(Some(settings)).await;
+    let (_, listed) = api.get("/mediators").await;
+    let directory_id = listed[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let request = json!({
+        "gateway_id": self_gateway_id(&api).await,
+        "mediator_id": directory_id,
+        "name": "cp",
+        "description": "cp",
+        "secret": "s3cret",
+        "did_method": "peer"
+    });
+
+    let (status, body) = api
+        .post("/connection-points", &request)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    eventually("created", || {
+        std::future::ready(
+            hook.events()
+                .iter()
+                .any(|event| event["event"] == "connection_point.created"),
+        )
+    })
+    .await;
+
+    let (_, listed) = api.get("/mediators").await;
+    let stored_id = listed[0]["id"].clone();
+    assert!(
+        !stored_id
+            .as_str()
+            .unwrap()
+            .starts_with("directory:")
+    );
+    for event in hook.events() {
+        assert_eq!(event["connection_point"]["mediator_id"], stored_id, "{event}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provided_mediator_cannot_be_edited_and_is_deleted_only_when_unused() {
+    let mediator = FakeMediator::start_resolvable().await;
+    Api::install_fake_mediator(&mediator, fake_invitation());
+    let hook = MockHook::start(HookReply::accept()).await;
+    let (api, _directory) = Api::start_listing(&mediator, &hook).await;
+    let (status, body) = api
+        .create_on_directory_mediator(&mediator)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let stored_id = body["connection_point"]["mediator_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let response = api
+        .client
+        .put(api.url(&format!("/mediators/{stored_id}")))
+        .json(&json!({"name": "renamed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 409);
+    let response = api
+        .client
+        .delete(api.url(&format!("/mediators/{stored_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 409);
+    let (_, listed) = api.get("/mediators").await;
+    assert_eq!(listed[0]["id"], json!(stored_id));
+
+    let point_id = body["connection_point"]["id"]
+        .as_str()
+        .unwrap();
+    let response = api
+        .client
+        .delete(api.url(&format!("/connection-points/{point_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let response = api
+        .client
+        .delete(api.url(&format!("/mediators/{stored_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "an unused provided record can be removed");
+    let (_, listed) = api.get("/mediators").await;
+    assert!(
+        listed[0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("directory:"),
+        "the entry is offered again: {listed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_connection_point_creation_leaves_no_directory_mediator_record() {
+    let mediator = FakeMediator::start_resolvable().await;
+    install_directory_mediator_document(&mediator);
+    Api::install_fake_mediator(&mediator, Err("mediator refused".to_string()));
+    let directory = MockDirectory::start(200, directory_items(&mediator)).await;
+    let api = Api::start(Some(directory.settings())).await;
+    let (_, listed) = api.get("/mediators").await;
+    let directory_id = listed[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let request = json!({
+        "gateway_id": self_gateway_id(&api).await,
+        "mediator_id": directory_id,
+        "name": "cp",
+        "description": "cp",
+        "secret": "s3cret",
+        "did_method": "peer"
+    });
+
+    let (status, body) = api
+        .post("/connection-points", &request)
+        .await;
+    assert_eq!(status, 500, "{body}");
+
+    let (status, listed) = api.get("/mediators").await;
+    assert_eq!(status, 200, "{listed}");
+    let items = listed.as_array().unwrap();
+    assert_eq!(items.len(), 1, "{listed}");
+    assert_eq!(items[0]["id"], json!(directory_id), "the entry is still only offered, not stored: {listed}");
+    assert_eq!(items[0]["registered"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mediator_the_operator_added_wins_over_a_directory_entry_for_the_same_did() {
+    let mediator = FakeMediator::start_resolvable().await;
+    let directory = MockDirectory::start(200, directory_items(&mediator)).await;
+    let api = Api::start(Some(directory.settings())).await;
+    let (status, created) = api
+        .post("/mediators", &mediator.create_request())
+        .await;
+    assert_eq!(status, 200, "{created}");
+
+    let (status, listed) = api.get("/mediators").await;
+    assert_eq!(status, 200, "{listed}");
+    let items = listed.as_array().unwrap();
+    assert_eq!(items.len(), 1, "{listed}");
+    assert_eq!(items[0]["id"], created["id"]);
+    assert_eq!(items[0]["did"], json!(mediator.did()));
+    assert_ne!(items[0]["provided"], json!(true), "{listed}");
+    assert_ne!(items[0]["name"], "Shared mediator");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_id_while_the_directory_has_not_answered_is_unavailable_not_missing() {
+    let directory = MockDirectory::start(503, Value::Null).await;
+    let api = Api::start(Some(directory.settings())).await;
+    let response = api
+        .client
+        .post(api.url("/connection-points"))
+        .json(&json!({
+            "gateway_id": self_gateway_id(&api).await,
+            "mediator_id": "directory:0123456789abcdef",
+            "name": "cp",
+            "description": "cp",
+            "secret": "s3cret",
+            "did_method": "peer"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("5")
+    );
+    assert_eq!(response.text().await.unwrap(), "The mediator directory is not available yet; try again shortly");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_directory_id_is_not_found() {
+    let mediator = FakeMediator::start_resolvable().await;
+    let directory = MockDirectory::start(200, directory_items(&mediator)).await;
+    let api = Api::start(Some(directory.settings())).await;
+    let (_, gateways) = api.get("/gateways").await;
+    let gateway_id = gateways
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gateway| gateway["gateway_type"] == "self")
+        .and_then(|gateway| gateway["id"].as_str())
+        .unwrap()
+        .to_string();
+    let (status, body) = api
+        .post(
+            "/connection-points",
+            &json!({
+                "gateway_id": gateway_id,
+                "mediator_id": "directory:0000000000000000",
+                "name": "cp",
+                "description": "cp",
+                "secret": "s3cret"
+            }),
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_id_without_a_configured_directory_is_not_found() {
+    let api = Api::start(None).await;
+    let (_, gateways) = api.get("/gateways").await;
+    let gateway_id = gateways
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gateway| gateway["gateway_type"] == "self")
+        .and_then(|gateway| gateway["id"].as_str())
+        .unwrap()
+        .to_string();
+    let (status, _) = api
+        .post(
+            "/connection-points",
+            &json!({
+                "gateway_id": gateway_id,
+                "mediator_id": "directory:0000000000000000",
+                "name": "cp",
+                "description": "cp",
+                "secret": "s3cret"
+            }),
+        )
+        .await;
+    assert_eq!(status, 404);
 }
 
 #[tokio::test(flavor = "multi_thread")]

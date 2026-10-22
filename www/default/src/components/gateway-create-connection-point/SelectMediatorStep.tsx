@@ -4,6 +4,7 @@ import { topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../shared/AppButton';
 import { CopyButton } from '../shared/CopyButton';
 import { Link } from '../shared/Link';
+import { initialMediatorSelection, MediatorOption } from './mediatorOptions';
 
 interface SelectMediatorStepProps {
   onNext: (mediatorId: string) => void;
@@ -16,7 +17,7 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
   onCancel,
   initialMediatorId = null,
 }) => {
-  const [mediators, setMediators] = useState<any[]>([]);
+  const [mediators, setMediators] = useState<MediatorOption[]>([]);
   const [selectedMediator, setSelectedMediator] = useState<string>(initialMediatorId || '');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -31,14 +32,10 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
       setError('');
       const response = await apiClient.get('/mediators/compatible');
       // Backend returns array directly, not wrapped in object
-      const mediatorsList = Array.isArray(response.data) ? response.data : [];
+      const mediatorsList: MediatorOption[] = Array.isArray(response.data) ? response.data : [];
       setMediators(mediatorsList);
-
-      // Auto-select the first mediator if there's only one and no initial value
-      if (mediatorsList.length === 1 && !initialMediatorId) {
-        setSelectedMediator(mediatorsList[0].id);
-      }
-    } catch (err: any) {
+      setSelectedMediator(initialMediatorSelection(mediatorsList, initialMediatorId));
+    } catch (err: unknown) {
       console.error('Failed to load mediators:', err);
       setError('Failed to load mediators. Please try again.');
     } finally {
@@ -119,6 +116,7 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
           </label>
           <select
             id="mediator-select"
+            data-testid="connection-point-mediator-select"
             className="form-control dropdown-styling"
             value={selectedMediator}
             onChange={e => setSelectedMediator(e.target.value)}

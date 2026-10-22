@@ -223,8 +223,8 @@ addresses are blocked, the resolved address is pinned and redirects are not foll
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `AG_EVENT_HOOK_URL` | unset | Receiver endpoint, for example `http://127.0.0.1:8085/hooks/events`. Setting it turns the hook on. It must be an `https` URL with a host and needs `AG_EVENT_HOOK_SECRET`. `http` is accepted only for a loopback host (`localhost`, any `127.0.0.0/8` address, `::1`), and only there is the secret optional. The host name is checked as written, with no DNS lookup, so any name other than `localhost` counts as non-loopback. Anything else (an unparsable URL, `http` to another host, `https` to another host without a secret) disables the hook with one error log that names the failed rule and never the URL. |
-| `AG_EVENT_HOOK_SECRET` | unset | HMAC key that signs every call when set, at least 32 characters after trimming whitespace. Read once at startup through the configuration loaders, like `AG_IDENTITY_HASH_PEPPER`: a plain value or an `env://`, `file://`, `aws_secrets://` or `aws_parameter_store://` reference ([`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#secret-references)). A value that is too short, or a reference that cannot be resolved, disables the hook with one error log that says which of the two it was. Never logged. With no secret the hook stays on and sends unsigned requests, with one startup `warn`, but only for a loopback receiver; any other host without a secret disables the hook. |
+| `AG_EVENT_HOOK_URL` | unset | Receiver endpoint, for example `http://127.0.0.1:8085/events`. Setting it turns the hook on. It must be an `https` URL with a host and needs `AG_EVENT_HOOK_SECRET`. `http` is accepted only for a loopback host (`localhost`, any `127.0.0.0/8` address, `::1`), and only there is the secret optional. The host name is checked as written, with no DNS lookup, so any name other than `localhost` counts as non-loopback. Anything else (an unparsable URL, `http` to another host, `https` to another host without a secret) disables the hook with one error log that names the failed rule and never the URL. |
+| `AG_EVENT_HOOK_SECRET` | unset | HMAC key that signs every call when set, at least 32 characters after trimming whitespace. Read once at startup through the configuration loaders, like `AG_IDENTITY_HASH_PEPPER`: a plain value or an `env://`, `file://`, `aws_secrets://` or `aws_parameter_store://` reference ([`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#secret-references)). A value that is too short, or a reference that cannot be resolved, disables the hook with one error log that says which of the two it was. Never logged. With no secret the hook stays on and sends unsigned requests, with one startup `warn`, but only for a loopback receiver; any other host without a secret disables the hook. A receiver that verifies signatures answers `401` to every unsigned attempt, so set the same secret on both sides. |
 | `AG_EVENT_HOOK_TIMEOUT_MS` | `5000` | HTTP timeout of one delivery attempt. No request waits on it. |
 
 **Events.** Every call is a `POST` with `Content-Type: application/json`. Only Connection Points created through the management API after the gateway recorded `mediator_did` are announced. Not announced are the permanent Connection Points the gateway pairing flows create (the inviter side after approval and the acceptor side after pairing), Connection Points stored before `mediator_did` was recorded (there is no backfill, so deleting one sends nothing), and the temporary pairing Connection Points; none of them produce `connected` or `deleted`. A receiver that registers DIDs on a mediator that only admits known DIDs therefore supports only API-created Connection Points created after this change; pairing flows and older Connection Points are not covered.
@@ -315,10 +315,124 @@ Guarantees, stated plainly:
   Receivers must order by `sequence` (or `timestamp`), be idempotent, and tolerate `created` or `connected`
   arriving before `creation_started`.
 - `creation_started` is emitted before the first mediator contact but delivered in the
-  background, so it can still reach the receiver after the gateway's first call. The gateway does
-  not retry that call, so a Connection Point on a mediator that only admits known DIDs fails with
-  a `500` when the mediator answers `403` because the receiver has not processed the event yet,
-  and creating it again mints a new DID.
+  background, so it can still reach the receiver after the gateway's first call. A mediator listed
+  by the [mediator directory](#mediator-directory) that only admits known DIDs answers that call
+  with `403` until the receiver has processed the event, so the gateway repeats the first call with
+  the same DID, as described below; for any other mediator a refusal is final. If the mediator
+  still refuses after the last repeat, creation fails with a `500`, `creation_failed` is sent, and
+  creating it again mints a new DID.
+
+**First mediator call retry.** This applies only to a mediator the gateway's directory lists, that
+is a stored record with `provided: true` that the last successful directory answer the gateway holds
+still lists (a stale answer counts, and the gateway never fetches the list for this). While the
+directory has not answered successfully yet (after a restart, or because every fetch failed) nothing
+says a provided record is gone, so it is retried too. The gateway never repeats the first call for
+any other mediator, an operator-added one included: for those a refusal is real and fails at once,
+as does a provided record that a successful directory answer no longer lists (the error then says
+the mediator is no longer offered by the directory). For these mediators each attempt is also
+bounded by the time left of the 60 second cap below; the first call to any other mediator has no
+added time bound.
+
+A mediator the directory lists may admit a DID only on demand, after the directory's operator has
+registered it in response to the gateway's `creation_started` notification, so it can refuse the
+very first call until that registration lands. That is why the gateway repeats the first call, and
+only for directory mediators.
+
+When a new Connection Point's first call to such a mediator (opening the live connection that
+precedes the OOB invitation) is refused because the mediator does not know the DID yet, the gateway
+repeats that call, with the same DID, after a fixed delay. Only that refusal is repeated. Exactly these failures count as one: an HTTP `403` status, an ACL denial, and a
+transport error whose text contains `WebSocket is not active` or `WebSocket isActive? command timed
+out` (the live connection failing to become active, which is how the SDK reports a refused
+authentication on that path). The last two also match a mediator that is simply unreachable, so it
+is retried too, until the attempts or the 60 second cap below run out. Nothing else is matched, so
+every other failure, including a `401`, ends creation at once. The wait respects request cancellation, which sends
+`connection_point.creation_failed` like any other failure. The retry applies with or without an
+event hook, because it is about the mediator, not the receiver, and its settings apply to
+directory-listed mediators only.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_ATTEMPTS` | `5` | For directory-listed mediators only: how many times the first call is repeated after the first refusal, from `0` (never repeat) to `20`. Any other value is ignored with a `warn` and the default is used. |
+| `AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_DELAY_MS` | `2000` | For directory-listed mediators only: wait before each repeat, from `1` to `60000` milliseconds. Any other value is ignored with a `warn` and the default is used. |
+
+Each repeat logs one `warn` (`Directory mediator has not admitted the connection point DID yet;
+retrying the first call retry=1 of=5 delay_ms=2000`). The live connection's own readiness wait can add up to
+10 seconds to an attempt, so the whole sequence is capped at 60 seconds: once another wait would
+pass that point the last refusal is returned and creation fails with `creation_failed`, whatever the
+attempts and delay are set to. The settings are read once at startup.
+
+## Mediator directory
+
+The same operator can also offer extra mediators next to the ones stored on the gateway: when
+`AG_MEDIATOR_DIRECTORY_URL` is set, the gateway asks that endpoint for a list of mediators and adds
+them to `GET /v1/mediators` and `GET /v1/mediators/compatible`, so they appear in the Create
+Connection Point wizard and on the Mediators page. With the variable unset the responses are
+unchanged.
+
+The URL follows the event hook's target rules (`https`, or `http` only for a loopback host; any
+non-loopback host needs `AG_EVENT_HOOK_SECRET`) and goes through the same pinned egress client, so
+redirects are not followed. The secret is shared with the event hook: a request is signed exactly
+like an event, with `X-Webhook-Timestamp` and `X-Webhook-Signature-256: sha256=<hex>` over
+`"{timestamp}.{body}"` where the body of the `GET` is empty. An invalid URL or secret disables the
+directory with one error log, and an invalid event hook URL does not disable a valid directory.
+
+The endpoint answers `200` with at most 1 MiB of JSON:
+
+```json
+{"items": [{"did": "did:web:mediator.example", "name": "Shared mediator"}]}
+```
+
+Only `did` and `name` are read; any other field is ignored.
+
+Anything else (another status, a redirect, a body that does not parse, a slow answer beyond 3 seconds)
+counts as unavailable, and the gateway lists only its stored mediators. Entries are cleaned before
+use: at most 50, a well-formed `did:` DID of at most 1024 bytes, a non-empty `name` of at most 200
+characters with control characters replaced by spaces and whitespace collapsed, duplicates by DID
+dropped. The list is cached for 5
+minutes after a non-empty answer and 30 seconds after an empty or failed one, and a failed refresh
+keeps serving the last good list.
+
+**Startup.** A directory may need time to answer its first request, or answer `503` until it can.
+Right after start the gateway therefore asks every 2 seconds, in the background, for up to 30
+seconds, until the directory answers `200`, and allows each of those requests up to 10 seconds
+(later requests allow 3). No request
+waits for that: until the first answer, the lists contain the stored mediators only and the wizard
+pre-selects nothing. After that a stale list is refreshed on demand, as described above, and a
+caller that arrives while a first fetch is running waits for its result instead of seeing an empty
+list.
+
+Creating a Connection Point with a `directory:` id before the directory has answered successfully
+(right after start, while the startup requests still run, or because every fetch failed) answers
+`503` with `The mediator directory is not available yet; try again shortly` and a `Retry-After: 5`
+header, because the gateway cannot tell yet whether the id was ever offered. Once the directory has
+answered, an id it does not list is `404 Mediator not found`.
+
+A directory entry is listed with the id `directory:<16 hex characters>` (stable per DID), its `name`,
+`provided: true`, no description and no identity on the mediator. The wizard pre-selects the first
+`provided` mediator when no other choice was made; nothing else marks it. It is read-only: it cannot be
+fetched, edited, deleted or pinged by that id. Creating a Connection Point with that `mediator_id`
+turns it into a stored record the first time: the gateway resolves the mediator's DID document,
+mints its own identity on it like `POST /v1/mediators` does, and stores it with `provided: true`.
+That path needs no `mediators.edit` permission and the record does not count toward the
+`connections.mediators` limit. The caller's resource scope is checked against the `directory:` id,
+as in the list. The record's id is fixed by the DID (and the token's tenant), so every event of the
+Connection Point, `creation_started` included, carries the id the record is stored under. The record
+is stored just before the Connection Point is saved and removed again if saving fails; a request
+that fails earlier (an unresolvable DID document answers `502`, a mediator that refuses the DID
+fails the creation) stores nothing. Later requests for the same entry reuse the record, which the
+list shows in place of the entry. A mediator an operator stored for the same DID always wins: it
+is listed as it is, without `provided`, and the entry is not listed. A stored provided record is
+listed under the entry's current `name`. Among
+several records for one DID, an operator's comes first, then the oldest. A stored provided record cannot be
+changed through the API: `PUT /v1/mediators/<id>` answers `409`, and so does `DELETE` while a
+Connection Point or a running request uses the record. Once nothing uses it, `DELETE` removes it, and
+the next Connection Point created on the entry stores it again from the directory, which is how a
+stale record (for example one whose DID the directory dropped) is refreshed or cleaned up. A stored
+provided record is also subject to the caller's mediator resource scope, by its own id, like any
+mediator. A record is reused only
+when the gateway of the new Connection Point may reference it, so each tenant gets its own, and the
+list shows one row per DID. A record that a failed request created is removed again unless another
+request or a stored Connection Point uses it.
 
 **Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
 `did` field is logged like any DID and masked by the global log redactor. The URL, the secret and

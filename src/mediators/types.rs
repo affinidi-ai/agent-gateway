@@ -45,6 +45,11 @@ pub struct Mediator {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub our_secrets: Option<serde_json::Value>,
 
+    /// Created from a mediator directory entry instead of added by the operator;
+    /// does not count toward the mediator limit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provided: bool,
+
     /// Timestamp when this record was created
     pub created_at: chrono::DateTime<chrono::Utc>,
 
@@ -76,6 +81,7 @@ impl Mediator {
             did_document,
             our_did: None,
             our_secrets: None,
+            provided: false,
             created_at: now,
             updated_at: now,
         }
@@ -101,6 +107,9 @@ pub struct MediatorResponse {
     /// Whether the gateway has an identity on this mediator (`our_did` and
     /// `our_secrets` both set), without exposing the secrets.
     pub registered: bool,
+    /// Offered by the mediator directory and read-only for the operator.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub provided: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -117,6 +126,7 @@ impl From<Mediator> for MediatorResponse {
             did_document,
             our_did,
             our_secrets,
+            provided,
             created_at,
             updated_at,
         } = mediator;
@@ -131,6 +141,7 @@ impl From<Mediator> for MediatorResponse {
             did_document,
             our_did,
             registered,
+            provided,
             created_at,
             updated_at,
         }

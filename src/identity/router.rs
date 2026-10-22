@@ -1449,7 +1449,12 @@ pub fn create_identity_api_router(
                 .layer(Extension(msg_store))
                 .layer(Extension(surface_store_for_connection_points))
                 .layer(Extension(notification_store.clone()))
-                .layer(Extension(state.event_hook.clone()));
+                .layer(Extension(state.event_hook.clone()))
+                .layer(Extension(
+                    state
+                        .mediator_directory
+                        .clone(),
+                ));
 
             #[cfg(feature = "didwebvh")]
             let router = router
@@ -1548,6 +1553,11 @@ pub fn create_identity_api_router(
     } else {
         Router::new()
     };
+    let mediator_router = mediator_router.layer(Extension(
+        state
+            .mediator_directory
+            .clone(),
+    ));
 
     // Reuse the agents-api TR listener manager for issuer trust registry registration
     let issuer_tr_listener_manager = agents_api_listener_manager;
