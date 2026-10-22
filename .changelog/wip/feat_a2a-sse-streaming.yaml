@@ -27,7 +27,18 @@ changes:
         now says, and one event by [a2a] max_body_size; a stream that passes a limit ends with an
         error event.
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-22T00:00:00.000Z'
+      title: Keep carried-over A2A settings when a stored surface change is applied
+      description: >-
+        A stored surface that reached the gateway as a storage event, from another node's
+        write, the cache refresh scan or the disk refresh a configuration reload starts with,
+        was applied as stored. An A2A surface stored without its own settings was then served
+        with the defaults (0.3 and 1.0), even when the reload running at the same time had
+        just given it A2A 1.0 only from the retired a2a_legacy_compatibility flag, so callers
+        without an A2A-Version header were accepted. The record is now given its settings,
+        and unsupported header metadata mappings are cleared, before it is applied, as on any
+        load.
   removed: []
   security:
     - timestamp: '2026-10-22T00:00:00.000Z'

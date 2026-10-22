@@ -1800,12 +1800,31 @@ async fn apply_surface_change(
     }
 }
 
-// wraps original function to avoid leaking implementation details
+/// Applies a surface another writer stored, brought up to date as a load brings
+/// it: unsupported header metadata mappings are dropped and an A2A surface
+/// stored without its own settings is given the carried-over ones. Otherwise
+/// the event a reload's own disk refresh raises could replace the surface that
+/// reload applied with the raw stored record.
 pub(crate) async fn apply_surface_upsert_from_storage(
     state: &IdentityApiState,
     surface: AgentSurface,
 ) {
-    apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
+    let mut surfaces = vec![surface];
+    if let Some(store) = state
+        .agent_surface_store
+        .as_deref()
+    {
+        if let Err(error) = crate::surfaces::strip_unsupported_header_metadata_mappings(store, &mut surfaces).await {
+            warn!(%error, "Could not store a surface with its unsupported header metadata mappings cleared");
+        }
+        crate::surfaces::carry_over_a2a_settings(store, &mut surfaces, !crate::server::mode::is_standby(), || {
+            crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config)
+        })
+        .await;
+    }
+    for surface in &surfaces {
+        apply_surface_change(state, SurfaceChange::Upsert(surface)).await;
+    }
 }
 
 // wraps original function to avoid leaking implementation details
