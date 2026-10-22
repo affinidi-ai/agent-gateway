@@ -1,0 +1,17 @@
+branch: fix/node-security-release
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-22T11:47:56.000Z'
+      title: Build the dashboard on Node.js 22.23.4
+      description: >-
+        The Docker images now build the www dashboard on Node.js 22.23.4 instead
+        of 22.21.1, and the MCP conformance CI job pins the same version. 22.23.4
+        is the October 2026 Node.js security release, which fixes an out-of-bounds
+        write in the Brotli decoder (CVE-2026-111497) and several TLS certificate
+        hostname-check bypasses. Node only runs while the image is built; the
+        runtime image ships no Node.
+  breaking: []
