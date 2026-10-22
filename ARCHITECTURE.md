@@ -75,6 +75,9 @@ so a fabric peer can be reachable while the dashboard is still being assembled.
 reports 503 on health. `SIGUSR1` promotes, `SIGUSR2` steps down. See
 [`src/server/mode.rs`](src/server/mode.rs).
 
+`SIGTERM` or Ctrl-C stops the process: `main.rs` writes the system metrics history to disk,
+shuts down OpenTelemetry, and exits. In-flight requests are not drained.
+
 ## Inbound path
 
 External caller → Access Point → Target. Implemented in

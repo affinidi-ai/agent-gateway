@@ -717,6 +717,7 @@ pub async fn run_axum_proxy(
         if let Err(e) = store.load().await {
             warn!("Failed to load system metrics history: {}", e);
         }
+        crate::observability::set_global_system_metrics_store(store.clone());
         Some(store)
     };
 

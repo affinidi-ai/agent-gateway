@@ -40,7 +40,8 @@ pub use policy_audit::{PolicyDecisionEvent, PolicyEvaluationError, PolicyFlow, P
 pub use simple_format::SimpleFormat;
 pub use span_filter::FilteringSpanExporter;
 pub use system_metrics::{
-    SYSTEM_METRICS_INTERVAL_SECS, SystemMetricsResponse, SystemMetricsStore, periodic_system_metrics_collection,
+    SYSTEM_METRICS_INTERVAL_SECS, SystemMetricsResponse, SystemMetricsStore, global_system_metrics_store,
+    periodic_system_metrics_collection, set_global_system_metrics_store,
 };
 pub use task_monitor::*;
 pub use tasks::{spawn_traced_task, spawn_traced_task_with_fields};

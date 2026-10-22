@@ -129,11 +129,14 @@ fn main() -> Result<()> {
     // ssi-json-ld's recursive expansion (json-ld-expansion) overflows the
     // default 2 MiB Tokio worker stack on macOS for typical agent-identity
     // VPs. Give every Tokio-managed thread (workers + blocking pool) 8 MiB.
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)
-        .build()?
-        .block_on(async_main())
+        .build()?;
+    let result = runtime.block_on(async_main());
+    // Background tasks are still running after a shutdown signal; don't let a blocking one hold up exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    result
 }
 
 async fn async_main() -> Result<()> {
@@ -601,7 +604,17 @@ async fn async_main() -> Result<()> {
     //   stale identity.
 
     // Run the Axum-based server (identity API is initialized inside if enabled)
-    let result = server::run_axum_proxy(config.clone(), bootstrap_config.clone()).await;
+    let result = tokio::select! {
+        result = server::run_axum_proxy(config.clone(), bootstrap_config.clone()) => result,
+        signal = shutdown_signal() => {
+            info!("Received {}, shutting down", signal);
+            Ok(())
+        }
+    };
+
+    if let Some(store) = observability::global_system_metrics_store() {
+        store.flush().await;
+    }
 
     // Shutdown OpenTelemetry gracefully (check metrics.json config)
     // We reload to check if it was actually enabled
@@ -618,6 +631,38 @@ async fn async_main() -> Result<()> {
     }
 
     result
+}
+
+/// Resolves with the name of the first termination signal received: SIGTERM or Ctrl-C.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = ctrl_c() => "SIGINT",
+            },
+            Err(e) => {
+                warn!("Failed to install SIGTERM handler: {}", e);
+                ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
+/// Waits for Ctrl-C; never resolves if the handler can't be installed, so that failure can't stop the server.
+async fn ctrl_c() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        warn!("Failed to install Ctrl-C handler: {}", e);
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Load configuration from the specified source with fallback to last-known-good config

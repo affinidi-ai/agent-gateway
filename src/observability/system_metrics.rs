@@ -3,8 +3,9 @@
 //! Periodically samples process and system resource usage, keeps a bounded
 //! in-memory ring buffer, and flushes it to a JSON file at most once per
 //! [`PERSIST_INTERVAL`] so historical data survives restarts without
-//! rewriting the whole history on every sample. The gateway runs no shutdown
-//! hook, so a restart drops the samples taken since the last write (up to
+//! rewriting the whole history on every sample. The gateway also writes it on
+//! SIGTERM or Ctrl-C through [`SystemMetricsStore::flush`]; a crash or forced
+//! kill drops the samples taken since the last write (up to
 //! [`PERSIST_INTERVAL`]). This history only feeds the dashboard view.
 //!
 //! When an OpenTelemetry meter provider is active, every sample is also
@@ -15,7 +16,7 @@ use chrono::{DateTime, Utc};
 use opentelemetry::{global, metrics::Gauge};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use sysinfo::{Pid, System};
 use tokio::sync::{Mutex, RwLock};
@@ -29,7 +30,7 @@ pub const SYSTEM_METRICS_INTERVAL_SECS: u64 = 5;
 const MAX_SAMPLES: usize = 17_280; // 24 h at 5 s intervals
 
 /// Minimum time between writes of the sample history to disk.
-const PERSIST_INTERVAL: Duration = Duration::from_secs(300);
+const PERSIST_INTERVAL: Duration = Duration::from_secs(900);
 
 /// Age after which [`SystemMetricsStore::load`] removes a temp file left by an interrupted write.
 /// Younger ones are kept because another instance sharing the directory may still be writing them.
@@ -198,6 +199,25 @@ impl SystemMetricsStore {
         }
     }
 
+    /// Writes the whole history now, regardless of [`Self::persist_interval`]. Called on shutdown.
+    pub async fn flush(&self) {
+        let data = self
+            .samples
+            .read()
+            .await
+            .clone();
+        if data.is_empty() {
+            return;
+        }
+        *self
+            .last_persisted
+            .lock()
+            .await = Some(Instant::now());
+        if let Err(e) = write_samples_atomically(&self.storage_path, &data).await {
+            error!("Failed to persist system metrics: {:#}", e);
+        }
+    }
+
     /// Claims the next persist slot. A failed write still consumes the slot, so a persistent
     /// storage fault is retried once per interval rather than on every sample.
     async fn persist_due(&self) -> bool {
@@ -251,6 +271,20 @@ impl SystemMetricsStore {
             current,
         }
     }
+}
+
+static GLOBAL_SYSTEM_METRICS_STORE: OnceLock<Arc<SystemMetricsStore>> = OnceLock::new();
+
+/// Register the process-wide system metrics store (orchestrator, once) so shutdown can flush it.
+pub fn set_global_system_metrics_store(store: Arc<SystemMetricsStore>) {
+    let _ = GLOBAL_SYSTEM_METRICS_STORE.set(store);
+}
+
+/// Access the process-wide system metrics store, if registered.
+pub fn global_system_metrics_store() -> Option<Arc<SystemMetricsStore>> {
+    GLOBAL_SYSTEM_METRICS_STORE
+        .get()
+        .cloned()
 }
 
 /// Writes the history to a uniquely named sibling temp file and renames it over `path`, so a
@@ -537,6 +571,32 @@ mod tests {
         assert!(!stale.exists());
         assert!(recent.exists());
         assert!(unrelated.exists());
+    }
+
+    #[tokio::test]
+    async fn flush_writes_full_history_before_interval_elapses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SystemMetricsStore::with_persist_interval(dir.path(), Duration::from_secs(3600));
+        store.push(sample(1.0)).await;
+        store.push(sample(2.0)).await;
+        assert_eq!(persisted_cpu(dir.path()).await, vec![1.0]);
+
+        store.flush().await;
+
+        assert_eq!(persisted_cpu(dir.path()).await, vec![1.0, 2.0]);
+    }
+
+    #[tokio::test]
+    async fn flush_with_no_samples_leaves_existing_history_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = SystemMetricsStore::with_persist_interval(dir.path(), Duration::ZERO);
+        writer.push(sample(1.0)).await;
+
+        SystemMetricsStore::new(dir.path())
+            .flush()
+            .await;
+
+        assert_eq!(persisted_cpu(dir.path()).await, vec![1.0]);
     }
 
     #[tokio::test]
