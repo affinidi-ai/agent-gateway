@@ -595,7 +595,7 @@ pub(crate) async fn resolve_directory_mediator<S: MediatorStore>(
     let tenant_id = tenant_for_create(None, false, tenant_context(context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     let existing =
-        under_did_lock(&entry.did, find_directory_record(store, &entry.did, gateway_tenant, context, scope)).await?;
+        under_did_lock(&entry.did, find_directory_record(store, &entry.did, gateway_tenant, context)).await?;
     if let Some(existing) = existing {
         return Ok(DirectoryMediator::Stored(existing));
     }
@@ -643,14 +643,15 @@ fn directory_record_id(
 }
 
 /// The provided record for a DID that the gateway may reference and the caller
-/// may use; the oldest when several qualify. Operator-added records are never
-/// returned.
+/// may use; the oldest when several qualify. The caller's grant on the
+/// `directory:` id, checked by the resolver, covers the record created for it,
+/// so the record's own id is not checked against the resource scope. Operator-
+/// added records are never returned.
 async fn find_directory_record<S: MediatorStore>(
     store: &S,
     did: &str,
     gateway_tenant: Option<&str>,
     context: &Option<Extension<PatTenantContext>>,
-    scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<Option<Mediator>, (StatusCode, String)> {
     Ok(store
         .list_all()
@@ -661,7 +662,7 @@ async fn find_directory_record<S: MediatorStore>(
             mediator.provided
                 && mediator.did == did
                 && can_reference(gateway_tenant, mediator.tenant_id.as_deref())
-                && mediator_allowed(mediator, context, scope)
+                && can_access(mediator.tenant_id.as_deref(), tenant_context(context))
         })
         .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id))))
 }
@@ -677,10 +678,9 @@ pub(crate) async fn store_pending_directory_mediator<S: MediatorStore>(
     pending: Mediator,
     gateway_tenant: Option<&str>,
     context: &Option<Extension<PatTenantContext>>,
-    scope: &Option<Extension<PatResourceScope>>,
 ) -> Result<Mediator, (StatusCode, String)> {
     under_did_lock(&pending.did, async {
-        if let Some(existing) = find_directory_record(store, &pending.did, gateway_tenant, context, scope).await? {
+        if let Some(existing) = find_directory_record(store, &pending.did, gateway_tenant, context).await? {
             return Ok(existing);
         }
         let hidden = store
@@ -1596,7 +1596,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let found = super::find_directory_record(&store, "did:web:a", None, &None, &None)
+        let found = super::find_directory_record(&store, "did:web:a", None, &None)
             .await
             .unwrap()
             .unwrap();
@@ -1607,7 +1607,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            super::find_directory_record(&store, "did:web:a", None, &None, &None)
+            super::find_directory_record(&store, "did:web:a", None, &None)
                 .await
                 .unwrap()
                 .is_none()
@@ -1633,7 +1633,7 @@ mod tests {
         let find = |tenant: Option<&'static str>| {
             let store = &store;
             async move {
-                super::find_directory_record(store, "did:web:a", tenant, &None, &None)
+                super::find_directory_record(store, "did:web:a", tenant, &None)
                     .await
                     .unwrap()
                     .map(|mediator| mediator.id)
@@ -1703,14 +1703,12 @@ mod tests {
     async fn a_stored_pending_record_stays_and_the_next_request_reuses_it() {
         use crate::mediators::MediatorStore;
         let (store, _points, _dir) = stores().await;
-        let first =
-            super::store_pending_directory_mediator(&store, None, pending_for("did:web:a").await, None, &None, &None)
-                .await
-                .unwrap();
-        let second =
-            super::store_pending_directory_mediator(&store, None, pending_for("did:web:a").await, None, &None, &None)
-                .await
-                .unwrap();
+        let first = super::store_pending_directory_mediator(&store, None, pending_for("did:web:a").await, None, &None)
+            .await
+            .unwrap();
+        let second = super::store_pending_directory_mediator(&store, None, pending_for("did:web:a").await, None, &None)
+            .await
+            .unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(
             store
@@ -1746,7 +1744,6 @@ mod tests {
             None,
             pending_for("did:web:hidden").await,
             Some("tenant-a"),
-            &None,
             &None,
         )
         .await;
@@ -1801,15 +1798,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_store_does_not_leave_a_lock_entry_behind() {
-        let result = super::store_pending_directory_mediator(
-            &FailingStore,
-            None,
-            pending_for("did:web:c").await,
-            None,
-            &None,
-            &None,
-        )
-        .await;
+        let result =
+            super::store_pending_directory_mediator(&FailingStore, None, pending_for("did:web:c").await, None, &None)
+                .await;
         assert!(result.is_err());
         assert!(
             super::MATERIALIZE_LOCKS
@@ -1886,7 +1877,7 @@ mod tests {
         use crate::gateways::connection_points::ConnectionPointStore;
         let (store, points, _dir) = stores().await;
         let created =
-            super::store_pending_directory_mediator(&store, None, pending_for("did:web:d").await, None, &None, &None)
+            super::store_pending_directory_mediator(&store, None, pending_for("did:web:d").await, None, &None)
                 .await
                 .unwrap();
 
@@ -1943,7 +1934,6 @@ mod tests {
                     pending_for("did:web:locked").await,
                     None,
                     &None,
-                    &None,
                 )
                 .await
             })
@@ -1960,34 +1950,142 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_scoped_token_reuses_only_the_provided_records_its_scope_allows() {
+    async fn a_token_scoped_to_directory_ids_can_create_on_the_same_entry_again() {
+        let did = "did:web:scoped.example";
+        crate::mediators::utils::test_documents::install(
+            did,
+            json!({
+                "id": did,
+                "service": [{
+                    "id": format!("{did}#didcomm"),
+                    "type": "DIDCommMessaging",
+                    "serviceEndpoint": [{ "uri": "http://127.0.0.1:1" }]
+                }]
+            }),
+        );
+        let (store, _points, _dir) = stores().await;
+        let (directory, _) = directory_listing(Some(did)).await;
+        let id = crate::event_hook::DirectoryEntry {
+            did: did.into(),
+            name: "Shared".into(),
+        }
+        .id();
+        let scope = Some(Extension(PatResourceScope(Arc::new(
+            Regex::new(r"\ATENANT:tenant-a:mediators:directory:.*\z").unwrap(),
+        ))));
+
+        let mut stored_ids = Vec::new();
+        for round in 0..3 {
+            let resolved =
+                super::resolve_directory_mediator(&store, Some(&directory), &id, Some("tenant-a"), &tenant_a(), &scope)
+                    .await;
+            let mediator = match resolved {
+                Ok(super::DirectoryMediator::Pending(pending)) => {
+                    assert_eq!(round, 0, "only the first creation builds a record");
+                    super::store_pending_directory_mediator(&store, None, pending, Some("tenant-a"), &tenant_a())
+                        .await
+                        .unwrap()
+                }
+                Ok(super::DirectoryMediator::Stored(stored)) => stored,
+                Err(error) => panic!("round {round} failed with {}", error.into_parts().0),
+            };
+            stored_ids.push(mediator.id);
+        }
+        assert!(
+            stored_ids
+                .iter()
+                .all(|id| id == &stored_ids[0]),
+            "every creation uses the one record the first one stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provided_record_is_reused_only_for_the_tenants_that_may_reference_it_whatever_the_scope() {
         use crate::mediators::MediatorStore;
         let dir = tempfile::tempdir().unwrap();
         let store = crate::mediators::FileSystemMediatorStore::new(dir.path().to_path_buf())
             .await
             .unwrap();
-        for id in ["allowed-record", "blocked-record"] {
-            store
-                .create(&tenant_record("did:web:a", 10, id, Some("tenant-a")))
-                .await
-                .unwrap();
-        }
-        let scope = |pattern: &str| Some(Extension(PatResourceScope(Arc::new(Regex::new(pattern).unwrap()))));
-        let narrow = scope(r"\ATENANT:tenant-a:mediators:allowed-record\z");
-        let found = super::find_directory_record(&store, "did:web:a", Some("tenant-a"), &tenant_a(), &narrow)
+        store
+            .create(&tenant_record("did:web:a", 10, "tenant-b-record", Some("tenant-b")))
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(found.id, "allowed-record");
-
-        let none = scope(r"\ATENANT:tenant-a:mediators:something-else\z");
         assert!(
-            super::find_directory_record(&store, "did:web:a", Some("tenant-a"), &tenant_a(), &none)
+            super::find_directory_record(&store, "did:web:a", Some("tenant-a"), &tenant_a())
                 .await
                 .unwrap()
                 .is_none(),
-            "a stored provided record outside the scope is not reused"
+            "another tenant's record is not reused"
         );
+    }
+
+    #[tokio::test]
+    async fn a_delete_that_starts_after_the_check_waits_for_the_save_and_then_finds_the_record_used() {
+        use crate::gateways::connection_points::ConnectionPointStore;
+        let (store, points, _dir) = stores().await;
+        let points = Arc::new(points);
+        let created =
+            super::store_pending_directory_mediator(&store, None, pending_for("did:web:e").await, None, &None)
+                .await
+                .unwrap();
+        let (dropped, _) = directory_listing(None).await;
+
+        let creating = super::lock_did(&created.did).await;
+        let deleting = {
+            let (created, points, dropped) = (created.clone(), points.clone(), dropped.clone());
+            tokio::spawn(async move {
+                let _guard = super::lock_did(&created.did).await;
+                super::reject_provided_delete(&created, Some(&dropped), Some(points.as_ref())).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!deleting.is_finished(), "the delete waits while the creation holds the lock");
+
+        points
+            .create(&point_on(&created.id))
+            .await
+            .unwrap();
+        drop(creating);
+        let refused = deleting
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refused.0, axum::http::StatusCode::CONFLICT);
+        assert!(
+            refused
+                .1
+                .contains("used by a connection point"),
+            "{}",
+            refused.1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_request_mid_save_keeps_the_did_lock_until_the_save_ends() {
+        let did = "did:web:save.example";
+        let guard = super::lock_did(did).await;
+        let payload = crate::event_hook::ConnectionPointPayload::minted("cp", "cp", "", "gw", "m", did, "did:web:cp");
+        let creation = crate::event_hook::CreationGuard::start(None, payload.clone());
+        let request = tokio::spawn(async move {
+            creation
+                .complete(
+                    async move {
+                        let _held_until_saved = guard;
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        Ok::<_, String>(())
+                    },
+                    payload,
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        request.abort();
+        let _ = request.await;
+
+        let early = tokio::time::timeout(std::time::Duration::from_millis(100), super::lock_did(did)).await;
+        assert!(early.is_err(), "the cancelled request's save still holds the lock");
+        let late = tokio::time::timeout(std::time::Duration::from_secs(2), super::lock_did(did)).await;
+        assert!(late.is_ok(), "the lock is released when the save finishes");
     }
 
     async fn stored_mediator(

@@ -1192,7 +1192,66 @@ async fn a_provided_mediator_cannot_be_edited_or_deleted_while_the_directory_off
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_connection_point_creation_leaves_no_directory_mediator_record() {
+async fn racing_creations_on_one_directory_entry_name_the_saved_mediator_in_every_event() {
+    let mediator = FakeMediator::start_resolvable().await;
+    Api::install_fake_mediator(&mediator, fake_invitation());
+    let hook = MockHook::start(HookReply::accept()).await;
+    let (api, _directory) = Api::start_listing(&mediator, &hook).await;
+    let (_, listed) = api.get("/mediators").await;
+    let directory_id = listed[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let request = json!({
+        "gateway_id": self_gateway_id(&api).await,
+        "mediator_id": directory_id,
+        "name": "cp",
+        "description": "cp",
+        "secret": "s3cret",
+        "did_method": "peer"
+    });
+    let (first, second) =
+        tokio::join!(api.post("/connection-points", &request), api.post("/connection-points", &request));
+    let mut saved = std::collections::HashMap::new();
+    for (status, body) in [first, second] {
+        assert_eq!(status, 200, "{body}");
+        saved.insert(
+            body["connection_point"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            body["connection_point"]["mediator_id"].clone(),
+        );
+    }
+    eventually("both connection points created", || {
+        std::future::ready(
+            hook.events()
+                .iter()
+                .filter(|event| event["event"] == "connection_point.created")
+                .count()
+                >= 2,
+        )
+    })
+    .await;
+    for event in hook.events() {
+        let point = event["connection_point"]["id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(event["connection_point"]["mediator_id"], saved[point], "{event}");
+    }
+    let (_, listed) = api.get("/mediators").await;
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "one stored record shared by both: {listed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_connection_point_creation_leaves_the_provided_record_for_the_next_attempt() {
     let mediator = FakeMediator::start_resolvable().await;
     install_directory_mediator_document(&mediator);
     Api::install_fake_mediator(&mediator, Err("mediator refused".to_string()));
@@ -1220,9 +1279,18 @@ async fn a_failed_connection_point_creation_leaves_no_directory_mediator_record(
     let (status, listed) = api.get("/mediators").await;
     assert_eq!(status, 200, "{listed}");
     let items = listed.as_array().unwrap();
-    assert_eq!(items.len(), 1, "{listed}");
-    assert_eq!(items[0]["id"], json!(directory_id), "the entry is still only offered, not stored: {listed}");
-    assert_eq!(items[0]["registered"], false);
+    assert_eq!(items.len(), 2, "the entry, then the record stored for the failed attempt: {listed}");
+    assert_eq!(items[0]["id"], json!(directory_id));
+    assert_eq!(items[1]["provided"], true);
+    assert_eq!(items[1]["registered"], true);
+    let stored_id = items[1]["id"].clone();
+
+    Api::install_fake_mediator(&mediator, fake_invitation());
+    let (status, body) = api
+        .post("/connection-points", &request)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["connection_point"]["mediator_id"], stored_id, "the next attempt reuses the record");
 }
 
 #[tokio::test(flavor = "multi_thread")]
