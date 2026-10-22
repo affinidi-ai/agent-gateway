@@ -34,6 +34,11 @@ Applies to:
    explicitly requested.
 8. Header topbar controls must use the shared topbar action button pattern, a single
    reusable component plus shared CSS state rules, rather than ad-hoc per-button markup.
+9. Mediator lists may contain directory entries (`directory:*` ids), and stored records
+   created from them carry `provided: true`. The Create Connection Point wizard pre-selects the
+   first `provided` mediator (else the only mediator, else nothing) and marks it in no other way;
+   the Mediators page renders every mediator with `provided: true` read-only (no ping, edit or
+   delete) and shows no badge or warning for them.
 
 ## Toasts
 

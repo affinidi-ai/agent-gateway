@@ -348,7 +348,7 @@ from.
 | --- | --- | --- |
 | [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification, display names (including dashboard-only managed-agent Agent Card names) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
 | [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
-| [`event_hook/`](src/event_hook/) | Operator-configured notifications of Connection Point lifecycle events to a receiver: signed, sequenced, delivered from background tasks with retries, nothing persisted | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
+| [`event_hook/`](src/event_hook/) | Operator-configured notifications of Connection Point lifecycle events to a receiver: signed, sequenced, delivered from background tasks with retries, nothing persisted. `directory.rs` is the cached client of the operator-configured mediator directory, whose entries `mediators/` lists next to stored records | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#mediator-directory) |
 | [`didauth/`](src/didauth/) | The DID Auth challenge and JWS ceremony | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#did-auth) |
 | [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies and JWKS fetching | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`api_keys/`](src/api_keys/) | Data-plane API keys | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
@@ -378,7 +378,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`gateways/`](src/gateways/) | Remote gateway records, pairing, connection points, issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md) |
+| [`gateways/`](src/gateways/) | Remote gateway records, pairing, connection points (`connection_points/first_call_retry.rs` repeats a new one's first mediator call while a mediator the directory lists refuses its DID; other mediators fail at once), issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
 | [`mediators/`](src/mediators/) | DIDComm mediator connections | [`FABRIC.md`](docs/FABRIC.md), [`PER_GATEWAY_MEDIATOR_FEDERATION.md`](docs/PER_GATEWAY_MEDIATOR_FEDERATION.md) |
 
 ### Management plane

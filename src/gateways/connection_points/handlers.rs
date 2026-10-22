@@ -1,7 +1,7 @@
 use affinidi_messaging_sdk::{ATM, protocols::oob_discovery::OOBDiscovery};
 use affinidi_tdk_common::{TDKSharedState, profiles::TDKProfile, secrets_resolver::secrets::Secret};
 use anyhow::Result;
-use axum::{Extension, Json, extract::Path, http::StatusCode};
+use axum::{Extension, Json, extract::Path, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -613,6 +613,46 @@ pub async fn get_connection_point<S: ConnectionPointStore>(
     Ok(Json(connection_point))
 }
 
+/// An error answer of connection point creation, with the seconds a client
+/// should wait before asking again when the failure is temporary.
+pub struct CreateError {
+    status: StatusCode,
+    message: String,
+    retry_after_secs: Option<u32>,
+}
+
+impl From<(StatusCode, String)> for CreateError {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self {
+            status,
+            message,
+            retry_after_secs: None,
+        }
+    }
+}
+
+impl From<crate::mediators::handlers::DirectoryResolveError> for CreateError {
+    fn from(error: crate::mediators::handlers::DirectoryResolveError) -> Self {
+        let (status, message, retry_after_secs) = error.into_parts();
+        Self {
+            status,
+            message,
+            retry_after_secs,
+        }
+    }
+}
+
+impl IntoResponse for CreateError {
+    fn into_response(self) -> axum::response::Response {
+        match self.retry_after_secs {
+            Some(secs) => {
+                (self.status, [(axum::http::header::RETRY_AFTER, secs.to_string())], self.message).into_response()
+            }
+            None => (self.status, self.message).into_response(),
+        }
+    }
+}
+
 /// Create a new connection point (OOB invitation)
 pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: GatewayStore, M: MediatorStore>(
     Extension(pub_store): Extension<std::sync::Arc<P>>,
@@ -631,10 +671,11 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
         Option<std::sync::Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>,
     >,
     Extension(event_hook): Extension<Option<Arc<crate::event_hook::EventHook>>>,
+    Extension(mediator_directory): Extension<Option<Arc<crate::event_hook::MediatorDirectory>>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
-    Json(req): Json<CreateConnectionPointRequest>,
-) -> Result<Json<CreateConnectionPointResponse>, (StatusCode, String)> {
+    Json(mut req): Json<CreateConnectionPointRequest>,
+) -> Result<Json<CreateConnectionPointResponse>, CreateError> {
     crate::config::enforce_add("connections.connectionpoints")
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, e.message()))?;
@@ -661,37 +702,64 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
             "Attempted to create connection point for non-self gateway: {} (type: {:?})",
             req.gateway_id, gateway.gateway_type
         );
-        return Err((StatusCode::BAD_REQUEST, "Can only create connection points for self gateway".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "Can only create connection points for self gateway".to_string()).into());
     }
 
     if !can_mutate(gateway.tenant_id.as_deref(), tenant_context(&context)) {
-        return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()));
+        return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".to_string()).into());
     }
 
     info!("Gateway '{}' validated (DID: {})", gateway.name, gateway.did);
 
-    // Verify the mediator exists
-    let mediator = mediator_store
-        .get(&req.mediator_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to get mediator '{}': {}", req.mediator_id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e))
-        })?
-        .ok_or_else(|| {
-            warn!("Mediator '{}' not found", req.mediator_id);
-            (StatusCode::NOT_FOUND, "Mediator not found".to_string())
-        })?;
+    let via_directory = crate::event_hook::is_directory_mediator_id(&req.mediator_id);
+    let mut pending_mediator = None;
+    let mut directory_use = None;
+    let mediator = if via_directory {
+        match crate::mediators::handlers::resolve_directory_mediator(
+            mediator_store.as_ref(),
+            mediator_directory.as_ref(),
+            &req.mediator_id,
+            gateway.tenant_id.as_deref(),
+            &context,
+            &scope,
+        )
+        .await?
+        {
+            crate::mediators::handlers::DirectoryMediator::Stored(mediator, usage) => {
+                directory_use = Some(usage);
+                mediator
+            }
+            crate::mediators::handlers::DirectoryMediator::Pending(mediator) => {
+                pending_mediator = Some(mediator.clone());
+                mediator
+            }
+        }
+    } else {
+        // Verify the mediator exists
+        mediator_store
+            .get(&req.mediator_id)
+            .await
+            .map_err(|e| {
+                error!("Failed to get mediator '{}': {}", req.mediator_id, e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e))
+            })?
+            .ok_or_else(|| {
+                warn!("Mediator '{}' not found", req.mediator_id);
+                (StatusCode::NOT_FOUND, "Mediator not found".to_string())
+            })?
+    };
+    req.mediator_id = mediator.id.clone();
 
     if !can_reference(gateway.tenant_id.as_deref(), mediator.tenant_id.as_deref())
-        || !scope_allows_resource(
-            resource_scope(&scope),
-            tenant_context(&context),
-            ResourceKind::Mediators,
-            &mediator.id,
-        )
+        || !(via_directory
+            || scope_allows_resource(
+                resource_scope(&scope),
+                tenant_context(&context),
+                ResourceKind::Mediators,
+                &mediator.id,
+            ))
     {
-        return Err((StatusCode::BAD_REQUEST, "Mediator reference is not accessible".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "Mediator reference is not accessible".to_string()).into());
     }
 
     info!("Mediator '{}' validated (DID: {})", mediator.name, mediator.did);
@@ -705,7 +773,9 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
         ResourceKind::ConnectionPoints,
         &temp_cp_id,
     ) {
-        return Err((StatusCode::FORBIDDEN, "Connection point is outside this token's permitted scope".to_string()));
+        return Err(
+            (StatusCode::FORBIDDEN, "Connection point is outside this token's permitted scope".to_string()).into()
+        );
     }
     let storage_path = std::path::Path::new(
         &bootstrap_config
@@ -810,6 +880,18 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
     info!("  Connection Point DID: {}", connection_point_did);
     info!("  Label: {}", req.name);
 
+    let listing = match mediator_directory.as_ref() {
+        Some(directory) => {
+            directory
+                .listing(&mediator.did)
+                .await
+        }
+        None => crate::event_hook::Listing::NotListed,
+    };
+    let first_call_retry = super::first_call_retry::applies_to(mediator.provided, listing)
+        .then(super::first_call_retry::FirstCallRetry::current);
+    let no_longer_offered = super::first_call_retry::no_longer_offered(mediator.provided, listing);
+
     let oob_result = create_oob_invitation(
         &mediator_url,
         &mediator.did,         // Use actual mediator DID from record
@@ -820,15 +902,22 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
         did_document,       // Pass DID document for caching
         mediator.did_document.clone(),
         Some(expiry_duration),
+        first_call_retry,
     )
     .await;
 
     let (oob_id, oob_url, oob_message) = oob_result.map_err(|e| {
         error!("Failed to create OOB invitation: {}", e);
+        let hint = if no_longer_offered {
+            warn!("The mediator is no longer offered by the mediator directory; its first call was not retried");
+            " (the mediator is no longer offered by the directory)"
+        } else {
+            ""
+        };
 
         warn!("Keys NOT cleaned up for debugging - ID: {}", temp_cp_id);
 
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create OOB invitation: {}", e))
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create OOB invitation: {e}{hint}"))
     })?;
 
     info!("Successfully created OOB invitation with ID: {}", oob_id);
@@ -866,16 +955,45 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
 
     debug!("Creating connection point with ID: {}", connection_point.id);
 
+    let mut created_mediator = None;
+    if let Some(pending) = pending_mediator {
+        let (stored, created, usage) = crate::mediators::handlers::store_pending_directory_mediator(
+            mediator_store.as_ref(),
+            pending,
+            gateway.tenant_id.as_deref(),
+            &context,
+            &scope,
+        )
+        .await?;
+        directory_use = Some(usage);
+        connection_point.mediator_id = stored.id.clone();
+        if created {
+            created_mediator = Some(stored);
+        }
+    }
+
     let saved = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, Some(&mediator.did));
     let record = connection_point.clone();
     let store = pub_store.clone();
-    creation
+    if let Err(e) = creation
         .complete(async move { store.create(&record).await }, saved)
         .await
-        .map_err(|e| {
-            error!("Failed to create connection point: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create connection point: {}", e))
-        })?;
+    {
+        error!("Failed to create connection point: {}", e);
+        if let Some(created) = &created_mediator {
+            crate::mediators::handlers::roll_back_directory_mediator(
+                mediator_store.as_ref(),
+                pub_store.as_ref(),
+                created,
+            )
+            .await;
+        }
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create connection point: {}", e)).into());
+    }
+    drop(directory_use);
+    if let (Some(created), Some(notif)) = (&created_mediator, notif_store.as_ref()) {
+        crate::mediators::handlers::announce_mediator_created(notif, created);
+    }
 
     info!(
         "Connection point created successfully: ID={}, Gateway={}, Mediator={}, OOB_ID={}, URL={}",
@@ -1023,6 +1141,7 @@ async fn create_oob_invitation(
     did_document: serde_json::Value,
     mediator_did_document: Option<serde_json::Value>,
     expiry: Option<std::time::Duration>,
+    first_call_retry: Option<super::first_call_retry::FirstCallRetry>,
 ) -> Result<(String, String, serde_json::Value), String> {
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     info!("Creating OOB invitation via SDK");
@@ -1035,7 +1154,7 @@ async fn create_oob_invitation(
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     #[cfg(test)]
-    if let Some(outcome) = super::test_mediator::oob_invitation(mediator_did) {
+    if let Some(outcome) = super::test_mediator::oob_invitation(mediator_did, first_call_retry.is_some()).await {
         return outcome;
     }
 
@@ -1111,10 +1230,25 @@ async fn create_oob_invitation(
     info!("ATM Profile created for DID: {}", from_did);
     // Add profile to ATM (this returns Arc<ATMProfile> and registers it properly)
     // IMPORTANT: Use live_stream=true so we can query and update ACL mode
-    let profile = atm
-        .profile_add(&profile, true)
+    let profile = match first_call_retry
+        .unwrap_or_else(super::first_call_retry::FirstCallRetry::never)
+        .run(
+            || atm.profile_add(&profile, true),
+            super::first_call_retry::refused_until_admitted,
+            || {
+                affinidi_messaging_sdk::errors::ATMError::TransportError(
+                    "The first call did not finish within the retry time limit".into(),
+                )
+            },
+        )
         .await
-        .map_err(|e| format!("Failed to add profile to ATM: {}", e))?;
+    {
+        Ok(profile) => profile,
+        Err(e) => {
+            atm.graceful_shutdown().await;
+            return Err(format!("Failed to add profile to ATM: {}", e));
+        }
+    };
 
     info!("Profile added to ATM successfully");
 
@@ -2380,7 +2514,8 @@ mod tests {
             .layer(Extension(None::<Arc<crate::integrations::FileSystemNotificationStore>>))
             .layer(Extension(None::<Arc<dyn crate::storage::DidLogStorage>>))
             .layer(Extension(None::<Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>))
-            .layer(Extension(None::<Arc<crate::event_hook::EventHook>>));
+            .layer(Extension(None::<Arc<crate::event_hook::EventHook>>))
+            .layer(Extension(None::<Arc<crate::event_hook::MediatorDirectory>>));
         if let Some(tenant) = tenant {
             router = router.layer(Extension(tenant));
         }

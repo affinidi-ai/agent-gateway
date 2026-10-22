@@ -6,16 +6,22 @@ use crate::comm::client::CommClient;
 use crate::gateways::connection_points::ConnectionPointStore;
 use crate::mediators::utils::extract_mediator_info;
 use crate::tenancy::{
-    PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
+    PatTenantContext, ResourceKind, can_access, can_mutate, can_reference, scope_allows_resource, tenant_for_create,
 };
 
 use super::MediatorStore;
 use super::types::{Mediator, MediatorResponse, MediatorStatus};
+use crate::event_hook::{DirectoryEntry, MediatorDirectory, is_directory_mediator_id};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OnceCell, RwLock};
+
+/// One lock per directory mediator DID while a request is storing its record, so
+/// concurrent requests store it once. An entry is dropped when its last user is done.
+static MATERIALIZE_LOCKS: std::sync::LazyLock<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
 
 struct GlobalCommClientCache {
     clients: RwLock<HashMap<String, Arc<CommClient>>>,
@@ -138,6 +144,40 @@ fn mediator_writable(
         && scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Mediators, &mediator.id)
 }
 
+/// A provided record can be removed once nothing uses it, so a stale one can be
+/// refreshed: the next use stores it again from the directory.
+async fn reject_provided_in_use(
+    mediator: &Mediator,
+    connection_points: Option<&crate::gateways::FileSystemConnectionPointStore>,
+) -> Result<(), (StatusCode, String)> {
+    let in_use_message = || {
+        (StatusCode::CONFLICT, "Mediator is provided by the directory and is used by a connection point".to_string())
+    };
+    let in_flight = IN_USE
+        .get(&mediator.id)
+        .is_some_and(|holders| *holders > 0);
+    let Some(connection_points) = connection_points else {
+        return Err(in_use_message());
+    };
+    let referenced = connection_points
+        .list_all()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list connection points: {}", e)))?
+        .iter()
+        .any(|point| point.mediator_id == mediator.id);
+    if referenced || in_flight {
+        return Err(in_use_message());
+    }
+    Ok(())
+}
+
+fn reject_provided(mediator: &Mediator) -> Result<(), (StatusCode, String)> {
+    if mediator.provided {
+        return Err((StatusCode::CONFLICT, "Mediator is provided by the directory and cannot be changed".to_string()));
+    }
+    Ok(())
+}
+
 /// Request body for updating a mediator
 #[derive(Debug, Deserialize)]
 pub struct UpdateMediatorRequest {
@@ -161,47 +201,129 @@ pub struct CheckAuthResponse {
     pub endpoint_url: Option<String>,
 }
 
-/// List all mediators
-pub async fn list_mediators<S: MediatorStore>(
-    Extension(store): Extension<std::sync::Arc<S>>,
-    context: Option<Extension<PatTenantContext>>,
-    scope: Option<Extension<PatResourceScope>>,
-) -> Result<Json<Vec<MediatorResponse>>, (StatusCode, String)> {
+/// Directory entries first, a stored record the directory created for the same
+/// DID taking the entry's place, then the remaining stored records. A mediator
+/// the operator added themselves wins over a directory entry for the same DID:
+/// it stays as it is and the entry is not listed. Without entries the stored
+/// records are returned as they are.
+fn merge_directory_entries(
+    entries: Vec<DirectoryEntry>,
+    mut stored: Vec<Mediator>,
+    listed_at: chrono::DateTime<chrono::Utc>,
+) -> Vec<MediatorResponse> {
+    let mut items = Vec::with_capacity(entries.len() + stored.len());
+    for entry in entries {
+        let same_did: Vec<usize> = (0..stored.len())
+            .filter(|&index| stored[index].did == entry.did)
+            .collect();
+        let operator_added = same_did
+            .iter()
+            .any(|&index| !stored[index].provided);
+        let mut provided: Vec<usize> = same_did
+            .into_iter()
+            .filter(|&index| stored[index].provided)
+            .collect();
+        let stands_in = provided
+            .iter()
+            .copied()
+            .min_by(|&a, &b| record_order(&stored[a]).cmp(&record_order(&stored[b])))
+            .map(|index| stored[index].clone());
+        provided.sort_unstable_by(|a, b| b.cmp(a));
+        for index in provided {
+            stored.remove(index);
+        }
+        if operator_added {
+            continue;
+        }
+        let mediator = stands_in.unwrap_or_else(|| directory_mediator(&entry, listed_at));
+        let mut item = MediatorResponse::from(mediator);
+        item.provided = true;
+        item.name = entry.name;
+        items.push(item);
+    }
+    items.extend(
+        stored
+            .into_iter()
+            .map(MediatorResponse::from),
+    );
+    items
+}
+
+/// Orders the records for one DID: operator-added before provided ones, then
+/// oldest first, so the choice never depends on the order of the list.
+fn record_order(mediator: &Mediator) -> (bool, chrono::DateTime<chrono::Utc>, &str) {
+    (mediator.provided, mediator.created_at, mediator.id.as_str())
+}
+
+fn directory_mediator(
+    entry: &DirectoryEntry,
+    listed_at: chrono::DateTime<chrono::Utc>,
+) -> Mediator {
+    Mediator {
+        id: entry.id(),
+        tenant_id: None,
+        name: entry.name.clone(),
+        description: String::new(),
+        did: entry.did.clone(),
+        status: MediatorStatus::Active,
+        did_document: None,
+        our_did: None,
+        our_secrets: None,
+        provided: true,
+        created_at: listed_at,
+        updated_at: listed_at,
+    }
+}
+
+async fn list_accessible_mediators<S: MediatorStore>(
+    store: &S,
+    directory: Option<&Arc<MediatorDirectory>>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<Vec<MediatorResponse>, (StatusCode, String)> {
     let mut mediators = store
         .list_all()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list mediators: {}", e)))?;
-    mediators.retain(|mediator| mediator_allowed(mediator, &context, &scope));
+    mediators.retain(|mediator| mediator_allowed(mediator, context, scope));
 
-    Ok(Json(
-        mediators
+    let Some(directory) = directory else {
+        return Ok(mediators
             .into_iter()
             .map(MediatorResponse::from)
-            .collect(),
-    ))
+            .collect());
+    };
+    let mut items = merge_directory_entries(directory.entries().await, mediators, chrono::Utc::now());
+    items.retain(|item| {
+        !is_directory_mediator_id(&item.id)
+            || scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Mediators, &item.id)
+    });
+    Ok(items)
+}
+
+/// List all mediators
+pub async fn list_mediators<S: MediatorStore>(
+    Extension(store): Extension<std::sync::Arc<S>>,
+    Extension(directory): Extension<Option<Arc<MediatorDirectory>>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Result<Json<Vec<MediatorResponse>>, (StatusCode, String)> {
+    list_accessible_mediators(store.as_ref(), directory.as_ref(), &context, &scope)
+        .await
+        .map(Json)
 }
 
 /// List mediators compatible with OOB invitation creation
 /// All stored mediators are compatible (validated during addition)
 pub async fn list_compatible_mediators<S: MediatorStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
+    Extension(directory): Extension<Option<Arc<MediatorDirectory>>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<Vec<MediatorResponse>>, (StatusCode, String)> {
-    let mut mediators = store
-        .list_all()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list mediators: {}", e)))?;
-    mediators.retain(|mediator| mediator_allowed(mediator, &context, &scope));
-
+    let mediators = list_accessible_mediators(store.as_ref(), directory.as_ref(), &context, &scope).await?;
     tracing::info!("Returning {} mediators (all are compatible)", mediators.len());
-
-    Ok(Json(
-        mediators
-            .into_iter()
-            .map(MediatorResponse::from)
-            .collect(),
-    ))
+    Ok(Json(mediators))
 }
 
 /// Get a mediator by ID
@@ -237,6 +359,15 @@ pub async fn create_mediator<S: MediatorStore>(
     crate::config::enforce_add("connections.mediators")
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, e.message()))?;
+    create_mediator_record(store.as_ref(), notification_store.as_ref(), req, &context, &scope)
+        .await
+        .map(|mediator| Json(mediator.into()))
+}
+
+fn new_mediator_with_identity(
+    req: CreateMediatorRequest,
+    provided: bool,
+) -> Result<Mediator, (StatusCode, String)> {
     use affinidi_tdk_common::secrets_resolver::secrets::Secret;
     use did_peer::{DIDPeer, DIDPeerCreateKeys, DIDPeerKeys};
 
@@ -287,52 +418,356 @@ pub async fn create_mediator<S: MediatorStore>(
 
     let mut mediator = Mediator::new(req.name, req.description, req.did, fixed_did_document);
     mediator.tenant_id = req.tenant_id;
-    if !mediator_writable(&mediator, &context, &scope) {
-        return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
-    }
+    mediator.provided = provided;
     mediator.our_did = Some(our_did);
     mediator.our_secrets = Some(secrets_json);
+    Ok(mediator)
+}
 
+async fn create_mediator_record<S: MediatorStore>(
+    store: &S,
+    notification_store: Option<&std::sync::Arc<crate::integrations::FileSystemNotificationStore>>,
+    req: CreateMediatorRequest,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<Mediator, (StatusCode, String)> {
+    let mediator = new_mediator_with_identity(req, false)?;
+    if !mediator_writable(&mediator, context, scope) {
+        return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
+    }
+    store_new_mediator(store, notification_store, &mediator).await?;
+    Ok(mediator)
+}
+
+async fn store_new_mediator<S: MediatorStore>(
+    store: &S,
+    notification_store: Option<&std::sync::Arc<crate::integrations::FileSystemNotificationStore>>,
+    mediator: &Mediator,
+) -> Result<(), (StatusCode, String)> {
     store
-        .create(&mediator)
+        .create(mediator)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to store mediator: {}", e)))?;
 
-    // Trigger mediator created event
-    if let Some(ref notif_store) = notification_store {
-        let mediator_clone = mediator.clone();
-        let notif = notif_store.clone();
-        tokio::spawn(async move {
-            let status_str = match mediator_clone.status {
-                crate::mediators::types::MediatorStatus::Active => "Active".to_string(),
-                crate::mediators::types::MediatorStatus::Disabled => "Inactive".to_string(),
-            };
-            let mediator_trigger = crate::integrations::mediator_integration_triggers::Mediator {
-                id: mediator_clone.id.clone(),
-                name: mediator_clone.name.clone(),
-                description: mediator_clone
-                    .description
-                    .clone(),
-                did: mediator_clone.did.clone(),
-                status: status_str,
-                our_did: mediator_clone.our_did.clone(),
-                created_at: Some(
-                    mediator_clone
-                        .created_at
-                        .to_rfc3339(),
-                ),
-                updated_at: Some(
-                    mediator_clone
-                        .updated_at
-                        .to_rfc3339(),
-                ),
-            };
-            crate::integrations::mediator_integration_triggers::trigger_mediator_created(&notif, &mediator_trigger)
-                .await;
-        });
+    if let Some(notif_store) = notification_store {
+        spawn_mediator_created_trigger(notif_store, mediator);
     }
 
-    Ok(Json(mediator.into()))
+    Ok(())
+}
+
+fn spawn_mediator_created_trigger(
+    notif_store: &std::sync::Arc<crate::integrations::FileSystemNotificationStore>,
+    mediator: &Mediator,
+) {
+    let mediator_clone = mediator.clone();
+    let notif = std::sync::Arc::clone(notif_store);
+    tokio::spawn(async move {
+        let status_str = match mediator_clone.status {
+            crate::mediators::types::MediatorStatus::Active => "Active".to_string(),
+            crate::mediators::types::MediatorStatus::Disabled => "Inactive".to_string(),
+        };
+        let mediator_trigger = crate::integrations::mediator_integration_triggers::Mediator {
+            id: mediator_clone.id.clone(),
+            name: mediator_clone.name.clone(),
+            description: mediator_clone
+                .description
+                .clone(),
+            did: mediator_clone.did.clone(),
+            status: status_str,
+            our_did: mediator_clone.our_did.clone(),
+            created_at: Some(
+                mediator_clone
+                    .created_at
+                    .to_rfc3339(),
+            ),
+            updated_at: Some(
+                mediator_clone
+                    .updated_at
+                    .to_rfc3339(),
+            ),
+        };
+        crate::integrations::mediator_integration_triggers::trigger_mediator_created(&notif, &mediator_trigger).await;
+    });
+}
+
+/// Why a `directory:` mediator id could not be resolved.
+pub(crate) enum DirectoryResolveError {
+    Response(StatusCode, String),
+    DirectoryUnavailable,
+}
+
+impl From<(StatusCode, String)> for DirectoryResolveError {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self::Response(status, message)
+    }
+}
+
+impl DirectoryResolveError {
+    /// The status, the message, and the seconds a client should wait before
+    /// asking again when the failure is temporary.
+    pub(crate) fn into_parts(self) -> (StatusCode, String, Option<u32>) {
+        match self {
+            Self::Response(status, message) => (status, message, None),
+            Self::DirectoryUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The mediator directory is not available yet; try again shortly".to_string(),
+                Some(5),
+            ),
+        }
+    }
+}
+
+/// How many requests currently rely on each stored directory record, by record
+/// id, so a request that fails cannot remove a record another one still uses.
+static IN_USE: std::sync::LazyLock<dashmap::DashMap<String, usize>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Held by a request for as long as it relies on a stored directory record.
+pub(crate) struct DirectoryRecordUse {
+    id: String,
+}
+
+impl DirectoryRecordUse {
+    fn hold(id: &str) -> Self {
+        *IN_USE
+            .entry(id.to_string())
+            .or_insert(0) += 1;
+        Self { id: id.to_string() }
+    }
+}
+
+impl Drop for DirectoryRecordUse {
+    fn drop(&mut self) {
+        if let Some(mut holders) = IN_USE.get_mut(&self.id) {
+            *holders = holders.saturating_sub(1);
+        }
+        IN_USE.remove_if(&self.id, |_, holders| *holders == 0);
+    }
+}
+
+/// Keeps a DID's lock entry in the map for as long as it is in use and removes
+/// it when the last user is gone, also when a request is cancelled mid-wait.
+struct LockEntry {
+    did: String,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl LockEntry {
+    fn acquire(did: &str) -> Self {
+        let lock = MATERIALIZE_LOCKS
+            .entry(did.to_string())
+            .or_default()
+            .clone();
+        Self {
+            did: did.to_string(),
+            lock: Some(lock),
+        }
+    }
+
+    fn lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.lock
+            .clone()
+            .expect("the lock is held until the entry is dropped")
+    }
+}
+
+impl Drop for LockEntry {
+    fn drop(&mut self) {
+        self.lock.take();
+        MATERIALIZE_LOCKS.remove_if(&self.did, |_, lock| Arc::strong_count(lock) == 1);
+    }
+}
+
+async fn under_did_lock<T>(
+    did: &str,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let entry = LockEntry::acquire(did);
+    let _one_at_a_time = entry
+        .lock()
+        .lock_owned()
+        .await;
+    work.await
+}
+
+/// A directory mediator turned into a mediator record. `Pending` has not been
+/// stored yet: the caller stores it with [`store_pending_directory_mediator`]
+/// once the rest of its request has succeeded.
+pub(crate) enum DirectoryMediator {
+    Stored(Mediator, DirectoryRecordUse),
+    Pending(Mediator),
+}
+
+/// Resolves a `directory:*` mediator id to the record a Connection Point on a
+/// gateway of `gateway_tenant` can use. The caller's resource scope is checked
+/// against the directory id, as the list does, and the DID document is
+/// resolved here, before anything is stored. A record the directory created
+/// earlier, one the gateway may reference, is reused; a new one is only built.
+/// It carries no `mediators.edit` check and does not count toward the mediator
+/// limit.
+pub(crate) async fn resolve_directory_mediator<S: MediatorStore>(
+    store: &S,
+    directory: Option<&Arc<MediatorDirectory>>,
+    id: &str,
+    gateway_tenant: Option<&str>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<DirectoryMediator, DirectoryResolveError> {
+    let not_found = || (StatusCode::NOT_FOUND, "Mediator not found".to_string());
+    let directory = directory.ok_or_else(not_found)?;
+    let Some(entry) = directory.find(id).await else {
+        return Err(if directory.has_loaded() {
+            not_found().into()
+        } else {
+            DirectoryResolveError::DirectoryUnavailable
+        });
+    };
+    if !scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Mediators, id) {
+        return Err(not_found().into());
+    }
+    let tenant_id = tenant_for_create(None, false, tenant_context(context))
+        .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
+    let existing = under_did_lock(&entry.did, async {
+        let found = find_directory_record(store, &entry.did, gateway_tenant, context, scope).await?;
+        Ok::<_, (StatusCode, String)>(found.map(|mediator| {
+            let usage = DirectoryRecordUse::hold(&mediator.id);
+            (mediator, usage)
+        }))
+    })
+    .await?;
+    if let Some((existing, usage)) = existing {
+        return Ok(DirectoryMediator::Stored(existing, usage));
+    }
+    let hidden_by_scope = store
+        .get(&directory_record_id(tenant_id.as_deref(), &entry.did))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
+        .is_some();
+    if hidden_by_scope {
+        return Err(not_found().into());
+    }
+    let did_document = super::utils::resolve_did(&entry.did)
+        .await
+        .map_err(|e| {
+            tracing::warn!("Could not resolve the DID document of a directory mediator: {e}");
+            (StatusCode::BAD_GATEWAY, "Could not resolve the mediator's DID document".to_string())
+        })?;
+    let mut mediator = new_mediator_with_identity(
+        CreateMediatorRequest {
+            tenant_id,
+            name: entry.name,
+            description: String::new(),
+            did: entry.did,
+            did_document: Some(did_document),
+        },
+        true,
+    )?;
+    mediator.id = directory_record_id(mediator.tenant_id.as_deref(), &mediator.did);
+    Ok(DirectoryMediator::Pending(mediator))
+}
+
+/// The id of the record stored for a directory mediator: fixed by the owner and
+/// the DID, so the id known before the record exists is the id it gets.
+fn directory_record_id(
+    tenant_id: Option<&str>,
+    did: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("directory-mediator\n{}\n{did}", tenant_id.unwrap_or_default()));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes)
+        .into_uuid()
+        .to_string()
+}
+
+async fn find_directory_record<S: MediatorStore>(
+    store: &S,
+    did: &str,
+    gateway_tenant: Option<&str>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<Option<Mediator>, (StatusCode, String)> {
+    Ok(store
+        .list_all()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list mediators: {}", e)))?
+        .into_iter()
+        .filter(|mediator| {
+            mediator.did == did
+                && can_access(mediator.tenant_id.as_deref(), tenant_context(context))
+                && can_reference(gateway_tenant, mediator.tenant_id.as_deref())
+                && mediator_allowed(mediator, context, scope)
+        })
+        .min_by(|a, b| record_order(a).cmp(&record_order(b))))
+}
+
+/// Stores a pending directory mediator, unless a record for the same DID the
+/// gateway may reference is already there, and returns the record in use,
+/// whether this call created it, and the hold that keeps it from being rolled
+/// back under this request. Concurrent callers for the same DID share one
+/// record. The mediator created trigger is left to
+/// [`announce_mediator_created`], once the request that needed the record has
+/// succeeded.
+pub(crate) async fn store_pending_directory_mediator<S: MediatorStore>(
+    store: &S,
+    pending: Mediator,
+    gateway_tenant: Option<&str>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<(Mediator, bool, DirectoryRecordUse), (StatusCode, String)> {
+    under_did_lock(&pending.did, async {
+        match find_directory_record(store, &pending.did, gateway_tenant, context, scope).await? {
+            Some(existing) => {
+                let usage = DirectoryRecordUse::hold(&existing.id);
+                Ok((existing, false, usage))
+            }
+            None => {
+                store_new_mediator(store, None, &pending).await?;
+                let usage = DirectoryRecordUse::hold(&pending.id);
+                Ok((pending.clone(), true, usage))
+            }
+        }
+    })
+    .await
+}
+
+/// Removes a directory mediator record the failed request created, unless
+/// another request relies on it or a stored Connection Point references it.
+pub(crate) async fn roll_back_directory_mediator<S: MediatorStore, C: ConnectionPointStore>(
+    store: &S,
+    connection_points: &C,
+    record: &Mediator,
+) {
+    under_did_lock(&record.did, async {
+        let others_rely_on_it = IN_USE
+            .get(&record.id)
+            .is_some_and(|holders| *holders > 1);
+        if others_rely_on_it {
+            return;
+        }
+        match connection_points
+            .list_all()
+            .await
+        {
+            Ok(stored)
+                if stored
+                    .iter()
+                    .all(|point| point.mediator_id != record.id) => {}
+            _ => return,
+        }
+        if let Err(e) = store.delete(&record.id).await {
+            tracing::warn!("Could not remove the directory mediator record created by a failed request: {e}");
+        }
+    })
+    .await;
+}
+
+pub(crate) fn announce_mediator_created(
+    notification_store: &std::sync::Arc<crate::integrations::FileSystemNotificationStore>,
+    mediator: &Mediator,
+) {
+    spawn_mediator_created_trigger(notification_store, mediator);
 }
 
 /// Fix malformed service endpoints in DID documents
@@ -432,6 +867,7 @@ pub async fn update_mediator<S: MediatorStore>(
     if !mediator_allowed(&mediator, &context, &scope) {
         return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()));
     }
+    reject_provided(&mediator)?;
     if !mediator_writable(&mediator, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
     }
@@ -554,6 +990,9 @@ pub async fn delete_mediator<S: MediatorStore>(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Mediator not found".to_string()))?;
     if !mediator_allowed(&mediator, &context, &scope) {
         return Err((StatusCode::NOT_FOUND, "Mediator not found".to_string()));
+    }
+    if mediator.provided {
+        reject_provided_in_use(&mediator, cp_store.as_deref()).await?;
     }
     if !mediator_writable(&mediator, &context, &scope) {
         return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
@@ -1105,6 +1544,424 @@ mod tests {
 
         record.tenant_id = Some("tenant-b".into());
         assert!(!mediator_writable(&record, &tenant, &None));
+    }
+
+    fn record(
+        did: &str,
+        provided: bool,
+        age_secs: i64,
+        id: &str,
+    ) -> Mediator {
+        let mut mediator = Mediator::new(id.into(), String::new(), did.into(), None);
+        mediator.id = id.into();
+        mediator.provided = provided;
+        mediator.created_at = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        mediator
+    }
+
+    fn entry(did: &str) -> crate::event_hook::DirectoryEntry {
+        crate::event_hook::DirectoryEntry {
+            did: did.into(),
+            name: "Entry".into(),
+        }
+    }
+
+    fn tenant_record(
+        did: &str,
+        age_secs: i64,
+        id: &str,
+        tenant: Option<&str>,
+    ) -> Mediator {
+        let mut mediator = record(did, true, age_secs, id);
+        mediator.tenant_id = tenant.map(str::to_string);
+        mediator
+    }
+
+    #[test]
+    fn an_operator_record_wins_over_a_provided_one_and_is_the_only_row_for_the_did() {
+        let operator = record("did:web:a", false, 10, "operator");
+        let provided = record("did:web:a", true, 100, "provided");
+        for stored in [vec![operator.clone(), provided.clone()], vec![provided.clone(), operator.clone()]] {
+            let items = super::merge_directory_entries(vec![entry("did:web:a")], stored, chrono::Utc::now());
+            assert_eq!(items.len(), 1, "one row per DID");
+            assert_eq!(items[0].id, "operator");
+            assert!(!items[0].provided);
+            assert_ne!(items[0].name, "Entry", "the entry is not applied to the operator's record");
+        }
+    }
+
+    #[test]
+    fn among_provided_records_one_stands_for_the_entry_and_the_others_are_not_listed() {
+        let older = record("did:web:a", true, 100, "older");
+        let newer = record("did:web:a", true, 10, "newer");
+        for stored in [vec![older.clone(), newer.clone()], vec![newer.clone(), older.clone()]] {
+            let items = super::merge_directory_entries(vec![entry("did:web:a")], stored, chrono::Utc::now());
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].id, "older");
+            assert!(items[0].provided);
+            assert_eq!(items[0].name, "Entry", "a stored provided record shows the entry's current name");
+        }
+    }
+
+    #[test]
+    fn provided_records_of_other_tenants_for_one_did_make_one_row() {
+        let stored = vec![
+            tenant_record("did:web:a", 50, "tenant-a-record", Some("tenant-a")),
+            tenant_record("did:web:a", 10, "tenant-b-record", Some("tenant-b")),
+            record("did:web:other", false, 5, "unrelated"),
+        ];
+        let items = super::merge_directory_entries(vec![entry("did:web:a")], stored, chrono::Utc::now());
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(ids, ["tenant-a-record", "unrelated"]);
+    }
+
+    #[tokio::test]
+    async fn the_record_a_request_reuses_is_the_operators_then_the_gateways_tenants() {
+        use crate::mediators::MediatorStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::mediators::FileSystemMediatorStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        for stored in [record("did:web:a", true, 100, "provided"), record("did:web:a", false, 10, "operator")] {
+            store
+                .create(&stored)
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            let found = super::find_directory_record(&store, "did:web:a", None, &None, &None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.id, "operator");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_provided_record_a_request_reuses_is_one_the_target_gateway_may_reference() {
+        use crate::mediators::MediatorStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::mediators::FileSystemMediatorStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        for stored in [
+            tenant_record("did:web:a", 100, "tenant-a-record", Some("tenant-a")),
+            tenant_record("did:web:a", 10, "tenant-b-record", Some("tenant-b")),
+        ] {
+            store
+                .create(&stored)
+                .await
+                .unwrap();
+        }
+        let find = |tenant: Option<&'static str>| {
+            let store = &store;
+            async move {
+                super::find_directory_record(store, "did:web:a", tenant, &None, &None)
+                    .await
+                    .unwrap()
+                    .map(|mediator| mediator.id)
+            }
+        };
+        assert_eq!(
+            find(Some("tenant-b"))
+                .await
+                .as_deref(),
+            Some("tenant-b-record")
+        );
+        assert_eq!(
+            find(Some("tenant-a"))
+                .await
+                .as_deref(),
+            Some("tenant-a-record")
+        );
+        assert_eq!(find(Some("tenant-c")).await, None);
+        assert_eq!(find(None).await, None, "an appliance-wide gateway cannot reference another owner's record");
+    }
+
+    #[test]
+    fn a_directory_record_id_is_fixed_by_the_owner_and_the_did() {
+        let id = super::directory_record_id(None, "did:web:a");
+        assert_eq!(id, super::directory_record_id(None, "did:web:a"));
+        assert_ne!(id, super::directory_record_id(None, "did:web:b"));
+        assert_ne!(id, super::directory_record_id(Some("tenant-a"), "did:web:a"));
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+    }
+
+    async fn pending_for(did: &str) -> Mediator {
+        let mut pending = record(did, true, 0, "unused");
+        pending.id = super::directory_record_id(None, did);
+        pending
+    }
+
+    async fn stores()
+    -> (crate::mediators::FileSystemMediatorStore, crate::gateways::FileSystemConnectionPointStore, tempfile::TempDir)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mediators = crate::mediators::FileSystemMediatorStore::new(dir.path().join("mediators"))
+            .await
+            .unwrap();
+        let points = crate::gateways::FileSystemConnectionPointStore::new(dir.path().join("points"))
+            .await
+            .unwrap();
+        (mediators, points, dir)
+    }
+
+    fn point_on(mediator_id: &str) -> crate::gateways::connection_points::types::GatewayConnectionPoint {
+        crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+            "gateway".into(),
+            mediator_id.into(),
+            "did:web:cp".into(),
+            "cp".into(),
+            String::new(),
+            "oob".into(),
+            "https://m.invalid/oob".into(),
+            serde_json::json!({}),
+            None,
+            crate::gateways::connection_points::ConnectionPointType::User,
+            "secret".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stored_pending_record_is_shared_and_its_creator_alone_rolls_it_back() {
+        use crate::mediators::MediatorStore;
+        let (store, points, _dir) = stores().await;
+        let (first, created, first_use) =
+            super::store_pending_directory_mediator(&store, pending_for("did:web:a").await, None, &None, &None)
+                .await
+                .unwrap();
+        assert!(created);
+        let (second, created_again, second_use) =
+            super::store_pending_directory_mediator(&store, pending_for("did:web:a").await, None, &None, &None)
+                .await
+                .unwrap();
+        assert!(!created_again);
+        assert_eq!(first.id, second.id);
+        assert!(
+            super::MATERIALIZE_LOCKS
+                .get("did:web:a")
+                .is_none(),
+            "the lock entry is dropped when its last user is done"
+        );
+
+        super::roll_back_directory_mediator(&store, &points, &first).await;
+        assert_eq!(
+            store
+                .list_all()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a second request still relies on the record"
+        );
+
+        drop(second_use);
+        super::roll_back_directory_mediator(&store, &points, &first).await;
+        assert!(
+            store
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(first_use);
+        assert!(
+            super::IN_USE
+                .get(&first.id)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_a_stored_connection_point_references_is_not_rolled_back() {
+        use crate::gateways::connection_points::ConnectionPointStore;
+        use crate::mediators::MediatorStore;
+        let (store, points, _dir) = stores().await;
+        let (created, _, usage) =
+            super::store_pending_directory_mediator(&store, pending_for("did:web:b").await, None, &None, &None)
+                .await
+                .unwrap();
+        points
+            .create(&point_on(&created.id))
+            .await
+            .unwrap();
+        super::roll_back_directory_mediator(&store, &points, &created).await;
+        drop(usage);
+        assert_eq!(
+            store
+                .list_all()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    struct FailingStore;
+
+    #[async_trait::async_trait]
+    impl crate::mediators::MediatorStore for FailingStore {
+        async fn create(
+            &self,
+            _: &Mediator,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("down")
+        }
+
+        async fn get(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<Mediator>> {
+            anyhow::bail!("down")
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<Mediator>> {
+            anyhow::bail!("down")
+        }
+
+        async fn delete(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("down")
+        }
+
+        async fn update(
+            &self,
+            _: &Mediator,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("down")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_does_not_leave_a_lock_entry_behind() {
+        let result =
+            super::store_pending_directory_mediator(&FailingStore, pending_for("did:web:c").await, None, &None, &None)
+                .await;
+        assert!(result.is_err());
+        assert!(
+            super::MATERIALIZE_LOCKS
+                .get("did:web:c")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_provided_record_cannot_be_changed_through_the_api() {
+        let provided = record("did:web:a", true, 0, "provided");
+        let operator = record("did:web:a", false, 0, "operator");
+        let rejected = super::reject_provided(&provided).unwrap_err();
+        assert_eq!(rejected.0, axum::http::StatusCode::CONFLICT);
+        assert!(
+            rejected
+                .1
+                .contains("provided by the directory")
+        );
+        assert!(super::reject_provided(&operator).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_does_not_leak_its_lock_entry() {
+        let did = "did:web:cancelled.example";
+        let holder = tokio::spawn(super::under_did_lock(did, async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let waiter = tokio::spawn(super::under_did_lock(did, async {}));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(
+            super::MATERIALIZE_LOCKS
+                .get(did)
+                .is_some(),
+            "the holder still uses the entry"
+        );
+        holder.abort();
+        let _ = holder.await;
+        assert!(
+            super::MATERIALIZE_LOCKS
+                .get(did)
+                .is_none(),
+            "dropping the last user, cancelled or not, removes the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provided_record_can_be_deleted_only_while_nothing_uses_it() {
+        use crate::gateways::connection_points::ConnectionPointStore;
+        let (store, points, _dir) = stores().await;
+        let (created, _, usage) =
+            super::store_pending_directory_mediator(&store, pending_for("did:web:d").await, None, &None, &None)
+                .await
+                .unwrap();
+
+        let busy = super::reject_provided_in_use(&created, Some(&points))
+            .await
+            .unwrap_err();
+        assert_eq!(busy.0, axum::http::StatusCode::CONFLICT, "a request still relies on it");
+        drop(usage);
+        assert!(
+            super::reject_provided_in_use(&created, Some(&points))
+                .await
+                .is_ok(),
+            "nothing uses it any more"
+        );
+
+        points
+            .create(&point_on(&created.id))
+            .await
+            .unwrap();
+        let referenced = super::reject_provided_in_use(&created, Some(&points))
+            .await
+            .unwrap_err();
+        assert_eq!(referenced.0, axum::http::StatusCode::CONFLICT);
+        assert!(
+            referenced
+                .1
+                .contains("used by a connection point")
+        );
+        assert!(
+            super::reject_provided_in_use(&created, None)
+                .await
+                .is_err(),
+            "without a connection point store a provided record is not removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_reuses_only_the_provided_records_its_scope_allows() {
+        use crate::mediators::MediatorStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::mediators::FileSystemMediatorStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        for id in ["allowed-record", "blocked-record"] {
+            store
+                .create(&tenant_record("did:web:a", 10, id, Some("tenant-a")))
+                .await
+                .unwrap();
+        }
+        let scope = |pattern: &str| Some(Extension(PatResourceScope(Arc::new(Regex::new(pattern).unwrap()))));
+        let narrow = scope(r"\ATENANT:tenant-a:mediators:allowed-record\z");
+        let found = super::find_directory_record(&store, "did:web:a", Some("tenant-a"), &tenant_a(), &narrow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, "allowed-record");
+
+        let none = scope(r"\ATENANT:tenant-a:mediators:something-else\z");
+        assert!(
+            super::find_directory_record(&store, "did:web:a", Some("tenant-a"), &tenant_a(), &none)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stored provided record outside the scope is not reused"
+        );
     }
 
     async fn stored_mediator(

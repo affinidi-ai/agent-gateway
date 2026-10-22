@@ -22,6 +22,8 @@ Two records drive gateway-to-gateway connections:
 - **`Mediator`** ([src/mediators/types.rs](../src/mediators/types.rs)): a
   registered mediator. It holds the mediator's `did` and the gateway's own
   identity on that mediator, `our_did` and `our_secrets`.
+  A record created from a [mediator directory](INTEGRATIONS.md#mediator-directory)
+  entry has `provided: true` and does not count toward the mediator limit. A mediator the operator stored for the same DID is listed instead of the entry.
 - **`GatewayConnectionPoint`** ([src/gateways/connection_points/types.rs](../src/gateways/connection_points/types.rs)):
   holds a `mediator_id` and its own `connection_point_did`. The DID's
   `DIDCommMessaging` service endpoint is the mediator's URL, so anyone who

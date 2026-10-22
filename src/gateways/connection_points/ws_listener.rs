@@ -5231,6 +5231,7 @@ mod tests {
             status,
             our_did: None,
             our_secrets: None,
+            provided: false,
             created_at: now,
             updated_at: now,
         }

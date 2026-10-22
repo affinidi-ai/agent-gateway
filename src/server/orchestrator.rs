@@ -196,7 +196,11 @@ fn register_resource_limit_counters(
             async move {
                 s.list_all()
                     .await
-                    .map(|v| v.len())
+                    .map(|v| {
+                        v.iter()
+                            .filter(|mediator| !mediator.provided)
+                            .count()
+                    })
                     .unwrap_or(0)
             }
         });
@@ -1334,6 +1338,7 @@ pub async fn run_axum_proxy(
             surface_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             surface_template_store: surface_template_store.clone(),
             event_hook: None,
+            mediator_directory: None,
 
             // DID:webvh fields (will be initialized later if feature is enabled)
             #[cfg(feature = "didwebvh")]
@@ -1536,16 +1541,18 @@ pub async fn run_axum_proxy(
             };
 
         #[cfg(test)]
-        let event_hook = match crate::event_hook::test_settings::get(
+        let hook_settings = match crate::event_hook::test_settings::get(
             &bootstrap_config
                 .storage_paths
                 .gateways,
         ) {
-            Some(settings) => crate::event_hook::EventHook::new(settings),
-            None => build_event_hook().await,
+            Some(settings) => settings,
+            None => crate::event_hook::EventHookSettings::from_env().await,
         };
         #[cfg(not(test))]
-        let event_hook = build_event_hook().await;
+        let hook_settings = crate::event_hook::EventHookSettings::from_env().await;
+        let mediator_directory = crate::event_hook::MediatorDirectory::new(&hook_settings);
+        let event_hook = crate::event_hook::EventHook::new(hook_settings);
 
         let mediator_store: Option<Arc<crate::mediators::FileSystemMediatorStore>> =
             match crate::mediators::FileSystemMediatorStore::new(PathBuf::from(
@@ -2127,6 +2134,7 @@ pub async fn run_axum_proxy(
         identity_state.connection_point_store = connection_point_store.clone();
         identity_state.mediator_store = mediator_store.clone();
         identity_state.event_hook = event_hook.clone();
+        identity_state.mediator_directory = mediator_directory.clone();
         if let (Some(hook), Some(store)) = (event_hook.as_ref(), connection_point_store.as_ref()) {
             store.set_event_hook(hook.clone());
         }
@@ -4228,10 +4236,6 @@ pub async fn run_axum_proxy(
     }
 
     Ok(())
-}
-
-async fn build_event_hook() -> Option<Arc<crate::event_hook::EventHook>> {
-    crate::event_hook::EventHook::new(crate::event_hook::EventHookSettings::from_env().await)
 }
 
 /// Re-derive the config + policy planes from shared storage when this node is
