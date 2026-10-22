@@ -338,8 +338,19 @@ pub async fn init_secrets_store(store: Arc<dyn crate::secrets::SecretsStore>) {
     info!("GW2: Global secrets store initialized for credential delegation");
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// The secrets store [`get_secrets_store`] returns inside a test's scope, instead of the
+    /// global one, which is set once per process.
+    pub(crate) static TEST_SECRETS_STORE: Arc<dyn crate::secrets::SecretsStore>;
+}
+
 /// Get the global secrets store.
 pub(crate) fn get_secrets_store() -> Option<Arc<dyn crate::secrets::SecretsStore>> {
+    #[cfg(test)]
+    if let Ok(store) = TEST_SECRETS_STORE.try_with(Arc::clone) {
+        return Some(store);
+    }
     GLOBAL_SECRETS_STORE
         .get()
         .cloned()
@@ -1047,10 +1058,13 @@ pub(crate) async fn redeem_invitation<CS: ConnectionPointStore + ?Sized>(
     }
     invitation.use_count += 1;
     invitation.last_used_at = Some(chrono::Utc::now());
-    store
-        .update(&invitation)
+    let written = store
+        .update_if_exists(&invitation)
         .await
         .map_err(|e| InvitationRefusal::Unavailable(format!("failed to mark invitation as used: {}", e)))?;
+    if !written {
+        return Err(unavailable("connection point not found"));
+    }
     Ok(invitation)
 }
 
@@ -1073,7 +1087,7 @@ pub(crate) async fn release_invitation<CS: ConnectionPointStore + ?Sized>(
     };
     invitation.use_count -= 1;
     if let Err(e) = store
-        .update(&invitation)
+        .update_if_exists(&invitation)
         .await
     {
         error!("Failed to release invitation {}: {}", connection_point_id, e);
@@ -11842,6 +11856,134 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    struct DeletesAfterRead {
+        inner: crate::gateways::connection_points::FileSystemConnectionPointStore,
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectionPointStore for DeletesAfterRead {
+        async fn create(
+            &self,
+            cp: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            self.inner.create(cp).await
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            let read = self.inner.get(id).await?;
+            self.inner.delete(id).await?;
+            Ok(read)
+        }
+
+        async fn list_all(
+            &self
+        ) -> anyhow::Result<Vec<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            let read = self.inner.list_all().await?;
+            for cp in &read {
+                self.inner
+                    .delete(&cp.id)
+                    .await?;
+            }
+            Ok(read)
+        }
+
+        async fn list_by_gateway(
+            &self,
+            gateway_id: &str,
+        ) -> anyhow::Result<Vec<crate::gateways::connection_points::types::GatewayConnectionPoint>> {
+            self.inner
+                .list_by_gateway(gateway_id)
+                .await
+        }
+
+        async fn update(
+            &self,
+            cp: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<()> {
+            self.inner.update(cp).await
+        }
+
+        async fn update_if_exists(
+            &self,
+            cp: &crate::gateways::connection_points::types::GatewayConnectionPoint,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .update_if_exists(cp)
+                .await
+        }
+
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.delete(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn redeeming_an_invitation_deleted_before_the_write_is_refused_and_not_recreated() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let store = DeletesAfterRead {
+            inner: invitation_store(temp.path()).await,
+        };
+
+        let refused = redeem_invitation(&store, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused, InvitationRefusal::Unavailable("connection point not found".to_string()));
+        assert!(
+            store
+                .inner
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .inner
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_an_invitation_deleted_before_the_write_does_not_recreate_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection_point = store_invitation(temp.path(), None).await;
+        let inner = invitation_store(temp.path()).await;
+        redeem_invitation(&inner, INVITER_TMP_DID, "s3cret")
+            .await
+            .unwrap();
+        let store = DeletesAfterRead { inner };
+
+        release_invitation(&store, &connection_point.id).await;
+
+        assert!(
+            store
+                .inner
+                .get(&connection_point.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .inner
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

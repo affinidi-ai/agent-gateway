@@ -46,15 +46,12 @@ describe('IdentityNameCell', () => {
     expect(screen.getByTestId('identities-name')).not.toHaveTextContent('OXYGEN');
   });
 
-  it('marks a managed agent name from its target Agent Card as unverified', () => {
+  it('shows a managed agent name from its target Agent Card without any badge', () => {
     renderCell({ display_name: 'DateTime Agent', display_name_source: 'target_agent_card' }, 'DEF');
 
     expect(screen.getByTestId('identities-name')).toHaveTextContent('DateTime Agent');
     expect(screen.getByTestId('identities-name')).not.toHaveTextContent('DEF');
-    expect(screen.getByTestId('identities-name-unverified')).toHaveAttribute(
-      'title',
-      expect.stringContaining("target's Agent Card")
-    );
+    expect(screen.getByTestId('identities-name')).not.toHaveTextContent('unverified');
     expect(screen.queryByTestId('identities-name-verified')).not.toBeInTheDocument();
   });
 
@@ -62,7 +59,7 @@ describe('IdentityNameCell', () => {
     renderCell({ display_name: 'DEF', display_name_source: 'surface_name' }, 'DEF');
 
     expect(screen.getByTestId('identities-name')).toHaveTextContent('DEF');
-    expect(screen.queryByTestId('identities-name-unverified')).not.toBeInTheDocument();
+    expect(screen.getByTestId('identities-name')).not.toHaveTextContent('unverified');
   });
 
   it('makes the DID the primary line when no name is known', () => {
@@ -119,7 +116,6 @@ describe('IdentityNameCell', () => {
     expect(screen.getByTestId('identities-name')).toHaveTextContent('billing · acme.com');
     expect(screen.getByText('acme.com').tagName).toBe('STRONG');
     expect(screen.getByRole('img', { name: 'Verified agent name' })).toBeInTheDocument();
-    expect(screen.queryByTestId('identities-name-unverified')).not.toBeInTheDocument();
   });
 
   it('omits the verified marker when the agent name is not verified', () => {
@@ -128,10 +124,11 @@ describe('IdentityNameCell', () => {
     expect(screen.queryByTestId('identities-name-verified')).not.toBeInTheDocument();
   });
 
-  it('marks Agent Card names as unverified', () => {
+  it('shows Agent Card names without any badge', () => {
     renderCell({ display_name: 'Billing Bot', display_name_source: 'agent_card' });
 
-    expect(screen.getByTestId('identities-name-unverified')).toHaveTextContent('unverified');
+    expect(screen.getByTestId('identities-name')).toHaveTextContent('Billing Bot');
+    expect(screen.getByTestId('identities-name')).not.toHaveTextContent('unverified');
     expect(screen.queryByTestId('identities-name-verified')).not.toBeInTheDocument();
   });
 

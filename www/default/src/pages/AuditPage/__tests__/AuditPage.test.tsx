@@ -291,26 +291,27 @@ function renderWithRoutes() {
   );
 }
 
-const SELECTED = ['policy_decision'];
+const AUDIT_SET = { id: 'audit-set', events: ['audit.policy_decision'] };
+const GATEWAY_SET = { id: 'gateway-set', events: ['gateway.created'] };
 
-function withIntegrations(
-  integrations: Array<{
-    category?: string;
-    status: string;
-    tenant_id?: string;
-    audit_events?: string[];
-  }>,
-  categories = ['general', 'audit']
-) {
+/** An integration with the active endpoint `on`, receiving `eventSetId`'s events. */
+const integration = (status: string, eventSetId = AUDIT_SET.id, endpointId = 'on') => ({
+  status,
+  endpoint_id: endpointId,
+  event_set_id: eventSetId,
+});
+
+function withIntegrations(integrations: ReturnType<typeof integration>[]) {
+  const definitions: Record<string, unknown> = {
+    '/integrations': integrations,
+    '/integrations/endpoints': [
+      { id: 'on', status: 'active' },
+      { id: 'off', status: 'disabled' },
+    ],
+    '/integrations/event-sets': [AUDIT_SET, GATEWAY_SET],
+  };
   mockGet.mockImplementation((url: string) =>
-    Promise.resolve({
-      data:
-        url === '/integrations'
-          ? integrations
-          : url === '/integrations/config'
-            ? { categories: categories.map(enum_value => ({ enum_value })) }
-            : AUDIT_RESPONSE,
-    })
+    Promise.resolve({ data: url in definitions ? definitions[url] : AUDIT_RESPONSE })
   );
 }
 
@@ -320,23 +321,10 @@ describe('AuditPage forwarding', () => {
     mockAuditEnabled = true;
   });
 
-  it('leaves tenant-owned integrations out of the count, as the gateway never forwards to them', async () => {
-    mockPermissions = { 'integrations.view': true, 'integrations.edit': true };
-    withIntegrations([
-      { category: 'audit', status: 'active', audit_events: SELECTED },
-      { category: 'audit', status: 'active', tenant_id: 'tenant-a', audit_events: SELECTED },
-    ]);
-    renderWithRoutes();
-
-    expect(await screen.findByTestId('audit-forward-button')).toHaveTextContent(
-      /^Forwarding to 1 integration$/
-    );
-  });
-
   it('keeps forwarding while VP Auditing is off and says only the log keeps nothing', async () => {
     mockPermissions = { 'integrations.view': true };
     mockAuditEnabled = false;
-    withIntegrations([{ category: 'audit', status: 'active', audit_events: SELECTED }]);
+    withIntegrations([integration('active')]);
     renderWithRoutes();
 
     const button = await screen.findByTestId('audit-forward-button');
@@ -344,82 +332,71 @@ describe('AuditPage forwarding', () => {
     expect(button).toHaveAttribute(
       'title',
       'VP Auditing is off in Settings › Security, so the VP Audit Log keeps nothing; ' +
-        'Governance Audit integrations still receive the events selected for them.'
+        'Governance Audit integrations still receive the audit events of their event sets.'
     );
   });
 
-  it('warns that Governance Audit integrations selecting no events receive nothing', async () => {
+  it('warns about integrations with audit events that are disabled or whose endpoint is', async () => {
     mockPermissions = { 'integrations.view': true };
     withIntegrations([
-      { category: 'audit', status: 'active', audit_events: SELECTED },
-      { category: 'audit', status: 'active', audit_events: [] },
-      { category: 'audit', status: 'active' },
+      integration('active'),
+      integration('disabled'),
+      integration('active', AUDIT_SET.id, 'off'),
     ]);
     renderWithRoutes();
 
     const button = await screen.findByTestId('audit-forward-button');
     expect(button).toHaveTextContent(/^Forwarding to 1 integration$/);
-    expect(within(button).getByTestId('audit-forward-no-events-warning')).toBeInTheDocument();
+    expect(within(button).getByTestId('audit-forward-paused-warning')).toBeInTheDocument();
     expect(button).toHaveAttribute(
       'title',
-      '2 Governance Audit integrations select no events and receive nothing.'
+      '2 Governance Audit integrations are disabled, or their endpoint is, and receive nothing.'
     );
   });
 
-  it('warns about an integration selecting no events while VP Auditing is off', async () => {
+  it('warns about a disabled integration while VP Auditing is off', async () => {
     mockPermissions = { 'integrations.view': true, 'integrations.edit': true };
     mockAuditEnabled = false;
-    withIntegrations([{ category: 'audit', status: 'active', audit_events: [] }]);
+    withIntegrations([integration('disabled')]);
     renderWithRoutes();
 
     const button = await screen.findByTestId('audit-forward-button');
     expect(button).toHaveTextContent(/^Forward records$/);
-    expect(within(button).getByTestId('audit-forward-no-events-warning')).toBeInTheDocument();
+    expect(within(button).getByTestId('audit-forward-paused-warning')).toBeInTheDocument();
     expect(button).toHaveAttribute(
       'title',
       expect.stringContaining(
-        '1 Governance Audit integration selects no events and receives nothing.'
+        '1 Governance Audit integration is disabled, or its endpoint is, and receives nothing.'
       )
     );
     expect(button).toHaveAttribute('title', expect.stringContaining('VP Audit Log keeps nothing'));
   });
 
-  it('offers no forwarding when the gateway has no Governance Audit category', async () => {
+  it('starts an event set of every audit event when no integration receives the records', async () => {
     mockPermissions = { 'integrations.view': true, 'integrations.edit': true };
-    withIntegrations([], ['general', 'gateway']);
-    renderWithRoutes();
-
-    await waitFor(() => expect(mockGet).toHaveBeenCalledWith('/integrations/config'));
-    await screen.findByTestId('audit-list');
-    expect(screen.queryByTestId('audit-forward-button')).not.toBeInTheDocument();
-  });
-
-  it('starts a Governance Audit stream when no integration receives the records', async () => {
-    mockPermissions = { 'integrations.view': true, 'integrations.edit': true };
-    withIntegrations([{ category: 'gateway', status: 'active' }]);
+    withIntegrations([integration('active', GATEWAY_SET.id)]);
     renderWithRoutes();
 
     const button = await screen.findByTestId('audit-forward-button');
     expect(button).toHaveTextContent('Forward records');
     fireEvent.click(button);
     expect(screen.getByTestId('location')).toHaveTextContent(
-      '/integrations/integrations/wizard?category=audit&type=stream'
+      '/integrations/event-sets/new?preset=audit'
     );
   });
 
-  it('counts only active Governance Audit integrations and opens the list', async () => {
+  it('counts only active integrations with audit events and opens the list', async () => {
     mockPermissions = { 'integrations.view': true, 'integrations.edit': true };
     withIntegrations([
-      { category: 'audit', status: 'active', audit_events: SELECTED },
-      { category: 'audit', status: 'active', audit_events: SELECTED },
-      { category: 'audit', status: 'disabled', audit_events: SELECTED },
-      { category: 'gateway', status: 'active' },
+      integration('active'),
+      integration('active'),
+      integration('active', GATEWAY_SET.id),
     ]);
     renderWithRoutes();
 
     const button = await screen.findByTestId('audit-forward-button');
     expect(button).toHaveTextContent('Forwarding to 2 integrations');
-    expect(within(button).queryByTestId('audit-forward-no-events-warning')).not.toBeInTheDocument();
+    expect(within(button).queryByTestId('audit-forward-paused-warning')).not.toBeInTheDocument();
     expect(button).not.toHaveAttribute('title');
     fireEvent.click(button);
     expect(screen.getByTestId('location')).toHaveTextContent(/^\/integrations$/);
@@ -427,7 +404,7 @@ describe('AuditPage forwarding', () => {
 
   it('shows existing forwarding to a caller who cannot add integrations', async () => {
     mockPermissions = { 'integrations.view': true };
-    withIntegrations([{ category: 'audit', status: 'active', audit_events: SELECTED }]);
+    withIntegrations([integration('active')]);
     renderWithRoutes();
 
     expect(await screen.findByTestId('audit-forward-button')).toHaveTextContent(
@@ -447,7 +424,7 @@ describe('AuditPage forwarding', () => {
 
   it('does not look up integrations without integrations.view', async () => {
     mockPermissions = {};
-    withIntegrations([{ category: 'audit', status: 'active', audit_events: SELECTED }]);
+    withIntegrations([integration('active')]);
     renderWithRoutes();
 
     await screen.findByTestId('audit-list');

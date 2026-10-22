@@ -6,7 +6,6 @@ import { ConnectionRuntimeStatus } from '../utils/connectionHealth';
 import { showToast } from '../utils/toaster';
 import { ExposureMode, exposureModeOf } from '../utils/gateways';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
-import { integrationIntegration } from '../components/connection-points/IntegrationsStep';
 import OverviewTab from './EditGatewayPage/OverviewTab';
 import PublishingTab from './EditGatewayPage/PublishingTab';
 import RemoteTab from './EditGatewayPage/RemoteTab';
@@ -14,7 +13,6 @@ import IssuerDidsCard, {
   GatewayIssuerDids,
   issuerDidsFromGateway,
 } from './EditGatewayPage/IssuerDidsCard';
-import GatewayIntegrationsTab from './EditGatewayPage/GatewayIntegrationsTab';
 import GlobalPolicyTab from './EditGatewayPage/GlobalPolicyTab';
 
 interface GatewayForm {
@@ -25,7 +23,6 @@ interface GatewayForm {
   status: 'active' | 'disabled';
   exposed_channels?: string[];
   exposure_mode?: ExposureMode;
-  integrations?: integrationIntegration[];
 }
 
 interface GatewayMetadata {
@@ -64,9 +61,6 @@ const EditGatewayPage: React.FC = () => {
   const [success, setSuccess] = useState<string | null>(null);
   const isSelfGateway = form.gateway_type === 'self';
   const [activeTab, setActiveTab] = useState<string>('overview');
-  const [, setHasIntegrationErrors] = useState(false);
-  const [integrationsModified, setIntegrationsModified] = useState(false);
-  const [savingIntegrations, setSavingIntegrations] = useState(false);
   const [gatewayMetadata, setGatewayMetadata] = useState<GatewayMetadata | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<ConnectionRuntimeStatus | null>(null);
   const [issuerDids, setIssuerDids] = useState<GatewayIssuerDids>(issuerDidsFromGateway({}));
@@ -133,20 +127,6 @@ const EditGatewayPage: React.FC = () => {
     }
   }, []);
 
-  const fetchGatewayIntegrations = useCallback(async () => {
-    if (!id) return;
-    try {
-      const response = await apiClient.get(`/gateways/${id}/integrations`);
-      setForm(prev => ({
-        ...prev,
-        integrations: response.data.integration_integrations || [],
-      }));
-      setIntegrationsModified(false);
-    } catch (error: any) {
-      console.error('Failed to load gateway integrations:', error);
-    }
-  }, [id]);
-
   const fetchGateway = useCallback(async () => {
     try {
       setLoading(true);
@@ -162,18 +142,10 @@ const EditGatewayPage: React.FC = () => {
         description: response.data.description,
         did: response.data.did,
         gateway_type: response.data.gateway_type,
-        integrations: [] as any[],
         status: response.data.status,
         exposed_channels: response.data.exposed_channels || [],
         exposure_mode: exposureModeOf(response.data),
       });
-
-      // Load integrations from separate endpoint
-      try {
-        await fetchGatewayIntegrations();
-      } catch (err) {
-        console.error('Error in fetchGatewayIntegrations call:', err);
-      }
 
       // Load all local channels for remote gateways
       if (response.data.gateway_type === 'remote') {
@@ -189,7 +161,7 @@ const EditGatewayPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [fetchAllChannels, fetchGatewayIntegrations, fetchRemoteChannels, id]);
+  }, [fetchAllChannels, fetchRemoteChannels, id]);
 
   useEffect(() => {
     if (isEditMode && id && id !== 'self') {
@@ -224,35 +196,6 @@ const EditGatewayPage: React.FC = () => {
       setError(error.message || 'Failed to update exposure');
     } finally {
       setSavingExposedChannels(false);
-    }
-  };
-
-  const handleIntegrationsChange = (integrations: integrationIntegration[]) => {
-    setForm({ ...form, integrations });
-    setIntegrationsModified(true);
-  };
-
-  const handleSaveIntegrations = async () => {
-    if (!id) {
-      console.error('No gateway ID available for saving integrations');
-      return;
-    }
-    try {
-      setSavingIntegrations(true);
-      const payload = {
-        integration_integrations: form.integrations || [],
-      };
-      const url = `/gateways/${id}/integrations`;
-      await apiClient.put(url, payload);
-      setSuccess('Gateway integrations updated successfully!');
-      setIntegrationsModified(false);
-      setTimeout(() => setSuccess(null), 3000);
-    } catch (error: any) {
-      console.error('Failed to save integrations:', error);
-      console.error('Error details:', error.message, error.stack);
-      setError(error.message || 'Failed to update gateway integrations');
-    } finally {
-      setSavingIntegrations(false);
     }
   };
 
@@ -519,28 +462,6 @@ const EditGatewayPage: React.FC = () => {
                   loadingSurfaces={loadingChannels}
                   surfacesError={channelsError}
                   fetchRemoteSurfaces={fetchRemoteChannels}
-                />
-              </Tab>
-            )}
-
-            {/* Integrations Tab - Only in edit mode */}
-            {isEditMode && (
-              <Tab
-                eventKey="integrations"
-                tabAttrs={{ 'data-testid': 'gateway-editor-integrations-tab-trigger' }}
-                title={
-                  <>
-                    <i className="fas fa-plug"></i> Integrations
-                  </>
-                }
-              >
-                <GatewayIntegrationsTab
-                  integrations={form.integrations || []}
-                  onIntegrationsChange={handleIntegrationsChange}
-                  onValidationChange={setHasIntegrationErrors}
-                  onSave={handleSaveIntegrations}
-                  isModified={integrationsModified}
-                  isSaving={savingIntegrations}
                 />
               </Tab>
             )}

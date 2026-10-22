@@ -21,18 +21,18 @@ const AgentCardTab: React.FC<AgentCardTabProps> = ({ formData, onChange }) => {
         docLink={DOCS_URL.proxies}
       >
         <p>
-          Some backends (like this one) don&apos;t publish their own agent card, a small public
-          profile describing what an agent can do. This proxy generates one automatically.
+          An agent card is a small public profile that describes what an agent can do. This backend
+          doesn&apos;t publish one, so the proxy generates it.
         </p>
         <p data-testid="a2a-proxy-agent-card-version">
-          The generated card lists the A2A versions accepted by the Agent Surface that exposes this
-          proxy: A2A 1.0 for a new surface, and 0.3 as well for an existing surface that accepts it.
-          Callers using <code>message/send</code> get A2A 0.3 replies, and those using{' '}
-          <code>SendMessage</code> get A2A 1.0 replies.
+          The card lists the A2A versions accepted by the Agent Surface that exposes this proxy, as
+          shown on its Access Point. A new surface whose Target is this proxy accepts only A2A 1.0,
+          so its callers must send the <code>A2A-Version: 1.0</code> header and should use A2A 1.0
+          methods such as <code>SendMessage</code>. Requests to this proxy are checked only for a
+          valid JSON-RPC envelope.
         </p>
         <p className="mb-0">
-          Leave the fields below blank to reuse the name and description of the Agent Surface that
-          exposes this proxy.
+          Leave the fields below blank to reuse that surface&apos;s name and description.
         </p>
       </InfoBanner>
 

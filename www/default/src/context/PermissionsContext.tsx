@@ -69,6 +69,9 @@ const defaultPermissions: Permissions = {
   'dashboard.view': false,
   'logs.view': false,
   'audit.view': false,
+  'integrations.view': false,
+  'integrations.edit': false,
+  'integrations.delete': false,
 };
 
 export function PermissionsProvider({ children }: { children: ReactNode }) {

@@ -1,30 +1,12 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::info;
 
-use super::IntegrationPublisher;
-use crate::integrations::runtime_variables::substitute_variables;
-use crate::storage::Integration;
+use super::{IntegrationPublisher, Message, with_defaults};
+use crate::integrations::delivery::render::Escaping;
 
 pub struct SlackPublisher;
-
-/// Escapes Slack's mrkdwn control characters in variable values so caller-supplied text
-/// cannot form mentions such as `<!channel>` or disguised links. The admin-written
-/// template is left as is.
-fn escape_mrkdwn_values(variables: &HashMap<String, String>) -> HashMap<String, String> {
-    variables
-        .iter()
-        .map(|(name, value)| {
-            let escaped = value
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
-            (name.clone(), escaped)
-        })
-        .collect()
-}
 
 #[async_trait]
 impl IntegrationPublisher for SlackPublisher {
@@ -52,111 +34,64 @@ impl IntegrationPublisher for SlackPublisher {
         Ok(())
     }
 
-    async fn publish(
+    fn complete_template(
         &self,
-        integration: &Integration,
-        subject: &str,
-        message: &str,
-        variables: &HashMap<String, String>,
+        template: &Value,
+    ) -> Value {
+        with_defaults(template, serde_json::json!({"text": "*${EVENT_NAME}*\n${EVENT_SUMMARY}"}))
+    }
+
+    /// Values are escaped so caller-supplied text cannot form mentions such as `<!channel>`
+    /// or disguised links.
+    fn escaping(
+        &self,
+        _template: &Value,
+    ) -> Escaping {
+        Escaping::SlackMrkdwn
+    }
+
+    async fn send(
+        &self,
+        configuration: &Value,
+        message: &Message,
     ) -> Result<()> {
-        info!("Triggering Slack integration: {}", integration.name);
-
-        let webhook_url = integration.configuration["webhook_url"]
-            .as_str()
+        let webhook_url = configuration
+            .get("webhook_url")
+            .and_then(Value::as_str)
             .context("Missing webhook_url in Slack configuration")?;
-
         crate::url_validation::validate_resolved_webhook_url(webhook_url)
             .map_err(|e| anyhow::anyhow!("webhook_url rejected: {}", e))?;
-
-        // Use content template if provided
-        let text_template = if let Some(template_text) = integration
-            .content
-            .get("text")
-            .and_then(|v| v.as_str())
-        {
-            template_text.to_string()
-        } else {
-            format!("*{}*\n{}", subject, message)
+        let setting = |name: &str, default: &'static str| {
+            configuration
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or(default)
+                .to_string()
         };
-
-        // Perform template variable substitution
-        let text = substitute_variables(
-            &text_template,
-            integration
-                .category
-                .as_deref(),
-            &escape_mrkdwn_values(variables),
-        );
-
-        let bot_name = integration
-            .content
-            .get("bot_name")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                integration
-                    .configuration
-                    .get("bot_name")
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("Agent Gateway");
-
-        let icon_emoji = integration
-            .content
-            .get("icon_emoji")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                integration
-                    .configuration
-                    .get("icon_emoji")
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or(":robot_face:");
-
-        // Build Slack message payload
-        let mut payload = serde_json::json!({
-            "text": text,
-            "username": bot_name,
-            "icon_emoji": icon_emoji
+        let payload = serde_json::json!({
+            "text": message.content.get("text").and_then(Value::as_str).unwrap_or_default(),
+            "username": setting("bot_name", "Agent Gateway"),
+            "icon_emoji": setting("icon_emoji", ":robot_face:"),
         });
-
-        // Add channel if specified in content
-        if let Some(channel) = integration
-            .content
-            .get("channel")
-            .and_then(|v| v.as_str())
-        {
-            payload["channel"] = serde_json::json!(channel);
-        }
-
-        debug!("Slack payload: {:?}", payload);
-        info!("Sending Slack notification via integration: {}", integration.name);
-
-        // Send HTTP POST to Slack webhook with timeout
-        let client = crate::http_client::external()?;
-
-        let response = client
+        let response = crate::http_client::external()?
             .post(webhook_url)
             .json(&payload)
             .send()
             .await
             .map_err(reqwest::Error::without_url)
             .context("Failed to send Slack webhook")?;
-
         if response.status().is_success() {
-            info!("Slack notification sent successfully via integration: {}", integration.name);
-            Ok(())
-        } else {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_default();
-            Err(anyhow::anyhow!("Slack webhook failed: {} - {}", status, body))
+            info!(integration_id = %message.integration_id, "Slack message delivered");
+            return Ok(());
         }
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_default();
+        Err(anyhow::anyhow!("Slack webhook failed: {} - {}", status, body))
     }
 }
-
-// ── SSRF guard tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -170,7 +105,22 @@ mod tests {
         SlackPublisher
     }
 
-    // ── validate_config SSRF checks ───────────────────────────────────────
+    #[test]
+    fn an_empty_template_posts_the_event_name_and_summary() {
+        assert_eq!(
+            publisher().complete_template(&serde_json::json!({})),
+            serde_json::json!({"text": "*${EVENT_NAME}*\n${EVENT_SUMMARY}"})
+        );
+        assert_eq!(
+            publisher().complete_template(&serde_json::json!({"text": "${GATEWAY_NAME} changed"})),
+            serde_json::json!({"text": "${GATEWAY_NAME} changed"})
+        );
+    }
+
+    #[test]
+    fn values_are_escaped_for_mrkdwn() {
+        assert_eq!(publisher().escaping(&serde_json::json!({})), Escaping::SlackMrkdwn);
+    }
 
     #[test]
     fn validate_config_rejects_aws_metadata_ip() {
@@ -236,34 +186,6 @@ mod tests {
     fn validate_config_rejects_missing_url() {
         let result = publisher().validate_config(&serde_json::json!({}));
         assert!(result.is_err(), "should reject missing webhook_url");
-    }
-
-    #[test]
-    fn escape_mrkdwn_values_escapes_mentions_and_links_in_values_only() {
-        let variables = HashMap::from([(
-            "AUDIT_PRINCIPAL_NAME".to_string(),
-            "<!channel> <https://evil.example|Re-verify admin> & co".to_string(),
-        )]);
-
-        let text = substitute_variables(
-            "<https://gateway.example|Audit>: ${AUDIT_PRINCIPAL_NAME}",
-            None,
-            &escape_mrkdwn_values(&variables),
-        );
-
-        assert_eq!(
-            text,
-            "<https://gateway.example|Audit>: &lt;!channel&gt; &lt;https://evil.example|Re-verify admin&gt; &amp; co"
-        );
-    }
-
-    #[test]
-    fn escape_mrkdwn_values_leaves_plain_values_unchanged() {
-        let variables = HashMap::from([("AUDIT_PRINCIPAL_EMAIL".to_string(), "alice@example.com".to_string())]);
-
-        let escaped = escape_mrkdwn_values(&variables);
-
-        assert_eq!(escaped["AUDIT_PRINCIPAL_EMAIL"], "alice@example.com");
     }
 
     #[test]

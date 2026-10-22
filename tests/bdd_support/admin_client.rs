@@ -10,33 +10,16 @@ use serde_json::Value;
 use crate::bdd_support::gateway_process::G2G_TEST_AUTH_TOKEN;
 use crate::bdd_support::http::collect_headers;
 
-/// The shipped gateway configuration. Its Governance Audit integration category
-/// lists every audit event as `audit.<event>`, and a product test keeps that
-/// list equal to the audit event catalog.
-const SHIPPED_GATEWAY_CONFIG: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config/examples/gateway.example.json"));
+/// The audit event catalog the gateway is built with: each entry starts
+/// `event("<name>", …`.
+const SHIPPED_AUDIT_CATALOG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/audit/catalog.rs"));
 
 /// Every audit event a gateway can record, read from the shipped audit catalog.
 pub fn every_audit_event() -> Vec<String> {
-    let config: Value = serde_json::from_str(SHIPPED_GATEWAY_CONFIG).expect("shipped gateway config is JSON");
-    let categories = config["integration"]["categories"]
-        .as_array()
-        .expect("shipped gateway config lists integration categories");
-    let audit = categories
-        .iter()
-        .find(|category| category["enum_value"] == "audit")
-        .expect("shipped gateway config offers the Governance Audit category");
-    let events: Vec<String> = audit["metadata"]["event_types"]
-        .as_array()
-        .expect("the Governance Audit category lists its event types")
-        .iter()
-        .map(|event| {
-            event["event_type"]
-                .as_str()
-                .and_then(|event_type| event_type.strip_prefix("audit."))
-                .expect("audit event types are named audit.<event>")
-                .to_string()
-        })
+    let entry = regex::Regex::new(r#"\bevent\(\s*"([a-z_]+)""#).expect("pattern compiles");
+    let events: Vec<String> = entry
+        .captures_iter(SHIPPED_AUDIT_CATALOG)
+        .map(|capture| capture[1].to_string())
         .collect();
     assert!(!events.is_empty(), "the shipped audit catalog lists no events");
     events

@@ -9,6 +9,7 @@ describe('deepLinks', () => {
     expect(deepLinks.issuer).toBe('/issuers/new');
     expect(deepLinks.authority).toBe('/authorities/new');
     expect(deepLinks.mediator).toBe('/mediators/wizard');
+    expect(deepLinks.integration).toBe('/integrations/new');
   });
 
   it('encodes the certificate kind filter when supplied', () => {

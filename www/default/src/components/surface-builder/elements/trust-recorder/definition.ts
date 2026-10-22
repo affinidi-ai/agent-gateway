@@ -5,9 +5,10 @@ import TrustRecorderFullscreenPanel from './TrustRecorderFullscreenPanel';
 import { DOCS_URL } from '../../../../config/docs';
 
 /**
- * One row of the Trust Recorder editor: which registry to write to, which
- * issuer signs the records, an optional ownedAgent triple, and any
- * operator-defined custom records.
+ * One row of the Trust Recorder editor: which registry to write to, the
+ * Issuer whose DID is the entity of custom `issuer`-target records, the
+ * Authority that asserts every record, an optional ownedAgent triple, and
+ * any operator-defined custom records.
  *
  * Wire shape mirrors `TrustRecorderEntry` in `src/config/types.rs`.
  */
@@ -55,6 +56,15 @@ export const TRUST_RECORDER_ENTRIES_MAX = 10;
  * gateway whose caller VP was minted by the same Issuer.
  */
 export const SURFACE_ISSUER_DID_TEMPLATE = '{{ surface.issuer_did }}';
+
+/**
+ * True when the entry's Authority is the surface Issuer template, so the
+ * recorder skips it unless the surface has an Issuer selected. Trims like
+ * the backend's `resolve_authority_did`.
+ */
+export function usesSurfaceIssuer(entry: Pick<TrustRecorderEntry, 'authority_did'>): boolean {
+  return entry.authority_did.trim() === SURFACE_ISSUER_DID_TEMPLATE;
+}
 
 /** Mint a fresh empty entry for the panel's "+ Add Trust Registry" action. */
 export function makeDefaultEntry(): TrustRecorderEntry {

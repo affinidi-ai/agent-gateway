@@ -26,7 +26,7 @@ export const deepLinks = {
   mcpProxy: '/mcp-proxies/wizard',
   credentialProvider: '/credential-providers/new',
   policies: '/policies',
-  integration: '/integrations/integrations/wizard',
+  integration: '/integrations/new',
   oidcProvider: '/oidc-providers/new',
   a2aProxy: '/proxies/a2a-proxies/new',
 } as const;

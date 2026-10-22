@@ -38,6 +38,7 @@ impl BootstrapConfig {
         let contents = std::fs::read_to_string(path)?;
 
         let mut config: BootstrapConfig = toml::from_str(&contents)?;
+        place_unset_integration_keys_beside_the_deprecated_one(&contents, &mut config.storage_paths);
 
         // Resolve config file paths relative to the config file directory
         if let Some(config_dir) = path.parent() {
@@ -157,19 +158,31 @@ impl BootstrapConfig {
                     .storage_paths
                     .a2a_proxies,
             );
-            config
-                .storage_paths
-                .integrations = resolve_storage_path(
-                &config
+            for path in [
+                &mut config
                     .storage_paths
-                    .integrations,
+                    .integration_endpoints,
+                &mut config
+                    .storage_paths
+                    .integration_event_sets,
+                &mut config
+                    .storage_paths
+                    .integration_definitions,
+            ] {
+                *path = resolve_storage_path(path);
+            }
+            let paths = &mut config.storage_paths;
+            paths.legacy_integrations = resolve_storage_path(
+                paths
+                    .integrations
+                    .as_deref()
+                    .unwrap_or(&paths.legacy_integrations),
             );
-            config
-                .storage_paths
-                .integration_triggers = resolve_storage_path(
-                &config
-                    .storage_paths
-                    .integration_triggers,
+            paths.legacy_integration_triggers = resolve_storage_path(
+                paths
+                    .integration_triggers
+                    .as_deref()
+                    .unwrap_or(&paths.legacy_integration_triggers),
             );
             config.storage_paths.webhooks = resolve_storage_path(&config.storage_paths.webhooks);
             config.storage_paths.vc_keys = resolve_storage_path(&config.storage_paths.vc_keys);
@@ -322,6 +335,8 @@ impl BootstrapConfig {
                 .map_err(|error| anyhow::anyhow!("Invalid [mcp.continuations] config: {error}"))?;
         }
 
+        integration_stores_apart_from_the_deprecated_ones(&self.storage_paths)?;
+
         // Validate TLS certificate paths
         if !self.tls.cert_path.exists() {
             anyhow::bail!("TLS certificate file not found: {:?}", self.tls.cert_path);
@@ -333,6 +348,125 @@ impl BootstrapConfig {
 
         Ok(())
     }
+}
+
+/// Puts each integration storage key the raw config leaves unset beside the deprecated
+/// `integrations` directory, when that key is set. A config written for the version before
+/// endpoints and event sets sets `integrations` (`../_storage/integrations/definitions` in the
+/// example) but none of the new keys, whose defaults would otherwise resolve under the config
+/// directory: read-only in Docker, and outside the persisted storage elsewhere. A key whose
+/// folder there is one of the deprecated directories (`integrations = "/data/integrations"`)
+/// takes the key's name as its folder instead, so it never reads the previous version's records.
+fn place_unset_integration_keys_beside_the_deprecated_one(
+    raw: &str,
+    paths: &mut StoragePaths,
+) {
+    let Some(deprecated) = paths.integrations.clone() else {
+        return;
+    };
+    let triggers = paths
+        .integration_triggers
+        .clone()
+        .unwrap_or_else(|| {
+            paths
+                .legacy_integration_triggers
+                .clone()
+        });
+    let deprecated_dirs = [lexically_normalized(Path::new(&deprecated)), lexically_normalized(Path::new(&triggers))];
+    let parent = Path::new(&deprecated)
+        .parent()
+        .unwrap_or(Path::new(""));
+    let section = toml::from_str::<toml::Table>(raw)
+        .ok()
+        .and_then(|table| {
+            table
+                .get("storage_paths")?
+                .as_table()
+                .cloned()
+        });
+    let is_set = |key: &str| {
+        section
+            .as_ref()
+            .is_some_and(|section| section.contains_key(key))
+    };
+    for (key, path, folder) in [
+        ("integration_endpoints", &mut paths.integration_endpoints, "endpoints"),
+        ("integration_event_sets", &mut paths.integration_event_sets, "event_sets"),
+        ("integration_definitions", &mut paths.integration_definitions, "integrations"),
+    ] {
+        if !is_set(key) {
+            let beside = parent.join(folder);
+            let place = if deprecated_dirs.contains(&lexically_normalized(&beside)) {
+                parent.join(key)
+            } else {
+                beside
+            };
+            *path = place
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+}
+
+/// Refuses an integration store that is, or sits inside, a directory the migration reads the
+/// previous version's integrations from. The store would read the old records, which it cannot
+/// parse, so listing integrations (and with it the audit pipeline) fails; and the migration
+/// renames that directory, taking the store with it.
+fn integration_stores_apart_from_the_deprecated_ones(paths: &StoragePaths) -> anyhow::Result<()> {
+    let deprecated_dirs =
+        [("integrations", &paths.legacy_integrations), ("integration_triggers", &paths.legacy_integration_triggers)];
+    for (key, store) in [
+        ("integration_endpoints", &paths.integration_endpoints),
+        ("integration_event_sets", &paths.integration_event_sets),
+        ("integration_definitions", &paths.integration_definitions),
+    ] {
+        let store_dir = comparable_path(store);
+        for (deprecated_key, deprecated) in deprecated_dirs {
+            if store_dir.starts_with(comparable_path(deprecated)) {
+                anyhow::bail!(
+                    "storage_paths.{key} ({store}) is, or is inside, the directory of the previous version's storage_paths.{deprecated_key} ({deprecated}). Give it a directory of its own."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `path` with `.` and `..` resolved without the filesystem; a `..` above a relative start is kept.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => match normalized
+                .components()
+                .next_back()
+            {
+                Some(std::path::Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(std::path::Component::RootDir | std::path::Component::Prefix(_)) => {}
+                _ => normalized.push(".."),
+            },
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// `path` as the filesystem names it: its longest existing ancestor canonicalized (symbolic links
+/// resolved) and the rest normalized lexically, so two spellings of one directory compare equal.
+fn comparable_path(path: &str) -> PathBuf {
+    let normalized = lexically_normalized(Path::new(path));
+    for ancestor in normalized.ancestors() {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            return match normalized.strip_prefix(ancestor) {
+                Ok(rest) if !rest.as_os_str().is_empty() => canonical.join(rest),
+                _ => canonical,
+            };
+        }
+    }
+    normalized
 }
 
 /// Return true when the raw TOML config text mentions the legacy
@@ -527,6 +661,119 @@ key_path = "key.pem"
 
         let config = BootstrapConfig::from_file(&path).expect("unknown top-level keys are ignored");
         assert_eq!(config.backup_encryption_key, "unused");
+    }
+
+    /// The storage paths of `config.toml` written to `<tempdir>/config` with `storage_paths`.
+    fn storage_paths_of(storage_paths: &str) -> (tempfile::TempDir, StoragePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        let path = config_dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "backup_encryption_key = \"unused\"\n\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n\n[storage_paths]\n{storage_paths}\n"
+            ),
+        )
+        .unwrap();
+        let paths = BootstrapConfig::from_file(&path)
+            .unwrap()
+            .storage_paths;
+        (dir, paths)
+    }
+
+    #[test]
+    fn unset_integration_keys_live_beside_the_deprecated_integrations_directory() {
+        let (dir, paths) = storage_paths_of(
+            "integrations = \"../_storage/integrations/definitions\"\nintegration_definitions = \"/data/integrations\"",
+        );
+        let beside = |folder: &str| {
+            dir.path()
+                .join("_storage/integrations")
+                .join(folder)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(paths.integration_endpoints, beside("endpoints"));
+        assert_eq!(paths.integration_event_sets, beside("event_sets"));
+        assert_eq!(paths.integration_definitions, "/data/integrations", "a set key wins");
+        assert_eq!(paths.legacy_integrations, beside("definitions"));
+    }
+
+    #[test]
+    fn without_the_deprecated_key_integration_keys_keep_their_defaults() {
+        let (dir, paths) = storage_paths_of("integration_triggers = \"/old/triggers\"");
+        let default = |folder: &str| {
+            dir.path()
+                .join("config/_storage/integrations")
+                .join(folder)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(paths.integration_endpoints, default("endpoints"));
+        assert_eq!(paths.integration_event_sets, default("event_sets"));
+        assert_eq!(paths.integration_definitions, default("integrations"));
+    }
+
+    #[test]
+    fn an_unset_key_whose_place_is_a_deprecated_directory_is_named_after_the_key() {
+        let (dir, paths) = storage_paths_of("integrations = \"../_storage/integrations\"");
+        let storage = |folder: &str| {
+            dir.path()
+                .join("_storage")
+                .join(folder)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(paths.legacy_integrations, storage("integrations"));
+        assert_eq!(paths.integration_definitions, storage("integration_definitions"));
+        assert_eq!(paths.integration_endpoints, storage("endpoints"));
+        assert_eq!(paths.integration_event_sets, storage("event_sets"));
+        assert!(integration_stores_apart_from_the_deprecated_ones(&paths).is_ok());
+
+        let (_dir, paths) =
+            storage_paths_of("integrations = \"/old/definitions\"\nintegration_triggers = \"/old/endpoints\"");
+        assert_eq!(paths.integration_endpoints, "/old/integration_endpoints");
+    }
+
+    #[test]
+    fn an_integration_store_on_a_deprecated_directory_is_refused() {
+        let (_dir, paths) = storage_paths_of(
+            "integrations = \"/data/integrations\"\nintegration_definitions = \"/data/integrations/\"",
+        );
+
+        let error = integration_stores_apart_from_the_deprecated_ones(&paths)
+            .expect_err("the new store would read the old records")
+            .to_string();
+        assert!(error.contains("storage_paths.integration_definitions"), "{error}");
+        assert!(error.contains("storage_paths.integrations"), "{error}");
+    }
+
+    #[test]
+    fn an_integration_store_inside_a_deprecated_directory_is_refused() {
+        let (_dir, paths) = storage_paths_of(
+            "integration_triggers = \"/data/triggers\"\nintegration_event_sets = \"/data/triggers/../triggers/event_sets\"",
+        );
+
+        let error = integration_stores_apart_from_the_deprecated_ones(&paths)
+            .expect_err("migrating would move the new store with the old directory")
+            .to_string();
+        assert!(error.contains("storage_paths.integration_event_sets"), "{error}");
+        assert!(error.contains("storage_paths.integration_triggers"), "{error}");
+    }
+
+    #[test]
+    fn default_and_example_integration_paths_are_apart() {
+        let (_dir, defaults) = storage_paths_of("");
+        assert!(integration_stores_apart_from_the_deprecated_ones(&defaults).is_ok());
+
+        let (_dir, example) = storage_paths_of(
+            "integrations = \"../_storage/integrations/definitions\"\nintegration_triggers = \"../_storage/integrations/triggers\"",
+        );
+        assert!(integration_stores_apart_from_the_deprecated_ones(&example).is_ok());
     }
 
     #[test]

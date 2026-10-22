@@ -2,7 +2,7 @@ import React from 'react';
 import { Badge } from '../../components/shared/Badge';
 import { CopyButton } from '../../components/shared/CopyButton';
 import { topAndTail } from '../../utils/stringUtils';
-import type { CredentialPrincipal, Identity, IdentityDisplayNameSource } from '../../types';
+import type { CredentialPrincipal, Identity } from '../../types';
 
 export type NamedIdentity = Pick<
   Identity,
@@ -54,19 +54,12 @@ const AgentName: React.FC<{ name: string; verified: boolean }> = ({ name, verifi
   );
 };
 
-const UNVERIFIED_SOURCE_TITLES: Partial<Record<IdentityDisplayNameSource, string>> = {
-  agent_card: "Name taken from the caller's Agent Card; not verified",
-  target_agent_card:
-    "Name taken from the target's Agent Card; not verified and never signed or published",
-};
-
 const NameLine: React.FC<{
   identity: NamedIdentity;
   displayName: string;
   liveSurfaceName?: string;
 }> = ({ identity, displayName, liveSurfaceName }) => {
   const source = identity.display_name_source;
-  const unverifiedTitle = source ? UNVERIFIED_SOURCE_TITLES[source] : undefined;
 
   if (source === 'agent_name') {
     return <AgentName name={displayName} verified={identity.display_name_verified === true} />;
@@ -75,16 +68,6 @@ const NameLine: React.FC<{
   return (
     <span>
       <strong>{(source === 'surface_name' && liveSurfaceName) || displayName}</strong>
-      {unverifiedTitle && (
-        <Badge
-          tone="secondary"
-          size="sm"
-          value="unverified"
-          className="ms-1 fw-normal"
-          title={unverifiedTitle}
-          data-testid="identities-name-unverified"
-        />
-      )}
     </span>
   );
 };

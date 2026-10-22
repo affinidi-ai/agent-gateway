@@ -9,7 +9,7 @@ import { EmptyState } from '../components/shared/EmptyState';
 import { DOCS_URL } from '../config/docs';
 import AddResourceLink from '../components/shared/AddResourceLink';
 import { apiClient, ApiKeyMeta, ApiKeyCreated } from '../api';
-import { getErrorMessage } from '../utils/apiError';
+import { formatApiError, getErrorMessage } from '../utils/apiError';
 import SearchInput from '../components/shared/SearchInput';
 import { formatDateTime } from '../utils/stringUtils';
 import { deepLinks } from '../utils/deepLinks';
@@ -166,6 +166,10 @@ const SecretsPage: React.FC = () => {
 
       if (response.ok) {
         loadSecrets();
+      } else {
+        // A secret an integration endpoint references answers 409 naming the endpoints.
+        const reason = formatApiError(response.status, await response.text(), response.statusText);
+        showToast('error', `Delete failed: ${reason}`, { autoRemove: false });
       }
     } catch (error) {
       console.error('Failed to delete secret:', error);

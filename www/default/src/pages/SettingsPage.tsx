@@ -5,7 +5,6 @@ import { usePermissions } from '../context/PermissionsContext';
 import { Settings, UserSettingsOverrides } from '../types';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { showToast } from '../utils/toaster';
-import { clearRuntimeVariablesCache } from '../utils/runtimeVariables';
 import UserPreferencesTab from './SettingsPage/UserPreferencesTab';
 import SystemSettingsTab from './SettingsPage/SystemSettingsTab';
 import SystemTab from './SettingsPage/SystemTab';
@@ -185,7 +184,6 @@ const SettingsPage: React.FC = () => {
 
     try {
       await actions.updateSettings(formData);
-      clearRuntimeVariablesCache();
       showToast('success', 'Settings saved successfully!');
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Failed to save settings';

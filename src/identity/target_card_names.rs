@@ -1,7 +1,7 @@
 //! Cached managed-agent names read from the `name` of the surface target's Agent Card.
 //!
 //! For A2A and AP2 surfaces with an HTTP(S) target, the dashboard shows this name in place
-//! of the surface name, marked unverified. The name is self-asserted by the target, so it is
+//! of the surface name. The name is self-asserted by the target and never verified, so it is
 //! never signed into the identity VC or published to trust registries.
 //! [`TargetCardNameService::lookup_or_spawn`] never waits.
 

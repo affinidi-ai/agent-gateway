@@ -91,6 +91,10 @@ The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and r
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
+The Trust Recorder panel and its entries warn while an entry uses the surface Issuer as its
+Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
+
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 
 ## Architecture
@@ -160,7 +164,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Source auth, managed identity, Trust Recorder                                  | [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md)                         |
 | Credential providers, delegation vault, consent modes                          | [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md)     |
 | Terms, acceptance, consent-pending sessions                                    | [`docs/TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md)             |
-| Integrations, events, notifications                                            | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)                       |
+| Integrations, events, notifications, the event hook                            | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)                       |
 
 # Ways of working
 

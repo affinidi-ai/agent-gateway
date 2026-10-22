@@ -1,13 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
-use tracing::{debug, info};
 
-use super::IntegrationPublisher;
-use crate::integrations::runtime_variables::substitute_variables_in_json;
+use super::{IntegrationPublisher, Message, event_envelope, is_empty_template};
 use crate::integrations::stream_publishers::PUBLISHER_REGISTRY as STREAM_PUBLISHER_REGISTRY;
-use crate::storage::Integration;
 
 pub struct StreamPublisher;
 
@@ -47,135 +43,54 @@ impl IntegrationPublisher for StreamPublisher {
         Ok(())
     }
 
-    async fn publish(
+    fn complete_template(
         &self,
-        integration: &Integration,
-        subject: &str,
-        message: &str,
-        variables: &HashMap<String, String>,
-    ) -> Result<()> {
-        debug!("Triggering stream integration: {}", integration.name);
-
-        // Get streaming platform configuration
-        let config = &integration.configuration;
-
-        let platform = config
-            .get("platform")
-            .and_then(|v| v.as_str())
-            .unwrap_or("kafka");
-
-        let topic = config
-            .get("topic")
-            .and_then(|v| v.as_str())
-            .context("Stream topic/stream name is required")?;
-
-        // Build event payload from content template with variable substitution
-        let event_payload = if !integration.content.is_null()
-            && integration
-                .content
-                .is_object()
-        {
-            // Use JSON-safe variable substitution to preserve JSON structure
-            substitute_variables_in_json(
-                &integration.content,
-                integration
-                    .category
-                    .as_deref(),
-                variables,
-            )
+        template: &Value,
+    ) -> Value {
+        if is_empty_template(template) {
+            event_envelope()
         } else {
-            // Default payload with standard fields
-            serde_json::json!({
-                "subject": subject,
-                "message": message,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "integration_id": integration.id,
-                "integration_name": integration.name,
-            })
-        };
-
-        debug!("Stream event payload: {:?}", event_payload);
-
-        // Get the stream publisher from the registry
-        let publisher = STREAM_PUBLISHER_REGISTRY
-            .get(platform)
-            .ok_or_else(|| anyhow::anyhow!("Unsupported streaming platform: {}", platform))?;
-
-        // Use the publisher to send the event
-        publisher
-            .publish(topic, &event_payload, config, &integration.id)
-            .await
+            template.clone()
+        }
     }
 
-    async fn publish_batch(
+    fn embeds_json(&self) -> bool {
+        true
+    }
+
+    async fn send(
         &self,
-        integration: &Integration,
-        items: Vec<(&str, &str, &HashMap<String, String>)>,
-    ) -> Result<Vec<Result<()>>> {
-        info!("Triggering stream batch integration: {} with {} items", integration.name, items.len());
-
-        let config = &integration.configuration;
-
-        let platform = config
+        configuration: &Value,
+        message: &Message,
+    ) -> Result<()> {
+        let platform = configuration
             .get("platform")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .unwrap_or("kafka");
-
-        let topic = config
+        let topic = configuration
             .get("topic")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .context("Stream topic/stream name is required")?;
-
-        // Get the stream publisher from the registry
-        let publisher = STREAM_PUBLISHER_REGISTRY
+        STREAM_PUBLISHER_REGISTRY
             .get(platform)
-            .ok_or_else(|| anyhow::anyhow!("Unsupported streaming platform: {}", platform))?;
-
-        // Build all event payloads
-        let mut events = Vec::new();
-        for (subject, message, variables) in items {
-            let event_payload = if !integration.content.is_null()
-                && integration
-                    .content
-                    .is_object()
-            {
-                substitute_variables_in_json(
-                    &integration.content,
-                    integration
-                        .category
-                        .as_deref(),
-                    variables,
-                )
-            } else {
-                serde_json::json!({
-                    "subject": subject,
-                    "message": message,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "integration_id": integration.id,
-                    "integration_name": integration.name,
-                })
-            };
-            events.push(event_payload);
-        }
-
-        debug!("Stream batch contains {} events", events.len());
-
-        // Use the native batch API if available
-        if let Ok(results) = publisher
-            .publish_batch(topic, &events, config, &integration.id)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported streaming platform: {}", platform))?
+            .publish(topic, &message.content, configuration, &message.integration_id, &message.endpoint_id)
             .await
-        {
-            Ok(results)
-        } else {
-            // Fallback to sequential publishing if batch not supported
-            let mut results = Vec::new();
-            for event in events {
-                let result = publisher
-                    .publish(topic, &event, config, &integration.id)
-                    .await;
-                results.push(result);
-            }
-            Ok(results)
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn an_empty_template_streams_the_event_envelope_and_its_own_is_kept() {
+        assert_eq!(StreamPublisher.complete_template(&json!({}))["data"], "${EVENT_DATA}");
+        assert_eq!(StreamPublisher.complete_template(&json!({}))["event_type"], "${EVENT_TYPE}");
+        assert_eq!(
+            StreamPublisher.complete_template(&json!({"record": "${AUDIT_RECORD}"})),
+            json!({"record": "${AUDIT_RECORD}"})
+        );
     }
 }

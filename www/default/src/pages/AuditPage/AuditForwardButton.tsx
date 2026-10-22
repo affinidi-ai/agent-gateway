@@ -4,27 +4,26 @@ import { AppButton } from '../../components/shared/AppButton';
 import { useApp } from '../../context/AppContext';
 import { usePermissions } from '../../context/PermissionsContext';
 import { ROUTES } from '../../routes';
-import { AUDIT_INTEGRATION_CATEGORY } from '../../utils/auditIntegrations';
 import { useAuditForwarding } from './useAuditForwarding';
 
-const NEW_AUDIT_STREAM = `${ROUTES.INTEGRATION_WIZARD}?category=${AUDIT_INTEGRATION_CATEGORY}&type=stream`;
+/** An event set of every audit event, the first step towards forwarding records. */
+const NEW_AUDIT_EVENT_SET = `${ROUTES.EVENT_SET_NEW}?preset=audit`;
 
 const AUDITING_OFF_NOTE =
   'VP Auditing is off in Settings › Security, so the VP Audit Log keeps nothing; ' +
-  'Governance Audit integrations still receive the events selected for them.';
+  'Governance Audit integrations still receive the audit events of their event sets.';
 
-function noEventsNote(count: number): string {
+function pausedNote(count: number): string {
   return count === 1
-    ? '1 Governance Audit integration selects no events and receives nothing.'
-    : `${count} Governance Audit integrations select no events and receive nothing.`;
+    ? '1 Governance Audit integration is disabled, or its endpoint is, and receives nothing.'
+    : `${count} Governance Audit integrations are disabled, or their endpoint is, and receive nothing.`;
 }
 
 /**
- * Shows how many Governance Audit integrations receive audit records and opens
- * them, or starts a new Governance Audit stream when none do. Hidden when the
- * gateway does not offer the Governance Audit category. Warns when active
- * integrations select no events, and says when VP Auditing is off that only the
- * VP Audit Log keeps nothing, since integrations receive their own events.
+ * Shows how many integrations receive audit records and opens them, or starts an event set of
+ * the audit events when none do. Warns when integrations with audit events are disabled, and
+ * says when VP Auditing is off that only the VP Audit Log keeps nothing, since integrations
+ * receive the audit events of their own event sets.
  */
 const AuditForwardButton: React.FC = () => {
   const navigate = useNavigate();
@@ -34,21 +33,17 @@ const AuditForwardButton: React.FC = () => {
   const forwarding = useAuditForwarding(hasPermission('integrations.view'));
   const auditingOff = state.settings?.audit_enabled === false;
 
-  if (
-    forwarding === null ||
-    !forwarding.categoryConfigured ||
-    (forwarding.integrations === 0 && !canEditIntegrations)
-  ) {
+  if (forwarding === null || (forwarding.integrations === 0 && !canEditIntegrations)) {
     return null;
   }
 
-  const { integrations, integrationsWithoutEvents } = forwarding;
+  const { integrations, pausedIntegrations } = forwarding;
   const label =
     integrations > 0
       ? `Forwarding to ${integrations} integration${integrations === 1 ? '' : 's'}`
       : 'Forward records';
   const notes = [
-    integrationsWithoutEvents > 0 ? noEventsNote(integrationsWithoutEvents) : null,
+    pausedIntegrations > 0 ? pausedNote(pausedIntegrations) : null,
     auditingOff ? AUDITING_OFF_NOTE : null,
   ].filter((note): note is string => note !== null);
 
@@ -56,16 +51,16 @@ const AuditForwardButton: React.FC = () => {
     <AppButton
       variant="outline-primary"
       size="md"
-      onClick={() => navigate(integrations > 0 ? ROUTES.INTEGRATIONS : NEW_AUDIT_STREAM)}
+      onClick={() => navigate(integrations > 0 ? ROUTES.INTEGRATIONS : NEW_AUDIT_EVENT_SET)}
       data-testid="audit-forward-button"
       title={notes.length > 0 ? notes.join(' ') : undefined}
       iconStart={<i className="fas fa-share-square me-1" aria-hidden="true" />}
       iconEnd={
-        integrationsWithoutEvents > 0 ? (
+        pausedIntegrations > 0 ? (
           <i
             className="fas fa-exclamation-triangle text-warning ms-1"
             aria-hidden="true"
-            data-testid="audit-forward-no-events-warning"
+            data-testid="audit-forward-paused-warning"
           />
         ) : undefined
       }

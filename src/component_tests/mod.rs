@@ -5,13 +5,13 @@ mod access_tokens_pat;
 mod channel_e2e;
 #[cfg(feature = "didwebvh")]
 mod didwebvh_e2e;
+mod event_hook_e2e;
 mod fabric_stream_revocation;
 mod global_policy_e2e;
 mod header_metadata_mapping_e2e;
 pub(crate) mod helpers;
 mod identity_e2e;
 mod identity_naming_e2e;
-mod integration_mappings_e2e;
 mod mcp_outbound_e2e;
 mod mcp_policy_e2e;
 mod mcp_record_compat;

@@ -42,6 +42,9 @@ pub struct Pipeline {
     /// What the writer handed back once it stopped during a graceful stop.
     writer_stopped: Option<Result<WriterStopped<JournalWriter>, oneshot::error::RecvError>>,
     dispatcher: tokio::task::JoinHandle<()>,
+    /// Closed once the dispatcher stops, so a write it started cannot land after the next
+    /// pipeline opens the log.
+    audit_log: AuditLogSink,
 }
 
 impl Pipeline {
@@ -59,8 +62,10 @@ impl Pipeline {
     /// Stops every job now: disconnects the producer, cancels the writer, the
     /// dispatcher and its readers, and closes the cursor store, so no cursor
     /// is saved after it. Records the writer had not journalled are
-    /// discarded and counted as `aborted`. The journal, and its lock, is
-    /// released last, once the dispatcher and the writer have stopped.
+    /// discarded and counted as `aborted`. Once the dispatcher has stopped,
+    /// the VP Audit Log is closed, which waits for a write a cancelled
+    /// reader left running. The journal, and its lock, is released last,
+    /// once the dispatcher and the writer have stopped.
     pub async fn abort(self) {
         let Self {
             producer,
@@ -69,12 +74,18 @@ impl Pipeline {
             writer,
             writer_stopped,
             dispatcher,
+            audit_log,
         } = self;
         producer.disconnect();
         drop(cancel);
         cursors.close();
         if let Err(e) = dispatcher.await {
             error!(error = %e, "The audit dispatcher ended abnormally");
+        }
+        match tokio::task::spawn_blocking(move || audit_log.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!(error = %e, "Failed to close the VP Audit Log"),
+            Err(e) => error!(error = %e, "Closing the VP Audit Log ended abnormally"),
         }
         let stopped = match writer_stopped {
             Some(stopped) => stopped,
@@ -114,8 +125,9 @@ pub fn start_with(
     let journal_dir = audit_dir.join("journal");
     let writer = JournalWriter::open(&journal_dir, SEGMENT_MAX_BYTES)?;
     let cursors = Arc::new(CursorStore::open(&journal_dir)?);
+    let audit_log = AuditLogSink::open(audit_log, REMEMBERED_IDS)?;
     let factory = ProductionSinks {
-        audit_log: AuditLogSink::open(audit_log, REMEMBERED_IDS)?,
+        audit_log: audit_log.clone(),
         publish: Arc::new(publish_audit_delivery),
     };
     let (durable_tx, durable) = watch::channel(
@@ -141,6 +153,7 @@ pub fn start_with(
         writer,
         writer_stopped: None,
         dispatcher,
+        audit_log,
     })
 }
 

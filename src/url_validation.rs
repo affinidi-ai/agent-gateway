@@ -98,6 +98,16 @@ fn is_blocked_host(host: &Host<&str>) -> bool {
     }
 }
 
+/// `raw` parsed as an `http` or `https` URL. The `url` crate's parse errors do not repeat
+/// the input.
+fn parse_http_url(raw: &str) -> Result<Url, String> {
+    let parsed = Url::parse(raw).map_err(|e| format!("Invalid URL: {}", e))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("URL scheme must be http or https".into());
+    }
+    Ok(parsed)
+}
+
 /// Validate that a URL does not point to a cloud-provider metadata service or
 /// loopback address.
 ///
@@ -108,19 +118,15 @@ fn is_blocked_host(host: &Host<&str>) -> bool {
 ///   - Loopback / unspecified addresses (`127.x`, `localhost`, `::1`, `0.0.0.0`)
 ///   - Embedded credentials (`user:pass@host`)
 ///
-/// Returns the parsed [`Url`] on success, or a human-readable error string.
+/// Returns the parsed [`Url`] on success, or a human-readable error string. The URL can be a
+/// credential, such as a Slack webhook URL, so no error repeats it; a blocked host is named.
 pub fn validate_url_not_cloud_metadata(raw: &str) -> Result<Url, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("URL must not be empty".into());
     }
 
-    let parsed = Url::parse(trimmed).map_err(|e| format!("Invalid URL '{}': {}", trimmed, e))?;
-
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("URL scheme must be http or https, got '{}'", scheme));
-    }
+    let parsed = parse_http_url(trimmed)?;
 
     if parsed.host().is_none() {
         return Err("URL must include a host".into());
@@ -204,11 +210,7 @@ fn validate_resolved_url_inner(
         if trimmed.is_empty() {
             return Err("URL must not be empty".into());
         }
-        let p = Url::parse(trimmed).map_err(|e| format!("Invalid URL '{}': {}", trimmed, e))?;
-        let scheme = p.scheme();
-        if scheme != "http" && scheme != "https" {
-            return Err(format!("URL scheme must be http or https, got '{}'", scheme));
-        }
+        let p = parse_http_url(trimmed)?;
         if p.host().is_none()
             || p.host_str()
                 .is_some_and(|h| h.is_empty())
@@ -351,10 +353,7 @@ fn validate_oauth_endpoint_url_inner(
             {
                 Ok(candidate)
             } else {
-                Err(format!(
-                    "{}; OAuth endpoint '{}' is not in the BDD exact endpoint allowlist",
-                    production_error, candidate
-                ))
+                Err(format!("{}; the OAuth endpoint is not in the BDD exact endpoint allowlist", production_error))
             }
         }
     }
@@ -746,6 +745,65 @@ mod tests {
         // are link-local but not metadata — we allow them since the goal
         // is blocking cloud metadata, not all link-local traffic.
         must_allow("http://169.254.1.1/");
+    }
+
+    // ── Error messages never repeat the URL ─────────────────────────────
+
+    const SECRET: &str = "s3cr3t-token";
+
+    fn every_validator(raw: &str) -> Vec<Result<Url, String>> {
+        vec![
+            validate_url_not_cloud_metadata(raw),
+            validate_resolved_url(raw),
+            validate_resolved_cloud_metadata_url(raw),
+            validate_webhook_url(raw),
+            validate_resolved_webhook_url(raw),
+        ]
+    }
+
+    #[test]
+    fn an_unparsable_url_is_refused_without_repeating_it() {
+        for result in every_validator(&format!("not a url {SECRET}")) {
+            let error = result.expect_err("refused");
+            assert!(error.starts_with("Invalid URL: "), "{error}");
+            assert!(!error.contains(SECRET), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_scheme_other_than_http_is_refused_without_repeating_it() {
+        for result in every_validator(&format!("{SECRET}:rest")) {
+            let error = result.expect_err("refused");
+            assert_eq!(error, "URL scheme must be http or https");
+        }
+    }
+
+    #[test]
+    fn a_blocked_host_is_named_without_the_path_or_query() {
+        let loopback = format!("http://127.0.0.1/services/{SECRET}?token={SECRET}");
+        let private = format!("http://10.0.0.1/services/{SECRET}?token={SECRET}");
+        for result in [
+            validate_url_not_cloud_metadata(&loopback),
+            validate_resolved_url(&loopback),
+            validate_webhook_url(&private),
+            validate_resolved_webhook_url(&private),
+        ] {
+            let error = result.expect_err("refused");
+            assert!(error.contains("URL host '"), "{error}");
+            assert!(!error.contains(SECRET), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_oauth_endpoint_outside_the_bdd_allowlist_is_refused_without_repeating_it() {
+        let error = validate_oauth_endpoint_url_inner(
+            &format!("http://127.0.0.1:8081/token?key={SECRET}"),
+            Some("http://127.0.0.1:8080/token"),
+        )
+        .expect_err("refused");
+
+        assert!(error.contains("is not in the BDD exact endpoint allowlist"), "{error}");
+        assert!(!error.contains(SECRET), "{error}");
     }
 
     #[test]

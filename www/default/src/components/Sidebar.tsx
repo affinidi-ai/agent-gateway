@@ -93,6 +93,7 @@ const Sidebar: React.FC = () => {
       label: 'Integrations',
       icon: 'fa-puzzle-piece',
       path: '/integrations',
+      permission: 'integrations.view' as const,
     },
 
     {

@@ -36,7 +36,6 @@ pub struct IdentityApiState {
     pub issuer_store: Option<Arc<crate::issuers::FileSystemIssuerStore>>,
     pub trust_registry_store: Option<Arc<crate::trust_registries::FileSystemTrustRegistryStore>>,
     pub authority_store: Option<Arc<crate::authorities::FileSystemAuthorityStore>>,
-    pub integration_store: Option<Arc<crate::storage::IntegrationStorage>>,
     pub mcp_proxy_store: Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
     pub a2a_proxy_store: Option<Arc<crate::a2a_proxies::FileSystemA2aProxyStore>>,
     pub secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>>,
@@ -51,6 +50,7 @@ pub struct IdentityApiState {
     /// here instead of re-deriving them from `ChannelMapping`.
     pub resolved_surface_cache: Arc<crate::surfaces::ResolvedSurfaceCache>,
     pub surface_template_store: Option<Arc<crate::surface_templates::FileSystemSurfaceTemplateStore>>,
+    pub event_hook: Option<Arc<crate::event_hook::EventHook>>,
 
     // DID:webvh support (optional, behind feature gate)
     #[cfg(feature = "didwebvh")]

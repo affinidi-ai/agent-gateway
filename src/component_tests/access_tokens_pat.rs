@@ -1858,9 +1858,14 @@ async fn a_tenant_pat_reads_but_cannot_change_an_appliance_wide_secret() {
         Arc::new(crate::terms::TermsManager::disabled()),
     )
     .with_pat_authenticator(Some(store.clone()));
-    let app =
-        crate::secrets::router::create_secrets_router(secrets.clone(), None, None, Some(RbacGuard::new(users, rbac)))
-            .layer(middleware::from_fn_with_state(auth, require_session_auth));
+    let app = crate::secrets::router::create_secrets_router(
+        secrets.clone(),
+        None,
+        None,
+        None,
+        Some(RbacGuard::new(users, rbac)),
+    )
+    .layer(middleware::from_fn_with_state(auth, require_session_auth));
     let (_, token) = create_token_with(
         &store,
         &user_id,
