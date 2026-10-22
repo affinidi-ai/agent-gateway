@@ -300,6 +300,16 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
         return Err((StatusCode::FORBIDDEN, "Trust registry is outside this token's permitted scope".into()));
     }
 
+    // Held until the record is deleted, so no connection is built for it meanwhile.
+    let _connect_guard = match listener_manager {
+        Some(Extension(ref listener_mgr)) => Some(
+            listener_mgr
+                .connect_lock(&id)
+                .await,
+        ),
+        None => None,
+    };
+
     // Stop background worker listener
     if let Some(Extension(ref w)) = worker {
         w.stop_listener(&id).await;
@@ -954,6 +964,53 @@ mod tests {
             Some("Tenant registry".to_string())
         );
         assert_eq!(delete_as_tenant_a(&store, &dir, &registry.id).await, StatusCode::NO_CONTENT);
+        assert!(
+            store
+                .get(&registry.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_waits_for_a_connection_being_built_for_the_registry() {
+        use futures::FutureExt;
+
+        let (store, registry, dir) = stored_registry(None).await;
+        let listener_mgr =
+            Arc::new(TrustRegistryListenerManager::new("example.com".to_string(), dir.path().join("keys"), None));
+        let connecting = listener_mgr
+            .connect_lock(&registry.id)
+            .await;
+
+        let delete = delete_trust_registry(
+            Extension(store.clone()),
+            Some(Extension(listener_mgr.clone())),
+            None,
+            Extension(None),
+            Extension(bootstrap(&dir)),
+            Path(registry.id.clone()),
+            None,
+            None,
+        );
+        tokio::pin!(delete);
+        assert!(
+            (&mut delete)
+                .now_or_never()
+                .is_none(),
+            "delete waits while a connection is being built"
+        );
+        assert!(
+            store
+                .get(&registry.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        drop(connecting);
+        assert_eq!(delete.await, Ok(StatusCode::NO_CONTENT));
         assert!(
             store
                 .get(&registry.id)

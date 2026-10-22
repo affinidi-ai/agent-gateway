@@ -15,9 +15,11 @@ changes:
         time builds a connection for a trust registry, so concurrent Trust Check queries
         on a stale connection reuse the one replacement instead of each opening a
         session, and a reconnect closes the old session before opening the new one. A
-        failed connection setup now closes its websocket. A Standby gateway refuses to
-        build trust registry connections, and closes any it was building when it
-        stepped down.
+        stale connection that cannot be rebuilt is removed, so the next query starts
+        fresh. Deleting a trust registry waits for any connection being built for it
+        and no longer leaves one behind. A failed connection setup now closes its
+        websocket. A Standby gateway refuses to build trust registry connections, and
+        closes any it was building when it stepped down.
   removed: []
   security: []
   breaking: []
