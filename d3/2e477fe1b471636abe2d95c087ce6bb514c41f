@@ -1,0 +1,22 @@
+.changelog/wip/fix_system-metrics-persist-interval.yaml
+  s_a12417fd0f90cb::t_80b74a53887a5c 19,21-28
+  s_a12417fd0f90cb::t_f9776cc2dd498a 20
+Cargo.lock
+  s_a12417fd0f90cb::t_0358a560249c67 6500,10154,10642,10644,16188,16190,16201,16206,16208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d32e477fe1b471636abe2d95c087ce6bb514c41f",
+  "prompts": {},
+  "sessions": {
+    "s_a12417fd0f90cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f4a15d6-f4a3-4b3c-a461-dfcdcce851f7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
