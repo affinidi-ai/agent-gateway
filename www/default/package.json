@@ -59,7 +59,9 @@
     "ws": ">=8.21.0",
     "uuid": ">=9.0.1",
     "serialize-javascript": ">=6.1.0",
-    "underscore": ">=1.13.7"
+    "underscore": ">=1.13.7",
+    "postcss-selector-parser": "^7.1.6",
+    "@tootallnate/once": "^2.0.1"
   },
   "proxy": "https://localhost:8443"
 }

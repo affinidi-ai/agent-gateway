@@ -18,7 +18,9 @@ changes:
         Updates anyhow to 1.0.104 and event-listener to 5.4.2 to fix soundness
         advisories RUSTSEC-2026-0190 and RUSTSEC-2026-0221, and applies non-breaking
         dashboard dependency fixes, including the critical websocket-driver,
-        shell-quote and proxy-addr advisories in the build toolchain.
+        shell-quote and proxy-addr advisories in the build toolchain. Overrides pin
+        postcss-selector-parser to 7.1.6 or newer and @tootallnate/once to 2.0.1 or
+        newer, clearing GHSA-rj75-hqrm-r3gf and GHSA-vpq2-c234-7xj6 from the build.
     - timestamp: '2026-10-22T11:30:00Z'
       title: Upgrade the dashboard to React Router 7.18.4
       description: >-
