@@ -50,6 +50,7 @@ pub struct IdentityApiState {
     /// here instead of re-deriving them from `ChannelMapping`.
     pub resolved_surface_cache: Arc<crate::surfaces::ResolvedSurfaceCache>,
     pub surface_template_store: Option<Arc<crate::surface_templates::FileSystemSurfaceTemplateStore>>,
+    pub event_hook: Option<Arc<crate::event_hook::EventHook>>,
 
     // DID:webvh support (optional, behind feature gate)
     #[cfg(feature = "didwebvh")]

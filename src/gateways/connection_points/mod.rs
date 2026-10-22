@@ -5,6 +5,8 @@ pub mod handlers;
 pub mod message_processor;
 pub mod messages;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_mediator;
 pub mod types;
 pub mod webhook;
 pub mod ws_listener;

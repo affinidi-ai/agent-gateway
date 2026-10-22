@@ -189,10 +189,8 @@ fn signature(
     timestamp: &str,
     body: &str,
 ) -> Result<String> {
-    use hmac::{Hmac, Mac};
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).context("Invalid HMAC key")?;
-    mac.update(format!("{timestamp}.{body}").as_bytes());
-    Ok(format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
+    let digest = crate::integrations::webhook_signing::sign_timestamped_payload(secret, timestamp, body.as_bytes())?;
+    Ok(format!("sha256={digest}"))
 }
 
 #[cfg(test)]
