@@ -19,7 +19,7 @@ changes:
         scroll sideways on laptop screens, the Name and Description columns keep their
         width, and every row action stays on screen.
     - timestamp: '2026-10-21T16:02:23Z'
-      title: Fit the Identities, Connection Points, Credential Audit, Metrics and Tasks pages on laptop screens
+      title: Fit Identities, Connection Points, Credential Audit, Metrics, Tasks on laptops
       description: >-
         The Identities table no longer scrolls sideways at 1280px wide, so every row action stays
         reachable. Connection Points show their four actions in a compact block, and Credential
