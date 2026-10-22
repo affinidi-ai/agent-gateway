@@ -1,0 +1,33 @@
+ARCHITECTURE.md
+  s_a12417fd0f90cb::t_bce7e08170b9ab 78-80
+docs/DESIGN_PATTERNS.md
+  s_a12417fd0f90cb::t_ebf3314b2d060a 55-56
+.changelog/wip/fix_system-metrics-persist-interval.yaml
+  s_a12417fd0f90cb::t_f6d5af026fb4ce 7,15-21
+src/observability/mod.rs
+  s_a12417fd0f90cb::t_50c201dbb50d26 43-44
+src/server/orchestrator.rs
+  s_a12417fd0f90cb::t_50c201dbb50d26 720
+src/observability/system_metrics.rs
+  s_a12417fd0f90cb::t_50c201dbb50d26 6-8,19,33,202-220,276-289,576-600
+  s_a12417fd0f90cb::t_bdd8bb559a1e5f 601
+src/main.rs
+  s_a12417fd0f90cb::t_398a083f3d33dd 132,135-139,607-617,636-666
+  s_a12417fd0f90cb::t_a8e4e9a5a3c25a 667
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e6d453f51e6018239b2ecdd7b3c9dfb42022ace6",
+  "prompts": {},
+  "sessions": {
+    "s_a12417fd0f90cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f4a15d6-f4a3-4b3c-a461-dfcdcce851f7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
