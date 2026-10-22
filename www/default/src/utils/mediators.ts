@@ -27,13 +27,16 @@ export function dropdownMediators<T extends ListedMediator>(mediators: T[]): T[]
 }
 
 /**
- * The Mediators page shows the stored record when one exists for a directory DID
- * (connection points refer to it by its id), and the `directory:` entry only
- * while there is none.
+ * The Mediators page shows the stored provided record when one exists for a
+ * directory DID (connection points refer to it by its id), and the `directory:`
+ * entry only while there is none. An operator-added mediator with the same DID is
+ * a row of its own and never hides the entry.
  */
 export function mediatorPageRows<T extends ListedMediator>(mediators: T[]): T[] {
-  const stored = new Set(mediators.filter(m => !isUnstoredDirectoryMediator(m)).map(m => m.did));
+  const storedProvided = new Set(
+    mediators.filter(m => !isUnstoredDirectoryMediator(m) && m.provided === true).map(m => m.did)
+  );
   return mediators.filter(
-    mediator => !isUnstoredDirectoryMediator(mediator) || !stored.has(mediator.did)
+    mediator => !isUnstoredDirectoryMediator(mediator) || !storedProvided.has(mediator.did)
   );
 }

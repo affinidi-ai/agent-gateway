@@ -445,14 +445,36 @@ fn sanitize_entries(items: Vec<serde_json::Value>) -> Vec<DirectoryEntry> {
         .collect()
 }
 
+/// `did:<method>:<method-specific part>` with a lowercase alphanumeric method and
+/// a non-empty rest of ASCII letters, digits, `_`, `.`, `:`, `%` and `-`, at most
+/// 1024 bytes: the rule the registering side applies, so an entry that would
+/// fail there is never offered.
+///
+/// TODO: DID syntax is validated in several places with different rules (the
+/// authorities, credential identity and credentials handlers each have their own,
+/// all looser than this one). Move DID validation into its own shared module, with
+/// one rule and one set of tests, and have this and those callers use it.
+pub(crate) fn is_well_formed_did(did: &str) -> bool {
+    let Some(rest) = did.strip_prefix("did:") else {
+        return false;
+    };
+    let Some((method, specific)) = rest.split_once(':') else {
+        return false;
+    };
+    did.len() <= MAX_DID_BYTES
+        && !method.is_empty()
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && !specific.is_empty()
+        && specific
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'%' | b'-'))
+}
+
 fn sanitize_entry(entry: DirectoryEntry) -> Option<DirectoryEntry> {
     let did = entry.did.trim().to_string();
-    let well_formed = did.starts_with("did:")
-        && did.len() <= MAX_DID_BYTES
-        && did.split(':').count() >= 3
-        && !did
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control());
+    let well_formed = is_well_formed_did(&did);
     if !well_formed {
         return None;
     }
@@ -538,6 +560,46 @@ mod tests {
                 .chars()
                 .count(),
             MAX_NAME_CHARS
+        );
+    }
+
+    #[test]
+    fn only_well_formed_dids_are_offered() {
+        for valid in [
+            "did:web:mediator.example",
+            "did:web:mediator.example:path:to",
+            "did:web:127.0.0.1%3A7037",
+            "did:webvh:QmSkCG4BH4whWhwJvcSj1r8FKyNrr89hhvUuyKQeytDZC7:localhost%3A7037",
+            "did:peer:2.Vz6MktaxeC1qTnoCSJY5ouLBNStouhntbo4frM3q2qYrUZCvJ.Ez6LSkSmhYuqMSEs29f31Czk",
+        ] {
+            assert!(is_well_formed_did(valid), "{valid}");
+        }
+        let too_long = format!("did:web:{}", "a".repeat(MAX_DID_BYTES));
+        for invalid in [
+            "did:WEB:mediator.example",
+            "did:web:has space",
+            "did:web:quo\"te",
+            "did:web:slash/path",
+            "did:web:",
+            "did:web",
+            "did::x",
+            "did:we-b:x",
+            "not-a-did",
+            too_long.as_str(),
+        ] {
+            assert!(!is_well_formed_did(invalid), "{invalid}");
+        }
+        let entries = sanitize_entries(vec![
+            json!({"did": "did:WEB:upper.example", "name": "A"}),
+            json!({"did": "did:web:ok.example", "name": "B"}),
+            json!({"did": "did:web:bad/slash", "name": "C"}),
+        ]);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.did.as_str())
+                .collect::<Vec<_>>(),
+            ["did:web:ok.example"]
         );
     }
 

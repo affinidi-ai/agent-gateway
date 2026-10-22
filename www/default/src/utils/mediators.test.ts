@@ -35,15 +35,27 @@ describe('dropdownMediators and mediatorPageRows', () => {
     ]);
   });
 
-  it('shows the stored record instead of the entry on the Mediators page', () => {
-    expect(mediatorPageRows(all).map(m => m.id)).toEqual([
+  it('shows the stored provided record instead of the entry on the Mediators page', () => {
+    expect(mediatorPageRows([entry, storedProvided, staleProvided]).map(m => m.id)).toEqual([
       storedProvided.id,
       staleProvided.id,
-      operator.id,
     ]);
     expect(mediatorPageRows([entry, staleProvided]).map(m => m.id)).toEqual([
       entry.id,
       staleProvided.id,
     ]);
+  });
+
+  it('keeps the entry next to an operator-added mediator with the same DID', () => {
+    expect(mediatorPageRows([entry, operator]).map(m => m.id)).toEqual([entry.id, operator.id]);
+    expect(mediatorPageRows(all).map(m => m.id)).toEqual([
+      storedProvided.id,
+      staleProvided.id,
+      operator.id,
+    ]);
+  });
+
+  it('never drops an operator-added mediator from the dropdown', () => {
+    expect(dropdownMediators([entry, operator]).map(m => m.id)).toEqual([entry.id, operator.id]);
   });
 });

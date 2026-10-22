@@ -433,8 +433,9 @@ The list returns every directory entry first, then every stored record the calle
 operator-added and provided alike, one row per record id: a Connection Point keeps the id of the
 record it was created on, so that record stays listed while the directory still offers its DID. The
 dashboard shows each mediator once: the Create Connection Point dropdown offers a directory mediator
-only as its `directory:` entry, and the Mediators page shows the stored record when one exists for the
-DID and the entry otherwise. A stored provided record cannot be changed through the API: `PUT
+only as its `directory:` entry, and the Mediators page shows the stored provided record when one
+exists for the DID and the entry otherwise. A mediator an operator added for the same DID is a row
+of its own and never hides the entry. A stored provided record cannot be changed through the API: `PUT
 /v1/mediators/<id>` answers `409`. `DELETE` answers `409` too, with a message saying it is still
 offered by the directory or used by a connection point or a pending pairing, until the directory
 has answered successfully without its DID and nothing uses it: no stored Connection Point names it
