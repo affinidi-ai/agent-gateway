@@ -29,5 +29,16 @@ changes:
   changed: []
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-22T00:00:00.000Z'
+      title: Apply the response policy and identity credential to A2A streams
+      description: >-
+        An A2A event stream from a direct Target used to be returned whole, and the response
+        checks found no JSON in it. A response policy rule on the content could not block a
+        stream, the response extension rules were skipped, and the caller received the agent's
+        raw, unverifiable identity instead of the signed agent-identity-credential. Each event is
+        now checked before it is sent and its identity claim replaced by the credential. On a
+        surface that reads identity from the response, a stream that never claims one ends with
+        an identity error. fabric:// surfaces and Transit Points still return the stream whole
+        without these checks.
   breaking: []
