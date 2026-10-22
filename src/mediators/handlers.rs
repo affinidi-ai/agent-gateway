@@ -145,13 +145,17 @@ fn mediator_writable(
 }
 
 /// A provided record can be removed only once the directory has answered and no
-/// longer offers its DID, and no stored Connection Point uses it. The caller
-/// holds the DID's lock, so a creation cannot start using it meanwhile. The
-/// next use of the entry stores the record again from the directory.
+/// longer offers its DID, and nothing uses it: no stored Connection Point (a
+/// temporary one of a pending pairing included, which names its acceptor
+/// mediator record in `oob_message.secure_mediator_id`), and no pending pairing
+/// that names its record id. The caller holds the DID's lock, so a creation cannot start using it
+/// meanwhile. The next use of the entry stores the record again from the
+/// directory.
 async fn reject_provided_delete(
     mediator: &Mediator,
     directory: Option<&Arc<MediatorDirectory>>,
     connection_points: Option<&crate::gateways::FileSystemConnectionPointStore>,
+    pending_pairings: Option<&crate::gateways::PendingConnectionStore>,
 ) -> Result<(), (StatusCode, String)> {
     let listing = match directory {
         Some(directory) => {
@@ -168,9 +172,12 @@ async fn reject_provided_delete(
         ));
     }
     let used_message = || {
-        (StatusCode::CONFLICT, "Mediator is provided by the directory and is used by a connection point".to_string())
+        (
+            StatusCode::CONFLICT,
+            "Mediator is provided by the directory and is used by a connection point or a pending pairing".to_string(),
+        )
     };
-    let Some(connection_points) = connection_points else {
+    let (Some(connection_points), Some(pending_pairings)) = (connection_points, pending_pairings) else {
         return Err(used_message());
     };
     let referenced = connection_points
@@ -178,8 +185,25 @@ async fn reject_provided_delete(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list connection points: {}", e)))?
         .iter()
-        .any(|point| point.mediator_id == mediator.id);
-    if referenced {
+        .any(|point| {
+            point.mediator_id == mediator.id
+                || point
+                    .oob_message
+                    .get("secure_mediator_id")
+                    .and_then(|value| value.as_str())
+                    == Some(mediator.id.as_str())
+        });
+    let pairing = pending_pairings
+        .list_all()
+        .await
+        .iter()
+        .any(|pending| {
+            pending
+                .mediator_record_id
+                .as_deref()
+                == Some(mediator.id.as_str())
+        });
+    if referenced || pairing {
         return Err(used_message());
     }
     Ok(())
@@ -594,6 +618,9 @@ pub(crate) async fn resolve_directory_mediator<S: MediatorStore>(
     }
     let tenant_id = tenant_for_create(None, false, tenant_context(context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
+    if !can_reference(gateway_tenant, tenant_id.as_deref()) {
+        return Err((StatusCode::BAD_REQUEST, "Mediator reference is not accessible".to_string()).into());
+    }
     let existing =
         under_did_lock(&entry.did, find_directory_record(store, &entry.did, gateway_tenant, context)).await?;
     if let Some(existing) = existing {
@@ -904,6 +931,7 @@ pub async fn delete_mediator<S: MediatorStore>(
         Option<std::sync::Arc<crate::gateways::connection_points::ws_listener::ConnectionPointListenerManager>>,
     >,
     Extension(directory): Extension<Option<Arc<MediatorDirectory>>>,
+    Extension(pending_pairings): Extension<Option<Arc<crate::gateways::PendingConnectionStore>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -937,7 +965,7 @@ pub async fn delete_mediator<S: MediatorStore>(
         return Err((StatusCode::FORBIDDEN, "Mediator is outside this token's permitted scope".into()));
     }
     if mediator.provided {
-        reject_provided_delete(&mediator, directory.as_ref(), cp_store.as_deref()).await?;
+        reject_provided_delete(&mediator, directory.as_ref(), cp_store.as_deref(), pending_pairings.as_deref()).await?;
     }
 
     // Stop all connection point listeners using this mediator
@@ -1872,17 +1900,42 @@ mod tests {
         (directory, url)
     }
 
+    fn pending_pairing(
+        id: &str,
+        mediator_record_id: Option<&str>,
+    ) -> crate::gateways::PendingOOBConnection {
+        serde_json::from_value(json!({
+            "id": id,
+            "our_temporary_did": "did:web:us.example:tmp",
+            "our_secure_did": "did:web:us.example:secure",
+            "their_temporary_did": "did:web:them.example:tmp",
+            "their_secure_did": null,
+            "mediator_did": "did:web:other-mediator.example",
+            "connection_point_id": "",
+            "invitation_id": id,
+            "role": "Acceptor",
+            "state": "WaitingForResponse",
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2026-01-01T01:00:00Z",
+            "mediator_record_id": mediator_record_id,
+        }))
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn a_provided_record_is_deleted_only_when_the_directory_dropped_it_and_nothing_uses_it() {
         use crate::gateways::connection_points::ConnectionPointStore;
-        let (store, points, _dir) = stores().await;
+        let (store, points, dir) = stores().await;
+        let pairings = crate::gateways::PendingConnectionStore::new(dir.path().join("pairings"))
+            .await
+            .unwrap();
         let created =
             super::store_pending_directory_mediator(&store, None, pending_for("did:web:d").await, None, &None)
                 .await
                 .unwrap();
 
         let (offering, _) = directory_listing(Some("did:web:d")).await;
-        let offered = super::reject_provided_delete(&created, Some(&offering), Some(&points))
+        let offered = super::reject_provided_delete(&created, Some(&offering), Some(&points), Some(&pairings))
             .await
             .unwrap_err();
         assert_eq!(offered.0, axum::http::StatusCode::CONFLICT);
@@ -1893,30 +1946,70 @@ mod tests {
         );
 
         let (dropped, _) = directory_listing(None).await;
-        assert!(
-            super::reject_provided_delete(&created, Some(&dropped), Some(&points))
-                .await
-                .is_ok(),
-            "stale and unreferenced"
-        );
+        let check = || super::reject_provided_delete(&created, Some(&dropped), Some(&points), Some(&pairings));
+        assert!(check().await.is_ok(), "stale and unreferenced");
 
+        let direct = point_on(&created.id);
         points
-            .create(&point_on(&created.id))
+            .create(&direct)
             .await
             .unwrap();
-        let used = super::reject_provided_delete(&created, Some(&dropped), Some(&points))
-            .await
-            .unwrap_err();
+        let used = check().await.unwrap_err();
         assert_eq!(used.0, axum::http::StatusCode::CONFLICT);
         assert!(
             used.1
-                .contains("used by a connection point")
+                .contains("used by a connection point or a pending pairing")
         );
+        points
+            .delete(&direct.id)
+            .await
+            .unwrap();
+        assert!(check().await.is_ok());
+
+        let mut temporary = point_on("did:web:inviters-mediator.example");
+        temporary.oob_message = json!({"secure_mediator_id": created.id});
+        points
+            .create(&temporary)
+            .await
+            .unwrap();
+        assert_eq!(
+            check().await.unwrap_err().0,
+            axum::http::StatusCode::CONFLICT,
+            "the temporary connection point of a pending pairing names the record as its acceptor mediator"
+        );
+        points
+            .delete(&temporary.id)
+            .await
+            .unwrap();
+        assert!(check().await.is_ok(), "removed again");
+
+        pairings
+            .store(pending_pairing("inv-1", Some(&created.id)))
+            .await;
+        assert_eq!(
+            check().await.unwrap_err().0,
+            axum::http::StatusCode::CONFLICT,
+            "a pending pairing names the record as its acceptor mediator"
+        );
+        pairings.remove("inv-1").await;
+        assert!(check().await.is_ok(), "the pairing is gone");
+
+        pairings
+            .store(pending_pairing("inv-2", None))
+            .await;
+        assert!(check().await.is_ok(), "a pairing on the inviter's mediator does not use the record");
+
         assert!(
-            super::reject_provided_delete(&created, Some(&dropped), None)
+            super::reject_provided_delete(&created, Some(&dropped), None, Some(&pairings))
                 .await
                 .is_err(),
             "without a connection point store nothing is removed"
+        );
+        assert!(
+            super::reject_provided_delete(&created, Some(&dropped), Some(&points), None)
+                .await
+                .is_err(),
+            "without the pending pairing store nothing is removed"
         );
     }
 
@@ -2022,7 +2115,12 @@ mod tests {
     #[tokio::test]
     async fn a_delete_that_starts_after_the_check_waits_for_the_save_and_then_finds_the_record_used() {
         use crate::gateways::connection_points::ConnectionPointStore;
-        let (store, points, _dir) = stores().await;
+        let (store, points, dir) = stores().await;
+        let pairings = Arc::new(
+            crate::gateways::PendingConnectionStore::new(dir.path().join("pairings"))
+                .await
+                .unwrap(),
+        );
         let points = Arc::new(points);
         let created =
             super::store_pending_directory_mediator(&store, None, pending_for("did:web:e").await, None, &None)
@@ -2032,10 +2130,12 @@ mod tests {
 
         let creating = super::lock_did(&created.did).await;
         let deleting = {
-            let (created, points, dropped) = (created.clone(), points.clone(), dropped.clone());
+            let (created, points, dropped, pairings) =
+                (created.clone(), points.clone(), dropped.clone(), pairings.clone());
             tokio::spawn(async move {
                 let _guard = super::lock_did(&created.did).await;
-                super::reject_provided_delete(&created, Some(&dropped), Some(points.as_ref())).await
+                super::reject_provided_delete(&created, Some(&dropped), Some(points.as_ref()), Some(pairings.as_ref()))
+                    .await
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2159,6 +2259,7 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(None),
+            Extension(None),
             Path(mediator.id.clone()),
             tenant_a(),
             None,
@@ -2209,6 +2310,7 @@ mod tests {
             Extension(None),
             Extension(None),
             Extension(None),
+            Extension(None),
             Path(mediator.id.clone()),
             tenant_a(),
             None,
@@ -2251,6 +2353,7 @@ mod tests {
 
         let status = super::delete_mediator(
             Extension(store.clone()),
+            Extension(None),
             Extension(None),
             Extension(None),
             Extension(None),

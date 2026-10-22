@@ -419,7 +419,9 @@ toward the `connections.mediators` limit. The caller's resource scope is checked
 `directory:` id, and that grant also covers reusing the record created for it, so a token scoped to
 `directory:` ids can create on the same entry again and again. The record's id is fixed by the DID
 (and the token's tenant), and the record is stored, under a lock per DID, before the Connection
-Point's first event, so every event of the Connection Point, `creation_started` included, carries
+Point's first event, after every authorization and scope check of the request (the scope for the
+new Connection Point id included), so a refused request stores no record and sends no created
+notification, and every event of the Connection Point, `creation_started` included, carries
 the id it is saved with. The record stays if the creation then fails (a mediator that refuses the
 DID, say): it is read-only and reused by the next attempt. The mediator created notification fires
 when it is stored; an unresolvable DID document answers `502` and stores nothing. A record is
@@ -434,8 +436,10 @@ dashboard shows each mediator once: the Create Connection Point dropdown offers 
 only as its `directory:` entry, and the Mediators page shows the stored record when one exists for the
 DID and the entry otherwise. A stored provided record cannot be changed through the API: `PUT
 /v1/mediators/<id>` answers `409`. `DELETE` answers `409` too, with a message saying it is still
-offered by the directory or used by a connection point, until the directory has answered
-successfully without its DID and no stored Connection Point uses it. Then `DELETE` removes it, and
+offered by the directory or used by a connection point or a pending pairing, until the directory
+has answered successfully without its DID and nothing uses it: no stored Connection Point names it
+(a pending pairing's temporary Connection Point names its acceptor mediator in
+`oob_message.secure_mediator_id`), and no pending pairing names it as its acceptor mediator record. Then `DELETE` removes it, and
 the next Connection Point created on the entry, if the directory offers it again, stores it fresh.
 That is how a stale provided mediator is cleaned up or refreshed. The check and the removal hold
 the same per-DID lock as the creation, and the record is read again under it, so a creation cannot
