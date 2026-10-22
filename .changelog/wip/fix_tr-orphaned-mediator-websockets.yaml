@@ -14,9 +14,10 @@ changes:
         down, including when the gateway steps down to Standby. Only one request at a
         time builds a connection for a trust registry, so concurrent Trust Check queries
         on a stale connection reuse the one replacement instead of each opening a
-        session. A failed connection setup now closes its websocket, and a Standby
-        gateway no longer opens trust registry connections. A trust registry already
-        marked Failed is not reconnected at startup; reconnect it from the dashboard.
+        session, and a reconnect closes the old session before opening the new one. A
+        failed connection setup now closes its websocket. A Standby gateway refuses to
+        build trust registry connections, and closes any it was building when it
+        stepped down.
   removed: []
   security: []
   breaking: []
