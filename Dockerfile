@@ -14,7 +14,7 @@
 # Build:  docker build -t agent-gateway:local .
 # Run:    see docker-compose.yml / `make docker-run`.
 
-ARG NODE_VERSION=22.21.1
+ARG NODE_VERSION=22.23.4
 ARG RUST_VERSION=1.95.0
 
 # Cargo release profile overrides for the in-container build. These default to

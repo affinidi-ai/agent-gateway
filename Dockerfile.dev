@@ -17,7 +17,7 @@
 # Build:  docker build -t agent-gateway:local-dev -f Dockerfile.dev .
 # Run:    make docker-run-dev
 
-ARG NODE_VERSION=22.21.1
+ARG NODE_VERSION=22.23.4
 ARG RUST_VERSION=1.95.0
 
 ###############################################################################
