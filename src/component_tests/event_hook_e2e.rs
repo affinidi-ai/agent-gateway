@@ -1042,27 +1042,38 @@ async fn creating_a_connection_point_on_a_directory_mediator_stores_one_provided
         "did_method": "peer"
     });
 
+    let mut stored_ids = Vec::new();
     for _ in 0..2 {
         let (status, body) = api
             .post("/connection-points", &request)
             .await;
         assert_eq!(status, 200, "{body}");
         assert_ne!(body["connection_point"]["mediator_id"], json!(directory_id), "{body}");
+        stored_ids.push(body["connection_point"]["mediator_id"].clone());
     }
+    assert_eq!(stored_ids[0], stored_ids[1], "both connection points share one stored record");
 
     let (status, listed) = api.get("/mediators").await;
     assert_eq!(status, 200, "{listed}");
     let items = listed.as_array().unwrap();
-    assert_eq!(items.len(), 1, "both connection points share one stored record: {listed}");
-    assert!(
-        !items[0]["id"]
-            .as_str()
-            .unwrap()
-            .starts_with("directory:")
-    );
+    assert_eq!(items.len(), 2, "the entry, then the stored record the connection points use: {listed}");
+    assert_eq!(items[0]["id"], json!(directory_id));
     assert_eq!(items[0]["provided"], true);
-    assert_eq!(items[0]["name"], "Shared mediator");
-    assert_eq!(items[0]["registered"], true);
+    assert_eq!(items[1]["id"], stored_ids[0]);
+    assert_eq!(items[1]["provided"], true);
+
+    let (status, stored) = api
+        .get(&format!(
+            "/mediators/{}",
+            stored_ids[0]
+                .as_str()
+                .unwrap()
+        ))
+        .await;
+    assert_eq!(status, 200, "{stored}");
+    assert_eq!(stored["provided"], true);
+    assert_eq!(stored["name"], "Shared mediator");
+    assert_eq!(stored["registered"], true);
 }
 
 async fn self_gateway_id(api: &Api) -> String {
@@ -1115,8 +1126,7 @@ async fn every_event_for_a_directory_mediator_carries_the_id_of_the_stored_recor
     })
     .await;
 
-    let (_, listed) = api.get("/mediators").await;
-    let stored_id = listed[0]["id"].clone();
+    let stored_id = body["connection_point"]["mediator_id"].clone();
     assert!(
         !stored_id
             .as_str()
@@ -1129,7 +1139,7 @@ async fn every_event_for_a_directory_mediator_carries_the_id_of_the_stored_recor
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_provided_mediator_cannot_be_edited_and_is_deleted_only_when_unused() {
+async fn a_provided_mediator_cannot_be_edited_or_deleted_while_the_directory_offers_it() {
     let mediator = FakeMediator::start_resolvable().await;
     Api::install_fake_mediator(&mediator, fake_invitation());
     let hook = MockHook::start(HookReply::accept()).await;
@@ -1158,9 +1168,6 @@ async fn a_provided_mediator_cannot_be_edited_and_is_deleted_only_when_unused() 
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 409);
-    let (_, listed) = api.get("/mediators").await;
-    assert_eq!(listed[0]["id"], json!(stored_id));
-
     let point_id = body["connection_point"]["id"]
         .as_str()
         .unwrap();
@@ -1177,14 +1184,10 @@ async fn a_provided_mediator_cannot_be_edited_and_is_deleted_only_when_unused() 
         .send()
         .await
         .unwrap();
-    assert!(response.status().is_success(), "an unused provided record can be removed");
-    let (_, listed) = api.get("/mediators").await;
-    assert!(
-        listed[0]["id"]
-            .as_str()
-            .unwrap()
-            .starts_with("directory:"),
-        "the entry is offered again: {listed}"
+    assert_eq!(
+        response.status().as_u16(),
+        409,
+        "while the directory still offers the mediator its record is not removed"
     );
 }
 
@@ -1223,10 +1226,12 @@ async fn a_failed_connection_point_creation_leaves_no_directory_mediator_record(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mediator_the_operator_added_wins_over_a_directory_entry_for_the_same_did() {
+async fn an_operator_added_mediator_and_the_directory_entry_for_the_same_did_are_listed_separately() {
     let mediator = FakeMediator::start_resolvable().await;
-    let directory = MockDirectory::start(200, directory_items(&mediator)).await;
-    let api = Api::start(Some(directory.settings())).await;
+    install_directory_mediator_document(&mediator);
+    Api::install_fake_mediator(&mediator, fake_invitation());
+    let hook = MockHook::start(HookReply::accept()).await;
+    let (api, _directory) = Api::start_listing(&mediator, &hook).await;
     let (status, created) = api
         .post("/mediators", &mediator.create_request())
         .await;
@@ -1235,11 +1240,26 @@ async fn a_mediator_the_operator_added_wins_over_a_directory_entry_for_the_same_
     let (status, listed) = api.get("/mediators").await;
     assert_eq!(status, 200, "{listed}");
     let items = listed.as_array().unwrap();
-    assert_eq!(items.len(), 1, "{listed}");
-    assert_eq!(items[0]["id"], created["id"]);
-    assert_eq!(items[0]["did"], json!(mediator.did()));
-    assert_ne!(items[0]["provided"], json!(true), "{listed}");
-    assert_ne!(items[0]["name"], "Shared mediator");
+    assert_eq!(items.len(), 2, "{listed}");
+    assert!(
+        items[0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("directory:")
+    );
+    assert_eq!(items[0]["provided"], true);
+    assert_eq!(items[0]["name"], "Shared mediator");
+    assert_eq!(items[1]["id"], created["id"]);
+    assert_ne!(items[1]["provided"], json!(true), "{listed}");
+
+    let (status, body) = api
+        .create_on_directory_mediator(&mediator)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_ne!(
+        body["connection_point"]["mediator_id"], created["id"],
+        "a directory id never resolves to the operator's record"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
