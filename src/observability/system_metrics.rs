@@ -6,7 +6,9 @@
 //! rewriting the whole history on every sample. The gateway also writes it on
 //! SIGTERM or Ctrl-C through [`SystemMetricsStore::flush`]; a crash or forced
 //! kill drops the samples taken since the last write (up to
-//! [`PERSIST_INTERVAL`]). This history only feeds the dashboard view.
+//! [`PERSIST_INTERVAL`]). On a rolling deploy the new instance starts from the
+//! file as it stood when it loaded, so up to [`PERSIST_INTERVAL`] before the old
+//! instance stopped can be missing too. This history only feeds the dashboard view.
 //!
 //! When an OpenTelemetry meter provider is active, every sample is also
 //! recorded as OTel gauge metrics and exported via OTLP.
@@ -597,6 +599,41 @@ mod tests {
             .await;
 
         assert_eq!(persisted_cpu(dir.path()).await, vec![1.0]);
+    }
+
+    #[tokio::test]
+    async fn failed_rename_removes_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir
+            .path()
+            .join("system_metrics.json");
+        tokio::fs::create_dir(&target)
+            .await
+            .expect("create a directory at the history path");
+        tokio::fs::write(target.join("keep"), b"")
+            .await
+            .expect("make the directory non-empty");
+
+        let result = write_samples_atomically(&target, &[sample(1.0)]).await;
+
+        assert!(result.is_err());
+        let mut names = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir.path())
+            .await
+            .expect("read_dir");
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .expect("next_entry")
+        {
+            names.push(
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        assert_eq!(names, vec!["system_metrics.json".to_string()]);
     }
 
     #[tokio::test]

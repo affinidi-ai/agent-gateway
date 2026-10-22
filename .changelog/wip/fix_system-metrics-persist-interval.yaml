@@ -16,7 +16,8 @@ changes:
         receives SIGTERM or Ctrl-C, via a temp file and rename so a crash
         mid-write can no longer leave a truncated file. SIGTERM and Ctrl-C now
         stop the gateway promptly with exit code 0 instead of waiting to be
-        killed; in-flight requests are not drained. A crash or forced kill can
+        killed; each shutdown step is limited to 10 seconds and in-flight
+        requests are not drained. A crash, forced kill or rolling deploy can
         lose up to 15 minutes of history. Temp files from failed or interrupted
         writes are removed, either right away or at the next startup.
   removed: []

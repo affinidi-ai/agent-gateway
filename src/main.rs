@@ -612,8 +612,12 @@ async fn async_main() -> Result<()> {
         }
     };
 
-    if let Some(store) = observability::global_system_metrics_store() {
-        store.flush().await;
+    if let Some(store) = observability::global_system_metrics_store()
+        && tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, store.flush())
+            .await
+            .is_err()
+    {
+        warn!("Timed out writing system metrics history during shutdown");
     }
 
     // Shutdown OpenTelemetry gracefully (check metrics.json config)
@@ -627,11 +631,19 @@ async fn async_main() -> Result<()> {
         .enabled
     {
         info!("Shutting down OpenTelemetry");
-        observability::shutdown_otel();
+        if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, tokio::task::spawn_blocking(observability::shutdown_otel))
+            .await
+            .is_err()
+        {
+            warn!("Timed out shutting down OpenTelemetry");
+        }
     }
 
     result
 }
+
+/// Upper bound for each shutdown step, so a stalled volume or exporter can't outlast the container stop timeout.
+const SHUTDOWN_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Resolves with the name of the first termination signal received: SIGTERM or Ctrl-C.
 async fn shutdown_signal() -> &'static str {
