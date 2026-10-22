@@ -712,7 +712,6 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
     info!("Gateway '{}' validated (DID: {})", gateway.name, gateway.did);
 
     let via_directory = crate::event_hook::is_directory_mediator_id(&req.mediator_id);
-    let mut pending_mediator = None;
     let mediator = if via_directory {
         match crate::mediators::handlers::resolve_directory_mediator(
             mediator_store.as_ref(),
@@ -725,9 +724,15 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
         .await?
         {
             crate::mediators::handlers::DirectoryMediator::Stored(mediator) => mediator,
-            crate::mediators::handlers::DirectoryMediator::Pending(mediator) => {
-                pending_mediator = Some(mediator.clone());
-                mediator
+            crate::mediators::handlers::DirectoryMediator::Pending(pending) => {
+                crate::mediators::handlers::store_pending_directory_mediator(
+                    mediator_store.as_ref(),
+                    notif_store.as_ref(),
+                    pending,
+                    gateway.tenant_id.as_deref(),
+                    &context,
+                )
+                .await?
             }
         }
     } else {
@@ -951,19 +956,11 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
 
     debug!("Creating connection point with ID: {}", connection_point.id);
 
-    if let Some(pending) = pending_mediator {
-        let stored = crate::mediators::handlers::store_pending_directory_mediator(
-            mediator_store.as_ref(),
-            notif_store.as_ref(),
-            pending,
-            gateway.tenant_id.as_deref(),
-            &context,
-            &scope,
-        )
-        .await?;
-        connection_point.mediator_id = stored.id;
-    }
-
+    let provided_lock = if mediator.provided {
+        Some(crate::mediators::handlers::lock_did(&mediator.did).await)
+    } else {
+        None
+    };
     if mediator_store
         .get(&connection_point.mediator_id)
         .await
@@ -977,7 +974,13 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
     let record = connection_point.clone();
     let store = pub_store.clone();
     creation
-        .complete(async move { store.create(&record).await }, saved)
+        .complete(
+            async move {
+                let _held_until_saved = provided_lock;
+                store.create(&record).await
+            },
+            saved,
+        )
         .await
         .map_err(|e| {
             error!("Failed to create connection point: {}", e);
