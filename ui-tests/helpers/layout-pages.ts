@@ -61,6 +61,11 @@ const IDENTITIES = ['identities-search-input', ...tabs('identities', ['identitie
 
 const CONNECTIONS = ['connections-search-input', ...tabs('connections', ['gateways', 'mediators', 'trust-registries'])];
 
+const INTEGRATIONS = [
+    'integrations-search-input',
+    ...['integrations', 'endpoints', 'event-sets'].map(key => `integrations-tab-${key}`),
+];
+
 const SETTINGS_TABS = tabs('settings', [
     'system-settings',
     'user-settings',
@@ -334,14 +339,32 @@ const SIDEBAR_PAGES: LayoutPage[] = [
     {
         id: 'integrations',
         route: '/integrations',
-        testIds: ['page-integrations', `integrations-row-${FIXTURE_ID.integration}`],
+        testIds: ['page-integrations', `integration-row-${FIXTURE_ID.integration}`],
         actions: [
-            'integrations-search-input',
+            ...INTEGRATIONS,
             'integrations-add-button',
-            `integrations-test-button-${FIXTURE_ID.integration}`,
-            `integrations-edit-button-${FIXTURE_ID.integration}`,
-            `integrations-delete-button-${FIXTURE_ID.integration}`,
+            'integration-test-button',
+            'integration-edit-button',
+            'integration-delete-button',
         ],
+    },
+    {
+        id: 'integrations-endpoints',
+        route: '/integrations?tab=endpoints',
+        testIds: ['page-integrations', `endpoint-row-${FIXTURE_ID.endpoint}`],
+        actions: [
+            ...INTEGRATIONS,
+            'endpoints-add-button',
+            'endpoint-test-button',
+            'endpoint-edit-button',
+            'endpoint-delete-button',
+        ],
+    },
+    {
+        id: 'integrations-event-sets',
+        route: '/integrations?tab=event-sets',
+        testIds: ['page-integrations', `event-set-row-${FIXTURE_ID.eventSet}`],
+        actions: [...INTEGRATIONS, 'event-sets-add-button', 'event-set-edit-button', 'event-set-delete-button'],
     },
     {
         id: 'settings',
@@ -400,7 +423,6 @@ const SIDEBAR_PAGES: LayoutPage[] = [
             'users-search-input',
             'users-role-filter',
             'users-status-filter',
-            'users-add-integration-button',
             `users-edit-button-${TEST_USER_ID}`,
         ],
     },
@@ -533,15 +555,22 @@ const CREATE_PAGES: LayoutPage[] = [
         ],
     },
     {
-        id: 'integration-wizard',
-        route: '/integrations/integrations/wizard',
-        testIds: ['page-integration-wizard', 'integration-form'],
-        actions: [
-            'integration-wizard-back-button',
-            'integration-category-select',
-            'integration-wizard-clear-button',
-            'wizard-submit',
-        ],
+        id: 'integration-new',
+        route: '/integrations/new',
+        testIds: ['page-integration-editor'],
+        actions: ['integration-test-button', 'integration-cancel-button', 'integration-save-button'],
+    },
+    {
+        id: 'endpoint-new',
+        route: '/integrations/endpoints/new',
+        testIds: ['page-endpoint-editor'],
+        actions: ['endpoint-cancel-button', 'endpoint-save-button'],
+    },
+    {
+        id: 'event-set-new',
+        route: '/integrations/event-sets/new',
+        testIds: ['page-event-set-editor'],
+        actions: ['event-set-cancel-button', 'event-set-save-button'],
     },
     {
         id: 'trust-registry-wizard',
@@ -644,7 +673,7 @@ const CREATE_PAGES: LayoutPage[] = [
         actions: [
             'policy-definition-editor-back-button',
             'policy-definition-editor-save-button',
-            'policy-definition-editor-instructions-button',
+            'policy-instructions-toggle',
         ],
     },
     {

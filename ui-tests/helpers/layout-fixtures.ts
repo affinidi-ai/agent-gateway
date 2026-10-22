@@ -23,6 +23,7 @@ import type {
 } from '../../www/default/src/types';
 import type {AuditEntry, AuditResponse} from '../../www/default/src/pages/AuditPage/types';
 import type {A2aProxy} from '../../www/default/src/pages/A2aProxyPage/types';
+import type {Endpoint, EventSet, Integration} from '../../www/default/src/integrationsApi';
 
 /** Fixed ids so the inventory can name row test ids. */
 export const FIXTURE_ID = {
@@ -45,7 +46,9 @@ export const FIXTURE_ID = {
     mediator: 'layout-mediator-1',
     connectionPoint: 'layout-connection-point-1',
     trustRegistry: 'layout-trust-registry-1',
-    integration: 'layout-integration-1',
+    integration: 'layout-integration-enterprise-procurement-purchase-order-reconciliation-emea-production-0001',
+    endpoint: 'layout-endpoint-enterprise-procurement-purchase-order-reconciliation-operations-webhook-0001',
+    eventSet: 'layout-event-set-enterprise-procurement-gateway-lifecycle-and-connection-point-changes-0001',
     metricsChannel: 'layout-surface-1',
 } as const;
 
@@ -274,19 +277,6 @@ interface ConnectionPointFixture {
     secret?: string;
     enabled?: boolean;
     did_method?: string;
-}
-
-/** Mirrors `Integration` in `www/default/src/pages/IntegrationsPage.tsx`. */
-interface IntegrationFixture {
-    id: string;
-    name: string;
-    description: string;
-    type: string;
-    category?: string;
-    configuration: Record<string, unknown>;
-    content: Record<string, unknown>;
-    status: string;
-    created_at: string;
 }
 
 /** Mirrors `HierarchicalMetrics` in `www/default/src/pages/MetricsPage.tsx`. */
@@ -662,17 +652,42 @@ const trustRegistries: TrustRegistry[] = [
     },
 ];
 
-const integrations: IntegrationFixture[] = [
+const integrations: Integration[] = [
     {
         id: FIXTURE_ID.integration,
-        name: `${LONG_NAME} Operations Webhook`,
+        name: `${LONG_NAME} Gateway Change Alerts`,
         description: LONG_DESCRIPTION,
-        type: 'webhook',
-        category: 'notification',
-        configuration: {url: LONG_URL},
+        endpoint_id: FIXTURE_ID.endpoint,
+        event_set_id: FIXTURE_ID.eventSet,
         content: {},
         status: 'active',
         created_at: iso(7300),
+        updated_at: iso(73),
+    },
+];
+
+const endpoints: Endpoint[] = [
+    {
+        id: FIXTURE_ID.endpoint,
+        name: `${LONG_NAME} Operations Webhook`,
+        description: LONG_DESCRIPTION,
+        type: 'webhook',
+        configuration: {url: LONG_URL, method: 'POST'},
+        status: 'active',
+        secrets: [],
+        created_at: iso(7310),
+        updated_at: iso(74),
+    },
+];
+
+const eventSets: EventSet[] = [
+    {
+        id: FIXTURE_ID.eventSet,
+        name: `${LONG_NAME} Gateway Lifecycle Events`,
+        description: LONG_DESCRIPTION,
+        events: ['gateway.created', 'gateway.deleted'],
+        created_at: iso(7320),
+        updated_at: iso(75),
     },
 ];
 
@@ -762,6 +777,8 @@ const API_FIXTURES: Record<string, Body> = {
     '/api/v1/connection-points': connectionPoints,
     '/api/v1/trust-registries': trustRegistries,
     '/api/v1/integrations': integrations,
+    '/api/v1/integrations/endpoints': endpoints,
+    '/api/v1/integrations/event-sets': eventSets,
     '/api/v1/dashboard/metrics/hierarchical': hierarchicalMetrics,
     '/api/v1/audit': auditPage,
     '/api/admin/x402/payments/all': {payments: paymentRecords, total: paymentRecords.length, chart_data: []},
