@@ -38,7 +38,10 @@ Applies to:
    created from them carry `provided: true`. The Create Connection Point wizard pre-selects the
    first `provided` mediator (else the only mediator, else nothing) and marks it in no other way;
    the Mediators page renders every mediator with `provided: true` read-only (no ping, edit or
-   delete) and shows no badge or warning for them.
+   delete) and shows no badge or warning for them. The dropdown lists a directory mediator once, as
+   its `directory:` entry; the Mediators page shows the stored `provided` record instead of the
+   entry when one exists for the DID. An operator-added mediator with the same DID is a separate
+   row and never hides the entry.
 
 ## Toasts
 
