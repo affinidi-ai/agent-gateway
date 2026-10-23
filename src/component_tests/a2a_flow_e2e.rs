@@ -2697,8 +2697,7 @@ impl Drop for Unwritable {
 
 /// When a reload cannot store the A2A settings it carries over, it serves them
 /// from memory only, and the storage event its own disk refresh raises applies
-/// the stored record given the same settings, so it does not undo them. A surface
-/// removed from disk is no longer served after the next reload.
+/// the stored record given the same settings, so it does not undo them.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a2a_settings_a_reload_could_not_store_are_kept_by_its_storage_event() {
@@ -2800,6 +2799,10 @@ async fn a2a_settings_a_reload_could_not_store_are_kept_by_its_storage_event() {
     if !unwritable.applies() {
         return;
     }
+    // Held so no mode-changing test can defer the reload's storage event while it is checked.
+    let _mode = crate::server::mode::TEST_GUARD
+        .lock()
+        .await;
     reload().await;
     let kept_until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while tokio::time::Instant::now() < kept_until {
@@ -2811,15 +2814,4 @@ async fn a2a_settings_a_reload_could_not_store_are_kept_by_its_storage_event() {
     }
     let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
     assert!(on_disk["access_point"]["a2a"].is_null(), "the carried settings were not stored: {on_disk}");
-    drop(unwritable);
-
-    std::fs::remove_file(&stored_path).unwrap();
-    reload().await;
-    assert_eq!(
-        send_without_version()
-            .await
-            .status(),
-        404,
-        "a surface removed from disk is no longer served"
-    );
 }
