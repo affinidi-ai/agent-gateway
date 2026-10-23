@@ -593,7 +593,7 @@ afterwards. The checks are those a non-streaming reply gets on the Access Point,
 
 | Check | On each event |
 | --- | --- |
-| Protected and external identity | Resolved when the event claims an identity: a message that declares `agent-identity/v1` or `agent-identity-credential/v1`, or an identity payload where [backend identity](#backend-identity-in-task-artifacts) is read (a status message, a message, or an artifact, including the single `artifact` of an artifact update). An event without a claim is not resolved and nothing is signed for it. A slot that derives identity from a credential (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) is resolved once, on the first event. A claim that cannot be resolved falls back to the request-path identity when there is one, and ends the stream otherwise. A slot that reads identity from the response (`from_payload`) also needs the stream to claim it: see the end-of-stream check below. |
+| Protected and external identity | Resolved when the event claims an identity: a message that declares `agent-identity/v1` or `agent-identity-credential/v1`, or an identity payload where [backend identity](#backend-identity-in-task-artifacts) is read (a status message, a message, or an artifact, including the single `artifact` of an artifact update). An event without a claim is not resolved and nothing is signed for it. A slot that derives identity from a credential (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) is resolved once, on the first event. A claim that cannot be resolved falls back to the request-path identity when there is one, and ends the stream otherwise. The first managed DID resolved for the protected agent holds for the whole stream: a later event that resolves a different one ends it. A slot that reads identity from the response (`from_payload`) also needs the stream to claim it: see the end-of-stream check below. |
 | Response custom metadata | Injected into the event's `result`, which for a v1.0 event is the member's payload |
 | Agent identity credential | Replaces the raw extension where the event's message declares it, as on a non-streaming reply |
 | Response extension rules | Run on the event |
@@ -619,6 +619,7 @@ data: {"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Response blocked
 | `response_policy_denied` | The response policy denied the event |
 | `response_extension_rejected` | The event failed the response extension rules |
 | `identity_extension_missing`, `identity_invalid_response`, `identity_validation_failed`, `identity_did_failed` | The event's identity claim could not be resolved, and the request path resolved no identity; `identity_extension_missing` also follows the last event of a stream that never claimed one (see below) |
+| `identity_changed` | The event resolved a different protected agent DID than an earlier event of the stream |
 | `upstream_event_invalid` | The event's data is not a JSON object |
 | `upstream_event_too_large` | The event is larger than `[a2a] max_body_size` |
 | `upstream_stream_idle` | The Target sent nothing for the idle timeout |

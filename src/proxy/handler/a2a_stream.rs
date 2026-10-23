@@ -1,17 +1,5 @@
-//! Response checks for an A2A event stream from a direct Target.
-//!
-//! Each event gets the treatment a non-streaming reply gets on the Access Point:
-//! identity resolution and the agent-identity credential where the event claims
-//! an identity, response custom metadata, response extension rules and the
-//! response policy. Identity a slot derives from a credential is resolved once
-//! per stream; identity read from the body is resolved on each event that claims
-//! one. The Trust Recorder runs once per resolved DID, when an event that
-//! resolved it passes every check.
-//!
-//! A stream that delivered results without any event resolving the identity a
-//! slot reads from the body ends with an identity error after its last event,
-//! as a non-streaming reply without a claim is refused. The protected slot is
-//! exempt when the request path resolved an identity.
+//! Response checks for an A2A event stream from a direct Target, described
+//! under Event streams in `docs/PROTOCOLS.md`.
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -30,6 +18,8 @@ use crate::state::ProxyState;
 const RESPONSE_BLOCKED: StreamStop = StreamStop::new("response_policy_denied", "Response blocked");
 const EXTENSIONS_REJECTED: StreamStop =
     StreamStop::new("response_extension_rejected", "Response extension validation failed");
+const IDENTITY_CHANGED: StreamStop =
+    StreamStop::new("identity_changed", "Protected agent identity changed within the stream");
 
 /// The limits on an event stream from a direct Target: one event may be as
 /// large as `[a2a] max_body_size`, the Target may stay quiet for the surface's
@@ -75,7 +65,8 @@ pub(super) struct StreamRequest {
 pub(super) struct AccessPointEvents {
     state: ProxyState,
     request: StreamRequest,
-    /// The last protected identity resolved in this stream.
+    /// The protected identity resolved in this stream; a later event must
+    /// resolve the same managed DID.
     protected_identity: Option<ProtectedAgentIdentity>,
     /// The managed DID the event being checked resolved, recorded once the
     /// event is admitted.
@@ -170,6 +161,18 @@ impl AccessPointEvents {
                 }
             },
         };
+        if let (Some(ProtectedAgentIdentity::Managed { did: pinned, .. }), ProtectedAgentIdentity::Managed { did, .. }) =
+            (&self.protected_identity, &identity)
+            && pinned != did
+        {
+            warn!(
+                channel = self.request.channel_name,
+                pinned = %pinned,
+                did = %did,
+                "A stream event resolved a different protected agent identity"
+            );
+            return Err(IDENTITY_CHANGED);
+        }
         self.protected_identity = Some(identity.clone());
         if let ProtectedAgentIdentity::Managed { did, .. } = &identity {
             self.event_did = Some(did.clone());

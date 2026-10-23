@@ -65,7 +65,11 @@ fn agent_message(identity: Value) -> Value {
 }
 
 fn identity_payload() -> Value {
-    json!({ AGENT_IDENTITY_URI: { "softwareInfo": { "name": "backend-agent", "version": "2.0" }, "cloudProvider": "local" } })
+    identity_payload_named("backend-agent")
+}
+
+fn identity_payload_named(name: &str) -> Value {
+    json!({ AGENT_IDENTITY_URI: { "softwareInfo": { "name": name, "version": "2.0" }, "cloudProvider": "local" } })
 }
 
 async fn send_streaming_message(h: &GatewayHarness) -> reqwest::Response {
@@ -366,6 +370,44 @@ async fn an_identity_claim_on_a_stream_event_is_replaced_by_a_credential() {
             .is_some_and(|vp| !vp.is_empty()),
         "{credential}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_keeps_the_agent_identity_its_first_claim_resolved() {
+    for (second_agent, refused) in [("backend-agent", false), ("another-agent", true)] {
+        let working_claim = json!({ "statusUpdate": { "taskId": "t-1", "contextId": "c-1", "status": {
+            "state": "TASK_STATE_WORKING", "message": agent_message(identity_payload())
+        } } });
+        let mock = MockServer::start_with_finished_stream(
+            "text/event-stream",
+            vec![
+                (Duration::ZERO, event(working_claim)),
+                (Duration::ZERO, event(completed(Some(agent_message(identity_payload_named(second_agent)))))),
+            ],
+        )
+        .await;
+        let h = GatewayHarness::start_with_mock(mock, |_, config, _| {
+            config.surfaces = vec![helpers::build_identity_channel()];
+        })
+        .await;
+
+        let response = send_streaming_message(&h).await;
+        let (events, ended) = read_events(response, Instant::now(), |_| false).await;
+
+        assert!(ended, "{second_agent}");
+        assert_eq!(events.len(), 2, "{second_agent}: {events:?}");
+        let first = &events[0].1["result"]["statusUpdate"]["status"]["message"]["metadata"];
+        assert!(first[AGENT_IDENTITY_CREDENTIAL_URI]["did"].is_string(), "{second_agent}: {first}");
+        if refused {
+            assert_eq!(error_code(&events[1].1), Some("identity_changed"));
+        } else {
+            assert_eq!(state_of(&events[1].1), Some("TASK_STATE_COMPLETED"));
+            assert_eq!(
+                events[1].1["result"]["statusUpdate"]["status"]["message"]["metadata"][AGENT_IDENTITY_CREDENTIAL_URI]["did"],
+                first[AGENT_IDENTITY_CREDENTIAL_URI]["did"]
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
