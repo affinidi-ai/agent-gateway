@@ -10,7 +10,9 @@
 //! gets the same bounds. The passthrough itself ends at the surface's
 //! `mcp_http` stream idle timeout and maximum lifetime.
 //! The same bounds apply to every other protocol's buffered responses, shown
-//! here for A2A.
+//! here for A2A. An A2A `message/stream` answered as `text/event-stream` is
+//! passed through like an MCP stream, past the request timeout; any other A2A
+//! call keeps it.
 
 use std::time::{Duration, Instant};
 
@@ -391,6 +393,95 @@ async fn access_point_rejects_an_a2a_body_over_the_limit_and_stops_a_stalled_one
     let (status, body, elapsed) = post_a2a(&harness.gateway_url).await;
     assert_eq!(status, 504, "{body}");
     assert!(elapsed < STALL_BUDGET, "stalled body held the caller for {elapsed:?}");
+}
+
+fn a2a_call(method: &str) -> String {
+    json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": {"message": {
+        "kind": "message", "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hi"}]}}})
+    .to_string()
+}
+
+fn a2a_surface_with_one_second_request() -> AgentSurface {
+    let mut surface = helpers::build_minimal_channel();
+    surface.target.networking =
+        Some(serde_json::from_value(json!({"timeout": {"request_secs": 1}})).expect("NetworkingConfig JSON"));
+    surface
+}
+
+/// A task that is working at once and completes after 2.5 s, past the 1 s
+/// request timeout.
+async fn slow_a2a_task_stream() -> MockServer {
+    let working = r#"data: {"jsonrpc":"2.0","id":7,"result":{"kind":"status-update","taskId":"t-1","status":{"state":"working"},"final":false}}"#;
+    let completed = r#"data: {"jsonrpc":"2.0","id":7,"result":{"kind":"status-update","taskId":"t-1","status":{"state":"completed"},"final":true}}"#;
+    MockServer::start_with_streamed_body(
+        "text/event-stream",
+        vec![(Duration::ZERO, format!("{working}\n\n")), (Duration::from_millis(2500), format!("{completed}\n\n"))],
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_point_streams_an_a2a_message_stream_past_the_request_timeout() {
+    let harness = GatewayHarness::start_with_mock(slow_a2a_task_stream().await, |_, config, _| {
+        config.surfaces = vec![a2a_surface_with_one_second_request()];
+    })
+    .await;
+    let started = Instant::now();
+
+    let mut response = sse_shaped_request_with(&harness.gateway_url, a2a_call("message/stream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut received = String::new();
+    let mut working_after = None;
+    while !received.contains("completed") {
+        let chunk = tokio::time::timeout(STALL_BUDGET, response.chunk())
+            .await
+            .expect("A2A stream stopped delivering")
+            .unwrap()
+            .expect("A2A stream ended before the task completed");
+        received.push_str(&String::from_utf8_lossy(&chunk));
+        if working_after.is_none() && received.contains("working") {
+            working_after = Some(started.elapsed());
+        }
+    }
+
+    let working_after = working_after.expect("the working event arrives before the completed one");
+    assert!(working_after < Duration::from_secs(2), "working event held until {working_after:?}");
+    assert!(started.elapsed() >= Duration::from_secs(2), "completed after {:?}", started.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_point_keeps_the_request_timeout_on_an_a2a_message_send() {
+    let harness = GatewayHarness::start_with_mock(slow_a2a_task_stream().await, |_, config, _| {
+        config.surfaces = vec![a2a_surface_with_one_second_request()];
+    })
+    .await;
+
+    let (status, body, elapsed) = post_sse_shaped_with(&harness.gateway_url, a2a_call("message/send")).await;
+
+    assert!(status.is_server_error(), "{status}: {body}");
+    assert!(!body.contains("completed"), "{body}");
+    assert!(elapsed >= Duration::from_millis(900), "cut before the request timeout: {elapsed:?}");
+    assert!(elapsed < STALL_BUDGET, "buffered call held the caller for {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_point_buffers_an_a2a_message_stream_when_a_response_policy_needs_the_body() {
+    let harness = GatewayHarness::start_with_mock(slow_a2a_task_stream().await, |_, config, _| {
+        let mut surface = serde_json::to_value(a2a_surface_with_one_second_request()).unwrap();
+        surface["target"]["response_policy"] = json!({"policy_definition_id": "p-1"});
+        config.surfaces = vec![serde_json::from_value(surface).unwrap()];
+    })
+    .await;
+
+    let (status, body, elapsed) = post_sse_shaped_with(&harness.gateway_url, a2a_call("message/stream")).await;
+
+    assert!(status.is_server_error(), "{status}: {body}");
+    assert!(!body.contains("completed"), "{body}");
+    assert!(elapsed >= Duration::from_millis(900), "cut before the request timeout: {elapsed:?}");
+    assert!(elapsed < STALL_BUDGET, "buffered stream held the caller for {elapsed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

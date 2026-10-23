@@ -1423,6 +1423,76 @@ pub(crate) fn listen_surface_key(surface: &crate::config::agent_surface::AgentSu
     format!("surface:{id}")
 }
 
+/// Whether an A2A `message/stream` or `tasks/resubscribe` call reaches the
+/// caller as a live event stream. Only when no response step needs the whole
+/// body: a response policy, response metadata, a managed or external identity,
+/// UCP parsing or extension validation keeps the response buffered.
+fn a2a_stream_passes_through(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method_canonical: Option<&str>,
+    validates_response_extensions: bool,
+) -> bool {
+    surface.channel_protocol() == crate::config::ChannelProtocol::A2a
+        && matches!(method_canonical, Some("message/stream" | "tasks/resubscribe"))
+        && surface
+            .response_policy_definition_id()
+            .is_none()
+        && !surface
+            .response_custom_metadata()
+            .is_some_and(|metadata| metadata.enabled)
+        && surface
+            .protected_identity()
+            .is_none()
+        && surface
+            .managed_identity()
+            .is_none()
+        && surface
+            .external_identity()
+            .is_none()
+        && !surface.is_ucp()
+        && !validates_response_extensions
+}
+
+#[cfg(test)]
+mod a2a_stream_tests {
+    use super::a2a_stream_passes_through;
+    use crate::config::agent_surface::AgentSurface;
+
+    fn with_target(
+        field: &str,
+        value: serde_json::Value,
+    ) -> AgentSurface {
+        let mut surface = serde_json::to_value(crate::component_tests::helpers::build_minimal_channel()).unwrap();
+        surface["target"][field] = value;
+        serde_json::from_value(surface).unwrap()
+    }
+
+    #[test]
+    fn streaming_methods_pass_through_a_plain_a2a_surface() {
+        let surface = crate::component_tests::helpers::build_minimal_channel();
+        assert!(a2a_stream_passes_through(&surface, Some("message/stream"), false));
+        assert!(a2a_stream_passes_through(&surface, Some("tasks/resubscribe"), false));
+    }
+
+    #[test]
+    fn other_methods_and_protocols_stay_buffered() {
+        let surface = crate::component_tests::helpers::build_minimal_channel();
+        assert!(!a2a_stream_passes_through(&surface, Some("message/send"), false));
+        assert!(!a2a_stream_passes_through(&surface, Some("tasks/get"), false));
+        assert!(!a2a_stream_passes_through(&surface, None, false));
+        let mcp = crate::component_tests::helpers::build_minimal_mcp_surface();
+        assert!(!a2a_stream_passes_through(&mcp, Some("message/stream"), false));
+    }
+
+    #[test]
+    fn a_response_step_that_needs_the_whole_body_keeps_the_stream_buffered() {
+        let policy = with_target("response_policy", serde_json::json!({"policy_definition_id": "p-1"}));
+        assert!(!a2a_stream_passes_through(&policy, Some("message/stream"), false));
+        let surface = crate::component_tests::helpers::build_minimal_channel();
+        assert!(!a2a_stream_passes_through(&surface, Some("message/stream"), true));
+    }
+}
+
 /// Keeps a streamed response counted as an active connection until its body
 /// ends or the client drops it.
 fn hold_connection_for_body(
@@ -7142,6 +7212,52 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
+    // An A2A stream is bounded like an MCP one: the request timeout covers the
+    // wait for its headers, the stream limits cover the stream itself.
+    let modern_limits = crate::mcp::modern_sse::SseLimits::from(
+        &state
+            .surface
+            .mcp_http
+            .clone()
+            .unwrap_or_default(),
+    );
+    let a2a_stream = a2a_stream_passes_through(
+        &state.surface,
+        a2a_context
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .method_canonical
+                    .as_deref()
+            }),
+        state
+            .config
+            .extension_inspection
+            .enabled
+            && state
+                .identity_rules_engine
+                .is_some(),
+    );
+    let a2a_header_timeout = std::time::Duration::from_secs(
+        state
+            .surface
+            .timeout()
+            .map_or(
+                state
+                    .config
+                    .a2a
+                    .timeout_seconds,
+                |timeout| timeout.request_secs,
+            ),
+    );
+    if a2a_stream {
+        upstream_req = upstream_req.timeout(
+            modern_limits
+                .max_lifetime
+                .saturating_add(a2a_header_timeout),
+        );
+    }
+
     // Get circuit breaker if configured
     let circuit_breaker = if state
         .surface
@@ -7390,6 +7506,12 @@ async fn proxy_handler_with_mcp_runtime(
             .map_err(|_| {
                 create_error_response(StatusCode::GATEWAY_TIMEOUT, "Modern MCP upstream response headers timed out")
             })??
+    } else if a2a_stream {
+        tokio::time::timeout(a2a_header_timeout, send_response)
+            .await
+            .map_err(|_| {
+                create_error_response(StatusCode::GATEWAY_TIMEOUT, "A2A upstream response headers timed out")
+            })??
     } else {
         send_response.await?
     };
@@ -7478,19 +7600,13 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
-    // ── SSE handling for MCP channels ──────────────────────────────────────
+    // ── SSE handling for MCP channels and A2A streams ──────────────────────
     // If the upstream responded with text/event-stream, stream the SSE events
     // directly back to the client — EXCEPT for `tools/list`, which we buffer
     // into its JSON-RPC payload so the tool filter + MCP tool gating below can
     // run on it (it is re-wrapped as SSE for Streamable-HTTP clients further
     // down). Without this a Streamable-HTTP/SSE MCP server bypasses gating.
-    let modern_limits = crate::mcp::modern_sse::SseLimits::from(
-        &state
-            .surface
-            .mcp_http
-            .clone()
-            .unwrap_or_default(),
-    );
+    // An A2A stream passes through only when `a2a_stream` holds.
     let (modern_upstream, legacy_upstream) = if modern_request.is_some() {
         (Some(upstream_response), None)
     } else {
@@ -7512,110 +7628,116 @@ async fn proxy_handler_with_mcp_runtime(
         let Some(upstream_response) = legacy_upstream else {
             break 'acquire_body (StatusCode::OK, HeaderMap::new(), bytes::Bytes::new());
         };
-        if state
+        let is_mcp = state
             .surface
             .channel_protocol()
-            == crate::config::ChannelProtocol::Mcp
-        {
-            let upstream_ct = upstream_response
+            == crate::config::ChannelProtocol::Mcp;
+        let upstream_is_sse = crate::mcp::sse_transport::is_sse_content_type(
+            upstream_response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-
-            if crate::mcp::sse_transport::is_sse_content_type(upstream_ct) {
-                if crate::mcp::is_tools_list_request(&body_bytes) {
-                    info!(
-                        channel = channel_name,
-                        "Upstream MCP tools/list arrived as SSE — buffering to apply tool gating/policies"
-                    );
-                    let sse_status = upstream_response.status();
-                    let mut sse_headers = upstream_response
-                        .headers()
-                        .clone();
-                    // Re-label as JSON so the tool filter + Streamable-HTTP SSE
-                    // re-wrap below treat the buffered body as a normal JSON-RPC
-                    // response.
-                    sse_headers.remove(reqwest::header::CONTENT_TYPE);
-                    sse_headers.insert(
-                        reqwest::header::CONTENT_TYPE,
-                        reqwest::header::HeaderValue::from_static("application/json"),
-                    );
-                    match crate::mcp::sse_transport::consume_sse_response(upstream_response, &body_bytes, body_limits)
-                        .await
-                    {
-                        Ok(json) => break 'acquire_body (sse_status, sse_headers, bytes::Bytes::from(json)),
-                        Err(e) => {
-                            warn!(channel = channel_name, error = %e, "Failed to buffer SSE tools/list response");
-                            connection_guard
-                                .decrement()
-                                .await;
-                            let (status, message) = match &e {
-                                crate::mcp::sse_transport::SseConsumeError::Body(body_error) => {
-                                    body_error.status_and_message()
-                                }
-                                crate::mcp::sse_transport::SseConsumeError::NoResponse => {
-                                    (StatusCode::BAD_GATEWAY, "Failed to read MCP tools/list response")
-                                }
-                            };
-                            return Err(create_error_response(status, message));
-                        }
+                .unwrap_or(""),
+        );
+        // A paid call is buffered so its receipt headers still reach the caller.
+        let streams_a2a = a2a_stream
+            && upstream_is_sse
+            && upstream_response
+                .status()
+                .is_success()
+            && payment_response_header.is_none()
+            && delegation_receipt_headers.is_empty();
+        if (is_mcp && upstream_is_sse) || streams_a2a {
+            if is_mcp && crate::mcp::is_tools_list_request(&body_bytes) {
+                info!(
+                    channel = channel_name,
+                    "Upstream MCP tools/list arrived as SSE — buffering to apply tool gating/policies"
+                );
+                let sse_status = upstream_response.status();
+                let mut sse_headers = upstream_response
+                    .headers()
+                    .clone();
+                // Re-label as JSON so the tool filter + Streamable-HTTP SSE
+                // re-wrap below treat the buffered body as a normal JSON-RPC
+                // response.
+                sse_headers.remove(reqwest::header::CONTENT_TYPE);
+                sse_headers.insert(
+                    reqwest::header::CONTENT_TYPE,
+                    reqwest::header::HeaderValue::from_static("application/json"),
+                );
+                match crate::mcp::sse_transport::consume_sse_response(upstream_response, &body_bytes, body_limits).await
+                {
+                    Ok(json) => break 'acquire_body (sse_status, sse_headers, bytes::Bytes::from(json)),
+                    Err(e) => {
+                        warn!(channel = channel_name, error = %e, "Failed to buffer SSE tools/list response");
+                        connection_guard
+                            .decrement()
+                            .await;
+                        let (status, message) = match &e {
+                            crate::mcp::sse_transport::SseConsumeError::Body(body_error) => {
+                                body_error.status_and_message()
+                            }
+                            crate::mcp::sse_transport::SseConsumeError::NoResponse => {
+                                (StatusCode::BAD_GATEWAY, "Failed to read MCP tools/list response")
+                            }
+                        };
+                        return Err(create_error_response(status, message));
                     }
-                } else {
-                    info!(channel = channel_name, "Upstream MCP agent responded with SSE — streaming to client");
-
-                    let resp_headers = upstream_response
-                        .headers()
-                        .clone();
-
-                    // Record metrics for the SSE connection start
-                    if let Some(ref metrics) = state.metrics_store {
-                        let latency_ms = request_latency_start
-                            .elapsed()
-                            .as_millis() as u64;
-                        let metrics = Arc::clone(metrics);
-                        let channel_config_id = state
-                            .surface
-                            .surface_id
-                            .clone();
-                        let source = source_addr.clone();
-                        let dest = state
-                            .surface
-                            .target
-                            .endpoint
-                            .clone();
-                        let trace = trace_id.clone();
-                        tokio::spawn(async move {
-                            metrics
-                                .record_connection(
-                                    channel_config_id,
-                                    source,
-                                    dest,
-                                    crate::metrics::ConnectionStatus::Success,
-                                    Some(latency_ms),
-                                    None,
-                                    crate::metrics::ConnectionDirection::Request,
-                                    trace,
-                                    None,
-                                    None,
-                                    latency_ms,
-                                    None,
-                                )
-                                .await;
-                        });
-                    }
-
-                    let sse_response = crate::mcp::sse_transport::create_sse_passthrough_response(
-                        upstream_response,
-                        resp_headers,
-                        channel_name.to_string(),
-                        state.config.a2a.max_body_size,
-                        modern_limits.idle_timeout,
-                        modern_limits.max_lifetime,
-                    );
-
-                    return Ok(hold_connection_for_body(connection_guard, sse_response));
                 }
+            } else {
+                info!(channel = channel_name, "Upstream agent responded with SSE — streaming to client");
+
+                let resp_headers = upstream_response
+                    .headers()
+                    .clone();
+
+                // Record metrics for the SSE connection start
+                if let Some(ref metrics) = state.metrics_store {
+                    let latency_ms = request_latency_start
+                        .elapsed()
+                        .as_millis() as u64;
+                    let metrics = Arc::clone(metrics);
+                    let channel_config_id = state
+                        .surface
+                        .surface_id
+                        .clone();
+                    let source = source_addr.clone();
+                    let dest = state
+                        .surface
+                        .target
+                        .endpoint
+                        .clone();
+                    let trace = trace_id.clone();
+                    tokio::spawn(async move {
+                        metrics
+                            .record_connection(
+                                channel_config_id,
+                                source,
+                                dest,
+                                crate::metrics::ConnectionStatus::Success,
+                                Some(latency_ms),
+                                None,
+                                crate::metrics::ConnectionDirection::Request,
+                                trace,
+                                None,
+                                None,
+                                latency_ms,
+                                None,
+                            )
+                            .await;
+                    });
+                }
+
+                let sse_response = crate::mcp::sse_transport::create_sse_passthrough_response(
+                    upstream_response,
+                    resp_headers,
+                    channel_name.to_string(),
+                    state.config.a2a.max_body_size,
+                    modern_limits.idle_timeout,
+                    modern_limits.max_lifetime,
+                );
+
+                return Ok(hold_connection_for_body(connection_guard, sse_response));
             }
         }
 
