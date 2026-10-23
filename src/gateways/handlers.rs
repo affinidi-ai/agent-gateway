@@ -1478,8 +1478,12 @@ mod tests {
                 .is_none(),
             "an operator-added mediator needs no lock"
         );
-        let missing = lock_provided_acceptor_mediator(&mediators, "gone", None, &None, &None).await;
-        assert!(matches!(missing, Ok(None)), "an unknown id is left to the usual checks");
+        let missing = lock_provided_acceptor_mediator(&mediators, "gone", None, &None, &None)
+            .await
+            .err()
+            .expect("a mediator that no longer exists is refused");
+        assert_eq!(missing.0, StatusCode::BAD_REQUEST);
+        assert_eq!(missing.1, "Mediator not found: gone");
 
         let mut stale = acceptor_mediator("unused");
         stale.id = "stale".into();
@@ -1735,14 +1739,15 @@ async fn lock_provided_acceptor_mediator<M: crate::mediators::MediatorStore>(
         error!(mediator_id, error = %e, "Failed to look up acceptor mediator");
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to look up mediator".to_string())
     };
-    let Some(provided) = mediator_store
+    let selected = mediator_store
         .get(mediator_id)
         .await
         .map_err(lookup_failed)?
-        .filter(|mediator| mediator.provided)
-    else {
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Mediator not found: {}", mediator_id)))?;
+    if !selected.provided {
         return Ok(None);
-    };
+    }
+    let provided = selected;
     let guard = crate::mediators::handlers::lock_did(&provided.did).await;
     let current = mediator_store
         .get(mediator_id)
