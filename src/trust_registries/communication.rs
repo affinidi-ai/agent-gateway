@@ -826,6 +826,7 @@ impl TrustRegistryListenerManager {
     }
 
     /// Reconnect to a trust registry using stored secrets (for startup recovery).
+    /// Closes the registry's current connection before building the new one.
     pub async fn reconnect(
         &self,
         trust_registry_id: &str,
@@ -930,6 +931,11 @@ impl TrustRegistryListenerManager {
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
             (secrets, did_doc_to_cache)
         };
+
+        // The mediator allows one websocket per DID, so the old client must be
+        // gone before the new one connects or its reader sees the duplicate.
+        self.remove_connection(trust_registry_id)
+            .await;
 
         let client = create_tr_client(
             trust_registry_id,
@@ -1508,8 +1514,6 @@ impl TrustRegistryListenerManager {
                 {
                     Some(current) => current,
                     None => {
-                        self.remove_connection(&connection.trust_registry_id)
-                            .await;
                         self.reconnect(
                             &connection.trust_registry_id,
                             &connection.our_did,
@@ -2240,6 +2244,75 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_closes_the_current_connection_before_building_a_new_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = TrustRegistryListenerManager::new("example.com".to_string(), dir.path().to_path_buf(), None);
+        let (our_did, _, _) = generate_trust_registry_identity(
+            "tr-1",
+            "example.com",
+            dir.path(),
+            "https://mediator.example.com",
+            "did:example:mediator",
+            DidMethod::Peer,
+            #[cfg(feature = "didwebvh")]
+            None,
+            #[cfg(feature = "didwebvh")]
+            None,
+        )
+        .await
+        .expect("a did:peer identity generates offline");
+        let connection = test_connection("tr-1").await;
+        let pending = connection
+            .register_waiter("thread-1".to_string())
+            .await;
+        mgr.install_connection(connection)
+            .await;
+
+        let result = mgr
+            .reconnect("tr-1", &our_did, "did:example:registry", "did:example:mediator", None)
+            .await;
+
+        assert!(result.is_err(), "an unresolvable mediator cannot connect");
+        let closed = tokio::time::timeout(Duration::from_secs(5), pending).await;
+        assert!(matches!(closed, Ok(Err(_))), "the current connection must be closed");
+        assert!(
+            mgr.get_connection_clone("tr-1")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_keeps_the_current_connection_when_secrets_cannot_load() {
+        let mgr = test_manager();
+        let connection = test_connection("tr-1").await;
+        let _pending = connection
+            .register_waiter("thread-1".to_string())
+            .await;
+        mgr.install_connection(connection.clone())
+            .await;
+
+        let result = mgr
+            .reconnect("tr-1", "did:example:gateway", "did:example:registry", "did:example:mediator", None)
+            .await;
+
+        assert!(result.is_err(), "missing key files fail the reconnect");
+        assert!(
+            connection
+                .response_waiters
+                .lock()
+                .await
+                .contains_key("thread-1"),
+            "the current connection must stay open"
+        );
+        let stored = mgr
+            .get_connection_clone("tr-1")
+            .await
+            .expect("the current connection stays stored");
+        assert!(stored.is_same_client(&connection));
     }
 
     #[tokio::test]
