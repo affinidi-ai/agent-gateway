@@ -12,8 +12,9 @@ pub const ENV_DELAY_MS: &str = "AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_DELAY_MS"
 const DEFAULT_ATTEMPTS: u32 = 5;
 const DEFAULT_DELAY_MS: u64 = 2_000;
 const MAX_ATTEMPTS: u32 = 20;
-const MAX_DELAY_MS: u64 = 60_000;
+const MAX_DELAY_MS: u64 = 30_000;
 const MAX_TOTAL: Duration = Duration::from_secs(60);
+const MIN_ATTEMPT: Duration = Duration::from_secs(10);
 
 const SOCKET_NOT_ACTIVE: &str = "WebSocket is not active";
 const SOCKET_READINESS_TIMED_OUT: &str = "WebSocket isActive? command timed out";
@@ -27,6 +28,10 @@ pub struct FirstCallRetry {
     pub attempts: u32,
     pub delay: Duration,
     pub max_total: Duration,
+    /// The least time an attempt needs: no repeat starts unless this much of
+    /// `max_total` is left after its wait, so the last refusal of the mediator is
+    /// returned instead of an attempt cut short.
+    pub min_attempt: Duration,
 }
 
 impl Default for FirstCallRetry {
@@ -35,6 +40,7 @@ impl Default for FirstCallRetry {
             attempts: DEFAULT_ATTEMPTS,
             delay: Duration::from_millis(DEFAULT_DELAY_MS),
             max_total: MAX_TOTAL,
+            min_attempt: MIN_ATTEMPT,
         }
     }
 }
@@ -83,6 +89,7 @@ impl FirstCallRetry {
             attempts,
             delay: Duration::from_millis(delay_ms),
             max_total: MAX_TOTAL,
+            min_attempt: MIN_ATTEMPT,
         }
     }
 
@@ -118,7 +125,7 @@ impl FirstCallRetry {
             match result {
                 Err(error)
                     if retried < self.attempts
-                        && started.elapsed() + self.delay <= self.max_total
+                        && started.elapsed() + self.delay + self.min_attempt <= self.max_total
                         && refused(&error) =>
                 {
                     retried += 1;
@@ -140,19 +147,22 @@ impl FirstCallRetry {
 /// be admitting the DID. Any other mediator, an operator-added one included,
 /// refuses for real, so its refusal fails at once.
 /// A provided mediator whose directory has not answered yet is retried too:
-/// nothing says it is gone.
+/// nothing says it is gone. Without a configured directory (`None`) nothing
+/// offers the mediator, so there is no retry.
 pub(crate) fn applies_to(
     provided: bool,
-    listing: Listing,
+    listing: Option<Listing>,
 ) -> bool {
-    provided && listing != Listing::NotListed
+    provided && matches!(listing, Some(Listing::Listed | Listing::Unknown))
 }
 
+/// Only a directory that answered without the DID has dropped the mediator; one
+/// that is not configured, or has not answered, says nothing of the kind.
 pub(crate) fn no_longer_offered(
     provided: bool,
-    listing: Listing,
+    listing: Option<Listing>,
 ) -> bool {
-    provided && listing == Listing::NotListed
+    provided && listing == Some(Listing::NotListed)
 }
 
 /// Whether `error` is the mediator refusing a DID it does not know yet. Opening
@@ -190,6 +200,7 @@ mod tests {
             attempts,
             delay: Duration::from_millis(1),
             max_total: MAX_TOTAL,
+            min_attempt: Duration::ZERO,
         }
     }
 
@@ -241,7 +252,7 @@ mod tests {
     fn invalid_values_fall_back_to_defaults() {
         let parsed = FirstCallRetry::from_lookup(lookup(&[(ENV_ATTEMPTS, "many"), (ENV_DELAY_MS, "0")]));
         assert_eq!(parsed, FirstCallRetry::default());
-        let parsed = FirstCallRetry::from_lookup(lookup(&[(ENV_ATTEMPTS, "21"), (ENV_DELAY_MS, "60001")]));
+        let parsed = FirstCallRetry::from_lookup(lookup(&[(ENV_ATTEMPTS, "21"), (ENV_DELAY_MS, "30001")]));
         assert_eq!(parsed, FirstCallRetry::default());
     }
 
@@ -266,6 +277,7 @@ mod tests {
             attempts: 20,
             delay: Duration::from_millis(20),
             max_total: Duration::from_millis(70),
+            min_attempt: Duration::ZERO,
         };
         let (result, calls) = script(bounded, 99, None).await;
         assert_eq!(result, Err("refused"));
@@ -279,16 +291,18 @@ mod tests {
 
     #[test]
     fn the_retry_applies_to_a_provided_mediator_unless_the_directory_dropped_it() {
-        assert!(applies_to(true, Listing::Listed));
-        assert!(applies_to(true, Listing::Unknown));
-        assert!(!applies_to(true, Listing::NotListed));
-        for listing in [Listing::Listed, Listing::NotListed, Listing::Unknown] {
+        assert!(applies_to(true, Some(Listing::Listed)));
+        assert!(applies_to(true, Some(Listing::Unknown)));
+        assert!(!applies_to(true, Some(Listing::NotListed)));
+        assert!(!applies_to(true, None), "no directory configured");
+        for listing in [Some(Listing::Listed), Some(Listing::NotListed), Some(Listing::Unknown), None] {
             assert!(!applies_to(false, listing), "{listing:?}");
             assert!(!no_longer_offered(false, listing), "{listing:?}");
         }
-        assert!(no_longer_offered(true, Listing::NotListed));
-        assert!(!no_longer_offered(true, Listing::Listed));
-        assert!(!no_longer_offered(true, Listing::Unknown), "an unknown directory is not a gone mediator");
+        assert!(no_longer_offered(true, Some(Listing::NotListed)));
+        assert!(!no_longer_offered(true, Some(Listing::Listed)));
+        assert!(!no_longer_offered(true, Some(Listing::Unknown)), "an unknown directory is not a gone mediator");
+        assert!(!no_longer_offered(true, None), "no directory configured: no hint");
     }
 
     #[tokio::test]
@@ -297,6 +311,7 @@ mod tests {
             attempts: 0,
             delay: Duration::from_millis(10),
             max_total: Duration::from_millis(20),
+            min_attempt: Duration::ZERO,
         };
         let result: Result<u32, &str> = unbounded
             .run(
@@ -318,6 +333,7 @@ mod tests {
             attempts: 5,
             delay: Duration::from_millis(10),
             max_total: Duration::from_millis(100),
+            min_attempt: Duration::ZERO,
         };
         let started = std::time::Instant::now();
         let result: Result<u32, &str> = bounded
@@ -332,6 +348,47 @@ mod tests {
             .await;
         assert_eq!(result, Err("timed out"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    fn status_error(status: u16) -> ATMError {
+        ATMError::HttpStatus(Box::new(affinidi_messaging_sdk::errors::HttpStatusError::new("first call", status)))
+    }
+
+    #[test]
+    fn only_a_403_status_counts_among_http_status_errors() {
+        assert!(refused_until_admitted(&status_error(403)));
+        for status in [401, 404, 429, 500, 503] {
+            assert!(!refused_until_admitted(&status_error(status)), "{status}");
+        }
+    }
+
+    #[test]
+    fn real_errors_of_every_other_kind_are_not_a_refusal() {
+        assert!(!refused_until_admitted(&ATMError::ACLConfigError("403".into())));
+        assert!(!refused_until_admitted(&ATMError::SDKError("WebSocket is not active".into())));
+        assert!(!refused_until_admitted(&ATMError::MediatorError("403".into(), "Forbidden".into())));
+        assert!(!refused_until_admitted(&ATMError::Disconnected("closed".into())));
+    }
+
+    #[test]
+    fn the_largest_delay_leaves_room_for_a_repeat_inside_the_cap() {
+        let largest = FirstCallRetry::from_lookup(lookup(&[(ENV_DELAY_MS, "30000")]));
+        assert_eq!(largest.delay, Duration::from_secs(30));
+        assert!(largest.delay + largest.min_attempt < largest.max_total);
+        assert_eq!(FirstCallRetry::from_lookup(lookup(&[(ENV_DELAY_MS, "30001")])), FirstCallRetry::default());
+    }
+
+    #[tokio::test]
+    async fn no_repeat_starts_when_too_little_of_the_cap_is_left() {
+        let tight = FirstCallRetry {
+            attempts: 5,
+            delay: Duration::from_millis(40),
+            max_total: Duration::from_millis(120),
+            min_attempt: Duration::from_millis(100),
+        };
+        let (result, calls) = script(tight, 99, None).await;
+        assert_eq!(result, Err("refused"), "the mediator's own refusal is returned, not a timeout");
+        assert_eq!(calls, 1, "40 ms wait + 100 ms minimum attempt does not fit in 120 ms");
     }
 
     #[test]

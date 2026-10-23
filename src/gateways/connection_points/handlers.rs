@@ -881,13 +881,15 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
     info!("  Connection Point DID: {}", connection_point_did);
     info!("  Label: {}", req.name);
 
+    // Without a configured directory nothing is offered, so a provided record gets
+    // neither the retry nor the "no longer offered" hint.
     let listing = match mediator_directory.as_ref() {
-        Some(directory) => {
+        Some(directory) => Some(
             directory
                 .listing(&mediator.did)
-                .await
-        }
-        None => crate::event_hook::Listing::NotListed,
+                .await,
+        ),
+        None => None,
     };
     let first_call_retry = super::first_call_retry::applies_to(mediator.provided, listing)
         .then(super::first_call_retry::FirstCallRetry::current);
@@ -2577,7 +2579,9 @@ mod tests {
             directory_url: Some(url),
             ..crate::event_hook::EventHookSettings::default()
         };
-        let directory = crate::event_hook::MediatorDirectory::new(&settings).unwrap();
+        let directory = crate::event_hook::MediatorDirectory::new(&settings)
+            .await
+            .unwrap();
         directory.entries().await;
         let directory_id = crate::event_hook::DirectoryEntry {
             did: did.into(),

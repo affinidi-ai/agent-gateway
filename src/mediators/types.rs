@@ -110,6 +110,11 @@ pub struct MediatorResponse {
     /// Offered by the mediator directory and read-only for the operator.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub provided: bool,
+    /// A provided record the directory has stopped offering: only the list
+    /// endpoints set it, from a directory answer that omits the DID. `DELETE`
+    /// still refuses while something uses the record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deletable: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -142,6 +147,7 @@ impl From<Mediator> for MediatorResponse {
             our_did,
             registered,
             provided,
+            deletable: false,
             created_at,
             updated_at,
         }

@@ -13,19 +13,22 @@ describe('initialMediatorSelection', () => {
     expect(initialMediatorSelection([directory('directory:a'), stored('b')], 'b')).toBe('b');
   });
 
-  it('pre-selects the first provided mediator in list order', () => {
+  it('pre-selects the first directory entry in list order', () => {
     expect(
       initialMediatorSelection(
-        [stored('c'), directory('directory:a'), { ...stored('b'), provided: true }],
+        [stored('c'), directory('directory:a'), directory('directory:z')],
         null
       )
     ).toBe('directory:a');
   });
 
-  it('pre-selects a stored mediator that was created from a directory entry', () => {
+  it('never pre-selects a stored record created from a directory entry', () => {
     expect(
-      initialMediatorSelection([{ ...stored('kept'), provided: true }, stored('own')], null)
-    ).toBe('kept');
+      initialMediatorSelection(
+        [{ ...stored('kept'), provided: true }, stored('own'), stored('other')],
+        null
+      )
+    ).toBe('');
   });
 
   it('falls back to the only stored mediator', () => {

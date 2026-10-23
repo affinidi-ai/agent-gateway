@@ -1,3 +1,5 @@
+import { isUnstoredDirectoryMediator } from '../../utils/mediators';
+
 export interface MediatorOption {
   id: string;
   name?: string;
@@ -8,16 +10,16 @@ export interface MediatorOption {
 
 /**
  * The mediator pre-selected when the step opens: an explicit initial choice,
- * else the first mediator offered by the mediator directory (whether still a
- * directory entry or already stored), else the only mediator when there is
- * exactly one, else none.
+ * else the first `directory:` entry of the mediator directory (a stored record
+ * created from an entry is never pre-selected), else the only mediator when
+ * there is exactly one, else none.
  */
 export function initialMediatorSelection(
   mediators: MediatorOption[],
   initialMediatorId: string | null
 ): string {
   if (initialMediatorId) return initialMediatorId;
-  const offered = mediators.find(mediator => mediator.provided === true);
+  const offered = mediators.find(isUnstoredDirectoryMediator);
   if (offered) return offered.id;
   if (mediators.length === 1) return mediators[0].id;
   return '';
