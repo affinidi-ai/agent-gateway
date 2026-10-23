@@ -1,0 +1,29 @@
+branch: fix/tr-orphaned-mediator-websockets
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-21T00:00:00.000Z'
+      title: Stop trust registry reconnects from leaving duplicate mediator sessions
+      description: >-
+        Reconnecting a trust registry, from the dashboard, at startup or after a stale
+        connection, left the previous connection's mediator websocket running. It kept
+        reconnecting under the same DID and fought the new connection, so the mediator
+        closed one with "A new duplicate websocket connection for this DID" and the
+        trust registry ended up Failed. Replaced and removed connections are now shut
+        down, including when the gateway steps down to Standby, and stale connection
+        recovery reuses a connection another request has already replaced instead of
+        tearing it down. A connection setup that fails partway also closes its
+        websocket. A reconnect now closes the current connection before opening the
+        new one, so the old connection no longer receives the duplicate error and
+        marks the trust registry Failed.
+  removed: []
+  security:
+    - timestamp: '2026-10-23T00:00:00.000Z'
+      title: Update ctutils to 0.4.5 for constant-time mask and comparison fixes
+      description: >-
+        Bump the transitive ctutils dependency from 0.4.2 to 0.4.5, which fixes
+        non-constant-time mask generation and u128 comparisons reported by cargo audit
+        (RustCrypto/utils#1569). The crate is pulled in by the elliptic-curve and digest
+        crates used for DID and DIDComm cryptography.
+  breaking: []
