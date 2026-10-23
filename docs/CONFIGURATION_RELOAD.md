@@ -104,6 +104,19 @@ If the requested configuration source cannot be loaded,
 available, reload returns an error. A failure after listener teardown is not converted into the old
 live listener set.
 
+With `channel_config_source = "local"`, a reload first re-reads the Agent Surface records from disk,
+and each record that changed on disk is then also applied as a single-surface change, as a change
+picked up by [cache refresh](#cache-refresh) is. That change applies the surface as it is stored
+when the change runs, not the copy read from disk, and an A2A surface stored without its own
+settings is given the carried-over ones in memory, as a load gives them (see
+[A2A surface settings](PROTOCOLS.md#a2a-surface-settings)).
+
+An explicit `POST /v1/config/reload`, the reload a node runs when it becomes Active, a surface
+change made through the API, and a change from storage are applied one at a time, under a surface
+reload lock held outside the listener reload lock above. A change from storage that a reload raised
+therefore runs only after that reload has finished, and cannot replace what the reload serves with
+an older surface.
+
 ## Single-surface reload
 
 A single-surface reload keeps the existing inbound listener bound:

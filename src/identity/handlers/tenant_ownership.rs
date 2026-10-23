@@ -818,7 +818,7 @@ async fn persist_tenant_id(
                 .save(&resource)
                 .await
                 .map_err(internal)?;
-            super::surfaces::apply_surface_upsert_from_storage(state, resource).await;
+            super::surfaces::apply_surface_from_storage(state, id).await;
         }
         ResourceKind::Issuers => {
             let store = state
