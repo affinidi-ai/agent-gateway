@@ -125,6 +125,16 @@ fn default_cp_type() -> ConnectionPointType {
 }
 
 impl GatewayConnectionPoint {
+    /// The recorded expiry: the field, else `expires_at` in the OOB message. `None`
+    /// when neither holds a readable date.
+    pub fn recorded_expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.expires_at.or_else(|| {
+            self.oob_message
+                .get("expires_at")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+        })
+    }
+
     pub fn new(
         gateway_id: String,
         mediator_id: String,

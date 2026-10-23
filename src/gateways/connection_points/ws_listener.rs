@@ -3355,8 +3355,30 @@ fn permanent_mediator_reference(
         .to_string()
 }
 
+/// The deadline of a pairing rebuilt from its temporary connection point: the
+/// recorded expiry, else the connection point's creation time plus the configured
+/// lifetime. A recorded value that cannot be read is an error, never a fresh
+/// deadline, so recovery cannot renew an expired pairing.
+fn resolve_recovered_expires_at(
+    temp_connection_point: &super::types::GatewayConnectionPoint,
+    pending_expiry_hours: u64,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    if let Some(recorded) = temp_connection_point.expires_at {
+        return Ok(recorded);
+    }
+    match temp_connection_point
+        .oob_message
+        .get("expires_at")
+    {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
+            format!("Temporary connection point {} has an unreadable expiry: {e}", temp_connection_point.id)
+        }),
+        None => Ok(temp_connection_point.created_at + chrono::Duration::hours(pending_expiry_hours as i64)),
+    }
+}
+
 /// Finalize OOB connection as ACCEPTOR after receiving connection-accepted
-async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::ConnectionPointStore>(
+async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::ConnectionPointStore + 'static>(
     inviter_temporary_did: &str,
     inviter_secure_did: &str,
     issuer_attestation: Option<&str>,
@@ -3379,10 +3401,28 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     // pending OOB cache is briefly unavailable. The temporary connection point
     // and pending gateway record contain enough persisted state to complete the
     // handshake, so reconstruct from them instead of dropping the message.
-    let pending_conn = if let Some(pending_conn) = pending_store
-        .get_by_temporary_did(inviter_temporary_did)
-        .await
-    {
+    // The message arrives on this attempt's temporary connection point, which names
+    // the attempt exactly; acceptances of one invitation share the inviter's DID.
+    let own_pairing = match current_connection_point {
+        Some(connection_point) => {
+            pending_store
+                .get_by_temporary_cp_id(&connection_point.id)
+                .await
+        }
+        None => None,
+    };
+    let pending_conn = if let Some(pending_conn) = own_pairing {
+        pending_conn
+    } else if let Some(pending_conn) = match current_connection_point {
+        // Acceptances of one invitation share the inviter's DID, so a message that
+        // arrived on a known attempt never falls back to another attempt's pairing.
+        Some(_) => None,
+        None => {
+            pending_store
+                .get_by_temporary_did(inviter_temporary_did)
+                .await
+        }
+    } {
         pending_conn
     } else {
         let temp_connection_point = match current_connection_point {
@@ -3523,6 +3563,12 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             )
             .await?;
 
+            let recovered_expires_at = resolve_recovered_expires_at(
+                &temp_connection_point,
+                bootstrap_config
+                    .oob_connection
+                    .pending_expiry_hours,
+            )?;
             crate::gateways::PendingOOBConnection {
                 id: pending_gateway.id.clone(),
                 invitation_id: pending_gateway.id.clone(),
@@ -3538,7 +3584,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                 role: crate::gateways::ConnectionRole::Acceptor,
                 state: crate::gateways::ConnectionState::WaitingForResponse,
                 created_at: temp_connection_point.created_at,
-                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                expires_at: recovered_expires_at,
                 secure_cp_id: recovered_secure_cp_id,
                 temporary_cp_id: Some(
                     temp_connection_point
@@ -3603,41 +3649,72 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     // Step 3: Update existing pending gateway with inviter's SECURE DID and set to Active
     info!("  Looking for existing pending gateway with temporary DID: {}", inviter_temporary_did);
 
-    let mut gateway = gateway_store
-        .get_by_did(inviter_temporary_did)
-        .await
-        .map_err(|e| format!("Failed to get pending gateway: {}", e))?
-        .or_else(|| {
-            Some(crate::gateways::types::Gateway {
-                id: pending_conn.id.clone(),
-                tenant_id: None,
-                name: format!(
-                    "Gateway {}",
-                    &inviter_temporary_did[inviter_temporary_did
-                        .len()
-                        .saturating_sub(12)..]
-                ),
-                description: format!(
-                    "Recovered connection request from {}",
-                    &inviter_temporary_did[inviter_temporary_did
-                        .len()
-                        .saturating_sub(12)..]
-                ),
-                did: inviter_temporary_did.to_string(),
-                issuer_did: None,
-                issuer_did_source: None,
-                trusted_issuer_dids: Vec::new(),
-                gateway_type: crate::gateways::types::GatewayType::Remote,
-                status: crate::gateways::types::GatewayStatus::Pending,
-                creation_type: crate::gateways::types::GatewayCreationType::System,
-                created_at: pending_conn.created_at,
-                updated_at: chrono::Utc::now(),
-                exposed_channels: Vec::new(),
-                exposure_mode: Some(crate::gateways::types::ExposureMode::None),
-                opa_policy_config: None,
-            })
+    let attempt_connection_point = match current_connection_point {
+        Some(connection_point) => Some(connection_point.clone()),
+        None => match pending_conn
+            .temporary_cp_id
+            .as_deref()
+        {
+            Some(id) => cp_store
+                .get(id)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        },
+    };
+    let own_pending_gateway = match attempt_connection_point
+        .as_ref()
+        .and_then(|connection_point| {
+            connection_point
+                .oob_message
+                .get("pending_gateway_id")
+                .and_then(|value| value.as_str())
+        }) {
+        Some(id) => gateway_store
+            .get(id)
+            .await
+            .map_err(|e| format!("Failed to get pending gateway: {}", e))?,
+        None => None,
+    };
+    let mut gateway = match own_pending_gateway {
+        Some(gateway) => Some(gateway),
+        None => gateway_store
+            .get_by_did(inviter_temporary_did)
+            .await
+            .map_err(|e| format!("Failed to get pending gateway: {}", e))?,
+    }
+    .or_else(|| {
+        Some(crate::gateways::types::Gateway {
+            id: pending_conn.id.clone(),
+            tenant_id: None,
+            name: format!(
+                "Gateway {}",
+                &inviter_temporary_did[inviter_temporary_did
+                    .len()
+                    .saturating_sub(12)..]
+            ),
+            description: format!(
+                "Recovered connection request from {}",
+                &inviter_temporary_did[inviter_temporary_did
+                    .len()
+                    .saturating_sub(12)..]
+            ),
+            did: inviter_temporary_did.to_string(),
+            issuer_did: None,
+            issuer_did_source: None,
+            trusted_issuer_dids: Vec::new(),
+            gateway_type: crate::gateways::types::GatewayType::Remote,
+            status: crate::gateways::types::GatewayStatus::Pending,
+            creation_type: crate::gateways::types::GatewayCreationType::System,
+            created_at: pending_conn.created_at,
+            updated_at: chrono::Utc::now(),
+            exposed_channels: Vec::new(),
+            exposure_mode: Some(crate::gateways::types::ExposureMode::None),
+            opa_policy_config: None,
         })
-        .ok_or_else(|| format!("No pending gateway found for temporary DID: {}", inviter_temporary_did))?;
+    })
+    .ok_or_else(|| format!("No pending gateway found for temporary DID: {}", inviter_temporary_did))?;
 
     info!("✓ Found pending gateway: {}", gateway.id);
     info!("  Keeping user-provided name: {}", gateway.name);
@@ -3823,41 +3900,48 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
 
     info!("🧹 Cleaning up temporary connection point: {}", temp_cp_id);
 
-    // Step 5.1: Stop the temporary listener if it's running
-    if let Err(e) = listener_manager
-        .stop_listener(&temp_cp_id)
-        .await
-    {
-        warn!("   Failed to stop temporary listener: {}", e);
-    } else {
-        info!("   ✓ Stopped temporary listener");
-    }
+    // Stopping the temporary listener aborts the task that may be running this
+    // function, so the whole cleanup runs in a task of its own.
+    let cleanup = tokio::spawn({
+        let listener_manager = listener_manager.clone();
+        let cp_store = cp_store.clone();
+        let storage_root = std::path::PathBuf::from(
+            &bootstrap_config
+                .storage_paths
+                .connection_points,
+        );
+        async move {
+            if let Err(e) = listener_manager
+                .stop_listener(&temp_cp_id)
+                .await
+            {
+                warn!("   Failed to stop temporary listener: {}", e);
+            } else {
+                info!("   ✓ Stopped temporary listener");
+            }
 
-    // Step 5.2: Delete the temporary connection point from the store
-    if let Err(e) = cp_store
-        .delete(&temp_cp_id)
-        .await
-    {
-        warn!("   Failed to delete temporary connection point: {}", e);
-    } else {
-        info!("   ✓ Deleted temporary connection point metadata");
-    }
+            if let Err(e) = cp_store
+                .delete(&temp_cp_id)
+                .await
+            {
+                warn!("   Failed to delete temporary connection point: {}", e);
+            } else {
+                info!("   ✓ Deleted temporary connection point metadata");
+            }
 
-    // Step 5.3: Remove the storage directory
-    let temp_storage_path = std::path::PathBuf::from(
-        &bootstrap_config
-            .storage_paths
-            .connection_points,
-    )
-    .join(temp_cp_id);
-
-    if temp_storage_path.exists() {
-        match std::fs::remove_dir_all(&temp_storage_path) {
-            Ok(_) => info!("   ✓ Cleaned up temporary DID storage: {:?}", temp_storage_path),
-            Err(e) => {
-                warn!("   Failed to cleanup temporary DID storage: {}", e)
+            let temp_storage_path = storage_root.join(&temp_cp_id);
+            if temp_storage_path.exists() {
+                match tokio::fs::remove_dir_all(&temp_storage_path).await {
+                    Ok(_) => info!("   ✓ Cleaned up temporary DID storage: {:?}", temp_storage_path),
+                    Err(e) => {
+                        warn!("   Failed to cleanup temporary DID storage: {}", e)
+                    }
+                }
             }
         }
+    });
+    if let Err(e) = cleanup.await {
+        warn!("   Temporary connection point cleanup did not finish: {}", e);
     }
 
     info!("🎉 OOB connection finalized successfully!");
@@ -4228,7 +4312,7 @@ pub async fn spawn_oob_acceptor_listener<S: GatewayStore + 'static, CS: super::C
 
 /// Listen for connection-accepted message on temporary DID
 #[allow(dead_code)]
-async fn listen_for_connection_accepted<S: GatewayStore, CS: super::ConnectionPointStore>(
+async fn listen_for_connection_accepted<S: GatewayStore, CS: super::ConnectionPointStore + 'static>(
     _temp_did: String,
     _pending_gateway_id: String,
     client: DIDCommClient,
@@ -5600,6 +5684,38 @@ mod connected_event_tests {
         );
         cp.mediator_did = Some("did:example:mediator".to_string());
         cp
+    }
+
+    #[test]
+    fn a_recovered_pairing_keeps_the_recorded_expiry_and_is_never_renewed() {
+        let recorded = chrono::Utc::now() - chrono::Duration::hours(3);
+
+        let mut field = announced_cp();
+        field.expires_at = Some(recorded);
+        assert_eq!(super::resolve_recovered_expires_at(&field, 24).unwrap(), recorded);
+
+        let mut in_message = announced_cp();
+        in_message.expires_at = None;
+        in_message.oob_message = serde_json::json!({ "expires_at": recorded });
+        assert_eq!(super::resolve_recovered_expires_at(&in_message, 24).unwrap(), recorded);
+
+        let mut unrecorded = announced_cp();
+        unrecorded.expires_at = None;
+        unrecorded.oob_message = serde_json::json!({});
+        assert_eq!(
+            super::resolve_recovered_expires_at(&unrecorded, 2).unwrap(),
+            unrecorded.created_at + chrono::Duration::hours(2),
+            "without a recorded expiry the deadline counts from the connection point's creation"
+        );
+
+        let mut unreadable = announced_cp();
+        unreadable.expires_at = None;
+        unreadable.oob_message = serde_json::json!({ "expires_at": "not a date" });
+        assert!(
+            super::resolve_recovered_expires_at(&unreadable, 24)
+                .unwrap_err()
+                .contains("unreadable expiry")
+        );
     }
 
     async fn store_with(
