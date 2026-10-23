@@ -28,6 +28,7 @@ pub struct AccessPointFixture {
     pub agent_card_path: Option<String>,
     pub didwebvh_identity_id: Option<String>,
     pub caller_trust_check_list: Vec<Value>,
+    pub trust_recorder_entries: Vec<Value>,
     pub rate_limit: Option<Value>,
 }
 impl Default for AccessPointFixture {
@@ -41,6 +42,7 @@ impl Default for AccessPointFixture {
             agent_card_path: None,
             didwebvh_identity_id: None,
             caller_trust_check_list: Vec::new(),
+            trust_recorder_entries: Vec::new(),
             rate_limit: None,
         }
     }
@@ -130,6 +132,7 @@ impl AgentSurfaceFixture {
                 agent_card_path: None,
                 didwebvh_identity_id: None,
                 caller_trust_check_list: Vec::new(),
+                trust_recorder_entries: Vec::new(),
                 rate_limit: None,
             },
             target: TargetFixture {
@@ -209,6 +212,16 @@ impl AgentSurfaceFixture {
         self.access_point
             .caller_trust_check_list
             .push(element);
+        self
+    }
+
+    pub fn with_trust_recorder_entry(
+        mut self,
+        entry: Value,
+    ) -> Self {
+        self.access_point
+            .trust_recorder_entries
+            .push(entry);
         self
     }
 
@@ -388,6 +401,13 @@ impl AgentSurfaceFixture {
                     .clone(),
             );
         }
+        if !self
+            .access_point
+            .trust_recorder_entries
+            .is_empty()
+        {
+            access_point["trust_recorder"] = json!({ "entries": self.access_point.trust_recorder_entries });
+        }
 
         let mut target = json!({
             "endpoint": self.target.endpoint,
@@ -550,6 +570,7 @@ impl Default for AgentSurfaceFixture {
                 agent_card_path: None,
                 didwebvh_identity_id: None,
                 caller_trust_check_list: Vec::new(),
+                trust_recorder_entries: Vec::new(),
                 rate_limit: None,
             },
             target: TargetFixture {

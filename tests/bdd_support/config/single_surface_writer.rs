@@ -280,6 +280,9 @@ fn write_single_surface_config_inner(
     for element in &surface_config.caller_trust_check_list {
         surface_fixture = surface_fixture.with_caller_trust_check_element(element.clone());
     }
+    for entry in &surface_config.trust_recorder_entries {
+        surface_fixture = surface_fixture.with_trust_recorder_entry(entry.clone());
+    }
     for element in &surface_config.target_trust_check_list {
         surface_fixture = surface_fixture.with_target_trust_check_element(element.clone());
     }

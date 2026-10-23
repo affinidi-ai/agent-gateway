@@ -50,8 +50,8 @@ pub use policy_definitions::{
 pub use policy_validation::validate_policy;
 pub use settings::{get_audit_event_catalog, get_settings, reset_settings, update_settings};
 pub use surfaces::{
-    create_surface, create_variant, delete_surface, delete_variant, get_resolved_variant, get_surface, list_surfaces,
-    promote_variant_to_default, update_surface, update_variant,
+    create_surface, create_variant, delete_surface, delete_variant, get_resolved_variant, get_surface,
+    get_trust_recorder_status, list_surfaces, promote_variant_to_default, update_surface, update_variant,
 };
 pub use trust_check_predefined::list_predefined_trust_check_queries;
 pub use user_settings::{get_user_settings, get_user_settings_overrides, reset_user_settings, update_user_settings};

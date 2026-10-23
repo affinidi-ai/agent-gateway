@@ -2,6 +2,7 @@
 
 pub mod metadata_gate;
 pub mod predefined_queries;
+pub mod recorder_status;
 pub mod stage;
 pub mod template;
 pub mod trqp_adapter;

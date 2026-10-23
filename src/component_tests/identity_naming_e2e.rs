@@ -124,6 +124,7 @@ impl Fixture {
             Some(&self.surfaces),
             &self.caller_names,
             &self.card_names,
+            None,
         )
         .await
         .expect("identity list")
@@ -305,7 +306,7 @@ async fn delta_includes_caller_after_its_name_resolves() {
         .changed_since(since)
         .into_iter()
         .collect();
-    assert!(identities_changed_since(before, since, &renamed, &HashSet::new()).is_empty());
+    assert!(identities_changed_since(before, since, &renamed, &HashSet::new(), &HashSet::new()).is_empty());
 
     fixture
         .wait_for_caller_name()
@@ -320,7 +321,7 @@ async fn delta_includes_caller_after_its_name_resolves() {
         .changed_since(since)
         .into_iter()
         .collect();
-    let delta = identities_changed_since(after, since, &renamed, &HashSet::new());
+    let delta = identities_changed_since(after, since, &renamed, &HashSet::new(), &HashSet::new());
 
     assert_eq!(delta.len(), 1);
     assert_eq!(delta[0].did, CALLER_DID);
@@ -394,7 +395,7 @@ async fn delta_includes_managed_identity_after_its_card_name_resolves() {
         .changed_since(since)
         .into_iter()
         .collect();
-    let delta = identities_changed_since(after, since, &HashSet::new(), &renamed_surfaces);
+    let delta = identities_changed_since(after, since, &HashSet::new(), &renamed_surfaces, &HashSet::new());
 
     assert_eq!(delta.len(), 1);
     assert_eq!(delta[0].did, "did:example:def");
