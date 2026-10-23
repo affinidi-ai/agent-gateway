@@ -95,3 +95,6 @@ test-results.xml
 
 # Generated development certificate configuration
 config/certs/openssl.cnf
+
+# python generated files
+*.py[cod]

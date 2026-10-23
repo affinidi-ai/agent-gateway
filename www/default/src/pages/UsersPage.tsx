@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { apiClient } from '../api';
 import { formatDateTime } from '../utils/stringUtils';
-import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
 import { DeleteButton } from '../components/shared/DeleteButton';
 import SearchInput from '../components/shared/SearchInput';
@@ -283,15 +282,6 @@ const UsersPage: React.FC = () => {
                   } users`}
                 />
               </h6>
-              <AppButton
-                variant="primary"
-                size="md"
-                className="shadow-sm"
-                onClick={() => navigate('/users/integrations')}
-                iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
-              >
-                Add Integration
-              </AppButton>
             </div>
           </div>
           <div className="card-body">

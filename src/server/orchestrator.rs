@@ -96,7 +96,7 @@ fn register_resource_limit_counters(
     delegation_vault_store: &Option<Arc<crate::delegation_vault::storage::FileSystemDelegationVaultStore>>,
     mcp_proxy_store: &Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
     a2a_proxy_store: &Option<Arc<crate::a2a_proxies::FileSystemA2aProxyStore>>,
-    integration_storage: &Arc<crate::storage::IntegrationStorage>,
+    definition_stores: &Arc<crate::integrations::definitions::DefinitionStores>,
 ) {
     use crate::config::register_counter;
     use crate::credential_providers::storage::CredentialProviderStorage as _;
@@ -287,12 +287,12 @@ fn register_resource_limit_counters(
         });
     }
 
-    // integrations — notifier definitions.
-    let s = integration_storage.clone();
+    let s = definition_stores.clone();
     register_counter("integrations", move || {
         let s = s.clone();
         async move {
-            s.list()
+            s.integrations
+                .list()
                 .await
                 .map(|v| v.len())
                 .unwrap_or(0)
@@ -646,14 +646,6 @@ pub async fn run_axum_proxy(
     );
     // Register the settings store globally so the audit vault can read categories.
     crate::storage::settings_store::set_global_settings_store(settings_store.clone());
-
-    // Store integration triggers storage path globally for user/gateway integrations
-    crate::storage::init_integration_triggers_storage_path(
-        bootstrap_config
-            .storage_paths
-            .integration_triggers
-            .clone(),
-    );
 
     // Store gateways storage path globally for x402 gateway facilitator resolution
     crate::storage::init_gateways_storage_path(
@@ -1344,7 +1336,6 @@ pub async fn run_axum_proxy(
             issuer_store: None,
             trust_registry_store: None,
             authority_store: None,
-            integration_store: None,
             mcp_proxy_store: None,
             a2a_proxy_store: None,
             secrets_store: None,
@@ -1354,6 +1345,7 @@ pub async fn run_axum_proxy(
             sts_client_store: None,
             resolved_surface_cache: resolved_surface_cache.clone(),
             surface_template_store: surface_template_store.clone(),
+            event_hook: None,
 
             // DID:webvh fields (will be initialized later if feature is enabled)
             #[cfg(feature = "didwebvh")]
@@ -1567,6 +1559,18 @@ pub async fn run_axum_proxy(
                 }
             };
 
+        #[cfg(test)]
+        let event_hook = match crate::event_hook::test_settings::get(
+            &bootstrap_config
+                .storage_paths
+                .gateways,
+        ) {
+            Some(settings) => crate::event_hook::EventHook::new(settings),
+            None => build_event_hook().await,
+        };
+        #[cfg(not(test))]
+        let event_hook = build_event_hook().await;
+
         let mediator_store: Option<Arc<crate::mediators::FileSystemMediatorStore>> =
             match crate::mediators::FileSystemMediatorStore::new(PathBuf::from(
                 &bootstrap_config
@@ -1744,33 +1748,41 @@ pub async fn run_axum_proxy(
             crate::proxy::server::init_transit_token_issuer(Arc::new(issuer));
         }
 
-        // Initialize integration storage. The audit pipeline builds its sinks
-        // from the integrations, so this comes before it starts.
-        let integration_storage: Arc<crate::storage::IntegrationStorage> = {
-            let storage = crate::storage::IntegrationStorage::new(PathBuf::from(
-                &bootstrap_config
-                    .storage_paths
-                    .integrations,
-            ))
-            .await
-            .expect("Failed to initialize integration storage");
-            info!("Notifier storage initialized");
-            let storage_arc = Arc::new(storage);
-
-            // Initialize global integration storage
-            crate::storage::init_integration_storage(storage_arc.clone()).await;
-            info!("✓ Global integration storage initialized");
-            crate::audit::sources::rebuild_sinks().await;
-
-            if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
-                spawn_x402_cleanup_worker(txn_store);
-            }
-
-            // Validate all active integrations
-            crate::integrations::validation::validate_all_integrations(&storage_arc).await;
-
-            storage_arc
-        };
+        // The audit pipeline builds its sinks from the integrations, so their
+        // stores are opened before the sinks are first built.
+        let definition_stores = Arc::new(
+            crate::integrations::definitions::DefinitionStores::open_configured(&bootstrap_config.storage_paths)
+                .await
+                .expect("Failed to initialize integration endpoint, event set and integration storage"),
+        );
+        crate::integrations::definitions::init_definition_stores(definition_stores.clone());
+        // The previous version's integrations become endpoints, event sets and integrations
+        // once, on the Active node; a Standby runs this when it is promoted.
+        if !crate::server::mode::is_standby() {
+            crate::integrations::migration::run::migrate_on_activation(
+                &bootstrap_config.storage_paths,
+                &definition_stores,
+                Some(secrets_store.as_ref()),
+            )
+            .await;
+        }
+        // Only a node holding renamed live directories, from this sweep or an earlier one,
+        // runs the job that deletes them after the retention.
+        crate::integrations::migration::cleanup::start_cleanup_if_pending(&bootstrap_config.storage_paths).await;
+        // Definitions that stopped passing their checks, such as after a restore, are reported
+        // now rather than at their first delivery.
+        if let Err(error) = crate::integrations::definitions::check::report_stored_definitions(
+            &definition_stores,
+            Some(secrets_store.as_ref()),
+        )
+        .await
+        {
+            warn!(error = %error, "Failed to check the stored integration definitions");
+        }
+        crate::audit::sources::rebuild_sinks().await;
+        if let Some(txn_store) = crate::gateways::connection_points::message_processor::get_transaction_store() {
+            spawn_x402_cleanup_worker(txn_store);
+        }
 
         // Initialize delegation vault audit logger (started only on an Active node)
         crate::delegation_vault::audit::init_audit_logger(
@@ -2138,6 +2150,10 @@ pub async fn run_axum_proxy(
         identity_state.gateway_store = gateway_store.clone();
         identity_state.connection_point_store = connection_point_store.clone();
         identity_state.mediator_store = mediator_store.clone();
+        identity_state.event_hook = event_hook.clone();
+        if let (Some(hook), Some(store)) = (event_hook.as_ref(), connection_point_store.as_ref()) {
+            store.set_event_hook(hook.clone());
+        }
         identity_state.issuer_store = issuer_store.clone();
         identity_state.trust_registry_store = trust_registry_store.clone();
         identity_state.authority_store = authority_store.clone();
@@ -2316,8 +2332,6 @@ pub async fn run_axum_proxy(
             info!("✓ GW2 notification store initialized for integration triggers");
         }
 
-        identity_state.integration_store = Some(integration_storage.clone());
-
         // Register appliance resource-limit counters now that every entity store
         // has been constructed. `credentials.jwt`, `secrets.apikeys`, and
         // `secrets.certificates` are registered at their own construction sites.
@@ -2333,7 +2347,7 @@ pub async fn run_axum_proxy(
             &delegation_vault_store,
             &mcp_proxy_store,
             &a2a_proxy_store,
-            &integration_storage,
+            &definition_stores,
         );
 
         // users — resolved from the passkey/SAML auth storage (no dedicated
@@ -2480,6 +2494,9 @@ pub async fn run_axum_proxy(
             }
             manager = manager.with_bootstrap_config(bootstrap_config.clone());
             manager = manager.with_network_config(Arc::new(network_config.clone()));
+            if let Some(hook) = event_hook.as_ref() {
+                manager = manager.with_event_hook(hook.clone());
+            }
 
             if crate::server::mode::is_standby() {
                 manager.deactivate();
@@ -3200,6 +3217,13 @@ pub async fn run_axum_proxy(
         // while they are still owned here).
         let identity_state_for_mode = identity_state.clone();
         let gateway_store_for_mode = gateway_store.clone();
+        let integration_migration_for_mode = (
+            bootstrap_config
+                .storage_paths
+                .clone(),
+            definition_stores.clone(),
+            secrets_store.clone(),
+        );
 
         let mcp_replay = if network_config
             .sts
@@ -3244,7 +3268,6 @@ pub async fn run_axum_proxy(
             listener_manager.clone(),
             message_store.clone(),
             pending_connection_store.clone(),
-            integration_storage,
             // Re-use the same store that backs the middleware so hot-reloads are consistent.
             Some(source_auth_middleware.provider_store()),
             // Pass the JwksClient so the validate-jwks-uri endpoint can probe URIs.
@@ -3288,6 +3311,7 @@ pub async fn run_axum_proxy(
             secrets_store.clone(),
             notification_store.clone(),
             None,
+            Some(definition_stores.clone()),
             vault_rbac_guard.clone(),
         );
 
@@ -4048,6 +4072,22 @@ pub async fn run_axum_proxy(
                             // gateway/surface OPA, MCP gating, or global policy.
                             rederive_planes_on_activation(&identity_state_for_mode, &gateway_store_for_mode).await;
 
+                            // A node that booted Standby migrates the previous version's
+                            // integrations now; routes and sinks are already built, so they
+                            // are refreshed before the audit pipeline takes over.
+                            let (storage_paths, definition_stores, secrets_store) = &integration_migration_for_mode;
+                            if crate::integrations::migration::run::migrate_on_activation(
+                                storage_paths,
+                                definition_stores,
+                                Some(secrets_store.as_ref()),
+                            )
+                            .await
+                            {
+                                crate::integrations::delivery::dispatch::invalidate_routes().await;
+                                crate::audit::sources::rebuild_sinks().await;
+                                crate::integrations::migration::cleanup::start_cleanup_if_pending(storage_paths).await;
+                            }
+
                             // Take over the audit journal before admitting traffic,
                             // continuing from what the previous Active node wrote.
                             crate::delegation_vault::audit::set_audit_pipeline_mode(
@@ -4212,6 +4252,10 @@ pub async fn run_axum_proxy(
     }
 
     Ok(())
+}
+
+async fn build_event_hook() -> Option<Arc<crate::event_hook::EventHook>> {
+    crate::event_hook::EventHook::new(crate::event_hook::EventHookSettings::from_env().await)
 }
 
 /// Re-derive the config + policy planes from shared storage when this node is
@@ -4440,9 +4484,6 @@ async fn initialize_saml_state(
             .context("Failed to create SAML session manager")?,
     );
 
-    // Notification store will be set later (similar to passkey auth)
-    let notification_store = Arc::new(tokio::sync::RwLock::new(None));
-
     info!("Initialized SAML authentication with entity ID: {}", saml_config.sp_entity_id);
 
     Ok(crate::auth::saml::SamlState {
@@ -4450,7 +4491,6 @@ async fn initialize_saml_state(
         storage,
         session_manager,
         avatars_storage_path: avatars_path,
-        notification_store,
         terms_manager,
         login_throttle: Arc::new(crate::sts::throttle::TokenEndpointThrottle::per_client_ip(
             &saml_config.login_throttle,

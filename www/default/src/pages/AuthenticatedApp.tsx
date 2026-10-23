@@ -3,7 +3,6 @@ import { Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { AppProvider, useApp } from '../context/AppContext';
 import { PermissionsProvider, usePermissions } from '../context/PermissionsContext';
 import { PageTitleProvider } from '../context/PageTitleContext';
-import { loadVariablePatterns } from '../utils/templateVariables';
 
 // Load dashboard components - only when authenticated
 import Sidebar from '../components/Sidebar';
@@ -16,6 +15,7 @@ import Dashboard from './Dashboard';
 import '../dashboard.css';
 import { apiClient, sessionManager } from '../api';
 import { ROUTES } from '../routes';
+import { integrationRoutes } from './integrationRoutes';
 
 // Loading fallback component
 const PageLoader: React.FC = () => (
@@ -38,7 +38,6 @@ const IdentitiesPage = lazy(() => import('./IdentitiesPage'));
 const SurfacesPage = lazy(() => import('./SurfacesPage'));
 const GatewaysPage = lazy(() => import('./GatewaysPage'));
 const ConnectionsPage = lazy(() => import('./ConnectionsPage'));
-const IntegrationsPage = lazy(() => import('./IntegrationsPage'));
 const MediatorsPage = lazy(() => import('./MediatorsPage'));
 const TrustRegistriesPage = lazy(() => import('./TrustRegistriesPage'));
 const ProxiesPage = lazy(() => import('./ProxiesPage'));
@@ -62,7 +61,6 @@ const EditMcpProxyPage = lazy(() => import('./EditMcpProxyPage'));
 const EditA2aProxyPage = lazy(() => import('./EditA2aProxyPage'));
 const EditTrustRegistryPage = lazy(() => import('./EditTrustRegistryPage'));
 const EditNotificationPage = lazy(() => import('./EditNotificationPage'));
-const EditIntegrationPage = lazy(() => import('./EditIntegrationPage'));
 const EditSecretPage = lazy(() => import('./EditSecretPage'));
 const EditApiKeyPage = lazy(() => import('./EditApiKeyPage'));
 const ApiKeyDetailPage = lazy(() => import('./ApiKeyDetailPage'));
@@ -75,9 +73,6 @@ const ApproveGatewayWizardPage = lazy(() => import('./ApproveGatewayWizardPage')
 const AddMcpProxyWizardPage = lazy(() => import('./AddMcpProxyWizardPage'));
 const AddMediatorWizardPage = lazy(() => import('./AddMediatorWizardPage'));
 const AddTrustRegistryWizardPage = lazy(() => import('./AddTrustRegistryWizardPage'));
-const AddIntegrationWizardPage = lazy(() => import('./AddIntegrationWizardPage'));
-const UserIntegrationsPage = lazy(() => import('./UserIntegrationsPage'));
-const IdentityIntegrationsPage = lazy(() => import('./IdentityIntegrationsPage'));
 const EditJwtVerificationStrategyPage = lazy(() => import('./EditJwtVerificationStrategyPage'));
 const EditStsClientPage = lazy(() => import('./EditStsClientPage'));
 const EditAccessTokenPage = lazy(() => import('./EditAccessTokenPage'));
@@ -141,13 +136,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
   const hasRefreshedCache = useRef<boolean>(false);
   const [version, setVersion] = useState('-.-.-');
   const [isInitializing, setIsInitializing] = useState(true);
-
-  // Load variable patterns from config on mount
-  useEffect(() => {
-    loadVariablePatterns().catch(err => {
-      console.warn('Failed to load variable patterns:', err);
-    });
-  }, []);
 
   // Add dashboard class
   useEffect(() => {
@@ -297,7 +285,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 />
                 <Route path="/identities" element={<IdentitiesPage />} />
                 <Route path="/identities/:did" element={<IdentitiesPage />} />
-                <Route path="/identities/integrations" element={<IdentityIntegrationsPage />} />
                 <Route
                   path="/surfaces"
                   element={
@@ -434,14 +421,7 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                     </ProtectedRoute>
                   }
                 />
-                <Route
-                  path="/integrations"
-                  element={
-                    <ProtectedRoute permission="mcp_proxies.view">
-                      <IntegrationsPage />
-                    </ProtectedRoute>
-                  }
-                />
+                {integrationRoutes()}
                 <Route
                   path="/integrations/mcp-proxies/wizard"
                   element={
@@ -455,22 +435,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   element={
                     <ProtectedRoute permission="mcp_proxies.edit">
                       <EditMcpProxyPage />
-                    </ProtectedRoute>
-                  }
-                />
-                <Route
-                  path={ROUTES.INTEGRATION_WIZARD}
-                  element={
-                    <ProtectedRoute permission="mcp_proxies.edit">
-                      <AddIntegrationWizardPage />
-                    </ProtectedRoute>
-                  }
-                />
-                <Route
-                  path="/integrations/integrations/:id"
-                  element={
-                    <ProtectedRoute permission="mcp_proxies.edit">
-                      <EditIntegrationPage />
                     </ProtectedRoute>
                   }
                 />
@@ -756,14 +720,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   }
                 />
                 <Route path="/users" element={<Navigate to="/settings?tab=users" replace />} />
-                <Route
-                  path="/users/integrations"
-                  element={
-                    <ProtectedRoute permission="users.edit">
-                      <UserIntegrationsPage />
-                    </ProtectedRoute>
-                  }
-                />
                 <Route
                   path="/users/:userId"
                   element={

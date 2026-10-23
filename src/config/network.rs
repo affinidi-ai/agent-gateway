@@ -184,17 +184,7 @@ impl NetworkConfig {
     /// Load network configuration from a JSON file
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let mut config: NetworkConfig = serde_json::from_str(&contents)?;
-        for category in config
-            .integration
-            .add_missing_built_in_categories()
-        {
-            tracing::warn!(
-                category,
-                path,
-                "gateway.json has no '{category}' integration category; offering the built-in one. Add it to integration.categories to customise it"
-            );
-        }
+        let config: NetworkConfig = serde_json::from_str(&contents)?;
         config.validate_listeners()?;
         config.validate_terms()?;
         if let Some(profile) = &config.sts.mcp_issuer {

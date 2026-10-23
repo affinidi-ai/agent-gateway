@@ -1,4 +1,8 @@
-import { trustRecorderDefinition } from '../trust-recorder/definition';
+import {
+  SURFACE_ISSUER_DID_TEMPLATE,
+  trustRecorderDefinition,
+  usesSurfaceIssuer,
+} from '../trust-recorder/definition';
 
 describe('trustRecorderDefinition — suppressIncompleteBanner', () => {
   it('suppresses the sidebar incomplete banner on a fresh element (no entries)', () => {
@@ -131,5 +135,18 @@ describe('trustRecorderDefinition — incompleteReason (regression)', () => {
         ],
       })
     ).toBeNull();
+  });
+});
+
+describe('usesSurfaceIssuer', () => {
+  it('is true for the surface Issuer template, ignoring surrounding whitespace like the backend', () => {
+    expect(usesSurfaceIssuer({ authority_did: SURFACE_ISSUER_DID_TEMPLATE })).toBe(true);
+    expect(usesSurfaceIssuer({ authority_did: `  ${SURFACE_ISSUER_DID_TEMPLATE}\n` })).toBe(true);
+  });
+
+  it('is false for an explicit DID, an empty value, or a near-miss template', () => {
+    expect(usesSurfaceIssuer({ authority_did: 'did:web:authority.example' })).toBe(false);
+    expect(usesSurfaceIssuer({ authority_did: '' })).toBe(false);
+    expect(usesSurfaceIssuer({ authority_did: '{{ surface.issuer }}' })).toBe(false);
   });
 });

@@ -1,9 +1,13 @@
 import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 import SecretsPage from '../SecretsPage';
 import { apiClient } from '../../api';
+import { showToast } from '../../utils/toaster';
+
+jest.mock('../../utils/toaster', () => ({ showToast: jest.fn() }));
 
 jest.mock('../../api', () => ({
   apiClient: {
@@ -145,5 +149,39 @@ describe('SecretsPage secret timestamps', () => {
 
     expect(screen.getByText('Updated')).toBeInTheDocument();
     expect(screen.getByText('July 3, 2026')).toBeInTheDocument();
+  });
+});
+
+describe('SecretsPage secret delete', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockFetchByUrl();
+  });
+
+  it('shows why a secret was not deleted', async () => {
+    const message = 'The secret is used by these integration endpoints: Ops webhook';
+    const listing = (apiClient.fetch as jest.Mock).getMockImplementation()!;
+    (apiClient.fetch as jest.Mock).mockImplementation((url: string, init?: RequestInit) =>
+      init?.method === 'DELETE'
+        ? Promise.resolve({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            text: () => Promise.resolve(JSON.stringify({ message })),
+          })
+        : listing(url, init)
+    );
+    renderAt('/secrets?tab=secrets');
+
+    const remove = await screen.findByTitle('Delete secret');
+    await userEvent.click(remove);
+    await userEvent.click(remove);
+
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith('error', `Delete failed: ${message} (409)`, {
+        autoRemove: false,
+      })
+    );
+    expect(apiClient.fetch).toHaveBeenCalledWith('/api/v1/secrets/secret-1', { method: 'DELETE' });
   });
 });

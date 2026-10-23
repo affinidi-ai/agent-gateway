@@ -107,9 +107,9 @@ mod tests {
             Box::pin(async move {
                 published.calls.lock().push((
                     integration_id,
-                    delivery.subject().to_string(),
+                    delivery.values()["EVENT_NAME"].clone(),
                     delivery
-                        .variables()
+                        .values()
                         .get("EVENT_TYPE")
                         .cloned(),
                 ));
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_record_is_published_rendered_as_today() {
+    async fn a_record_is_published_with_its_event_values() {
         let published = Arc::new(Published::default());
         let sink = IntegrationSink::new("siem".to_string(), recording(published.clone(), false));
 
@@ -145,11 +145,7 @@ mod tests {
 
         assert_eq!(
             *published.calls.lock(),
-            vec![(
-                "siem".to_string(),
-                "Governance Audit: audit.consent_granted".to_string(),
-                Some("audit.consent_granted".to_string())
-            )]
+            vec![("siem".to_string(), "Consent Granted".to_string(), Some("audit.consent_granted".to_string()))]
         );
     }
 

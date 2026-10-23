@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
@@ -97,6 +98,8 @@ fn tail_event_ids(
 struct Inner {
     path: PathBuf,
     file: Mutex<Option<File>>,
+    /// Set under the `file` lock once the log is closed; later appends are refused.
+    closed: AtomicBool,
     recent: Mutex<RecentIds>,
 }
 
@@ -119,6 +122,12 @@ impl Inner {
         let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
         let mut file = self.file.lock();
+        if self
+            .closed
+            .load(Ordering::Acquire)
+        {
+            return Err(io::Error::other("the VP Audit Log is closed"));
+        }
         if file.is_none() {
             *file = Some(
                 OpenOptions::new()
@@ -147,6 +156,16 @@ impl Inner {
             None => Ok(()),
         }
     }
+
+    fn close(&self) -> io::Result<()> {
+        let mut file = self.file.lock();
+        self.closed
+            .store(true, Ordering::Release);
+        match file.take() {
+            Some(open) => open.sync_data(),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -169,8 +188,16 @@ impl AuditLogSink {
         Ok(Self(Arc::new(Inner {
             path: path.to_path_buf(),
             file: Mutex::new(None),
+            closed: AtomicBool::new(false),
             recent: Mutex::new(recent),
         })))
+    }
+
+    /// Waits for a write in progress, syncs the log and refuses every later write. A delivery
+    /// cancelled mid-write still finishes on a blocking thread; closing makes sure it lands
+    /// before another pipeline opens the log and reads the ids at its end, or not at all.
+    pub fn close(&self) -> io::Result<()> {
+        self.0.close()
     }
 }
 
@@ -278,6 +305,54 @@ mod tests {
         sink.commit().await.unwrap();
 
         assert_eq!(ids(&path), vec![earlier.record.event_id, later.record.event_id]);
+    }
+
+    #[tokio::test]
+    async fn a_closed_log_takes_no_more_records() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        let sink = AuditLogSink::open(&path, 16).unwrap();
+        let (kept, refused) = (entry(1), entry(2));
+        sink.deliver(&kept)
+            .await
+            .unwrap();
+
+        sink.close().unwrap();
+
+        assert!(
+            sink.deliver(&refused)
+                .await
+                .is_err()
+        );
+        assert_eq!(ids(&path), vec![kept.record.event_id]);
+    }
+
+    #[test]
+    fn closing_waits_for_a_write_in_progress() {
+        let dir = TempDir::new().unwrap();
+        let sink = AuditLogSink::open(
+            &dir.path()
+                .join("delegation-audit.jsonl"),
+            16,
+        )
+        .unwrap();
+        // A write in progress holds the file while it appends.
+        let writing = sink.0.file.lock();
+
+        let closing = std::thread::spawn({
+            let sink = sink.clone();
+            move || sink.close()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!closing.is_finished(), "close returned while a write was still in progress");
+
+        drop(writing);
+        closing
+            .join()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

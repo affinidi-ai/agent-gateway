@@ -39,6 +39,7 @@ mod delegation_vault; // Delegation vault — encrypted OAuth tokens + consent f
 mod didauth; // DID Authentication for channels
 mod egress; // DNS-pinning, redirect-revalidating SSRF egress guard primitive
 mod encryption; // Encryption at rest for local storage
+mod event_hook; // Operator-configured Connection Point event hook (best-effort notifications)
 mod export; // Storage export with PII redaction and public-key encryption
 mod gateways;
 mod http_client; // Shared reqwest client factory (timeout + redirect policy defaults)
@@ -421,10 +422,6 @@ async fn async_main() -> Result<()> {
         config
             .integration
             .variable_pattern
-            .clone(),
-        config
-            .integration
-            .custom_variable_prefix
             .clone(),
     )?;
 
@@ -1339,8 +1336,13 @@ fn render_default_bootstrap_toml(
             certificates: format!("{}_storage/certificates", base_folder_prefix),
             mcp_proxies: format!("{}_storage/mcp_proxies", base_folder_prefix),
             a2a_proxies: format!("{}_storage/a2a_proxies", base_folder_prefix),
-            integrations: format!("{}_storage/integrations/definitions", base_folder_prefix),
-            integration_triggers: format!("{}_storage/integrations/triggers", base_folder_prefix),
+            integration_endpoints: format!("{}_storage/integrations/endpoints", base_folder_prefix),
+            integration_event_sets: format!("{}_storage/integrations/event_sets", base_folder_prefix),
+            integration_definitions: format!("{}_storage/integrations/integrations", base_folder_prefix),
+            integrations: None,
+            integration_triggers: None,
+            legacy_integrations: format!("{}_storage/integrations/definitions", base_folder_prefix),
+            legacy_integration_triggers: format!("{}_storage/integrations/triggers", base_folder_prefix),
             webhooks: format!("{}_storage/webhooks", base_folder_prefix),
             vc_keys: format!("{}_storage/vc_keys", base_folder_prefix),
             metrics: format!("{}_storage/metrics", base_folder_prefix),

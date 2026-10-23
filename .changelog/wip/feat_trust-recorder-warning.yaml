@@ -1,0 +1,14 @@
+branch: feat/trust-recorder-warning
+changes:
+  added:
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Warn when a Trust Recorder uses the surface Issuer but none is selected
+      description: A Trust Recorder entry whose Authority is Use surface Issuer is skipped, and writes no records, when the surface has no Issuer or its Issuer no longer exists, and the only sign was a gateway log line. The Trust Recorder panel and the entry in its editor now show a warning while the surface has no Issuer selected, or its Issuer was deleted, pointing at the Surface's Issuer setting. Entries with an explicit Authority are not affected and show no warning.
+  changed:
+    - timestamp: '2026-10-14T00:00:00.000Z'
+      title: Explain how Issuer, Authority and Entity relate in the Trust Recorder
+      description: The Trust Recorder editor has a collapsed explainer for Authority, Entity, the entry Issuer and the surface Issuer, with a link to the Trust elements guide. The Issuer field no longer says it signs the records, because it is only recorded as the Entity of custom records whose Entity Target is Issuer DID.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

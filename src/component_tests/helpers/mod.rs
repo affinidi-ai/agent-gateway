@@ -796,11 +796,25 @@ fn build_bootstrap_config(
                 .join("a2a_proxies")
                 .to_string_lossy()
                 .into_owned(),
-            integrations: base
+            integration_endpoints: base
+                .join("integrations/endpoints")
+                .to_string_lossy()
+                .into_owned(),
+            integration_event_sets: base
+                .join("integrations/event_sets")
+                .to_string_lossy()
+                .into_owned(),
+            integration_definitions: base
+                .join("integrations/integrations")
+                .to_string_lossy()
+                .into_owned(),
+            integrations: None,
+            integration_triggers: None,
+            legacy_integrations: base
                 .join("integrations/definitions")
                 .to_string_lossy()
                 .into_owned(),
-            integration_triggers: base
+            legacy_integration_triggers: base
                 .join("integrations/triggers")
                 .to_string_lossy()
                 .into_owned(),
@@ -1252,9 +1266,6 @@ fn build_gateway_config(bootstrap: &BootstrapConfig) -> GatewayConfig {
         integration: IntegrationConfig {
             variable_pattern: r"\$\{([^:}]+)(?::([^}]+))?\}".to_string(),
             variable_pattern_description: None,
-            custom_variable_prefix: "_".to_string(),
-            types: vec![],
-            categories: vec![],
         },
         facilitator_mode: FacilitatorMode::default(),
         x402_headers: X402Headers::default(),

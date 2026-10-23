@@ -4,6 +4,10 @@
 // expect(element).toHaveTextContent(/react/i)
 // learn more: https://github.com/testing-library/jest-dom
 import '@testing-library/jest-dom';
+import { TextDecoder, TextEncoder } from 'util';
+
+// jsdom lacks TextEncoder/TextDecoder, which react-router 7 needs
+Object.assign(global, { TextDecoder, TextEncoder });
 
 // Mock window.matchMedia (required for Bootstrap modals in tests)
 Object.defineProperty(window, 'matchMedia', {

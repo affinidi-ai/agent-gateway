@@ -1,0 +1,17 @@
+branch: fix/remove-a2a-proxy-notes
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-21T12:18:44Z'
+      title: Move the A2A proxy version notes to the A2A proxy's Agent Card tab
+      description: >-
+        The Managed Agent panel no longer shows the A2A version and identity notes when its
+        Target is an A2A proxy. The A2A proxy's Agent Card tab now gives a shorter explanation:
+        the card lists the versions the exposing surface accepts, as its Access Point shows them; a
+        new surface whose Target is the proxy accepts only A2A 1.0, so its callers send the
+        A2A-Version 1.0 header and use A2A 1.0 methods such as SendMessage; and requests to the
+        proxy are checked only for the JSON-RPC envelope.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

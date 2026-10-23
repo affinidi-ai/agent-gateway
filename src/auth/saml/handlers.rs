@@ -36,9 +36,6 @@ pub struct SamlState {
     /// Path to avatars storage
     pub avatars_storage_path: String,
 
-    /// Optional notification store for sending notifications
-    pub notification_store: Arc<tokio::sync::RwLock<Option<Arc<crate::integrations::FileSystemNotificationStore>>>>,
-
     /// Terms enforcement for human authentication.
     pub terms_manager: Arc<crate::terms::TermsManager>,
 
@@ -322,26 +319,14 @@ pub async fn saml_acs(
 
     info!(user_id = %user.user_id, role = %user.role, "SAML login successful");
 
-    // Raise the sign-in's user events in order (async, non-blocking)
-    let notif_store_guard = saml_state
-        .notification_store
-        .read()
-        .await;
-    if let Some(notif_store) = notif_store_guard.as_ref() {
-        let notif = notif_store.clone();
-        crate::observability::spawn_traced_task("integration.user_sign_in", async move {
-            for event in sign_in_events(&provisioned) {
-                match event {
-                    SignInEvent::Created(user) => crate::integrations::trigger_user_created(notif.as_ref(), user).await,
-                    SignInEvent::Updated { old, new } => {
-                        crate::integrations::trigger_user_updated(notif.as_ref(), old, new).await
-                    }
-                    SignInEvent::Login(user) => crate::integrations::trigger_user_login(notif.as_ref(), user).await,
-                }
-            }
-        });
+    // Raise the sign-in's user events in order; each is delivered in the background
+    for event in sign_in_events(&provisioned) {
+        match event {
+            SignInEvent::Created(user) => crate::integrations::trigger_user_created(user),
+            SignInEvent::Updated { old, new } => crate::integrations::trigger_user_updated(old, new),
+            SignInEvent::Login(user) => crate::integrations::trigger_user_login(user),
+        }
     }
-    drop(notif_store_guard);
 
     tracing::info!("Setting SAML session cookie");
 
@@ -641,7 +626,6 @@ mod tests {
             ),
             session_manager: Arc::new(SessionManager::new()),
             avatars_storage_path: avatars,
-            notification_store: Arc::new(tokio::sync::RwLock::new(None)),
             terms_manager: Arc::new(crate::terms::TermsManager::disabled()),
             login_throttle: Arc::new(TokenEndpointThrottle::per_client_ip(&login_throttle)),
         })

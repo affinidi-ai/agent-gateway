@@ -101,7 +101,7 @@ fn write_gateway_bootstrap_json_inner(
             "rp_id": "localhost",
             "external_origin": listen_address,
         },
-        "integration": { "types": [], "categories": [] },
+        "integration": {},
         "terms": affinidi_terms_url.is_some(),
         "affinidi_terms_url": affinidi_terms_url,
         "listeners": listeners,

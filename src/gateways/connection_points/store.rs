@@ -29,11 +29,20 @@ pub trait ConnectionPointStore: Send + Sync {
         gateway_id: &str,
     ) -> Result<Vec<GatewayConnectionPoint>>;
 
-    /// Update a connection point
+    /// Update a connection point, creating the record when it is absent
     async fn update(
         &self,
         connection_point: &GatewayConnectionPoint,
     ) -> Result<()>;
+
+    /// Update a connection point only when its record still exists, returning
+    /// whether it was written. A record deleted in the meantime is not recreated,
+    /// so implementations must make the existence check and the write atomic
+    /// with respect to `delete` for the same id.
+    async fn update_if_exists(
+        &self,
+        connection_point: &GatewayConnectionPoint,
+    ) -> Result<bool>;
 
     /// Delete a connection point
     async fn delete(
