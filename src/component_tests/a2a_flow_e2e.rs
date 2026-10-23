@@ -2557,9 +2557,9 @@ async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_
 /// Settings a configuration reload gives a stored surface without its own reach
 /// the traffic it serves: after the reload, the surface accepts what the
 /// carried settings say, not what the resolved-surface cache held before. The
-/// reload's own disk refresh also raises a storage event for the edited record,
-/// applied concurrently; it is given the same settings, so whichever lands last
-/// serves A2A 1.0 only.
+/// reload's own disk refresh also raises a storage event for the edited record;
+/// it is applied only after the reload finishes, from the stored surface, so it
+/// also serves A2A 1.0 only.
 #[tokio::test(flavor = "multi_thread")]
 async fn a2a_settings_carried_over_on_reload_are_served() {
     let mut paths = None;
@@ -2663,4 +2663,163 @@ async fn a2a_settings_carried_over_on_reload_are_served() {
     let body: serde_json::Value = refused.json().await.unwrap();
     assert_eq!(body["error"]["code"], -32009, "{body}");
     assert_eq!(body["error"]["data"]["supported"], serde_json::json!(["1.0"]), "{body}");
+}
+
+/// A stored record that can be read but not written, so saving it fails. Restored
+/// on drop.
+#[cfg(unix)]
+struct Unwritable(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Unwritable {
+    fn new(file: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        Self(file.to_path_buf())
+    }
+
+    /// Whether writing fails for this user: root writes anyway.
+    fn applies(&self) -> bool {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.0)
+            .is_err()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unwritable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// When a reload cannot store the A2A settings it carries over, it serves them
+/// from memory only, and the storage event its own disk refresh raises applies
+/// the stored record given the same settings, so it does not undo them. A surface
+/// removed from disk is no longer served after the next reload.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_settings_a_reload_could_not_store_are_kept_by_its_storage_event() {
+    let mut paths = None;
+    let mock = MockServer::start_with_response(serde_json::to_string(&a2a_response_body()).unwrap()).await;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        let admin = helpers::configure_admin_api(bootstrap);
+        paths = Some((
+            admin,
+            std::path::PathBuf::from(
+                &bootstrap
+                    .storage_paths
+                    .agent_surfaces,
+            ),
+            std::path::PathBuf::from(
+                &bootstrap
+                    .storage_paths
+                    .settings,
+            ),
+        ));
+    })
+    .await;
+    let (admin, surfaces_dir, settings_dir) = paths.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while admin
+        .get(format!("{}/api/v1/health", h.gateway_base))
+        .send()
+        .await
+        .map_or(true, |response| response.status() != 200)
+    {
+        assert!(tokio::time::Instant::now() < deadline, "the gateway never became ready to serve");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut listener = url::Url::parse(&h.gateway_base).unwrap();
+    listener
+        .set_host(Some("localhost"))
+        .unwrap();
+    let response = admin
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&serde_json::json!({
+            "name": "unstored", "status": "active",
+            "access_point": {"listen_address": listener.origin().ascii_serialization(), "route": "/smoke/unstored",
+                             "protocol": "a2a"},
+            "target": {"endpoint": h.mock.url()}
+        }))
+        .send()
+        .await
+        .expect("create surface");
+    assert_eq!(response.status(), 201);
+    let created: serde_json::Value = response.json().await.unwrap();
+
+    let send_without_version = || async {
+        reqwest::Client::new()
+            .post(format!("{}/smoke/unstored", h.gateway_base))
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"m-1","parts":[{"kind":"text","text":"hi"}]}}}"#)
+            .send()
+            .await
+            .expect("request")
+    };
+    let reload = || async {
+        let reload = admin
+            .post(format!("{}/api/v1/config/reload", h.gateway_base))
+            .send()
+            .await
+            .expect("reload");
+        assert!(reload.status().is_success(), "reload: {}", reload.status());
+    };
+    assert_eq!(
+        send_without_version()
+            .await
+            .status(),
+        200,
+        "the stored surface accepts A2A 0.3"
+    );
+
+    let surface_id = created["surface_id"]
+        .as_str()
+        .unwrap();
+    let stored_path = std::fs::read_dir(&surfaces_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| std::fs::read_to_string(path).is_ok_and(|content| content.contains(surface_id)))
+        .expect("stored surface file");
+    let mut stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
+    stored["access_point"]
+        .as_object_mut()
+        .unwrap()
+        .remove("a2a");
+    std::fs::write(&stored_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+    std::fs::create_dir_all(&settings_dir).unwrap();
+    std::fs::write(
+        settings_dir.join(crate::storage::settings_store::SETTINGS_FILE_NAME),
+        r#"{"feature_flags":{"a2a_legacy_compatibility":false}}"#,
+    )
+    .unwrap();
+
+    let unwritable = Unwritable::new(&stored_path);
+    if !unwritable.applies() {
+        return;
+    }
+    reload().await;
+    let kept_until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while tokio::time::Instant::now() < kept_until {
+        let refused = send_without_version().await;
+        assert_eq!(refused.status(), 400, "the carried A2A 1.0-only settings stay served");
+        let body: serde_json::Value = refused.json().await.unwrap();
+        assert_eq!(body["error"]["data"]["supported"], serde_json::json!(["1.0"]), "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stored_path).unwrap()).unwrap();
+    assert!(on_disk["access_point"]["a2a"].is_null(), "the carried settings were not stored: {on_disk}");
+    drop(unwritable);
+
+    std::fs::remove_file(&stored_path).unwrap();
+    reload().await;
+    assert_eq!(
+        send_without_version()
+            .await
+            .status(),
+        404,
+        "a surface removed from disk is no longer served"
+    );
 }

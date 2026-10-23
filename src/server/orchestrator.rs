@@ -4286,6 +4286,10 @@ async fn rederive_planes_on_activation(
     }
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
+    let reloading = identity_state
+        .surface_reload_lock
+        .lock()
+        .await;
     match crate::identity::handlers::config::perform_config_reload(identity_state).await {
         Ok((channels, surfaces, _, _)) => {
             info!("→ Active: reloaded {channels} channel(s) + {surfaces} surface(s) on activation");
@@ -4324,6 +4328,7 @@ async fn rederive_planes_on_activation(
             Err(e) => warn!("Failed to list surfaces for policy recompile on activation: {e}"),
         }
     }
+    drop(reloading);
 
     // 4. Recompile gateway-level OPA from the refreshed gateway records.
     if let (Some(manager), Some(store)) = (

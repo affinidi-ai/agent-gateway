@@ -1814,34 +1814,12 @@ async fn apply_surface_change_while_locked(
     }
 }
 
-/// Applies a surface another writer stored. An A2A surface stored without its
-/// own settings is served with the carried-over ones, as a load gives them;
-/// otherwise the event a reload's own disk refresh raises could replace the
-/// surface that reload applied with the raw stored record. Nothing is written
-/// back: the load that gives the settings also stores them.
-pub(crate) async fn apply_surface_upsert_from_storage(
-    state: &IdentityApiState,
-    surface: AgentSurface,
-) {
-    let mut surfaces = vec![surface];
-    if let Some(store) = state
-        .agent_surface_store
-        .as_deref()
-    {
-        crate::surfaces::carry_over_a2a_settings(store, &mut surfaces, false, || {
-            crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config)
-        })
-        .await;
-    }
-    for surface in &surfaces {
-        apply_surface_change(state, SurfaceChange::Upsert(surface)).await;
-    }
-}
-
-/// Apply a change another writer made to a surface on disk. The stored surface is
-/// applied rather than the event's copy, which a configuration reload may already
-/// have superseded (for example by carrying over A2A settings), and the surface
-/// reload lock is held from the read until the change is applied.
+/// Apply the surface as currently stored, or remove it when it is no longer stored.
+/// The surface reload lock is held from the read until the change is applied, so a
+/// change raised before a configuration reload cannot overwrite what that reload
+/// applied. An A2A surface stored without its own settings is served with the
+/// carried-over ones, as a load gives them; nothing is written back, because the
+/// load that gives the settings also stores them.
 pub(crate) async fn apply_surface_from_storage(
     state: &IdentityApiState,
     surface_id: &str,
@@ -1856,12 +1834,28 @@ pub(crate) async fn apply_surface_from_storage(
         .surface_reload_lock
         .lock()
         .await;
-    match store.get(surface_id).await {
-        Ok(Some(surface)) => apply_surface_change_while_locked(state, SurfaceChange::Upsert(&surface)).await,
-        Ok(None) => apply_surface_change_while_locked(state, SurfaceChange::Delete(surface_id)).await,
-        Err(error) => {
-            warn!(surface = %surface_id, "Could not read the surface to apply a change from storage: {error}")
+    let surface = match store.get(surface_id).await {
+        Ok(Some(surface)) => surface,
+        Ok(None) => {
+            apply_surface_change_while_locked(state, SurfaceChange::Delete(surface_id)).await;
+            return;
         }
+        Err(error) => {
+            error!(
+                surface = %surface_id,
+                "Could not read the surface to apply a change from storage: {error}. \
+                 Call POST /v1/config/reload for the change to take effect."
+            );
+            return;
+        }
+    };
+    let mut surfaces = vec![surface];
+    crate::surfaces::carry_over_a2a_settings(store, &mut surfaces, false, || {
+        crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config)
+    })
+    .await;
+    for surface in &surfaces {
+        apply_surface_change_while_locked(state, SurfaceChange::Upsert(surface)).await;
     }
 }
 
