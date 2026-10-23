@@ -2556,7 +2556,10 @@ async fn a_tenant_access_token_cannot_turn_a2a_validation_off_through_the_admin_
 
 /// Settings a configuration reload gives a stored surface without its own reach
 /// the traffic it serves: after the reload, the surface accepts what the
-/// carried settings say, not what the resolved-surface cache held before.
+/// carried settings say, not what the resolved-surface cache held before. The
+/// reload's own disk refresh also raises a storage event for the edited record,
+/// applied concurrently; it is given the same settings, so whichever lands last
+/// serves A2A 1.0 only.
 #[tokio::test(flavor = "multi_thread")]
 async fn a2a_settings_carried_over_on_reload_are_served() {
     let mut paths = None;

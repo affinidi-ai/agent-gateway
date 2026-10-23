@@ -86,6 +86,9 @@ pub enum MockStream {
     /// An open SSE stream that carries only keep-alive comments until the
     /// caller goes away.
     Quiet,
+    /// Each element of the configured JSON array as one SSE `message` event,
+    /// then the end of the body.
+    Events,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -514,6 +517,21 @@ async fn handler(
     let body = match response.stream {
         MockStream::None => Body::from(serde_json::to_vec(&response_body_value).unwrap()),
         MockStream::Sse => Body::from(sse_event(&response_body_value)),
+        MockStream::Events => {
+            let events: Vec<u8> = response_body_value
+                .as_array()
+                .expect("an Events stream is configured with a JSON array")
+                .iter()
+                .flat_map(|event| {
+                    let mut event = event.clone();
+                    if let (Some(event), Some(request_id)) = (event.as_object_mut(), body.get("id")) {
+                        event.insert("id".to_string(), request_id.clone());
+                    }
+                    sse_event(&event)
+                })
+                .collect();
+            Body::from(events)
+        }
         MockStream::ProgressThenRelease => {
             let progress = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
                 "progressToken": body.pointer("/params/_meta/progressToken").cloned().unwrap_or_default(),

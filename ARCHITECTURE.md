@@ -154,6 +154,7 @@ logic.
 | VP injection | The deferred identity presentation added to the upstream request | [`src/identity/`](src/identity/) |
 | Forward | Vetting the target and sending the request | [`src/egress.rs`](src/egress.rs) |
 | Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
+| A2A event streams | Forwarding a direct Target's `text/event-stream` one event at a time, each event given the response checks below; a refused event ends the stream with a JSON-RPC error event | [`src/a2a/streaming.rs`](src/a2a/streaming.rs), [`src/proxy/handler/a2a_stream.rs`](src/proxy/handler/a2a_stream.rs) |
 | Protected identity resolution | Deriving the managed agent's DID from its response | [`src/proxy/backend_identity.rs`](src/proxy/backend_identity.rs) |
 | Response processing | Rewrites, tool-list filtering, agent cards | [`src/proxy/response_policy.rs`](src/proxy/response_policy.rs) |
 | Metrics | Recording the outcome | [`src/metrics/`](src/metrics/) |
@@ -301,6 +302,7 @@ Breaking one of these is a correctness bug, not a style question.
 | DNS is resolved once per forward, and the request is pinned to that address with redirects disabled. | A host could rebind to an internal or metadata address between vetting and connect. |
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
+| Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
@@ -328,7 +330,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting, event-stream forwarding | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`a2a_proxies/`](src/a2a_proxies/) | Exposing a non-A2A agent as an A2A endpoint | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`mcp/`](src/mcp/) | MCP wire handling, metadata, transports | [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md), [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`mcp_proxies/`](src/mcp_proxies/) | Exposing REST APIs as MCP tool servers | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |

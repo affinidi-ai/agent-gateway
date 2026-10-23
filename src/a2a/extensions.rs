@@ -460,6 +460,18 @@ fn visit_credential_locations(
     Ok(matched)
 }
 
+/// Whether a response carries an agent identity claim: the raw identity
+/// extension or a credential declared where
+/// [`inject_identity_credential_into_response`] replaces one, or an identity
+/// payload, well-formed or not, where the protected agent's identity is read.
+pub fn response_claims_identity(body_json: &mut JsonValue) -> bool {
+    visit_credential_locations(body_json, &mut |message, _| Ok(carries_identity_extension(message))).unwrap_or(false)
+        || matches!(
+            crate::proxy::backend_identity::extract_a2a_identity_from_message(body_json),
+            Ok(_) | Err(crate::proxy::backend_identity::IdentityExtractionError::DeclaredButMissing)
+        )
+}
+
 /// Whether a message declares the raw identity extension or the credential.
 fn carries_identity_extension(message: &JsonValue) -> bool {
     let agent_identity_uri = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
@@ -1020,6 +1032,53 @@ mod tests {
         );
         assert!(!inject_credential_into_response_json(&mut body, "vp.jwt", "did:web:agent", "ch").unwrap());
         assert_eq!(body, before, "an artifact keeps its raw extension");
+    }
+
+    #[test]
+    fn a_status_message_declaring_identity_is_a_claim() {
+        let mut body = json!({
+            "result": { "taskId": "t", "status": { "state": "TASK_STATE_COMPLETED", "message": agent_message() } }
+        });
+        assert!(response_claims_identity(&mut body));
+    }
+
+    #[test]
+    fn a_planted_credential_is_a_claim() {
+        let mut body = json!({
+            "result": { "role": "ROLE_AGENT", "parts": [], "extensions": [CREDENTIAL_URI], "metadata": {} }
+        });
+        assert!(response_claims_identity(&mut body));
+    }
+
+    #[test]
+    fn an_artifact_identity_payload_is_a_claim() {
+        let mut body = json!({
+            "result": {
+                "taskId": "t",
+                "artifact": { "artifactId": "a", "parts": [], "metadata": { IDENTITY_URI: { "name": "agent" } } }
+            }
+        });
+        assert!(response_claims_identity(&mut body));
+    }
+
+    #[test]
+    fn a_declared_extension_without_payload_is_a_claim() {
+        let mut body = json!({
+            "result": { "taskId": "t", "artifact": { "artifactId": "a", "parts": [], "extensions": [IDENTITY_URI] } }
+        });
+        assert!(response_claims_identity(&mut body));
+    }
+
+    #[test]
+    fn plain_task_updates_and_errors_make_no_claim() {
+        for mut body in [
+            json!({ "result": { "taskId": "t", "status": { "state": "TASK_STATE_WORKING" } } }),
+            json!({ "result": { "taskId": "t", "artifact": { "artifactId": "a", "parts": [{ "text": "x" }] } } }),
+            json!({ "result": { "role": "ROLE_AGENT", "parts": [], "metadata": { "other": 1 } } }),
+            json!({ "error": { "code": -32603, "message": "failed" } }),
+        ] {
+            assert!(!response_claims_identity(&mut body), "{body}");
+        }
     }
 
     #[test]

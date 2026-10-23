@@ -1433,6 +1433,120 @@ fn response_contains_valid_vp(world: &mut SurfaceWorld) {
     assert!(did.starts_with("did:"), "did should start with 'did:', got: {}", did);
 }
 
+/// `error`, or the `StreamResponse` member a v1.0 stream event's result carries.
+fn stream_event_kind(event: &serde_json::Value) -> String {
+    if event.get("error").is_some() {
+        return "error".to_string();
+    }
+    event["result"]
+        .as_object()
+        .and_then(|result| result.keys().next())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn last_stream_status(world: &SurfaceWorld) -> &serde_json::Value {
+    world
+        .a2a_stream_events
+        .iter()
+        .rev()
+        .find_map(|event| event["result"].get("statusUpdate"))
+        .map(|update| &update["status"])
+        .unwrap_or_else(|| panic!("no status update in the stream: {:?}", world.a2a_stream_events))
+}
+
+#[then(expr = "the caller received the stream events {string}")]
+fn caller_received_stream_events(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let kinds: Vec<String> = world
+        .a2a_stream_events
+        .iter()
+        .map(stream_event_kind)
+        .collect();
+    let expected: Vec<&str> = expected
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(kinds, expected, "stream events: {:?}", world.a2a_stream_events);
+}
+
+#[then(expr = "the final task status is {string}")]
+fn final_task_status_is(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    assert_eq!(last_stream_status(world)["state"], expected.as_str());
+}
+
+#[then("the stream ended without an error event")]
+fn stream_ended_without_error(world: &mut SurfaceWorld) {
+    assert!(world.a2a_stream_ended, "the stream did not end cleanly");
+    assert!(
+        world
+            .a2a_stream_events
+            .iter()
+            .all(|event| event.get("error").is_none()),
+        "unexpected error event: {:?}",
+        world.a2a_stream_events
+    );
+}
+
+#[then(expr = "the stream ended with the error code {string}")]
+fn stream_ended_with_error_code(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    assert!(world.a2a_stream_ended, "the stream did not end cleanly");
+    let last = world
+        .a2a_stream_events
+        .last()
+        .expect("the stream carried events");
+    assert_eq!(last["id"], "bdd-stream", "the error event echoes the request id: {last}");
+    assert_eq!(last["error"]["code"], -32603, "{last}");
+    assert_eq!(last["error"]["data"]["code"], expected.as_str(), "{last}");
+}
+
+#[then(expr = "the last stream event is the managed agent's error {string}")]
+fn last_stream_event_is_agent_error(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    assert!(world.a2a_stream_ended, "the stream did not end cleanly");
+    let last = world
+        .a2a_stream_events
+        .last()
+        .expect("the stream carried events");
+    assert_eq!(last["error"]["message"], expected.as_str(), "{last}");
+    assert!(
+        last["error"]
+            .get("data")
+            .is_none(),
+        "the gateway added nothing to the agent's error: {last}"
+    );
+}
+
+#[then("the final stream status message carries the credential extension")]
+fn final_stream_status_carries_credential(world: &mut SurfaceWorld) {
+    let message = &last_stream_status(world)["message"];
+    assert_eq!(message["extensions"], serde_json::json!([AGENT_IDENTITY_CREDENTIAL_URI]), "{message}");
+    assert!(
+        message["metadata"]
+            .get(AGENT_IDENTITY_URI)
+            .is_none(),
+        "the raw identity is replaced: {message}"
+    );
+    let credential = &message["metadata"][AGENT_IDENTITY_CREDENTIAL_URI];
+    assert!(is_valid_vp(&credential["verifiablePresentation"]), "{credential}");
+    assert!(
+        credential["did"]
+            .as_str()
+            .is_some_and(|did| did.starts_with("did:")),
+        "{credential}"
+    );
+}
+
 #[then("the agent card contains the credential extension")]
 fn agent_card_contains_credential(world: &mut SurfaceWorld) {
     let body = get_response_body_value(world);

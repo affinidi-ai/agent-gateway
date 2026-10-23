@@ -16,7 +16,7 @@ use crate::bdd_support::config::single_surface_fixture::{
 };
 use crate::bdd_support::config::source_auth::caller_authentication_method_json;
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN;
-use crate::bdd_support::mock_server::{MockAgentFixture, MockResponse};
+use crate::bdd_support::mock_server::{MockAgentFixture, MockResponse, MockStream};
 use crate::bdd_support::policies::{
     build_gateway_request_path_policy, build_mcp_tool_allow_all_policy, build_mcp_tool_allow_policy,
     build_mcp_tool_deny_all_policy, build_surface_a2a_method_policy, build_surface_request_content_policy,
@@ -2488,6 +2488,81 @@ fn managed_agent_response_has_identity(
         }
     });
     set_primary_target_response(world, response);
+}
+
+/// A v1.0 task event stream: submitted, working, an artifact, then completed
+/// with `final_message` on its status when one is given.
+fn streamed_task(final_message: Option<serde_json::Value>) -> MockResponse {
+    let event = |result: serde_json::Value| serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": result });
+    let mut completed = serde_json::json!({ "state": "TASK_STATE_COMPLETED" });
+    if let Some(message) = final_message {
+        completed["message"] = message;
+    }
+    MockResponse::streamed(
+        serde_json::json!([
+            event(serde_json::json!({ "task": {
+                "id": "bdd-task", "contextId": "bdd-context", "status": { "state": "TASK_STATE_SUBMITTED" }
+            } })),
+            event(serde_json::json!({ "statusUpdate": {
+                "taskId": "bdd-task", "contextId": "bdd-context", "status": { "state": "TASK_STATE_WORKING" }
+            } })),
+            event(serde_json::json!({ "artifactUpdate": {
+                "taskId": "bdd-task", "contextId": "bdd-context",
+                "artifact": { "artifactId": "bdd-artifact", "parts": [{ "text": "draft" }] }
+            } })),
+            event(serde_json::json!({ "statusUpdate": {
+                "taskId": "bdd-task", "contextId": "bdd-context", "status": completed
+            } })),
+        ]),
+        MockStream::Events,
+    )
+}
+
+#[given(expr = "managed agent {string} streams a task that completes")]
+fn managed_agent_streams_a_task(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    set_primary_target_response(world, streamed_task(None));
+}
+
+#[given(expr = "managed agent {string} streams a task whose final status message claims its identity")]
+fn managed_agent_streams_a_task_claiming_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let message = serde_json::json!({
+        "messageId": "bdd-agent-message",
+        "role": "ROLE_AGENT",
+        "parts": [{ "text": "done" }],
+        "extensions": [AGENT_IDENTITY_URI],
+        "metadata": {
+            AGENT_IDENTITY_URI: {
+                "softwareInfo": { "name": "managed-agent", "version": "2.0" },
+                "cloudProvider": "local"
+            }
+        }
+    });
+    set_primary_target_response(world, streamed_task(Some(message)));
+}
+
+#[given(expr = "managed agent {string} streams the error {string}")]
+fn managed_agent_streams_an_error(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    message: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let error = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32001, "message": message } });
+    set_primary_target_response(world, MockResponse::streamed(serde_json::json!([error]), MockStream::Events));
 }
 
 #[given(expr = "managed agent {string} publishes the agent-identity extension on its agent card")]

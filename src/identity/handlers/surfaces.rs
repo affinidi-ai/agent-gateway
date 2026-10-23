@@ -1800,12 +1800,28 @@ async fn apply_surface_change(
     }
 }
 
-// wraps original function to avoid leaking implementation details
+/// Applies a surface another writer stored. An A2A surface stored without its
+/// own settings is served with the carried-over ones, as a load gives them;
+/// otherwise the event a reload's own disk refresh raises could replace the
+/// surface that reload applied with the raw stored record. Nothing is written
+/// back: the load that gives the settings also stores them.
 pub(crate) async fn apply_surface_upsert_from_storage(
     state: &IdentityApiState,
     surface: AgentSurface,
 ) {
-    apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
+    let mut surfaces = vec![surface];
+    if let Some(store) = state
+        .agent_surface_store
+        .as_deref()
+    {
+        crate::surfaces::carry_over_a2a_settings(store, &mut surfaces, false, || {
+            crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config)
+        })
+        .await;
+    }
+    for surface in &surfaces {
+        apply_surface_change(state, SurfaceChange::Upsert(surface)).await;
+    }
 }
 
 // wraps original function to avoid leaking implementation details
