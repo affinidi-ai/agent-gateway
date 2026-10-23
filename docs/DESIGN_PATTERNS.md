@@ -52,6 +52,8 @@ spawned owner must publish one initialized value, rather than introducing a shar
 `MetricsStore::start_periodic_save` batches dirty in-memory metrics into periodic backend writes.
 Mutation paths mark the store dirty; the periodic task persists a snapshot instead of writing on
 every request. Shutdown paths are responsible for their explicit final flush.
+`SystemMetricsStore` follows the same rule: it writes its history at most every 15 minutes and
+`main.rs` flushes it on `SIGTERM` or Ctrl-C.
 
 ## Builder-style optional dependencies
 
