@@ -199,17 +199,46 @@ impl PendingConnectionStore {
         existing
     }
 
-    /// Store a pending connection
+    /// Store a pending connection, logging a persistence failure
+    #[cfg(test)]
     pub async fn store(
         &self,
         connection: PendingOOBConnection,
     ) {
         if let Err(e) = self
-            .connections
-            .save(&connection)
+            .try_store(connection)
             .await
         {
             error!("Failed to store OOB connection: {}", e);
+        }
+    }
+
+    /// Store a pending connection and report whether it was persisted
+    pub async fn try_store(
+        &self,
+        connection: PendingOOBConnection,
+    ) -> Result<()> {
+        self.connections
+            .save(&connection)
+            .await
+    }
+
+    /// Removes the pending connections of the gateway whose DID is `gateway_did`,
+    /// which is the inviter's temporary DID until the handshake completes and the
+    /// inviter's secure DID after it.
+    pub async fn remove_for_gateway_did(
+        &self,
+        gateway_did: &str,
+    ) {
+        for pending in self.list_all().await {
+            if pending.their_temporary_did == gateway_did
+                || pending
+                    .their_secure_did
+                    .as_deref()
+                    == Some(gateway_did)
+            {
+                self.remove(&pending.id).await;
+            }
         }
     }
 
@@ -357,6 +386,70 @@ impl PendingConnectionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pairing(
+        id: &str,
+        their_temporary_did: &str,
+        their_secure_did: Option<&str>,
+    ) -> PendingOOBConnection {
+        let json = serde_json::json!({
+            "id": id,
+            "our_temporary_did": "did:web:us.example:connection-points:tmp",
+            "our_secure_did": "did:web:us.example:connection-points:1111",
+            "their_temporary_did": their_temporary_did,
+            "their_secure_did": their_secure_did,
+            "mediator_did": "did:web:mediator.example",
+            "connection_point_id": "",
+            "invitation_id": id,
+            "role": "Acceptor",
+            "state": "WaitingForResponse",
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2026-01-01T01:00:00Z"
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn try_store_reports_success_and_the_pairing_is_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingConnectionStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .try_store(pairing("one", "did:web:them:tmp", None))
+            .await
+            .unwrap();
+        assert_eq!(store.list_all().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_for_gateway_did_removes_only_that_gateways_pairings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingConnectionStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .store(pairing("by-temporary", "did:web:them:tmp", None))
+            .await;
+        store
+            .store(pairing("by-secure", "did:web:other:tmp", Some("did:web:them:tmp")))
+            .await;
+        store
+            .store(pairing("someone-else", "did:web:else:tmp", Some("did:web:else:secure")))
+            .await;
+
+        store
+            .remove_for_gateway_did("did:web:them:tmp")
+            .await;
+
+        let left: Vec<String> = store
+            .list_all()
+            .await
+            .into_iter()
+            .map(|pending| pending.id)
+            .collect();
+        assert_eq!(left, vec!["someone-else".to_string()]);
+    }
 
     #[test]
     fn pending_oob_connection_json_without_their_issuer_did_deserialises() {

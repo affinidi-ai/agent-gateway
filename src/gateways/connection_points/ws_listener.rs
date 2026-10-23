@@ -2933,15 +2933,6 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                                     info!("✓ Gateway {} created successfully!", gateway.id);
                                                     info!("  Gateway DID: {}", gateway.did);
 
-                                                    if let Some(pending) = pend_store
-                                                        .get_by_temporary_did(&inviter_temporary_did)
-                                                        .await
-                                                    {
-                                                        pend_store
-                                                            .remove(&pending.id)
-                                                            .await;
-                                                    }
-
                                                     // Clean up temporary connection point
                                                     info!(
                                                         "🧹 Cleaning up temporary connection point: {}",
@@ -3772,6 +3763,13 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
 
     info!("   ✓ Gateway listener endpoint {} created", connection_point.id);
 
+    // The pairing is complete once the permanent connection point is stored. It is
+    // retired before the temporary listener stops, because stopping that listener
+    // aborts the task that is running this function.
+    pending_store
+        .remove(&pending_conn.id)
+        .await;
+
     // Step 4.5: Start listener for this gateway using the connection's mediator.
     // Mediator-side ACLs (if any) are managed by the mediator itself and are
     // not a precondition set by this gateway before starting the listener.
@@ -3858,10 +3856,6 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             }
         }
     }
-
-    // Step 5: Don't remove pending connection yet - caller needs mediator info
-    // pending_store.remove(&pending_conn.id).await;
-    // info!("✓ Removed pending connection state");
 
     info!("🎉 OOB connection finalized successfully!");
     info!("  Gateway ID: {}", gateway.id);
@@ -4347,19 +4341,6 @@ async fn listen_for_connection_accepted<S: GatewayStore, CS: super::ConnectionPo
                 })?;
 
                 info!("✅ Gateway finalized: {} ({})", gateway.id, gateway.did);
-
-                // Now remove the pending connection (we're done with it)
-                if let Some(pending_conn) = pending_store
-                    .get_by_temporary_did(inviter_temp_did)
-                    .await
-                {
-                    pending_store
-                        .remove(&pending_conn.id)
-                        .await;
-                    info!("   ✓ Removed pending connection state");
-                } else {
-                    warn!("   Could not find pending connection to remove (may have been removed already)");
-                }
 
                 // Delete the message from mediator
                 let delete_req = affinidi_messaging_sdk::messages::DeleteMessageRequest {

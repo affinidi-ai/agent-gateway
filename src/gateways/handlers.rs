@@ -647,6 +647,7 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
     Extension(connection_point_store): Extension<std::sync::Arc<P>>,
     Extension(listener_manager): Extension<std::sync::Arc<ConnectionPointListenerManager>>,
+    Extension(pending_store): Extension<Arc<crate::gateways::PendingConnectionStore>>,
     Extension(caller_user_id): Extension<String>,
     Extension(user_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
@@ -718,6 +719,9 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
         .delete(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete gateway: {}", e)))?;
+    pending_store
+        .remove_for_gateway_did(&gateway.did)
+        .await;
 
     info!("Deleted gateway {} and stopped all associated listeners", id);
 
@@ -2133,27 +2137,36 @@ pub async fn connect_via_oob<
         }
         None => None,
     };
-    match acceptor_lock {
+    let stored = match acceptor_lock {
         Some(guard) => {
             let pending_store = pending_store.clone();
             // Spawned so a cancelled request cannot release the lock while the write runs.
             tokio::spawn(async move {
                 let _held_until_stored = guard;
                 pending_store
-                    .store(pending_connection)
-                    .await;
+                    .try_store(pending_connection)
+                    .await
             })
             .await
-            .map_err(|e| {
-                error!("Storing the pending connection failed: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store the pending connection".to_string())
-            })?;
+            .map_err(|e| anyhow::anyhow!("the store task failed: {e}"))
+            .and_then(|stored| stored)
         }
         None => {
             pending_store
-                .store(pending_connection)
-                .await;
+                .try_store(pending_connection)
+                .await
         }
+    };
+    if let Err(e) = stored {
+        error!("Storing the pending connection failed: {e}");
+        remove_generated_identities(
+            &bootstrap_config
+                .storage_paths
+                .connection_points,
+            &[temp_cp_uuid, secure_cp_uuid],
+        )
+        .await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to store the pending connection".to_string()));
     }
     info!("✓ Pending connection state stored");
     info!("");
