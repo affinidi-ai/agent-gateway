@@ -2933,6 +2933,15 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                                     info!("✓ Gateway {} created successfully!", gateway.id);
                                                     info!("  Gateway DID: {}", gateway.did);
 
+                                                    if let Some(pending) = pend_store
+                                                        .get_by_temporary_did(&inviter_temporary_did)
+                                                        .await
+                                                    {
+                                                        pend_store
+                                                            .remove(&pending.id)
+                                                            .await;
+                                                    }
+
                                                     // Clean up temporary connection point
                                                     info!(
                                                         "🧹 Cleaning up temporary connection point: {}",

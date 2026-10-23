@@ -625,8 +625,9 @@ pub(crate) async fn resolve_directory_mediator<S: MediatorStore>(
 ) -> Result<DirectoryMediator, DirectoryResolveError> {
     let not_found = || (StatusCode::NOT_FOUND, "Mediator not found".to_string());
     let directory = directory.ok_or_else(not_found)?;
+    let answered = directory.has_loaded();
     let Some(entry) = directory.find(id).await else {
-        return Err(if directory.has_loaded() {
+        return Err(if answered {
             not_found().into()
         } else {
             DirectoryResolveError::DirectoryUnavailable

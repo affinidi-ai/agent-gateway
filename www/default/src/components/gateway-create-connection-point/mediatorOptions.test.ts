@@ -31,6 +31,10 @@ describe('initialMediatorSelection', () => {
     ).toBe('');
   });
 
+  it('never falls back to a single stored provided record', () => {
+    expect(initialMediatorSelection([{ ...stored('kept'), provided: true }], null)).toBe('');
+  });
+
   it('falls back to the only stored mediator', () => {
     expect(initialMediatorSelection([stored('only')], null)).toBe('only');
   });
