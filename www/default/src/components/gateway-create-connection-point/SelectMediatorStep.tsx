@@ -74,21 +74,42 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
             <i className="fas fa-exclamation-triangle hero-status-icon warning"></i>
           </div>
           <h5>No Compatible Mediators Available</h5>
+          {error && (
+            <div
+              className="alert alert-danger"
+              role="alert"
+              data-testid="wizard-mediator-load-error"
+            >
+              {error}
+            </div>
+          )}
           <p className="text-muted">
             No mediators are compatible with this gateway. Please{' '}
             <Link href="/mediators/wizard" variant="inline">
               add a mediator
-            </Link>{' '}
-            or contact your administrator.
+            </Link>
+            , refresh the list (a mediator directory can take a moment to answer after the gateway
+            starts), or contact your administrator.
           </p>
-          <AppButton
-            variant="secondary"
-            size="md"
-            onClick={onCancel}
-            iconStart={<i className="fas fa-arrow-left"></i>}
-          >
-            Back to Connections
-          </AppButton>
+          <div className="d-flex justify-content-center gap-2">
+            <AppButton
+              variant="secondary"
+              size="md"
+              onClick={onCancel}
+              iconStart={<i className="fas fa-arrow-left"></i>}
+            >
+              Back to Connections
+            </AppButton>
+            <AppButton
+              variant="primary"
+              size="md"
+              data-testid="wizard-mediator-refresh-button"
+              onClick={loadMediators}
+              iconStart={<i className="fas fa-sync"></i>}
+            >
+              Refresh
+            </AppButton>
+          </div>
         </div>
       </div>
     );
@@ -131,6 +152,17 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
               </option>
             ))}
           </select>
+          <div className="mt-2">
+            <AppButton
+              variant="secondary"
+              size="sm"
+              data-testid="wizard-mediator-refresh-button"
+              onClick={loadMediators}
+              iconStart={<i className="fas fa-sync"></i>}
+            >
+              Refresh list
+            </AppButton>
+          </div>
 
           {selectedMediator && (
             <div className="mt-3 p-3 border rounded bg-light">

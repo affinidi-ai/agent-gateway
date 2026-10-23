@@ -416,7 +416,7 @@ Right after start the gateway therefore asks every 2 seconds, in the background,
 seconds, until the directory answers `200`, and allows each of those requests up to 10 seconds
 (later requests allow 3). No request
 waits for that: until the first answer, the lists contain the stored mediators only and the wizard
-pre-selects nothing. If the window ends without an answer, the background refresh keeps trying, not
+pre-selects no directory entry (it still pre-selects the only stored mediator, other than a provided record), and an empty wizard list offers a Refresh button. If the window ends without an answer, the background refresh keeps trying, not
 more often than every 30 seconds, and the lists stay as they are until it succeeds.
 
 Creating a Connection Point with a `directory:` id before the directory has answered successfully
@@ -472,6 +472,26 @@ the record used. Calling `GET`, `PUT` or `DELETE` on a stored provided record fo
 mediator resource scope by its own id, like any mediator. A record already stored under the id a
 `directory:` entry would get, which the caller may not use, fails the creation with `404` before
 anything is sent or created.
+
+**Known limitations of pairing with a provided acceptor mediator.** These are current behaviour,
+not guarantees:
+
+- An invitation accepted just before the gateway restarts does not complete. The startup sweep removes
+  pending gateways and their pairings, and finalization refuses to continue when this attempt's
+  pending gateway is missing instead of recreating one, which would attach a gateway with no tenant
+  to a tenant's mediator. The invitation has to be accepted again. Recreating the pending gateway
+  with its original tenant is a planned change that is not implemented yet.
+- A rejected acceptance, or one whose finalization fails, leaves its pairing, temporary Connection
+  Point, listener and pending gateway until the pairing expires or the gateway restarts. They hold the
+  provided mediator (`409` on `DELETE`) until then. A failure while the invitation is being
+  accepted removes all of them at once.
+- A request cancelled by the client after its pending gateway is stored and before its temporary
+  Connection Point is created leaves a Pending gateway, which a restart removes and an operator can
+  delete. The window is a few store operations wide and needs a disconnect inside it, so it is rare,
+  and handling it is postponed.
+- For `did:webvh` Connection Points, cleaning up a failed acceptance removes the generated key
+  directories only. The DID log and the identity record stay, as they do when such a Connection
+  Point is deleted.
 
 **Log lines.** The directory's lines are plain text at the targets `agent_gateway::event_hook` (the
 directory client), `agent_gateway::mediators::handlers` and

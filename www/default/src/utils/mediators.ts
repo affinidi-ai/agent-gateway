@@ -43,8 +43,8 @@ export function mediatorPageRows<T extends ListedMediator>(mediators: T[]): T[] 
 
 /**
  * Delete is offered for a stored provided record only when the server marks it
- * `deletable`: the directory answered without its DID. The API still refuses
- * while something uses the record.
+ * `deletable`: the directory answered without its DID, or none is configured.
+ * The API still refuses while something uses the record.
  */
 export function canDeleteProvidedMediator(mediator: {
   id: string;

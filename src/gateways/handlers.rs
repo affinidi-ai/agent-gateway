@@ -1764,8 +1764,9 @@ async fn lock_provided_acceptor_mediator<M: crate::mediators::MediatorStore>(
     Ok(Some(guard))
 }
 
-/// Removes the key directories this request generated for its identities, so a
-/// request that stops before storing anything leaves no key material behind.
+/// Removes the key directories this request generated for its identities. For
+/// did:webvh the DID log and the identity record stay behind, as they do when a
+/// connection point is deleted.
 async fn remove_generated_identities(
     keys_root: &str,
     identity_ids: &[uuid::Uuid],
