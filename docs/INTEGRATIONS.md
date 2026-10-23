@@ -353,13 +353,30 @@ directory-listed mediators only.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_ATTEMPTS` | `5` | For directory-listed mediators only: how many times the first call is repeated after the first refusal, from `0` (never repeat) to `20`. Any other value is ignored with a `warn` and the default is used. |
-| `AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_DELAY_MS` | `2000` | For directory-listed mediators only: wait before each repeat, from `1` to `60000` milliseconds. Any other value is ignored with a `warn` and the default is used. |
+| `AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_DELAY_MS` | `2000` | For directory-listed mediators only: wait before each repeat, from `1` to `30000` milliseconds. Any other value is ignored with a `warn` and the default is used. |
 
 Each repeat logs one `warn` (`Directory mediator has not admitted the connection point DID yet;
 retrying the first call retry=1 of=5 delay_ms=2000`). The live connection's own readiness wait can add up to
-10 seconds to an attempt, so the whole sequence is capped at 60 seconds: once another wait would
-pass that point the last refusal is returned and creation fails with `creation_failed`, whatever the
-attempts and delay are set to. The settings are read once at startup.
+10 seconds to an attempt, so the whole sequence is capped at 60 seconds, and a repeat starts only if,
+after its wait, at least 10 seconds of the cap remain for it. Otherwise the last refusal is returned
+and creation fails with `creation_failed`, whatever the attempts and delay are set to, so a longer
+delay or slower attempts mean fewer repeats than configured (with the largest delay, 30 seconds, at
+most one). The settings are read from the environment the first time a Connection Point is created on a directory mediator after the gateway starts, and kept until it restarts.
+
+**Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
+`did` field is logged like any DID and masked by the global log redactor. The URL, the secret and
+the signature are never logged.
+
+| Level | Line |
+| --- | --- |
+| `info` | `Event hook configured signed=false timeout_ms=5000` |
+| `warn` | `Event hook is enabled without a signing secret; requests are sent unsigned. Set AG_EVENT_HOOK_SECRET to sign them` |
+| `info` | `Event hook event delivered event="connection_point.creation_failed" sequence=1792490172201530 connection_point_id=4c747a16-5378-46f4-a73d-c3bf55d7fdd2 did=did:peer:2.<...> attempt=1` (`debug` for `connection_point.connected`) |
+| `warn` | `Event hook delivery failed event="connection_point.creation_started" sequence=1792490173523043 connection_point_id=9dd6556a-3b12-408d-82cf-87dba9cf34c4 did=did:peer:2.<...> attempt=1 error=hook answered 503 Service Unavailable` |
+| `warn` | `Event hook event dropped after the last retry event=... attempts=6 error=...` |
+| `warn` | `Event hook rejected an event; dropping it event="connection_point.creation_started" ... status=422 reason="not_eligible"` |
+| `warn` | `Event hook delivery pool is full; dropping the event` |
+| `warn` | `Connection point deleted, but its record could not be read first, so no connection_point.deleted event is sent connection_point_id=...` |
 
 ## Mediator directory
 
@@ -389,18 +406,18 @@ counts as unavailable, and the gateway lists only its stored mediators. Entries 
 use: at most 50, a well-formed `did:` DID of at most 1024 bytes, a non-empty `name` of at most 200
 characters with control characters replaced by spaces and whitespace collapsed, duplicates by DID
 dropped. The list is cached for 5
-minutes after a non-empty answer and 30 seconds after an empty or failed one. Once the directory has answered, an
-expired list is returned at once while one background task refreshes it, so no caller waits, and a
-failed refresh keeps serving the last good list.
+minutes after a non-empty answer and 30 seconds after an empty or failed one. An expired list, or
+the empty list of a directory that has not answered yet, is returned at once while one background
+task refreshes it, so no list request ever waits for the directory, and a failed refresh keeps
+serving the last good list.
 
 **Startup.** A directory may need time to answer its first request, or answer `503` until it can.
 Right after start the gateway therefore asks every 2 seconds, in the background, for up to 30
 seconds, until the directory answers `200`, and allows each of those requests up to 10 seconds
 (later requests allow 3). No request
 waits for that: until the first answer, the lists contain the stored mediators only and the wizard
-pre-selects nothing. After that a stale list is refreshed on demand, as described above, and a
-caller that arrives while a first fetch is running waits for its result instead of seeing an empty
-list.
+pre-selects nothing. If the window ends without an answer, the background refresh keeps trying, not
+more often than every 30 seconds, and the lists stay as they are until it succeeds.
 
 Creating a Connection Point with a `directory:` id before the directory has answered successfully
 (right after start, while the startup requests still run, or because every fetch failed) answers
@@ -410,7 +427,8 @@ answered, an id it does not list is `404 Mediator not found`.
 
 A directory entry is always listed with the id `directory:<16 hex characters>` (stable per DID), its
 `name`, `provided: true`, no description and no identity on the mediator. The wizard pre-selects the
-first `provided` mediator when no other choice was made; nothing else marks it. The entry is
+first `directory:` entry when no other choice was made (a stored record created from an entry is
+never pre-selected); nothing else marks it. The entry is
 read-only: it cannot be fetched, edited, deleted or pinged by that id. Creating a Connection Point
 with that `mediator_id` turns it into a stored record the first time: the gateway resolves the
 mediator's DID document, mints its own identity on it like `POST /v1/mediators` does, and stores it
@@ -438,10 +456,13 @@ exists for the DID and the entry otherwise. A mediator an operator added for the
 of its own and never hides the entry. A stored provided record cannot be changed through the API: `PUT
 /v1/mediators/<id>` answers `409`. `DELETE` answers `409` too, with a message saying it is still
 offered by the directory or used by a connection point or a pending pairing, until the directory
-has answered successfully without its DID and nothing uses it: no stored Connection Point names it
+has answered successfully without its DID (or no directory is configured) and nothing uses it: no stored Connection Point names it
 (a pending pairing's temporary Connection Point names its acceptor mediator in
 `oob_message.secure_mediator_id`), and no pending pairing names it as its acceptor mediator record. Then `DELETE` removes it, and
-the next Connection Point created on the entry, if the directory offers it again, stores it fresh.
+the list marks such a record `"deletable": true` (a directory answer that omits its DID sets it, and so does having no directory
+configured, since nothing then offers the record; a directory that has not answered yet, or still
+lists the DID, does not. The dashboard offers Delete only for such records, and the in-use check still
+happens at `DELETE`). The next Connection Point created on the entry, if the directory offers it again, stores it fresh.
 That is how a stale provided mediator is cleaned up or refreshed. The check and the removal hold
 the same per-DID lock as the creation, and the record is read again under it, so a creation cannot
 start using the record meanwhile. A creation on a provided record takes the same lock for its final
@@ -452,20 +473,20 @@ mediator resource scope by its own id, like any mediator. A record already store
 `directory:` entry would get, which the caller may not use, fails the creation with `404` before
 anything is sent or created.
 
-**Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
-`did` field is logged like any DID and masked by the global log redactor. The URL, the secret and
-the signature are never logged.
+**Log lines.** The directory's lines are plain text at the targets `agent_gateway::event_hook` (the
+directory client), `agent_gateway::mediators::handlers` and
+`agent_gateway::gateways::connection_points`. The URL, the secret and the host are never logged: a
+failed request is reported by category only.
 
 | Level | Line |
 | --- | --- |
-| `info` | `Event hook configured signed=false timeout_ms=5000` |
-| `warn` | `Event hook is enabled without a signing secret; requests are sent unsigned. Set AG_EVENT_HOOK_SECRET to sign them` |
-| `info` | `Event hook event delivered event="connection_point.creation_failed" sequence=1792490172201530 connection_point_id=4c747a16-5378-46f4-a73d-c3bf55d7fdd2 did=did:peer:2.<...> attempt=1` (`debug` for `connection_point.connected`) |
-| `warn` | `Event hook delivery failed event="connection_point.creation_started" sequence=1792490173523043 connection_point_id=9dd6556a-3b12-408d-82cf-87dba9cf34c4 did=did:peer:2.<...> attempt=1 error=hook answered 503 Service Unavailable` |
-| `warn` | `Event hook event dropped after the last retry event=... attempts=6 error=...` |
-| `warn` | `Event hook rejected an event; dropping it event="connection_point.creation_started" ... status=422 reason="not_eligible"` |
-| `warn` | `Event hook delivery pool is full; dropping the event` |
-| `warn` | `Connection point deleted, but its record could not be read first, so no connection_point.deleted event is sent connection_point_id=...` |
+| `error` | `AG_MEDIATOR_DIRECTORY_URL must be an http or https URL with a host; the mediator directory is disabled` (and the other rule failures, which name the rule and never the URL) |
+| `warn` | `Mediator directory unavailable: the target address is blocked by the egress policy` (the reason is one of the categories `directory answered <status>`, `the response was not a valid directory`, `request failed`, `the request could not be prepared`, `the host name could not be resolved`, `the target address is blocked by the egress policy`, `too many redirects`, `the URL could not be parsed`) |
+| `warn` | `Mediator directory did not answer within 3s` (10 s for a startup request) |
+| `warn` | `Could not resolve the DID document of a directory mediator: ...` (creating a Connection Point on an entry answers `502`) |
+| `warn` | `Directory mediator has not admitted the connection point DID yet; retrying the first call retry=1 of=5 delay_ms=2000` |
+| `warn` | `The mediator is no longer offered by the mediator directory; its first call was not retried` |
+| `warn` | `AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_ATTEMPTS="..." is not an integer from 0 to 20; using 5 (it applies to mediators listed by the directory only)` (and the same for `..._DELAY_MS`) |
 
 ## Dashboard
 

@@ -40,3 +40,20 @@ export function mediatorPageRows<T extends ListedMediator>(mediators: T[]): T[] 
     mediator => !isUnstoredDirectoryMediator(mediator) || !storedProvided.has(mediator.did)
   );
 }
+
+/**
+ * Delete is offered for a stored provided record only when the server marks it
+ * `deletable`: the directory answered without its DID. The API still refuses
+ * while something uses the record.
+ */
+export function canDeleteProvidedMediator(mediator: {
+  id: string;
+  provided?: boolean;
+  deletable?: boolean;
+}): boolean {
+  return (
+    mediator.provided === true &&
+    mediator.deletable === true &&
+    !isUnstoredDirectoryMediator(mediator)
+  );
+}

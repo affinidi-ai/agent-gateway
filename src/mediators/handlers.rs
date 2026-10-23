@@ -151,7 +151,7 @@ fn mediator_writable(
 /// that names its record id. The caller holds the DID's lock, so a creation cannot start using it
 /// meanwhile. The next use of the entry stores the record again from the
 /// directory.
-async fn reject_provided_delete(
+pub(crate) async fn reject_provided_delete(
     mediator: &Mediator,
     directory: Option<&Arc<MediatorDirectory>>,
     connection_points: Option<&crate::gateways::FileSystemConnectionPointStore>,
@@ -293,16 +293,35 @@ async fn list_accessible_mediators<S: MediatorStore>(
     mediators.retain(|mediator| mediator_allowed(mediator, context, scope));
 
     let Some(directory) = directory else {
+        // With no directory configured nothing offers a provided record: it is stale.
         return Ok(mediators
             .into_iter()
-            .map(MediatorResponse::from)
+            .map(|mediator| {
+                let mut item = MediatorResponse::from(mediator);
+                item.deletable = item.provided;
+                item
+            })
             .collect());
     };
-    let mut items = merge_directory_entries(directory.entries().await, mediators, chrono::Utc::now());
+    // One snapshot: whether the directory ever answered, read first so that a
+    // `true` is always backed by the list read next, and that list.
+    let answered = directory.has_loaded();
+    let entries = directory.entries().await;
+    let offered: std::collections::HashSet<&str> = entries
+        .iter()
+        .map(|entry| entry.did.as_str())
+        .collect();
+    let mut items = merge_directory_entries(entries.clone(), mediators, chrono::Utc::now());
     items.retain(|item| {
         !is_directory_mediator_id(&item.id)
             || scope_allows_resource(resource_scope(scope), tenant_context(context), ResourceKind::Mediators, &item.id)
     });
+    for item in items
+        .iter_mut()
+        .filter(|item| item.provided && !is_directory_mediator_id(&item.id))
+    {
+        item.deletable = answered && !offered.contains(item.did.as_str());
+    }
     Ok(items)
 }
 
@@ -1852,6 +1871,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_provided_record_a_loaded_directory_stopped_offering_is_deletable() {
+        use crate::mediators::MediatorStore;
+        let (store, _points, _dir) = stores().await;
+        for stored in [
+            record("did:web:offered", true, 5, "offered"),
+            record("did:web:dropped", true, 5, "dropped"),
+            record("did:web:operator", false, 5, "operator"),
+        ] {
+            store
+                .create(&stored)
+                .await
+                .unwrap();
+        }
+        let (directory, _) = directory_listing(Some("did:web:offered")).await;
+        let items = super::list_accessible_mediators(&store, Some(&directory), &None, &None)
+            .await
+            .unwrap();
+        let deletable: Vec<(&str, bool)> = items
+            .iter()
+            .filter(|item| {
+                !item
+                    .id
+                    .starts_with("directory:")
+            })
+            .map(|item| (item.id.as_str(), item.deletable))
+            .collect();
+        assert!(deletable.contains(&("dropped", true)), "{deletable:?}");
+        assert!(deletable.contains(&("offered", false)), "{deletable:?}");
+        assert!(deletable.contains(&("operator", false)), "{deletable:?}");
+        assert!(
+            items
+                .iter()
+                .filter(|item| item
+                    .id
+                    .starts_with("directory:"))
+                .all(|item| !item.deletable)
+        );
+
+        let never_answered = crate::event_hook::MediatorDirectory::new(&crate::event_hook::EventHookSettings {
+            directory_url: Some("http://127.0.0.1:9/directory".into()),
+            ..crate::event_hook::EventHookSettings::default()
+        })
+        .await
+        .unwrap();
+        let items = super::list_accessible_mediators(&store, Some(&never_answered), &None, &None)
+            .await
+            .unwrap();
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.deletable),
+            "a directory that has not answered says nothing about a record"
+        );
+        let items = super::list_accessible_mediators(&store, None, &None, &None)
+            .await
+            .unwrap();
+        let deletable: Vec<(&str, bool)> = items
+            .iter()
+            .map(|item| (item.id.as_str(), item.deletable))
+            .collect();
+        assert!(deletable.contains(&("offered", true)), "no directory configured: provided records are stale");
+        assert!(deletable.contains(&("dropped", true)), "{deletable:?}");
+        assert!(deletable.contains(&("operator", false)), "{deletable:?}");
+    }
+
+    #[tokio::test]
     async fn a_cancelled_request_does_not_leak_its_lock_entry() {
         let did = "did:web:cancelled.example";
         let holder = tokio::spawn(super::under_did_lock(did, async {
@@ -1895,7 +1980,9 @@ mod tests {
             directory_url: Some(url.clone()),
             ..crate::event_hook::EventHookSettings::default()
         };
-        let directory = crate::event_hook::MediatorDirectory::new(&settings).unwrap();
+        let directory = crate::event_hook::MediatorDirectory::new(&settings)
+            .await
+            .unwrap();
         directory.entries().await;
         (directory, url)
     }

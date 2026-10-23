@@ -11,6 +11,7 @@ import { EmptyState } from '../components/shared/EmptyState';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
 import {
+  canDeleteProvidedMediator,
   isProvidedMediator,
   isUnstoredDirectoryMediator,
   mediatorPageRows,
@@ -27,6 +28,7 @@ interface Mediator {
   created_at: string;
   updated_at: string;
   provided?: boolean;
+  deletable?: boolean;
 }
 
 function hasDIDCommMessaging(doc: any): boolean {
@@ -48,7 +50,8 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
   const { guard, balloonNode } = useLimitGuard();
   const { hasPermission } = usePermissions();
   const { id: idParam } = useParams<{ id?: string }>();
-  const [mediators, setMediators] = useState<Mediator[]>([]);
+  const [listedMediators, setListedMediators] = useState<Mediator[]>([]);
+  const mediators = useMemo(() => mediatorPageRows(listedMediators), [listedMediators]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -94,7 +97,7 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
       setLoading(true);
       setError(null);
       const response = await apiClient.get('/mediators');
-      setMediators(mediatorPageRows(response.data));
+      setListedMediators(response.data);
     } catch (err: any) {
       setError(err.message || 'Failed to load mediators');
     } finally {
@@ -462,7 +465,8 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
                                   <i className="fas fa-edit" aria-hidden="true"></i>
                                 </AppButton>
                               )}
-                              {!isProvidedMediator(mediator) &&
+                              {(!isProvidedMediator(mediator) ||
+                                canDeleteProvidedMediator(mediator)) &&
                                 hasPermission('mediators.delete') && (
                                   <DeleteButton
                                     onDelete={() => handleDelete(mediator.id)}

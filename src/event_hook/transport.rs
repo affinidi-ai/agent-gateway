@@ -32,7 +32,7 @@ pub async fn post_json(
     let (client, target) =
         match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&raw_url, timeout)).await {
             Ok(Ok(pinned)) => pinned,
-            Ok(Err(e)) => return HookOutcome::retry(e.to_string()),
+            Ok(Err(e)) => return HookOutcome::retry(egress_reason(&e)),
             Err(e) => return HookOutcome::retry(format!("egress task failed: {e}")),
         };
     let request = client
@@ -71,6 +71,20 @@ fn sign_request(
         .header("X-Webhook-Signature-256", format!("sha256={signature}")))
 }
 
+/// The category of an egress failure, without the host or address it names: the
+/// configured URL is operator input and stays out of logs and errors.
+pub(crate) fn egress_reason(error: &crate::egress::EgressError) -> String {
+    use crate::egress::EgressError;
+    match error {
+        EgressError::Blocked(_) => "the target address is blocked by the egress policy",
+        EgressError::Dns(_) => "the host name could not be resolved",
+        EgressError::TooManyRedirects => "too many redirects",
+        EgressError::Http(_) => "the request could not be prepared",
+        EgressError::Parse(_) => "the URL could not be parsed",
+    }
+    .to_string()
+}
+
 /// GETs `url` through the same pinned client as [`post_json`], signing the
 /// empty body when a secret is set, and returns the status and at most
 /// `limit` bytes of the body. The URL stays out of every error.
@@ -84,7 +98,7 @@ pub async fn get_limited(
     let (client, target) = tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&raw_url, timeout))
         .await
         .map_err(|e| format!("egress task failed: {e}"))?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| egress_reason(&e))?;
     let request = sign_request(client.get(target.url), secret, b"")?;
     let mut response = request
         .send()
@@ -192,6 +206,30 @@ pub(crate) mod tests {
     use super::*;
     use axum::{Router, http::HeaderMap, routing::any};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn an_egress_failure_names_its_category_and_never_the_host() {
+        use crate::egress::EgressError;
+        for (error, category) in [
+            (EgressError::Blocked("169.254.169.254".into()), "blocked"),
+            (EgressError::Dns("secret-host.internal".into()), "resolved"),
+            (EgressError::Parse("http://user@secret-host.internal".into()), "parsed"),
+            (EgressError::TooManyRedirects, "redirects"),
+        ] {
+            let reason = egress_reason(&error);
+            assert!(reason.contains(category), "{reason}");
+            assert!(!reason.contains("secret-host") && !reason.contains("169.254"), "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_directory_target_reports_the_category_only() {
+        let reason = get_limited("http://169.254.169.254/latest/meta-data", Duration::from_secs(1), None, 1024)
+            .await
+            .unwrap_err();
+        assert!(reason.contains("blocked"), "{reason}");
+        assert!(!reason.contains("169.254"), "{reason}");
+    }
 
     #[derive(Debug, Clone)]
     pub(crate) struct Captured {

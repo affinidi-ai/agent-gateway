@@ -1,4 +1,5 @@
 import {
+  canDeleteProvidedMediator,
   dropdownMediators,
   isProvidedMediator,
   isUnstoredDirectoryMediator,
@@ -57,5 +58,29 @@ describe('dropdownMediators and mediatorPageRows', () => {
 
   it('never drops an operator-added mediator from the dropdown', () => {
     expect(dropdownMediators([entry, operator]).map(m => m.id)).toEqual([entry.id, operator.id]);
+  });
+});
+
+describe('canDeleteProvidedMediator', () => {
+  it('is true only for a stored provided record the server marks deletable', () => {
+    expect(canDeleteProvidedMediator({ id: 'aaaa-1', provided: true, deletable: true })).toBe(true);
+  });
+
+  it('stays false while the server has not said the directory dropped it', () => {
+    expect(canDeleteProvidedMediator({ id: 'aaaa-1', provided: true })).toBe(false);
+    expect(canDeleteProvidedMediator({ id: 'aaaa-1', provided: true, deletable: false })).toBe(
+      false
+    );
+  });
+
+  it('is not about entries or operator-added mediators', () => {
+    expect(
+      canDeleteProvidedMediator({
+        id: 'directory:0123456789abcdef',
+        provided: true,
+        deletable: true,
+      })
+    ).toBe(false);
+    expect(canDeleteProvidedMediator({ id: 'cccc-3', deletable: true })).toBe(false);
   });
 });

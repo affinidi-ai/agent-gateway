@@ -1347,6 +1347,156 @@ mod tests {
         mediator
     }
 
+    #[tokio::test]
+    async fn a_delete_that_starts_after_the_acceptor_check_waits_for_the_pairing_and_then_finds_it() {
+        use crate::mediators::MediatorStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mediators = crate::mediators::FileSystemMediatorStore::new(dir.path().join("mediators"))
+            .await
+            .unwrap();
+        let points = Arc::new(
+            crate::gateways::FileSystemConnectionPointStore::new(dir.path().join("points"))
+                .await
+                .unwrap(),
+        );
+        let pairings = Arc::new(
+            crate::gateways::PendingConnectionStore::new(dir.path().join("pairings"))
+                .await
+                .unwrap(),
+        );
+        let mut provided = acceptor_mediator("unused");
+        provided.tenant_id = None;
+        provided.provided = true;
+        provided.did = "did:web:provided-acceptor.example".into();
+        mediators
+            .create(&provided)
+            .await
+            .unwrap();
+
+        let guard = lock_provided_acceptor_mediator(&mediators, &provided.id, None, &None, &None)
+            .await
+            .unwrap()
+            .expect("a provided acceptor mediator is locked");
+        let deleting = {
+            let (provided, points, pairings) = (provided.clone(), points.clone(), pairings.clone());
+            tokio::spawn(async move {
+                let _guard = crate::mediators::handlers::lock_did(&provided.did).await;
+                crate::mediators::handlers::reject_provided_delete(
+                    &provided,
+                    None,
+                    Some(points.as_ref()),
+                    Some(pairings.as_ref()),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!deleting.is_finished(), "the delete waits while the pairing is being persisted");
+
+        let pairing: crate::gateways::PendingOOBConnection = serde_json::from_value(serde_json::json!({
+            "id": "inv-1",
+            "our_temporary_did": "did:web:us.example:tmp",
+            "our_secure_did": "did:web:us.example:secure",
+            "their_temporary_did": "did:web:them.example:tmp",
+            "their_secure_did": null,
+            "mediator_did": provided.did,
+            "connection_point_id": "",
+            "invitation_id": "inv-1",
+            "role": "Acceptor",
+            "state": "WaitingForResponse",
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2026-01-01T01:00:00Z",
+            "mediator_record_id": provided.id,
+        }))
+        .unwrap();
+        pairings.store(pairing).await;
+        drop(guard);
+        let refused = deleting
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(
+            refused
+                .1
+                .contains("pending pairing"),
+            "{}",
+            refused.1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keys_of_a_refused_pairing_request_are_removed_and_other_keys_stay() {
+        let root = tempfile::tempdir().unwrap();
+        for id in ["temporary", "secure", "someone-elses"] {
+            let directory = root.path().join(id);
+            tokio::fs::create_dir_all(&directory)
+                .await
+                .unwrap();
+            tokio::fs::write(directory.join("keys.json"), b"[]")
+                .await
+                .unwrap();
+        }
+        remove_generated_identities(root.path().to_str().unwrap(), &["temporary", "secure", "never-created"]).await;
+        assert!(
+            !root
+                .path()
+                .join("temporary")
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join("secure")
+                .exists()
+        );
+        assert!(
+            root.path()
+                .join("someone-elses")
+                .join("keys.json")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_provided_acceptor_mediator_is_locked_and_a_vanished_one_is_refused() {
+        use crate::mediators::MediatorStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mediators = crate::mediators::FileSystemMediatorStore::new(dir.path().join("mediators"))
+            .await
+            .unwrap();
+        let mut operator = acceptor_mediator("unused");
+        operator.tenant_id = None;
+        mediators
+            .create(&operator)
+            .await
+            .unwrap();
+        assert!(
+            lock_provided_acceptor_mediator(&mediators, &operator.id, None, &None, &None)
+                .await
+                .unwrap()
+                .is_none(),
+            "an operator-added mediator needs no lock"
+        );
+        let missing = lock_provided_acceptor_mediator(&mediators, "gone", None, &None, &None).await;
+        assert!(matches!(missing, Ok(None)), "an unknown id is left to the usual checks");
+
+        let mut stale = acceptor_mediator("unused");
+        stale.id = "stale".into();
+        stale.tenant_id = None;
+        stale.provided = true;
+        stale.status = crate::mediators::types::MediatorStatus::Disabled;
+        mediators
+            .create(&stale)
+            .await
+            .unwrap();
+        let refused = lock_provided_acceptor_mediator(&mediators, "stale", None, &None, &None)
+            .await
+            .err()
+            .expect("a provided record that is no longer usable is refused under the lock");
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+    }
+
     fn tenant_a_caller() -> (Option<Extension<PatTenantContext>>, Option<Extension<PatResourceScope>>) {
         let context = PatTenantContext {
             token_id: "token-a".into(),
@@ -1567,6 +1717,55 @@ fn check_acceptor_mediator(
         return Err((StatusCode::BAD_REQUEST, ACCEPTOR_MEDIATOR_UNAVAILABLE.to_string()));
     }
     Ok(mediator)
+}
+
+/// For a provided acceptor mediator (one the directory created), takes the DID's
+/// lock, the one deleting and creating on that record use, and checks under it
+/// that the record still exists and is usable. The caller holds the guard until
+/// the pairing that names the record is persisted, so a delete cannot slip in
+/// between the first check and that write. Any other mediator needs no lock.
+async fn lock_provided_acceptor_mediator<M: crate::mediators::MediatorStore>(
+    mediator_store: &M,
+    mediator_id: &str,
+    gateway_tenant_id: Option<&str>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<Option<crate::mediators::handlers::DidGuard>, (StatusCode, String)> {
+    let lookup_failed = |e: anyhow::Error| {
+        error!(mediator_id, error = %e, "Failed to look up acceptor mediator");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to look up mediator".to_string())
+    };
+    let Some(provided) = mediator_store
+        .get(mediator_id)
+        .await
+        .map_err(lookup_failed)?
+        .filter(|mediator| mediator.provided)
+    else {
+        return Ok(None);
+    };
+    let guard = crate::mediators::handlers::lock_did(&provided.did).await;
+    let current = mediator_store
+        .get(mediator_id)
+        .await
+        .map_err(lookup_failed)?;
+    check_acceptor_mediator(mediator_id, current, gateway_tenant_id, context, scope)?;
+    Ok(Some(guard))
+}
+
+/// Removes the key directories this request generated for its identities, so a
+/// request that stops before storing anything leaves no key material behind.
+async fn remove_generated_identities(
+    keys_root: &str,
+    identity_ids: &[&str],
+) {
+    for id in identity_ids {
+        let directory = std::path::Path::new(keys_root).join(id);
+        if let Err(e) = tokio::fs::remove_dir_all(&directory).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!("Could not remove the identity keys of a refused request: {e}");
+        }
+    }
 }
 
 /// Response for connecting to a gateway via OOB
@@ -1893,9 +2092,61 @@ pub async fn connect_via_oob<
     info!("    Role: {:?}", pending_connection.role);
     info!("    State: {:?}", pending_connection.state);
 
-    pending_store
-        .store(pending_connection)
-        .await;
+    let acceptor_lock = match req
+        .acceptor_mediator_id
+        .as_deref()
+    {
+        Some(mediator_id) => {
+            match lock_provided_acceptor_mediator(
+                mediator_store.as_ref(),
+                mediator_id,
+                req.tenant_id.as_deref(),
+                &context,
+                &scope,
+            )
+            .await
+            {
+                Ok(lock) => lock,
+                Err(refusal) => {
+                    didcomm_client
+                        .atm()
+                        .graceful_shutdown()
+                        .await;
+                    remove_generated_identities(
+                        &bootstrap_config
+                            .storage_paths
+                            .connection_points,
+                        &[&temp_cp_id, &secure_cp_id],
+                    )
+                    .await;
+                    return Err(refusal);
+                }
+            }
+        }
+        None => None,
+    };
+    match acceptor_lock {
+        Some(guard) => {
+            let pending_store = pending_store.clone();
+            // Spawned so a cancelled request cannot release the lock while the write runs.
+            tokio::spawn(async move {
+                let _held_until_stored = guard;
+                pending_store
+                    .store(pending_connection)
+                    .await;
+            })
+            .await
+            .map_err(|e| {
+                error!("Storing the pending connection failed: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store the pending connection".to_string())
+            })?;
+        }
+        None => {
+            pending_store
+                .store(pending_connection)
+                .await;
+        }
+    }
     info!("✓ Pending connection state stored");
     info!("");
 
