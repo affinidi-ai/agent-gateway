@@ -739,6 +739,63 @@ mod tests {
         assert_eq!(error_code(&forwarded[1].1), "upstream_stream_idle");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_pauses_past_the_idle_timeout_still_gets_the_next_event() {
+        let (processor, _) = Recorder::new();
+        let (response, _) = respond(futures::stream::iter(chunks(&task_events()[..2])), processor);
+        let mut body = response
+            .into_body()
+            .into_data_stream();
+        let first = body
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("TASK_STATE_SUBMITTED"));
+
+        tokio::time::advance(limits().idle_timeout * 2).await;
+
+        let second = loop {
+            let frame = body
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            if !frame.starts_with(b":") {
+                break String::from_utf8_lossy(&frame).into_owned();
+            }
+        };
+        assert!(second.contains("TASK_STATE_WORKING"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn events_split_across_chunks_with_crlf_line_endings_are_forwarded_whole() {
+        let events = task_events();
+        let wire: String = events
+            .iter()
+            .map(|event| format!("event: message\r\ndata: {event}\r\n\r\n"))
+            .collect();
+        let source: Chunks = wire
+            .as_bytes()
+            .chunks(7)
+            .map(|piece| Ok(Bytes::copy_from_slice(piece)))
+            .collect();
+        let (processor, recorded) = Recorder::new();
+        let (response, _) = respond(futures::stream::iter(source), processor);
+        let forwarded = body_events(response).await;
+        assert_eq!(forwarded.len(), events.len());
+        assert_eq!(forwarded[2].1["result"]["artifactUpdate"]["artifact"]["parts"][0]["text"], "draft");
+        assert_eq!(forwarded[3].1["result"]["statusUpdate"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(
+            recorded
+                .lock()
+                .unwrap()
+                .rewritten
+                .len(),
+            events.len()
+        );
+    }
+
     #[tokio::test]
     async fn an_event_is_forwarded_before_the_next_one_arrives() {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();

@@ -190,6 +190,8 @@ struct ByteBudget {
     bom_checked: bool,
 }
 
+/// The idle clock runs only while the upstream is being waited on, so time
+/// the consumer takes between reads is not counted against the upstream.
 fn with_deadlines<Source, SourceError>(
     source: Source,
     limits: SseLimits,
@@ -199,11 +201,11 @@ where
     SourceError: Display,
 {
     let started = tokio::time::Instant::now();
-    futures::stream::try_unfold((Box::pin(source), started), move |(mut source, last_activity)| async move {
+    futures::stream::try_unfold(Box::pin(source), move |mut source| async move {
         let lifetime = started
             .checked_add(limits.max_lifetime)
             .ok_or(SseReadError::InvalidLimits)?;
-        let idle = last_activity
+        let idle = tokio::time::Instant::now()
             .checked_add(limits.idle_timeout)
             .ok_or(SseReadError::InvalidLimits)?;
         let deadline = lifetime.min(idle);
@@ -223,7 +225,7 @@ where
                 .map_err(|_| timeout_error())?;
             match next {
                 Some(Ok(bytes)) if bytes.is_empty() => tokio::task::yield_now().await,
-                Some(Ok(bytes)) => return Ok(Some((bytes, (source, tokio::time::Instant::now())))),
+                Some(Ok(bytes)) => return Ok(Some((bytes, source))),
                 Some(Err(error)) => return Err(SseReadError::Transport(error.to_string())),
                 None => return Ok(None),
             }
@@ -1704,6 +1706,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.unwrap().unwrap_err(), SseReadError::IdleTimeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_consumer_is_not_counted_as_a_quiet_upstream() {
+        let source = futures::stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"first")),
+            Ok(Bytes::from_static(b"second")),
+        ]);
+        let idle_timeout = Duration::from_secs(1);
+        let mut stream = Box::pin(with_deadlines(source, SseLimits { idle_timeout, ..limits(1024) }));
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap(),
+            "first"
+        );
+        tokio::time::advance(idle_timeout * 5).await;
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap(),
+            "second"
+        );
     }
 
     #[tokio::test]

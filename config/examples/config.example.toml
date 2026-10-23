@@ -198,7 +198,7 @@ default_version = "1.0"
 max_body_size = 10485760  # 10MB in bytes; also caps buffered upstream responses
 timeout_seconds = 30
 # Longest an A2A event stream from a direct Target is forwarded (1 to 86400
-# seconds). The gap between events is bounded by the surface's
+# seconds). It ends sooner when the Target sends nothing for the surface's
 # networking.timeout.idle_secs.
 stream_max_lifetime_secs = 3600
 

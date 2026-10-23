@@ -1333,9 +1333,9 @@ pub struct TimeoutConfig {
     #[serde(default = "default_connect_timeout")]
     pub connect_secs: u64,
 
-    /// Idle timeout in seconds (time between data frames of a buffered
-    /// upstream response body, and between the events of a forwarded A2A
-    /// event stream; `0` disables it)
+    /// Idle timeout in seconds (how long the upstream may send nothing while a
+    /// buffered response body or a forwarded A2A event stream is read; `0`
+    /// disables it)
     #[serde(default = "default_idle_timeout")]
     pub idle_secs: u64,
 }

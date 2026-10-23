@@ -724,7 +724,10 @@ An A2A event stream from a direct Target (see [Event streams](#event-streams)) i
 a time. One event, as received and after the checks, may hold up to `[a2a] max_body_size`, and the
 stream ends with an error event when the Target sends nothing for the surface's
 `networking.timeout.idle_secs` (default 60 s; `0` leaves only the lifetime) or is still streaming at
-`[a2a] stream_max_lifetime_secs` (default 3600 s, at most 86400 s). The Target must send its
+`[a2a] stream_max_lifetime_secs` (default 3600 s, at most 86400 s). Anything the Target sends counts
+as activity, a comment or keep-alive line included, and the idle time is counted only while the
+Gateway waits for the Target, so a caller that is slow to read an event does not end the stream.
+The same holds for the MCP passthrough's idle timeout. The Target must send its
 headers within the request timeout, and the call to it is bounded by that lifetime plus the request
 timeout.
 

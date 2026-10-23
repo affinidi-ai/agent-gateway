@@ -25,10 +25,10 @@ changes:
         A forwarded A2A event stream may run for [a2a] stream_max_lifetime_secs (default 3600,
         1 to 86400), no longer the 30-second request timeout, though the Target must still send
         its response headers within the request timeout. A streaming call is sent once, whatever
-        the surface's retry policy. The gap between events is bounded
-        by the surface's networking.timeout.idle_secs, as the Surface Builder's Idle timeout help
-        now says, and one event by [a2a] max_body_size; a stream that passes a limit ends with an
-        error event.
+        the surface's retry policy. A Target that sends nothing for the surface's
+        networking.timeout.idle_secs ends the stream, as the Surface Builder's Idle timeout help
+        now says, and one event may hold up to [a2a] max_body_size; a stream that passes a limit
+        ends with an error event.
   changed: []
   fixed:
     - timestamp: '2026-10-22T00:00:00.000Z'
@@ -42,6 +42,14 @@ changes:
         without an A2A-Version header were accepted. The record is now given its settings,
         and unsupported header metadata mappings are cleared, before it is applied, as on any
         load.
+    - timestamp: '2026-10-23T00:00:00.000Z'
+      title: Stop counting a slow caller's reading time as an idle MCP stream
+      description: >-
+        The idle timeout of an MCP text/event-stream passthrough ran from the moment the
+        previous chunk was handed on, so a caller that took longer than
+        mcp_http.stream_idle_timeout_secs to read an event ended the stream as idle even
+        though the upstream kept sending. The timeout now counts only the time the gateway
+        waits for the upstream, for MCP and A2A streams alike.
   removed: []
   security:
     - timestamp: '2026-10-22T00:00:00.000Z'
