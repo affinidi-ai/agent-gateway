@@ -201,10 +201,14 @@ const AddMcpProxyWizardPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-mcp-proxy-wizard">
       {wizardState.currentStep !== 'complete' && (
         <div className="mb-3">
-          <button className="btn btn-sm btn-secondary" onClick={handleCancel}>
+          <button
+            className="btn btn-sm btn-secondary"
+            data-testid="mcp-proxy-wizard-back-button"
+            onClick={handleCancel}
+          >
             <i className="fas fa-arrow-left"></i>
           </button>
         </div>

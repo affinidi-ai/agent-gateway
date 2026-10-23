@@ -47,7 +47,7 @@ const LimitsTab: React.FC = () => {
                 const p = pct(item.current, item.limit);
                 const barClass = atLimit ? 'bg-danger' : p >= 80 ? 'bg-warning' : 'bg-success';
                 return (
-                  <tr key={item.id}>
+                  <tr key={item.id} data-testid={`limits-row-${item.id}`}>
                     <td>
                       <div className="fw-semibold">{item.name}</div>
                       <div className="text-muted small">{item.description}</div>

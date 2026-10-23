@@ -159,6 +159,7 @@ const UserPreferencesTab: React.FC<UserPreferencesTabProps> = ({
 
               <div className="d-flex">
                 <button
+                  data-testid="settings-user-save-button"
                   type="submit"
                   className="btn btn-primary btn-sm me-2"
                   disabled={isSubmitting}
@@ -169,6 +170,7 @@ const UserPreferencesTab: React.FC<UserPreferencesTabProps> = ({
                   type="button"
                   className="btn btn-secondary btn-sm"
                   disabled={isSubmitting}
+                  data-testid="settings-user-reset-button"
                   onClick={onResetUserSettings}
                 >
                   <i className="fas fa-undo"></i> Reset to System Defaults

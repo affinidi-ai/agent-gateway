@@ -137,7 +137,10 @@ export const ManagedByBanner: React.FC<{ managedBy: string }> = ({ managedBy }) 
 );
 
 export const ManagedByBadge: React.FC<{ managedBy: string }> = ({ managedBy }) => (
-  <span className="badge badge-secondary ms-2" title={`Created and maintained by ${managedBy}`}>
+  <span
+    className="badge badge-secondary text-wrap text-break ms-2"
+    title={`Created and maintained by ${managedBy}`}
+  >
     <i className="fas fa-robot me-1" aria-hidden="true" />
     {managedBy}
   </span>

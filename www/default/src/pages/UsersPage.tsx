@@ -135,9 +135,15 @@ const UsersPage: React.FC = () => {
     <div className="container-fluid">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div>
-          <SearchInput value={searchTerm} onChange={setSearchTerm} placeholder="Filter Users...." />
+          <SearchInput
+            data-testid="users-search-input"
+            value={searchTerm}
+            onChange={setSearchTerm}
+            placeholder="Filter Users...."
+          />
           <select
             className="form-control dropdown-styling"
+            data-testid="users-role-filter"
             value={roleFilter}
             onChange={e => setRoleFilter(e.target.value as any)}
             style={{
@@ -153,6 +159,7 @@ const UsersPage: React.FC = () => {
           </select>
           <select
             className="form-control dropdown-styling"
+            data-testid="users-status-filter"
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value as any)}
             style={{
@@ -302,6 +309,7 @@ const UsersPage: React.FC = () => {
                   {filteredUsers.map(user => {
                     return (
                       <tr
+                        data-testid={`users-row-${user.user_id}`}
                         key={user.user_id}
                         className={user.status === 'new' ? 'table-light' : ''}
                         onClick={() => setSelectedUser(user)}
@@ -377,6 +385,7 @@ const UsersPage: React.FC = () => {
                             <>
                               <button
                                 className="btn btn-sm btn-primary"
+                                data-testid={`users-edit-button-${user.user_id}`}
                                 onClick={() => navigate(`/users/${user.user_id}`)}
                                 title="Edit user"
                               >
@@ -388,6 +397,7 @@ const UsersPage: React.FC = () => {
                             <>
                               <button
                                 className="btn btn-sm btn-success"
+                                data-testid={`users-approve-button-${user.user_id}`}
                                 onClick={() => handleQuickApprove(user)}
                                 title="Quick approve user"
                               >
@@ -399,6 +409,7 @@ const UsersPage: React.FC = () => {
                             user.role !== 'administrator' &&
                             !user.is_primary && (
                               <DeleteButton
+                                data-testid={`users-delete-button-${user.user_id}`}
                                 onDelete={() => handleDelete(user)}
                                 className="btn-sm"
                                 title="Delete user permanently"

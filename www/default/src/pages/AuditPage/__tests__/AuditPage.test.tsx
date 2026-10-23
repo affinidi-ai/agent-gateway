@@ -212,6 +212,69 @@ describe('AuditPage', () => {
   });
 });
 
+describe('AuditPage stacked layout', () => {
+  let scrolled: Element[];
+  let shellDirection: string;
+  const realGetComputedStyle = window.getComputedStyle;
+
+  beforeEach(() => {
+    mockPermissions = {};
+    mockGet.mockReset();
+    mockGet.mockResolvedValue({ data: AUDIT_RESPONSE });
+    scrolled = [];
+    shellDirection = 'column';
+    Element.prototype.scrollIntoView = jest.fn(function (this: Element) {
+      scrolled.push(this);
+    });
+    // jsdom applies no stylesheet, so stand in for the breakpoint that turns
+    // the shell into a column.
+    jest
+      .spyOn(window, 'getComputedStyle')
+      .mockImplementation((el, pseudo) =>
+        el.classList.contains('audit-shell')
+          ? ({ flexDirection: shellDirection } as CSSStyleDeclaration)
+          : realGetComputedStyle(el, pseudo)
+      );
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    delete (Element.prototype as Partial<Element>).scrollIntoView;
+  });
+
+  it('scrolls to the detail panel when an entry is selected while stacked', async () => {
+    renderPage();
+
+    fireEvent.click(await screen.findByTestId('audit-item-1'));
+    expect(scrolled).toEqual([screen.getByTestId('audit-detail-panel')]);
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
+      block: 'start',
+      behavior: 'smooth',
+    });
+  });
+
+  it('does not scroll on the default selection or a filter change', async () => {
+    renderPage();
+
+    await screen.findByTestId('audit-item-1');
+    expect(screen.getByTestId('audit-detail-panel')).toHaveAttribute('data-open', 'true');
+    fireEvent.click(within(facet('Decision:')).getByTestId('filter-chip-deny'));
+    await waitFor(() =>
+      expect(mockGet).toHaveBeenCalledWith(expect.stringContaining('decision=deny'))
+    );
+    expect(scrolled).toEqual([]);
+  });
+
+  it('does not scroll when an entry is selected side by side', async () => {
+    shellDirection = 'row';
+    renderPage();
+
+    fireEvent.click(await screen.findByTestId('audit-item-1'));
+    expect(screen.getByTestId('audit-item-1')).toHaveAttribute('aria-current', 'true');
+    expect(scrolled).toEqual([]);
+  });
+});
+
 function LocationProbe() {
   const location = useLocation();
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;

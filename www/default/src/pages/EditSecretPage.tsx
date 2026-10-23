@@ -406,10 +406,11 @@ const EditSecretPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-secret-editor">
       <div className="mb-3">
         <button
           className="btn btn-sm btn-secondary"
+          data-testid="secret-editor-back-button"
           onClick={() => navigate('/secrets')}
           disabled={isSaving}
         >
@@ -616,6 +617,7 @@ const EditSecretPage: React.FC = () => {
                     <button
                       type="button"
                       className="btn btn-outline-secondary"
+                      data-testid="secret-editor-generate-button"
                       onClick={generateSecretValue}
                       disabled={isSaving}
                       title="Generate a random 32-character secret value (letters, digits, symbols)"
@@ -662,6 +664,7 @@ const EditSecretPage: React.FC = () => {
                       <button
                         type="button"
                         className="btn btn-outline-secondary"
+                        data-testid="secret-editor-add-tag-button"
                         onClick={handleAddTag}
                       >
                         <i className="fas fa-plus"></i> Add
@@ -739,6 +742,7 @@ const EditSecretPage: React.FC = () => {
                   {isEditMode && (
                     <DeleteButton
                       onDelete={handleDelete}
+                      data-testid="secret-editor-delete-button"
                       title="Delete this secret"
                       disabled={isSaving}
                       variant="danger"

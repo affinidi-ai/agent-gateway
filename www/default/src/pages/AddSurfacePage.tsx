@@ -642,7 +642,10 @@ const AddSurfacePage: React.FC = () => {
   // builder renders.
   if (protocolPickerShown) {
     return (
-      <div className="container-fluid surface-page-fill surface-page-fill--picker">
+      <div
+        className="container-fluid surface-page-fill surface-page-fill--picker"
+        data-testid="page-add-surface"
+      >
         <div className="surface-canvas-protocol-picker">
           <div
             className="card shadow channel-editor-card surface-picker-card"
@@ -689,6 +692,7 @@ const AddSurfacePage: React.FC = () => {
                     return (
                       <li
                         key={tpl.id}
+                        data-testid={`surface-template-row-${tpl.id}`}
                         className="surface-template-row surface-template-row--static"
                       >
                         <div
@@ -727,6 +731,7 @@ const AddSurfacePage: React.FC = () => {
                             type="button"
                             className="btn btn-sm btn-primary surface-template-row__action"
                             disabled={applying}
+                            data-testid={`surface-template-use-button-${tpl.id}`}
                             aria-label={`Use template ${tpl.name}`}
                             title={`Use template ${tpl.name}`}
                             onClick={e => {
@@ -762,6 +767,7 @@ const AddSurfacePage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-secondary btn-sm"
+                data-testid="add-surface-cancel-button"
                 onClick={() => navigate('/surfaces')}
               >
                 Cancel
@@ -774,7 +780,7 @@ const AddSurfacePage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid surface-page-fill">
+    <div className="container-fluid surface-page-fill" data-testid="page-add-surface">
       {error && (
         <div className="alert alert-danger" role="alert">
           <i className="fas fa-exclamation-circle me-2" />
@@ -827,6 +833,7 @@ const AddSurfacePage: React.FC = () => {
             <button
               type="button"
               className="btn btn-secondary btn-sm"
+              data-testid="add-surface-back-button"
               onClick={discard}
               disabled={saving}
               title="Back to surfaces"
@@ -836,6 +843,7 @@ const AddSurfacePage: React.FC = () => {
             <button
               type="button"
               className="btn btn-success btn-sm"
+              data-testid="add-surface-create-button"
               onClick={handleCreate}
               disabled={saving || !!saveDisabledReason}
               title={saveDisabledReason || (saving ? 'Creating…' : 'Create surface')}
