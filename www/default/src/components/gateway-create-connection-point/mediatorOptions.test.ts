@@ -13,6 +13,13 @@ describe('initialMediatorSelection', () => {
     expect(initialMediatorSelection([directory('directory:a'), stored('b')], 'b')).toBe('b');
   });
 
+  it('drops an initial choice that is not among the options', () => {
+    expect(initialMediatorSelection([directory('directory:a'), stored('b')], 'kept')).toBe(
+      'directory:a'
+    );
+    expect(initialMediatorSelection([stored('b'), stored('c')], 'kept')).toBe('');
+  });
+
   it('pre-selects the first directory entry in list order', () => {
     expect(
       initialMediatorSelection(
