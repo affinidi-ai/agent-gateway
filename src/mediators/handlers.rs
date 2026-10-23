@@ -193,15 +193,17 @@ pub(crate) async fn reject_provided_delete(
                     .and_then(|value| value.as_str())
                     == Some(mediator.id.as_str())
         });
+    let now = chrono::Utc::now();
     let pairing = pending_pairings
         .list_all()
         .await
         .iter()
         .any(|pending| {
-            pending
-                .mediator_record_id
-                .as_deref()
-                == Some(mediator.id.as_str())
+            pending.expires_at > now
+                && pending
+                    .mediator_record_id
+                    .as_deref()
+                    == Some(mediator.id.as_str())
         });
     if referenced || pairing {
         return Err(used_message());
@@ -2036,6 +2038,14 @@ mod tests {
         id: &str,
         mediator_record_id: Option<&str>,
     ) -> crate::gateways::PendingOOBConnection {
+        pairing_expiring(id, mediator_record_id, chrono::Utc::now() + chrono::Duration::hours(1))
+    }
+
+    fn pairing_expiring(
+        id: &str,
+        mediator_record_id: Option<&str>,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::gateways::PendingOOBConnection {
         serde_json::from_value(json!({
             "id": id,
             "our_temporary_did": "did:web:us.example:tmp",
@@ -2048,7 +2058,7 @@ mod tests {
             "role": "Acceptor",
             "state": "WaitingForResponse",
             "created_at": "2026-01-01T00:00:00Z",
-            "expires_at": "2026-01-01T01:00:00Z",
+            "expires_at": expires_at,
             "mediator_record_id": mediator_record_id,
         }))
         .unwrap()
@@ -2115,6 +2125,10 @@ mod tests {
             .unwrap();
         assert!(check().await.is_ok(), "removed again");
 
+        pairings
+            .store(pairing_expiring("old", Some(&created.id), chrono::Utc::now() - chrono::Duration::minutes(1)))
+            .await;
+        assert!(check().await.is_ok(), "an expired pairing no longer holds the record");
         pairings
             .store(pending_pairing("inv-1", Some(&created.id)))
             .await;
