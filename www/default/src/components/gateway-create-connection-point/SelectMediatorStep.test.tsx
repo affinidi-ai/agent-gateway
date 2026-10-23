@@ -36,6 +36,22 @@ describe('SelectMediatorStep', () => {
     expect(await screen.findByRole('option', { name: /Shared/ })).toBeInTheDocument();
   });
 
+  it('keeps the mediator the user picked when the list is refreshed', async () => {
+    const stored = { id: 'own', did: 'did:web:own.example', name: 'Own' };
+    get.mockResolvedValueOnce({ data: [entry, stored] }).mockResolvedValueOnce({
+      data: [entry, stored],
+    });
+    renderStep();
+    const select = await screen.findByTestId('connection-point-mediator-select');
+    await waitFor(() => expect(select).toHaveValue('directory:a'));
+    await userEvent.selectOptions(select, 'own');
+    await userEvent.click(screen.getByTestId('wizard-mediator-refresh-button'));
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByTestId('connection-point-mediator-select')).toHaveValue('own')
+    );
+  });
+
   it('shows a failed load instead of the empty-list message alone, and can retry', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     get.mockRejectedValueOnce(new Error('boom')).mockResolvedValueOnce({ data: [entry] });

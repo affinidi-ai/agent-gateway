@@ -37,7 +37,11 @@ const SelectMediatorStep: React.FC<SelectMediatorStepProps> = ({
         Array.isArray(response.data) ? response.data : []
       );
       setMediators(mediatorsList);
-      setSelectedMediator(initialMediatorSelection(mediatorsList, initialMediatorId));
+      setSelectedMediator(current =>
+        current && mediatorsList.some(mediator => mediator.id === current)
+          ? current
+          : initialMediatorSelection(mediatorsList, initialMediatorId)
+      );
     } catch (err: unknown) {
       console.error('Failed to load mediators:', err);
       setError('Failed to load mediators. Please try again.');
