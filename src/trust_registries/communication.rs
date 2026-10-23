@@ -48,8 +48,6 @@ const WS_READY_MAX_ATTEMPTS: u8 = 5;
 const WS_READY_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Back-off delay between failed preflight attempts.
 const WS_READY_RETRY_DELAY: Duration = Duration::from_millis(300);
-/// Upper bound on shutting down a closed connection's mediator websocket.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connection protocol message types
 #[allow(dead_code)]
@@ -140,6 +138,7 @@ pub(crate) struct TrustRegistryConnection {
     /// Mediator DID for routing
     pub(crate) mediator_did: String,
     /// Whether this is a temporary connection for querying public registries
+    #[allow(dead_code)]
     pub(crate) is_temporary: bool,
     /// DIDComm client (wraps ATM + profile)
     pub(crate) client: crate::comm::didcomm::client::DIDCommClient,
@@ -231,19 +230,10 @@ impl TrustRegistryConnection {
     /// per DID.
     async fn close(&self) {
         self.fail_all_waiters().await;
-        let shutdown = self
-            .client
+        self.client
             .atm()
-            .graceful_shutdown();
-        if tokio::time::timeout(CLOSE_TIMEOUT, shutdown)
-            .await
-            .is_err()
-        {
-            warn!(
-                "Trust registry '{}': mediator websocket shutdown timed out after {:?}",
-                self.trust_registry_id, CLOSE_TIMEOUT
-            );
-        }
+            .graceful_shutdown()
+            .await;
     }
 
     /// Whether `other` is this same connection, i.e. shares its DIDComm client.
@@ -252,15 +242,6 @@ impl TrustRegistryConnection {
         other: &TrustRegistryConnection,
     ) -> bool {
         Arc::ptr_eq(self.client.atm(), other.client.atm())
-    }
-
-    /// Whether this connection reaches the registry with canonical DID (`main_did`)
-    /// or transport DID (`registry_did`) `did`.
-    fn serves_did(
-        &self,
-        did: &str,
-    ) -> bool {
-        self.main_did.as_deref() == Some(did) || self.registry_did == did
     }
 }
 
@@ -396,9 +377,6 @@ pub struct TrustRegistryListenerManager {
     readers: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
     /// Whether connections may be established; false while in Standby mode.
     listeners_active: Arc<AtomicBool>,
-    /// Per-registry locks so only one caller at a time builds a mediator
-    /// session for a registry, keyed by trust registry ID.
-    connect_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl TrustRegistryListenerManager {
@@ -422,7 +400,6 @@ impl TrustRegistryListenerManager {
             ws_state: RwLock::new(None),
             readers: Arc::new(RwLock::new(HashMap::new())),
             listeners_active: Arc::new(AtomicBool::new(true)),
-            connect_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -486,13 +463,10 @@ impl TrustRegistryListenerManager {
 
         let handle = tokio::spawn(async move {
             super::reader::run(connections, tr_id_for_task.clone(), store, ws_state).await;
-            let mut readers = readers_ref.write().await;
-            if readers
-                .get(&tr_id_for_task)
-                .is_some_and(|handle| handle.id() == tokio::task::id())
-            {
-                readers.remove(&tr_id_for_task);
-            }
+            readers_ref
+                .write()
+                .await
+                .remove(&tr_id_for_task);
         });
 
         readers.insert(tr_id, handle.abort_handle());
@@ -517,40 +491,6 @@ impl TrustRegistryListenerManager {
     pub fn is_active(&self) -> bool {
         self.listeners_active
             .load(Ordering::SeqCst)
-    }
-
-    /// Hold the connection-creation lock for `key`, a trust registry ID or, for
-    /// temporary connections, the registry DID.
-    ///
-    /// Locks nobody holds or waits on are pruned on each call, so the map only
-    /// keeps the ones in use.
-    pub(crate) async fn connect_lock(
-        &self,
-        key: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self
-                .connect_locks
-                .lock()
-                .await;
-            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-            locks
-                .entry(key.to_string())
-                .or_default()
-                .clone()
-        };
-        lock.lock_owned().await
-    }
-
-    /// Fail with `NoConnection` while the manager is in Standby.
-    fn ensure_active(&self) -> Result<(), TrustRegistryError> {
-        if self.is_active() {
-            Ok(())
-        } else {
-            Err(TrustRegistryError::NoConnection(
-                "Trust registry connections are deactivated in Standby mode".to_string(),
-            ))
-        }
     }
 
     pub fn activate(&self) {
@@ -675,9 +615,6 @@ impl TrustRegistryListenerManager {
                 continue;
             }
 
-            let _connect_guard = self
-                .connect_lock(&tr.id)
-                .await;
             if self
                 .connections
                 .read()
@@ -699,7 +636,7 @@ impl TrustRegistryListenerManager {
             };
 
             match self
-                .connect_stored(&tr.id, our_did, registry_did, mediator_did, tr.main_did.clone())
+                .reconnect(&tr.id, our_did, registry_did, mediator_did, tr.main_did.clone())
                 .await
             {
                 Ok(()) => {
@@ -783,11 +720,6 @@ impl TrustRegistryListenerManager {
             inviter_did, mediator_did, mediator_url, main_did
         );
 
-        let _connect_guard = self
-            .connect_lock(trust_registry_id)
-            .await;
-        self.ensure_active()?;
-
         // Step 2: Generate per-registry identity
         let (our_did, secrets, did_doc) = generate_trust_registry_identity(
             trust_registry_id,
@@ -811,9 +743,6 @@ impl TrustRegistryListenerManager {
         .map_err(|e| TrustRegistryError::ConnectionError(format!("Failed to generate identity: {}", e)))?;
 
         info!("Generated per-registry identity: {}", our_did);
-
-        self.remove_connection(trust_registry_id)
-            .await;
 
         // Step 3: Create DIDComm client and connect (pre-cache our DID doc to avoid HTTPS resolution)
         let client = create_tr_client(trust_registry_id, &our_did, &mediator_did, &secrets, Some((&our_did, &did_doc)))
@@ -877,8 +806,13 @@ impl TrustRegistryListenerManager {
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        self.install_with_reader(connection)
-            .await?;
+        self.install_connection(connection)
+            .await;
+
+        // Start the sole stream reader for this connection so setup/approval
+        // responses and future query responses are demultiplexed.
+        self.spawn_reader(trust_registry_id)
+            .await;
 
         info!("🔗 Trust registry '{}' connection established — awaiting registry-side approval", trust_registry_id,);
 
@@ -900,26 +834,6 @@ impl TrustRegistryListenerManager {
         mediator_did: &str,
         main_did: Option<String>,
     ) -> Result<(), TrustRegistryError> {
-        let _connect_guard = self
-            .connect_lock(trust_registry_id)
-            .await;
-        self.connect_stored(trust_registry_id, our_did, registry_did, mediator_did, main_did)
-            .await
-    }
-
-    /// Build a connection from stored secrets, closing the registry's current
-    /// connection first. Callers hold the registry's connect lock.
-    async fn connect_stored(
-        &self,
-        trust_registry_id: &str,
-        our_did: &str,
-        registry_did: &str,
-        mediator_did: &str,
-        main_did: Option<String>,
-    ) -> Result<(), TrustRegistryError> {
-        self.ensure_active()?;
-        self.ensure_registry_exists(trust_registry_id)
-            .await?;
         debug!("Reconnecting to trust registry '{}'", trust_registry_id);
 
         // For did:webvh identities, prefer key material persisted on disk (parity
@@ -1017,10 +931,6 @@ impl TrustRegistryListenerManager {
             (secrets, did_doc_to_cache)
         };
 
-        // Close any existing session first so the old and new ones never share the DID.
-        self.remove_connection(trust_registry_id)
-            .await;
-
         let client = create_tr_client(
             trust_registry_id,
             our_did,
@@ -1051,35 +961,18 @@ impl TrustRegistryListenerManager {
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        self.install_with_reader(connection)
-            .await?;
+        self.install_connection(connection)
+            .await;
+
+        // Replace any reader bound to the previous (now-evicted) client so the
+        // new connection's stream is drained.
+        self.stop_reader(trust_registry_id)
+            .await;
+        self.spawn_reader(trust_registry_id)
+            .await;
 
         debug!("🔗 Trust registry: reconnected to '{}'", trust_registry_id);
         Ok(())
-    }
-
-    /// Fail with `NotFound` when a store is attached and no longer holds
-    /// `trust_registry_id`, so a deleted registry is not reconnected.
-    async fn ensure_registry_exists(
-        &self,
-        trust_registry_id: &str,
-    ) -> Result<(), TrustRegistryError> {
-        let Some(store) = self.store().await else {
-            return Ok(());
-        };
-        match store
-            .get(trust_registry_id)
-            .await
-        {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => {
-                Err(TrustRegistryError::NotFound(format!("Trust registry '{}' no longer exists", trust_registry_id)))
-            }
-            Err(e) => Err(TrustRegistryError::ConnectionError(format!(
-                "Failed to look up trust registry '{}': {}",
-                trust_registry_id, e
-            ))),
-        }
     }
 
     /// Remove a connection by trust registry ID
@@ -1100,91 +993,24 @@ impl TrustRegistryListenerManager {
     }
 
     /// Store `connection` under its registry id, closing any connection it replaces.
-    ///
-    /// In Standby the connection is closed instead of stored. The flag is read
-    /// under the write lock, so a connection stored before `deactivate` is still
-    /// seen by the following `disconnect_all`.
     async fn install_connection(
         &self,
         connection: TrustRegistryConnection,
-    ) -> Result<(), TrustRegistryError> {
-        let mut connections = self.connections.write().await;
-        if let Err(e) = self.ensure_active() {
-            drop(connections);
-            connection.close().await;
-            return Err(e);
-        }
-        let replaced = connections.insert(
-            connection
-                .trust_registry_id
-                .clone(),
-            connection,
-        );
-        drop(connections);
+    ) {
+        let replaced = self
+            .connections
+            .write()
+            .await
+            .insert(
+                connection
+                    .trust_registry_id
+                    .clone(),
+                connection,
+            );
         if let Some(replaced) = replaced {
             replaced.close().await;
             debug!("Closed replaced connection for trust registry '{}'", replaced.trust_registry_id);
         }
-        Ok(())
-    }
-
-    /// Install `connection` and give it a stream reader. The previous reader is
-    /// stopped first so it cannot pick up the new connection while the old one
-    /// shuts down and then be aborted mid-read.
-    async fn install_with_reader(
-        &self,
-        connection: TrustRegistryConnection,
-    ) -> Result<(), TrustRegistryError> {
-        let trust_registry_id = connection
-            .trust_registry_id
-            .clone();
-        self.stop_reader(&trust_registry_id)
-            .await;
-        self.install_connection(connection)
-            .await?;
-        self.spawn_reader(&trust_registry_id)
-            .await;
-        Ok(())
-    }
-
-    /// Return the connection that replaced `stale`, or run `rebuild` and return
-    /// the connection it stored. Holds the registry's connect lock throughout,
-    /// so concurrent callers recovering the same stale connection share one
-    /// rebuild. A failed rebuild removes `stale` if it is still stored, so the
-    /// next query starts fresh.
-    async fn recover_stale<F, Fut>(
-        &self,
-        stale: &TrustRegistryConnection,
-        rebuild: F,
-    ) -> Result<TrustRegistryConnection, TrustRegistryError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<(), TrustRegistryError>>,
-    {
-        let _connect_guard = self
-            .connect_lock(&stale.trust_registry_id)
-            .await;
-        if let Some(current) = self
-            .replacement_for(stale)
-            .await
-        {
-            return Ok(current);
-        }
-        if let Err(e) = rebuild().await {
-            let still_stored = self
-                .connections
-                .read()
-                .await
-                .get(&stale.trust_registry_id)
-                .is_some_and(|current| current.is_same_client(stale));
-            if still_stored {
-                self.remove_connection(&stale.trust_registry_id)
-                    .await;
-            }
-            return Err(e);
-        }
-        let connections = self.connections.read().await;
-        Ok(Self::get_connection_by_id(&connections, &stale.trust_registry_id)?.clone())
     }
 
     /// The connection now stored for `stale`'s registry, when another caller has
@@ -1293,7 +1119,7 @@ impl TrustRegistryListenerManager {
     ) -> Result<&'a TrustRegistryConnection, TrustRegistryError> {
         connections
             .values()
-            .find(|c| c.serves_did(registry_did))
+            .find(|c| c.main_did.as_deref() == Some(registry_did) || c.registry_did == registry_did)
             .ok_or_else(|| {
                 let known: Vec<String> = connections
                     .values()
@@ -1553,54 +1379,22 @@ impl TrustRegistryListenerManager {
             if let (Some(our_did), Some(registry_did), Some(mediator_did)) =
                 (&tr.our_did, &tr.registry_did, &tr.mediator_did)
             {
-                let _connect_guard = self
-                    .connect_lock(&tr.id)
-                    .await;
-                let connected = self
-                    .connections
-                    .read()
-                    .await
-                    .contains_key(&tr.id);
-                if !connected {
-                    info!("Reconnecting to stored trust registry '{}' for DID '{}'", tr.name, trust_registry_did);
-                    self.connect_stored(&tr.id, our_did, registry_did, mediator_did, tr.main_did.clone())
-                        .await?;
-                }
+                info!("Reconnecting to stored trust registry '{}' for DID '{}'", tr.name, trust_registry_did);
+                self.reconnect(&tr.id, our_did, registry_did, mediator_did, tr.main_did.clone())
+                    .await?;
             } else {
                 warn!("Stored trust registry '{}' missing DID fields, falling back to temporary connection", tr.name);
-                self.ensure_temporary_connection(trust_registry_did)
+                self.create_temporary_connection(trust_registry_did)
                     .await?;
             }
         } else {
             warn!("No registered connection for DID '{}', creating temporary connection", trust_registry_did);
-            self.ensure_temporary_connection(trust_registry_did)
+            self.create_temporary_connection(trust_registry_did)
                 .await?;
         }
 
         let connections = self.connections.read().await;
         Ok(Self::find_connection_by_did(&connections, trust_registry_did)?.clone())
-    }
-
-    /// Create a temporary connection for `trust_registry_did` unless another
-    /// caller stored a connection for it while this one waited on the lock.
-    async fn ensure_temporary_connection(
-        &self,
-        trust_registry_did: &str,
-    ) -> Result<(), TrustRegistryError> {
-        let _connect_guard = self
-            .connect_lock(trust_registry_did)
-            .await;
-        let connected = self
-            .connections
-            .read()
-            .await
-            .values()
-            .any(|c| c.serves_did(trust_registry_did));
-        if connected {
-            return Ok(());
-        }
-        self.create_temporary_connection(trust_registry_did)
-            .await
     }
 
     /// Create a temporary DIDComm connection for querying a public trust registry
@@ -1612,7 +1406,6 @@ impl TrustRegistryListenerManager {
         &self,
         trust_registry_did: &str,
     ) -> Result<(), TrustRegistryError> {
-        self.ensure_active()?;
         info!("Creating temporary connection for public trust registry '{}'", trust_registry_did);
 
         // Step 1: Resolve the trust registry DID to discover mediator
@@ -1668,18 +1461,20 @@ impl TrustRegistryListenerManager {
             response_waiters: Arc::new(Mutex::new(HashMap::new())),
         };
 
+        self.install_connection(connection)
+            .await;
+
         // Temporary connections serve queries too, so they need a reader.
-        self.install_with_reader(connection)
-            .await?;
+        self.spawn_reader(&temp_id)
+            .await;
 
         info!("✓ Temporary connection created for public trust registry '{}' (id: {})", trust_registry_did, temp_id);
         Ok(())
     }
 
-    /// Send with stale connection recovery. On StaleConnection, retries once on
-    /// a fresh connection: a stale temporary connection is dropped and a new one
-    /// created, since its keys are not kept on disk; a stored registry reuses the
-    /// connection another caller already put in its place, or reconnects from disk.
+    /// Send with stale connection recovery. On StaleConnection, reuses the
+    /// connection another caller already put in its place, or evicts the dead
+    /// connection and reconnects from disk, then retries once.
     async fn send_with_reconnect(
         &self,
         trust_registry_did: &str,
@@ -1707,22 +1502,26 @@ impl TrustRegistryListenerManager {
             Err(TrustRegistryError::StaleConnection(reason)) => {
                 warn!("Stale connection to '{}': {}. Reconnecting (one attempt).", trust_registry_did, reason);
 
-                let fresh = if connection.is_temporary {
-                    self.remove_connection(&connection.trust_registry_id)
-                        .await;
-                    self.recover_or_create_connection(trust_registry_did)
-                        .await?
-                } else {
-                    self.recover_stale(&connection, || {
-                        self.connect_stored(
+                let fresh = match self
+                    .replacement_for(&connection)
+                    .await
+                {
+                    Some(current) => current,
+                    None => {
+                        self.remove_connection(&connection.trust_registry_id)
+                            .await;
+                        self.reconnect(
                             &connection.trust_registry_id,
                             &connection.our_did,
                             &connection.registry_did,
                             &connection.mediator_did,
                             connection.main_did.clone(),
                         )
-                    })
-                    .await?
+                        .await?;
+
+                        let connections = self.connections.read().await;
+                        Self::get_connection_by_id(&connections, &connection.trust_registry_id)?.clone()
+                    }
                 };
 
                 // enable_websocket() may return before the WS is fully ready.
@@ -2296,7 +2095,6 @@ async fn create_tr_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::FutureExt;
 
     fn parse(url: &str) -> url::Url {
         url::Url::parse(url).expect("test URL must be syntactically valid")
@@ -2376,13 +2174,11 @@ mod tests {
             .register_waiter("thread-1".to_string())
             .await;
         mgr.install_connection(first.clone())
-            .await
-            .expect("an active manager stores the connection");
+            .await;
 
         let second = test_connection("tr-1").await;
         mgr.install_connection(second.clone())
-            .await
-            .expect("an active manager stores the connection");
+            .await;
 
         assert!(pending.await.is_err(), "the replaced connection must be closed");
         let stored = mgr
@@ -2405,12 +2201,10 @@ mod tests {
             .register_waiter("thread-1".to_string())
             .await;
         mgr.install_connection(first.clone())
-            .await
-            .expect("an active manager stores the connection");
+            .await;
 
         mgr.install_connection(test_connection("tr-2").await)
-            .await
-            .expect("an active manager stores the connection");
+            .await;
 
         assert!(
             first
@@ -2435,8 +2229,7 @@ mod tests {
             .register_waiter("thread-1".to_string())
             .await;
         mgr.install_connection(connection)
-            .await
-            .expect("an active manager stores the connection");
+            .await;
 
         mgr.remove_connection("tr-1")
             .await;
@@ -2454,8 +2247,7 @@ mod tests {
         let mgr = test_manager();
         let stale = test_connection("tr-1").await;
         mgr.install_connection(stale.clone())
-            .await
-            .expect("an active manager stores the connection");
+            .await;
 
         assert!(
             mgr.replacement_for(&stale)
@@ -2469,327 +2261,16 @@ mod tests {
         let mgr = test_manager();
         let stale = test_connection("tr-1").await;
         mgr.install_connection(stale.clone())
-            .await
-            .expect("an active manager stores the connection");
+            .await;
         let fresh = test_connection("tr-1").await;
         mgr.install_connection(fresh.clone())
-            .await
-            .expect("an active manager stores the connection");
+            .await;
 
         let current = mgr
             .replacement_for(&stale)
             .await
             .expect("another caller replaced the stale connection");
         assert!(current.is_same_client(&fresh));
-    }
-
-    #[tokio::test]
-    async fn installing_a_connection_in_standby_closes_it_without_storing() {
-        let mgr = test_manager();
-        mgr.deactivate();
-        let connection = test_connection("tr-1").await;
-        let pending = connection
-            .register_waiter("thread-1".to_string())
-            .await;
-
-        let result = mgr
-            .install_connection(connection)
-            .await;
-
-        assert!(matches!(result, Err(TrustRegistryError::NoConnection(_))));
-        assert!(pending.await.is_err(), "the refused connection must be closed");
-        assert_eq!(
-            mgr.active_connection_count()
-                .await,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn installing_a_connection_in_standby_keeps_the_stored_one_untouched() {
-        let mgr = test_manager();
-        let stored = test_connection("tr-1").await;
-        let _pending = stored
-            .register_waiter("thread-1".to_string())
-            .await;
-        mgr.install_connection(stored.clone())
-            .await
-            .expect("an active manager stores the connection");
-        mgr.deactivate();
-
-        let result = mgr
-            .install_connection(test_connection("tr-1").await)
-            .await;
-
-        assert!(result.is_err());
-        let current = mgr
-            .get_connection_clone("tr-1")
-            .await
-            .expect("the stored connection stays until disconnect_all");
-        assert!(current.is_same_client(&stored));
-        assert!(
-            stored
-                .response_waiters
-                .lock()
-                .await
-                .contains_key("thread-1"),
-            "a refused install must not close the stored connection"
-        );
-    }
-
-    #[tokio::test]
-    async fn connect_lock_serialises_callers_for_the_same_registry() {
-        let mgr = test_manager();
-        let held = mgr.connect_lock("tr-1").await;
-
-        assert!(
-            mgr.connect_lock("tr-1")
-                .now_or_never()
-                .is_none(),
-            "a second caller waits while the lock is held"
-        );
-
-        drop(held);
-        assert!(
-            mgr.connect_lock("tr-1")
-                .now_or_never()
-                .is_some(),
-            "the lock is free once released"
-        );
-    }
-
-    #[tokio::test]
-    async fn connect_lock_does_not_block_other_registries() {
-        let mgr = test_manager();
-        let _held = mgr.connect_lock("tr-1").await;
-
-        let other = tokio::time::timeout(Duration::from_secs(1), mgr.connect_lock("tr-2")).await;
-
-        assert!(other.is_ok(), "a different registry gets its own lock");
-    }
-
-    #[tokio::test]
-    async fn connect_lock_prunes_locks_nobody_holds() {
-        let mgr = test_manager();
-        drop(mgr.connect_lock("tr-1").await);
-
-        let _held = mgr.connect_lock("tr-2").await;
-
-        let locks = mgr.connect_locks.lock().await;
-        assert!(!locks.contains_key("tr-1"), "a released lock is pruned");
-        assert!(locks.contains_key("tr-2"), "a held lock is kept");
-    }
-
-    #[tokio::test]
-    async fn reconnect_in_standby_fails_before_building_a_client() {
-        let mgr = test_manager();
-        mgr.deactivate();
-
-        let result = mgr
-            .reconnect("tr-1", "did:example:gateway", "did:example:registry", "did:example:mediator", None)
-            .await;
-
-        assert!(matches!(result, Err(TrustRegistryError::NoConnection(_))));
-        assert_eq!(
-            mgr.active_connection_count()
-                .await,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_stale_recoveries_share_one_rebuild() {
-        let mgr = test_manager();
-        let stale = test_connection("tr-1").await;
-        mgr.install_connection(stale.clone())
-            .await
-            .expect("an active manager stores the connection");
-        let builds = std::sync::atomic::AtomicUsize::new(0);
-        let second_waiting = tokio::sync::Notify::new();
-        let rebuild = || async {
-            builds.fetch_add(1, Ordering::SeqCst);
-            second_waiting
-                .notified()
-                .await;
-            mgr.install_connection(test_connection("tr-1").await)
-                .await
-        };
-        let second_caller = async {
-            let recovery = mgr.recover_stale(&stale, rebuild);
-            tokio::pin!(recovery);
-            assert!(
-                (&mut recovery)
-                    .now_or_never()
-                    .is_none(),
-                "the second caller waits on the connect lock"
-            );
-            second_waiting.notify_one();
-            recovery.await
-        };
-
-        let (first, second) = tokio::join!(mgr.recover_stale(&stale, rebuild), second_caller);
-
-        let first = first.expect("the first caller rebuilds");
-        let second = second.expect("the second caller reuses the rebuild");
-        assert_eq!(builds.load(Ordering::SeqCst), 1, "only one caller rebuilds");
-        assert!(first.is_same_client(&second));
-        assert!(!first.is_same_client(&stale));
-    }
-
-    #[tokio::test]
-    async fn stale_recovery_reports_a_failed_rebuild_and_removes_the_stale_connection() {
-        let mgr = test_manager();
-        let stale = test_connection("tr-1").await;
-        let pending = stale
-            .register_waiter("thread-1".to_string())
-            .await;
-        mgr.install_connection(stale.clone())
-            .await
-            .expect("an active manager stores the connection");
-
-        let result = mgr
-            .recover_stale(&stale, || async { Err(TrustRegistryError::ConnectionError("unreachable".to_string())) })
-            .await;
-
-        assert!(matches!(result, Err(TrustRegistryError::ConnectionError(_))));
-        assert!(
-            mgr.get_connection_clone("tr-1")
-                .await
-                .is_none(),
-            "the stale connection is removed"
-        );
-        assert!(pending.await.is_err(), "the removed connection is closed");
-    }
-
-    #[tokio::test]
-    async fn a_failed_rebuild_keeps_a_connection_another_caller_stored() {
-        let mgr = test_manager();
-        let stale = test_connection("tr-1").await;
-        let fresh = test_connection("tr-1").await;
-
-        let result = mgr
-            .recover_stale(&stale, || async {
-                mgr.install_connection(fresh.clone())
-                    .await?;
-                Err(TrustRegistryError::ConnectionError("unreachable".to_string()))
-            })
-            .await;
-
-        assert!(result.is_err());
-        let current = mgr
-            .get_connection_clone("tr-1")
-            .await
-            .expect("a connection that is not the stale one stays stored");
-        assert!(current.is_same_client(&fresh));
-    }
-
-    #[tokio::test]
-    async fn reconnect_fails_for_a_registry_no_longer_in_the_store() {
-        let mgr = test_manager();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = super::super::FileSystemTrustRegistryStore::new(dir.path().to_path_buf())
-            .await
-            .expect("store");
-        mgr.set_store(Arc::new(store))
-            .await;
-
-        let result = mgr
-            .reconnect("tr-1", "did:example:gateway", "did:example:registry", "did:example:mediator", None)
-            .await;
-
-        assert!(matches!(result, Err(TrustRegistryError::NotFound(_))));
-        assert_eq!(
-            mgr.active_connection_count()
-                .await,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn create_temporary_connection_in_standby_fails_before_resolving() {
-        let mgr = test_manager();
-        mgr.deactivate();
-
-        let result = mgr
-            .create_temporary_connection("did:example:registry")
-            .await;
-
-        assert!(matches!(result, Err(TrustRegistryError::NoConnection(_))));
-    }
-
-    #[tokio::test]
-    async fn ensure_temporary_connection_reuses_a_connection_serving_the_did() {
-        let mgr = test_manager();
-        let existing = test_connection("temp-1").await;
-        mgr.install_connection(existing.clone())
-            .await
-            .expect("an active manager stores the connection");
-        mgr.deactivate();
-
-        mgr.ensure_temporary_connection("did:example:registry")
-            .await
-            .expect("an existing connection serving the DID is reused without building one");
-
-        let current = mgr
-            .get_connection_clone("temp-1")
-            .await
-            .expect("the existing connection stays stored");
-        assert!(current.is_same_client(&existing));
-        assert_eq!(
-            mgr.active_connection_count()
-                .await,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn an_exiting_reader_removes_its_own_entry() {
-        let mgr = test_manager();
-        mgr.spawn_reader("tr-1").await;
-        let reader = mgr
-            .readers
-            .read()
-            .await
-            .get("tr-1")
-            .cloned()
-            .expect("a reader is registered");
-
-        while !reader.is_finished() {
-            tokio::task::yield_now().await;
-        }
-
-        assert!(
-            !mgr.readers
-                .read()
-                .await
-                .contains_key("tr-1")
-        );
-    }
-
-    #[tokio::test]
-    async fn an_exiting_reader_keeps_a_newer_readers_entry() {
-        let mgr = test_manager();
-        mgr.spawn_reader("tr-1").await;
-        let newer = tokio::spawn(std::future::pending::<()>());
-        let old = mgr
-            .readers
-            .write()
-            .await
-            .insert("tr-1".to_string(), newer.abort_handle())
-            .expect("the old reader is registered");
-
-        while !old.is_finished() {
-            tokio::task::yield_now().await;
-        }
-
-        let current = mgr
-            .readers
-            .read()
-            .await
-            .get("tr-1")
-            .map(|handle| handle.id());
-        assert_eq!(current, Some(newer.id()));
-        newer.abort();
     }
 
     #[tokio::test]

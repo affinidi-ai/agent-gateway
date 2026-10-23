@@ -11,15 +11,10 @@ changes:
         reconnecting under the same DID and fought the new connection, so the mediator
         closed one with "A new duplicate websocket connection for this DID" and the
         trust registry ended up Failed. Replaced and removed connections are now shut
-        down, including when the gateway steps down to Standby. Only one request at a
-        time builds a connection for a trust registry, so concurrent Trust Check queries
-        on a stale connection reuse the one replacement instead of each opening a
-        session, and a reconnect closes the old session before opening the new one. A
-        stale connection that cannot be rebuilt is removed, so the next query starts
-        fresh. Deleting a trust registry waits for any connection being built for it
-        and no longer leaves one behind. A failed connection setup now closes its
-        websocket. A Standby gateway refuses to build trust registry connections, and
-        closes any it was building when it stepped down.
+        down, including when the gateway steps down to Standby, and stale connection
+        recovery reuses a connection another request has already replaced instead of
+        tearing it down. A connection setup that fails partway also closes its
+        websocket.
   removed: []
   security: []
   breaking: []
