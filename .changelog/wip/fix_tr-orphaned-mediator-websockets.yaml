@@ -16,5 +16,12 @@ changes:
         tearing it down. A connection setup that fails partway also closes its
         websocket.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-23T00:00:00.000Z'
+      title: Update ctutils to 0.4.5 for constant-time mask and comparison fixes
+      description: >-
+        Bump the transitive ctutils dependency from 0.4.2 to 0.4.5, which fixes
+        non-constant-time mask generation and u128 comparisons reported by cargo audit
+        (RustCrypto/utils#1569). The crate is pulled in by the elliptic-curve and digest
+        crates used for DID and DIDComm cryptography.
   breaking: []
