@@ -1428,7 +1428,8 @@ mod tests {
     #[tokio::test]
     async fn the_keys_of_a_refused_pairing_request_are_removed_and_other_keys_stay() {
         let root = tempfile::tempdir().unwrap();
-        for id in ["temporary", "secure", "someone-elses"] {
+        let (temporary, secure, never_created) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        for id in [temporary.to_string(), secure.to_string(), "someone-elses".to_string()] {
             let directory = root.path().join(id);
             tokio::fs::create_dir_all(&directory)
                 .await
@@ -1437,17 +1438,17 @@ mod tests {
                 .await
                 .unwrap();
         }
-        remove_generated_identities(root.path().to_str().unwrap(), &["temporary", "secure", "never-created"]).await;
+        remove_generated_identities(root.path().to_str().unwrap(), &[temporary, secure, never_created]).await;
         assert!(
             !root
                 .path()
-                .join("temporary")
+                .join(temporary.to_string())
                 .exists()
         );
         assert!(
             !root
                 .path()
-                .join("secure")
+                .join(secure.to_string())
                 .exists()
         );
         assert!(
@@ -1761,10 +1762,10 @@ async fn lock_provided_acceptor_mediator<M: crate::mediators::MediatorStore>(
 /// request that stops before storing anything leaves no key material behind.
 async fn remove_generated_identities(
     keys_root: &str,
-    identity_ids: &[&str],
+    identity_ids: &[uuid::Uuid],
 ) {
     for id in identity_ids {
-        let directory = std::path::Path::new(keys_root).join(id);
+        let directory = std::path::Path::new(keys_root).join(id.to_string());
         if let Err(e) = tokio::fs::remove_dir_all(&directory).await
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -1978,7 +1979,8 @@ pub async fn connect_via_oob<
     info!("🔑 Step 5: Creating temporary DID for handshake...");
     info!("  DID #1: Temporary (ephemeral) - used only for initial handshake");
 
-    let temp_cp_id = uuid::Uuid::new_v4().to_string();
+    let temp_cp_uuid = uuid::Uuid::new_v4();
+    let temp_cp_id = temp_cp_uuid.to_string();
     info!("  Temporary CP ID: {}", temp_cp_id);
     info!("  Generating identity...");
 
@@ -2033,7 +2035,8 @@ pub async fn connect_via_oob<
     info!("  DID #2: Secure (permanent) - used for actual connection after handshake");
     debug!("  Homed on mediator: {}", acceptor_mediator_did);
 
-    let secure_cp_id = uuid::Uuid::new_v4().to_string();
+    let secure_cp_uuid = uuid::Uuid::new_v4();
+    let secure_cp_id = secure_cp_uuid.to_string();
     info!("  Secure CP ID: {}", secure_cp_id);
     info!("  Generating identity...");
 
@@ -2121,7 +2124,7 @@ pub async fn connect_via_oob<
                         &bootstrap_config
                             .storage_paths
                             .connection_points,
-                        &[&temp_cp_id, &secure_cp_id],
+                        &[temp_cp_uuid, secure_cp_uuid],
                     )
                     .await;
                     return Err(refusal);
