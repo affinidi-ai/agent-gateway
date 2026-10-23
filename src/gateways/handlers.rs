@@ -2076,8 +2076,10 @@ pub async fn connect_via_oob<
     // Note: mediator_did is the mediator the permanent secure DID is homed on -
     // the acceptor's own mediator when acceptor_mediator_id was set (Step 4.5),
     // otherwise the inviter's mediator (shared-mediator fallback).
+    // Keyed by this attempt's temporary connection point: acceptances of one invitation
+    // must not share, overwrite or remove each other's pairing.
     let pending_connection = crate::gateways::PendingOOBConnection {
-        id: invitation_message.id.clone(),
+        id: temp_cp_id.clone(),
         invitation_id: invitation_message.id.clone(),
         our_temporary_did: temporary_did.clone(),
         our_secure_did: secure_did.clone(),
@@ -2317,7 +2319,7 @@ pub async fn connect_via_oob<
         let mut pending_gateway =
             Gateway::new(req.name.clone(), req.description.clone(), inviter_temporary_did.clone(), GatewayType::Remote);
 
-        pending_gateway.id = pending_gateway_id;
+        pending_gateway.id = pending_gateway_id.clone();
         pending_gateway.tenant_id = req.tenant_id;
         pending_gateway.status = GatewayStatus::Pending;
 
@@ -2417,6 +2419,34 @@ pub async fn connect_via_oob<
         pending_store
             .remove(&pending_id)
             .await;
+        // Without the pairing a late connection-accepted would be recovered from this
+        // attempt's temporary connection point, so that record, the pending gateway
+        // and the generated keys go too.
+        if let Err(e) = cp_store
+            .delete(&temp_cp_id)
+            .await
+        {
+            tracing::debug!("No temporary connection point to remove for a failed attempt: {e}");
+        }
+        if let Ok(Some(orphan)) = store
+            .get(&pending_gateway_id)
+            .await
+            && orphan.status == GatewayStatus::Pending
+            && let Err(e) = store.delete(&orphan.id).await
+        {
+            warn!("Could not remove the pending gateway of a failed attempt: {e}");
+        }
+        didcomm_client
+            .atm()
+            .graceful_shutdown()
+            .await;
+        remove_generated_identities(
+            &bootstrap_config
+                .storage_paths
+                .connection_points,
+            &[temp_cp_uuid, secure_cp_uuid],
+        )
+        .await;
     }
     outcome
 }

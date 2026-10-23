@@ -186,12 +186,16 @@ pub(crate) async fn reject_provided_delete(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list connection points: {}", e)))?
         .iter()
         .any(|point| {
+            let expired = point
+                .recorded_expires_at()
+                .is_some_and(|expires_at| expires_at <= chrono::Utc::now());
             point.mediator_id == mediator.id
-                || point
-                    .oob_message
-                    .get("secure_mediator_id")
-                    .and_then(|value| value.as_str())
-                    == Some(mediator.id.as_str())
+                || (!expired
+                    && point
+                        .oob_message
+                        .get("secure_mediator_id")
+                        .and_then(|value| value.as_str())
+                        == Some(mediator.id.as_str()))
         });
     let now = chrono::Utc::now();
     let pairing = pending_pairings
@@ -2124,6 +2128,22 @@ mod tests {
             .await
             .unwrap();
         assert!(check().await.is_ok(), "removed again");
+
+        let mut lapsed = point_on("did:web:inviters-mediator.example");
+        lapsed.oob_message = json!({
+            "secure_mediator_id": created.id,
+            "expires_at": chrono::Utc::now() - chrono::Duration::minutes(1),
+        });
+        lapsed.expires_at = None;
+        points
+            .create(&lapsed)
+            .await
+            .unwrap();
+        assert!(check().await.is_ok(), "an expired temporary connection point no longer holds the record");
+        points
+            .delete(&lapsed.id)
+            .await
+            .unwrap();
 
         pairings
             .store(pairing_expiring("old", Some(&created.id), chrono::Utc::now() - chrono::Duration::minutes(1)))

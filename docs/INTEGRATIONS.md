@@ -457,7 +457,7 @@ of its own and never hides the entry. A stored provided record cannot be changed
 /v1/mediators/<id>` answers `409`. `DELETE` answers `409` too, with a message saying it is still
 offered by the directory or used by a connection point or a pending pairing, until the directory
 has answered successfully without its DID (or no directory is configured) and nothing uses it: no stored Connection Point names it
-(a pending pairing's temporary Connection Point names its acceptor mediator in
+(a pending pairing's temporary Connection Point, until its recorded expiry, names its acceptor mediator in
 `oob_message.secure_mediator_id`), and no unexpired pending pairing names it as its acceptor mediator record (a pairing expires after `oob_connection.pending_expiry_hours`, and one that has expired can no longer be finalized). Then `DELETE` removes it, and
 the list marks such a record `"deletable": true` (a directory answer that omits its DID sets it, and so does having no directory
 configured, since nothing then offers the record; a directory that has not answered yet, or still
