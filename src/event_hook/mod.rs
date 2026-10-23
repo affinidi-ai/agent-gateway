@@ -1,4 +1,5 @@
 mod config;
+mod directory;
 mod event;
 mod transport;
 
@@ -12,6 +13,7 @@ use tokio_retry::strategy::jitter;
 use tracing::{debug, info, warn};
 
 pub use config::{EventHookSettings, HookSecret};
+pub use directory::{DirectoryEntry, Listing, MediatorDirectory, is_directory_mediator_id};
 
 /// Per-gateway hook settings for in-process gateways in component tests, keyed
 /// by the gateway's storage directory, so no test has to touch the process
@@ -362,6 +364,7 @@ mod tests {
             hook_url: Some(url),
             hook_secret: secret.and_then(HookSecret::new),
             hook_timeout: Duration::from_secs(5),
+            directory_url: None,
         })
         .unwrap()
     }

@@ -1229,6 +1229,7 @@ pub fn create_identity_api_router(
                 .layer(Extension(store.clone()))
                 .layer(Extension(cp_store.clone()))
                 .layer(Extension(listener_mgr.clone()))
+                .layer(Extension(pending_connection_store.clone()))
                 .layer(Extension(notification_store.clone()));
 
             if let (Some(sess_mgr), Some(user_storage)) = (gateway_session_mgr.as_ref(), gateway_user_storage.as_ref())
@@ -1449,7 +1450,12 @@ pub fn create_identity_api_router(
                 .layer(Extension(msg_store))
                 .layer(Extension(surface_store_for_connection_points))
                 .layer(Extension(notification_store.clone()))
-                .layer(Extension(state.event_hook.clone()));
+                .layer(Extension(state.event_hook.clone()))
+                .layer(Extension(
+                    state
+                        .mediator_directory
+                        .clone(),
+                ));
 
             #[cfg(feature = "didwebvh")]
             let router = router
@@ -1548,6 +1554,13 @@ pub fn create_identity_api_router(
     } else {
         Router::new()
     };
+    let mediator_router = mediator_router
+        .layer(Extension(
+            state
+                .mediator_directory
+                .clone(),
+        ))
+        .layer(Extension(Some(pending_connection_store.clone())));
 
     // Reuse the agents-api TR listener manager for issuer trust registry registration
     let issuer_tr_listener_manager = agents_api_listener_manager;

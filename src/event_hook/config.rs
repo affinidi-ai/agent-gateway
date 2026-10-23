@@ -7,6 +7,7 @@ use crate::config::loaders::{environment::optional_env, load};
 pub const ENV_HOOK_URL: &str = "AG_EVENT_HOOK_URL";
 pub const ENV_HOOK_TIMEOUT_MS: &str = "AG_EVENT_HOOK_TIMEOUT_MS";
 pub const ENV_HOOK_SECRET: &str = "AG_EVENT_HOOK_SECRET";
+pub const ENV_DIRECTORY_URL: &str = "AG_MEDIATOR_DIRECTORY_URL";
 
 const MIN_SECRET_CHARS: usize = 32;
 
@@ -41,6 +42,7 @@ pub struct EventHookSettings {
     pub hook_url: Option<String>,
     pub hook_timeout: Duration,
     pub hook_secret: Option<HookSecret>,
+    pub directory_url: Option<String>,
 }
 
 impl Default for EventHookSettings {
@@ -49,6 +51,7 @@ impl Default for EventHookSettings {
             hook_url: None,
             hook_timeout: Duration::from_millis(DEFAULT_HOOK_TIMEOUT_MS),
             hook_secret: None,
+            directory_url: None,
         }
     }
 }
@@ -127,44 +130,49 @@ impl EventHookSettings {
                 }
             },
         };
-        let mut hook_url = text(ENV_HOOK_URL);
-        let mut secret_required = false;
-        if let Some(raw) = hook_url.as_deref() {
-            match classify_target(raw) {
-                HookTarget::Loopback => {}
-                HookTarget::SecureRemote => secret_required = true,
+        let checked_url = |name: &str, feature: &str| {
+            let raw = text(name)?;
+            match classify_target(&raw) {
+                HookTarget::Loopback => Some(raw),
+                HookTarget::SecureRemote if secret.is_none() => {
+                    error!(
+                        "{name} points at a host that is not loopback, which requires {ENV_HOOK_SECRET}; the {feature} is disabled"
+                    );
+                    None
+                }
+                HookTarget::SecureRemote => Some(raw),
                 HookTarget::Invalid => {
-                    error!("{ENV_HOOK_URL} must be an http or https URL with a host; the event hook is disabled");
-                    hook_url = None;
+                    error!("{name} must be an http or https URL with a host; the {feature} is disabled");
+                    None
                 }
                 HookTarget::InsecureRemote => {
                     error!(
-                        "{ENV_HOOK_URL} uses http for a host that is not loopback; use https, or http only for localhost, 127.0.0.0/8 or ::1; the event hook is disabled"
+                        "{name} uses http for a host that is not loopback; use https, or http only for localhost, 127.0.0.0/8 or ::1; the {feature} is disabled"
                     );
-                    hook_url = None;
+                    None
                 }
             }
-        }
-        if secret_required && secret.is_none() {
-            error!(
-                "{ENV_HOOK_URL} points at a host that is not loopback, which requires {ENV_HOOK_SECRET}; the event hook is disabled"
-            );
-            hook_url = None;
-        }
-        let hook_secret = match secret.filter(|_| hook_url.is_some()) {
+        };
+        let mut hook_url = checked_url(ENV_HOOK_URL, "event hook");
+        let mut directory_url = checked_url(ENV_DIRECTORY_URL, "mediator directory");
+        let hook_secret = match secret.filter(|_| hook_url.is_some() || directory_url.is_some()) {
             None => None,
             Some(Err(reason)) => {
-                error!("{ENV_HOOK_SECRET} could not be loaded ({reason}); the event hook is disabled");
+                error!(
+                    "{ENV_HOOK_SECRET} could not be loaded ({reason}); the event hook and the mediator directory are disabled"
+                );
                 hook_url = None;
+                directory_url = None;
                 None
             }
             Some(Ok(raw)) => match HookSecret::new(&raw) {
                 Some(secret) => Some(secret),
                 None => {
                     error!(
-                        "{ENV_HOOK_SECRET} must be at least {MIN_SECRET_CHARS} characters; the event hook is disabled"
+                        "{ENV_HOOK_SECRET} must be at least {MIN_SECRET_CHARS} characters; the event hook and the mediator directory are disabled"
                     );
                     hook_url = None;
+                    directory_url = None;
                     None
                 }
             },
@@ -173,6 +181,7 @@ impl EventHookSettings {
             hook_url,
             hook_timeout: Duration::from_millis(timeout_ms),
             hook_secret,
+            directory_url,
         }
     }
 }
@@ -205,8 +214,8 @@ mod tests {
 
     #[test]
     fn reads_every_variable() {
-        let parsed = settings(&[(ENV_HOOK_URL, " http://127.0.0.1:8085/hooks/events "), (ENV_HOOK_TIMEOUT_MS, "1000")]);
-        assert_eq!(parsed.hook_url.as_deref(), Some("http://127.0.0.1:8085/hooks/events"));
+        let parsed = settings(&[(ENV_HOOK_URL, " http://127.0.0.1:8085/events "), (ENV_HOOK_TIMEOUT_MS, "1000")]);
+        assert_eq!(parsed.hook_url.as_deref(), Some("http://127.0.0.1:8085/events"));
         assert_eq!(parsed.hook_timeout, Duration::from_millis(1000));
     }
 
@@ -242,6 +251,46 @@ mod tests {
                 "an invalid URL was accepted"
             );
         }
+    }
+
+    #[test]
+    fn the_directory_url_follows_the_same_target_rules() {
+        let loopback = settings(&[(ENV_DIRECTORY_URL, " http://127.0.0.1:8085/directory/mediators ")]);
+        assert_eq!(
+            loopback
+                .directory_url
+                .as_deref(),
+            Some("http://127.0.0.1:8085/directory/mediators")
+        );
+        assert!(loopback.hook_url.is_none());
+
+        let remote =
+            settings(&[(ENV_DIRECTORY_URL, "https://directory.example.com/mediators"), (ENV_HOOK_SECRET, SECRET)]);
+        assert!(remote.directory_url.is_some());
+        assert!(remote.hook_secret.is_some());
+
+        for rejected in [
+            settings(&[(ENV_DIRECTORY_URL, "https://directory.example.com/mediators")]),
+            settings(&[(ENV_DIRECTORY_URL, "http://directory.example.com/mediators"), (ENV_HOOK_SECRET, SECRET)]),
+            settings(&[(ENV_DIRECTORY_URL, "ftp://127.0.0.1/mediators")]),
+            settings(&[(ENV_DIRECTORY_URL, "http://127.0.0.1/m"), (ENV_HOOK_SECRET, "short")]),
+        ] {
+            assert!(
+                rejected
+                    .directory_url
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_hook_does_not_disable_a_valid_directory() {
+        let parsed = settings(&[
+            (ENV_HOOK_URL, "http://hooks.example.com/events"),
+            (ENV_DIRECTORY_URL, "http://127.0.0.1:8085/directory/mediators"),
+        ]);
+        assert!(parsed.hook_url.is_none());
+        assert!(parsed.directory_url.is_some());
     }
 
     #[test]

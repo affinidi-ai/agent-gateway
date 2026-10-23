@@ -199,17 +199,45 @@ impl PendingConnectionStore {
         existing
     }
 
-    /// Store a pending connection
+    /// Store a pending connection, logging a persistence failure
+    #[cfg(test)]
     pub async fn store(
         &self,
         connection: PendingOOBConnection,
     ) {
         if let Err(e) = self
-            .connections
-            .save(&connection)
+            .try_store(connection)
             .await
         {
             error!("Failed to store OOB connection: {}", e);
+        }
+    }
+
+    /// Store a pending connection and report whether it was persisted
+    pub async fn try_store(
+        &self,
+        connection: PendingOOBConnection,
+    ) -> Result<()> {
+        self.connections
+            .save(&connection)
+            .await
+    }
+
+    /// Removes the pending connections whose temporary or permanent connection
+    /// point is one of `connection_point_ids`, the connection points of a gateway
+    /// that is being deleted.
+    pub async fn remove_for_connection_points(
+        &self,
+        connection_point_ids: &[String],
+    ) {
+        for pending in self.list_all().await {
+            let uses = |id: &Option<String>| {
+                id.as_ref()
+                    .is_some_and(|id| connection_point_ids.contains(id))
+            };
+            if uses(&pending.temporary_cp_id) || uses(&pending.secure_cp_id) {
+                self.remove(&pending.id).await;
+            }
         }
     }
 
@@ -315,7 +343,6 @@ impl PendingConnectionStore {
     }
 
     /// List all pending connections
-    #[allow(dead_code)]
     pub async fn list_all(&self) -> Vec<PendingOOBConnection> {
         self.connections
             .list_all()
@@ -358,6 +385,72 @@ impl PendingConnectionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pairing(
+        id: &str,
+        temporary_cp_id: &str,
+        secure_cp_id: &str,
+    ) -> PendingOOBConnection {
+        let json = serde_json::json!({
+            "id": id,
+            "our_temporary_did": "did:web:us.example:connection-points:tmp",
+            "our_secure_did": "did:web:us.example:connection-points:1111",
+            "their_temporary_did": "did:web:them.example:connection-points:tmp",
+            "their_secure_did": null,
+            "mediator_did": "did:web:mediator.example",
+            "connection_point_id": "",
+            "invitation_id": id,
+            "role": "Acceptor",
+            "state": "WaitingForResponse",
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2026-01-01T01:00:00Z",
+            "temporary_cp_id": temporary_cp_id,
+            "secure_cp_id": secure_cp_id
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn try_store_reports_success_and_the_pairing_is_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingConnectionStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .try_store(pairing("one", "tmp-1", "secure-1"))
+            .await
+            .unwrap();
+        assert_eq!(store.list_all().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_for_connection_points_removes_only_pairings_using_those_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingConnectionStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .store(pairing("by-temporary", "tmp-1", "secure-1"))
+            .await;
+        store
+            .store(pairing("by-secure", "tmp-2", "secure-2"))
+            .await;
+        store
+            .store(pairing("someone-else", "tmp-3", "secure-3"))
+            .await;
+
+        store
+            .remove_for_connection_points(&["tmp-1".to_string(), "secure-2".to_string()])
+            .await;
+
+        let left: Vec<String> = store
+            .list_all()
+            .await
+            .into_iter()
+            .map(|pending| pending.id)
+            .collect();
+        assert_eq!(left, vec!["someone-else".to_string()]);
+    }
 
     #[test]
     fn pending_oob_connection_json_without_their_issuer_did_deserialises() {
