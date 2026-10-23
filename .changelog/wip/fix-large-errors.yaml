@@ -1,0 +1,29 @@
+branch: fix-large-errors
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-21T16:10:00.000Z'
+      title: Report refusals as typed errors instead of prepared responses
+      description: >-
+        Consent ticket checks, credential provider reference checks, token refresh storage and
+        the fabric sender, envelope, policy and Target body checks now return an error that
+        names why a request was refused, and the response is built from it in one place. The
+        statuses and bodies callers receive are unchanged. Clippy 1.98 no longer flags these
+        functions for returning a large error.
+    - timestamp: '2026-10-21T23:59:00.000Z'
+      title: Build x402 and MPP payment refusals from typed payment errors
+      description: >-
+        x402 and MPP payment checks return the challenge to pay or why a payment failed, and the
+        402 or 400 answer is built from it on the proxy and fabric paths alike. A request with no
+        payment credential gets its 402, x402's, MPP's or both combined, from one shared builder
+        instead of four copies. The answers clients receive are unchanged.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-21T23:59:00.000Z'
+      title: Keep payment configuration errors out of 500 responses
+      description: >-
+        When MPP challenges cannot be generated, or x402 payment requirements cannot be
+        serialized, the 500 response says only "Payment configuration error" and the detail is
+        logged. Before, the response carried the internal error text.
+  breaking: []
