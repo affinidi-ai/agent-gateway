@@ -64,9 +64,15 @@ pub struct ReloadConfigResponse {
 pub async fn reload_configuration(
     State(state): State<IdentityApiState>
 ) -> Result<Json<ReloadConfigResponse>, AppError> {
-    let (channels_count, surfaces_count, is_fallback, warning) = perform_config_reload(&state)
-        .await
-        .map_err(|e| AppError::InternalError(format!("Failed to reload channels: {}", e)))?;
+    let (channels_count, surfaces_count, is_fallback, warning) = {
+        let _reloading = state
+            .surface_reload_lock
+            .lock()
+            .await;
+        perform_config_reload(&state)
+            .await
+            .map_err(|e| AppError::InternalError(format!("Failed to reload channels: {}", e)))?
+    };
 
     Ok(Json(ReloadConfigResponse {
         channels_count,

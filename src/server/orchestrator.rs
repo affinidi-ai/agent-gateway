@@ -429,17 +429,10 @@ async fn sync_issuer_did_logs(
     }
 }
 
-/// A surface storage event deferred while the node is mid-activation. Replayed once
-/// the activation re-derive completes so a remote write arriving during the readiness
-/// window is applied rather than silently dropped (F1 defer-and-drain).
-enum DeferredSurfaceEvent {
-    Upsert(Box<crate::config::agent_surface::AgentSurface>),
-    Delete(String),
-}
-
-/// Buffer of surface events deferred during an activation window, shared between the
-/// surface-store subscriber and the activation drain.
-type PendingSurfaceEvents = Arc<tokio::sync::Mutex<Vec<DeferredSurfaceEvent>>>;
+/// Ids of surfaces changed by a remote write while the node is mid-activation, shared
+/// between the surface-store subscriber and the activation drain. Each is applied from
+/// storage once the activation re-derive completes, so the change is not dropped.
+type PendingSurfaceEvents = Arc<tokio::sync::Mutex<Vec<String>>>;
 
 fn spawn_x402_cleanup_worker(txn_store: Arc<crate::x402::TransactionStore>) {
     tokio::spawn(async move {
@@ -490,20 +483,13 @@ async fn mark_ready_and_drain_surface_events(
     pending: &PendingSurfaceEvents,
     state: &crate::identity::IdentityApiState,
 ) {
-    let drained: Vec<DeferredSurfaceEvent> = {
+    let drained: Vec<String> = {
         let mut buffer = pending.lock().await;
         crate::server::mode::mark_activation_ready(generation);
         buffer.drain(..).collect()
     };
-    for event in drained {
-        match event {
-            DeferredSurfaceEvent::Upsert(surface) => {
-                crate::identity::handlers::surfaces::apply_surface_upsert_from_storage(state, *surface).await;
-            }
-            DeferredSurfaceEvent::Delete(id) => {
-                crate::identity::handlers::surfaces::apply_surface_delete_from_storage(state, &id).await;
-            }
-        }
+    for id in drained {
+        crate::identity::handlers::surfaces::apply_surface_from_storage(state, &id).await;
     }
 }
 
@@ -1344,6 +1330,7 @@ pub async fn run_axum_proxy(
             credential_provider_store: None,
             sts_client_store: None,
             resolved_surface_cache: resolved_surface_cache.clone(),
+            surface_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             surface_template_store: surface_template_store.clone(),
             event_hook: None,
 
@@ -1368,42 +1355,30 @@ pub async fn run_axum_proxy(
                 tokio::spawn(async move {
                     loop {
                         match surface_events.recv().await {
-                            Ok(crate::storage::filesystem::StorageEvent::Upsert {
-                                entity,
-                                source: crate::storage::filesystem::StorageEventSource::RemoteWrite,
-                                ..
-                            }) => {
+                            Ok(
+                                crate::storage::filesystem::StorageEvent::Upsert {
+                                    id,
+                                    source: crate::storage::filesystem::StorageEventSource::RemoteWrite,
+                                    ..
+                                }
+                                | crate::storage::filesystem::StorageEvent::Delete {
+                                    id,
+                                    source: crate::storage::filesystem::StorageEventSource::RemoteWrite,
+                                },
+                            ) => {
                                 // Defer remote surface changes that land mid-activation so
                                 // they replay after the re-derive, instead of racing it and
-                                // clobbering freshly re-derived state (F1). The is_activating
+                                // clobbering freshly re-derived state. The is_activating
                                 // check + enqueue is done under the same lock the drain flips
                                 // readiness under, so an event is never stranded.
                                 let mut buffer = pending_for_surface_events
                                     .lock()
                                     .await;
                                 if crate::server::mode::is_activating() {
-                                    buffer.push(DeferredSurfaceEvent::Upsert(Box::new(entity)));
+                                    buffer.push(id);
                                 } else {
                                     drop(buffer);
-                                    crate::identity::handlers::surfaces::apply_surface_upsert_from_storage(
-                                        &identity_state_for_surface_events,
-                                        entity,
-                                    )
-                                    .await;
-                                }
-                            }
-                            Ok(crate::storage::filesystem::StorageEvent::Delete {
-                                id,
-                                source: crate::storage::filesystem::StorageEventSource::RemoteWrite,
-                            }) => {
-                                let mut buffer = pending_for_surface_events
-                                    .lock()
-                                    .await;
-                                if crate::server::mode::is_activating() {
-                                    buffer.push(DeferredSurfaceEvent::Delete(id));
-                                } else {
-                                    drop(buffer);
-                                    crate::identity::handlers::surfaces::apply_surface_delete_from_storage(
+                                    crate::identity::handlers::surfaces::apply_surface_from_storage(
                                         &identity_state_for_surface_events,
                                         &id,
                                     )

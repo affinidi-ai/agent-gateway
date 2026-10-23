@@ -238,8 +238,8 @@ pub enum StorageEventSource {
 #[derive(Clone)]
 pub enum StorageEvent<T: StorableEntity> {
     Upsert {
-        #[allow(dead_code)]
         id: String,
+        #[allow(dead_code)]
         entity: T,
         source: StorageEventSource,
     },

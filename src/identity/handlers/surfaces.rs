@@ -1639,7 +1639,21 @@ enum SurfaceChange<'a> {
 /// Failures are logged but never propagated: the surface has already
 /// been persisted, so an operator can always recover by hitting
 /// `/v1/config/reload` explicitly.
+///
+/// Holds the surface reload lock; see [`apply_surface_change_while_locked`].
 async fn apply_surface_change(
+    state: &IdentityApiState,
+    change: SurfaceChange<'_>,
+) {
+    let _reloading = state
+        .surface_reload_lock
+        .lock()
+        .await;
+    apply_surface_change_while_locked(state, change).await;
+}
+
+/// [`apply_surface_change`] for a caller already holding the surface reload lock.
+async fn apply_surface_change_while_locked(
     state: &IdentityApiState,
     change: SurfaceChange<'_>,
 ) {
@@ -1824,12 +1838,31 @@ pub(crate) async fn apply_surface_upsert_from_storage(
     }
 }
 
-// wraps original function to avoid leaking implementation details
-pub(crate) async fn apply_surface_delete_from_storage(
+/// Apply a change another writer made to a surface on disk. The stored surface is
+/// applied rather than the event's copy, which a configuration reload may already
+/// have superseded (for example by carrying over A2A settings), and the surface
+/// reload lock is held from the read until the change is applied.
+pub(crate) async fn apply_surface_from_storage(
     state: &IdentityApiState,
     surface_id: &str,
 ) {
-    apply_surface_change(state, SurfaceChange::Delete(surface_id)).await;
+    let Some(store) = state
+        .agent_surface_store
+        .as_deref()
+    else {
+        return;
+    };
+    let _reloading = state
+        .surface_reload_lock
+        .lock()
+        .await;
+    match store.get(surface_id).await {
+        Ok(Some(surface)) => apply_surface_change_while_locked(state, SurfaceChange::Upsert(&surface)).await,
+        Ok(None) => apply_surface_change_while_locked(state, SurfaceChange::Delete(surface_id)).await,
+        Err(error) => {
+            warn!(surface = %surface_id, "Could not read the surface to apply a change from storage: {error}")
+        }
+    }
 }
 
 /// Trigger a full in-process gateway reload. Used as the slow-path

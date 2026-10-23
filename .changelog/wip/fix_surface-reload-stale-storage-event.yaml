@@ -1,0 +1,18 @@
+branch: fix/surface-reload-stale-storage-event
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-23T10:00:00Z'
+      title: Keep the surface a configuration reload stored instead of an older copy
+      description: >-
+        A configuration reload re-reads Agent Surfaces from disk, and each surface that changed is
+        then applied again as a single-surface change. That change could apply the copy read from
+        disk after the reload had already stored a newer one, so a surface edited by hand and
+        reloaded could keep serving the A2A versions it had before the reload carried its settings
+        over. A change from storage now applies the surface as currently stored, and reloads and
+        surface changes are applied one at a time. This also removes an intermittent component
+        test failure.
+  removed: []
+  security: []
+  breaking: []
