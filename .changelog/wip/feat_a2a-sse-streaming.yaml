@@ -66,4 +66,11 @@ changes:
         surface that reads identity from the response, a stream that never claims one ends with
         an identity error. fabric:// surfaces and Transit Points still return the stream whole
         without these checks.
+    - timestamp: '2026-10-23T00:00:00.000Z'
+      title: Update ctutils to 0.4.5 so its comparisons run in constant time
+      description: >-
+        ctutils, which the gateway's elliptic-curve signing and DIDComm libraries use, could
+        compile its mask generation and 128-bit comparisons to code that branches on the
+        values compared, which can leak them through timing. The RustCrypto advisory is fixed
+        in 0.4.4; the lockfile now pins 0.4.5.
   breaking: []
