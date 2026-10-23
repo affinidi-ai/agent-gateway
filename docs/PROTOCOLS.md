@@ -182,8 +182,9 @@ default) or **Envelope + A2A fields**.
   startup or on a configuration reload, each such A2A or AP2 surface, A2A proxy Targets included, is
   given one, and the block is written to storage. A stored record that reaches the gateway as a
   storage event (another node's write, the cache refresh scan, or the disk refresh a reload starts
-  with) is given one the same way before it is applied, so the event cannot undo what a reload
-  gave: `accepted_versions` is `["1.0"]` if the retired
+  with) is given one the same way before it is applied, in memory only, so the event cannot undo
+  what a reload gave and applying it writes nothing back: `accepted_versions` is `["1.0"]` if the
+  retired
   `a2a_legacy_compatibility` flag was off, and both versions otherwise, so an existing A2A proxy
   surface keeps serving callers that send no `A2A-Version` header; `validation` is `"envelope"` on a
   surface whose Targets are all A2A proxies, `"off"` elsewhere if the retired

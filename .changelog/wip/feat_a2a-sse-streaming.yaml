@@ -42,9 +42,9 @@ changes:
         was applied as stored. An A2A surface stored without its own settings was then served
         with the defaults (0.3 and 1.0), even when the reload running at the same time had
         just given it A2A 1.0 only from the retired a2a_legacy_compatibility flag, so callers
-        without an A2A-Version header were accepted. The record is now given its settings,
-        and unsupported header metadata mappings are cleared, before it is applied, as on any
-        load.
+        without an A2A-Version header were accepted. The record is now given its settings in
+        memory before it is applied, as a load gives them; applying the event writes nothing
+        back to storage.
     - timestamp: '2026-10-23T00:00:00.000Z'
       title: Stop counting a slow caller's reading time as an idle MCP stream
       description: >-
