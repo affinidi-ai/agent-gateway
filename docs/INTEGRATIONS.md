@@ -355,26 +355,6 @@ sidebar item and the pages need `integrations.view`, the editors and test sends
 - On the Audit page, **Forward records** opens a new event set of every audit event when no
   integration receives audit records yet.
 
-## Dashboard
-
-Settings live on the **Integrations** page, in three tabs: Integrations, Endpoints and Event Sets
-([`www/default/src/pages/IntegrationsPage/`](../www/default/src/pages/IntegrationsPage/)). The
-sidebar item and the pages need `integrations.view`, the editors and test sends
-`integrations.edit`, and deleting `integrations.delete`.
-
-- **Endpoints** show the fields of their type. Secret fields are never shown once stored: they
-  can be kept, replaced or cleared, or point to an appliance-wide secret with
-  `$SECRET:<secret_id>`. A saved endpoint can send a test message.
-- **Event sets** pick events from the catalog, grouped by family and audit events by their
-  audit group, with search. Audit events are picked and saved like any other.
-- **Integrations** join an endpoint and an event set and hold the template for the endpoint's
-  type. The editor lists the variables the event set fills, refuses a template that uses
-  others, sets the audit delivery limits when the event set holds audit events, and tests the
-  integration as it stands on screen.
-- An endpoint or event set in use cannot be deleted; the list names the integrations using it.
-- On the Audit page, **Forward records** opens a new event set of every audit event when no
-  integration receives audit records yet.
-
 ## Management API
 
 | Route | Purpose |
