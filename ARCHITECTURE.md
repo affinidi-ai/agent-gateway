@@ -153,7 +153,7 @@ logic.
 | Credential delegation | Injecting delegated OAuth tokens, or signalling consent | [`src/proxy/credential_delegation.rs`](src/proxy/credential_delegation.rs) |
 | VP injection | The deferred identity presentation added to the upstream request | [`src/identity/`](src/identity/) |
 | Forward | Vetting the target and sending the request | [`src/egress.rs`](src/egress.rs) |
-| Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
+| Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size, `504` on a stall. An MCP event-stream passthrough, and an A2A `message/stream` or `tasks/resubscribe` stream no response step needs whole, are not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
 | Protected identity resolution | Deriving the managed agent's DID from its response | [`src/proxy/backend_identity.rs`](src/proxy/backend_identity.rs) |
 | Response processing | Rewrites, tool-list filtering, agent cards | [`src/proxy/response_policy.rs`](src/proxy/response_policy.rs) |
 | Metrics | Recording the outcome | [`src/metrics/`](src/metrics/) |

@@ -1,0 +1,23 @@
+branch: feat/a2a-sse
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-21T17:30:00Z'
+      title: ⭐ Stream A2A message/stream and tasks/resubscribe responses live
+      description: >-
+        An A2A message/stream (SendStreamingMessage) or tasks/resubscribe
+        (SubscribeToTask) call that the agent answers with text/event-stream
+        is now passed through event by event, as an MCP stream is, instead of
+        being read in full and returned at the end. The request timeout now
+        covers only the wait for the stream's headers, and the stream ends at
+        the mcp_http stream idle timeout (default 60 s) or lifetime (default
+        3600 s), so an agent task longer than 30 seconds reaches the caller
+        instead of failing with a 504. The response stays buffered, as
+        before, on AP2 surfaces and whenever a response step needs the whole
+        body: a response policy, response custom metadata, a managed or
+        external agent identity, UCP, response extension validation, or a
+        payment receipt.
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

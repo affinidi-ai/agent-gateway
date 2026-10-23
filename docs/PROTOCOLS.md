@@ -594,15 +594,18 @@ Relevant implementation:
 
 ### Current limitations
 
-- **Streaming:** the SSE pass-through runs for MCP surfaces only. An A2A `message/stream` /
-  `SendStreamingMessage` or `tasks/resubscribe` / `SubscribeToTask` response is read in full in
-  `src/proxy/handler.rs` and returned whole, so the caller sees nothing until the upstream closes.
-  Headers, event order and terminal task states are preserved, but the whole stream must finish
-  within the request timeout (`[a2a] timeout_seconds`, default 30 s, or the surface's
-  `request_secs`), or the request fails; only MCP SSE requests get the long-lived timeout. The
-  buffered stream is also bound as described in [Upstream Response Bounds](#upstream-response-bounds),
-  so a pause between events longer than `networking.timeout.idle_secs` fails it. MCP streaming
-  keeps the incremental path.
+- **Streaming:** an A2A `message/stream` / `SendStreamingMessage` or `tasks/resubscribe` /
+  `SubscribeToTask` call that the agent answers `2xx` with `text/event-stream` is passed through
+  event by event, as an MCP stream is (`a2a_stream_passes_through` in `src/proxy/handler.rs`). The
+  request timeout (`[a2a] timeout_seconds`, default 30 s, or the surface's `request_secs`) covers
+  only the wait for the stream's headers (`504` "A2A upstream response headers timed out"); the
+  stream itself ends at the `mcp_http` stream idle timeout and lifetime described in
+  [Upstream Response Bounds](#upstream-response-bounds), and the Gateway sends its own keep-alive
+  comments meanwhile. The stream is buffered as before, whole and within the request timeout, on
+  an AP2 surface and whenever a response step needs the whole body: a response policy, response
+  custom metadata, a managed or external agent identity, UCP, response extension validation
+  (`[extension_inspection]` with identity rules), or a payment receipt to return. A passed-through
+  stream gets no payload capture.
 - **Signed cards:** there is no signature handling. URL rewriting and identity-extension
   replacement invalidate any `signatures[]` on a Managed Agent's card, and the signatures are passed
   through unchanged, so downstream verification fails.
@@ -632,12 +635,13 @@ gateway as a `ForwardResponse` with the same status. The Fabric receive agent-ca
 tool discovery (JSON or SSE, capped at the default `max_body_size`) are bounded the same way; a
 card that fails the bounds is treated as missing.
 
-An SSE stream the Gateway parses event by event rather than buffering whole (an MCP
+An SSE stream the Gateway parses event by event rather than buffering whole (an MCP or A2A
 `text/event-stream` passthrough, and Legacy SSE sessions) holds at most `[a2a] max_body_size` of
 one incomplete event (the default 10 MB for Legacy SSE sessions). An event that grows past that
-ends the stream, and a Legacy SSE session ends with it. An MCP `text/event-stream` passthrough also
+ends the stream, and a Legacy SSE session ends with it. A `text/event-stream` passthrough also
 ends when the upstream sends nothing for the surface's `mcp_http.stream_idle_timeout_secs` (default
-60 s) or is still streaming at `mcp_http.stream_max_lifetime_secs` (default 3600 s).
+60 s) or is still streaming at `mcp_http.stream_max_lifetime_secs` (default 3600 s); an A2A
+surface uses the same keys, and their defaults when it sets none.
 
 The gateway holds at most 10,000 Legacy SSE sessions (`GET /sse` on `proxy://` and `fabric://`
 surfaces, and on standalone MCP proxies). A `GET /sse` beyond that, after sessions whose client has
