@@ -1411,7 +1411,7 @@ mod tests {
             "role": "Acceptor",
             "state": "WaitingForResponse",
             "created_at": "2026-01-01T00:00:00Z",
-            "expires_at": "2026-01-01T01:00:00Z",
+            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
             "mediator_record_id": provided.id,
         }))
         .unwrap();
@@ -2089,7 +2089,12 @@ pub async fn connect_via_oob<
         role: crate::gateways::ConnectionRole::Acceptor,
         state: crate::gateways::ConnectionState::WaitingForResponse,
         created_at: chrono::Utc::now(),
-        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        expires_at: chrono::Utc::now()
+            + chrono::Duration::hours(
+                bootstrap_config
+                    .oob_connection
+                    .pending_expiry_hours as i64,
+            ),
         secure_cp_id: Some(secure_cp_id.clone()),
         temporary_cp_id: Some(temp_cp_id.clone()),
         mediator_record_id: req
@@ -2144,6 +2149,8 @@ pub async fn connect_via_oob<
         Some(guard) => {
             let pending_store = pending_store.clone();
             // Spawned so a cancelled request cannot release the lock while the write runs.
+            // If the request is cancelled after the write, the pairing is not retired by
+            // this handler; it stops holding the mediator record when it expires.
             tokio::spawn(async move {
                 let _held_until_stored = guard;
                 pending_store

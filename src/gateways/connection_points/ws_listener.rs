@@ -3557,6 +3557,9 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     // get_by_temporary_did matches both sides of the connection; without this
     // check a message whose `from` equals our_temporary_did would also resolve
     // and could be used to activate a gateway with an attacker-supplied DID.
+    if pending_conn.expires_at <= chrono::Utc::now() {
+        return Err(format!("Pending connection {} has expired", pending_conn.id));
+    }
     if pending_conn.role != crate::gateways::ConnectionRole::Acceptor {
         return Err(format!(
             "Pending connection {} has unexpected role {:?}; expected Acceptor",
