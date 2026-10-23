@@ -1229,6 +1229,7 @@ pub fn create_identity_api_router(
                 .layer(Extension(store.clone()))
                 .layer(Extension(cp_store.clone()))
                 .layer(Extension(listener_mgr.clone()))
+                .layer(Extension(pending_connection_store.clone()))
                 .layer(Extension(notification_store.clone()));
 
             if let (Some(sess_mgr), Some(user_storage)) = (gateway_session_mgr.as_ref(), gateway_user_storage.as_ref())
