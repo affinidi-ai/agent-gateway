@@ -3033,12 +3033,10 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                                     error!("❌ OOB connection-rejected received! Reason: {}", reason);
 
                                     // This is the ACCEPTOR side receiving rejection from INVITER
-                                    // Clean up the pending connection state
+                                    // The message is not tied to the sender of the invitation, so it only
+                                    // logs; the pairing and its temporary connection point expire.
                                     if let Some(_pend_store) = pending_connection_store {
-                                        // Find and delete pending connections for this DID
-                                        // Note: We don't have easy access to the pending connection ID here,
-                                        // so we'll log the failure. In production, you'd want to track this better.
-                                        error!("Connection rejected - pending connection cleanup needed");
+                                        error!("Connection rejected - pending connection left to expire");
                                         error!("Rejection reason: {}", reason);
                                     } else {
                                         warn!("Cannot cleanup rejected connection: missing pending store");
@@ -3635,20 +3633,8 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     .map_err(|e| format!("Inviter issuer attestation rejected: {e}"))?;
     info!("✓ Inviter issuer DID verified: {}", inviter_issuer_did);
 
-    // Step 2: Update pending connection with inviter's secure DID
-    let mut updated_conn = pending_conn.clone();
-    updated_conn.their_secure_did = Some(inviter_secure_did.to_string());
-    updated_conn.their_issuer_did = Some(inviter_issuer_did.clone());
-    updated_conn.state = crate::gateways::ConnectionState::ReadyToFinalize;
-
-    pending_store
-        .update(updated_conn)
-        .await;
-    info!("✓ Updated pending connection state");
-
-    // Step 3: Update existing pending gateway with inviter's SECURE DID and set to Active
-    info!("  Looking for existing pending gateway with temporary DID: {}", inviter_temporary_did);
-
+    // This attempt's pending gateway is looked up before anything is written, so a
+    // missing one refuses the finalization without leaving state behind.
     let attempt_connection_point = match current_connection_point {
         Some(connection_point) => Some(connection_point.clone()),
         None => match pending_conn
@@ -3671,12 +3657,92 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                 .get("pending_gateway_id")
                 .and_then(|value| value.as_str())
         }) {
-        Some(id) => gateway_store
-            .get(id)
-            .await
-            .map_err(|e| format!("Failed to get pending gateway: {}", e))?,
+        Some(id) => Some(
+            gateway_store
+                .get(id)
+                .await
+                .map_err(|e| format!("Failed to get pending gateway: {}", e))?
+                .ok_or_else(|| format!("Pending gateway {} not found for this connection attempt", id))?,
+        ),
         None => None,
     };
+
+    // A provided acceptor mediator is protected from deletion by this pairing until it
+    // expires, so the DID's lock is held from here until the permanent connection
+    // point is saved, and the expiry and the record are checked again under it.
+    use crate::mediators::MediatorStore as _;
+    let mediator_guard = match (
+        pending_conn
+            .mediator_record_id
+            .as_deref(),
+        listener_manager
+            .mediator_store
+            .as_deref(),
+    ) {
+        (Some(record_id), Some(mediator_store)) => {
+            let found = mediator_store
+                .get(record_id)
+                .await
+                .map_err(|e| format!("Failed to look up the acceptor mediator: {}", e))?
+                .ok_or_else(|| format!("Acceptor mediator {} no longer exists", record_id))?;
+            if found.provided {
+                let guard = crate::mediators::handlers::lock_did(&found.did).await;
+                if pending_conn.expires_at <= chrono::Utc::now() {
+                    return Err(format!("Pending connection {} has expired", pending_conn.id));
+                }
+                mediator_store
+                    .get(record_id)
+                    .await
+                    .map_err(|e| format!("Failed to look up the acceptor mediator: {}", e))?
+                    .ok_or_else(|| format!("Acceptor mediator {} no longer exists", record_id))?;
+                Some(guard)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    // Validated before the gateway is activated, and under the lock for a provided mediator.
+    // The pending connection records the permanent connection point's mediator:
+    // the acceptor mediator when one was selected, otherwise the inviter's,
+    // which is also the handshake mediator.
+    let connection_mediator_did = pending_conn
+        .mediator_did
+        .clone();
+    info!("   Using mediator from connection: {}", connection_mediator_did);
+
+    let connection_mediator_doc = selected_mediator_document(
+        listener_manager
+            .mediator_store
+            .as_deref(),
+        pending_conn
+            .mediator_record_id
+            .as_deref(),
+        &connection_mediator_did,
+    )
+    .await?;
+    let connection_mediator_url = permanent_mediator_url(
+        &connection_mediator_did,
+        connection_mediator_doc.as_ref(),
+        handshake_mediator_did,
+        handshake_mediator_url,
+    )?;
+
+    // Step 2: Update pending connection with inviter's secure DID
+    let mut updated_conn = pending_conn.clone();
+    updated_conn.their_secure_did = Some(inviter_secure_did.to_string());
+    updated_conn.their_issuer_did = Some(inviter_issuer_did.clone());
+    updated_conn.state = crate::gateways::ConnectionState::ReadyToFinalize;
+
+    pending_store
+        .update(updated_conn)
+        .await;
+    info!("✓ Updated pending connection state");
+
+    // Step 3: Update existing pending gateway with inviter's SECURE DID and set to Active
+    info!("  Looking for existing pending gateway with temporary DID: {}", inviter_temporary_did);
+
     let mut gateway = match own_pending_gateway {
         Some(gateway) => Some(gateway),
         None => gateway_store
@@ -3739,31 +3805,6 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
     // This is our DID for receiving messages FROM this remote gateway
     // IMPORTANT: Use the SAME DID that we sent in the connection-setup message!
     info!("🎧 Creating gateway listener endpoint...");
-
-    // The pending connection records the permanent connection point's mediator:
-    // the acceptor mediator when one was selected, otherwise the inviter's,
-    // which is also the handshake mediator.
-    let connection_mediator_did = pending_conn
-        .mediator_did
-        .clone();
-    info!("   Using mediator from connection: {}", connection_mediator_did);
-
-    let connection_mediator_doc = selected_mediator_document(
-        listener_manager
-            .mediator_store
-            .as_deref(),
-        pending_conn
-            .mediator_record_id
-            .as_deref(),
-        &connection_mediator_did,
-    )
-    .await?;
-    let connection_mediator_url = permanent_mediator_url(
-        &connection_mediator_did,
-        connection_mediator_doc.as_ref(),
-        handshake_mediator_did,
-        handshake_mediator_url,
-    )?;
 
     // Extract the UUID from our_secure_did (format: did:web:domain:connection-points:{UUID})
     let cp_id = pending_conn
@@ -3840,6 +3881,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
         .create(&connection_point)
         .await
         .map_err(|e| format!("Failed to store gateway listener: {}", e))?;
+    drop(mediator_guard);
 
     info!("   ✓ Gateway listener endpoint {} created", connection_point.id);
 

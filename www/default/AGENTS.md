@@ -43,7 +43,10 @@ Applies to:
    stopped offering it, or none is configured), shows no badge or
    warning for them, and shows the stored `provided` record instead of the entry when one exists
    for the DID. An operator-added mediator with the same DID is a separate row and never hides
-   the entry.
+   the entry. The wizard's mediator step shows a failed load above the empty-list message and
+   offers a Refresh button (`wizard-mediator-refresh-button`) in that state and below the list, since
+   a directory can take a moment to answer after the gateway starts; a load error shows as
+   `wizard-mediator-load-error`.
 
 ## Toasts
 
