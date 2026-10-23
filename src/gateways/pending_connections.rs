@@ -223,20 +223,19 @@ impl PendingConnectionStore {
             .await
     }
 
-    /// Removes the pending connections of the gateway whose DID is `gateway_did`,
-    /// which is the inviter's temporary DID until the handshake completes and the
-    /// inviter's secure DID after it.
-    pub async fn remove_for_gateway_did(
+    /// Removes the pending connections whose temporary or permanent connection
+    /// point is one of `connection_point_ids`, the connection points of a gateway
+    /// that is being deleted.
+    pub async fn remove_for_connection_points(
         &self,
-        gateway_did: &str,
+        connection_point_ids: &[String],
     ) {
         for pending in self.list_all().await {
-            if pending.their_temporary_did == gateway_did
-                || pending
-                    .their_secure_did
-                    .as_deref()
-                    == Some(gateway_did)
-            {
+            let uses = |id: &Option<String>| {
+                id.as_ref()
+                    .is_some_and(|id| connection_point_ids.contains(id))
+            };
+            if uses(&pending.temporary_cp_id) || uses(&pending.secure_cp_id) {
                 self.remove(&pending.id).await;
             }
         }
@@ -389,22 +388,24 @@ mod tests {
 
     fn pairing(
         id: &str,
-        their_temporary_did: &str,
-        their_secure_did: Option<&str>,
+        temporary_cp_id: &str,
+        secure_cp_id: &str,
     ) -> PendingOOBConnection {
         let json = serde_json::json!({
             "id": id,
             "our_temporary_did": "did:web:us.example:connection-points:tmp",
             "our_secure_did": "did:web:us.example:connection-points:1111",
-            "their_temporary_did": their_temporary_did,
-            "their_secure_did": their_secure_did,
+            "their_temporary_did": "did:web:them.example:connection-points:tmp",
+            "their_secure_did": null,
             "mediator_did": "did:web:mediator.example",
             "connection_point_id": "",
             "invitation_id": id,
             "role": "Acceptor",
             "state": "WaitingForResponse",
             "created_at": "2026-01-01T00:00:00Z",
-            "expires_at": "2026-01-01T01:00:00Z"
+            "expires_at": "2026-01-01T01:00:00Z",
+            "temporary_cp_id": temporary_cp_id,
+            "secure_cp_id": secure_cp_id
         });
         serde_json::from_value(json).unwrap()
     }
@@ -416,30 +417,30 @@ mod tests {
             .await
             .unwrap();
         store
-            .try_store(pairing("one", "did:web:them:tmp", None))
+            .try_store(pairing("one", "tmp-1", "secure-1"))
             .await
             .unwrap();
         assert_eq!(store.list_all().await.len(), 1);
     }
 
     #[tokio::test]
-    async fn remove_for_gateway_did_removes_only_that_gateways_pairings() {
+    async fn remove_for_connection_points_removes_only_pairings_using_those_points() {
         let dir = tempfile::tempdir().unwrap();
         let store = PendingConnectionStore::new(dir.path().to_path_buf())
             .await
             .unwrap();
         store
-            .store(pairing("by-temporary", "did:web:them:tmp", None))
+            .store(pairing("by-temporary", "tmp-1", "secure-1"))
             .await;
         store
-            .store(pairing("by-secure", "did:web:other:tmp", Some("did:web:them:tmp")))
+            .store(pairing("by-secure", "tmp-2", "secure-2"))
             .await;
         store
-            .store(pairing("someone-else", "did:web:else:tmp", Some("did:web:else:secure")))
+            .store(pairing("someone-else", "tmp-3", "secure-3"))
             .await;
 
         store
-            .remove_for_gateway_did("did:web:them:tmp")
+            .remove_for_connection_points(&["tmp-1".to_string(), "secure-2".to_string()])
             .await;
 
         let left: Vec<String> = store

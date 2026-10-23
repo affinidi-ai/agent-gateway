@@ -654,7 +654,7 @@ impl IntoResponse for CreateError {
 }
 
 /// Create a new connection point (OOB invitation)
-pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: GatewayStore, M: MediatorStore>(
+pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: GatewayStore, M: MediatorStore + 'static>(
     Extension(pub_store): Extension<std::sync::Arc<P>>,
     Extension(gateway_store): Extension<std::sync::Arc<G>>,
     Extension(mediator_store): Extension<std::sync::Arc<M>>,
@@ -738,12 +738,12 @@ pub async fn create_connection_point<P: ConnectionPointStore + 'static, G: Gatew
         {
             crate::mediators::handlers::DirectoryMediator::Stored(mediator) => mediator,
             crate::mediators::handlers::DirectoryMediator::Pending(pending) => {
-                crate::mediators::handlers::store_pending_directory_mediator(
-                    mediator_store.as_ref(),
-                    notif_store.as_ref(),
+                crate::mediators::handlers::store_pending_directory_mediator_detached(
+                    mediator_store.clone(),
+                    notif_store.clone(),
                     pending,
-                    gateway.tenant_id.as_deref(),
-                    &context,
+                    gateway.tenant_id.clone(),
+                    context.clone(),
                 )
                 .await?
             }

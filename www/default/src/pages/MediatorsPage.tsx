@@ -78,7 +78,11 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
           [decodedId]: new Set(['summary']),
         });
         // Check auth if needed
-        if (!mediator.provided && mediator.did_document && hasDIDCommMessaging(mediator.did_document)) {
+        if (
+          !mediator.provided &&
+          mediator.did_document &&
+          hasDIDCommMessaging(mediator.did_document)
+        ) {
           checkAuthEndpoints(decodedId, mediator.did_document);
         }
         // Scroll to the mediator after a short delay
@@ -161,7 +165,11 @@ const MediatorsPage: React.FC<MediatorsPageProps> = ({ externalSearchTerm, onCou
           [mediatorId]: new Set(['summary']),
         }));
         // Check auth if needed
-        if (!mediator.provided && mediator.did_document && hasDIDCommMessaging(mediator.did_document)) {
+        if (
+          !mediator.provided &&
+          mediator.did_document &&
+          hasDIDCommMessaging(mediator.did_document)
+        ) {
           checkAuthEndpoints(mediatorId, mediator.did_document);
         }
         // Navigate to deep link URL

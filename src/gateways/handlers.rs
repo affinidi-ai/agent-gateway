@@ -680,12 +680,14 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
 
     // Stop all WebSocket listeners for connection points associated with this gateway
     // and delete system-created connection points (user-created ones are kept)
+    let mut connection_point_ids = Vec::new();
     match connection_point_store
         .list_by_gateway(&id)
         .await
     {
         Ok(connection_points) => {
             for cp in connection_points {
+                connection_point_ids.push(cp.id.clone());
                 // Stop the listener
                 if let Err(e) = listener_manager
                     .stop_listener(&cp.id)
@@ -720,7 +722,7 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete gateway: {}", e)))?;
     pending_store
-        .remove_for_gateway_did(&gateway.did)
+        .remove_for_connection_points(&connection_point_ids)
         .await;
 
     info!("Deleted gateway {} and stopped all associated listeners", id);

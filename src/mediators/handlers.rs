@@ -641,18 +641,24 @@ pub(crate) async fn resolve_directory_mediator<S: MediatorStore>(
     if !can_reference(gateway_tenant, tenant_id.as_deref()) {
         return Err((StatusCode::BAD_REQUEST, "Mediator reference is not accessible".to_string()).into());
     }
-    let existing =
-        under_did_lock(&entry.did, find_directory_record(store, &entry.did, gateway_tenant, context)).await?;
+    let record_id = directory_record_id(tenant_id.as_deref(), &entry.did);
+    let existing = under_did_lock(&entry.did, async {
+        if let Some(existing) = find_directory_record(store, &entry.did, gateway_tenant, context).await? {
+            return Ok(Some(existing));
+        }
+        let hidden = store
+            .get(&record_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
+            .is_some();
+        if hidden {
+            return Err(not_found());
+        }
+        Ok(None)
+    })
+    .await?;
     if let Some(existing) = existing {
         return Ok(DirectoryMediator::Stored(existing));
-    }
-    let hidden = store
-        .get(&directory_record_id(tenant_id.as_deref(), &entry.did))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get mediator: {}", e)))?
-        .is_some();
-    if hidden {
-        return Err(not_found().into());
     }
     let did_document = super::utils::resolve_did(&entry.did)
         .await
@@ -712,6 +718,32 @@ async fn find_directory_record<S: MediatorStore>(
                 && can_access(mediator.tenant_id.as_deref(), tenant_context(context))
         })
         .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id))))
+}
+
+/// [`store_pending_directory_mediator`] in a task of its own, so a cancelled
+/// request cannot drop the DID's lock while the write is still running.
+pub(crate) async fn store_pending_directory_mediator_detached<S: MediatorStore + 'static>(
+    store: Arc<S>,
+    notification_store: Option<Arc<crate::integrations::FileSystemNotificationStore>>,
+    pending: Mediator,
+    gateway_tenant: Option<String>,
+    context: Option<Extension<PatTenantContext>>,
+) -> Result<Mediator, (StatusCode, String)> {
+    tokio::spawn(async move {
+        store_pending_directory_mediator(
+            store.as_ref(),
+            notification_store.as_ref(),
+            pending,
+            gateway_tenant.as_deref(),
+            &context,
+        )
+        .await
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Storing the directory mediator failed: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store mediator".to_string())
+    })?
 }
 
 /// Stores a pending directory mediator, unless a record for the same DID the
