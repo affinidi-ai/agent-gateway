@@ -975,7 +975,7 @@ pub async fn update_mediator<S: MediatorStore>(
 }
 
 /// Delete a mediator
-pub async fn delete_mediator<S: MediatorStore>(
+pub async fn delete_mediator<S: MediatorStore + 'static>(
     Extension(store): Extension<std::sync::Arc<S>>,
     Extension(notification_store): Extension<Option<std::sync::Arc<crate::integrations::FileSystemNotificationStore>>>,
     Extension(cp_store): Extension<Option<std::sync::Arc<crate::gateways::FileSystemConnectionPointStore>>>,
@@ -1001,7 +1001,7 @@ pub async fn delete_mediator<S: MediatorStore>(
     }
     // A provided record is read again under its DID's lock, so the checks below
     // run on the record as it is now.
-    let _did_guard = if mediator.provided {
+    let did_guard = if mediator.provided {
         let guard = lock_did(&mediator.did).await;
         mediator = store
             .get(&id)
@@ -1060,10 +1060,22 @@ pub async fn delete_mediator<S: MediatorStore>(
     } else {
         tracing::warn!("Cannot stop connection point listeners: store or listener manager not available");
     }
-    store
-        .delete(&id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete mediator: {}", e)))?;
+    // Spawned, with the DID's lock moved in, so a cancelled request cannot release
+    // the lock while the file removal and the cache update are still running.
+    let deleting = store.clone();
+    let record_id = id.clone();
+    tokio::spawn(async move {
+        let _held_until_deleted = did_guard;
+        deleting
+            .delete(&record_id)
+            .await
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Deleting the mediator failed: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete mediator".to_string())
+    })?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete mediator: {}", e)))?;
 
     let removed_clients = remove_cached_clients_for_mediator(&mediator.did).await;
     tracing::info!("Removed {} cached comm client(s) for mediator DID {}", removed_clients, mediator.did);
