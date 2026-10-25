@@ -1032,6 +1032,11 @@ pub fn create_identity_api_router(
             router = router.layer(Extension(listener_mgr.clone()));
             router = router.layer(Extension(gateway_channel_cache.clone()));
         }
+        router = router.layer(Extension(
+            state
+                .mediator_directory
+                .clone(),
+        ));
 
         // Add connection point store if available (needed for OOB connections and delete)
         if let Some(cp_store) = &connection_point_store {

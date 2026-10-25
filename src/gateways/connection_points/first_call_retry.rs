@@ -1,10 +1,13 @@
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
+use affinidi_messaging_sdk::ATM;
 use affinidi_messaging_sdk::errors::ATMError;
+use affinidi_messaging_sdk::profiles::ATMProfile;
 use tracing::warn;
 
-use crate::event_hook::Listing;
+use crate::event_hook::{Listing, MediatorDirectory};
 
 pub const ENV_ATTEMPTS: &str = "AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_ATTEMPTS";
 pub const ENV_DELAY_MS: &str = "AG_MEDIATOR_DIRECTORY_FIRST_CALL_RETRY_DELAY_MS";
@@ -154,6 +157,43 @@ pub(crate) fn applies_to(
     listing: Option<Listing>,
 ) -> bool {
     provided && matches!(listing, Some(Listing::Listed | Listing::Unknown))
+}
+
+/// The retry for a DID whose mediator has no stored record to say it is provided:
+/// only a mediator the directory currently lists gets it. A directory that is
+/// not configured, has not answered, or does not list the mediator gets none.
+pub(crate) async fn policy_for_listed(
+    directory: Option<&Arc<MediatorDirectory>>,
+    mediator_did: &str,
+) -> FirstCallRetry {
+    match directory {
+        Some(directory)
+            if directory
+                .listing(mediator_did)
+                .await
+                == Listing::Listed =>
+        {
+            FirstCallRetry::current()
+        }
+        _ => FirstCallRetry::never(),
+    }
+}
+
+/// `atm.profile_add`, repeated under `retry` while the mediator refuses a DID it
+/// has not admitted yet.
+pub(crate) async fn profile_add(
+    atm: &ATM,
+    profile: &ATMProfile,
+    live_stream: bool,
+    retry: FirstCallRetry,
+) -> Result<Arc<ATMProfile>, ATMError> {
+    retry
+        .run(
+            || atm.profile_add(profile, live_stream),
+            refused_until_admitted,
+            || ATMError::TransportError("The first call did not finish within the retry time limit".into()),
+        )
+        .await
 }
 
 /// Only a directory that answered without the DID has dropped the mediator; one
@@ -415,5 +455,41 @@ mod tests {
         assert!(!refused_until_admitted(&ATMError::TransportError("blocked by 403 firewall".into())));
         assert!(!refused_until_admitted(&ATMError::TransportError("connection refused".into())));
         assert!(!refused_until_admitted(&ATMError::ConfigError("bad".into())));
+    }
+
+    async fn directory_with(url: String) -> Arc<crate::event_hook::MediatorDirectory> {
+        crate::event_hook::MediatorDirectory::new(&crate::event_hook::EventHookSettings {
+            directory_url: Some(url),
+            ..crate::event_hook::EventHookSettings::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_a_mediator_the_directory_lists_gets_the_retry() {
+        let (url, _) = crate::event_hook::tests_support::serve(
+            200,
+            r#"{"items":[{"did":"did:web:public.example","name":"Shared"}]}"#,
+        )
+        .await;
+        let answered = directory_with(url).await;
+        answered.entries().await;
+        let listed = policy_for_listed(Some(&answered), "did:web:public.example").await;
+        assert_eq!(listed, FirstCallRetry::current());
+        assert!(listed.attempts > 0);
+        assert_eq!(policy_for_listed(Some(&answered), "did:web:other.example").await, FirstCallRetry::never());
+        assert_eq!(policy_for_listed(None, "did:web:public.example").await, FirstCallRetry::never());
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_has_not_answered_gives_no_retry() {
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let silent = directory_with(format!("http://127.0.0.1:{closed_port}/mediators")).await;
+        assert_eq!(policy_for_listed(Some(&silent), "did:web:public.example").await, FirstCallRetry::never());
     }
 }

@@ -1224,18 +1224,13 @@ async fn create_oob_invitation(
     info!("ATM Profile created for DID: {}", from_did);
     // Add profile to ATM (this returns Arc<ATMProfile> and registers it properly)
     // IMPORTANT: Use live_stream=true so we can query and update ACL mode
-    let profile = match first_call_retry
-        .unwrap_or_else(super::first_call_retry::FirstCallRetry::never)
-        .run(
-            || atm.profile_add(&profile, true),
-            super::first_call_retry::refused_until_admitted,
-            || {
-                affinidi_messaging_sdk::errors::ATMError::TransportError(
-                    "The first call did not finish within the retry time limit".into(),
-                )
-            },
-        )
-        .await
+    let profile = match super::first_call_retry::profile_add(
+        &atm,
+        &profile,
+        true,
+        first_call_retry.unwrap_or_else(super::first_call_retry::FirstCallRetry::never),
+    )
+    .await
     {
         Ok(profile) => profile,
         Err(e) => {

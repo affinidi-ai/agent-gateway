@@ -1801,6 +1801,7 @@ pub async fn connect_via_oob<
     Extension(network_config): Extension<Arc<crate::config::NetworkConfig>>,
     Extension(pending_store): Extension<Arc<crate::gateways::PendingConnectionStore>>,
     Extension(listener_manager): Extension<Option<Arc<ConnectionPointListenerManager>>>,
+    Extension(mediator_directory): Extension<Option<Arc<crate::event_hook::MediatorDirectory>>>,
     #[cfg(feature = "didwebvh")] Extension(log_storage): Extension<
         Option<std::sync::Arc<dyn crate::storage::DidLogStorage>>,
     >,
@@ -2281,8 +2282,30 @@ pub async fn connect_via_oob<
         info!("  Target mediator DID: {}", their_mediator_did);
         info!("  Target recipient DID: {}", inviter_temporary_did);
 
+        let temp_payload = crate::event_hook::ConnectionPointPayload::minted(
+            &temp_cp_id,
+            "Temporary listener for a pending gateway",
+            "",
+            &pending_gateway_id,
+            "",
+            &their_mediator_did,
+            &temporary_did,
+        );
+        let temp_announcement = crate::event_hook::CreationGuard::start(
+            listener_manager
+                .as_ref()
+                .and_then(|manager| manager.event_hook().cloned()),
+            temp_payload.clone(),
+        );
+
         didcomm_client
-            .register_profile()
+            .register_profile_with(
+                crate::gateways::connection_points::first_call_retry::policy_for_listed(
+                    mediator_directory.as_ref(),
+                    &their_mediator_did,
+                )
+                .await,
+            )
             .await
             .map_err(|e| {
                 error!("❌ Failed to register profile with mediator: {}", e);
@@ -2380,6 +2403,7 @@ pub async fn connect_via_oob<
         );
         temp_connection_point.id = temp_cp_id.clone();
         temp_connection_point.did_method = did_method.clone();
+        temp_connection_point.mediator_did = Some(their_mediator_did.clone());
 
         // Store the temporary connection point
         cp_store
@@ -2391,6 +2415,7 @@ pub async fn connect_via_oob<
             })?;
 
         info!("  ✓ Temporary connection point created: {}", temp_cp_id);
+        temp_announcement.created(temp_payload);
 
         // Start WebSocket listener for the temporary connection point
         info!("  Starting WebSocket listener (not polling!)...");

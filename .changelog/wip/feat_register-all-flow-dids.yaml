@@ -1,0 +1,11 @@
+branch: feat/register-all-flow-dids
+changes:
+  added:
+    - timestamp: '2026-10-25T00:00:00.000Z'
+      title: Announce the DIDs of gateway pairing and Trust Registries to the event hook
+      description: The gateway now sends the event hook the DID it generates for each flow that logs in to a mediator, not only for Connection Points created through the API. The acceptor's temporary and permanent DIDs, the inviter's permanent DID after approval, and the DID of a stored Trust Registry are announced before the gateway first contacts the mediator, so a receiver that registers DIDs on a mediator that admits only known DIDs, such as the shared public mediator, covers them. Their records now carry mediator_did, so deleting a pairing, expiring a temporary Connection Point or deleting a Trust Registry sends deleted. The acceptor's handshake DID and a new Trust Registry's DID also repeat their first mediator call while a mediator the directory lists refuses a DID it has not admitted yet. The ephemeral DID for querying an unstored public Trust Registry and connections rebuilt after a restart are not announced. See docs/INTEGRATIONS.md.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

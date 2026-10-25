@@ -1897,6 +1897,7 @@ pub async fn run_axum_proxy(
             listener_mgr
                 .set_ws_state((*ws_state).clone())
                 .await;
+            listener_mgr.set_event_hook(event_hook.clone(), mediator_directory.clone());
 
             let listener_mgr = listener_mgr.clone();
             let tr_store_for_boot = tr_store.clone();

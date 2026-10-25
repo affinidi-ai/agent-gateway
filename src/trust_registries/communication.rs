@@ -33,6 +33,7 @@ use super::types::{
     TrustRegistryConnectionStatus, UpdateReferenceFieldRequest,
 };
 use crate::egress::{EgressError, EgressPolicy, bdd_egress_allowlist, guarded_send_inner};
+use crate::gateways::connection_points::first_call_retry::FirstCallRetry;
 use crate::mediators::utils::{fetch_mediator_did_from_url, set_acl_to_allow_everything_and_more};
 
 // =============================================================================
@@ -386,6 +387,10 @@ pub struct TrustRegistryListenerManager {
     readers: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
     /// Whether connections may be established; false while in Standby mode.
     listeners_active: Arc<AtomicBool>,
+    /// Reports each stored registry's DID to the event hook receiver.
+    event_hook: std::sync::OnceLock<Arc<crate::event_hook::EventHook>>,
+    /// Tells whether a registry's mediator is one the directory lists.
+    mediator_directory: std::sync::OnceLock<Arc<crate::event_hook::MediatorDirectory>>,
 }
 
 impl TrustRegistryListenerManager {
@@ -409,6 +414,40 @@ impl TrustRegistryListenerManager {
             ws_state: RwLock::new(None),
             readers: Arc::new(RwLock::new(HashMap::new())),
             listeners_active: Arc::new(AtomicBool::new(true)),
+            event_hook: std::sync::OnceLock::new(),
+            mediator_directory: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Attach the event hook and the mediator directory, so a stored registry's DID
+    /// is announced before the gateway first contacts its mediator.
+    pub fn set_event_hook(
+        &self,
+        hook: Option<Arc<crate::event_hook::EventHook>>,
+        directory: Option<Arc<crate::event_hook::MediatorDirectory>>,
+    ) {
+        if let Some(hook) = hook {
+            let _ = self.event_hook.set(hook);
+        }
+        if let Some(directory) = directory {
+            let _ = self
+                .mediator_directory
+                .set(directory);
+        }
+    }
+
+    /// Tell the event hook receiver that `trust_registry`'s DID is no longer used.
+    pub fn announce_deleted(
+        &self,
+        trust_registry: &super::types::TrustRegistry,
+    ) {
+        if let (Some(hook), Some(our_did), Some(mediator_did)) =
+            (self.event_hook.get(), &trust_registry.our_did, &trust_registry.mediator_did)
+        {
+            hook.emit(
+                crate::event_hook::EventKind::Deleted,
+                trust_registry_payload(&trust_registry.id, mediator_did, our_did),
+            );
         }
     }
 
@@ -758,10 +797,27 @@ impl TrustRegistryListenerManager {
         self.remove_connection(trust_registry_id)
             .await;
 
+        let announcement = crate::event_hook::CreationGuard::start(
+            self.event_hook.get().cloned(),
+            trust_registry_payload(trust_registry_id, &mediator_did, &our_did),
+        );
+        let first_call_retry = crate::gateways::connection_points::first_call_retry::policy_for_listed(
+            self.mediator_directory.get(),
+            &mediator_did,
+        )
+        .await;
+
         // Step 3: Create DIDComm client and connect (pre-cache our DID doc to avoid HTTPS resolution)
-        let client = create_tr_client(trust_registry_id, &our_did, &mediator_did, &secrets, Some((&our_did, &did_doc)))
-            .await
-            .map_err(TrustRegistryError::ConnectionError)?;
+        let client = create_tr_client(
+            trust_registry_id,
+            &our_did,
+            &mediator_did,
+            &secrets,
+            Some((&our_did, &did_doc)),
+            first_call_retry,
+        )
+        .await
+        .map_err(TrustRegistryError::ConnectionError)?;
 
         // Set ACL to allow messages from the trust registry
         set_acl_to_allow_everything_and_more(client.atm(), client.profile().clone())
@@ -827,6 +883,8 @@ impl TrustRegistryListenerManager {
         // responses and future query responses are demultiplexed.
         self.spawn_reader(trust_registry_id)
             .await;
+
+        announcement.created(trust_registry_payload(trust_registry_id, &mediator_did, &our_did));
 
         info!("🔗 Trust registry '{}' connection established — awaiting registry-side approval", trust_registry_id,);
 
@@ -959,6 +1017,7 @@ impl TrustRegistryListenerManager {
             did_doc_to_cache
                 .as_ref()
                 .map(|doc| (our_did, doc)),
+            FirstCallRetry::never(),
         )
         .await
         .map_err(TrustRegistryError::ConnectionError)?;
@@ -1461,9 +1520,16 @@ impl TrustRegistryListenerManager {
         }
 
         // Step 3: Create DIDComm client
-        let client = create_tr_client(&temp_id, &our_did, &mediator_did, &secrets, Some((&our_did, &did_doc)))
-            .await
-            .map_err(TrustRegistryError::ConnectionError)?;
+        let client = create_tr_client(
+            &temp_id,
+            &our_did,
+            &mediator_did,
+            &secrets,
+            Some((&our_did, &did_doc)),
+            FirstCallRetry::never(),
+        )
+        .await
+        .map_err(TrustRegistryError::ConnectionError)?;
 
         set_acl_to_allow_everything_and_more(client.atm(), client.profile().clone())
             .await
@@ -2073,6 +2139,22 @@ fn resolve_did_peer_document(did: &str) -> Result<serde_json::Value, TrustRegist
 // ATM Instance Creation
 // =============================================================================
 
+fn trust_registry_payload(
+    trust_registry_id: &str,
+    mediator_did: &str,
+    our_did: &str,
+) -> crate::event_hook::ConnectionPointPayload {
+    crate::event_hook::ConnectionPointPayload::minted(
+        trust_registry_id,
+        &format!("Trust registry {trust_registry_id}"),
+        "",
+        "",
+        "",
+        mediator_did,
+        our_did,
+    )
+}
+
 /// Create a DIDComm client for trust registry communication.
 ///
 /// Wraps `DIDCommClient::new` + optional DID doc pre-caching + `enable_websocket`.
@@ -2086,6 +2168,7 @@ async fn create_tr_client(
     mediator_did: &str,
     secrets: &[Secret],
     did_doc_to_cache: Option<(&str, &serde_json::Value)>,
+    first_call_retry: FirstCallRetry,
 ) -> Result<crate::comm::didcomm::client::DIDCommClient, String> {
     let mut client = crate::comm::didcomm::client::DIDCommClient::new(
         our_did.to_string(),
@@ -2105,7 +2188,7 @@ async fn create_tr_client(
             info!("✓ Pre-cached DID document for {} in ATM resolver", did);
         }
         client
-            .enable_websocket()
+            .enable_websocket_with(first_call_retry)
             .await
     }
     .await;
@@ -2131,6 +2214,77 @@ mod tests {
     }
 
     // --- Active/Standby gate ---
+
+    async fn deleted_events_after(
+        registries: &[super::super::types::TrustRegistry],
+        expected: usize,
+    ) -> Vec<String> {
+        let manager = test_manager();
+        let (url, captured) = crate::event_hook::tests_support::serve(204, "").await;
+        let hook = crate::event_hook::EventHook::new(crate::event_hook::EventHookSettings {
+            hook_url: Some(url),
+            ..crate::event_hook::EventHookSettings::default()
+        });
+        manager.set_event_hook(hook, None);
+        for registry in registries {
+            manager.announce_deleted(registry);
+        }
+        for _ in 0..100 {
+            if captured.lock().unwrap().len() >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.body.clone())
+            .collect()
+    }
+
+    fn stored_registry(
+        our_did: Option<&str>,
+        mediator_did: Option<&str>,
+    ) -> super::super::types::TrustRegistry {
+        let mut registry = super::super::types::TrustRegistry::new(
+            "tr".into(),
+            String::new(),
+            "https://oob.example".into(),
+            DidMethod::Peer,
+        );
+        registry.our_did = our_did.map(str::to_string);
+        registry.mediator_did = mediator_did.map(str::to_string);
+        registry
+    }
+
+    #[tokio::test]
+    async fn deleting_a_connected_registry_reports_its_did() {
+        let bodies =
+            deleted_events_after(&[stored_registry(Some("did:peer:2.ours"), Some("did:web:mediator.example"))], 1)
+                .await;
+        assert_eq!(bodies.len(), 1, "one event: {bodies:?}");
+        let event: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(event["event"], "connection_point.deleted");
+        assert_eq!(event["connection_point"]["did"], "did:peer:2.ours");
+        assert_eq!(event["connection_point"]["mediator_did"], "did:web:mediator.example");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_registry_that_never_connected_reports_nothing() {
+        let bodies = deleted_events_after(
+            &[
+                stored_registry(None, None),
+                stored_registry(Some("did:peer:2.half"), None),
+                stored_registry(Some("did:peer:2.sentinel"), Some("did:web:mediator.example")),
+            ],
+            1,
+        )
+        .await;
+        assert_eq!(bodies.len(), 1, "only the connected registry is reported: {bodies:?}");
+        assert!(bodies[0].contains("did:peer:2.sentinel"));
+    }
 
     fn test_manager() -> TrustRegistryListenerManager {
         let dir = tempfile::tempdir().expect("tempdir");

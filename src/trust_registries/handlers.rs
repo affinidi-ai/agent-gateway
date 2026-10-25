@@ -306,7 +306,7 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
     }
 
     // Stop connection and clean up listener
-    if let Some(Extension(listener_mgr)) = listener_manager {
+    if let Some(Extension(listener_mgr)) = &listener_manager {
         listener_mgr
             .remove_connection(&id)
             .await;
@@ -329,6 +329,10 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
         .delete(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete trust registry: {}", e)))?;
+
+    if let Some(Extension(listener_mgr)) = &listener_manager {
+        listener_mgr.announce_deleted(&trust_registry);
+    }
 
     // Trigger integration event
     let trigger_registry = build_trigger_registry(&trust_registry);
@@ -583,6 +587,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
     }
 
     // Fall back to full OOB re-connection
+    let previous = tr.clone();
     match listener_mgr
         .accept_oob_and_connect(&id, &tr.oob_url, &tr.did_method)
         .await
@@ -599,6 +604,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
             tr.mediator_url = Some(connection_info.mediator_url);
             tr.mediator_did = Some(connection_info.mediator_did);
             tr.updated_at = chrono::Utc::now();
+            let replaced = previous.our_did != tr.our_did;
 
             // Wait for WS readiness; fail rather than persisting a terminal Connecting state
             // that the reader will never promote (already-approved TR won't re-send setup/approved).
@@ -618,7 +624,14 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
             if !conn_ready {
                 tracing::error!("OOB reconnection transport not ready for '{}'; failing reconnect", id);
                 tr.connection_status = TrustRegistryConnectionStatus::Failed;
-                let _ = store.update(&tr).await;
+                if store
+                    .update(&tr)
+                    .await
+                    .is_ok()
+                    && replaced
+                {
+                    listener_mgr.announce_deleted(&previous);
+                }
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     "Reconnection failed: WebSocket not ready after retries".to_string(),
@@ -631,6 +644,9 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
                 .update(&tr)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)))?;
+            if replaced {
+                listener_mgr.announce_deleted(&previous);
+            }
 
             if let (Some(Extension(w)), Some(ws)) = (&worker, &ws_state) {
                 w.start_listener(&tr, store.clone(), (**ws).clone())
