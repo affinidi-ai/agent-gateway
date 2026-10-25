@@ -116,6 +116,27 @@ pub async fn get_trust_registry<S: TrustRegistryStore>(
 }
 
 /// Create a new trust registry
+/// Saves `trust_registry` on its own task, so a cancelled request cannot report the DID
+/// it announced as failed while the record is written, and reports it `created` once the
+/// record, which now names that DID, is stored.
+async fn save_announced<S: TrustRegistryStore + 'static>(
+    store: &Arc<S>,
+    trust_registry: &TrustRegistry,
+    announcement: crate::event_hook::CreationGuard,
+) -> Result<(), anyhow::Error> {
+    let (Some(our_did), Some(mediator_did)) = (&trust_registry.our_did, &trust_registry.mediator_did) else {
+        return store
+            .update(trust_registry)
+            .await;
+    };
+    let saved = super::communication::trust_registry_payload(&trust_registry.id, mediator_did, our_did);
+    let record = trust_registry.clone();
+    let store = store.clone();
+    announcement
+        .complete(async move { store.update(&record).await }, saved)
+        .await
+}
+
 pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
     Extension(store): Extension<std::sync::Arc<S>>,
     listener_manager: Option<Extension<Arc<TrustRegistryListenerManager>>>,
@@ -156,6 +177,7 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
             .await
         {
             Ok(connection_info) => {
+                let announcement = connection_info.announcement;
                 trust_registry.our_did = Some(connection_info.our_did);
                 trust_registry.registry_did = Some(
                     connection_info
@@ -170,12 +192,12 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
                 trust_registry.updated_at = chrono::Utc::now();
 
                 // Update store with connection info
-                store
-                    .update(&trust_registry)
-                    .await
-                    .map_err(|e| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e))
-                    })?;
+                if let Err(e) = save_announced(&store, &trust_registry, announcement).await {
+                    listener_mgr
+                        .remove_connection(&trust_registry.id)
+                        .await;
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)));
+                }
 
                 // Start background listener for connection protocol messages
                 if let (Some(Extension(w)), Some(ws)) = (&worker, &ws_state) {
@@ -593,6 +615,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
         .await
     {
         Ok(connection_info) => {
+            let announcement = connection_info.announcement;
             tr.our_did = Some(connection_info.our_did);
             tr.registry_did = Some(
                 connection_info
@@ -624,8 +647,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
             if !conn_ready {
                 tracing::error!("OOB reconnection transport not ready for '{}'; failing reconnect", id);
                 tr.connection_status = TrustRegistryConnectionStatus::Failed;
-                if store
-                    .update(&tr)
+                if save_announced(&store, &tr, announcement)
                     .await
                     .is_ok()
                     && replaced
@@ -640,10 +662,12 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
 
             tr.connection_status = TrustRegistryConnectionStatus::Connected;
 
-            store
-                .update(&tr)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)))?;
+            if let Err(e) = save_announced(&store, &tr, announcement).await {
+                listener_mgr
+                    .remove_connection(&id)
+                    .await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)));
+            }
             if replaced {
                 listener_mgr.announce_deleted(&previous);
             }

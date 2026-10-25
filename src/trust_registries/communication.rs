@@ -113,6 +113,9 @@ pub struct OobConnectionInfo {
     pub mediator_did: String,
     /// The canonical DID of the trust registry (from OOB URL `main_did` query param)
     pub main_did: Option<String>,
+    /// Reports `creation_failed` for `our_did` unless the caller reports `created`
+    /// once the registry's record is saved.
+    pub announcement: crate::event_hook::CreationGuard,
 }
 
 /// Parsed data from an OOB invitation URL
@@ -884,8 +887,6 @@ impl TrustRegistryListenerManager {
         self.spawn_reader(trust_registry_id)
             .await;
 
-        announcement.created(trust_registry_payload(trust_registry_id, &mediator_did, &our_did));
-
         info!("🔗 Trust registry '{}' connection established — awaiting registry-side approval", trust_registry_id,);
 
         Ok(OobConnectionInfo {
@@ -894,6 +895,7 @@ impl TrustRegistryListenerManager {
             mediator_url,
             mediator_did,
             main_did,
+            announcement,
         })
     }
 
@@ -2139,7 +2141,7 @@ fn resolve_did_peer_document(did: &str) -> Result<serde_json::Value, TrustRegist
 // ATM Instance Creation
 // =============================================================================
 
-fn trust_registry_payload(
+pub(crate) fn trust_registry_payload(
     trust_registry_id: &str,
     mediator_did: &str,
     our_did: &str,

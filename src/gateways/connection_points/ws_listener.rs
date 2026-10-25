@@ -3884,12 +3884,21 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             .cloned(),
         crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None),
     );
-    cp_store
-        .create(&connection_point)
+    let saved = crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None);
+    let record = connection_point.clone();
+    let point_store = cp_store.clone();
+    announcement
+        .complete(
+            async move {
+                let _held_until_saved = mediator_guard;
+                point_store
+                    .create(&record)
+                    .await
+            },
+            saved,
+        )
         .await
         .map_err(|e| format!("Failed to store gateway listener: {}", e))?;
-    announcement.created(crate::event_hook::ConnectionPointPayload::from_record(&connection_point, None));
-    drop(mediator_guard);
 
     info!("   ✓ Gateway listener endpoint {} created", connection_point.id);
 

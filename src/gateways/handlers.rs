@@ -2406,8 +2406,17 @@ pub async fn connect_via_oob<
         temp_connection_point.mediator_did = Some(their_mediator_did.clone());
 
         // Store the temporary connection point
-        cp_store
-            .create(&temp_connection_point)
+        let record = temp_connection_point.clone();
+        let point_store = cp_store.clone();
+        temp_announcement
+            .complete(
+                async move {
+                    point_store
+                        .create(&record)
+                        .await
+                },
+                temp_payload,
+            )
             .await
             .map_err(|e| {
                 error!("❌ Failed to create temporary connection point: {}", e);
@@ -2415,7 +2424,6 @@ pub async fn connect_via_oob<
             })?;
 
         info!("  ✓ Temporary connection point created: {}", temp_cp_id);
-        temp_announcement.created(temp_payload);
 
         // Start WebSocket listener for the temporary connection point
         info!("  Starting WebSocket listener (not polling!)...");
