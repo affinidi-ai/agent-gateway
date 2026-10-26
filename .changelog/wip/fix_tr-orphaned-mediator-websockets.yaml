@@ -1,0 +1,40 @@
+branch: fix/tr-orphaned-mediator-websockets
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-21T00:00:00.000Z'
+      title: Stop trust registry reconnects from leaving duplicate mediator sessions
+      description: >-
+        Reconnecting a trust registry, from the dashboard, at startup or after a stale
+        connection, left the previous connection's mediator websocket running. It kept
+        reconnecting under the same DID and fought the new connection, so the mediator
+        closed one with "A new duplicate websocket connection for this DID" and the
+        trust registry ended up Failed. Replaced and removed connections are now shut
+        down, including when the gateway steps down to Standby, and stale connection
+        recovery reuses a connection another request has already replaced instead of
+        tearing it down. A connection setup that fails partway also closes its
+        websocket. A reconnect or connection setup now closes the current connection
+        before opening the new one, so the old connection no longer receives the
+        duplicate error and marks the trust registry Failed. A stale temporary
+        connection to a public trust registry is replaced with a new one instead of
+        staying stuck, and closing a connection no longer waits more than 10 seconds
+        for its websocket to shut down.
+  removed: []
+  security:
+    - timestamp: '2026-10-23T00:00:00.000Z'
+      title: Update ctutils to 0.4.5 for constant-time mask and comparison fixes
+      description: >-
+        Bump the transitive ctutils dependency from 0.4.2 to 0.4.5, which fixes
+        non-constant-time mask generation and u128 comparisons reported by cargo audit
+        (RustCrypto/utils#1569). The crate is pulled in by the elliptic-curve and digest
+        crates used for DID and DIDComm cryptography.
+    - timestamp: '2026-10-26T00:00:00.000Z'
+      title: Update crypto-bigint to 0.7.10 for constant-time operation fixes
+      description: >-
+        Bump the transitive crypto-bigint 0.7 dependency from 0.7.5 to 0.7.10 (and
+        ctutils to 0.4.6), which fixes timing variability in operations intended to
+        be constant-time (RUSTSEC-2026-0387). The older 0.3 and 0.5 copies pulled in
+        by elliptic-curve 0.13 and der 0.5 have no fixed release, so the advisory is
+        recorded as accepted for them until those upstream crates move to 0.7.
+  breaking: []

@@ -49,5 +49,14 @@ ignore = [
     # ssi / affinidi did-resolver dependency chain.
     # https://rustsec.org/advisories/RUSTSEC-2026-0258
     "RUSTSEC-2026-0258",
+
+    # crypto-bigint 0.3.2 / 0.5.5 — Timing variability in operations intended to
+    # be constant-time. Fix requires ≥0.7.6 with no 0.3.x or 0.5.x backport. The
+    # 0.7.x tree is already bumped to 0.7.10; only the older lines remain.
+    # 0.5.5 transitive via: elliptic-curve 0.13 ← affinidi-did-key,
+    # affinidi-secrets-resolver, alloy
+    # 0.3.2 transitive via: der 0.5 ← rsa 0.6.1 / pkcs8 0.8 ← ssi
+    # https://rustsec.org/advisories/RUSTSEC-2026-0387
+    "RUSTSEC-2026-0387",
 ]
 informational_warnings = ["unmaintained", "unsound", "notice"]
