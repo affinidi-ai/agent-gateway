@@ -1552,6 +1552,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rollback_finishes_when_the_request_running_it_is_cancelled() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        let rolling_back = tokio::spawn({
+            let guard = AcceptanceGuard(Some(acceptance.cleanup_clone()));
+            async move { guard.undo().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        rolling_back.abort();
+        for _ in 0..100 {
+            if acceptance.leftovers().await == (false, false, false, 0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(acceptance.leftovers().await, (false, false, false, 0));
+    }
+
+    #[tokio::test]
     async fn an_undone_acceptance_is_removed_before_undo_returns() {
         let acceptance = UnfinishedAcceptance::start().await;
         AcceptanceGuard(Some(acceptance.cleanup_clone()))
@@ -2041,8 +2059,10 @@ struct AcceptanceGuard<S: GatewayStore + 'static, P: ConnectionPointStore + 'sta
 
 impl<S: GatewayStore + 'static, P: ConnectionPointStore + 'static> AcceptanceGuard<S, P> {
     async fn undo(mut self) {
-        if let Some(cleanup) = self.0.take() {
-            cleanup.run().await;
+        if let Some(cleanup) = self.0.take()
+            && let Err(e) = tokio::spawn(cleanup.run()).await
+        {
+            warn!("Could not finish the cleanup of a failed attempt: {e}");
         }
     }
 

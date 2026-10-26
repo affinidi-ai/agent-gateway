@@ -186,9 +186,11 @@ attributed to the authenticated actor and records whether it was orphan cleanup.
 - A tenant-owned resource may reference same-tenant or global dependencies.
 - A global resource may reference only global dependencies.
 - A referenced resource must also match the PAT pattern before the write is persisted.
-  The one exception is a Connection Point created on a mediator the mediator directory offers
-  (a `directory:` id): the offer is not a stored resource, so it is not matched against the
-  pattern, and the Connection Point itself still must match.
+  For a Connection Point created on a mediator the mediator directory offers, the pattern must
+  match the `directory:` id, and a mismatch is refused before anything is stored. That grant
+  also covers the stored mediator record created for the offer: its generated id is not matched
+  against the pattern. The Connection Point itself must still match, so a token that matches only
+  Connection Points cannot create one on a directory offer.
 
 ### What tenancy does not partition
 
