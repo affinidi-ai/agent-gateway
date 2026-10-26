@@ -372,6 +372,13 @@ pub struct SurfaceInfo {
     /// MPP payment configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mpp_policy: Option<crate::mpp::MppConfig>,
+    /// agent-pay payment configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_pay_policy: Option<crate::config::agent_surface::AgentPayPolicy>,
+    /// `unsupported_legacy` when the surface carries an enabled local x402 or
+    /// MPP policy, which makes every request answer 503.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_status: Option<String>,
     /// Supported A2A extensions (e.g., UCP)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_extensions: Vec<String>,
@@ -1441,6 +1448,10 @@ pub async fn get_dashboard_stats(
                     .publish_to_did_document,
                 payment_policy: r.x402_config().cloned(),
                 mpp_policy: r.mpp_config().cloned(),
+                agent_pay_policy: r.agent_pay_policy().cloned(),
+                payment_status: r
+                    .payment_policy_unsupported()
+                    .then(|| "unsupported_legacy".to_string()),
                 supported_extensions: r
                     .access_point
                     .supported_extensions
@@ -2339,6 +2350,10 @@ async fn build_channel_list(
                 .publish_to_did_document,
             payment_policy: r.x402_config().cloned(),
             mpp_policy: r.mpp_config().cloned(),
+            agent_pay_policy: r.agent_pay_policy().cloned(),
+            payment_status: r
+                .payment_policy_unsupported()
+                .then(|| "unsupported_legacy".to_string()),
             supported_extensions: r
                 .access_point
                 .supported_extensions

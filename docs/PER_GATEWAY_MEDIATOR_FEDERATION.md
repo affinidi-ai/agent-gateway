@@ -125,9 +125,12 @@ Every `pack_and_send_message` caller is routed this way, including the
 and retry forwards in [src/proxy/handler.rs](../src/proxy/handler.rs). Fabric
 stream frames
 ([src/proxy/fabric_stream/transport.rs](../src/proxy/fabric_stream/transport.rs))
-and the x402 facilitator
+and the x402 verify and settle messages this gateway sends
 ([src/x402/gateway_facilitator_service.rs](../src/x402/gateway_facilitator_service.rs))
-always send directly, so they do not reach a gateway on another mediator.
+always send directly, so they do not reach a gateway on another mediator. A peer's verify and
+settle requests are refused, since the gateway is no longer an x402 facilitator (see
+[FABRIC.md](FABRIC.md)). Delegated
+`agent_pay` payment requests are ordinary fabric forwards and are routed like any other send.
 
 ---
 

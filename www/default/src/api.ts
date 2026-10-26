@@ -8,6 +8,14 @@ import {
   DashboardStats,
   Issuer,
   LogEntry,
+  PaymentAuditPage,
+  PaymentAuditQuery,
+  PaymentBreaker,
+  PaymentLedgerPage,
+  PaymentLedgerQuery,
+  PaymentSummary,
+  PaymentLedgerRow,
+  PaymentManifest,
   PredefinedTrustCheckQuery,
   Settings,
   Task,
@@ -15,26 +23,30 @@ import {
   TruncateMetricsResult,
   TrustRecorderStatus,
   TrustRegistry,
+  SurfacePaymentPolicy,
   UpdateAccessTokenRequest,
   UserSettingsOverrides,
 } from './types';
 
 // Agent Surface types
 import type { SurfaceStatus } from './generated/SurfaceStatus';
-import { formatApiError } from './utils/apiError';
+import { extractErrorCode, formatApiError } from './utils/apiError';
 import { parseWarningHeader } from './utils/warningHeader';
 
 const API_BASE = '/api/v1';
+const ADMIN_API_BASE = '/api/admin';
 
 /**
  * A request the server answered with an error status. The message is the
  * formatted error text, as before; `status` lets a caller tell, say, a 403
- * from a transient failure without reading the message.
+ * from a transient failure without reading the message, and `code` is the
+ * machine-readable error code of the response body, when it has one.
  */
 export class ApiError extends Error {
   constructor(
     message: string,
-    public readonly status: number
+    public readonly status: number,
+    public readonly code?: string
   ) {
     super(message);
   }
@@ -148,11 +160,18 @@ class SessionManager {
 export const sessionManager = new SessionManager();
 
 class APIClient {
-  private async request<T>(
+  private request<T>(
     endpoint: string,
     options?: RequestInit & { timeout?: number; onResponse?: (response: Response) => void }
   ): Promise<T> {
-    const url = `${API_BASE}${endpoint}`;
+    return this.requestUrl<T>(`${API_BASE}${endpoint}`, options);
+  }
+
+  /** `request` for a full path outside `API_BASE`; a 401 expires the session either way. */
+  private async requestUrl<T>(
+    url: string,
+    options?: RequestInit & { timeout?: number; onResponse?: (response: Response) => void }
+  ): Promise<T> {
     const { onResponse, ...fetchOptions } = options ?? {};
 
     // Setup timeout using AbortController
@@ -181,7 +200,7 @@ class APIClient {
       }
 
       if (!response.ok) {
-        console.error('[API] Request failed:', endpoint, response.status, response.statusText);
+        console.error('[API] Request failed:', url, response.status, response.statusText);
         let errorBody: string | null = null;
         try {
           errorBody = await response.text();
@@ -193,7 +212,8 @@ class APIClient {
         }
         throw new ApiError(
           formatApiError(response.status, errorBody, response.statusText),
-          response.status
+          response.status,
+          extractErrorCode(errorBody)
         );
       }
 
@@ -582,6 +602,73 @@ class APIClient {
     await this.request(`/surfaces/${encodeURIComponent(surfaceId)}`, {
       method: 'DELETE',
     });
+  }
+
+  async getPaymentManifest(
+    gatewayId: string,
+    surfaceId: string,
+    forceRefresh = false
+  ): Promise<PaymentManifest | null> {
+    const query = forceRefresh ? '?force_refresh=true' : '';
+    const data = await this.request<{ manifest?: PaymentManifest | null }>(
+      `/gateways/${encodeURIComponent(gatewayId)}/surfaces/${encodeURIComponent(surfaceId)}/payment-manifest${query}`,
+      { timeout: 10000 }
+    );
+    return data?.manifest ?? null;
+  }
+
+  async listPayments(query: PaymentLedgerQuery = {}): Promise<PaymentLedgerPage> {
+    const params = new URLSearchParams();
+    if (query.surface_id) params.set('surface_id', query.surface_id);
+    if (query.outcome) params.set('outcome', query.outcome);
+    if (query.limit) params.set('limit', String(query.limit));
+    const qs = params.toString();
+    const data = await this.requestUrl<Partial<PaymentLedgerPage> | null>(
+      `${ADMIN_API_BASE}/payments${qs ? `?${qs}` : ''}`
+    );
+    return {
+      payments: Array.isArray(data?.payments) ? data.payments : [],
+      total: typeof data?.total === 'number' ? data.total : 0,
+    };
+  }
+
+  async getPayment(id: string): Promise<PaymentLedgerRow> {
+    return this.requestUrl<PaymentLedgerRow>(
+      `${ADMIN_API_BASE}/payments/${encodeURIComponent(id)}`
+    );
+  }
+
+  async listPaymentAudit(query: PaymentAuditQuery = {}): Promise<PaymentAuditPage> {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== '') params.set(key, String(value));
+    }
+    const qs = params.toString();
+    const data = await this.requestUrl<Partial<PaymentAuditPage> | null>(
+      `${ADMIN_API_BASE}/payments/audit${qs ? `?${qs}` : ''}`
+    );
+    return {
+      events: Array.isArray(data?.events) ? data.events : [],
+      total: data?.total ?? 0,
+      page: data?.page ?? 1,
+      page_size: data?.page_size ?? query.page_size ?? 50,
+      total_pages: data?.total_pages ?? 1,
+    };
+  }
+
+  async getPaymentSummary(surfaceId?: string, hours = 24): Promise<PaymentSummary> {
+    const params = new URLSearchParams({ hours: String(hours) });
+    if (surfaceId) params.set('surface_id', surfaceId);
+    const data = await this.requestUrl<Partial<PaymentSummary> | null>(
+      `${ADMIN_API_BASE}/payments/summary?${params.toString()}`
+    );
+    return { since: data?.since ?? '', total: data?.total ?? 0, counts: data?.counts ?? {} };
+  }
+
+  async getPaymentBreaker(paymentGatewayId: string): Promise<PaymentBreaker> {
+    return this.requestUrl<PaymentBreaker>(
+      `${ADMIN_API_BASE}/payments/breakers/${encodeURIComponent(paymentGatewayId)}`
+    );
   }
 
   // Surface Templates
@@ -1305,7 +1392,7 @@ export interface AgentSurface {
     auth?: any;
     policy?: { policy_definition_id: string };
     response_policy?: { policy_definition_id: string };
-    payment_policy?: any;
+    payment_policy?: SurfacePaymentPolicy;
     mcp_tool_policies?: any[];
     /** MCP Tool Gating firewall (`{ gates: [...] }`). Passed through verbatim. */
     mcp_tool_gating?: { gates?: any[] };
@@ -1360,6 +1447,14 @@ export interface AgentSurface {
    * callers with `source_auth`. Derived on every save; a write's value is ignored.
    */
   transit_point_source_auth?: boolean;
+
+  /** Non-blocking notes returned by a save; never sent back. */
+  warnings?: SurfaceSaveWarning[];
+}
+
+export interface SurfaceSaveWarning {
+  code: string;
+  message: string;
 }
 
 /**
@@ -1389,7 +1484,6 @@ export interface TransitPoint {
   mcp_http?: McpHttpConfig;
   target_auth?: any;
   policy?: { policy_definition_id: string };
-  payment_policy?: any;
   networking?: any;
   identity_injection?: { inject_vp: boolean };
   transit_credentials?: any;
@@ -1452,8 +1546,103 @@ function withoutDerivedMarks<T>(surface: T): T {
   return rest as T;
 }
 
-function toBackendSurface(surface: Partial<AgentSurface>): any {
-  surface = withoutDerivedMarks(surface);
+function withoutManifestSnapshot<T>(policy: T): T {
+  if (!policy || typeof policy !== 'object' || !('manifest_snapshot' in policy)) return policy;
+  const { manifest_snapshot: _snapshot, ...rest } = policy as Record<string, unknown>;
+  return rest as T;
+}
+
+function withoutServerWrittenPayment<T extends { payment_policy?: SurfacePaymentPolicy }>(
+  target: T
+): T {
+  if (!target || typeof target !== 'object' || !target.payment_policy) return target;
+  return { ...target, payment_policy: withoutManifestSnapshot(target.payment_policy) };
+}
+
+interface CanvasNodeLike {
+  config?: Record<string, unknown>;
+}
+
+const holdsSnapshot = (config: unknown): boolean => {
+  if (!config || typeof config !== 'object') return false;
+  const { manifest_snapshot, payment_policy } = config as Record<string, unknown>;
+  return (
+    manifest_snapshot !== undefined ||
+    (!!payment_policy &&
+      typeof payment_policy === 'object' &&
+      'manifest_snapshot' in payment_policy)
+  );
+};
+
+/** A node holds the snapshot as its own config (Payment) or inside its copy of the target slice (Managed Agent). */
+function withoutSnapshotInNodeConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const rest = withoutManifestSnapshot(config);
+  return rest.payment_policy
+    ? { ...rest, payment_policy: withoutManifestSnapshot(rest.payment_policy) }
+    : rest;
+}
+
+/** The canvas blob is stored verbatim, so it must never carry the snapshot, and one stored earlier is not believed. */
+function withoutServerWrittenCanvas<T>(canvas: T): T {
+  const nodes = (canvas as { nodes?: unknown } | null | undefined)?.nodes;
+  if (
+    !Array.isArray(nodes) ||
+    !nodes.some((n: CanvasNodeLike | null) => holdsSnapshot(n?.config))
+  ) {
+    return canvas;
+  }
+  return {
+    ...canvas,
+    nodes: nodes.map((node: CanvasNodeLike | null) => {
+      const config = node?.config;
+      return config && holdsSnapshot(config)
+        ? { ...node, config: withoutSnapshotInNodeConfig(config) }
+        : node;
+    }),
+  };
+}
+
+/** The surface canvas blob and every variant's canvas override, without the snapshot. */
+function withoutServerWrittenCanvases<S extends Partial<AgentSurface>>(surface: S): S {
+  const out = { ...surface };
+  if (out.canvas) out.canvas = withoutServerWrittenCanvas(out.canvas);
+  if (Array.isArray(out.variants)) {
+    out.variants = out.variants.map(v =>
+      v?.overrides?.canvas
+        ? {
+            ...v,
+            overrides: { ...v.overrides, canvas: withoutServerWrittenCanvas(v.overrides.canvas) },
+          }
+        : v
+    );
+  }
+  return out;
+}
+
+/**
+ * Drops fields the server writes and refuses on input: save `warnings`, `transit_point_source_auth`
+ * and `manifest_snapshot`, from the policies and from the canvas blobs.
+ */
+export function stripServerWrittenFields(surface: Partial<AgentSurface>): Partial<AgentSurface> {
+  if (!surface || typeof surface !== 'object') return surface;
+  const { warnings: _warnings, ...rest } = withoutDerivedMarks(surface);
+  const out: Partial<AgentSurface> = withoutServerWrittenCanvases(rest);
+  if (out.target) out.target = withoutServerWrittenPayment(out.target);
+  if (Array.isArray(out.variants)) {
+    out.variants = out.variants.map(v =>
+      v?.overrides?.target
+        ? {
+            ...v,
+            overrides: { ...v.overrides, target: withoutServerWrittenPayment(v.overrides.target) },
+          }
+        : v
+    );
+  }
+  return out;
+}
+
+function toBackendSurface(input: Partial<AgentSurface>): any {
+  const surface = stripServerWrittenFields(input);
   if (!surface || !surface.target) return withTrustCheckSplit(surface);
   const target: any = { ...surface.target };
   const ai: any = (target as any).agent_identity;
@@ -1490,5 +1679,5 @@ function fromBackendSurface(surface: AgentSurface): AgentSurface {
     // `target.agent_identity` for the legacy Identity panel.
     target.identity_injection = { inject_vp: typeof inject_vp === 'boolean' ? inject_vp : true };
   }
-  return { ...surface, target };
+  return withoutServerWrittenCanvases({ ...surface, target });
 }

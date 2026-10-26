@@ -140,7 +140,16 @@ recovery and its listener read that record by id, never a mediator found by DID.
 `DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
 in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
 directly. The route does not depend on the feature flag. Fabric stream frames and the x402
-facilitator always send directly.
+verify and settle messages always send directly. Delegated `agent_pay` payment
+requests are ordinary fabric forwards and are routed like any other send.
+
+The gateway is not an x402 facilitator for its peers. An incoming `x402/verify-request` is
+answered `{"valid": false, "error": "facilitator_disabled"}` and an `x402/settle-request`
+`{"settled": false, "error": "facilitator_disabled"}`; a deferred-settlement record
+(`action: "record"`) is dropped without a reply. Nothing is verified, settled or recorded,
+whatever `facilitator_mode.facilitator_via_fabric` says. Verify and settle responses to this
+gateway's own requests are still handled, and the settlement worker still drains x402
+payments already in its transaction store.
 
 ## Peer issuer DIDs
 
@@ -382,15 +391,16 @@ request received by the destination gateway:
 6. Build policy input containing the authenticated sending Gateway and any source-auth result. An
    identity presentation is attributed to the caller only when its issuer is one of the sending
    connection's issuers (see [Peer issuer DIDs](#peer-issuer-dids)).
-7. Run Gateway policy, payment verification, caller identity extraction, MCP per-tool policy, Trust
-   Check, surface policy, and MCP tool gating in that order where configured.
-8. Forward to the local surface Target. When the surface has Transit Points and the Target is an
-   HTTP or HTTPS URL, the request carries a transit token this gateway issued for it, naming the
-   peer, the hop count and, when step 5 verified one, the caller the surface's own source
-   authentication verified, so the agent can call its own Transit Points (see
-   [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as an agent
-   card fetch, carries none, nor does a request relayed to an MCP Target over the legacy HTTP+SSE
-   transport.
+7. Run Gateway policy, caller identity extraction, MCP per-tool policy, Trust Check, surface
+   policy, and MCP tool gating in that order where configured.
+8. Take the payment of a chargeable request through agent-pay, last, once every refusal that does
+   not depend on payment has been made. Then forward to the local surface Target. When the surface
+   has Transit Points and the Target is an HTTP or HTTPS URL, the request carries a transit token
+   this gateway issued for it, naming the peer, the hop count and, when step 5 verified one, the
+   caller the surface's own source authentication verified, so the agent can call its own Transit
+   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as
+   an agent card fetch, carries none, nor does a request relayed to an MCP Target over the legacy
+   HTTP+SSE transport.
 9. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
 

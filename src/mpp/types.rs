@@ -170,7 +170,8 @@ impl std::fmt::Debug for MppConfig {
 
 impl MppConfig {
     /// Validate the MPP configuration and return warnings for likely misconfigurations.
-    /// Called at config load time to surface problems early.
+    // A local MPP policy cannot be configured, so only the tests call it.
+    #[allow(dead_code)]
     pub fn validate(
         &self,
         channel_name: &str,

@@ -1,0 +1,407 @@
+branch: main
+changes:
+  added:
+    - timestamp: '2026-10-26T00:00:00Z'
+      title: ⭐ Capture held agent-pay payments only after the Target delivers
+      description: >-
+        When agent-pay answers with `payment-authorization`, the ledger records the payment as
+        `authorized`, and after the Target answers the gateway sends a fabric `payment-settle`
+        capture (delivered) or void (anything else), writing the decision to the ledger first.
+        New outcomes `authorized`, `voided` and `capture_failed`, with integration events, audit
+        stages and the dashboard's Payments views.
+    - timestamp: '2026-10-26T00:00:00Z'
+      title: Reconcile held and unconfirmed payments on the Active node
+      description: >-
+        Every 30 seconds the Active node resends recorded capture or void intents, voids stale
+        undecided authorizations and settles unconfirmed rows through
+        `payment-settlement-status`, raising `payment.reconcile_failed` after the deadline.
+    - timestamp: '2026-10-26T00:00:00Z'
+      title: Make payment gate breaker thresholds configurable
+      description: >-
+        `payment_gate.breaker_failures` and `breaker_open_secs` in gateway.json (defaults 5 and
+        30) set the breaker, whose opening and closing are now logged and counted.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Add agent_pay payment policy with manifest discovery
+      description: >-
+        A surface now charges through a `payment_policy` of type `agent_pay` that names a
+        payment surface on a connected agent-pay gateway. Saving one checks the gateway and
+        fetches the payment surface's Payment Manifest over the fabric, storing it as
+        `manifest_snapshot`; an unreachable gateway saves with a `payment_unverified` warning.
+        `GET /v1/gateways/{id}/surfaces/{surface_id}/payment-manifest` returns a manifest,
+        discovery treats a surface with a manifest as a payment surface, and the snapshots are
+        refreshed every 15 minutes with price and payment-point drift logged.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: ⭐ Charge agent_pay surfaces through a payment gate after policy
+      description: >-
+        A surface with an `agent_pay` policy now decides itself whether a request is chargeable
+        (MCP tool triggers, A2A method filters, or the now-evaluated `require_all`) and asks the
+        agent-pay payment surface to take the payment only after gateway and surface policy, on
+        the direct Access Point, `fabric://`, MCP proxy and A2A proxy Targets, and Fabric
+        receive. Free requests make no fabric hop. agent-pay gets a small payment request and a
+        `payment_context` (payer, intent, idempotency key, trace) instead of the caller's body
+        and headers. Challenges, refusals, holds (`202` / MCP `1003`), rate limits and outages
+        map to protocol-specific responses, receipts come back as `PAYMENT-RESPONSE` or
+        `Payment-Receipt` and in the JSON-RPC result, modern MCP continuations reuse the
+        receipt, and a per-gateway circuit breaker answers `503` with `Retry-After`.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Add the delegated payments ledger, payment events and gate metrics
+      description: >-
+        Every payment gate call is audited with its amount, resource, receipt reference, case,
+        latency and remote status, counted in `agent_gateway_payment_gate_requests_total` and
+        `agent_gateway_payment_gate_latency_ms`, raised as a `payment.*` integration event, and
+        kept for 7 days in a ledger served at `GET /api/admin/payments` and
+        `GET /api/admin/payments/{id}` (permission `payments.view`, tenant scoped).
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Show where a held payment stands in the payment detail
+      description: >-
+        `GET /api/admin/payments/{id}` adds `case_status: {status, checked_at}` to a held payment,
+        asked of the agent-pay gateway that holds the case: `held`, `approved`, `captured`,
+        `rejected`, `voided` or `capture_failed`. The query waits 3 seconds, an answer is reused for
+        15, and the field is left out when agent-pay is down, does not answer or does not know the
+        case.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Export the payment gate metrics to OpenTelemetry and CloudWatch
+      description: >-
+        The payment gate counter and latency are exported as `gateway.payment_gate.requests.total`
+        and `gateway.payment_gate.latency` when OpenTelemetry metrics are on, and CloudWatch gets
+        `PaymentGateRequestCount` per outcome with `PaymentGateAverageLatency`, as totals across
+        surfaces. Prometheus already carried them.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Pick an agent-pay payment surface with its manifest and triggers in the builder
+      description: >-
+        The Surface Builder's Payment element selects a connected agent-pay gateway and payment
+        surface, shows the payment surface's manifest (price, payment points, drift from the saved
+        snapshot) with a refresh, and edits which MCP tools or A2A methods and message texts are
+        charged.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Flush the payments ledger when the gateway is stopped by SIGTERM or SIGINT
+      description: >-
+        The gateway now writes the payments ledger rows it still holds in memory when it receives
+        `SIGTERM` or `SIGINT`, waiting at most 5 seconds, and then ends with status 143 or 130 as
+        an unhandled signal would. Before, a stopped gateway lost the rows of its last second.
+  changed:
+    - timestamp: '2026-10-26T00:00:00Z'
+      title: Write payment ledger money rows and claim keys to disk before forwarding
+      description: >-
+        Paid, authorized, voided, capture_failed and unconfirmed rows are appended and synced
+        before the request continues, rows the disk did not take are counted, dispatched payment
+        keys survive a restart in `_storage/payment_claims`, and the ledger records the price
+        from agent-pay's receipt, flagging a difference from the manifest.
+    - timestamp: '2026-10-26T00:00:00Z'
+      title: Show a held payment's cached case status in the payments list
+      description: >-
+        `GET /api/admin/payments` includes `case_status` for a held row when a detail request
+        asked agent-pay in the last 15 seconds, without asking it again.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Load x402 agent_pay delegation policies as agent_pay policies
+      description: >-
+        A stored `{"type": "x402", "provider": "agent_pay"}` policy now loads as the
+        `agent_pay` policy, keeping its gateway, surface and triggers and dropping
+        `delegated_rail`. Delegated payment waits `timeout_ms` (default 15 s) for agent-pay.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Describe agent-pay delegation as the only payment path in the docs
+      description: >-
+        The protocol, capability, fabric, federation, deployment and glossary docs no longer
+        describe local x402 or MPP verification, the HTTP facilitator or MPP auto-pay as current
+        features, and link to the surface payment policy reference instead.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Replace the x402 Payment Wall template with an agent-pay Payment Wall
+      description: >-
+        The built-in x402 Payment Wall template created a local x402 policy that can no longer
+        be saved. It is now the Agent-pay Payment Wall, which keeps the same template id and drops
+        an agent-pay Payment element charging every MCP tool call, with the payment gateway and
+        payment surface left for the user to select.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Describe the audit payment event as the agent-pay lifecycle
+      description: >-
+        The `payment` audit event is described as an agent-pay payment event (challenge, paid,
+        held for review, rejected, unavailable), noting that legacy x402/MPP settlement records
+        may still appear.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Charge payment last, and let one payment buy one forwarded request
+      description: >-
+        A chargeable request is now charged after every refusal that does not depend on payment:
+        consent preparation, target authentication, credential delegation, the checks of an MCP
+        proxy or A2A proxy Target (disabled, tool policies and gating) and an open Target circuit
+        breaker. A credential is single use: when agent-pay answers a credential as paid but this
+        gateway has already forwarded a request for the same key in the last 10 minutes, the
+        request is not forwarded again; it is answered as unpaid with a fresh challenge and reason
+        `payment_already_used`, and recorded as rejected. The `idempotency_key` sent to agent-pay
+        now also covers the request (method, path and query, variant, and the body without any
+        credential, or only a JSON-RPC `method` and `params`), so one credential on another tool
+        or other arguments is another payment.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Answer legacy MCP callers with the MPP MCP transport's error codes
+      description: >-
+        An MCP request with no protocol version now gets `-32042` (payment required) or `-32043`
+        (payment refused) with the challenge data and headers, as the MPP MCP transport
+        defines them. Modern MCP and A2A callers keep `1001`, `1002` and `1003`.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Map agent-pay answers by reason and relay its cache-control
+      description: >-
+        A `403` is a payment refusal only for `rejected_by_oversight` or
+        `delegated_mandate_denied`; any other `403` is a configuration problem answered
+        `502 payment_unavailable` with no rejection credential. The `402` problem types
+        `verification-failed`, `malformed-credential`, `invalid-challenge`, `invalid-payload`
+        and `payment-action-required` carry a fresh challenge, `payment-expired` is a challenge,
+        and `410` is `payment_session_gone`. The `cache-control` agent-pay sets on a paid answer
+        comes back with the receipt, and response headers match in any case.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Accept the MPP credential wherever agent-pay accepts it
+      description: >-
+        The credential is read from `Authorization: Payment` in any case, the MCP
+        `payment_signature` and `payment_credential` arguments, and `_meta` or A2A metadata
+        (`org.paymentauth/credential`) at the message root, `params._meta`, `params.metadata` or
+        `params.message.metadata`, on any JSON-RPC method. `Authorization: Payment` is not relayed
+        across a gateway hop, so a client sends an MPP credential in the body there.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Give gateway-level policy the payment context
+      description: >-
+        The appliance-wide and per-gateway gateway policies now get `input.payment`
+        (`{required, rail?, amount?, currency?}`) on the direct Access Point and on Fabric
+        receive, as `docs/POLICY.md` describes; before, only surface policies did.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Use one rail, trace id and resolved variant in every payment record
+      description: >-
+        The audit trail, the ledger, the integration events and the credentials this gateway
+        issues agree on the rail (the presented credential's, else the manifest's single rail),
+        carry the ingress trace id rather than the egress one, and name the resolved surface
+        variant rather than the alias a Fabric peer sent. A payment request sends
+        `payer_identity.did` only when no `principal_chain` is sent, since agent-pay takes the
+        payer from the chain's root.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Rewrite the Payments page around the payments ledger
+      description: >-
+        The dashboard Payments page lists the ledger from `GET /api/admin/payments` with an outcome
+        filter, a chart of outcomes over time and a detail view per payment, and keeps the older
+        x402 and MPP records on a Legacy tab.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Move the Payments page to /payments and redirect /x402payments
+      description: >-
+        The Payments page is served at `/payments`, and the old `/x402payments` address redirects to
+        it.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Write the payments ledger in hourly segments held in a bounded window
+      description: >-
+        The ledger no longer writes and syncs one file per gate call, keeps the whole retention
+        period in memory or scans it on a lookup. A row is appended in memory and written to an
+        append-only segment per UTC hour once a second; the newest 50,000 rows are listed, an older
+        row is read from its one segment by its time-ordered id, and cleanup deletes whole expired
+        segments. The ledger is also bounded to 2 GiB and 256 MiB a segment.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Refresh the stored payment manifest only when what it offers changes
+      description: >-
+        The 15-minute refresh no longer treats the signed `credential` agent-pay attaches to every
+        manifest as a change, so an unchanged price and payment points store nothing and reload no
+        surface. It writes only the snapshot, and only while the stored surface is still the one it
+        read, so an edit through the API is never overwritten; saves, deletes and the refresh wait
+        for each other.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Fetch the payment manifest afresh on save and never reuse a missing one
+      description: >-
+        Saving an agent_pay policy fetches the manifest without the one-minute cache, and an unknown
+        payment surface or a manifest with no payment point is no longer reused, so a save made
+        right after fixing the payment surface is no longer refused.
+  fixed:
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Charge agent_pay surfaces reached over the fabric
+      description: >-
+        A surface with an `agent_pay` policy reached over the fabric was never charged; Fabric
+        receive now runs the same payment gate. Payment refusals are recorded in the connection
+        metrics with their real status instead of as successes, and the agent card of a surface
+        with a local payment policy also answers `503 payment_unavailable`.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Deliver payment answers and receipts on every response path
+      description: >-
+        A payment challenge or refusal on a legacy MCP SSE session POST is now delivered on the
+        event stream instead of being replaced by a `-32603`, and the receipt now comes back on
+        the legacy SSE fallback, streamable passthrough, error and non-2xx responses, on every
+        path of Fabric receive, and in the final message of a streamed modern MCP response over
+        a `fabric://` Target and Fabric receive. A request that was charged and then failed
+        still carries its receipt.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Keep the payment credential on Fabric receive when a header cannot be decoded
+      description: >-
+        Fabric receive decoded the forwarded headers as a whole, so one header it could not read,
+        or more than 16 KiB of headers, dropped the payment credential and the request was
+        charged as unpaid. Each header is now decoded on its own and the others are kept, and a
+        header that cannot be encoded for the Target is skipped instead of failing the forward
+        after the payment was taken.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Count only agent-pay transport failures in the payment breaker
+      description: >-
+        A wait cut short by the caller's own `deadline_ms` neither opens the per-gateway breaker
+        nor resets its count, and a deadline with less than a second left is refused with `504`
+        without a call, so one caller's short deadline cannot make agent-pay look down.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Match MCP triggers and A2A filters once per request
+      description: >-
+        Whether a request is chargeable, its credential and its price are read once per request
+        instead of two to four times, compiled trigger patterns are cached per policy, and an
+        A2A message pattern is matched as text the message contains.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Keep the verified manifest snapshot when a save cannot reach agent-pay
+      description: >-
+        A save that names the same payment gateway and payment surface keeps the snapshot already
+        verified while agent-pay is unreachable, instead of dropping the price from `input.payment`
+        and the payment request and skipping the MPP-only A2A `jwt_bearer` check. The refresh runs
+        that check before it stores a snapshot, and says so when it does not.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Accept any text as an A2A payment message pattern
+      description: >-
+        An A2A `message_patterns` entry is text the message must contain and was never a regular
+        expression, so saving no longer refuses a text such as `50% off (today` or `C++` as an
+        invalid regex.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Let a surface with a disabled MPP policy be saved
+      description: >-
+        The MPP posture check on save only ever saw disabled policies, which charge nothing, and
+        refused the save of a surface that kept one with a risky posture. It is removed.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Stop listing every integration for each payment event
+      description: >-
+        A payment gate decision no longer lists and decrypts every integration from storage and
+        spawns a task. The integrations that receive payment events are listed once a minute and
+        again when an integration changes, nothing is spawned while none is active, and a surface
+        that still carries a legacy payment policy raises its unavailable event at most once a
+        minute.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Offer the payment integration category in the example gateway.json
+      description: >-
+        The shipped `gateway.example.json` carries the built-in `payment` integration category, so
+        an install made from it no longer warns about the missing category at every load.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Give a payment credential back when its request fails before dispatch
+      description: >-
+        A paid credential is claimed until the request is dispatched and released when the request fails or is cancelled before, so a client can retry within agent-pay's 120-second replay window instead of getting `payment_already_used`. A request the proxy or Target cannot serve is refused before it is charged on every path: an A2A proxy's unsupported method or message, an MCP proxy's spec, method and tool, an open breaker, and a modern MCP proxy that is missing.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Tell the client to retry a payment whose outcome is unknown
+      description: >-
+        An answer from agent-pay that does not say whether the payment was taken now carries `payment_unconfirmed` and `Retry-After: 2`, and is recorded with the new outcome `unconfirmed` in the ledger, the audit trail, the integration events (`payment.unconfirmed`) and the metrics; a request that never reached agent-pay stays `unavailable` and adds no latency sample.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Answer a payment still in progress with a retryable 409
+      description: >-
+        `409 idempotency_key_in_use`, and a credential presented while another request holds its claim, answer `409 payment_in_progress` with `Retry-After` instead of a rejected payment.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Put the A2A 1.0 receipt in the message or task metadata
+      description: >-
+        The payment receipt is added to the `metadata` of the message, task or event inside an A2A 1.0 result wrapper, not to the wrapper, which the schema does not allow.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Charge the default operations of a policy with no triggers
+      description: >-
+        A payment policy with no trigger for its protocol, an empty list or only blank patterns charges every MCP `tools/call` or A2A `message/send` and `message/stream` instead of nothing, and saving an MCP `match` trigger with no pattern is refused with `400 invalid_payment_policy`.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Let one request at a time probe a payment gateway that was down
+      description: >-
+        After the breaker's open time exactly one request is sent to agent-pay to find out whether it is back, and the others stay refused with `Retry-After`.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Give a paid credential back when the request never reached its Target
+      description: >-
+        A credential claimed for a request is now given back when the circuit breaker opens after the charge, the connection to the Target is refused, or the send over the fabric fails, on the direct Access Point, `fabric://`, MCP proxy and Fabric receive paths. The client can retry the same credential within agent-pay's replay window instead of getting `payment_already_used`. A request that may have reached the Target keeps its credential consumed.
+  removed:
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Stop serving the x402 HTTP facilitator and test endpoints
+      description: >-
+        `/api/x402/*` and the x402 test endpoints are no longer mounted, whatever
+        `facilitator_mode` says. The settlement and recovery workers keep running so payments
+        verified earlier can still settle.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Stop acting as an x402 facilitator over the fabric
+      description: >-
+        A peer's fabric `x402/verify-request` is answered `valid: false` and an
+        `x402/settle-request` `settled: false`, both with `facilitator_disabled`, and a
+        deferred-settlement record is dropped, whatever `facilitator_mode.facilitator_via_fabric`
+        says; a warning is logged at startup when it is set. Responses to this gateway's own
+        verify and settle requests are still handled, and x402 payments already in the
+        transaction store still settle.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Remove the Paywall tab from Policies
+      description: >-
+        The Policies page no longer has a Paywall tab, since a surface charges through its agent_pay
+        payment policy.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Remove the agent_pay_delegation feature flag row from Settings
+      description: >-
+        Settings > System no longer lists the agent_pay_delegation flag: delegating to agent-pay is
+        the only payment path.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Remove the x402 and MPP editors from the Surface Builder
+      description: >-
+        The Payment element no longer edits local x402 or MPP settings, which can no longer be
+        saved.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Remove the unused mpp.example.json example
+      description: >-
+        The `mpp.example.json` example is deleted: nothing reads a local MPP configuration.
+  security:
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Strip payment credentials from requests that are not charged
+      description: >-
+        A payment credential in a header (an array-valued `authorization` included), tool
+        argument or `_meta` is removed from the request before it is forwarded even when the
+        request is free, so a Target never receives one.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Keep query strings away from agent-pay
+      description: >-
+        The payment resource and the forwarded path are the request path without its query
+        string, which can carry secrets, on the direct Access Point and on Fabric receive alike.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Hash the audited payer with the identity pepper
+      description: >-
+        The payer in a payment audit event is the verified agent DID or a hash of the
+        authenticated principal made with `AG_IDENTITY_HASH_PEPPER`, which changes at every
+        restart when the pepper is not set.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Charge a migrated agent_pay policy what its protocol charges by default
+      description: >-
+        A stored `{type: x402, provider: agent_pay}` policy that named no triggers loaded with none,
+        which charges nothing, so a paid MCP or A2A surface became free. It now gets MCP
+        `mcp_payment_triggers` `all`, or A2A `a2a_method_filters` for `message/send` and
+        `message/stream` (a legacy `a2a_methods` list becomes the filters), is rewritten in the new
+        shape on load, and one warning per surface names what was applied.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Keep payment credentials out of policy input and logs
+      description: >-
+        A payment credential in an MCP tool argument, in `_meta` or in A2A message metadata is removed before the MCP and A2A context that gateway and surface policy, the policy input log and every later stage read is built, on the direct Access Point and on Fabric receive, and from a modern MCP request before it is dispatched.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Keep payment credentials away from MCP proxy backends
+      description: >-
+        A modern MCP request for a `proxy://` Target is dispatched without its payment credential, which used to reach the REST tool backend as a tool argument.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Charge or refuse a JSON-RPC batch as a whole
+      description: >-
+        The payment gate reads a batch as chargeable when any message is, takes the credential from and strips it from every message, and refuses a batch on a charging MCP or A2A surface with `-32600` before any call to agent-pay.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Forward a principal chain only for a verified agent
+      description: >-
+        A principal chain a client supplies is forwarded to agent-pay only when this gateway verified the caller's agent DID and the chain ends at it; a caller authenticated any other way can no longer name the payer.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Show tenant callers only their own payment rows
+      description: >-
+        `GET /api/admin/payments` and `/{id}` return a tenant-scoped caller only the rows of its own tenant's surfaces, not those of operator surfaces, and ask agent-pay for the case status of visible rows only.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Throttle forced payment manifest refreshes
+      description: >-
+        `GET /v1/gateways/{id}/surfaces/{surface_id}/payment-manifest?force_refresh=true` asks agent-pay at most once every 10 seconds per manifest, serving the cached one with `refresh_throttled` in between, and at most 4 requests wait on payment gateways at once, the others getting `429 payment_manifest_busy`.
+  breaking:
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Refuse local x402 and MPP payment on surfaces
+      description: >-
+        A surface with an enabled local x402 or MPP payment policy now answers every request,
+        over HTTP and over the fabric, with `503 payment_unavailable`, and the dashboard
+        reports `payment_status: unsupported_legacy`. Saving such a policy, MPP auto-pay, or a
+        Transit Point payment policy is refused with `400 local_payment_unsupported`. A stored
+        `mpp_auto_pay` is ignored, so a 402 from a fabric Target reaches the caller.
+    - timestamp: '2026-10-20T00:00:00Z'
+      title: Replace input.payment.verified with the chargeable-request context
+      description: >-
+        Payment is now taken after policy, so OPA's `input.payment` is
+        `{required, rail?, amount?, currency?}` from the trigger check and the manifest snapshot.
+        A Rego rule that reads `input.payment.verified` no longer matches.
+    - timestamp: '2026-10-21T00:00:00Z'
+      title: Reserve /payments for the dashboard and rename the example channel
+      description: >-
+        A channel prefix or proxy route whose first segment is `payments` now stops the gateway at
+        startup, as the other dashboard pages do, because it would answer a reload of the Payments
+        page with a proxy 404. The shipped example's `payments` channel is now `billing`; rename a
+        `/payments` prefix in an existing `gateway.json` and in the surfaces that use it.

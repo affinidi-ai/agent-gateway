@@ -177,6 +177,19 @@ pub fn free_port() -> (u16, ReservedPort) {
     panic!("no free gateway test ports in {GATEWAY_TEST_PORT_START}..{GATEWAY_TEST_PORT_END}");
 }
 
+/// An address that accepts every connection and closes it at once, so a request
+/// to it fails the same way each time and no other server can take its port.
+pub fn closing_endpoint() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            drop(connection);
+        }
+    });
+    address
+}
+
 // ── mock target server ───────────────────────────────────────────────────────
 
 /// The details of a request received by the mock server.
@@ -190,7 +203,17 @@ pub struct ReceivedRequest {
 
 enum MockBody {
     Json(String),
-    Streamed { content_type: &'static str, chunks: Vec<(Duration, String)>, hold_open: bool },
+    /// Every response has this status and content type.
+    Status {
+        status: u16,
+        content_type: &'static str,
+        body: String,
+    },
+    Streamed {
+        content_type: &'static str,
+        chunks: Vec<(Duration, String)>,
+        hold_open: bool,
+    },
 }
 
 /// A running axum server that simply echoes back a configurable response.
@@ -213,6 +236,23 @@ impl MockServer {
     /// Start the mock with a custom response body returned for every request.
     pub async fn start_with_response(response_body: impl Into<String>) -> Self {
         Self::start_with_response_gate(MockBody::Json(response_body.into()), None).await
+    }
+
+    /// Start the mock so every response has `status` and `content_type`.
+    pub async fn start_with_status(
+        status: u16,
+        content_type: &'static str,
+        response_body: impl Into<String>,
+    ) -> Self {
+        Self::start_with_response_gate(
+            MockBody::Status {
+                status,
+                content_type,
+                body: response_body.into(),
+            },
+            None,
+        )
+        .await
     }
 
     pub async fn start_paused(response_body: impl Into<String>) -> (Self, Arc<tokio::sync::Notify>) {
@@ -307,8 +347,11 @@ impl MockServer {
                     if let Some(gate) = gate {
                         gate.notified().await;
                     }
-                    let (content_type, body) = match response_body.as_ref() {
-                        MockBody::Json(body) => ("application/json", axum::body::Body::from(body.clone())),
+                    let (status, content_type, body) = match response_body.as_ref() {
+                        MockBody::Json(body) => (200, "application/json", axum::body::Body::from(body.clone())),
+                        MockBody::Status { status, content_type, body } => {
+                            (*status, *content_type, axum::body::Body::from(body.clone()))
+                        }
                         MockBody::Streamed {
                             content_type,
                             chunks,
@@ -324,11 +367,11 @@ impl MockServer {
                             } else {
                                 axum::body::Body::from_stream(chunks)
                             };
-                            (*content_type, body)
+                            (200, *content_type, body)
                         }
                     };
                     Response::builder()
-                        .status(200)
+                        .status(status)
                         .header("content-type", content_type)
                         .body(body)
                         .unwrap()

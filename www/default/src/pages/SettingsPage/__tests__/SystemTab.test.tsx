@@ -27,7 +27,7 @@ const renderTab = (settings: Settings = SETTINGS) =>
   );
 
 describe('SystemTab feature flags', () => {
-  it.each(['metrics', 'agent_pay_delegation'])('names the %s switch after its flag', flag => {
+  it.each(['metrics', 'mediator_federation'])('names the %s switch after its flag', flag => {
     renderTab();
 
     expect(screen.getByRole('switch', { name: flag })).toBe(
@@ -39,7 +39,13 @@ describe('SystemTab feature flags', () => {
     renderTab();
 
     expect(screen.getByRole('switch', { name: 'metrics' })).not.toBeChecked();
-    expect(screen.getByRole('switch', { name: 'agent_pay_delegation' })).not.toBeChecked();
+    expect(screen.getByRole('switch', { name: 'mediator_federation' })).not.toBeChecked();
+  });
+
+  it('has no Agent-Pay delegation switch', () => {
+    renderTab();
+
+    expect(screen.queryByTestId('settings-flag-agent_pay_delegation')).not.toBeInTheDocument();
   });
 
   // Accepted A2A versions are set per A2A surface, on its Access Point.
@@ -63,11 +69,11 @@ describe('SystemTab feature flags', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('switch', { name: 'agent_pay_delegation' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'mediator_federation' }));
 
     await waitFor(() =>
       expect(updateSettings).toHaveBeenCalledWith({
-        feature_flags: { agent_pay_delegation: true },
+        feature_flags: { mediator_federation: true },
       })
     );
   });

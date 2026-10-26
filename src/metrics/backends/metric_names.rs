@@ -39,6 +39,13 @@ pub mod prom {
     pub const STS_TOKEN_EXCHANGE_TOTAL: &str = "agent_gateway_sts_token_exchange_total";
     pub const STS_TOKEN_EXCHANGE_DURATION_SECONDS: &str = "agent_gateway_sts_token_exchange_duration_seconds";
 
+    // Delegated payment gate (agent-pay)
+    pub const PAYMENT_GATE_REQUESTS_TOTAL: &str = "agent_gateway_payment_gate_requests_total";
+    pub const PAYMENT_GATE_LATENCY_MS: &str = "agent_gateway_payment_gate_latency_ms";
+    pub const PAYMENT_GATE_BREAKER_TRANSITIONS_TOTAL: &str = "agent_gateway_payment_gate_breaker_transitions_total";
+    pub const PAYMENT_SETTLEMENTS_TOTAL: &str = "agent_gateway_payment_settlements_total";
+    pub const PAYMENT_LEDGER_UNWRITTEN_ROWS_TOTAL: &str = "agent_gateway_payment_ledger_unwritten_rows_total";
+
     // AWS KMS per-value envelope operations (GenerateDataKey / Decrypt)
     pub const KMS_OPERATION_TOTAL: &str = "agent_gateway_kms_operation_total";
     pub const KMS_OPERATION_DURATION_SECONDS: &str = "agent_gateway_kms_operation_duration_seconds";
@@ -116,6 +123,9 @@ pub mod otel {
 
     pub const USER_EVENTS_TOTAL: &str = "gateway.user.events.total";
     pub const USER_LOGINS_TOTAL: &str = "gateway.user.logins.total";
+
+    pub const PAYMENT_GATE_REQUESTS_TOTAL: &str = "gateway.payment_gate.requests.total";
+    pub const PAYMENT_GATE_LATENCY: &str = "gateway.payment_gate.latency";
 }
 
 // ============ CloudWatch Metric Names ============
@@ -139,4 +149,7 @@ pub mod cloudwatch {
     pub const USER_CREATED_COUNT: &str = "UserCreatedCount";
     pub const ACTIVE_USERS: &str = "ActiveUsers";
     pub const USER_LOGINS: &str = "UserLogins";
+    pub const PAYMENT_GATE_REQUEST_COUNT: &str = "PaymentGateRequestCount";
+    pub const PAYMENT_GATE_AVG_LATENCY: &str = "PaymentGateAverageLatency";
+    pub const PAYMENT_GATE_LATENCY_SAMPLE_COUNT: &str = "PaymentGateLatencySampleCount";
 }

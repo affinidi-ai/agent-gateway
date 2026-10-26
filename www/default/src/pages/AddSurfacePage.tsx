@@ -34,6 +34,7 @@ import {
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
 import { joinWarnings } from '../utils/warningHeader';
+import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -457,11 +458,12 @@ const AddSurfacePage: React.FC = () => {
         },
       });
       justCreatedRef.current = true;
+      const serverWarnings = [...headerWarnings, ...saveWarningMessages(created?.warnings)];
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
       const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');
       // One toast: a later one replaces an earlier one.
-      const allWarnings = [...headerWarnings, ...warnings.map(w => w.message)];
+      const allWarnings = [...serverWarnings, ...warnings.map(w => w.message)];
       if (allWarnings.length === 0) {
         showToast('success', `Agent Surface "${name}" created`);
       } else {
@@ -473,9 +475,9 @@ const AddSurfacePage: React.FC = () => {
       }
       // Warnings from the gateway go with the operator to the new surface's
       // page, which lists them, since the toast goes after a few seconds.
-      if (headerWarnings.length > 0 && created?.surface_id) {
+      if (serverWarnings.length > 0 && created?.surface_id) {
         navigate(`/surfaces/${encodeURIComponent(created.surface_id)}`, {
-          state: { saveWarnings: headerWarnings },
+          state: { saveWarnings: serverWarnings },
         });
       } else {
         navigate('/surfaces');

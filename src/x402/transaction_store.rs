@@ -44,6 +44,7 @@ fn emit_payment_audit(
             payment_gateway_id: None,
             payment_surface_id: None,
             remote_status: None,
+            delegation: None,
         },
         Some(&txn.surface_id),
         Some(&txn.channel_name),
@@ -923,37 +924,6 @@ impl TransactionStore {
                 return Err(format!("Failed to persist transaction: {}", e));
             }
 
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
-    /// Set facilitator_gateway_id (used when remote gateway requests verification)
-    /// This allows the facilitator to send settlement-complete notification back to requester
-    pub async fn set_facilitator_gateway_id(
-        &self,
-        correlation_id: &str,
-        gateway_id: String,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction
-                .verification
-                .facilitator_gateway_id = Some(gateway_id.clone());
-            transaction.last_updated = Utc::now();
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            info!("[transaction-store] Set facilitator_gateway_id={} for: {}", gateway_id, correlation_id);
             Ok(())
         } else {
             Err(format!("Transaction not found: {}", correlation_id))

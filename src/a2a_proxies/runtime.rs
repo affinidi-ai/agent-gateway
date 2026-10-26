@@ -42,26 +42,36 @@ fn reply_shape(method: &str) -> ReplyShape {
     ReplyShape::of(method).unwrap_or(ReplyShape::V1_0)
 }
 
-pub async fn handle_a2a_proxy_request(
+/// A `message/send` request the proxy can serve: everything that can be refused
+/// without calling the backend has been checked.
+#[derive(Debug)]
+pub struct PreparedSend {
+    request_id: Option<Value>,
+    method: String,
+    context_id: Option<Value>,
+    text: String,
+}
+
+/// Checks a request the way [`send_prepared`] needs it: valid JSON, an enabled
+/// proxy, the one supported method, and a message with text. The error is the
+/// caller's response. Nothing is sent to the backend.
+pub fn prepare_request(
     proxy: &A2aProxy,
     body_bytes: &[u8],
-    secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
     channel_name: &str,
-    caller: CallerAssertion,
-) -> Response {
-    let allow_local = allow_local_a2a_dial();
+) -> Result<PreparedSend, Box<Response>> {
     let request = match serde_json::from_slice::<Value>(body_bytes) {
         Ok(request) => request,
         Err(e) => {
             warn!(channel = channel_name, proxy_id = %proxy.id, error = %e, "A2A proxy received invalid JSON");
-            return jsonrpc_error(None, JSONRPC_PARSE_ERROR, "Parse error");
+            return Err(Box::new(jsonrpc_error(None, JSONRPC_PARSE_ERROR, "Parse error")));
         }
     };
     let request_id = request.get("id").cloned();
 
     if proxy.status == A2aProxyStatus::Disabled {
         warn!(channel = channel_name, proxy_id = %proxy.id, proxy_name = %proxy.name, "A2A proxy is disabled");
-        return jsonrpc_error(request_id, JSONRPC_TARGET_UNAVAILABLE, "A2A proxy is disabled");
+        return Err(Box::new(jsonrpc_error(request_id, JSONRPC_TARGET_UNAVAILABLE, "A2A proxy is disabled")));
     }
 
     let method = request
@@ -70,30 +80,48 @@ pub async fn handle_a2a_proxy_request(
         .unwrap_or_default();
     if !is_supported_proxy_method(method) {
         warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), "A2A proxy refused an unsupported method");
-        return jsonrpc_error(request_id, JSONRPC_METHOD_NOT_FOUND, "Unsupported A2A method");
+        return Err(Box::new(jsonrpc_error(request_id, JSONRPC_METHOD_NOT_FOUND, "Unsupported A2A method")));
     }
 
-    let message = match request
+    let Some(message) = request
         .get("params")
         .and_then(|params| params.get("message"))
-    {
-        Some(message) => message,
-        None => {
-            warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), "A2A proxy refused a request without params.message");
-            return jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, "Missing params.message");
-        }
+    else {
+        warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), "A2A proxy refused a request without params.message");
+        return Err(Box::new(jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, "Missing params.message")));
     };
-    let context_id = message
-        .get("contextId")
-        .cloned();
     let text = match extract_text(message) {
         Ok(text) => text,
-        Err(message) => {
-            warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), reason = message, "A2A proxy refused the message");
-            return jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, message);
+        Err(reason) => {
+            warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), reason, "A2A proxy refused the message");
+            return Err(Box::new(jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, reason)));
         }
     };
+    Ok(PreparedSend {
+        context_id: message
+            .get("contextId")
+            .cloned(),
+        method: method.to_string(),
+        request_id,
+        text,
+    })
+}
 
+/// Sends a prepared request to the proxy's backend and answers the caller.
+pub async fn send_prepared(
+    proxy: &A2aProxy,
+    prepared: PreparedSend,
+    secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
+    channel_name: &str,
+    caller: CallerAssertion,
+) -> Response {
+    let PreparedSend {
+        request_id,
+        method,
+        context_id,
+        text,
+    } = prepared;
+    let allow_local = allow_local_a2a_dial();
     match &proxy.backend {
         A2aProxyBackend::CopilotDirectLine(backend) => {
             let started = Instant::now();
@@ -119,7 +147,7 @@ pub async fn handle_a2a_proxy_request(
                         duration_ms = started.elapsed().as_millis(),
                         "A2A proxy dispatch completed"
                     );
-                    jsonrpc_success(request_id, context_id, parts, reply_shape(method))
+                    jsonrpc_success(request_id, context_id, parts, reply_shape(&method))
                 }
                 Err(A2aProxyRuntimeError::Timeout) => {
                     warn!(

@@ -674,11 +674,8 @@ class ElementRegistry {
       : payload?.target?.default_variant_id;
     const variantList = variants.map((v, idx) => {
       const id = v?.id || `target-variant-${idx + 1}`;
-      // Identity-only shape for the panel. Legacy override fields
-      // (endpoint, policy_definition_id, mpp_*, agent_card_*,
-      // extensions, …) are no longer surfaced here — they live on
-      // `surface.variants[].overrides` and are produced by the
-      // (forthcoming) per-element `VariantEditingContext`.
+      // Identity-only shape for the panel; override fields live on
+      // `surface.variants[].overrides`.
       return {
         id,
         alias: typeof v?.alias === 'string' ? v.alias : '',

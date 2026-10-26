@@ -22,23 +22,14 @@ Each of these is named from the `[config_files]` table in `config.toml`.
 | [`rbac.example.json`](rbac.example.json) | `rbac.json` | The minimum management role each permission requires. `scripts/_prepare.sh` copies it into every local environment. It is not the built-in default set: it lowers `gateways.edit`, `gateways.delete`, `trust_registries.edit`, `trust_registries.delete`, and `payments.edit` from `administrator` to `poweruser`, and its `channels.*` keys are not recognised. The defaults are in `RbacConfig::default()` in [`src/rbac/mod.rs`](../../src/rbac/mod.rs). |
 | [`limits.example.json`](limits.example.json) | `limits.json` | Ceilings on how many records of each kind may exist. |
 | [`saml.example.json`](saml.example.json) | `saml.json` | SAML identity provider. Read only when `auth_mode = "saml"`. |
-| [`x402.example.json`](x402.example.json) | `x402.json` | x402 payment networks, assets, and facilitator settings. |
-| [`x402-proxy.example.json`](x402-proxy.example.json) | `x402-proxy.json` | Networks and wallets for the x402 proxy. |
+| [`x402.example.json`](x402.example.json) | `x402.json` | x402 networks, assets, and settlement storage. Only used to settle payments verified before local x402 payment was withdrawn; a surface charges through agent-pay (see [Surface payment policy](../../docs/CONFIGURATION_REFERENCE.md#surface-payment-policy)). |
+| [`x402-proxy.example.json`](x402-proxy.example.json) | `x402-proxy.json` | Networks and wallets for the x402 proxy. Still read at startup, but nothing uses it since MPP auto-pay was removed. |
 | [`agent_surface_templates/`](agent_surface_templates/) | the directory named by `agent_surface_templates_dir` | Surface templates seeded into the template store at boot. Has its own [README](agent_surface_templates/README.md). |
-
-## Fragments of stored records
-
-These are not files the gateway loads. They show the shape of a block that belongs
-inside a record managed through the dashboard or the management API.
-
-| Example | Belongs in | Notes |
-| --- | --- | --- |
-| [`mpp.example.json`](mpp.example.json) | An Agent Surface record | Shows the server-side `mpp_policy` block and the client-side proxy configuration. Read from the surface by `AgentSurface::mpp_config`, never from a file of this name. |
 
 ## Secrets
 
 Several examples contain `$PLACEHOLDER` tokens where a credential belongs, such as
-`$AZURE_TENANT` in `saml.example.json` and `$STRIPE_SECRET_KEY` in `mpp.example.json`.
+`$AZURE_TENANT` in `saml.example.json`.
 These are not substituted automatically. Replace them, or use a loader reference so the
 value is resolved at runtime:
 

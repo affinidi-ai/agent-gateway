@@ -1413,3 +1413,187 @@ async fn an_undeclared_a2a_proxy_create_with_a_target_list_keeps_its_fixed_versi
     let (status, _) = put(wrong_type).await;
     assert_eq!(status, 422, "a body of the wrong shape is still rejected as before");
 }
+
+async fn start_charged_a2a_proxy_harness(
+    fake_direct_line: &FakeDirectLine,
+    status: &'static str,
+    write_proxy: bool,
+    gateway_id: &'static str,
+) -> GatewayHarness {
+    let direct_line_base_url = fake_direct_line
+        .base_url
+        .clone();
+    GatewayHarness::start(move |temp_dir, gw_config, _| {
+        let mut surface = helpers::build_minimal_channel();
+        surface.target.endpoint = format!("a2a-proxy://{PROXY_ID}");
+        surface.target.a2a_proxy_id = Some(PROXY_ID.to_string());
+        surface.target.payment_policy = Some(
+            serde_json::from_value(json!({
+                "type": "agent_pay", "payment_gateway_id": gateway_id, "payment_surface_id": "pay-1",
+                "require_all": true
+            }))
+            .expect("payment policy"),
+        );
+        gw_config.surfaces = vec![surface];
+        write_a2a_proxy_fixtures(temp_dir, &direct_line_base_url, status, write_proxy, 5, 100, 3);
+    })
+    .await
+}
+
+async fn send_charged_a2a_text(
+    harness: &GatewayHarness,
+    credential: Option<&str>,
+) -> (u16, reqwest::header::HeaderMap, Value) {
+    let mut request = reqwest::Client::new()
+        .post(&harness.gateway_url)
+        .header("A2A-Version", "1.0")
+        .header("content-type", "application/json");
+    if let Some(credential) = credential {
+        request = request.header("PAYMENT-SIGNATURE", credential);
+    }
+    let response = request
+        .json(&a2a_text_request(vec![json!({ "kind": "text", "text": "hello" })]))
+        .send()
+        .await
+        .expect("send request through gateway");
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    (
+        status,
+        headers,
+        response
+            .json()
+            .await
+            .unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charged_a2a_proxy_is_charged_once_and_only_when_it_will_be_reached() {
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+    let gate = MockGate::answering(200, &[("Payment-Receipt", "a2a-proxy-receipt")], json!({}))
+        .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+    install_test_transport("a2a-proxy-gate", gate.clone());
+
+    for (status, write_proxy, message) in
+        [("active", false, "A2A proxy not found"), ("disabled", true, "A2A proxy is disabled")]
+    {
+        let fake_direct_line = FakeDirectLine::start("should not be called").await;
+        let h = start_charged_a2a_proxy_harness(&fake_direct_line, status, write_proxy, "a2a-proxy-gate").await;
+
+        let (_, headers, body) = send_charged_a2a_text(&h, Some("refused-proxy-proof")).await;
+
+        assert_eq!(body["error"]["message"], message, "{body}");
+        assert!(!headers.contains_key("payment-response"));
+        assert_eq!(gate.calls(), 0, "{message}: a proxy that cannot be reached is not charged");
+        assert_eq!(
+            fake_direct_line
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
+    let h = start_charged_a2a_proxy_harness(&fake_direct_line, "active", true, "a2a-proxy-gate").await;
+
+    let (status, headers, body) = send_charged_a2a_text(&h, None).await;
+    assert_eq!(status, 402, "{body}");
+    assert_eq!(headers["payment-required"], "eyJ4IjoxfQ==");
+    assert_eq!(gate.calls(), 1);
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0,
+        "an unpaid request does not reach the backend"
+    );
+
+    let (status, headers, body) = send_charged_a2a_text(&h, Some("a2a-proxy-proof")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(headers["payment-response"], "a2a-proxy-receipt");
+    assert_eq!(body["result"]["parts"][0]["text"], "Hello from Copilot", "{body}");
+    assert_eq!(gate.calls(), 2);
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        3,
+        "the paid request reaches the backend once"
+    );
+    let reached = fake_direct_line.requests();
+    assert!(
+        reached
+            .iter()
+            .all(|request| !request
+                .headers
+                .contains_key("payment-signature")),
+        "the payment credential is not relayed: {reached:?}"
+    );
+
+    let (status, headers, body) = send_charged_a2a_text(&h, Some("a2a-proxy-proof")).await;
+    assert_eq!(status, 402, "{body}");
+    assert!(!headers.contains_key("payment-response"));
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        3,
+        "a used payment does not reach the backend again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_an_a2a_proxy_cannot_serve_is_refused_before_it_is_charged() {
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+    let gate = MockGate::answering(200, &[("Payment-Receipt", "never-taken")], json!({}))
+        .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+    install_test_transport("a2a-proxy-refusal-gate", gate.clone());
+    let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
+    let h = start_charged_a2a_proxy_harness(&fake_direct_line, "active", true, "a2a-proxy-refusal-gate").await;
+
+    let mut unsupported = a2a_text_request(vec![json!({ "kind": "text", "text": "hello" })]);
+    unsupported["method"] = json!("tasks/get");
+    let mut no_message = a2a_text_request(Vec::new());
+    no_message["params"] = json!({});
+    let cases = [
+        ("an unsupported method", unsupported, -32601),
+        ("no params.message", no_message, -32602),
+        ("no parts", a2a_text_request(Vec::new()), -32602),
+        ("no text part", a2a_text_request(vec![json!({ "kind": "file", "file": {} })]), -32602),
+    ];
+    for (label, body, code) in cases {
+        let response = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("A2A-Version", "1.0")
+            .header("PAYMENT-SIGNATURE", "refused-before-payment")
+            .json(&body)
+            .send()
+            .await
+            .expect("send request through gateway");
+        assert!(
+            !response
+                .headers()
+                .contains_key("payment-response"),
+            "{label}"
+        );
+        let body: Value = response
+            .json()
+            .await
+            .unwrap_or(Value::Null);
+        assert_eq!(body["error"]["code"], code, "{label}: {body}");
+    }
+    assert_eq!(gate.calls(), 0, "nothing the proxy would refuse is charged");
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    let (status, _, body) = send_charged_a2a_text(&h, Some("paid-after-checks")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(gate.calls(), 1, "a request the proxy serves is charged once");
+}

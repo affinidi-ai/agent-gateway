@@ -23,10 +23,14 @@ pub mod middleware;
 pub mod payment;
 pub mod proxy_config;
 pub mod proxy_config_cache;
+// Only MPP auto-pay signs with it, and nothing calls auto-pay.
+#[allow(dead_code)]
 pub mod proxy_signer;
 pub mod remote_facilitator;
 pub mod settlement;
 pub mod settlement_worker;
+// The x402 test endpoints are not mounted.
+#[allow(dead_code)]
 pub mod test_handlers;
 pub mod transaction_store;
 pub mod verification;
@@ -34,23 +38,21 @@ pub mod x402rs_adapter;
 
 // DIDComm facilitator modules
 pub mod didcomm_facilitator_client;
+// The x402 HTTP facilitator is not mounted.
+#[allow(dead_code)]
 pub mod facilitator_api;
 pub mod gateway_facilitator_service;
 
 pub use admin_api::*;
 pub use config_cache::*;
-pub use delegate::{PaymentDelegationDecision, delegation_target, map_delegation_response};
+pub use delegate::{PaymentDelegationDecision, map_delegation_response};
 pub use errors::*;
 pub use middleware::*;
 pub use payment::*;
 pub use settlement::*;
-pub use test_handlers::{
-    protected_eip3009, protected_permit2, protected_solana_devnet, protected_solana_mainnet, test_close, test_health,
-};
 pub use verification::*;
 
 // DIDComm facilitator exports
-pub use facilitator_api::{HttpFacilitatorState, create_http_facilitator_router};
 pub use gateway_facilitator_service::{
     init_gateway_facilitator_service, set_atm_infrastructure, verify_via_facilitator_gateway,
 };

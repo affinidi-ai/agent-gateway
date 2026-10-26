@@ -168,6 +168,7 @@ const SPA_RESERVED_TOP_LEVEL: &[&str] = &[
     "notifications",
     "oidc-providers",
     "onboard",
+    "payments",
     "x402payments",
     "policies",
     "profile",
@@ -182,7 +183,7 @@ const SPA_RESERVED_TOP_LEVEL: &[&str] = &[
 ];
 
 /// Returns the first path segment of `prefix`, lowercased, or `None` if the
-/// prefix is empty / root. E.g. `"/x402payments"` -> `Some("x402payments")`,
+/// prefix is empty / root. E.g. `"/payments"` -> `Some("payments")`,
 /// `"/svc/payments"` -> `Some("svc")`.
 fn first_segment(prefix: &str) -> Option<String> {
     prefix
@@ -212,6 +213,33 @@ where
         }
     }
     collisions
+}
+
+/// The fatal startup message for prefixes that shadow dashboard pages: each
+/// offending prefix, the page it shadows, and how to fix it.
+pub fn spa_collision_banner(collisions: &[(String, String)]) -> String {
+    let detail = collisions
+        .iter()
+        .map(|(prefix, spa)| format!("    - prefix '{prefix}' shadows the dashboard page '{spa}'"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "\n\
+         ============================================================\n\
+         FATAL: Gateway configuration error\n\
+         ============================================================\n\
+         One or more channel/proxy prefixes collide with reserved\n\
+         dashboard routes. Starting in this state would replace\n\
+         dashboard pages with proxy 404s, so the server is exiting.\n\n\
+         Collisions:\n{detail}\n\n\
+         Fix: rename each offending prefix (a channel's `prefix`, or the\n\
+         `prefix` of a proxy route, in your gateway.json) to one that is\n\
+         not a dashboard page, e.g. '/svc/<name>', and restart. The\n\
+         dashboard's Payments page owns '/payments', so a channel on\n\
+         '/payments' must be renamed; clients that call it must use the\n\
+         new prefix.\n\
+         ============================================================\n"
+    )
 }
 
 #[cfg(test)]
@@ -424,7 +452,42 @@ mod tests {
 
     #[test]
     fn collision_ignores_non_reserved_prefix() {
-        assert!(check_spa_route_collisions(["/payments", "/helpdesk", "/foo"]).is_empty());
+        assert!(check_spa_route_collisions(["/billing", "/helpdesk", "/foo", "/svc/payments"]).is_empty());
+    }
+
+    #[test]
+    fn collision_detects_the_payments_page_and_its_legacy_redirect() {
+        let hits = check_spa_route_collisions(["/payments", "/payments/v1/report", "/x402payments"]);
+        assert_eq!(
+            hits,
+            vec![
+                ("/payments".to_string(), "/payments".to_string()),
+                ("/payments/v1/report".to_string(), "/payments".to_string()),
+                ("/x402payments".to_string(), "/x402payments".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_startup_error_names_each_prefix_the_page_it_shadows_and_the_rename() {
+        let banner = spa_collision_banner(&check_spa_route_collisions(["/payments", "/svc/x", "/policies/v1"]));
+
+        assert!(banner.contains("prefix '/payments' shadows the dashboard page '/payments'"), "{banner}");
+        assert!(banner.contains("prefix '/policies/v1' shadows the dashboard page '/policies'"), "{banner}");
+        assert!(!banner.contains("'/svc/x'"), "{banner}");
+        assert!(banner.contains("rename each offending prefix"), "{banner}");
+        assert!(banner.contains("'/payments' must be renamed"), "{banner}");
+    }
+
+    #[test]
+    fn the_shipped_example_config_passes_the_dashboard_route_check() {
+        let config = crate::config::NetworkConfig::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/examples/gateway.example.json"
+        ))
+        .expect("the shipped example config loads");
+        assert!(!config.channels.is_empty(), "the example offers channel prefixes");
+        assert_eq!(check_spa_route_collisions(config.proxy_prefixes()), Vec::<(String, String)>::new());
     }
 
     #[test]

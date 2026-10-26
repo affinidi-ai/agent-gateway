@@ -129,6 +129,7 @@ pub fn create_identity_api_router(
     authority_store: Option<std::sync::Arc<crate::authorities::FileSystemAuthorityStore>>,
     x402_admin_router: Option<Router>,
     mpp_admin_router: Option<Router>,
+    payments_ledger_router: Router,
     metric_store: Option<Arc<MetricsStore>>,
     sts_client_store: Option<std::sync::Arc<dyn crate::sts::store::StsClientStorage>>,
     mcp_replay: Option<std::sync::Arc<crate::sts::replay::McpReplay>>,
@@ -1137,6 +1138,15 @@ pub fn create_identity_api_router(
                         "/v1/gateways/{id}/surfaces",
                         gate(
                             get(crate::gateways::handlers::get_gateway_surfaces::<
+                                crate::gateways::FileSystemGatewayStore,
+                            >),
+                            Feature::GatewaysView,
+                        ),
+                    )
+                    .route(
+                        "/v1/gateways/{id}/surfaces/{surface_id}/payment-manifest",
+                        gate(
+                            get(crate::gateways::handlers::get_payment_manifest::<
                                 crate::gateways::FileSystemGatewayStore,
                             >),
                             Feature::GatewaysView,
@@ -2212,6 +2222,18 @@ pub fn create_identity_api_router(
         };
         app = app.nest("/admin", admin_router);
     }
+
+    // Delegated payment ledger routes become `/api/admin/payments...`, gated on `payments.view`.
+    let payments_ledger_router = match passkey_storage_for_manager.as_ref() {
+        Some(storage) => payments_ledger_router.layer(crate::auth_manager::middleware::require_feature(
+            storage.clone(),
+            rbac_config.clone(),
+            crate::rbac::Feature::PaymentsView,
+        )),
+        None => payments_ledger_router
+            .layer(axum::middleware::from_fn(crate::auth_manager::middleware::deny_unguarded_request)),
+    };
+    app = app.nest("/admin", payments_ledger_router);
 
     // Apply global session auth middleware when a session manager is available
     if let Some(sess_mgr) = session_mgr_for_global_auth {

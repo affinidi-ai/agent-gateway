@@ -41,8 +41,7 @@ describe('computeOverridesFromPayload', () => {
       target: {
         endpoint: 'https://upstream.example/api',
         auth: { kind: 'bearer', token: 'x' },
-        mpp_auto_pay: true,
-        mpp_auto_pay_max_amount: '0.10',
+        fabric_target_name: 'billing',
         // not in TARGET_FIELDS — should be ignored
         unknown_field: 42,
       },
@@ -50,8 +49,7 @@ describe('computeOverridesFromPayload', () => {
     expect(overrides.target).toEqual({
       endpoint: 'https://upstream.example/api',
       auth: { kind: 'bearer', token: 'x' },
-      mpp_auto_pay: true,
-      mpp_auto_pay_max_amount: '0.10',
+      fabric_target_name: 'billing',
     });
   });
 

@@ -2,9 +2,9 @@
 //!
 //! Live chose integrations by category, status and attachments: gateway and user events went
 //! to `gateway`/`user` or `general` integrations attached to the gateway or the users, x402
-//! and MPP events to their category, a connection point's messages to the integrations on its
-//! record (whatever their category or status), and audit records to every appliance-wide
-//! `audit` integration.
+//! and MPP events to their category, delegated payment events to every appliance-wide `payment`
+//! integration, a connection point's messages to the integrations on its record (whatever their
+//! category or status), and audit records to every appliance-wide `audit` integration.
 
 use std::collections::BTreeSet;
 
@@ -18,6 +18,18 @@ const USER_EVENTS: [&str; 6] =
 const X402_EVENTS: [&str; 4] =
     ["x402.verification.failed", "x402.settlement.failed", "x402.transaction.completed", "x402.cleanup.completed"];
 const MPP_EVENTS: [&str; 3] = ["mpp.verification.failed", "mpp.payment.verified", "mpp.challenge.issued"];
+const PAYMENT_EVENTS: [&str; 10] = [
+    "payment.challenge_issued",
+    "payment.paid",
+    "payment.held",
+    "payment.rejected",
+    "payment.unconfirmed",
+    "payment.unavailable",
+    "payment.authorized",
+    "payment.voided",
+    "payment.capture_failed",
+    "payment.reconcile_failed",
+];
 const CONNECTION_POINT_EVENT: &str = "connection_point.connected";
 
 /// The audit records live's audit writer always wrote.
@@ -133,6 +145,13 @@ pub fn received_events(
     let family: &[&str] = match category {
         "x402" => &X402_EVENTS,
         "mpp" => &MPP_EVENTS,
+        "payment"
+            if integration
+                .tenant_id
+                .is_none() =>
+        {
+            &PAYMENT_EVENTS
+        }
         _ => &[],
     };
     picked.extend(
@@ -335,6 +354,7 @@ mod tests {
             .chain(&USER_EVENTS)
             .chain(&X402_EVENTS)
             .chain(&MPP_EVENTS)
+            .chain(&PAYMENT_EVENTS)
             .chain(&[CONNECTION_POINT_EVENT])
             .map(|event| event.to_string());
 
@@ -409,6 +429,26 @@ mod tests {
 
         assert_eq!(events(&received_events(&live(Some("x402")), &records, &no_audit())), X402_EVENTS);
         assert_eq!(events(&received_events(&live(Some("mpp")), &records, &no_audit())), MPP_EVENTS);
+    }
+
+    #[test]
+    fn an_appliance_wide_payment_integration_receives_every_payment_event_and_a_tenant_owned_one_none() {
+        let records = LegacyRecords::default();
+
+        let appliance_wide = received_events(&live(Some("payment")), &records, &no_audit());
+        let mut received = events(&appliance_wide);
+        received.sort_unstable();
+        let mut expected = PAYMENT_EVENTS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(received, expected);
+
+        let mut tenant = live(Some("payment"));
+        tenant.tenant_id = Some("team-a".to_string());
+        assert!(
+            received_events(&tenant, &records, &no_audit())
+                .events
+                .is_empty()
+        );
     }
 
     #[test]

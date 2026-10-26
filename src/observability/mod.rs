@@ -25,8 +25,8 @@ pub mod websocket_log_layer;
 
 pub use dashboard::*;
 pub use http_trace::{
-    access_log, record_caller_did_on_current_span, record_caller_identity_on_current_span, set_record_caller_identity,
-    trace_http_request,
+    access_log, note_payment_outcome, record_caller_did_on_current_span, record_caller_identity_on_current_span,
+    set_record_caller_identity, trace_http_request,
 };
 pub use log_redact::{LogRedactor, RedactingMakeWriter};
 pub use metrics_updater::periodic_metrics_update;

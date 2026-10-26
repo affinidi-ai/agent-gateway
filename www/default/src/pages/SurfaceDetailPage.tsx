@@ -38,6 +38,8 @@ import {
   nodesFromSurface,
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
+import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
+import SurfacePaymentActivity from '../components/surface-builder/elements/payment/SurfacePaymentActivity';
 import './SurfaceBuilder.css';
 
 interface DetailBuilderState {
@@ -103,6 +105,7 @@ const SurfaceDetailPage: React.FC = () => {
   const navigate = useNavigate();
   const { hasPermission } = usePermissions();
   const canEdit = hasPermission('surfaces.edit');
+  const canViewPayments = hasPermission('payments.view');
   const { getCurrentStats } = useApp();
 
   const [surface, setSurface] = useState<AgentSurface | null>(null);
@@ -1265,12 +1268,13 @@ const SurfaceDetailPage: React.FC = () => {
       // operator removed is sent as null, removed only if the save succeeds.
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
       let headerWarnings: string[] = [];
-      const updated = await apiClient.updateSurface(surfaceId, payload, {
+      const { warnings: bodyWarnings, ...updated } = await apiClient.updateSurface(surfaceId, payload, {
         onWarnings: warnings => {
           headerWarnings = warnings;
         },
       });
-      setSavedWarnings({ surfaceId, warnings: headerWarnings });
+      const serverWarnings = [...headerWarnings, ...saveWarningMessages(bodyWarnings)];
+      setSavedWarnings({ surfaceId, warnings: serverWarnings });
       setSurface(updated);
       setJsonOverride(null);
       setJsonError(null);
@@ -1366,7 +1370,7 @@ const SurfaceDetailPage: React.FC = () => {
       const warnings = validateSurfacePayload(updated).filter(i => i.severity === 'warning');
       // One toast: a later one replaces an earlier one, so the saved message
       // and every warning go into this one.
-      const allWarnings = [...headerWarnings, ...warnings.map(w => w.message)];
+      const allWarnings = [...serverWarnings, ...warnings.map(w => w.message)];
       if (allWarnings.length === 0) {
         showToast('success', `Agent Surface "${updated.name}" saved`);
       } else {
@@ -1584,6 +1588,10 @@ const SurfaceDetailPage: React.FC = () => {
 
   if (!surface) return null;
 
+  const savedPayment = surface.target?.payment_policy;
+  const agentPayGatewayId =
+    savedPayment?.type === 'agent_pay' ? savedPayment.payment_gateway_id : undefined;
+
   const livePayload = (() => {
     try {
       return buildPayload({
@@ -1647,15 +1655,27 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error || (saveWarnings && saveWarnings.length > 0) ? (
+          error ||
+          (saveWarnings && saveWarnings.length > 0) ||
+          (agentPayGatewayId && canViewPayments) ? (
             <>
               {error && (
-                <div className="alert alert-danger surface-page-alert mb-2" role="alert">
+                <div
+                  className="alert alert-danger surface-page-alert mb-2"
+                  role="alert"
+                  data-testid="surface-error-alert"
+                >
                   <i className="fas fa-exclamation-circle me-2" />
                   {error}
                 </div>
               )}
               <SaveWarningsBanner warnings={saveWarnings} />
+              {agentPayGatewayId && canViewPayments && (
+                <SurfacePaymentActivity
+                  surfaceId={surface.surface_id}
+                  paymentGatewayId={agentPayGatewayId}
+                />
+              )}
             </>
           ) : null
         }
@@ -1728,6 +1748,7 @@ const SurfaceDetailPage: React.FC = () => {
                 onClick={handleSave}
                 disabled={saving || deleting}
                 title={saveDisabledReason || (saving ? 'Saving…' : 'Save changes')}
+                data-testid="surface-save-button"
               >
                 {saving ? <i className="fas fa-spinner fa-spin" /> : <i className="fas fa-save" />}
               </button>

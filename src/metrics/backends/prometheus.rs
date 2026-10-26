@@ -207,6 +207,60 @@ lazy_static! {
         h
     };
 
+    /// Payment gate calls to agent-pay (labeled by surface_id, outcome).
+    /// `outcome` = `paid` | `challenge` | `held` | `rejected` | `unavailable`.
+    pub static ref PAYMENT_GATE_REQUESTS: IntCounterVec = {
+        let opts = Opts::new(
+            names::PAYMENT_GATE_REQUESTS_TOTAL,
+            "Payment gate calls to agent-pay (outcome = paid|challenge|held|rejected|unavailable)",
+        );
+        let counter = IntCounterVec::new(opts, &["surface_id", "outcome"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// Payment gate round-trip latency in milliseconds (labeled by surface_id).
+    pub static ref PAYMENT_GATE_LATENCY: HistogramVec = {
+        let opts = HistogramOpts::new(names::PAYMENT_GATE_LATENCY_MS, "Payment gate round-trip latency in milliseconds")
+            .buckets(vec![5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 15000.0, 60000.0]);
+        let histogram = HistogramVec::new(opts, &["surface_id"]).unwrap();
+        REGISTRY.register(Box::new(histogram.clone())).unwrap();
+        histogram
+    };
+
+    /// Payment gate circuit breaker transitions (labeled by payment_gateway_id, state = open|closed).
+    pub static ref PAYMENT_GATE_BREAKER_TRANSITIONS: IntCounterVec = {
+        let opts = Opts::new(
+            names::PAYMENT_GATE_BREAKER_TRANSITIONS_TOTAL,
+            "Payment gate circuit breaker transitions (state = open|closed)",
+        );
+        let counter = IntCounterVec::new(opts, &["payment_gateway_id", "state"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// Capture, void and status requests for held payments (labeled by action, status).
+    pub static ref PAYMENT_SETTLEMENTS: IntCounterVec = {
+        let opts = Opts::new(
+            names::PAYMENT_SETTLEMENTS_TOTAL,
+            "Settle requests for payments held until delivery (action = capture|void|status|reconcile)",
+        );
+        let counter = IntCounterVec::new(opts, &["action", "status"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// Payments ledger rows that could not be queued for or written to the disk.
+    pub static ref PAYMENT_LEDGER_UNWRITTEN_ROWS: IntCounter = {
+        let counter = IntCounter::new(
+            names::PAYMENT_LEDGER_UNWRITTEN_ROWS_TOTAL,
+            "Payments ledger rows held in memory only because the disk write failed or the writer was behind",
+        )
+        .unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// STS token-exchange issuance outcomes (labeled by grant, result).
     /// `grant` = `token_exchange` | `jwt_bearer` | `other`; `result` = `ok` | `denied` | `error`.
     pub static ref STS_TOKEN_EXCHANGE: IntCounterVec = {
@@ -644,6 +698,96 @@ pub fn track_managed_identity_resolve(
         .observe(duration_secs);
 }
 
+/// Count one payment gate decision that made no round trip to agent-pay, such
+/// as a request refused for a legacy local payment policy. Counted in every
+/// metrics backend that carries the payment gate metrics.
+pub fn track_payment_gate_request(
+    surface_id: &str,
+    outcome: &str,
+) {
+    PAYMENT_GATE_REQUESTS
+        .with_label_values(&[surface_id, outcome])
+        .inc();
+    super::opentelemetry_backend::record_payment_gate_request(surface_id, outcome);
+}
+
+pub fn track_payment_gate_breaker(
+    payment_gateway_id: &str,
+    state: &str,
+) {
+    PAYMENT_GATE_BREAKER_TRANSITIONS
+        .with_label_values(&[payment_gateway_id, state])
+        .inc();
+}
+
+pub fn track_payment_settlement(
+    action: &str,
+    status: &str,
+) {
+    PAYMENT_SETTLEMENTS
+        .with_label_values(&[action, status])
+        .inc();
+}
+
+pub fn track_payment_ledger_unwritten_row() {
+    PAYMENT_LEDGER_UNWRITTEN_ROWS.inc();
+}
+
+/// Track one payment gate call and its latency.
+pub fn track_payment_gate(
+    surface_id: &str,
+    outcome: &str,
+    latency_ms: u64,
+) {
+    track_payment_gate_request(surface_id, outcome);
+    PAYMENT_GATE_LATENCY
+        .with_label_values(&[surface_id])
+        .observe(latency_ms as f64);
+    super::opentelemetry_backend::record_payment_gate_latency(surface_id, latency_ms);
+}
+
+/// The payment gate calls counted so far, by outcome, and the total latency of
+/// the calls that made a round trip, summed over every surface. What the
+/// CloudWatch backend reports, since it carries no per-surface series.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PaymentGateTotals {
+    pub requests_by_outcome: std::collections::BTreeMap<String, u64>,
+    pub latency_sum_ms: f64,
+    pub latency_count: u64,
+}
+
+pub fn payment_gate_totals() -> PaymentGateTotals {
+    use prometheus::core::Collector;
+
+    let mut totals = PaymentGateTotals::default();
+    for family in PAYMENT_GATE_REQUESTS.collect() {
+        for metric in family.get_metric() {
+            let Some(outcome) = metric
+                .get_label()
+                .iter()
+                .find(|label| label.name() == "outcome")
+            else {
+                continue;
+            };
+            *totals
+                .requests_by_outcome
+                .entry(outcome.value().to_string())
+                .or_default() += metric.get_counter().value() as u64;
+        }
+    }
+    for family in PAYMENT_GATE_LATENCY.collect() {
+        for metric in family.get_metric() {
+            totals.latency_sum_ms += metric
+                .get_histogram()
+                .get_sample_sum();
+            totals.latency_count += metric
+                .get_histogram()
+                .get_sample_count();
+        }
+    }
+    totals
+}
+
 /// Track a Trust Check element outcome.
 ///
 /// `query_type` = `authorization` | `recognition`
@@ -864,10 +1008,50 @@ pub fn set_active_users(count: i64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, AUDIT_SINK_REBUILD_FAILED, get_metrics, names,
-        set_audit_pipeline_started, track_a2a_protocol_version, track_audit_sink_rebuild_failed,
-        track_fabric_forward_received,
+        A2A_PROTOCOL_VERSION, AUDIT_PIPELINE_STARTED, AUDIT_SINK_REBUILD_FAILED, PAYMENT_GATE_LATENCY,
+        PAYMENT_GATE_REQUESTS, get_metrics, names, payment_gate_totals, set_audit_pipeline_started,
+        track_a2a_protocol_version, track_audit_sink_rebuild_failed, track_fabric_forward_received, track_payment_gate,
+        track_payment_gate_request,
     };
+
+    #[test]
+    fn a_payment_gate_call_is_counted_by_outcome_and_timed_and_a_refusal_is_only_counted() {
+        let surface = format!("surface-{}", uuid::Uuid::new_v4());
+        track_payment_gate(&surface, "paid", 40);
+        track_payment_gate(&surface, "paid", 60);
+        track_payment_gate_request(&surface, "unavailable");
+
+        assert_eq!(
+            PAYMENT_GATE_REQUESTS
+                .with_label_values(&[surface.as_str(), "paid"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            PAYMENT_GATE_REQUESTS
+                .with_label_values(&[surface.as_str(), "unavailable"])
+                .get(),
+            1
+        );
+        let latency = PAYMENT_GATE_LATENCY.with_label_values(&[surface.as_str()]);
+        assert_eq!((latency.get_sample_count(), latency.get_sample_sum()), (2, 100.0));
+    }
+
+    #[test]
+    fn the_payment_gate_totals_sum_every_surface_by_outcome() {
+        let outcome = format!("outcome-{}", uuid::Uuid::new_v4());
+        track_payment_gate_request("surface-a", &outcome);
+        track_payment_gate_request("surface-b", &outcome);
+        track_payment_gate_request("surface-b", &outcome);
+
+        let totals = payment_gate_totals();
+        assert_eq!(
+            totals
+                .requests_by_outcome
+                .get(&outcome),
+            Some(&3)
+        );
+    }
 
     #[test]
     fn the_audit_pipeline_gauge_reports_whether_it_started() {

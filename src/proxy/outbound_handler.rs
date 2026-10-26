@@ -5182,6 +5182,7 @@ async fn step_forward_request_fabric(
             timeout,
             trace_id: &ctx.request_id,
             log_label: &ctx.surface.name,
+            extra_body: None,
         },
     )
     .await

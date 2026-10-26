@@ -34,6 +34,24 @@ version and client declarations (see
 `input.mcp` only for modern requests, so a rule keyed on `input.mcp` never
 matched legacy Fabric traffic; it now does, and a decision can change on upgrade.
 
+### Payment context (`input.payment`)
+
+On a surface with an `agent_pay` payment policy, every policy that runs for it gets
+`input.payment`: the appliance-wide and per-gateway gateway policies as well as the surface
+policies, on the direct Access Point and on Fabric receive alike. A surface without an
+`agent_pay` policy has no `input.payment`.
+
+```json
+{"required": true, "rail": "x402", "amount": "0.25", "currency": "USD"}
+```
+
+`required` says whether the request is chargeable under the policy's triggers. `rail` is the
+rail of the credential the caller presented, or the only rail the payment surface's manifest
+offers; `amount` and `currency` come from the manifest snapshot. Each is omitted when unknown.
+Payment is taken only after policy allows the request, so a denied request is never charged,
+and policy never sees whether a payment succeeded: the older `input.payment.verified` field is
+gone, and a rule that reads it no longer matches.
+
 ## Versioned policy definitions
 
 Policy definitions are immutable and versioned
