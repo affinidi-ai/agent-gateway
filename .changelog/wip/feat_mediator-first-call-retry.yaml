@@ -16,5 +16,8 @@ changes:
       description: Finalizing a pairing, for every gateway and not only with a directory mediator, now needs the pending gateway of that acceptance and refuses, writing nothing, when it is missing. Earlier versions recreated it with no tenant, which could attach a gateway with no tenant to a tenant's mediator or pick up another acceptance's gateway by the shared DID. An invitation accepted just before the gateway restarts, which removes pending gateways left by an earlier run, therefore has to be accepted again. See docs/INTEGRATIONS.md.
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-26T00:00:00.000Z'
+      title: Update zstd-sys to 2.1.2 and ignore the zstd advisories no release fixes yet
+      description: RUSTSEC-2026-0410 reports memory corruption in the zstd-sys WebAssembly allocator shim, fixed in 2.1.2, which Cargo.lock now selects. RUSTSEC-2026-0391, RUSTSEC-2026-0398 and RUSTSEC-2026-0403 affect zstd 0.13.3 and zstd-safe 7.2.4 and are fixed only in zstd 0.14 and zstd-safe 8, while pulsar and the Solana RPC client still require zstd 0.13. The gateway calls no zstd API itself, so they are ignored in .cargo/audit.toml with the reason until those dependencies move.
   breaking: []
