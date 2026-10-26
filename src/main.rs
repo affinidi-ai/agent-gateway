@@ -31,6 +31,7 @@ mod audit;
 mod auth;
 mod auth_manager;
 mod authorities; // Local record book of external authority DIDs (trust anchors)
+mod authz_metadata;
 mod backup_restore; // Backup and restore logic for _storage
 mod certificates; // Certificate management (TLS/SSL certificates)
 mod comm;
