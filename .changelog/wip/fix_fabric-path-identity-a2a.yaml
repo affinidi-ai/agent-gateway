@@ -1,0 +1,27 @@
+branch: fix/fabric-path-identity-a2a
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-26T00:00:00.000Z'
+      title: Return the managed agent's identity credential for A2A 1.0 tasks over Fabric
+      description: >-
+        Over Fabric, the gateway in front of a Managed Agent did not find the identity
+        the agent asserted on an A2A 1.0 task, because it did not read the task a
+        `SendMessage` result wraps in `{"task": …}`. It issued no identity credential,
+        and the calling gateway received the raw identity. Both gateways now read the
+        same response locations as a direct call: the task's status message, then its
+        artifacts. The credential is placed on the status message, and the calling
+        gateway finds and verifies it there.
+  removed: []
+  security:
+    - timestamp: '2026-10-26T00:00:00.000Z'
+      title: Stop reading task history for the managed agent's identity over Fabric
+      description: >-
+        Over Fabric, both gateways read the managed agent's identity from the first
+        entry of a task's `history`, which is normally the caller's own message. A
+        caller could have its self-asserted identity resolved as the agent's and
+        signed, and the agent's credential could be attached to the caller's message.
+        Task history is no longer read for identity on the Fabric path, matching a
+        direct call.
+  breaking: []
