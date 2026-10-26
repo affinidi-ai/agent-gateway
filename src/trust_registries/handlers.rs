@@ -117,7 +117,8 @@ pub async fn get_trust_registry<S: TrustRegistryStore>(
 
 /// Saves `trust_registry` on its own task, so a cancelled request cannot report the DID
 /// it announced as failed while the record is written, and reports it `created` once the
-/// record, which now names that DID, is stored.
+/// record, which now names that DID, is stored. A DID it replaces is retired after that,
+/// on the same task.
 async fn save_announced<S: TrustRegistryStore + 'static>(
     store: &Arc<S>,
     trust_registry: &TrustRegistry,
@@ -132,18 +133,17 @@ async fn save_announced<S: TrustRegistryStore + 'static>(
     let saved = super::communication::trust_registry_payload(&trust_registry.id, mediator_did, our_did);
     let record = trust_registry.clone();
     let store = store.clone();
-    announcement
-        .complete(
-            async move {
-                store.update(&record).await?;
-                if let Some((manager, previous)) = replaced {
-                    manager.announce_deleted(&previous);
-                }
-                Ok(())
-            },
-            saved,
-        )
-        .await
+    tokio::spawn(async move {
+        announcement
+            .complete(async move { store.update(&record).await }, saved)
+            .await?;
+        if let Some((manager, previous)) = replaced {
+            manager.announce_deleted(&previous);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("the save task failed: {e}"))?
 }
 
 /// Create a new trust registry
@@ -820,6 +820,99 @@ mod tests {
             .await
             .unwrap();
         (store, registry, dir)
+    }
+
+    async fn events_of_a_save(replaced_did: Option<&str>) -> Vec<(String, String)> {
+        let (store, mut registry, dir) = stored_registry(None).await;
+        let mut previous = registry.clone();
+        previous.our_did = Some("did:peer:2.old".into());
+        previous.mediator_did = Some("did:web:mediator.example".into());
+        registry.our_did = Some("did:peer:2.new".into());
+        registry.mediator_did = Some("did:web:mediator.example".into());
+
+        let (url, captured) = crate::event_hook::tests_support::serve(204, "").await;
+        let hook = crate::event_hook::EventHook::new(crate::event_hook::EventHookSettings {
+            hook_url: Some(url),
+            ..crate::event_hook::EventHookSettings::default()
+        })
+        .unwrap();
+        let manager = Arc::new(TrustRegistryListenerManager::new("example.com".into(), dir.path().to_path_buf(), None));
+        manager.set_event_hook(Some(hook.clone()), None);
+        let announcement = crate::event_hook::CreationGuard::start(
+            Some(hook),
+            super::super::communication::trust_registry_payload(
+                &registry.id,
+                "did:web:mediator.example",
+                "did:peer:2.new",
+            ),
+        );
+        let replaced = replaced_did.map(|_| (manager, previous));
+
+        save_announced(&store, &registry, announcement, replaced)
+            .await
+            .unwrap();
+
+        let expected = if replaced_did.is_some() {
+            3
+        } else {
+            2
+        };
+        for _ in 0..100 {
+            if captured.lock().unwrap().len() >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut events: Vec<(u64, String, String)> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| {
+                let body: serde_json::Value = serde_json::from_str(&call.body).unwrap();
+                (
+                    body["sequence"]
+                        .as_u64()
+                        .unwrap(),
+                    body["event"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    body["connection_point"]["did"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+        events.sort();
+        events
+            .into_iter()
+            .map(|(_, event, did)| (event, did))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_replaced_did_is_reported_created_before_the_old_one_is_retired() {
+        assert_eq!(
+            events_of_a_save(Some("did:peer:2.old")).await,
+            vec![
+                ("connection_point.creation_started".to_string(), "did:peer:2.new".to_string()),
+                ("connection_point.created".to_string(), "did:peer:2.new".to_string()),
+                ("connection_point.deleted".to_string(), "did:peer:2.old".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_did_retires_nothing() {
+        assert_eq!(
+            events_of_a_save(None).await,
+            vec![
+                ("connection_point.creation_started".to_string(), "did:peer:2.new".to_string()),
+                ("connection_point.created".to_string(), "did:peer:2.new".to_string()),
+            ]
+        );
     }
 
     fn tenant_a() -> Option<Extension<PatTenantContext>> {
