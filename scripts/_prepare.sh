@@ -486,6 +486,8 @@ for _tmpl in ./config/examples/agent_surface_templates/*; do
   _dest="${target_dir}/config/agent_surface_templates/$(basename "${_tmpl}")"
   [[ -e "${_dest}" ]] || cp -R "${_tmpl}" "${_dest}"
 done
+# Superseded by partial_agent_pay_payment_wall.json, which keeps the same template id.
+rm -f "${target_dir}/config/agent_surface_templates/partial_x402_payment_wall.json"
 
 # Persist URL_LOCAL (always localhost) and URL_PROXY (gateway_url when
 # provided) to instance.env so 'make testkit-* x=<name> h=l|h=p' can resolve

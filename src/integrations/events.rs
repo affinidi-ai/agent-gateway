@@ -89,12 +89,47 @@ const VARIABLES: &[VariableSpec] = &[
     var("NETWORK", "Network", "Network the payment settled on"),
     var("SETTLEMENT_METHOD", "Settlement Method", "How the payment was settled"),
     var("ERROR_MESSAGE", "Error Message", "Why the payment step failed"),
-    var("SEVERITY", "Severity", "info or error"),
+    var("SEVERITY", "Severity", "info, warning or error"),
     var("TRANSACTIONS_DELETED", "Transactions Deleted", "Number of transactions the cleanup removed"),
     var("RETENTION_DAYS", "Retention Days", "Days transactions are kept before cleanup"),
     var("PAYMENT_METHOD", "Payment Method", "Payment method the caller used"),
     var("RESOURCE_URL", "Resource URL", "URL of the paid resource"),
     var("REFERENCE", "Reference", "Payment reference returned by the verifier"),
+    var("VARIANT", "Variant", "Surface variant that served the request; empty for the base surface"),
+    var("PAYMENT_GATEWAY_ID", "Payment Gateway ID", "ID of the connected agent-pay gateway"),
+    var("PAYMENT_SURFACE_ID", "Payment Surface ID", "ID of the payment surface on the agent-pay gateway"),
+    var("RESOURCE", "Resource", "Resource the payment is for; empty when unknown"),
+    var("RAIL", "Rail", "Payment rail (x402 or mpp); empty when the rail is not known"),
+    var("CURRENCY", "Currency", "Currency of the amount; empty when unknown"),
+    var("CASE_ID", "Case ID", "Review case ID of a held payment; empty otherwise"),
+    var("REMOTE_STATUS", "Remote Status", "HTTP status the payment gateway returned; empty when it gave none"),
+    var("TRACE_ID", "Trace ID", "Request trace ID"),
+    var(
+        "AUTHORIZATION_ID",
+        "Authorization ID",
+        "agent-pay's authorization of funds held until the Target delivers; empty otherwise",
+    ),
+    var(
+        "RECEIPT_REFERENCE",
+        "Receipt Reference",
+        "MPP receipt reference or x402 settlement transaction hash; empty without a receipt",
+    ),
+    var(
+        "QUOTED_AMOUNT",
+        "Quoted Amount",
+        "The manifest price when the receipt charged a different one; empty otherwise",
+    ),
+    var("QUOTED_CURRENCY", "Quoted Currency", "Currency of the quoted amount; empty otherwise"),
+    var(
+        "PRICE_MISMATCH",
+        "Price Mismatch",
+        "true when the receipt charged another price than the manifest quoted, else false",
+    ),
+    var(
+        "REASON",
+        "Reason",
+        "Why the payment was refused, failed or released, clipped and without credentials; empty otherwise",
+    ),
     var(
         "AUDIT_RECORD",
         "Audit Record",
@@ -164,7 +199,11 @@ const VARIABLES: &[VariableSpec] = &[
         "Policy Content Hash",
         "sha256:<hex> hash of the exact Rego enforced for policy_decision records, when known",
     ),
-    var("AUDIT_VP_JWT", "Signed VP", "Signed Verifiable Presentation (JWT) attached to the record"),
+    var(
+        "AUDIT_VP_JWT",
+        "Signed VP",
+        "Signed Verifiable Presentation (JWT) attached to the record; empty for payment records, which carry only the fingerprint",
+    ),
     var("AUDIT_VP_FINGERPRINT", "VP Fingerprint", "sha256:<hex> fingerprint of the signed VP attached to the record"),
 ];
 
@@ -195,6 +234,26 @@ const MESSAGE_VARIABLES: &[&str] = &[
     "DATE",
     "TIME",
     "DATETIME",
+];
+const PAYMENT_VARIABLES: &[&str] = &[
+    "SURFACE_ID",
+    "VARIANT",
+    "PAYMENT_GATEWAY_ID",
+    "PAYMENT_SURFACE_ID",
+    "RESOURCE",
+    "RAIL",
+    "AMOUNT",
+    "CURRENCY",
+    "CASE_ID",
+    "REMOTE_STATUS",
+    "TRACE_ID",
+    "AUTHORIZATION_ID",
+    "RECEIPT_REFERENCE",
+    "QUOTED_AMOUNT",
+    "QUOTED_CURRENCY",
+    "PRICE_MISMATCH",
+    "REASON",
+    "SEVERITY",
 ];
 const AUDIT_VARIABLES: &[&str] = &[
     "AUDIT_RECORD",
@@ -239,6 +298,10 @@ const X402: Family = Family {
 const MPP: Family = Family {
     id: "mpp",
     label: "MPP Payments",
+};
+const PAYMENT: Family = Family {
+    id: "payment",
+    label: "Delegated Payments",
 };
 const AUDIT: Family = Family {
     id: "audit",
@@ -343,6 +406,70 @@ const EVENTS: &[EventSpec] = &[
         "A caller was asked to pay with MPP",
         &[&["SURFACE_ID", "SURFACE_NAME", "RESOURCE_URL", "SEVERITY"]],
     ),
+    spec(
+        PAYMENT,
+        "payment.challenge_issued",
+        "Payment Challenge Issued",
+        "The payment gateway answered with a payment challenge",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(PAYMENT, "payment.paid", "Payment Paid", "The payment gateway accepted the payment", &[PAYMENT_VARIABLES]),
+    spec(
+        PAYMENT,
+        "payment.held",
+        "Payment Held",
+        "The payment gateway held the payment for review",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.rejected",
+        "Payment Rejected",
+        "The payment gateway rejected the payment",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.unconfirmed",
+        "Payment Unconfirmed",
+        "The payment gateway did not confirm whether the payment was taken",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.unavailable",
+        "Payment Unavailable",
+        "The payment gateway could not be reached or gave no usable answer",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.authorized",
+        "Payment Authorized",
+        "The payment gateway held the funds until the Target delivers",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.voided",
+        "Payment Voided",
+        "Held funds were released because the Target did not deliver",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.capture_failed",
+        "Payment Capture Failed",
+        "The Target delivered but capturing the held funds failed",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.reconcile_failed",
+        "Payment Reconcile Failed",
+        "A held or unconfirmed payment could not be settled before its deadline",
+        &[PAYMENT_VARIABLES],
+    ),
 ];
 
 fn event_variables(groups: &[&[&'static str]]) -> Vec<&'static str> {
@@ -435,6 +562,16 @@ mod tests {
             "mpp.verification.failed",
             "mpp.payment.verified",
             "mpp.challenge.issued",
+            "payment.challenge_issued",
+            "payment.paid",
+            "payment.held",
+            "payment.rejected",
+            "payment.unconfirmed",
+            "payment.unavailable",
+            "payment.authorized",
+            "payment.voided",
+            "payment.capture_failed",
+            "payment.reconcile_failed",
         ]
         .map(String::from)
         .to_vec();

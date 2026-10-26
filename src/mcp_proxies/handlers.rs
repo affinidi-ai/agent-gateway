@@ -2663,32 +2663,37 @@ pub(crate) fn owned_modern_subscription(
     )
 }
 
-/// Handle MCP request with full surface policy support (timeout, retry, circuit breaker, mirroring)
-/// This version applies all network policies for feature parity with A2A channels
-pub async fn handle_mcp_request_with_policies(
+/// An MCP request a proxy can serve, checked and with its MCP server built:
+/// everything that can be refused without calling the backend has been.
+pub struct PreparedMcpRequest {
+    server: McpServer,
+    request: serde_json::Value,
+    call: McpCall,
+}
+
+enum McpCall {
+    Initialize,
+    ToolsList,
+    ToolsCall { tool_name: String, arguments: serde_json::Value },
+}
+
+/// Checks that `proxy` can serve `request` and builds its MCP server: an
+/// active proxy, a readable OpenAPI spec and base URL, a known method and, for a
+/// `tools/call`, a tool the spec defines. Nothing is sent to the backend, so a
+/// refusal here can be given before the request is charged.
+pub fn prepare_mcp_request(
     proxy: &super::types::McpProxy,
     request: serde_json::Value,
-    surface: &crate::config::agent_surface::AgentSurface,
-    policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
-    client: &reqwest::Client,
-    channel_name: &str,
     target_auth_header: Option<(String, String)>,
-) -> Result<serde_json::Value, String> {
-    use rmcp_openapi::Authorization;
-
+    config_id: &str,
+) -> Result<PreparedMcpRequest, String> {
     // Check if proxy is active
     if proxy.status != super::types::McpProxyStatus::Active {
-        let config_id = surface
-            .config_id()
-            .unwrap_or("unknown");
         channel_warn!(config_id, "❌ Proxy '{}' is disabled", proxy.name);
         return Err("MCP proxy is disabled".to_string());
     }
 
     // Create MCP server from proxy config
-    let config_id = surface
-        .config_id()
-        .unwrap_or("unknown");
     channel_info!(config_id, "Creating MCP server for proxy '{}' at {}", proxy.name, proxy.base_url);
 
     // Parse the OpenAPI spec from YAML to JSON
@@ -2732,31 +2737,94 @@ pub async fn handle_mcp_request_with_policies(
         .get("method")
         .and_then(|m| m.as_str())
         .unwrap_or("unknown");
-    let request_id = request.get("id").cloned();
 
     channel_info!(config_id, "🔧 Handling MCP method: {}", method);
 
-    // Get circuit breaker if configured
-    let circuit_breaker = if surface
-        .circuit_breaker()
-        .is_some()
-    {
-        if let Some(pm) = policy_manager {
-            if let Some(config_id) = surface.config_id() {
-                pm.get_circuit_breaker(config_id)
-                    .await
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let call = match method {
+        "initialize" => McpCall::Initialize,
+        "tools/list" => McpCall::ToolsList,
+        "tools/call" => {
+            let params = request
+                .get("params")
+                .ok_or_else(|| "Missing 'params' in tools/call request".to_string())?;
 
-    match method {
-        "initialize" => {
+            let tool_name = params
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| "Missing tool 'name' in params".to_string())?
+                .to_string();
+
+            let raw_arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+
+            // Auto-wrap flat arguments into request_body if the tool expects it (only when flattening is enabled)
+            let arguments = if proxy.flatten_post_params {
+                wrap_request_body_if_needed(&server, &tool_name, raw_arguments)
+            } else {
+                raw_arguments
+            };
+
+            if server
+                .get_tool(&tool_name)
+                .is_none()
+            {
+                return Err(format!("Tool '{}' not found", tool_name));
+            }
+            McpCall::ToolsCall { tool_name, arguments }
+        }
+        _ => {
+            warn!("❌ Unknown MCP method: {}", method);
+            return Err(format!("Unknown MCP method: {}", method));
+        }
+    };
+    Ok(PreparedMcpRequest { server, request, call })
+}
+
+const CIRCUIT_OPEN_ERROR: &str = "Circuit breaker open";
+
+/// Whether `error`, from [`execute_mcp_request`], says the circuit breaker
+/// refused the call, so the request never reached the proxy's backend.
+pub fn is_circuit_open_error(error: &str) -> bool {
+    error.starts_with(CIRCUIT_OPEN_ERROR)
+}
+
+/// The circuit breaker of `surface`, when it has one configured.
+pub async fn surface_circuit_breaker(
+    surface: &crate::config::agent_surface::AgentSurface,
+    policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+) -> Option<std::sync::Arc<crate::policies::CircuitBreaker>> {
+    surface.circuit_breaker()?;
+    policy_manager?
+        .get_circuit_breaker(surface.config_id()?)
+        .await
+}
+
+/// Handle a prepared MCP request with full surface policy support (timeout,
+/// retry, circuit breaker, mirroring). This applies all network policies for
+/// feature parity with A2A channels.
+pub async fn execute_mcp_request(
+    proxy: &super::types::McpProxy,
+    prepared: PreparedMcpRequest,
+    surface: &crate::config::agent_surface::AgentSurface,
+    policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+    client: &reqwest::Client,
+    channel_name: &str,
+) -> Result<serde_json::Value, String> {
+    use rmcp_openapi::Authorization;
+
+    let PreparedMcpRequest { server, request, call } = prepared;
+    let request_id = request.get("id").cloned();
+    let config_id = surface
+        .config_id()
+        .unwrap_or("unknown");
+
+    // Get circuit breaker if configured
+    let circuit_breaker = surface_circuit_breaker(surface, policy_manager).await;
+
+    match call {
+        McpCall::Initialize => {
             channel_info!(config_id, "✓ Returning initialize response for '{}'", proxy.name);
 
             Ok(serde_json::json!({
@@ -2774,7 +2842,7 @@ pub async fn handle_mcp_request_with_policies(
                 }
             }))
         }
-        "tools/list" => {
+        McpCall::ToolsList => {
             let tool_names = server.get_tool_names();
             info!("✓ Found {} tools for proxy '{}'", tool_names.len(), proxy.name);
 
@@ -2802,33 +2870,12 @@ pub async fn handle_mcp_request_with_policies(
                 }
             }))
         }
-        "tools/call" => {
-            let params = request
-                .get("params")
-                .ok_or_else(|| "Missing 'params' in tools/call request".to_string())?;
-
-            let tool_name = params
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| "Missing tool 'name' in params".to_string())?;
-
-            let raw_arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-
-            // Auto-wrap flat arguments into request_body if the tool expects it (only when flattening is enabled)
-            let arguments = if proxy.flatten_post_params {
-                wrap_request_body_if_needed(&server, tool_name, raw_arguments)
-            } else {
-                raw_arguments
-            };
-
-            channel_info!(config_id, "🔨 Calling tool: {}", tool_name);
-
+        McpCall::ToolsCall { tool_name, arguments } => {
+            let tool_name = tool_name.as_str();
             let tool = server
                 .get_tool(tool_name)
                 .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
+            channel_info!(config_id, "🔨 Calling tool: {}", tool_name);
 
             // Apply timeout if configured
             let timeout_duration = surface
@@ -2913,7 +2960,7 @@ pub async fn handle_mcp_request_with_policies(
                     Ok(r) => r,
                     Err(crate::policies::CircuitBreakerError::Open { retry_after }) => {
                         error!("Circuit breaker is open for channel '{}', retry after {:?}", channel_name, retry_after);
-                        return Err(format!("Circuit breaker open, retry after {:?}", retry_after));
+                        return Err(format!("{CIRCUIT_OPEN_ERROR}, retry after {:?}", retry_after));
                     }
                     Err(crate::policies::CircuitBreakerError::Inner(e)) => {
                         return Err(format!("Tool execution failed: {}", e));
@@ -2988,10 +3035,6 @@ pub async fn handle_mcp_request_with_policies(
                     "isError": result.is_error
                 }
             }))
-        }
-        _ => {
-            warn!("❌ Unknown MCP method: {}", method);
-            Err(format!("Unknown MCP method: {}", method))
         }
     }
 }

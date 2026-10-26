@@ -12,7 +12,7 @@ jest.mock('../../api', () => ({
 }));
 
 describe('PoliciesPage — policy tabs', () => {
-  it('shows Gateway, Agent Surfaces and Paywall tabs but no Channel tab', () => {
+  it('shows Gateway and Agent Surfaces tabs but no Channel or Paywall tab', () => {
     render(
       <MemoryRouter initialEntries={['/policies']}>
         <PoliciesPage />
@@ -21,7 +21,7 @@ describe('PoliciesPage — policy tabs', () => {
 
     expect(screen.getByRole('tab', { name: /gateway/i })).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: /agent surfaces/i })).toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: /paywall/i })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: /paywall/i })).toBeNull();
     expect(screen.queryByRole('tab', { name: /channel/i })).toBeNull();
   });
 });

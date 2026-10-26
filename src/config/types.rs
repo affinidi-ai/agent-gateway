@@ -1228,6 +1228,94 @@ impl Default for LoginThrottleConfig {
     }
 }
 
+/// The delegated payment gate's circuit breaker: after `breaker_failures`
+/// consecutive failed calls to one agent-pay gateway it refuses calls to it for
+/// `breaker_open_secs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentGateConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaker_failures: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaker_open_secs: Option<u64>,
+}
+
+impl PaymentGateConfig {
+    pub const DEFAULT_BREAKER_FAILURES: u32 = 5;
+    pub const DEFAULT_BREAKER_OPEN_SECS: u64 = 30;
+    const MAX_BREAKER_FAILURES: u32 = 1000;
+    const MAX_BREAKER_OPEN_SECS: u64 = 3600;
+
+    /// The configured failure count, kept within 1 to 1000.
+    pub fn breaker_failures(&self) -> u32 {
+        self.breaker_failures
+            .unwrap_or(Self::DEFAULT_BREAKER_FAILURES)
+            .clamp(1, Self::MAX_BREAKER_FAILURES)
+    }
+
+    /// The configured open time, kept within 1 to 3600 seconds.
+    pub fn breaker_open_for(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.breaker_open_secs
+                .unwrap_or(Self::DEFAULT_BREAKER_OPEN_SECS)
+                .clamp(1, Self::MAX_BREAKER_OPEN_SECS),
+        )
+    }
+}
+
+/// How long the delegated payments ledger keeps rows and how large it may grow
+/// on disk before its oldest hourly segments are deleted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentLedgerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size_mb: Option<u64>,
+}
+
+impl PaymentLedgerConfig {
+    pub const DEFAULT_RETENTION_DAYS: u32 = 7;
+    pub const MAX_RETENTION_DAYS: u32 = 400;
+    pub const DEFAULT_MAX_SIZE_MB: u64 = 2048;
+    const MIN_SIZE_MB: u64 = 16;
+    const MAX_SIZE_MB: u64 = 1024 * 1024;
+
+    /// The configured retention, kept within 1 to [`Self::MAX_RETENTION_DAYS`] days.
+    pub fn retention_days(&self) -> u32 {
+        self.retention_days
+            .unwrap_or(Self::DEFAULT_RETENTION_DAYS)
+            .clamp(1, Self::MAX_RETENTION_DAYS)
+    }
+
+    /// The configured size bound in bytes, kept within 16 MiB to 1 TiB.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_size_mb
+            .unwrap_or(Self::DEFAULT_MAX_SIZE_MB)
+            .clamp(Self::MIN_SIZE_MB, Self::MAX_SIZE_MB)
+            * 1024
+            * 1024
+    }
+
+    /// The configured values that fall outside their range and were clamped.
+    pub fn clamped_fields(&self) -> Vec<&'static str> {
+        let mut clamped = Vec::new();
+        if self
+            .retention_days
+            .is_some_and(|days| days != self.retention_days())
+        {
+            clamped.push("retention_days");
+        }
+        if self
+            .max_size_mb
+            .is_some_and(|mb| mb.saturating_mul(1024 * 1024) != self.max_bytes())
+        {
+            clamped.push("max_size_mb");
+        }
+        clamped
+    }
+}
+
 /// Which proxies may report the caller's address for per-client-IP limits (the SAML and CLI
 /// login throttles). Separate from `tls.client_auth.trusted_proxies`, which only gates forwarded
 /// client certificates.
@@ -1575,18 +1663,12 @@ pub struct X402PaymentRequirement {
     pub asset: String,
 
     /// User-selected recipient identifier. Must match the `id` of an entry in
-    /// the global x402 config's `recipient_addresses` list. This is the only
-    /// recipient field the frontend / API caller is trusted to supply — the
-    /// actual wallet address is resolved server-side from `recipient_id` +
-    /// `network` and stored in `pay_to` during channel save and load.
+    /// the global x402 config's `recipient_addresses` list.
     #[serde(default, rename = "recipientId", alias = "recipient_id")]
     pub recipient_id: String,
 
-    /// Resolved on-chain recipient address. NEVER trusted from request input —
-    /// always overwritten by the server-side `recipient_id` → address lookup
-    /// in `validate_payment_policy`. Persisted on disk and read directly by
-    /// the verification, settlement, and proxy layers, so they don't need to
-    /// repeat the lookup on the hot path.
+    /// Resolved on-chain recipient address, as persisted with the policy and
+    /// read by the verification, settlement, and proxy layers.
     #[serde(default, rename = "payTo", alias = "recipient")]
     pub pay_to: String,
 
@@ -1625,14 +1707,9 @@ impl X402PaymentRequirement {
     }
 }
 
-/// x402 payment provider — who enforces the paywall.
-///
-/// `Local` (default) means this gateway runs the x402 challenge / verify /
-/// settle itself. `AgentPay` delegates the *entire* payment interaction to a
-/// remote payment gateway over the `fabric://` protocol: every
-/// request is relayed to the configured payment surface, whose `402`
-/// challenge is relayed back to the caller and whose `200` authorises the
-/// request to proceed to this surface's own upstream.
+/// x402 payment provider of a stored `x402` policy. An enabled `AgentPay`
+/// policy loads as [`crate::config::agent_surface::PaymentPolicy::AgentPay`];
+/// `Local` is the unsupported local paywall.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum X402Provider {
@@ -1650,12 +1727,8 @@ impl X402Provider {
     }
 }
 
-/// Which payment protocol the remote payment gateway enforces when
-/// `X402Provider::AgentPay` delegates the whole paywall over `fabric://`. This
-/// gateway's delegation transport is protocol-agnostic — the request/response
-/// are relayed verbatim regardless of this marker — so it exists purely to make
-/// the operator's choice explicit in config, the dashboard, and the delegation
-/// audit log, rather than to change any enforcement behavior.
+/// Which payment protocol a stored `x402` delegation policy named. Dropped
+/// when the policy loads as an `agent_pay` policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegatedPaymentRail {
@@ -1899,26 +1972,72 @@ impl McpPaymentTriggers {
     }
 }
 
+/// The compiled form of one pattern list: a single set, or the patterns that
+/// compile on their own when the set does not.
+enum CompiledPatterns {
+    Set(regex::RegexSet),
+    Each(Vec<regex::Regex>),
+}
+
+impl CompiledPatterns {
+    fn compile(patterns: &[String]) -> Self {
+        let used = || {
+            patterns
+                .iter()
+                .filter(|p| !p.trim().is_empty())
+        };
+        match regex::RegexSet::new(used()) {
+            Ok(set) => Self::Set(set),
+            Err(_) => Self::Each(
+                used()
+                    .filter_map(|p| regex::Regex::new(p).ok())
+                    .collect(),
+            ),
+        }
+    }
+
+    fn is_match(
+        &self,
+        s: &str,
+    ) -> bool {
+        match self {
+            Self::Set(set) => set.is_match(s),
+            Self::Each(each) => each
+                .iter()
+                .any(|regex| regex.is_match(s)),
+        }
+    }
+}
+
+/// How many distinct pattern lists stay compiled; a full cache is emptied.
+const COMPILED_PATTERN_LISTS: usize = 512;
+
 fn any_pattern_matches(
     patterns: &[String],
     s: &str,
 ) -> bool {
-    if let Ok(set) = regex::RegexSet::new(
-        patterns
-            .iter()
-            .filter(|p| !p.trim().is_empty()),
-    ) {
-        set.is_match(s)
-    } else {
-        patterns
-            .iter()
-            .filter(|p| !p.trim().is_empty())
-            .any(|p| {
-                regex::Regex::new(p)
-                    .map(|r| r.is_match(s))
-                    .unwrap_or(false)
-            })
-    }
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    static CACHE: LazyLock<Mutex<HashMap<Vec<String>, Arc<CompiledPatterns>>>> = LazyLock::new(Default::default);
+
+    let compiled = {
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match cache.get(patterns) {
+            Some(compiled) => compiled.clone(),
+            None => {
+                if cache.len() >= COMPILED_PATTERN_LISTS {
+                    cache.clear();
+                }
+                let compiled = Arc::new(CompiledPatterns::compile(patterns));
+                cache.insert(patterns.to_vec(), compiled.clone());
+                compiled
+            }
+        }
+    };
+    compiled.is_match(s)
 }
 
 #[cfg(test)]
@@ -2006,6 +2125,18 @@ mod mcp_payment_triggers_tests {
     }
 
     #[test]
+    fn compiled_patterns_match_the_same_before_and_after_the_cache_is_emptied() {
+        for index in 0..(super::COMPILED_PATTERN_LISTS + 50) {
+            let t = McpPaymentTriggers::Match {
+                patterns: vec![format!("^tool{index}$")],
+            };
+            assert!(t.requires_payment(&format!("tool{index}")));
+            assert!(!t.requires_payment(&format!("tool{index}x")));
+            assert!(t.requires_payment(&format!("tool{index}")), "a cached list keeps matching");
+        }
+    }
+
+    #[test]
     fn serde_round_trip_match() {
         let t = McpPaymentTriggers::Match {
             patterns: vec!["^paid_".to_string()],
@@ -2025,15 +2156,15 @@ mod mcp_payment_triggers_tests {
 }
 
 /// A2A method filter for payment triggers
-/// Allows filtering by JSON-RPC method and optional message content regex
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Allows filtering by JSON-RPC method and optional message content text
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct A2AMethodFilter {
     /// JSON-RPC method name (e.g., "SendMessage", "GetTask", "ListTasks")
     pub method: String,
 
-    /// Optional regex patterns to match message content
+    /// Optional plain text a message must contain (not a regular expression).
     /// For methods with message payloads (SendMessage, SendStreamingMessage),
-    /// payment is only required if the message matches at least one pattern
+    /// payment is only required if the message contains at least one of them.
     /// Empty list means match all requests for this method
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub message_patterns: Vec<String>,
@@ -4303,6 +4434,58 @@ mod x402_storage_config_tests {
             err.to_string()
                 .contains("invalid type"),
             "unexpected error: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod payment_ledger_config_tests {
+    use super::PaymentLedgerConfig;
+
+    #[test]
+    fn defaults_keep_seven_days_and_two_gibibytes() {
+        let config: PaymentLedgerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.retention_days(), 7);
+        assert_eq!(config.max_bytes(), 2048 * 1024 * 1024);
+        assert!(
+            config
+                .clamped_fields()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn configured_values_inside_their_range_are_used() {
+        let config: PaymentLedgerConfig =
+            serde_json::from_value(serde_json::json!({"retention_days": 90, "max_size_mb": 512})).unwrap();
+        assert_eq!(config.retention_days(), 90);
+        assert_eq!(config.max_bytes(), 512 * 1024 * 1024);
+        assert!(
+            config
+                .clamped_fields()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped_and_reported() {
+        let config: PaymentLedgerConfig =
+            serde_json::from_value(serde_json::json!({"retention_days": 1000, "max_size_mb": 1})).unwrap();
+        assert_eq!(config.retention_days(), PaymentLedgerConfig::MAX_RETENTION_DAYS);
+        assert_eq!(config.max_bytes(), 16 * 1024 * 1024);
+        assert_eq!(config.clamped_fields(), vec!["retention_days", "max_size_mb"]);
+        let zero: PaymentLedgerConfig = serde_json::from_value(serde_json::json!({"retention_days": 0})).unwrap();
+        assert_eq!(zero.retention_days(), 1);
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused() {
+        let error = serde_json::from_value::<PaymentLedgerConfig>(serde_json::json!({"retention": 30})).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field"),
+            "{error}"
         );
     }
 }

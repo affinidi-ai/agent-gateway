@@ -3,7 +3,6 @@ import { Form } from 'react-bootstrap';
 import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
-import { ENABLE_MPP_PAYWALL } from '../../../../utils/featureFlags';
 import { filterSelectableGateways } from '../../../../utils/gateways';
 import type { ConfigPanelProps } from '../types';
 import FieldHelp from '../../../shared/FieldHelp';
@@ -543,38 +542,6 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
           }
           onChange={next => updateField('fabric_delegated_credentials', next)}
         />
-      )}
-
-      {ENABLE_MPP_PAYWALL && config.endpoint?.startsWith('fabric://') && (
-        <div className="config-section">
-          <label>MPP Auto-Pay</label>
-          <Form.Check
-            type="switch"
-            id="mpp-autopay"
-            label="Automatically pay MPP challenges"
-            checked={config.mpp_auto_pay || false}
-            onChange={e => updateField('mpp_auto_pay', e.target.checked)}
-          />
-          {config.mpp_auto_pay && (
-            <Form.Group className="mt-2">
-              <Form.Label className="small text-muted mb-1">Max amount per request</Form.Label>
-              <Form.Control
-                size="sm"
-                type="text"
-                placeholder="1.00"
-                value={config.mpp_auto_pay_max_amount || ''}
-                onChange={e => updateField('mpp_auto_pay_max_amount', e.target.value)}
-              />
-              <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-                A safety cap on the amount per request. This isn&apos;t tied to a specific currency:
-                set it assuming the same denomination the target&apos;s payment challenges will use
-                (for example, USD for a card-based target, or the token&apos;s base unit for a
-                crypto-based one). The gateway compares the numbers only, it doesn&apos;t convert or
-                verify units.
-              </Form.Text>
-            </Form.Group>
-          )}
-        </div>
       )}
     </>
   );

@@ -459,10 +459,20 @@ impl serde::Serialize for ExtensionIdentityContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `input.payment`: whether the request is chargeable under the surface's
+/// payment policy, and the rail and price it would be charged at, when known.
+/// Payment is taken after policy, so a denied request is never charged.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PaymentContext {
-    pub verified: bool,
+    pub required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// A locally verified payment's receipt; never part of `input.payment`.
+    #[serde(skip)]
     pub response_header: Option<String>,
 }
 

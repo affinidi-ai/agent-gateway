@@ -287,6 +287,35 @@ mod tests {
     }
 
     #[test]
+    fn shipped_payment_wall_template_configures_agent_pay() {
+        let tpl: SurfaceTemplate = serde_json::from_str(include_str!(
+            "../../config/examples/agent_surface_templates/partial_agent_pay_payment_wall.json"
+        ))
+        .unwrap();
+        let item = &tpl.items[0];
+
+        let policy: crate::config::agent_surface::PaymentPolicy = serde_json::from_value(item.config.clone()).unwrap();
+
+        assert_eq!(tpl.items.len(), 1);
+        assert_eq!(item.kind, "payment");
+        assert!(!policy.is_unsupported_legacy());
+        let crate::config::agent_surface::PaymentPolicy::AgentPay(policy) = policy else {
+            panic!("expected an agent_pay policy, got {policy:?}");
+        };
+        assert_eq!(policy.payment_gateway_id, "");
+        assert_eq!(policy.payment_surface_id, "");
+        assert_eq!(policy.mcp_payment_triggers, Some(crate::config::types::McpPaymentTriggers::All));
+    }
+
+    #[test]
+    fn local_x402_payment_config_is_unsupported_legacy() {
+        let policy: crate::config::agent_surface::PaymentPolicy =
+            serde_json::from_value(serde_json::json!({"type": "x402"})).unwrap();
+
+        assert!(policy.is_unsupported_legacy());
+    }
+
+    #[test]
     fn unknown_scope_deserializes_to_other() {
         let json = r#"{ "scope": "future_anchor", "kind": "x" }"#;
         let item: TemplateItem = serde_json::from_str(json).unwrap();

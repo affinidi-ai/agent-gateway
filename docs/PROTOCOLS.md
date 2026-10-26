@@ -14,6 +14,7 @@ revision-specific behavior and limitations of the checked-out source.
 | MCP `2025-03-26`, `2025-06-18`, `2025-11-25` | Active | Admitted on every MCP endpoint and forwarded as session revisions, like `2024-11-05`. Advertised in discovery on every MCP endpoint except gateway-owned MCP Proxies, which answer `initialize` with `2024-11-05`. Tasks (`tasks/*`) and JSON-RPC batches are not supported (HTTP `422`). See [MCP Validation Boundary](#mcp-validation-boundary) |
 | MCP `2026-07-28` | Active | Admitted and advertised on every MCP endpoint, alongside the session revisions that endpoint advertises |
 | AP2 | Experimental | Disabled by default; production proof signing is not implemented |
+| x402, MPP | Delegated | Payment is taken by agent-pay through an `agent_pay` policy; this Gateway does not verify or settle payments itself. See [Payment](#payment) |
 
 The hosted documentation is rolling product documentation. Use this matrix and the repository
 changelog when behavior must match this source revision exactly.
@@ -102,13 +103,14 @@ the Managed Agent it reaches must share a version.
 
 On an A2A or AP2 surface the Gateway resolves the `A2A-Version` request header right after gateway
 OPA and the AP2 gate, and then runs [JSON-RPC and request-shape validation](#error-mapping). All
-three come before any payment (a delegated `agent_pay` payment or local x402/MPP verification), the
-forward-target egress check, the `max_body_size` limit and forwarding. So a request refused with
+three come before the forward-target egress check, the `max_body_size` limit, any payment and
+forwarding. So a request refused with
 any of the [errors below](#error-mapping) is never charged, and those errors take precedence over an egress
 block or HTTP `413`; the [protocol-version metric](OBSERVABILITY.md#a2a-protocol-version-metric)
-also counts requests that are refused later. A delegated `agent_pay` payment is still settled before
-the rest of this Gateway's pipeline (egress check, body-size limit, Trust Check, surface policy,
-upstream), so a request it paid for can still be refused there.
+also counts requests that are refused later. A delegated `agent_pay` payment is taken last, just
+before forwarding (see [Payment](#payment)), so a request refused by Trust Check, surface policy,
+target authentication or credential delegation is not charged, while one it paid for can still
+fail upstream.
 
 Negotiation runs on every request that reaches that point, whatever the HTTP method, and applies
 to Managed Agent, `a2a-proxy://` and `fabric://` targets alike, each against its surface's
@@ -151,8 +153,8 @@ default) or **Envelope + A2A fields**.
   appliance-wide caller can set it: an access token with a tenant or a resource scope (a resource
   pattern or required headers) that sets
   `"off"` on a surface that was not already `"off"` is refused with `403`, on create, `PUT`, merge
-  `PATCH` and the variant routes alike. On such a request, an x402 or MPP payment with A2A method
-  filters is required rather than skipped, since the filters cannot be matched. A batch that
+  `PATCH` and the variant routes alike. On such a request, an `agent_pay` policy with
+  `a2a_method_filters` charges it rather than skipping it, since the filters cannot be matched. A batch that
   contains an extended agent card request is still refused (see
   [Generated agent cards](#generated-agent-cards)).
 - The surface API stores the block explicitly on every save of an A2A or AP2 surface, the defaults
@@ -662,8 +664,8 @@ gateway does not run them again. So on a G2G hop:
   decides;
 - `agent_gateway_a2a_protocol_version_total` counts the request on the sending gateway, not on the
   receiving one;
-- an x402 or MPP payment with A2A method filters is checked on the receiving gateway without the
-  envelope check, so a body the filters cannot match is charged there whatever the validation level.
+- an `agent_pay` policy with `a2a_method_filters` on the receiving surface is checked on Fabric
+  receive without the envelope check, so a body the filters cannot match is charged there whatever the validation level.
 
 A malformed envelope, a batch, or an `A2A-Version` a `fabric://` surface does not accept is refused
 on the sending gateway, as on any other A2A surface, rather than forwarded for a conformant agent to
@@ -874,44 +876,39 @@ that changes may be overwritten by, or break, the managing product. The surface
 builder's "via MCP Proxy" target notes whether the chosen proxy can also be
 reached around the surface.
 
-## x402 Payment Verification
+## Payment
 
-A local x402 paywall verifies a caller's payment against the surface's own `payment_requirements`,
-never against the requirement the credential carries. The credential's `accepted` object must name
-one of the requirements the `402` challenge issued, exactly, in everything verification and
-settlement act on: `scheme`, `network`, `asset`, `payTo`, `amount`, the asset transfer method in
-`extra`, and the EIP-712 `name` and `version` in `extra`. The amount must equal the configured one
-for `upto` as well as `exact`, because an `upto` payer authorises the configured amount as the
-maximum. EVM addresses compare case-insensitively, because the challenge issues them lowercased;
-Solana addresses compare exactly. A credential that names no issued requirement is rejected with
-`400 invalid_payment` before any signature check, chain lookup, facilitator call, or settlement,
-in every `verification_mode` including `mock`, and its transaction record is marked failed. A
-surface with x402 enabled and no `payment_requirements` accepts no payment. Beyond that match,
-`mock` skips every signature, chain, and facilitator check, so it grants access for an unpaid
-credential; it is for tests only and must not be used in production.
+This Gateway takes payment only by delegating it to agent-pay. A surface's
+`target.payment_policy` of type `agent_pay` names a payment surface on a connected agent-pay
+gateway, which owns the price, the accepted x402 and MPP methods, verification and settlement.
+This Gateway decides whether a request is chargeable, sends agent-pay a payment request carrying any
+credential the caller presented, over the fabric after policy and just before forwarding, and relays agent-pay's answer: a `402`
+challenge, a receipt on the forwarded response, or a refusal. The policy fields, the request sent
+to agent-pay and the full answer mapping are in
+[Surface payment policy](CONFIGURATION_REFERENCE.md#surface-payment-policy) and
+[Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment).
 
-Every check takes its expected values from the resolved requirement: the recipient, amount, token,
-asset transfer method, and EIP-712 domain. A requirement checked by signature therefore needs
-`extra.assetTransferMethod` (`eip3009` or `permit2`), and an EIP-3009 one also needs `extra.name`
-and `extra.version`; clients no longer supply them. Signature checks require the authorised value
-to equal the configured amount. Solana transaction-hash verification checks native SOL lamports
-only and refuses a requirement for an SPL token, which must use `spl_transfer`. An embedded or
-external facilitator receives the resolved requirement as `paymentRequirements` next to the
-caller's `paymentPayload.accepted`, so the facilitator's own requirement match also applies.
+A request that reaches a charging surface through another gateway, over a `fabric://` Target, keeps
+the credentials that travel in the request: the x402 credential header, and a credential in the
+body (the MCP `payment_signature` and `payment_credential` arguments, `_meta` and A2A metadata).
+The sending gateway's header filter drops `Authorization`, so an MPP `Authorization: Payment ...`
+credential is not relayed and the receiving gateway answers the request as unpaid. A client that
+pays through a gateway hop sends an MPP credential in the body. A surface that charges the request
+itself reads `Authorization: Payment ...` as received.
 
-The transaction record and every settlement path (immediate, deferred, startup recovery, and
-fabric) use the payload with `accepted` replaced by the resolved requirement. A record written by
-an earlier build carries the caller's own `accepted`: the deferred worker and startup recovery
-settle it only if that still resolves to one of the surface's current requirements, and otherwise
-mark its settlement failed.
+When agent-pay holds a payment for human review (`202 held_for_oversight`), the request is not
+forwarded. An HTTP caller receives
+`202 {"status": "held_for_oversight", "case_id", "reason"}`; an MCP or A2A caller
+receives HTTP `200` with JSON-RPC error `1003` (`PAYMENT_PENDING`) and
+`data {httpStatus: 202, case_id, reason}`. This Gateway does not poll the case, so the client
+retries the request once the case is decided.
 
-In `fabric_gateway` verification mode, the requesting gateway resolves the requirement and sends it
-as `payment_requirement` in the `x402/verify-request` body. The facilitator gateway verifies against
-that requirement and rejects a verify-request that does not carry one. A facilitator gateway trusts
-its fabric peers: it verifies against the requirement a peer sends, and settles the payload a peer
-sends in `x402/settle-request` as it is. Upgrade requesting gateways first. An upgraded requester
-binds the payment, including its EIP-712 domain, before a facilitator on an earlier build sees it;
-an upgraded facilitator rejects every verify-request from a requester on an earlier build.
+A surface with an enabled local `x402` or `mpp` policy is refused with
+`503 {"error": "payment_unavailable"}` over HTTP and over the fabric, and saving one is refused
+with `400 local_payment_unsupported`; see
+[Migrating older policies](CONFIGURATION_REFERENCE.md#migrating-older-policies). The x402
+settlement and recovery workers keep running so payments verified locally earlier can still
+settle.
 
 ## AP2 Limitation
 

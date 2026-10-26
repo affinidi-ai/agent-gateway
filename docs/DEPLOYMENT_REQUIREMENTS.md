@@ -146,8 +146,8 @@ The gateway only calls out to what you configure. Allow egress to:
 | --- | --- |
 | Your managed agents, MCP servers and each Transit Point's target endpoint | Always |
 | `affinidi_terms_url` | `terms` is on in `gateway.json` |
-| A DIDComm mediator | You connect gateways over [Fabric](#fabric) |
-| Peer DID hosts, trust registries, OAuth providers, x402 facilitators | A surface uses identity verification, Trust Check, credential delegation or payments |
+| A DIDComm mediator | You connect gateways over [Fabric](#fabric), including to the agent-pay gateway a surface's payment policy names |
+| Peer DID hosts, trust registries, OAuth providers | A surface uses identity verification, Trust Check or credential delegation |
 | AWS Secrets Manager, Parameter Store, KMS | `secrets_backend = "aws"`, a secret uses an `aws_` reference, or encryption at rest uses KMS |
 | An OpenTelemetry collector or CloudWatch | You configure them in `metrics.json` |
 | `login.microsoftonline.com` and `graph.microsoft.com` | SAML login uses `graph_api` for Microsoft Entra ID provisioning and profile photos |

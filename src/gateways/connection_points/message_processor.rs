@@ -55,9 +55,6 @@ static GLOBAL_AGENT_SURFACE_STORE: OnceCell<Arc<dyn AgentSurfaceStore>> = OnceCe
 static GLOBAL_NOTIFICATION_STORE: OnceCell<Arc<crate::integrations::FileSystemNotificationStore>> =
     OnceCell::const_new();
 
-/// Global facilitator mode for GW2 - controls which facilitator features are enabled
-static GLOBAL_FACILITATOR_MODE: OnceCell<crate::config::types::FacilitatorMode> = OnceCell::const_new();
-
 /// Global transaction store for GW2 - for unified x402 lifecycle tracking
 static GLOBAL_TRANSACTION_STORE: OnceCell<Arc<crate::x402::TransactionStore>> = OnceCell::const_new();
 
@@ -151,6 +148,13 @@ pub async fn init_listener_manager(listener_manager: Arc<super::ConnectionPointL
     info!("GW2: Global listener manager initialized for peer gateway resolution");
 }
 
+/// The listener manager, once the fabric is up.
+pub fn get_listener_manager() -> Option<Arc<super::ConnectionPointListenerManager>> {
+    GLOBAL_LISTENER_MANAGER
+        .get()
+        .cloned()
+}
+
 /// Initialize the global MCP proxy store for GW2
 pub async fn init_mcp_proxy_store(mcp_proxy_store: Arc<crate::mcp_proxies::FileSystemMcpProxyStore>) {
     let _ = GLOBAL_MCP_PROXY_STORE.set(mcp_proxy_store);
@@ -220,14 +224,6 @@ pub fn get_agent_surface_store() -> Option<Arc<dyn AgentSurfaceStore>> {
     GLOBAL_AGENT_SURFACE_STORE
         .get()
         .cloned()
-}
-
-/// Initialize the global facilitator mode for GW2
-pub async fn init_facilitator_mode(facilitator_mode: crate::config::types::FacilitatorMode) {
-    let fabric_enabled = facilitator_mode.facilitator_via_fabric;
-    let http_enabled = facilitator_mode.facilitator_via_http;
-    let _ = GLOBAL_FACILITATOR_MODE.set(facilitator_mode);
-    info!("GW2: Global facilitator mode initialized (fabric={}, http={})", fabric_enabled, http_enabled);
 }
 
 /// Initialize the global transaction store for GW2
@@ -526,6 +522,17 @@ pub async fn process_message_internal(
         // Gateway channel query protocol (Affinidi custom)
         MessageType::GetSurfaces => process_get_surfaces(message).await,
         MessageType::GetSurfacesResponse => process_get_surfaces_response(message).await,
+        MessageType::GetManifest => process_get_manifest(message),
+        MessageType::GetManifestResponse => ProcessingResult::ProcessedNoResponse,
+        MessageType::PaymentCaseStatus => process_payment_case_status(message),
+        MessageType::PaymentCaseStatusResponse => ProcessingResult::ProcessedNoResponse,
+        MessageType::PaymentSettle => process_payment_settlement(message, MessageType::PaymentSettleResponse),
+        MessageType::PaymentSettlementStatus => {
+            process_payment_settlement(message, MessageType::PaymentSettlementStatusResponse)
+        }
+        MessageType::PaymentSettleResponse | MessageType::PaymentSettlementStatusResponse => {
+            ProcessingResult::ProcessedNoResponse
+        }
 
         // Gateway request forwarding protocol (Affinidi custom)
         // Box::pin moves the large future (~2700 lines) to the heap to prevent
@@ -564,9 +571,9 @@ pub async fn process_message_internal(
         }
 
         // x402 Facilitator protocol (Affinidi custom)
-        MessageType::X402VerifyRequest => process_x402_verify_request(message).await,
+        MessageType::X402VerifyRequest => refuse_x402_verify_request(message),
         MessageType::X402VerifyResponse => process_x402_verify_response(message).await,
-        MessageType::X402SettleRequest => process_x402_settle_request(message).await,
+        MessageType::X402SettleRequest => refuse_x402_settle_request(message),
         MessageType::X402SettleResponse => process_x402_settle_response(message).await,
         MessageType::X402SettlementComplete => process_x402_settlement_complete(message).await,
 
@@ -1548,6 +1555,47 @@ async fn lookup_channel(
         .find(|ch| ch.config_id() == Some(channel_id)))
 }
 
+/// This gateway publishes no payment surfaces, so a `get-manifest` query is
+/// always answered with a null manifest.
+fn process_get_manifest(message: &ReceivedMessage) -> ProcessingResult {
+    debug!("Received get-manifest query from {:?}", message.from_did);
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::GetManifestResponse.to_string(),
+        response_body: serde_json::json!({ "manifest": null }),
+    }
+}
+
+/// This gateway holds no payment cases, so a `payment-case-status` query is
+/// always answered with `case_not_found`.
+fn process_payment_case_status(message: &ReceivedMessage) -> ProcessingResult {
+    debug!("Received payment-case-status query from {:?}", message.from_did);
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::PaymentCaseStatusResponse.to_string(),
+        response_body: serde_json::json!({ "error": "case_not_found" }),
+    }
+}
+
+/// This gateway holds no payments, so a `payment-settle` or
+/// `payment-settlement-status` request is always answered with `unknown`.
+fn process_payment_settlement(
+    message: &ReceivedMessage,
+    response_type: MessageType,
+) -> ProcessingResult {
+    debug!("Received {} from {:?}", message.message_type, message.from_did);
+    let mut response_body = serde_json::json!({ "status": "unknown" });
+    if let Some(authorization_id) = message
+        .message_body
+        .get("authorization_id")
+        .and_then(Value::as_str)
+    {
+        response_body["authorization_id"] = Value::String(crate::a2a::clip_for_log(authorization_id).to_string());
+    }
+    ProcessingResult::RequiresResponse {
+        response_type: response_type.to_string(),
+        response_body,
+    }
+}
+
 async fn process_get_surfaces_response(message: &ReceivedMessage) -> ProcessingResult {
     info!("📥 Received get-channels-response from {:?}", message.from_did);
     // Response is handled by whoever initiated the query
@@ -1648,8 +1696,9 @@ async fn verify_payment_fabric(
             Ok(response_header) => {
                 channel_info!(config_id, "Payment verified successfully for fabric-forwarded request");
                 Ok(Some(crate::surface_context::PaymentContext {
-                    verified: true,
+                    required: true,
                     response_header,
+                    ..Default::default()
                 }))
             }
             Err(error) => {
@@ -2363,6 +2412,7 @@ async fn evaluate_gateway_policy_for_fabric(
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
     source_auth_context: Option<&crate::surface_context::SourceAuthContext>,
     mcp_context: Option<&crate::surface_context::McpContext>,
+    payment: Option<&crate::surface_context::PaymentContext>,
 ) -> Result<(), ForwardRefusal> {
     // Appliance-wide (global) gateway policy — enforced deny-overrides ahead of
     // the per-gateway policy, evaluated on every fabric request (public
@@ -2387,6 +2437,7 @@ async fn evaluate_gateway_policy_for_fabric(
         );
         g_input.source_auth = source_auth_context.cloned();
         g_input.mcp = mcp_context.cloned();
+        g_input.payment = payment.cloned();
         let g_input_value = serde_json::to_value(&g_input).unwrap_or_default();
         let gd = global_pm.evaluate_global(crate::policies::global_policy::PLANE_GATEWAY, &g_input_value);
         let self_gateway_id = GLOBAL_GATEWAY_POLICY_MANAGER
@@ -2448,6 +2499,7 @@ async fn evaluate_gateway_policy_for_fabric(
         );
         gw_input.source_auth = source_auth_context.cloned();
         gw_input.mcp = mcp_context.cloned();
+        gw_input.payment = payment.cloned();
         // Gateway OPA never sees caller-leg trust check results — the
         // caller-leg Trust Check stage runs post-identity in
         // `enrich_and_evaluate_surface_policies` and is observed only by
@@ -3810,6 +3862,8 @@ async fn process_forward_request_inner(
     .await
 }
 
+/// Processes a forward-request, adding the receipt of the payment taken for it
+/// to a successful response.
 async fn process_forward_request_with_mcp_runtime(
     message: &ReceivedMessage,
     stream_request: Option<FabricStreamRequest>,
@@ -3832,11 +3886,250 @@ async fn process_forward_request_with_mcp_runtime(
     }
 }
 
+/// Charges the request, and adds the receipt of the payment taken for it to the
+/// response.
 async fn process_forward_request_in_request_scope(
+    message: &ReceivedMessage,
+    stream_request: Option<FabricStreamRequest>,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> ProcessingResult {
+    let mut gate_receipt = None;
+    let result = Box::pin(process_charged_forward_request(
+        message,
+        stream_request,
+        mcp_versions,
+        mcp_continuations,
+        &mut gate_receipt,
+    ))
+    .await;
+    match gate_receipt {
+        Some((receipt, protocol)) => attach_receipt_to_forward_result(&receipt, &protocol, result).await,
+        None => result,
+    }
+}
+
+/// Adds a payment receipt to a forward response of any status: the receipt
+/// headers, and the JSON-RPC receipt in a JSON body that holds a result. A
+/// request that was paid for and then failed still carries its receipt. Funds
+/// held until delivery are captured or voided first, by what the Target
+/// answered, and a voided payment carries no receipt.
+async fn attach_receipt_to_forward_result(
+    receipt: &crate::proxy::handler::agent_pay_gate::Receipt,
+    protocol: &crate::config::ChannelProtocol,
+    result: ProcessingResult,
+) -> ProcessingResult {
+    let result = match result {
+        ProcessingResult::StreamingResponse { response } => {
+            return ProcessingResult::StreamingResponse {
+                response: receipt
+                    .settle_response(protocol, response)
+                    .await,
+            };
+        }
+        other => other,
+    };
+    let delivered = match &result {
+        ProcessingResult::RequiresResponse { response_body, .. } => {
+            let status = response_body
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .and_then(|status| axum::http::StatusCode::from_u16(status).ok())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            crate::proxy::handler::agent_pay_gate::delivered(
+                protocol,
+                status,
+                response_body
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .map(str::as_bytes),
+            )
+        }
+        _ => false,
+    };
+    let Some(receipt) = receipt
+        .settled(delivered)
+        .await
+    else {
+        return result;
+    };
+    let receipt = &receipt;
+    match result {
+        ProcessingResult::RequiresResponse {
+            response_type,
+            mut response_body,
+        } => {
+            if !response_body
+                .get("headers")
+                .is_some_and(Value::is_object)
+            {
+                response_body["headers"] = serde_json::json!({});
+            }
+            for (name, value) in receipt.headers() {
+                if let Ok(value) = value.to_str() {
+                    response_body["headers"][name.as_str()] = Value::String(value.to_string());
+                }
+            }
+            if let Some(injected) = response_body
+                .get("body")
+                .and_then(Value::as_str)
+                .and_then(|body| receipt.inject_into_json(protocol, body.as_bytes()))
+                .and_then(|body| String::from_utf8(body).ok())
+            {
+                response_body["body"] = Value::String(injected);
+            }
+            ProcessingResult::RequiresResponse { response_type, response_body }
+        }
+        other => other,
+    }
+}
+
+/// The x402 credential header this gateway is configured with.
+fn fabric_signature_header(message: &ReceivedMessage) -> String {
+    message
+        .context
+        .get("x402_headers")
+        .and_then(|value| serde_json::from_value::<crate::config::types::X402Headers>(value.clone()).ok())
+        .unwrap_or_default()
+        .payment_signature
+}
+
+/// The headers of a forward-request that decode as header names and values. One
+/// that does not is skipped, so a header the receiver cannot read never costs it
+/// the rest.
+fn lenient_headers(headers: Option<&serde_json::Map<String, Value>>) -> axum::http::HeaderMap {
+    headers
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, value)| {
+            Some((
+                axum::http::HeaderName::from_bytes(name.as_bytes()).ok()?,
+                axum::http::HeaderValue::from_str(value.as_str()?).ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// The request headers of a forward-request: those of the stream that carried
+/// it, or the ones in its body that decode.
+fn gate_request_headers(
+    stream_request: Option<&FabricStreamRequest>,
+    headers: Option<&serde_json::Map<String, Value>>,
+) -> axum::http::HeaderMap {
+    match stream_request {
+        Some(request) => request.headers.clone(),
+        None => lenient_headers(headers),
+    }
+}
+
+/// The surface variant a forward-request resolved to: the alias of the enabled
+/// variant it selected, or of the default one, and none when it selected no
+/// variant, whatever alias the peer named. `streamed_alias` is the alias a
+/// stream's open request named, which was checked against the surface when the
+/// stream was accepted.
+fn resolved_variant_alias(
+    surface: &crate::config::agent_surface::AgentSurface,
+    variant_id: Option<&str>,
+    streamed_alias: Option<&str>,
+) -> Option<String> {
+    surface
+        .variants
+        .iter()
+        .find(|variant| variant.enabled && variant_id == Some(variant.id.as_str()))
+        .map(|variant| variant.alias.clone())
+        .or_else(|| streamed_alias.map(str::to_string))
+}
+
+/// What a request received over the fabric needs to be charged, just before it is
+/// dispatched.
+#[derive(Clone, Copy)]
+struct FabricPayment<'a> {
+    message: &'a ReceivedMessage,
+    surface: &'a crate::config::agent_surface::AgentSurface,
+    intake: Option<&'a crate::proxy::handler::agent_pay_gate::Intake>,
+    identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
+    binding: Option<&'a crate::surface_context::IdentityBindingContext>,
+    trace_id: Option<&'a str>,
+    evidence: Option<&'a crate::mcp::continuations::protected::ContinuationPayment>,
+    received_at: std::time::Instant,
+}
+
+impl FabricPayment<'_> {
+    /// Puts the request through the agent-pay payment gate. `Ok(None)` when it
+    /// is free and `Ok(Some(receipt))` when it was paid for. `Err(result)` is
+    /// the gate's answer when it was not, already recorded in the connection
+    /// metrics.
+    async fn charge(&self) -> Result<Option<crate::proxy::handler::agent_pay_gate::Receipt>, ProcessingResult> {
+        use crate::proxy::handler::agent_pay_gate;
+
+        let Some(intake) = self.intake else {
+            return Ok(None);
+        };
+        let trace_id = self
+            .trace_id
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let egress_trace_id = crate::proxy::trace::egress_trace_id(
+            self.surface
+                .access_point
+                .terminate_trace_id,
+            &trace_id,
+        );
+        let fabric = Arc::new(tokio::sync::RwLock::new(get_listener_manager()));
+        match agent_pay_gate::charge(
+            intake,
+            agent_pay_gate::GateCall {
+                surface: self.surface,
+                caller: agent_pay_gate::Caller {
+                    identity: self.identity,
+                    verified_agent_did: self
+                        .binding
+                        .filter(|binding| binding.verified)
+                        .map(|binding| binding.agent_did.as_str()),
+                },
+                trace_id: &trace_id,
+                egress_trace_id: &egress_trace_id,
+                deadline_ms: self
+                    .message
+                    .message_body
+                    .get("deadline_ms")
+                    .and_then(Value::as_u64),
+                evidence: self.evidence,
+                fabric: &fabric,
+                via_fabric: true,
+            },
+        )
+        .await
+        {
+            agent_pay_gate::GateOutcome::Free => Ok(None),
+            agent_pay_gate::GateOutcome::Paid(paid) => Ok(Some(paid.receipt)),
+            agent_pay_gate::GateOutcome::Refused(response) => {
+                crate::proxy::handler::record_payment_refusal_metric(
+                    GLOBAL_METRICS_STORE
+                        .get()
+                        .cloned(),
+                    self.surface,
+                    self.message
+                        .from_did
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    self.received_at,
+                    &trace_id,
+                    response.status(),
+                );
+                Err(axum_response_to_forward_result(response).await)
+            }
+        }
+    }
+}
+
+async fn process_charged_forward_request(
     message: &ReceivedMessage,
     mut stream_request: Option<FabricStreamRequest>,
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+    gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
 ) -> ProcessingResult {
     use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
     use tracing::Instrument;
@@ -3953,6 +4246,7 @@ async fn process_forward_request_in_request_scope(
 
     // Execute the rest of the function within the span context
     async move {
+        let received_at = std::time::Instant::now();
         info!("📥 Received forward-request from {:?}", message.from_did);
 
     if channel_id.is_empty() {
@@ -4108,6 +4402,12 @@ async fn process_forward_request_in_request_scope(
     // not resolve and the default stands in, whose resource is then the one
     // a caller's token must name.
     let mut resolved_alias = variant_alias;
+    let gate_variant = resolved_variant_alias(
+        &surface,
+        active_variant_id.as_deref(),
+        stream_request.as_ref().and(variant_alias),
+    );
+
     let surface = if stream_request.is_some() { surface.clone() } else { match surface.resolve_variant(variant_alias) {
         Ok(s) => {
             if let Some(alias) = variant_alias {
@@ -4143,6 +4443,10 @@ async fn process_forward_request_in_request_scope(
             response_type: MessageType::ForwardResponse.to_string(),
             response_body: error_body,
         };
+    }
+
+    if let Some(response) = crate::proxy::handler::surface_payment::legacy_payment_unavailable(&surface, true) {
+        return axum_response_to_forward_result(response).await;
     }
 
     // ── Unified source authentication ──────────────────────────────────────────
@@ -4260,25 +4564,9 @@ async fn process_forward_request_in_request_scope(
             resource_authorization = Some(authorization);
             Some(identity)
         } else if !crate::proxy::paths::is_public_request(method, path) {
-            // Rebuild an axum HeaderMap from the JSON headers map so the middleware
-            // can use the same extract_bearer path as the direct handler.
-            let to_header_option = |(k, v): (&String, &Value)| -> Option<(axum::http::HeaderName, axum::http::HeaderValue)> {
-                if let (Ok(name), Some(val)) = (
-                    axum::http::HeaderName::from_bytes(k.as_bytes()),
-                    v.as_str().and_then(|s| axum::http::HeaderValue::from_str(s).ok()),
-                ) {
-                    Some((name, val))
-                } else {
-                    None
-                }
-            };
-            let to_header_iter = |headers: &serde_json::Map<String, Value>| -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
-                headers.iter().filter_map(to_header_option).collect::<Vec<(axum::http::HeaderName, axum::http::HeaderValue)>>()
-            };
-            let axum_headers = stream_request.as_ref().map(|request| request.headers.clone()).unwrap_or_else(|| headers
-                .as_ref()
-                .map(to_header_iter)
-                .map(axum::http::HeaderMap::from_iter).unwrap_or_else(axum::http::HeaderMap::new));
+            // The middleware reads the headers through the same extract_bearer path
+            // as the direct handler.
+            let axum_headers = gate_request_headers(stream_request.as_ref(), headers.as_ref());
 
             if let Some(auth_config) = surface.source_auth() {
                 let sa_middleware = match crate::source_auth::middleware::require_installed(get_source_auth_middleware()) {
@@ -4394,7 +4682,7 @@ async fn process_forward_request_in_request_scope(
     }
 
     let mut mcp_verified_binding = None;
-    let (mcp_metadata_context, mcp_classification) = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
+    let (mcp_metadata_context, mut mcp_classification) = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
         let http_policy = match crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
             surface.mcp_http.as_ref(),
             std::slice::from_ref(&surface.access_point.listen_address),
@@ -4520,17 +4808,20 @@ async fn process_forward_request_in_request_scope(
     } else {
         (crate::mcp::meta::McpMetadataContext::legacy(surface.mcp_legacy_metadata_output), None)
     };
-    let modern_mcp_context = mcp_classification.as_ref().and_then(crate::mcp::modern_mcp_context);
     // Gateway and surface policies see the same `input.mcp` as the direct path:
     // the validated modern context, else the legacy request context.
-    let policy_mcp_context = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
-        match mcp_classification.as_ref() {
-            Some(classification) => crate::mcp::build_validated_mcp_context(&body_bytes, classification),
-            None => crate::mcp::build_mcp_context(&body_bytes),
-        }
-    } else {
-        None
+    let mcp_contexts = |classification: Option<&crate::mcp::request_validation::McpRequestClassification>, body: &[u8]| {
+        let policy = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
+            match classification {
+                Some(classification) => crate::mcp::build_validated_mcp_context(body, classification),
+                None => crate::mcp::build_mcp_context(body),
+            }
+        } else {
+            None
+        };
+        (classification.and_then(crate::mcp::modern_mcp_context), policy)
     };
+    let (mut modern_mcp_context, mut policy_mcp_context) = mcp_contexts(mcp_classification.as_ref(), &body_bytes);
     let mut modern_request = match mcp_classification.as_ref() {
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
         _ => None,
@@ -4586,20 +4877,7 @@ async fn process_forward_request_in_request_scope(
         )
         && let Some(mapping) = surface.access_point.header_metadata_mapping.as_ref()
     {
-        let axum_headers = headers
-            .as_ref()
-            .map(|headers| {
-                headers
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        let name = axum::http::HeaderName::from_bytes(k.as_bytes()).ok()?;
-                        let value = axum::http::HeaderValue::from_str(v.as_str()?).ok()?;
-                        Some((name, value))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .map(axum::http::HeaderMap::from_iter)
-            .unwrap_or_else(axum::http::HeaderMap::new);
+        let axum_headers = lenient_headers(headers.as_ref());
         let diagnostics = mapping.diagnostics(&axum_headers);
         let identity_extraction_reads_mapped_extension = matches!(
             surface.inbound_identity(),
@@ -4651,6 +4929,44 @@ async fn process_forward_request_in_request_scope(
         }
     }
 
+    // On an `agent_pay` surface the request is read once here: whether it is
+    // chargeable (`input.payment`, seen by gateway and surface policy alike), and
+    // its payment credential, which is removed from the request whether or not it
+    // is charged. Agent-pay is asked to take the payment only just before the
+    // request is dispatched, after every refusal that does not depend on payment.
+    let signature_header = fabric_signature_header(message);
+    let payment = crate::proxy::handler::agent_pay_gate::Intake::read(
+        &surface,
+        crate::proxy::handler::agent_pay_gate::Inbound {
+            method,
+            path_and_query: path,
+            variant: gate_variant.as_deref(),
+            headers: &gate_request_headers(stream_request.as_ref(), headers.as_ref()),
+            body: &body_bytes,
+            mcp_context: policy_mcp_context.as_ref(),
+            signature_header: &signature_header,
+        },
+    );
+    let payment_input = payment
+        .as_ref()
+        .map(crate::proxy::handler::agent_pay_gate::Intake::policy_input);
+    if let Some(payment) = &payment {
+        if let Some(headers) = headers.as_mut() {
+            payment.strip_json_headers(headers);
+        }
+        if let Some(stream) = stream_request.as_mut() {
+            payment.strip_headers(&mut stream.headers);
+        }
+        body_bytes = payment.body().clone();
+        if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(message)) = mcp_classification.as_mut() {
+            payment.strip_modern(message);
+        }
+        if let Some(message) = modern_request.as_mut() {
+            payment.strip_modern(message);
+        }
+        (modern_mcp_context, policy_mcp_context) = mcp_contexts(mcp_classification.as_ref(), &body_bytes);
+    }
+
     if let Err(refusal) = evaluate_gateway_policy_for_fabric(
         GLOBAL_APPLIANCE_POLICY_MANAGER
             .get()
@@ -4664,6 +4980,7 @@ async fn process_forward_request_in_request_scope(
         authenticated_identity.as_ref(),
         source_auth_context.as_ref(),
         policy_mcp_context.as_ref(),
+        payment_input.as_ref(),
     )
     .await
     {
@@ -4688,7 +5005,7 @@ async fn process_forward_request_in_request_scope(
             Ok(ctx) => ctx,
             Err(error) => return axum_response_to_forward_result(error.render(&x402_headers)).await,
         }
-    };
+    }.or(payment_input);
 
     let managed_id = surface.managed_identity();
     // Prefer an explicit `extension_rules`; otherwise synthesise one from the
@@ -4857,6 +5174,16 @@ async fn process_forward_request_in_request_scope(
         };
         Some((payment_headers, x402_headers))
     } else { None };
+    let fabric_payment = FabricPayment {
+        message,
+        surface: &surface,
+        intake: payment.as_ref(),
+        identity: authenticated_identity.as_ref(),
+        binding: mcp_verified_binding.as_ref(),
+        trace_id: audit_trace_id,
+        evidence: None,
+        received_at,
+    };
     let mut modern_delegation = None;
     if let Some(request) = modern_request.as_ref()
         && !surface.outbound_credentials.is_empty()
@@ -4893,6 +5220,7 @@ async fn process_forward_request_in_request_scope(
                     crate::proxy::handler::surface_payment::LocalPayment::inspect(
                         &surface, headers, &body_bytes, None, &config.payment_signature,
                     ).unpaid()
+                        || payment.as_ref().is_some_and(crate::proxy::handler::agent_pay_gate::Intake::is_unpaid)
                 }),
             ).await
         }).await;
@@ -4914,6 +5242,10 @@ async fn process_forward_request_in_request_scope(
                 let Some((headers, config)) = modern_payment.as_ref() else {
                     return axum_response_to_forward_result(ModernDelegationError::Unpaid.response(request)).await;
                 };
+                match (FabricPayment { evidence: None, ..fabric_payment }).charge().await {
+                    Err(refused) => return refused,
+                    Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
+                }
                 return match Box::pin(process_modern_payment_fabric(&surface, config, headers, body_bytes, path, None)).await {
                     Err(error) => axum_response_to_forward_result(error.render(config)).await,
                     Ok(_) => axum_response_to_forward_result(ModernDelegationError::Unpaid.response(request)).await,
@@ -4928,9 +5260,11 @@ async fn process_forward_request_in_request_scope(
             modern_delegation.as_ref().and_then(|prepared| prepared.payment()),
         )).await {
             Ok(mut payment) => {
-                if let Some(prepared) = modern_delegation.as_mut() {
+                if let Some(prepared) = modern_delegation.as_mut()
+                    && let Some(evidence) = payment.continuation_evidence()
+                {
                     let recorded = crate::proxy::credential_delegation::modern::now_secs().and_then(|now| {
-                        prepared.record_local_payment(&payment, mcp_continuations.as_ref().map_or(300, |runtime| runtime.config.ttl_secs), now)
+                        prepared.record_payment(evidence, mcp_continuations.as_ref().map_or(300, |runtime| runtime.config.ttl_secs), now)
                     });
                     if let Err(error) = recorded {
                         return axum_response_to_forward_result(
@@ -5100,6 +5434,8 @@ async fn process_forward_request_in_request_scope(
             body_bytes,
             caller_identity,
             crate::proxy::handler::CallerAssertion::for_forwarded_request(method, path, source_auth_failed),
+            fabric_payment,
+            gate_receipt,
         )
         .await;
     }
@@ -5121,6 +5457,8 @@ async fn process_forward_request_in_request_scope(
             body_bytes,
             caller_identity,
             source_auth_failed,
+            fabric_payment,
+            gate_receipt,
         )
         .await;
     }
@@ -5265,6 +5603,12 @@ async fn process_forward_request_in_request_scope(
             };
             channel_info!(config_id, "    Header: {}", key);
             for value_str in values {
+                if axum::http::HeaderName::from_bytes(key.as_bytes()).is_err()
+                    || axum::http::HeaderValue::from_str(value_str).is_err()
+                {
+                    channel_warn!(config_id, "    Skipping a header that cannot be encoded: {}", key);
+                    continue;
+                }
                 req = req.header(key.as_str(), value_str);
             }
         }
@@ -5640,6 +5984,70 @@ async fn process_forward_request_in_request_scope(
         }
     }
 
+    // An MCP proxy Target that cannot be loaded, and a request that cannot be
+    // built for it, are refused before the payment is taken.
+    let modern_proxy = match (modern_request.as_ref(), surface.target_endpoint().strip_prefix("proxy://")) {
+        (Some(_), Some(proxy_id)) => {
+            use crate::mcp_proxies::McpProxyStore;
+            let Some(store) = GLOBAL_MCP_PROXY_STORE.get() else {
+                return axum_response_to_forward_result(crate::a2a::create_error_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE, "MCP proxy storage is unavailable",
+                )).await;
+            };
+            match store.get(proxy_id).await {
+                Ok(Some(proxy)) => Some(proxy),
+                Ok(None) => return axum_response_to_forward_result(crate::a2a::create_error_response(
+                    axum::http::StatusCode::NOT_FOUND, "MCP proxy was not found",
+                )).await,
+                Err(_) => return axum_response_to_forward_result(crate::a2a::create_error_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE, "MCP proxy storage is unavailable",
+                )).await,
+            }
+        }
+        _ => None,
+    };
+    if modern_proxy.is_some() && req.try_clone().is_none_or(|request| request.build().is_err()) {
+        return axum_response_to_forward_result(crate::a2a::create_error_response(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare modern MCP proxy request",
+        )).await;
+    }
+
+    // The payment is taken last: every refusal that does not depend on it has
+    // been made, and what follows is the dispatch itself.
+    let charged = (FabricPayment {
+        evidence: modern_delegation
+            .as_ref()
+            .and_then(|prepared| prepared.payment()),
+        ..fabric_payment
+    })
+    .charge()
+    .await;
+    match charged {
+        Ok(Some(receipt)) => {
+            *gate_receipt = Some((receipt.clone(), surface_protocol.clone()));
+            if let Some(prepared) = modern_delegation.as_mut() {
+                let recorded = crate::proxy::credential_delegation::modern::now_secs().and_then(|now| {
+                    prepared.record_payment(
+                        receipt.continuation_evidence(),
+                        mcp_continuations.as_ref().map_or(300, |runtime| runtime.config.ttl_secs),
+                        now,
+                    )
+                });
+                if let Err(error) = recorded {
+                    return axum_response_to_forward_result(
+                        crate::proxy::credential_delegation::modern::ModernDelegationError::from(error).response(&prepared.request),
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(refused) => return refused,
+    }
+    if let Some((receipt, _)) = gate_receipt.as_ref() {
+        receipt.commit();
+    }
+
     // MCP shortcut: if we already have a persistent SSE session to this upstream
     // (established during a previous request that got 400), use it directly
     // instead of trying a plain POST that we know will fail.
@@ -5705,23 +6113,8 @@ async fn process_forward_request_in_request_scope(
     }
 
     let response = if let Some(request) = modern_request.as_ref()
-        && let Some(proxy_id) = surface.target_endpoint().strip_prefix("proxy://")
+        && let Some(proxy) = modern_proxy.as_ref()
     {
-        use crate::mcp_proxies::McpProxyStore;
-        let Some(store) = GLOBAL_MCP_PROXY_STORE.get() else {
-            return axum_response_to_forward_result(crate::a2a::create_error_response(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE, "MCP proxy storage is unavailable",
-            )).await;
-        };
-        let proxy = match store.get(proxy_id).await {
-            Ok(Some(proxy)) => proxy,
-            Ok(None) => return axum_response_to_forward_result(crate::a2a::create_error_response(
-                axum::http::StatusCode::NOT_FOUND, "MCP proxy was not found",
-            )).await,
-            Err(_) => return axum_response_to_forward_result(crate::a2a::create_error_response(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE, "MCP proxy storage is unavailable",
-            )).await,
-        };
         let prepared = match req.build() {
             Ok(prepared) => prepared,
             Err(_) => return axum_response_to_forward_result(crate::a2a::create_error_response(
@@ -5729,7 +6122,7 @@ async fn process_forward_request_in_request_scope(
             )).await,
         };
         let execute = crate::mcp_proxies::handlers::handle_modern_surface_http_request(
-            &proxy, &surface, request, prepared, &client,
+            proxy, &surface, request, prepared, &client,
             crate::mcp::request_validation::runtime_policy_for(
                 crate::mcp::request_validation::McpPathKind::FabricReceive,
             ),
@@ -5953,6 +6346,10 @@ async fn process_forward_request_in_request_scope(
                 })
             } else { None };
             let message = message.clone();
+            // A modern response is streamed: its final message carries the receipt
+            // here. Any other response is given it whole, with its headers, by the
+            // caller of this function.
+            let stream_receipt = gate_receipt.clone().filter(|_| is_modern_response);
             let process_response = async move |mut response_body: String, mut response_headers: std::collections::HashMap<String, Vec<String>>| {
             let channel_id = channel_id_owned.as_str();
             let config_id = config_id_owned.as_str();
@@ -5966,6 +6363,14 @@ async fn process_forward_request_in_request_scope(
                     Ok(body) => body,
                     Err(error) => return axum_response_to_forward_result(error.into_response(response_body.as_bytes(), axum::http::StatusCode::BAD_GATEWAY)).await,
                 };
+            }
+            if let Some((receipt, protocol)) = stream_receipt.as_ref()
+                && let Some(injected) = receipt
+                    .inject_into_json(protocol, response_body.as_bytes())
+                    .and_then(|body| String::from_utf8(body).ok())
+            {
+                response_body = injected;
+                body_modified = true;
             }
 
             // GW2: Inject trust registry extension into agent card responses for fabric requests
@@ -7581,6 +7986,8 @@ async fn handle_a2a_proxy_forward(
     body_bytes: bytes::Bytes,
     caller_identity: Option<String>,
     caller: crate::proxy::handler::CallerAssertion,
+    payment: FabricPayment<'_>,
+    gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
 ) -> ProcessingResult {
     let config_id = surface
         .config_id()
@@ -7639,10 +8046,37 @@ async fn handle_a2a_proxy_forward(
         }
     };
 
-    let secrets_store = get_secrets_store();
-    let response = adapter
-        .dispatch_message_send(proxy_id, &body_bytes, secrets_store.as_ref(), &surface.name, caller)
-        .await;
+    // The payment is taken once the proxy is known to be there to serve the
+    // request.
+    let response = match adapter
+        .load_active_proxy(proxy_id, &surface.name)
+        .await
+    {
+        Err(err) => crate::a2a_proxies::target_adapter::json_rpc_target_error(&body_bytes, err),
+        Ok(proxy) => {
+            match crate::a2a_proxies::A2aProxyTargetAdapter::prepare_message_send(&proxy, &body_bytes, &surface.name) {
+                Err(refusal) => *refusal,
+                Ok(prepared) => {
+                    match payment.charge().await {
+                        Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
+                        Err(refused) => return refused,
+                    }
+                    if let Some((receipt, _)) = gate_receipt.as_ref() {
+                        receipt.commit();
+                    }
+                    let secrets_store = get_secrets_store();
+                    crate::a2a_proxies::A2aProxyTargetAdapter::dispatch_message_send(
+                        &proxy,
+                        prepared,
+                        secrets_store.as_ref(),
+                        &surface.name,
+                        caller,
+                    )
+                    .await
+                }
+            }
+        }
+    };
 
     let request_body_bytes = body_bytes;
     let (parts, body) = response.into_parts();
@@ -7847,7 +8281,7 @@ async fn spawn_mcp_proxy_trust_recorder(
 }
 
 /// Handle MCP proxy forwarding for fabric gateway requests
-#[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
+#[instrument(name = "fabric.mcp_proxy_forward", skip(message, surface, body_bytes, payment, gate_receipt), fields(channel_id, proxy_id, msg.id = %message.didcomm_message_id))]
 async fn handle_mcp_proxy_forward(
     message: &ReceivedMessage,
     surface: &crate::config::agent_surface::AgentSurface,
@@ -7859,6 +8293,8 @@ async fn handle_mcp_proxy_forward(
     body_bytes: bytes::Bytes,
     caller_identity: Option<String>,
     source_auth_failed: bool,
+    payment: FabricPayment<'_>,
+    gate_receipt: &mut Option<(crate::proxy::handler::agent_pay_gate::Receipt, crate::config::ChannelProtocol)>,
 ) -> ProcessingResult {
     // Record fields in the span
     tracing::Span::current().record("channel_id", channel_id);
@@ -8068,19 +8504,58 @@ async fn handle_mcp_proxy_forward(
         None
     };
 
-    // Use handle_mcp_request_with_policies to apply all surface policies
-    // This ensures MCP channels have feature parity with A2A (timeout, retry, circuit breaker, mirroring)
-    match crate::mcp_proxies::handlers::handle_mcp_request_with_policies(
-        &proxy,
-        mcp_request.clone(),
-        surface,
-        policy_manager,
-        http_client,
-        &surface.name,
-        target_auth_header,
-    )
-    .await
-    {
+    // The proxy has to be able to serve the request before it is charged: its
+    // spec and base URL, the method and the tool must be known.
+    let prepared =
+        crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, mcp_request.clone(), target_auth_header, config_id);
+
+    // Every refusal that does not depend on payment has been made: the rate
+    // limit, the proxy itself, its target authentication and an open circuit
+    // breaker.
+    let executed = match prepared {
+        Ok(prepared) => {
+            if let Some(breaker) = crate::mcp_proxies::handlers::surface_circuit_breaker(surface, policy_manager).await
+                && let Some(retry_after) = breaker.refusing_for().await
+            {
+                channel_error!(
+                    config_id,
+                    "Circuit breaker is open for MCP proxy '{}', retry after {:?}",
+                    proxy.name,
+                    retry_after
+                );
+                Err(format!("Circuit breaker open, retry after {:?}", retry_after))
+            } else {
+                match payment.charge().await {
+                    Ok(receipt) => *gate_receipt = receipt.map(|receipt| (receipt, surface.channel_protocol())),
+                    Err(refused) => return refused,
+                }
+                if let Some((receipt, _)) = gate_receipt.as_ref() {
+                    receipt.commit();
+                }
+                // Use execute_mcp_request to apply all surface policies
+                // This ensures MCP channels have feature parity with A2A (timeout, retry, circuit breaker, mirroring)
+                let executed = crate::mcp_proxies::handlers::execute_mcp_request(
+                    &proxy,
+                    prepared,
+                    surface,
+                    policy_manager,
+                    http_client,
+                    &surface.name,
+                )
+                .await;
+                if let Err(error) = &executed
+                    && crate::mcp_proxies::handlers::is_circuit_open_error(error)
+                {
+                    gate_receipt
+                        .iter()
+                        .for_each(|(receipt, _)| receipt.revoke());
+                }
+                executed
+            }
+        }
+        Err(error) => Err(error),
+    };
+    match executed {
         Ok(mcp_response) => {
             // Broadcast payload capture for successful MCP proxy request
             if let (Some(ws_state), Some(metrics_store)) = (GLOBAL_WS_STATE.get(), GLOBAL_METRICS_STORE.get()) {
@@ -8380,287 +8855,34 @@ async fn handle_mcp_proxy_forward(
     }
 }
 
-/// The x402 config a fabric verify-request is verified with: the requesting gateway resolved the
-/// payment to one of its surface's payment requirements and sent it as `payment_requirement`, so
-/// that requirement, not this gateway's x402.json, is the only one the payment can match.
-fn x402_verify_request_config(
-    config: crate::config::types::X402Config,
-    body: &serde_json::Value,
-) -> Option<crate::config::types::X402Config> {
-    let payment_requirement = serde_json::from_value(
-        body.get("payment_requirement")?
-            .clone(),
-    )
-    .ok()?;
-    Some(crate::config::types::X402Config {
-        payment_requirements: vec![payment_requirement],
-        ..config
-    })
+/// Error a peer's x402 verify-request or settle-request is refused with: this gateway takes
+/// payment only through agent-pay and is not an x402 facilitator.
+const FACILITATOR_DISABLED: &str = "facilitator_disabled";
+
+/// Refuse a peer's x402 verify-request without verifying the payment.
+fn refuse_x402_verify_request(message: &ReceivedMessage) -> ProcessingResult {
+    warn!(from = ?message.from_did, "Refusing x402 verify-request: this gateway is not an x402 facilitator");
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::X402VerifyResponse.to_string(),
+        response_body: serde_json::json!({"valid": false, "error": FACILITATOR_DISABLED}),
+    }
 }
 
-/// Process x402 verify-request message
-/// When acting as a facilitator, verify payment for another gateway
-#[instrument(skip(message), fields(message_id = %message.id))]
-async fn process_x402_verify_request(message: &ReceivedMessage) -> ProcessingResult {
-    info!("📥 Processing x402 verify-request from {:?}", message.from_did);
-
-    // Check if fabric facilitator is enabled at gateway level
-    if let Some(facilitator_mode) = GLOBAL_FACILITATOR_MODE.get() {
-        if !facilitator_mode.facilitator_via_fabric {
-            warn!("Fabric facilitator not enabled on this gateway, rejecting verification request");
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402VerifyResponse.to_string(),
-                response_body: serde_json::json!({
-                    "valid": false,
-                    "error": "Fabric facilitator not enabled on this gateway"
-                }),
-            };
-        }
-    } else {
-        warn!("Facilitator mode not initialized, rejecting verification request");
-        return ProcessingResult::RequiresResponse {
-            response_type: MessageType::X402VerifyResponse.to_string(),
-            response_body: serde_json::json!({
-                "valid": false,
-                "error": "Facilitator mode not configured on this gateway"
-            }),
-        };
+/// Refuse a peer's x402 settle-request without settling or recording it. A deferred-settlement
+/// record (`action: "record"`) is fire-and-forget, so it gets no reply.
+fn refuse_x402_settle_request(message: &ReceivedMessage) -> ProcessingResult {
+    warn!(from = ?message.from_did, "Refusing x402 settle-request: this gateway is not an x402 facilitator");
+    if message
+        .message_body
+        .get("action")
+        .and_then(|v| v.as_str())
+        == Some("record")
+    {
+        return ProcessingResult::ProcessedNoResponse;
     }
-
-    verify_x402_request(message, get_transaction_store()).await
-}
-
-/// Verify a fabric peer's x402 verify-request against the payment requirement it sent, recording
-/// the transaction in `transaction_store`
-async fn verify_x402_request(
-    message: &ReceivedMessage,
-    transaction_store: Option<Arc<crate::x402::TransactionStore>>,
-) -> ProcessingResult {
-    // Get x402 configuration from context
-    let config = match message
-        .context
-        .get("x402_config")
-    {
-        Some(config_value) => match serde_json::from_value::<crate::config::types::X402Config>(config_value.clone()) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                error!("Failed to parse x402 config from context: {}", e);
-                return ProcessingResult::RequiresResponse {
-                    response_type: MessageType::X402VerifyResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "valid": false,
-                        "error": "x402 not configured on this gateway"
-                    }),
-                };
-            }
-        },
-        None => {
-            warn!("x402 config not available in message context");
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402VerifyResponse.to_string(),
-                response_body: serde_json::json!({
-                    "valid": false,
-                    "error": "x402 not configured on this gateway"
-                }),
-            };
-        }
-    };
-
-    // Extract request fields from message body
-    let body = &message.message_body;
-
-    // Extract verification_id from the request (GW1 sends this)
-    let verification_id = body
-        .get("verification_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let payment_signature = match body
-        .get("payment_signature")
-        .and_then(|v| v.as_str())
-    {
-        Some(sig) => sig.to_string(),
-        None => {
-            error!("Missing payment_signature in verify-request");
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402VerifyResponse.to_string(),
-                response_body: serde_json::json!({
-                    "valid": false,
-                    "error": "Missing payment_signature field"
-                }),
-            };
-        }
-    };
-
-    let config = match x402_verify_request_config(config, body) {
-        Some(config) => config,
-        None => {
-            error!("Missing or invalid payment_requirement in verify-request");
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402VerifyResponse.to_string(),
-                response_body: serde_json::json!({
-                    "valid": false,
-                    "error": "Missing or invalid payment_requirement field"
-                }),
-            };
-        }
-    };
-
-    let network = body
-        .get("network")
-        .and_then(|v| v.as_str())
-        .unwrap_or("mainnet")
-        .to_string();
-
-    let channel_id = body
-        .get("channel_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("remote-gateway")
-        .to_string();
-
-    let resource = body
-        .get("resource")
-        .and_then(|v| v.as_str())
-        .unwrap_or("/")
-        .to_string();
-
-    if let Some(ref vid) = verification_id {
-        info!("   Verification ID: {}", vid);
-    }
-    info!(
-        "   Payment signature: {}...",
-        &payment_signature
-            .chars()
-            .take(20)
-            .collect::<String>()
-    );
-    info!("   Network: {}", network);
-    info!("   Channel: {}", channel_id);
-    info!("   Resource: {}", resource);
-
-    // Perform payment verification using deterministic correlation_id (tx_hash)
-    // This ensures both GW1 and GW2 use the same correlation_id for the same transaction
-    match crate::x402::verification::verify_payment(
-        &payment_signature,
-        &config,
-        &channel_id,
-        &channel_id,
-        &resource,
-        None,                      // No listener manager - verify locally
-        transaction_store.clone(), // Creates transaction with correlation_id=tx_hash
-        None,                      // No existing correlation_id - will use tx_hash from payment
-    )
-    .await
-    {
-        Ok((verified_payment, correlation_id)) => {
-            info!("✅ Payment verification successful - correlation_id={}", correlation_id);
-
-            // Update transaction to set facilitator_gateway_id to the requesting gateway (message sender)
-            // This allows GW2 to send settlement-complete notification back to GW1 after settling
-            if let Some(store) = &transaction_store {
-                // Set facilitator_gateway_id to the requesting gateway's ID
-                let requesting_gateway_id = message.gateway_id.clone();
-                info!("Setting requesting_gateway_id={} for transaction {}", requesting_gateway_id, correlation_id);
-
-                // Update the transaction with requesting gateway ID
-                if let Err(e) = store
-                    .set_facilitator_gateway_id(&correlation_id, requesting_gateway_id)
-                    .await
-                {
-                    warn!("Failed to set facilitator_gateway_id: {}", e);
-                }
-            }
-
-            // GW2 should create settlement stage after successful verification
-            // Settlement mode determines whether to settle immediately or defer
-            if let Some(store) = transaction_store {
-                let settlement_mode_str = format!("{:?}", config.settlement_mode).to_lowercase();
-
-                match config.settlement_mode {
-                    crate::config::types::X402SettlementMode::Immediate => {
-                        info!("GW2: Immediate settlement mode - will settle before responding");
-
-                        // Initialize settlement stage
-                        if let Err(e) = store
-                            .init_settlement(
-                                &correlation_id,
-                                settlement_mode_str.clone(),
-                                "local".to_string(),
-                                verified_payment.tx_hash(),
-                                None,
-                            )
-                            .await
-                        {
-                            warn!("Failed to init settlement: {}", e);
-                        }
-
-                        // Execute settlement
-                        match crate::x402::settlement::settle_payment(
-                            &verified_payment,
-                            &config,
-                            &channel_id,
-                            &channel_id,
-                            Some(&store),
-                            None,
-                            Some(correlation_id.clone()),
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                info!("✅ GW2 immediate settlement completed");
-                                // Transaction store is already updated by settle_payment
-                            }
-                            Err(e) => {
-                                warn!("❌ GW2 immediate settlement failed: {}", e);
-                            }
-                        }
-                    }
-                    crate::config::types::X402SettlementMode::Deferred => {
-                        info!("GW2: Deferred settlement mode - creating pending settlement for worker");
-
-                        // Create pending settlement stage for worker to pick up
-                        if let Err(e) = store
-                            .init_settlement(
-                                &correlation_id,
-                                settlement_mode_str,
-                                "local".to_string(),
-                                verified_payment.tx_hash(),
-                                None,
-                            )
-                            .await
-                        {
-                            warn!("Failed to create deferred settlement stage: {}", e);
-                        } else {
-                            info!("✅ GW2 pending settlement created - worker will process");
-                        }
-                    }
-                    crate::config::types::X402SettlementMode::None => {
-                        info!("GW2: No settlement mode - verification only");
-                    }
-                }
-            }
-
-            // Return success response with payment details
-            ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402VerifyResponse.to_string(),
-                response_body: serde_json::json!({
-                    "valid": true,
-                    "payment": verified_payment
-                }),
-            }
-        }
-        Err(e) => {
-            warn!("❌ Payment verification failed for {}: {}", channel_id, e);
-
-            // Return failure response
-            ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402VerifyResponse.to_string(),
-                response_body: serde_json::json!({
-                    "valid": false,
-                    "error": e
-                }),
-            }
-        }
+    ProcessingResult::RequiresResponse {
+        response_type: MessageType::X402SettleResponse.to_string(),
+        response_body: serde_json::json!({"settled": false, "error": FACILITATOR_DISABLED}),
     }
 }
 
@@ -8762,457 +8984,6 @@ async fn process_x402_verify_response(message: &ReceivedMessage) -> ProcessingRe
     }
 
     ProcessingResult::ProcessedNoResponse
-}
-
-/// Process x402 settle-request message
-/// When acting as a facilitator, execute on-chain settlement for another gateway
-/// OR record a deferred settlement if action="record"
-#[instrument(skip(message), fields(message_id = %message.id))]
-async fn process_x402_settle_request(message: &ReceivedMessage) -> ProcessingResult {
-    // Extract request fields
-    let body = &message.message_body;
-
-    // Check if this is a recording request (not execution)
-    let action = body
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("settle");
-
-    if action == "record" {
-        // This is a settlement recording request for deferred settlements
-        info!("📥 Processing x402 settle-request - recording deferred settlement");
-
-        // CRITICAL: GW2 must record the settlement to its TransactionStore
-        // This ensures both GW1 and GW2 have transaction records for traceability
-
-        // Extract payment and correlation_id from request
-        let payment: crate::x402::PaymentPayload = match body.get("payment") {
-            Some(payment_val) => match serde_json::from_value(payment_val.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Failed to parse payment payload for record action: {}", e);
-                    return ProcessingResult::ProcessedNoResponse;
-                }
-            },
-            None => {
-                warn!("Missing payment field in settle-request (record action)");
-                return ProcessingResult::ProcessedNoResponse;
-            }
-        };
-
-        let correlation_id = body
-            .get("correlation_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&message.didcomm_message_id)
-            .to_string();
-
-        // Get transaction store (GW2 records settlement)
-        if let Some(txn_store) = get_transaction_store() {
-            let channel_id = body
-                .get("channel_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let channel_name = body
-                .get("channel_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let resource_path = body
-                .get("resource_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("/");
-
-            // Check if transaction exists, if not create it
-            if txn_store
-                .get(&correlation_id)
-                .await
-                .is_none()
-                && let Err(e) = txn_store
-                    .create_transaction(
-                        correlation_id.clone(),
-                        channel_id.to_string(),
-                        channel_name.to_string(),
-                        resource_path.to_string(),
-                        payment.clone(),
-                        "fabric_gateway".to_string(),
-                        None,
-                    )
-                    .await
-            {
-                warn!("GW2 failed to create transaction for deferred settlement: {}", e);
-                return ProcessingResult::ProcessedNoResponse;
-            }
-
-            // Initialize settlement stage in GW2's TransactionStore
-            let tx_hash = payment
-                .tx_hash()
-                .unwrap_or_default();
-            if let Err(e) = txn_store
-                .init_settlement(
-                    &correlation_id,
-                    "deferred".to_string(),       // settlement_mode
-                    "fabric_gateway".to_string(), // settlement_method
-                    Some(tx_hash),
-                    None, // confirmations
-                )
-                .await
-            {
-                warn!("GW2 failed to record deferred settlement: {}", e);
-            } else {
-                info!("✅ GW2 recorded deferred settlement to TransactionStore: {}", correlation_id);
-            }
-        }
-
-        return ProcessingResult::ProcessedNoResponse; // Fire-and-forget, no response expected
-    }
-
-    // Otherwise, this is a settlement execution request
-    info!("📥 Processing x402 settle-request - executing on-chain settlement");
-
-    // Get x402 config from message context (same pattern as verify-request)
-    let config = match message
-        .context
-        .get("x402_config")
-    {
-        Some(config_value) => match serde_json::from_value::<crate::config::types::X402Config>(config_value.clone()) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                error!("Failed to parse x402 config from context: {}", e);
-                return ProcessingResult::RequiresResponse {
-                    response_type: MessageType::X402SettleResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "success": false,
-                        "errorReason": "x402 config parse error",
-                        "transaction": "",
-                    }),
-                };
-            }
-        },
-        None => {
-            warn!("x402 config not available in message context");
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402SettleResponse.to_string(),
-                response_body: serde_json::json!({
-                    "success": false,
-                    "errorReason": "x402 not configured on this gateway",
-                    "transaction": "",
-                }),
-            };
-        }
-    };
-
-    // Check if facilitator mode is enabled
-    if let Some(facilitator_mode) = GLOBAL_FACILITATOR_MODE.get() {
-        if !facilitator_mode.facilitator_via_fabric {
-            warn!("Fabric facilitator not enabled, rejecting settlement request");
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402SettleResponse.to_string(),
-                response_body: serde_json::json!({
-                    "success": false,
-                    "errorReason": "Fabric facilitator not enabled on this gateway",
-                    "transaction": "",
-                }),
-            };
-        }
-    } else {
-        warn!("Facilitator mode not initialized");
-        return ProcessingResult::RequiresResponse {
-            response_type: MessageType::X402SettleResponse.to_string(),
-            response_body: serde_json::json!({
-                "success": false,
-                "errorReason": "Facilitator mode not configured",
-                "transaction": "",
-            }),
-        };
-    }
-
-    // Extract request fields
-    let body = &message.message_body;
-
-    // Parse payment payload
-    let payment: crate::x402::PaymentPayload = match body.get("payment") {
-        Some(payment_val) => match serde_json::from_value(payment_val.clone()) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("Failed to parse payment payload: {}", e);
-                return ProcessingResult::RequiresResponse {
-                    response_type: MessageType::X402SettleResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "success": false,
-                        "errorReason": format!("Invalid payment payload: {}", e),
-                        "transaction": "",
-                    }),
-                };
-            }
-        },
-        None => {
-            error!("Missing payment field in settle-request");
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402SettleResponse.to_string(),
-                response_body: serde_json::json!({
-                    "success": false,
-                    "errorReason": "Missing payment field",
-                    "transaction": "",
-                }),
-            };
-        }
-    };
-
-    let channel_id = body
-        .get("channel_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("remote-gateway")
-        .to_string();
-
-    let asset_transfer_method = body
-        .get("asset_transfer_method")
-        .and_then(|v| v.as_str())
-        .unwrap_or("transaction")
-        .to_string();
-
-    let network = body
-        .get("network")
-        .and_then(|v| v.as_str())
-        .unwrap_or(payment.network())
-        .to_string();
-
-    info!("   Channel: {}", channel_id);
-    info!("   Method: {}", asset_transfer_method);
-    info!("   Network: {}", network);
-    info!("   Amount: {}", payment.amount());
-    info!("   PayTo: {}", payment.pay_to());
-
-    // Load facilitator_private_keys from global x402.json for settlement execution
-    let merged_config = match crate::x402::config_cache::get_or_load_x402_config().await {
-        Ok(global_config) => {
-            let mut merged = config.clone();
-            if let Some(global_keys) = &global_config.facilitator_private_keys {
-                merged.facilitator_private_keys = Some(global_keys.clone());
-                info!("Loaded {} facilitator_private_keys from global x402.json for settlement", global_keys.len());
-            } else {
-                error!("Global x402.json config has no facilitator_private_keys");
-                return ProcessingResult::RequiresResponse {
-                    response_type: MessageType::X402SettleResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "settled": false,
-                        "error": "Global x402.json config missing facilitator_private_keys",
-                        "payer": payment.payload.get("authorization")
-                            .and_then(|a| a.get("from"))
-                            .and_then(|f| f.as_str())
-                            .unwrap_or("unknown"),
-                        "network": network,
-                    }),
-                };
-            }
-            merged
-        }
-        Err(e) => {
-            error!("Failed to load global x402.json config for settlement: {}", e);
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402SettleResponse.to_string(),
-                response_body: serde_json::json!({
-                    "settled": false,
-                    "error": format!("Failed to load global x402.json config: {}", e),
-                    "payer": payment.payload.get("authorization")
-                        .and_then(|a| a.get("from"))
-                        .and_then(|f| f.as_str())
-                        .unwrap_or("unknown"),
-                    "network": network,
-                }),
-            };
-        }
-    };
-
-    // Initialize embedded facilitator with merged config
-    info!("Initializing embedded facilitator for settlement execution");
-    let facilitator = match crate::x402::embedded_facilitator::get_embedded_facilitator(&merged_config).await {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Failed to initialize embedded facilitator for settlement: {}", e);
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402SettleResponse.to_string(),
-                response_body: serde_json::json!({
-                    "settled": false,
-                    "error": format!("Failed to initialize embedded facilitator: {}", e),
-                    "payer": payment.payload.get("authorization")
-                        .and_then(|a| a.get("from"))
-                        .and_then(|f| f.as_str())
-                        .unwrap_or("unknown"),
-                    "network": network,
-                }),
-            };
-        }
-    };
-
-    // Convert payment to x402 SettleRequest
-    let settle_request = match crate::x402::x402rs_adapter::to_settle_request(&payment) {
-        Ok(req) => req,
-        Err(e) => {
-            error!("Failed to convert payment to settle request: {}", e);
-            return ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402SettleResponse.to_string(),
-                response_body: serde_json::json!({
-                    "settled": false,
-                    "error": format!("Failed to convert payment to x402 format: {}", e),
-                    "payer": payment.payload.get("authorization")
-                        .and_then(|a| a.get("from"))
-                        .and_then(|f| f.as_str())
-                        .unwrap_or("unknown"),
-                    "network": network,
-                }),
-            };
-        }
-    };
-
-    // Get facilitator address for this network for error reporting
-    let facilitator_address = merged_config
-        .facilitator_private_keys
-        .as_ref()
-        .and_then(|keys| keys.get(&network))
-        .map(|key_config| key_config.address.as_str())
-        .unwrap_or("unknown");
-
-    // Execute on-chain settlement via embedded facilitator with retry logic
-    info!(
-        "Executing on-chain settlement via embedded facilitator network={} facilitator={} method={}",
-        network, facilitator_address, asset_transfer_method
-    );
-
-    // Retry configuration (from x402.json facilitator section)
-    let max_retries = merged_config
-        .facilitator
-        .as_ref()
-        .map(|f| f.max_retries)
-        .unwrap_or(3);
-    let retry_backoff_ms = merged_config
-        .facilitator
-        .as_ref()
-        .map(|f| f.retry_backoff_ms)
-        .unwrap_or(1000);
-
-    let mut settlement_result = None;
-    let mut last_error = String::new();
-
-    for attempt in 1..=max_retries {
-        info!("Settlement attempt {}/{}", attempt, max_retries);
-
-        match facilitator
-            .settle(settle_request.clone())
-            .await
-        {
-            Ok(response) => {
-                settlement_result = Some(Ok(response));
-                break;
-            }
-            Err(e) => {
-                let error_msg = e.to_string().to_lowercase();
-
-                // Check if this is an "already settled" error (signature already used)
-                if error_msg.contains("already used")
-                    || error_msg.contains("already spent")
-                    || error_msg.contains("invalid nonce")
-                    || error_msg.contains("nonce too low")
-                    || error_msg.contains("authorization used")
-                    || error_msg.contains("transfer already executed")
-                {
-                    info!("✅ Settlement already completed (signature reused): {}", e);
-                    // Treat as success - create a successful response from JSON
-                    match serde_json::from_value::<x402_types::proto::SettleResponse>(serde_json::json!({
-                        "success": true,
-                        "transaction": "already_settled",
-                        "message": format!("Payment already settled: {}", e)
-                    })) {
-                        Ok(response) => {
-                            settlement_result = Some(Ok(response));
-                            break;
-                        }
-                        Err(parse_err) => {
-                            warn!("Failed to create already-settled response: {}", parse_err);
-                            // Error will be captured below
-                        }
-                    }
-                }
-
-                last_error = e.to_string();
-                warn!("Settlement attempt {}/{} failed: {}", attempt, max_retries, last_error);
-
-                if attempt < max_retries {
-                    // Exponential backoff: attempt 1 = 1x, attempt 2 = 2x, attempt 3 = 4x
-                    let delay_ms = retry_backoff_ms * (1u64 << (attempt - 1));
-                    info!("Retrying in {}ms...", delay_ms);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                }
-            }
-        }
-    }
-
-    let settlement_result = settlement_result
-        .unwrap_or_else(|| Err(format!("Settlement failed after {} attempts: {}", max_retries, last_error)));
-
-    // Process settlement result and return response
-    match settlement_result {
-        Ok(settle_response) => {
-            // Check if settlement was successful and extract transaction hash
-            let is_successful = crate::x402::x402rs_adapter::is_settlement_successful(&settle_response);
-            let tx_hash = crate::x402::x402rs_adapter::extract_transaction(&settle_response);
-
-            if is_successful {
-                let tx_hash_str = tx_hash.unwrap_or_else(|| "unknown".to_string());
-                info!(
-                    "✅ Settlement successful tx_hash={} network={} facilitator={}",
-                    tx_hash_str, network, facilitator_address
-                );
-                ProcessingResult::RequiresResponse {
-                    response_type: MessageType::X402SettleResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "settled": true,
-                        "payer": payment.payload.get("authorization")
-                            .and_then(|a| a.get("from"))
-                            .and_then(|f| f.as_str())
-                            .unwrap_or("unknown"),
-                        "transaction_id": tx_hash_str,
-                        "network": network,
-                        "facilitator": facilitator_address,
-                    }),
-                }
-            } else {
-                let error_msg = crate::x402::x402rs_adapter::extract_settle_error(&settle_response)
-                    .unwrap_or_else(|| "Unknown settlement error".to_string());
-                let detailed_error =
-                    format!("{} [network={}, facilitator={}]", error_msg, network, facilitator_address);
-                error!("❌ Settlement failed: {}", detailed_error);
-                ProcessingResult::RequiresResponse {
-                    response_type: MessageType::X402SettleResponse.to_string(),
-                    response_body: serde_json::json!({
-                        "settled": false,
-                        "error": detailed_error,
-                        "payer": payment.payload.get("authorization")
-                            .and_then(|a| a.get("from"))
-                            .and_then(|f| f.as_str())
-                            .unwrap_or("unknown"),
-                        "network": network,
-                        "facilitator": facilitator_address,
-                    }),
-                }
-            }
-        }
-        Err(e) => {
-            let detailed_error = format!("{} [network={}, facilitator={}]", e, network, facilitator_address);
-            error!("❌ Settlement execution failed: {}", detailed_error);
-            ProcessingResult::RequiresResponse {
-                response_type: MessageType::X402SettleResponse.to_string(),
-                response_body: serde_json::json!({
-                    "settled": false,
-                    "error": detailed_error,
-                    "payer": payment.payload.get("authorization")
-                        .and_then(|a| a.get("from"))
-                        .and_then(|f| f.as_str())
-                        .unwrap_or("unknown"),
-                    "network": network,
-                    "facilitator": facilitator_address,
-                }),
-            }
-        }
-    }
 }
 
 #[instrument(skip(message), fields(message_id = %message.id))]
@@ -9362,6 +9133,49 @@ mod tests {
     use crate::gateways::connection_points::messages::{MessageMetadata, ReceivedMessage};
     use axum::body::Body;
     use axum::http::{Response, StatusCode};
+
+    #[test]
+    fn a_manifest_query_is_answered_with_a_null_manifest() {
+        let message =
+            make_handshake_msg(MessageType::GetManifest.as_str(), None, serde_json::json!({"channel_id": "s1"}));
+        match process_get_manifest(&message) {
+            ProcessingResult::RequiresResponse { response_type, response_body } => {
+                assert_eq!(response_type, MessageType::GetManifestResponse.to_string());
+                assert_eq!(response_body, serde_json::json!({"manifest": null}));
+            }
+            other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payment_case_status_query_is_answered_with_case_not_found() {
+        let message =
+            make_handshake_msg(MessageType::PaymentCaseStatus.as_str(), None, serde_json::json!({"case_id": "case-1"}));
+        match process_payment_case_status(&message) {
+            ProcessingResult::RequiresResponse { response_type, response_body } => {
+                assert_eq!(response_type, MessageType::PaymentCaseStatusResponse.to_string());
+                assert_eq!(response_body, serde_json::json!({"error": "case_not_found"}));
+            }
+            other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payment_settlement_request_is_answered_with_unknown() {
+        for (request, response) in [
+            (MessageType::PaymentSettle, MessageType::PaymentSettleResponse),
+            (MessageType::PaymentSettlementStatus, MessageType::PaymentSettlementStatusResponse),
+        ] {
+            let message = make_handshake_msg(request.as_str(), None, serde_json::json!({"authorization_id": "auth-1"}));
+            match process_payment_settlement(&message, response.clone()) {
+                ProcessingResult::RequiresResponse { response_type, response_body } => {
+                    assert_eq!(response_type, response.to_string());
+                    assert_eq!(response_body, serde_json::json!({"authorization_id": "auth-1", "status": "unknown"}));
+                }
+                other => panic!("expected a response, got {other:?}"),
+            }
+        }
+    }
 
     /// Run `f` under a policy-decision collector and return what it recorded.
     async fn collect_policy_decisions<T>(
@@ -10938,12 +10752,79 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
             assert!(
                 matches!(result, Err(ForwardRefusal::AppliancePolicyDenied)),
                 "{method} {path}: expected the appliance-wide deny, got {result:?}"
             );
+        }
+    }
+
+    /// The appliance-wide gateway policy sees `input.payment` over Fabric, as it
+    /// does on the direct path: whether the request is chargeable and at what rail.
+    #[tokio::test]
+    async fn the_appliance_wide_policy_sees_the_payment_of_a_fabric_request() {
+        use crate::policies::global_policy::tests::{gw_def, store_with};
+        use crate::policies::global_policy::{GlobalAssignment, GlobalPolicyAssignments, PLANE_GATEWAY};
+        let manager = crate::policies::GlobalPolicyManager::new();
+        manager.set_policy_definition_store(
+            store_with(vec![gw_def(
+                "paid-only",
+                "package gateway.policy\ndefault allow = false\nallow if {\n  input.payment.required == true\n  input.payment.rail == \"x402\"\n}",
+            )])
+            .await,
+        );
+        let mut assignments = GlobalPolicyAssignments::default();
+        assignments
+            .assignments
+            .insert(
+                PLANE_GATEWAY.to_string(),
+                vec![GlobalAssignment {
+                    policy_id: "paid-only".to_string(),
+                    monitor_only: false,
+                }],
+            );
+        manager
+            .refresh(&assignments)
+            .await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "paid", "name": "paid",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://agent.example"}
+        }))
+        .unwrap();
+        let payment = |required: bool, rail: Option<&str>| crate::surface_context::PaymentContext {
+            required,
+            rail: rail.map(str::to_string),
+            ..Default::default()
+        };
+        for (case, input, allowed) in [
+            ("chargeable on x402", Some(payment(true, Some("x402"))), true),
+            ("chargeable on another rail", Some(payment(true, Some("mpp"))), false),
+            ("not chargeable", Some(payment(false, Some("x402"))), false),
+            ("no payment context", None, false),
+        ] {
+            let result = evaluate_gateway_policy_for_fabric(
+                Some(&manager),
+                &surface,
+                "paid",
+                "POST",
+                "/mcp",
+                None,
+                Some("did:web:peer.example".into()),
+                None,
+                None,
+                None,
+                input.as_ref(),
+            )
+            .await;
+            match (allowed, result) {
+                (true, Ok(())) => {}
+                (false, Err(ForwardRefusal::AppliancePolicyDenied)) => {}
+                (_, other) => panic!("{case}: expected allowed={allowed}, got {other:?}"),
+            }
         }
     }
 
@@ -12164,23 +12045,6 @@ mod tests {
         }
     }
 
-    async fn x402_verify_request(body: serde_json::Value) -> serde_json::Value {
-        let mut message = make_handshake_msg(MessageType::X402VerifyRequest.as_str(), None, body);
-        message.context.insert(
-            "x402_config".to_string(),
-            serde_json::to_value(crate::config::types::X402Config {
-                verification_mode: crate::config::types::X402VerificationMode::Mock,
-                settlement_mode: crate::config::types::X402SettlementMode::None,
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        match verify_x402_request(&message, None).await {
-            ProcessingResult::RequiresResponse { response_body, .. } => response_body,
-            other => panic!("expected RequiresResponse, got {other:?}"),
-        }
-    }
-
     fn x402_payment_signature(
         accepted: &crate::config::types::X402PaymentRequirement,
         nonce: &str,
@@ -12218,28 +12082,91 @@ mod tests {
         assert_eq!(body["channel_id"], "surface-1");
     }
 
-    #[tokio::test]
-    async fn x402_verify_request_refuses_missing_or_invalid_payment_requirement() {
-        let signature = x402_payment_signature(&x402_requirement("0x456"), "no-requirement");
-        for body in [
-            serde_json::json!({"payment_signature": signature}),
-            serde_json::json!({"payment_signature": signature, "payment_requirement": {"payTo": "0x456"}}),
-        ] {
-            let response = x402_verify_request(body.clone()).await;
-
-            assert_eq!(response["valid"], false, "{body}");
-            assert_eq!(response["error"], "Missing or invalid payment_requirement field", "{body}");
+    fn response_body(result: ProcessingResult) -> (String, serde_json::Value) {
+        match result {
+            ProcessingResult::RequiresResponse { response_type, response_body } => (response_type, response_body),
+            other => panic!("expected RequiresResponse, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn x402_verify_request_binds_to_the_requesters_requirement() {
-        let rejected = x402_verify_request(x402_requester_body(&x402_requirement("0xbad"), "self-payment")).await;
-        let accepted = x402_verify_request(x402_requester_body(&x402_requirement("0x456"), "honest")).await;
+    async fn a_peer_verify_request_is_refused_without_verifying() {
+        let message = make_handshake_msg(
+            MessageType::X402VerifyRequest.as_str(),
+            None,
+            x402_requester_body(&x402_requirement("0x456"), "peer-verify"),
+        );
 
-        assert_eq!(rejected["valid"], false);
-        assert_eq!(rejected["error"], "Payment does not match any payment requirement issued for this resource");
-        assert_eq!(accepted["valid"], true);
-        assert_eq!(accepted["payment"]["accepted"]["payTo"], "0x456");
+        let (response_type, body) =
+            response_body(process_message_internal(&message, &MessageType::X402VerifyRequest).await);
+
+        assert_eq!(response_type, MessageType::X402VerifyResponse.to_string());
+        assert_eq!(body, serde_json::json!({"valid": false, "error": "facilitator_disabled"}));
+    }
+
+    #[tokio::test]
+    async fn a_peer_settle_request_is_refused_without_settling() {
+        let message = make_handshake_msg(
+            MessageType::X402SettleRequest.as_str(),
+            None,
+            serde_json::json!({
+                "payment": {
+                    "x402Version": 2,
+                    "accepted": x402_requirement("0x456"),
+                    "payload": {"signature": "0xsig", "nonce": "peer-settle"}
+                },
+                "channel_id": "surface-1",
+            }),
+        );
+
+        let (response_type, body) =
+            response_body(process_message_internal(&message, &MessageType::X402SettleRequest).await);
+
+        assert_eq!(response_type, MessageType::X402SettleResponse.to_string());
+        assert_eq!(body, serde_json::json!({"settled": false, "error": "facilitator_disabled"}));
+    }
+
+    #[tokio::test]
+    async fn a_peer_settlement_record_is_dropped_without_a_reply() {
+        let message = make_handshake_msg(
+            MessageType::X402SettleRequest.as_str(),
+            None,
+            serde_json::json!({"action": "record", "correlation_id": "peer-record", "payment": {}}),
+        );
+
+        let result = process_message_internal(&message, &MessageType::X402SettleRequest).await;
+
+        assert!(matches!(result, ProcessingResult::ProcessedNoResponse), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_settle_response_completes_our_outstanding_settle_request() {
+        let correlation_id = format!("settle-{}", uuid::Uuid::new_v4());
+        let pending = crate::x402::gateway_facilitator_service::register_pending_settlement(&correlation_id).await;
+        let message = make_handshake_msg(
+            MessageType::X402SettleResponse.as_str(),
+            Some(&correlation_id),
+            serde_json::json!({"settled": true, "transaction_id": "0xabc", "network": "eip155:1"}),
+        );
+
+        let result = process_message_internal(&message, &MessageType::X402SettleResponse).await;
+        let response = pending.await.unwrap();
+
+        assert!(matches!(result, ProcessingResult::ProcessedNoResponse), "got {result:?}");
+        assert!(response.settled);
+        assert_eq!(response.tx_hash, "0xabc");
+    }
+
+    #[tokio::test]
+    async fn a_settle_response_without_a_thread_id_is_not_matched() {
+        let message = make_handshake_msg(
+            MessageType::X402SettleResponse.as_str(),
+            None,
+            serde_json::json!({"settled": true, "transaction_id": "0xabc"}),
+        );
+
+        let result = process_message_internal(&message, &MessageType::X402SettleResponse).await;
+
+        assert_eq!(failure_reason(&result), "Missing thid (thread ID) in settlement response");
     }
 }

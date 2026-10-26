@@ -72,6 +72,14 @@ pub struct NetworkConfig {
     /// Proxies trusted to report the caller's address for per-client-IP limits.
     #[serde(default)]
     pub client_ip: crate::config::types::ClientIpConfig,
+
+    /// The delegated payment gate's circuit breaker thresholds.
+    #[serde(default)]
+    pub payment_gate: crate::config::types::PaymentGateConfig,
+
+    /// How long and how large the delegated payments ledger is kept.
+    #[serde(default)]
+    pub payment_ledger: crate::config::types::PaymentLedgerConfig,
 }
 
 /// DID configuration
@@ -135,7 +143,7 @@ pub struct ChannelPrefix {
     /// Human-readable name (displayed in UI dropdown)
     pub name: String,
 
-    /// Route prefix (e.g., "/agents", "/payments")
+    /// Route prefix (e.g., "/agents", "/billing")
     pub prefix: String,
 }
 
@@ -181,6 +189,22 @@ pub struct RouteCategory {
 }
 
 impl NetworkConfig {
+    /// The route prefixes this configuration serves through the proxy: every
+    /// channel prefix and every route of type `proxy`. These are what must not
+    /// shadow a dashboard page.
+    pub fn proxy_prefixes(&self) -> Vec<&str> {
+        self.channels
+            .iter()
+            .map(|channel| channel.prefix.as_str())
+            .chain(
+                self.routes
+                    .values()
+                    .filter(|route| matches!(route.route_type, RouteType::Proxy))
+                    .map(|route| route.prefix.as_str()),
+            )
+            .collect()
+    }
+
     /// Load network configuration from a JSON file
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
@@ -524,6 +548,55 @@ mod url_mapping_tests {
     }
 
     #[test]
+    fn the_payment_gate_breaker_defaults_to_five_failures_and_thirty_seconds_and_reads_its_overrides() {
+        let defaults = cfg_with_listeners(serde_json::json!([]));
+        assert_eq!(
+            defaults
+                .payment_gate
+                .breaker_failures(),
+            5
+        );
+        assert_eq!(
+            defaults
+                .payment_gate
+                .breaker_open_for(),
+            std::time::Duration::from_secs(30)
+        );
+
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+            "payment_gate": { "breaker_failures": 3, "breaker_open_secs": 90 },
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.payment_gate
+                .breaker_failures(),
+            3
+        );
+        assert_eq!(
+            cfg.payment_gate
+                .breaker_open_for(),
+            std::time::Duration::from_secs(90)
+        );
+
+        let clamped = crate::config::types::PaymentGateConfig {
+            breaker_failures: Some(0),
+            breaker_open_secs: Some(86_400),
+        };
+        assert_eq!(clamped.breaker_failures(), 1);
+        assert_eq!(clamped.breaker_open_for(), std::time::Duration::from_secs(3600));
+
+        let unknown = serde_json::from_value::<crate::config::types::PaymentGateConfig>(
+            serde_json::json!({ "breaker_threshold": 3 }),
+        );
+        assert!(unknown.is_err(), "a misspelt key is refused");
+    }
+
+    #[test]
     fn client_ip_trusted_proxies_deserialize_from_gateway_json() {
         let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
             "did": { "domain": "test.local" },
@@ -722,5 +795,27 @@ mod url_mapping_tests {
         .expect("network config without mcp_proxies should deserialize");
 
         assert!(cfg.mcp_proxies.is_none());
+    }
+
+    #[test]
+    fn proxy_prefixes_are_the_channel_prefixes_and_the_proxy_routes_only() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "agents", "prefix": "/agents" }],
+            "mcp_proxies": [{ "id": "mcp", "name": "mcp", "prefix": "/mcp" }],
+            "routes": {
+                "channels": { "type": "proxy", "prefix": "/svc" },
+                "api": { "type": "identity_api", "prefix": "/api" },
+                "dashboard": { "type": "static", "prefix": "/", "path": "www", "fallback": true }
+            },
+        }))
+        .expect("network config should deserialize");
+
+        let mut prefixes = cfg.proxy_prefixes();
+        prefixes.sort_unstable();
+        assert_eq!(prefixes, vec!["/agents", "/svc"]);
     }
 }

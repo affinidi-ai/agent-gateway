@@ -214,14 +214,34 @@ pub enum ContinuationKind {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "rail", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContinuationPayment {
-    X402 { receipt: Option<String>, verified_at: u64, expires_at: u64 },
-    Mpp { receipt: Option<String>, verified_at: u64, expires_at: u64 },
+    X402 {
+        receipt: Option<String>,
+        verified_at: u64,
+        expires_at: u64,
+    },
+    Mpp {
+        receipt: Option<String>,
+        verified_at: u64,
+        expires_at: u64,
+    },
+    /// A payment agent-pay took for the request; `scheme` is the credential's
+    /// rail (`x402` or `mpp`), which names the receipt header.
+    AgentPay {
+        scheme: String,
+        receipt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vc_fingerprint: Option<String>,
+        verified_at: u64,
+        expires_at: u64,
+    },
 }
 
 impl ContinuationPayment {
     pub fn expires_at(&self) -> u64 {
         match self {
-            Self::X402 { expires_at, .. } | Self::Mpp { expires_at, .. } => *expires_at,
+            Self::X402 { expires_at, .. } | Self::Mpp { expires_at, .. } | Self::AgentPay { expires_at, .. } => {
+                *expires_at
+            }
         }
     }
 
@@ -240,6 +260,27 @@ impl ContinuationPayment {
                 verified_at,
                 expires_at,
             } => (receipt, *verified_at, *expires_at),
+            Self::AgentPay {
+                scheme,
+                receipt,
+                vc_fingerprint,
+                verified_at,
+                expires_at,
+            } => {
+                if !matches!(scheme.as_str(), "x402" | "mpp")
+                    || receipt.is_none()
+                    || vc_fingerprint
+                        .as_ref()
+                        .is_some_and(|fingerprint| {
+                            fingerprint.is_empty()
+                                || fingerprint.len() > 256
+                                || axum::http::HeaderValue::from_str(fingerprint).is_err()
+                        })
+                {
+                    return Err(ContinuationError::InvalidRecord);
+                }
+                (receipt, *verified_at, *expires_at)
+            }
         };
         if verified_at > now
             || expires_at <= now

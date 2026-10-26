@@ -45,6 +45,14 @@ pub enum MessageType {
     // Gateway Channel Query Protocol (Affinidi Custom)
     GetSurfaces,
     GetSurfacesResponse,
+    GetManifest,
+    GetManifestResponse,
+    PaymentCaseStatus,
+    PaymentCaseStatusResponse,
+    PaymentSettle,
+    PaymentSettleResponse,
+    PaymentSettlementStatus,
+    PaymentSettlementStatusResponse,
 
     // Gateway Request Forwarding Protocol (Affinidi Custom)
     ForwardRequest,
@@ -124,6 +132,16 @@ impl MessageType {
             // Gateway Channel Query
             "https://affinidi.com/atm/client-actions/get-surfaces" => Self::GetSurfaces,
             "https://affinidi.com/atm/client-actions/get-surfaces-response" => Self::GetSurfacesResponse,
+            "https://affinidi.com/atm/client-actions/get-manifest" => Self::GetManifest,
+            "https://affinidi.com/atm/client-actions/get-manifest-response" => Self::GetManifestResponse,
+            "https://affinidi.com/atm/client-actions/payment-case-status" => Self::PaymentCaseStatus,
+            "https://affinidi.com/atm/client-actions/payment-case-status-response" => Self::PaymentCaseStatusResponse,
+            "https://affinidi.com/atm/client-actions/payment-settle" => Self::PaymentSettle,
+            "https://affinidi.com/atm/client-actions/payment-settle-response" => Self::PaymentSettleResponse,
+            "https://affinidi.com/atm/client-actions/payment-settlement-status" => Self::PaymentSettlementStatus,
+            "https://affinidi.com/atm/client-actions/payment-settlement-status-response" => {
+                Self::PaymentSettlementStatusResponse
+            }
 
             // Gateway Request Forwarding
             "https://affinidi.com/atm/client-actions/forward-request" => Self::ForwardRequest,
@@ -203,6 +221,16 @@ impl MessageType {
             // Gateway Channel Query
             Self::GetSurfaces => "https://affinidi.com/atm/client-actions/get-surfaces",
             Self::GetSurfacesResponse => "https://affinidi.com/atm/client-actions/get-surfaces-response",
+            Self::GetManifest => "https://affinidi.com/atm/client-actions/get-manifest",
+            Self::GetManifestResponse => "https://affinidi.com/atm/client-actions/get-manifest-response",
+            Self::PaymentCaseStatus => "https://affinidi.com/atm/client-actions/payment-case-status",
+            Self::PaymentCaseStatusResponse => "https://affinidi.com/atm/client-actions/payment-case-status-response",
+            Self::PaymentSettle => "https://affinidi.com/atm/client-actions/payment-settle",
+            Self::PaymentSettleResponse => "https://affinidi.com/atm/client-actions/payment-settle-response",
+            Self::PaymentSettlementStatus => "https://affinidi.com/atm/client-actions/payment-settlement-status",
+            Self::PaymentSettlementStatusResponse => {
+                "https://affinidi.com/atm/client-actions/payment-settlement-status-response"
+            }
             Self::ForwardRequest => "https://affinidi.com/atm/client-actions/forward-request",
             Self::ForwardResponse => "https://affinidi.com/atm/client-actions/forward-response",
             Self::ForwardStreamFrame => "https://affinidi.com/atm/forward-stream/1.0/frame",
@@ -253,7 +281,16 @@ impl MessageType {
             Self::ConnectionSetup | Self::ConnectionAccepted | Self::ConnectionRejected => ProtocolFamily::Connection,
             Self::GatewayPing | Self::GatewayPong => ProtocolFamily::GatewayPing,
             Self::GatewayIssuerRequest | Self::GatewayIssuerResponse => ProtocolFamily::GatewayIssuer,
-            Self::GetSurfaces | Self::GetSurfacesResponse => ProtocolFamily::GatewayQuery,
+            Self::GetSurfaces
+            | Self::GetSurfacesResponse
+            | Self::GetManifest
+            | Self::GetManifestResponse
+            | Self::PaymentCaseStatus
+            | Self::PaymentCaseStatusResponse
+            | Self::PaymentSettle
+            | Self::PaymentSettleResponse
+            | Self::PaymentSettlementStatus
+            | Self::PaymentSettlementStatusResponse => ProtocolFamily::GatewayQuery,
             Self::ForwardRequest
             | Self::ForwardResponse
             | Self::ForwardStreamFrame
@@ -361,6 +398,52 @@ mod tests {
             "https://affinidi.com/atm/client-actions/gateway-issuer-response"
         );
         assert_eq!(ProtocolFamily::GatewayIssuer.to_string(), "Gateway Issuer");
+    }
+
+    #[test]
+    fn manifest_query_types_round_trip_through_their_uris() {
+        assert_eq!(MessageType::GetManifest.as_str(), "https://affinidi.com/atm/client-actions/get-manifest");
+        assert_eq!(
+            MessageType::GetManifestResponse.as_str(),
+            "https://affinidi.com/atm/client-actions/get-manifest-response"
+        );
+        for message_type in [MessageType::GetManifest, MessageType::GetManifestResponse] {
+            assert_eq!(MessageType::from_str(message_type.as_str()), message_type);
+            assert_eq!(message_type.protocol_family(), ProtocolFamily::GatewayQuery);
+        }
+    }
+
+    #[test]
+    fn payment_case_status_types_round_trip_through_their_uris() {
+        assert_eq!(
+            MessageType::PaymentCaseStatus.as_str(),
+            "https://affinidi.com/atm/client-actions/payment-case-status"
+        );
+        assert_eq!(
+            MessageType::PaymentCaseStatusResponse.as_str(),
+            "https://affinidi.com/atm/client-actions/payment-case-status-response"
+        );
+        for message_type in [MessageType::PaymentCaseStatus, MessageType::PaymentCaseStatusResponse] {
+            assert_eq!(MessageType::from_str(message_type.as_str()), message_type);
+            assert_eq!(message_type.protocol_family(), ProtocolFamily::GatewayQuery);
+        }
+    }
+
+    #[test]
+    fn payment_settlement_types_round_trip_through_their_uris() {
+        for (message_type, uri) in [
+            (MessageType::PaymentSettle, "https://affinidi.com/atm/client-actions/payment-settle"),
+            (MessageType::PaymentSettleResponse, "https://affinidi.com/atm/client-actions/payment-settle-response"),
+            (MessageType::PaymentSettlementStatus, "https://affinidi.com/atm/client-actions/payment-settlement-status"),
+            (
+                MessageType::PaymentSettlementStatusResponse,
+                "https://affinidi.com/atm/client-actions/payment-settlement-status-response",
+            ),
+        ] {
+            assert_eq!(message_type.as_str(), uri);
+            assert_eq!(MessageType::from_str(uri), message_type);
+            assert_eq!(message_type.protocol_family(), ProtocolFamily::GatewayQuery);
+        }
     }
 
     #[test]

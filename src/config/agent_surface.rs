@@ -646,14 +646,349 @@ pub struct Target {
 }
 
 /// Payment policy configuration.
+///
+/// `agent_pay` is the only supported policy. The local `x402` and `mpp`
+/// variants still load so a stored surface keeps its configuration, but an
+/// enabled one is unsupported: saving it is refused and requests to it fail
+/// closed (see [`PaymentPolicy::is_unsupported_legacy`]). A legacy
+/// `{"type": "x402", "provider": "agent_pay"}` policy loads as `agent_pay`,
+/// charging what its protocol charges by default (see `AgentPayPolicy::from_legacy_x402`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", from = "PaymentPolicyRecord")]
 #[allow(clippy::large_enum_variant)]
 pub enum PaymentPolicy {
-    /// HTTP 402 Payment Required protocol.
+    /// Local HTTP 402 Payment Required enforcement (unsupported).
+    #[serde(rename = "x402")]
     X402(X402Config),
-    /// Machine Payments Protocol.
+    /// Local Machine Payments Protocol enforcement (unsupported).
+    #[serde(rename = "mpp")]
     Mpp(MppConfig),
+    /// Payment taken by a remote agent-pay gateway over the fabric.
+    #[serde(rename = "agent_pay")]
+    AgentPay(AgentPayPolicy),
+}
+
+/// The stored shape of a [`PaymentPolicy`], before legacy normalisation.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
+enum PaymentPolicyRecord {
+    #[serde(rename = "x402")]
+    X402(X402Config),
+    #[serde(rename = "mpp")]
+    Mpp(MppConfig),
+    #[serde(rename = "agent_pay")]
+    AgentPay(AgentPayPolicy),
+}
+
+impl From<PaymentPolicyRecord> for PaymentPolicy {
+    fn from(record: PaymentPolicyRecord) -> Self {
+        match record {
+            PaymentPolicyRecord::X402(config)
+                if config.enabled && config.provider == super::types::X402Provider::AgentPay =>
+            {
+                let (policy, defaults) = AgentPayPolicy::from_legacy_x402(config, None);
+                if !defaults.is_empty() {
+                    tracing::warn!(
+                        payment_gateway_id = %policy.payment_gateway_id,
+                        payment_surface_id = %policy.payment_surface_id,
+                        "Legacy x402 agent_pay payment policy loaded as agent_pay; it named no triggers, so: {}",
+                        defaults.join("; ")
+                    );
+                }
+                PaymentPolicy::AgentPay(policy)
+            }
+            PaymentPolicyRecord::X402(config) => PaymentPolicy::X402(config),
+            PaymentPolicyRecord::Mpp(config) => PaymentPolicy::Mpp(config),
+            PaymentPolicyRecord::AgentPay(policy) => PaymentPolicy::AgentPay(policy),
+        }
+    }
+}
+
+impl PaymentPolicy {
+    /// An enabled local `x402` or `mpp` policy. Such a surface answers every
+    /// request with `503 payment_unavailable` and cannot be saved. A disabled
+    /// one charges nothing and is left alone.
+    pub fn is_unsupported_legacy(&self) -> bool {
+        match self {
+            PaymentPolicy::X402(config) => config.enabled,
+            PaymentPolicy::Mpp(config) => config.enabled,
+            PaymentPolicy::AgentPay(_) => false,
+        }
+    }
+}
+
+/// Default for [`AgentPayPolicy::timeout_ms`].
+pub const AGENT_PAY_DEFAULT_TIMEOUT_MS: u64 = 15_000;
+/// Accepted range for [`AgentPayPolicy::timeout_ms`].
+pub const AGENT_PAY_TIMEOUT_MS_RANGE: std::ops::RangeInclusive<u64> = 1_000..=120_000;
+
+fn default_agent_pay_timeout_ms() -> u64 {
+    AGENT_PAY_DEFAULT_TIMEOUT_MS
+}
+
+/// Charge for a surface through a payment surface on a connected agent-pay
+/// gateway. This gateway decides whether a request is chargeable; agent-pay
+/// owns the price, the payment methods, verification and settlement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPayPolicy {
+    /// Connected Remote gateway (agent-pay) that takes the payment.
+    #[serde(default)]
+    pub payment_gateway_id: String,
+    /// Payment surface on that gateway, optionally `<surface_id>$<alias>` to
+    /// name one of its variants.
+    #[serde(default, alias = "payment_channel_id")]
+    pub payment_surface_id: String,
+    /// Which MCP `tools/call` requests are chargeable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_payment_triggers: Option<super::types::McpPaymentTriggers>,
+    /// Which A2A methods (and which message texts) are chargeable. A
+    /// `message_patterns` entry is plain text the message must contain, not a
+    /// regular expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a_method_filters: Option<Vec<super::types::A2AMethodFilter>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_all: bool,
+    /// How long to wait for agent-pay, in milliseconds.
+    #[serde(default = "default_agent_pay_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Send the caller's email to agent-pay, which pseudonymises it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub share_payer_email: bool,
+    /// The payment surface's manifest as last fetched by this gateway.
+    /// Server-written: a value sent by a client is replaced on save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_snapshot: Option<crate::gateways::payment_manifest::PaymentManifest>,
+}
+
+impl Default for AgentPayPolicy {
+    fn default() -> Self {
+        Self {
+            payment_gateway_id: String::new(),
+            payment_surface_id: String::new(),
+            mcp_payment_triggers: None,
+            a2a_method_filters: None,
+            require_all: false,
+            timeout_ms: AGENT_PAY_DEFAULT_TIMEOUT_MS,
+            share_payer_email: false,
+            manifest_snapshot: None,
+        }
+    }
+}
+
+/// The A2A methods a policy charges when it names none.
+const DEFAULT_A2A_CHARGED_METHODS: [&str; 2] = ["message/send", "message/stream"];
+
+fn has_pattern(patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| !pattern.trim().is_empty())
+}
+
+impl AgentPayPolicy {
+    /// A legacy `{"type": "x402", "provider": "agent_pay"}` policy as an
+    /// `agent_pay` one, with a description of each default it needed.
+    ///
+    /// The legacy policy relayed every request to agent-pay, which charged by
+    /// its own triggers. This gateway decides now, so a trigger the record
+    /// leaves out is written out as what the protocol charges by default: every
+    /// MCP `tools/call`, and every A2A `message/send` and `message/stream` (the
+    /// legacy `a2a_methods` list becomes filters). Every other protocol is always
+    /// charged. `protocol` limits the defaults to the surface's own; `None`
+    /// applies both.
+    fn from_legacy_x402(
+        config: X402Config,
+        protocol: Option<&SurfaceProtocol>,
+    ) -> (Self, Vec<String>) {
+        let mut defaults = Vec::new();
+        let for_mcp = protocol.is_none_or(|protocol| *protocol == SurfaceProtocol::Mcp);
+        let for_a2a = protocol.is_none_or(|protocol| matches!(protocol, SurfaceProtocol::A2a | SurfaceProtocol::Ap2));
+
+        let mcp_payment_triggers = match config.mcp_payment_triggers {
+            None if for_mcp => {
+                defaults.push("mcp_payment_triggers is all, so every tools/call is charged".to_string());
+                Some(super::types::McpPaymentTriggers::All)
+            }
+            triggers => triggers,
+        };
+        let a2a_method_filters = match config
+            .a2a_method_filters
+            .filter(|filters| !filters.is_empty())
+        {
+            None if for_a2a => {
+                let legacy_methods = config
+                    .a2a_methods
+                    .filter(|methods| !methods.is_empty());
+                let from_legacy = legacy_methods.is_some();
+                let methods = legacy_methods.unwrap_or_else(|| {
+                    DEFAULT_A2A_CHARGED_METHODS
+                        .map(String::from)
+                        .to_vec()
+                });
+                defaults.push(format!(
+                    "a2a_method_filters {} {}, so every message of those methods is charged",
+                    if from_legacy {
+                        "is the legacy a2a_methods"
+                    } else {
+                        "is"
+                    },
+                    methods.join(", ")
+                ));
+                Some(
+                    methods
+                        .into_iter()
+                        .map(|method| super::types::A2AMethodFilter {
+                            method,
+                            message_patterns: Vec::new(),
+                        })
+                        .collect(),
+                )
+            }
+            filters => filters,
+        };
+        let policy = Self {
+            payment_gateway_id: config
+                .payment_gateway_id
+                .unwrap_or_default(),
+            payment_surface_id: config
+                .payment_surface_id
+                .unwrap_or_default(),
+            mcp_payment_triggers,
+            a2a_method_filters,
+            ..Self::default()
+        };
+        (policy, defaults)
+    }
+
+    /// The MCP triggers the policy charges by. A policy with none, or a `match`
+    /// list with no pattern, charges every `tools/call`: no trigger
+    /// configuration never means free.
+    pub fn charged_mcp_triggers(&self) -> std::borrow::Cow<'_, super::types::McpPaymentTriggers> {
+        use super::types::McpPaymentTriggers;
+
+        match self
+            .mcp_payment_triggers
+            .as_ref()
+        {
+            Some(McpPaymentTriggers::Match { patterns }) if !has_pattern(patterns) => {
+                std::borrow::Cow::Owned(McpPaymentTriggers::All)
+            }
+            Some(triggers) => std::borrow::Cow::Borrowed(triggers),
+            None => std::borrow::Cow::Owned(McpPaymentTriggers::All),
+        }
+    }
+
+    /// The A2A method filters the policy charges by, without the entries that
+    /// name no method and the blank message patterns. A policy with none left
+    /// charges `message/send` and `message/stream`; a filter with no pattern
+    /// left charges every message of its method.
+    pub fn charged_a2a_filters(&self) -> Vec<super::types::A2AMethodFilter> {
+        let filters: Vec<_> = self
+            .a2a_method_filters
+            .iter()
+            .flatten()
+            .filter(|filter| {
+                !filter
+                    .method
+                    .trim()
+                    .is_empty()
+            })
+            .map(|filter| super::types::A2AMethodFilter {
+                method: filter.method.clone(),
+                message_patterns: filter
+                    .message_patterns
+                    .iter()
+                    .filter(|pattern| !pattern.trim().is_empty())
+                    .cloned()
+                    .collect(),
+            })
+            .collect();
+        if !filters.is_empty() {
+            return filters;
+        }
+        DEFAULT_A2A_CHARGED_METHODS
+            .into_iter()
+            .map(|method| super::types::A2AMethodFilter {
+                method: method.to_string(),
+                message_patterns: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// How long to wait for agent-pay, kept within [`AGENT_PAY_TIMEOUT_MS_RANGE`].
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.timeout_ms
+                .clamp(*AGENT_PAY_TIMEOUT_MS_RANGE.start(), *AGENT_PAY_TIMEOUT_MS_RANGE.end()),
+        )
+    }
+
+    /// The `fabric://{gateway}/{surface}` address of the payment surface, or
+    /// why it cannot be built.
+    pub fn fabric_target(&self) -> Result<String, String> {
+        let gateway = self.payment_gateway_id.trim();
+        let surface = self.payment_surface_id.trim();
+        if gateway.is_empty() || surface.is_empty() {
+            return Err("payment delegation misconfigured: payment_gateway_id / payment_surface_id missing".to_string());
+        }
+        Ok(format!("fabric://{gateway}/{surface}"))
+    }
+
+    /// Configuration errors that need no network access.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self
+            .payment_gateway_id
+            .trim()
+            .is_empty()
+        {
+            errors.push("payment_gateway_id is required".to_string());
+        }
+        if !crate::gateways::payment_manifest::is_valid_payment_surface_id(&self.payment_surface_id) {
+            errors.push(
+                "payment_surface_id must be a surface id, optionally followed by '$<alias>' (letters, digits, '-', \
+                 '_' and '.')"
+                    .to_string(),
+            );
+        }
+        if !AGENT_PAY_TIMEOUT_MS_RANGE.contains(&self.timeout_ms) {
+            errors.push(format!(
+                "timeout_ms must be between {} and {}",
+                AGENT_PAY_TIMEOUT_MS_RANGE.start(),
+                AGENT_PAY_TIMEOUT_MS_RANGE.end()
+            ));
+        }
+        if let Some(triggers) = self
+            .mcp_payment_triggers
+            .as_ref()
+        {
+            if let super::types::McpPaymentTriggers::Match { patterns } = triggers
+                && !has_pattern(patterns)
+            {
+                errors.push(
+                    "mcp_payment_triggers mode match needs at least one non-blank pattern; use mode all to charge \
+                     every tools/call"
+                        .to_string(),
+                );
+            }
+            errors.extend(triggers.validate("payment policy"));
+        }
+        for filter in self
+            .a2a_method_filters
+            .iter()
+            .flatten()
+        {
+            if filter
+                .method
+                .trim()
+                .is_empty()
+            {
+                errors.push("a2a_method_filters entries need a method".to_string());
+            }
+        }
+        errors
+    }
 }
 
 // ─── Target Variants (legacy, removed) ──────────────────────────────────────
@@ -1608,11 +1943,17 @@ impl StorableEntity for AgentSurface {
     /// would fail loading. Strip them here so old configs load, and return
     /// `true` when anything was stripped so the storage layer re-persists
     /// the file without the legacy keys.
+    ///
+    /// A legacy `{"type": "x402", "provider": "agent_pay"}` payment policy is
+    /// rewritten as an `agent_pay` one with the defaults of the surface's
+    /// protocol (see `AgentPayPolicy::from_legacy_x402`), and persisted the
+    /// same way.
     fn migrate_raw_json(value: &mut serde_json::Value) -> anyhow::Result<bool> {
         let stripped = strip_legacy_trust_registry_fields(value);
         let split = split_target_trust_checks_per_transit_point(value);
         warn_target_lists_that_cannot_run(value);
-        Ok(stripped || split)
+        let migrated = migrate_legacy_agent_pay_policies(value);
+        Ok(stripped || split || migrated)
     }
 }
 
@@ -1660,6 +2001,105 @@ fn warn_target_lists_that_cannot_run(value: &serde_json::Value) {
             );
         }
     }
+}
+
+/// Rewrites the legacy delegated x402 payment policy of a stored
+/// [`AgentSurface`] JSON blob, on the base surface and on every variant, as an
+/// `agent_pay` policy, logging one warning per surface that names the defaults
+/// applied. Returns `true` when a policy was rewritten.
+fn migrate_legacy_agent_pay_policies(surface: &mut serde_json::Value) -> bool {
+    let Some(object) = surface.as_object_mut() else {
+        return false;
+    };
+    let protocol = object
+        .get("access_point")
+        .and_then(|access_point| access_point.get("protocol"))
+        .and_then(|protocol| serde_json::from_value::<SurfaceProtocol>(protocol.clone()).ok());
+    let surface_id = object
+        .get("surface_id")
+        .and_then(|id| id.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let name = object
+        .get("name")
+        .and_then(|name| name.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let mut defaults = Vec::new();
+    let mut migrated = false;
+    if let Some(policy) = object
+        .get_mut("target")
+        .and_then(|target| target.get_mut("payment_policy"))
+    {
+        migrated |= migrate_legacy_agent_pay_policy(policy, protocol.as_ref(), "the surface", &mut defaults);
+    }
+    for variant in object
+        .get_mut("variants")
+        .and_then(|variants| variants.as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        let label = format!(
+            "variant '{}'",
+            variant
+                .get("alias")
+                .and_then(|alias| alias.as_str())
+                .unwrap_or("?")
+        );
+        if let Some(policy) = variant
+            .get_mut("overrides")
+            .and_then(|overrides| overrides.get_mut("target"))
+            .and_then(|target| target.get_mut("payment_policy"))
+        {
+            migrated |= migrate_legacy_agent_pay_policy(policy, protocol.as_ref(), &label, &mut defaults);
+        }
+    }
+    if !defaults.is_empty() {
+        tracing::warn!(
+            surface_id,
+            surface = %name,
+            "Legacy x402 agent_pay payment policy loaded as agent_pay; it named no triggers, so: {}",
+            defaults.join("; ")
+        );
+    }
+    migrated
+}
+
+fn migrate_legacy_agent_pay_policy(
+    policy: &mut serde_json::Value,
+    protocol: Option<&SurfaceProtocol>,
+    label: &str,
+    defaults: &mut Vec<String>,
+) -> bool {
+    let is_legacy = policy
+        .get("type")
+        .and_then(|kind| kind.as_str())
+        == Some("x402")
+        && policy
+            .get("provider")
+            .and_then(|provider| provider.as_str())
+            == Some("agent_pay")
+        && policy
+            .get("enabled")
+            .and_then(|enabled| enabled.as_bool())
+            .unwrap_or(true);
+    if !is_legacy {
+        return false;
+    }
+    let Ok(config) = serde_json::from_value::<X402Config>(policy.clone()) else {
+        return false;
+    };
+    let (migrated, applied) = AgentPayPolicy::from_legacy_x402(config, protocol);
+    let Ok(rewritten) = serde_json::to_value(PaymentPolicy::AgentPay(migrated)) else {
+        return false;
+    };
+    defaults.extend(
+        applied
+            .into_iter()
+            .map(|default| format!("{label}: {default}")),
+    );
+    *policy = rewritten;
+    true
 }
 
 /// Strip removed keys from a stored [`AgentSurface`] JSON blob.
@@ -6509,5 +6949,525 @@ mod a2a_settings_tests {
         assert_eq!(resolved.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Envelope));
         assert_eq!(surface.a2a_settings(), effective(SUPPORTED_VERSIONS, A2aValidation::Full));
         assert_eq!(surface.validate_a2a_settings(), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod payment_policy_tests {
+    use super::*;
+    use crate::config::types::{A2AMethodFilter, McpPaymentTriggers};
+    use serde_json::json;
+
+    fn policy(value: serde_json::Value) -> PaymentPolicy {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn agent_pay(value: serde_json::Value) -> AgentPayPolicy {
+        match policy(value) {
+            PaymentPolicy::AgentPay(policy) => policy,
+            other => panic!("expected agent_pay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_agent_pay_policy_round_trips() {
+        let value = json!({
+            "type": "agent_pay",
+            "payment_gateway_id": "gw-1",
+            "payment_surface_id": "pay-1$pro",
+            "mcp_payment_triggers": {"mode": "match", "patterns": ["^premium_"]},
+            "a2a_method_filters": [{"method": "message/send"}],
+            "require_all": true,
+            "timeout_ms": 5000,
+            "share_payer_email": true,
+            "manifest_snapshot": {"version": "1", "payable": {"id": "pay-1$pro", "name": "", "description": ""},
+                                  "amount": {"amount": "0.01", "unit": "USDC"}, "payment_points": []}
+        });
+        let parsed = agent_pay(value.clone());
+        assert_eq!(parsed.payment_gateway_id, "gw-1");
+        assert_eq!(parsed.payment_surface_id, "pay-1$pro");
+        assert_eq!(
+            parsed.mcp_payment_triggers,
+            Some(McpPaymentTriggers::Match {
+                patterns: vec!["^premium_".into()]
+            })
+        );
+        assert_eq!(
+            parsed.a2a_method_filters,
+            Some(vec![A2AMethodFilter {
+                method: "message/send".into(),
+                message_patterns: vec![]
+            }])
+        );
+        assert!(parsed.require_all);
+        assert_eq!(parsed.timeout_ms, 5000);
+        assert!(parsed.share_payer_email);
+        assert_eq!(
+            parsed
+                .manifest_snapshot
+                .as_ref()
+                .map(|m| m.amount.amount.as_str()),
+            Some("0.01")
+        );
+        assert_eq!(serde_json::to_value(PaymentPolicy::AgentPay(parsed)).unwrap(), value);
+    }
+
+    #[test]
+    fn an_agent_pay_policy_fills_defaults_and_omits_them_when_written() {
+        let parsed =
+            agent_pay(json!({"type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1"}));
+        assert_eq!(
+            parsed,
+            AgentPayPolicy {
+                payment_gateway_id: "gw-1".into(),
+                payment_surface_id: "pay-1".into(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(parsed.timeout_ms, AGENT_PAY_DEFAULT_TIMEOUT_MS);
+        assert_eq!(
+            serde_json::to_value(PaymentPolicy::AgentPay(parsed)).unwrap(),
+            json!({"type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1", "timeout_ms": 15000})
+        );
+    }
+
+    #[test]
+    fn payment_channel_id_is_read_as_payment_surface_id() {
+        let parsed =
+            agent_pay(json!({"type": "agent_pay", "payment_gateway_id": "gw-1", "payment_channel_id": "pay-1"}));
+        assert_eq!(parsed.payment_surface_id, "pay-1");
+    }
+
+    #[test]
+    fn an_agent_pay_policy_with_an_unknown_field_is_rejected() {
+        let error = serde_json::from_value::<PaymentPolicy>(json!({
+            "type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1", "provider": "agent_pay"
+        }))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `provider`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_delegated_x402_policy_loads_as_agent_pay() {
+        let parsed = agent_pay(json!({
+            "type": "x402",
+            "provider": "agent_pay",
+            "payment_gateway_id": "gw-1",
+            "payment_channel_id": "pay-1",
+            "delegated_rail": "mpp",
+            "mcp_payment_triggers": {"mode": "all"},
+            "a2a_method_filters": [{"method": "message/send", "message_patterns": ["buy"]}],
+            "supported_networks": ["base"]
+        }));
+        assert_eq!(
+            parsed,
+            AgentPayPolicy {
+                payment_gateway_id: "gw-1".into(),
+                payment_surface_id: "pay-1".into(),
+                mcp_payment_triggers: Some(McpPaymentTriggers::All),
+                a2a_method_filters: Some(vec![A2AMethodFilter {
+                    method: "message/send".into(),
+                    message_patterns: vec!["buy".into()],
+                }]),
+                ..Default::default()
+            }
+        );
+        assert!(
+            !serde_json::to_string(&PaymentPolicy::AgentPay(parsed))
+                .unwrap()
+                .contains("delegated_rail")
+        );
+    }
+
+    #[test]
+    fn a_legacy_delegated_policy_naming_no_triggers_charges_what_its_protocol_charges() {
+        let parsed = agent_pay(json!({
+            "type": "x402", "provider": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1"
+        }));
+        assert_eq!(parsed.mcp_payment_triggers, Some(McpPaymentTriggers::All));
+        assert_eq!(parsed.a2a_method_filters, Some(legacy_default_filters()));
+        assert!(!parsed.require_all);
+    }
+
+    fn legacy_default_filters() -> Vec<A2AMethodFilter> {
+        ["message/send", "message/stream"]
+            .map(|method| A2AMethodFilter {
+                method: method.into(),
+                message_patterns: vec![],
+            })
+            .to_vec()
+    }
+
+    #[test]
+    fn a_legacy_a2a_methods_list_becomes_filters_and_empty_lists_count_as_unset() {
+        let from_methods = agent_pay(json!({
+            "type": "x402", "provider": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1",
+            "a2a_methods": ["SendMessage", "tasks/cancel"]
+        }));
+        assert_eq!(
+            from_methods.a2a_method_filters,
+            Some(
+                ["SendMessage", "tasks/cancel"]
+                    .map(|method| A2AMethodFilter {
+                        method: method.into(),
+                        message_patterns: vec![]
+                    })
+                    .to_vec()
+            )
+        );
+
+        let explicit_win = agent_pay(json!({
+            "type": "x402", "provider": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1",
+            "a2a_methods": ["tasks/cancel"], "a2a_method_filters": [{"method": "message/send", "message_patterns": ["buy"]}]
+        }));
+        assert_eq!(
+            explicit_win.a2a_method_filters,
+            Some(vec![A2AMethodFilter {
+                method: "message/send".into(),
+                message_patterns: vec!["buy".into()]
+            }])
+        );
+
+        let empty = agent_pay(json!({
+            "type": "x402", "provider": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1",
+            "a2a_methods": [], "a2a_method_filters": []
+        }));
+        assert_eq!(empty.a2a_method_filters, Some(legacy_default_filters()));
+    }
+
+    fn stored_surface(
+        protocol: &str,
+        payment_policy: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "surface_id": "s-1", "name": "legacy",
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/legacy", "protocol": protocol},
+            "target": {"endpoint": "http://upstream.example", "payment_policy": payment_policy}
+        })
+    }
+
+    fn legacy_delegated() -> serde_json::Value {
+        json!({"type": "x402", "provider": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1"})
+    }
+
+    fn migrated(mut stored: serde_json::Value) -> (serde_json::Value, bool) {
+        let changed = AgentSurface::migrate_raw_json(&mut stored).unwrap();
+        (stored, changed)
+    }
+
+    #[test]
+    fn a_stored_legacy_policy_is_rewritten_with_the_defaults_of_its_protocol() {
+        let (mcp, changed) = migrated(stored_surface("mcp", legacy_delegated()));
+        assert!(changed);
+        assert_eq!(
+            mcp["target"]["payment_policy"],
+            json!({
+                "type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1",
+                "mcp_payment_triggers": {"mode": "all"}, "timeout_ms": 15000
+            })
+        );
+        let surface: AgentSurface = serde_json::from_value(mcp).unwrap();
+        assert_eq!(
+            surface
+                .agent_pay_policy()
+                .unwrap()
+                .mcp_payment_triggers,
+            Some(McpPaymentTriggers::All)
+        );
+
+        for protocol in ["a2a", "ap2"] {
+            let (a2a, changed) = migrated(stored_surface(protocol, legacy_delegated()));
+            assert!(changed, "{protocol}");
+            assert_eq!(
+                a2a["target"]["payment_policy"],
+                json!({
+                    "type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1",
+                    "a2a_method_filters": [{"method": "message/send"}, {"method": "message/stream"}],
+                    "timeout_ms": 15000
+                }),
+                "{protocol}"
+            );
+        }
+
+        let (didcomm, changed) = migrated(stored_surface("didcomm", legacy_delegated()));
+        assert!(changed);
+        assert_eq!(
+            didcomm["target"]["payment_policy"],
+            json!({"type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1", "timeout_ms": 15000})
+        );
+    }
+
+    #[test]
+    fn a_stored_legacy_policy_keeps_the_triggers_it_names_and_maps_its_a2a_methods() {
+        let mut legacy = legacy_delegated();
+        legacy["mcp_payment_triggers"] = json!({"mode": "match", "patterns": ["^premium_"]});
+        let (mcp, _) = migrated(stored_surface("mcp", legacy));
+        assert_eq!(
+            mcp["target"]["payment_policy"]["mcp_payment_triggers"],
+            json!({"mode": "match", "patterns": ["^premium_"]})
+        );
+
+        let mut legacy = legacy_delegated();
+        legacy["a2a_methods"] = json!(["SendMessage"]);
+        let (a2a, _) = migrated(stored_surface("a2a", legacy));
+        assert_eq!(a2a["target"]["payment_policy"]["a2a_method_filters"], json!([{"method": "SendMessage"}]));
+    }
+
+    #[test]
+    fn a_stored_legacy_policy_on_a_variant_is_rewritten_too() {
+        let mut stored = stored_surface(
+            "mcp",
+            json!({"type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "p"}),
+        );
+        stored["variants"] = json!([{
+            "id": "v-1", "alias": "pro", "name": "Pro", "enabled": true,
+            "overrides": {"target": {"endpoint": "http://upstream.example", "payment_policy": legacy_delegated()}}
+        }]);
+        let (stored, changed) = migrated(stored);
+        assert!(changed);
+        assert_eq!(
+            stored["variants"][0]["overrides"]["target"]["payment_policy"]["mcp_payment_triggers"],
+            json!({"mode": "all"})
+        );
+        assert!(serde_json::from_value::<AgentSurface>(stored).is_ok());
+    }
+
+    #[test]
+    fn only_an_enabled_legacy_delegated_policy_is_rewritten() {
+        for untouched in [
+            json!({"type": "x402", "enabled": false, "provider": "agent_pay", "payment_gateway_id": "gw-1"}),
+            json!({"type": "x402", "payment_requirements": []}),
+            json!({"type": "mpp", "realm": "api", "secret_key": "$S"}),
+            json!({"type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1"}),
+        ] {
+            let (surface, changed) = migrated(stored_surface("mcp", untouched.clone()));
+            assert!(!changed, "{untouched}");
+            assert_eq!(surface["target"]["payment_policy"], untouched);
+        }
+        let (without_policy, changed) = migrated(json!({"surface_id": "s"}));
+        assert!(!changed);
+        assert_eq!(without_policy, json!({"surface_id": "s"}));
+    }
+
+    #[test]
+    fn a_disabled_legacy_delegated_policy_stays_inert() {
+        let parsed =
+            policy(json!({"type": "x402", "enabled": false, "provider": "agent_pay", "payment_gateway_id": "gw-1"}));
+        assert!(matches!(&parsed, PaymentPolicy::X402(config) if !config.enabled));
+        assert!(!parsed.is_unsupported_legacy());
+    }
+
+    #[test]
+    fn legacy_local_policies_load_but_are_unsupported() {
+        let x402 = policy(json!({"type": "x402", "payment_requirements": []}));
+        assert!(matches!(x402, PaymentPolicy::X402(_)));
+        assert!(x402.is_unsupported_legacy());
+
+        let mpp = policy(json!({"type": "mpp", "realm": "api", "secret_key": "$MPP_SECRET"}));
+        assert!(matches!(mpp, PaymentPolicy::Mpp(_)));
+        assert!(mpp.is_unsupported_legacy());
+
+        let disabled = policy(json!({"type": "mpp", "enabled": false, "realm": "api", "secret_key": "$MPP_SECRET"}));
+        assert!(!disabled.is_unsupported_legacy());
+        assert!(!PaymentPolicy::AgentPay(AgentPayPolicy::default()).is_unsupported_legacy());
+    }
+
+    #[test]
+    fn an_unknown_policy_type_is_rejected() {
+        assert!(serde_json::from_value::<PaymentPolicy>(json!({"type": "stripe"})).is_err());
+    }
+
+    #[test]
+    fn surface_accessors_expose_the_policy_and_the_unsupported_state() {
+        let mut surface = AgentSurface::default();
+        assert!(
+            surface
+                .agent_pay_policy()
+                .is_none()
+        );
+        assert!(!surface.payment_policy_unsupported());
+
+        surface.target.payment_policy = Some(policy(json!({"type": "x402"})));
+        assert!(
+            surface
+                .agent_pay_policy()
+                .is_none()
+        );
+        assert!(surface.payment_policy_unsupported());
+
+        surface.target.payment_policy =
+            Some(policy(json!({"type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1"})));
+        assert_eq!(
+            surface
+                .agent_pay_policy()
+                .map(|p| p.payment_surface_id.as_str()),
+            Some("pay-1")
+        );
+        assert!(!surface.payment_policy_unsupported());
+        assert!(
+            surface
+                .x402_config()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_complete_policy_validates_and_builds_its_fabric_target() {
+        let policy = AgentPayPolicy {
+            payment_gateway_id: "gw-1".into(),
+            payment_surface_id: "pay-1$pro".into(),
+            ..Default::default()
+        };
+        assert!(policy.validate().is_empty());
+        assert_eq!(policy.fabric_target(), Ok("fabric://gw-1/pay-1$pro".to_string()));
+    }
+
+    #[test]
+    fn a_match_trigger_with_no_pattern_is_refused_and_an_unset_trigger_charges_the_defaults() {
+        let valid = |triggers: Option<McpPaymentTriggers>| AgentPayPolicy {
+            payment_gateway_id: "gw-1".into(),
+            payment_surface_id: "pay-1".into(),
+            mcp_payment_triggers: triggers,
+            ..Default::default()
+        };
+        for patterns in [vec![], vec!["".to_string(), "  ".to_string()]] {
+            let policy = valid(Some(McpPaymentTriggers::Match { patterns }));
+            let errors = policy.validate();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].contains("needs at least one non-blank pattern"), "{errors:?}");
+            assert_eq!(
+                policy
+                    .charged_mcp_triggers()
+                    .into_owned(),
+                McpPaymentTriggers::All
+            );
+        }
+        let real = McpPaymentTriggers::Match { patterns: vec!["^a".into()] };
+        assert!(
+            valid(Some(real.clone()))
+                .validate()
+                .is_empty()
+        );
+        assert_eq!(
+            valid(Some(real.clone()))
+                .charged_mcp_triggers()
+                .into_owned(),
+            real
+        );
+        assert_eq!(
+            valid(None)
+                .charged_mcp_triggers()
+                .into_owned(),
+            McpPaymentTriggers::All
+        );
+
+        let methods = |policy: &AgentPayPolicy| {
+            policy
+                .charged_a2a_filters()
+                .into_iter()
+                .map(|filter| (filter.method, filter.message_patterns))
+                .collect::<Vec<_>>()
+        };
+        let defaults = vec![("message/send".to_string(), vec![]), ("message/stream".to_string(), vec![])];
+        assert_eq!(methods(&valid(None)), defaults);
+        let blank_method = AgentPayPolicy {
+            a2a_method_filters: Some(vec![A2AMethodFilter {
+                method: " ".into(),
+                message_patterns: vec![],
+            }]),
+            ..valid(None)
+        };
+        assert_eq!(methods(&blank_method), defaults);
+        let patterned = AgentPayPolicy {
+            a2a_method_filters: Some(vec![A2AMethodFilter {
+                method: "tasks/get".into(),
+                message_patterns: vec!["".into(), "x".into()],
+            }]),
+            ..valid(None)
+        };
+        assert_eq!(methods(&patterned), vec![("tasks/get".to_string(), vec!["x".to_string()])]);
+    }
+
+    #[test]
+    fn an_incomplete_policy_reports_every_problem() {
+        let policy = AgentPayPolicy {
+            payment_gateway_id: " ".into(),
+            payment_surface_id: "bad id".into(),
+            timeout_ms: 500,
+            mcp_payment_triggers: Some(McpPaymentTriggers::Match {
+                patterns: vec!["[unclosed".into()],
+            }),
+            a2a_method_filters: Some(vec![A2AMethodFilter {
+                method: "".into(),
+                message_patterns: vec!["(".into()],
+            }]),
+            ..Default::default()
+        };
+        let errors = policy.validate();
+        assert_eq!(errors.len(), 5, "{errors:?}");
+        assert_eq!(errors[0], "payment_gateway_id is required");
+        assert!(errors[1].starts_with("payment_surface_id must be"));
+        assert_eq!(errors[2], "timeout_ms must be between 1000 and 120000");
+        assert!(errors[3].contains("invalid mcp_payment_triggers regex '[unclosed'"));
+        assert_eq!(errors[4], "a2a_method_filters entries need a method");
+        assert!(
+            policy
+                .fabric_target()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_a2a_message_pattern_is_plain_text_and_is_never_checked_as_a_regex() {
+        let patterns = ["(", "[unclosed", "C++", "50% off (today", "buy|purchase", "a.b*c", "(?i)buy", "\\"];
+        let policy = AgentPayPolicy {
+            payment_gateway_id: "gw-1".into(),
+            payment_surface_id: "pay-1".into(),
+            a2a_method_filters: Some(vec![A2AMethodFilter {
+                method: "message/send".into(),
+                message_patterns: patterns
+                    .map(String::from)
+                    .to_vec(),
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(policy.validate(), Vec::<String>::new());
+        assert_eq!(
+            policy
+                .a2a_method_filters
+                .as_ref()
+                .map(|filters| filters[0]
+                    .message_patterns
+                    .len()),
+            Some(patterns.len())
+        );
+    }
+
+    #[test]
+    fn the_timeout_is_kept_within_bounds() {
+        let with = |timeout_ms| AgentPayPolicy {
+            timeout_ms,
+            ..Default::default()
+        };
+        assert_eq!(with(0).timeout(), std::time::Duration::from_millis(1_000));
+        assert_eq!(with(20_000).timeout(), std::time::Duration::from_millis(20_000));
+        assert_eq!(with(u64::MAX).timeout(), std::time::Duration::from_millis(120_000));
+        assert!(
+            with(120_000)
+                .validate()
+                .iter()
+                .all(|e| !e.starts_with("timeout_ms"))
+        );
+        assert!(
+            with(120_001)
+                .validate()
+                .iter()
+                .any(|e| e.starts_with("timeout_ms"))
+        );
     }
 }

@@ -3,12 +3,11 @@ import { Tab, Tabs } from 'react-bootstrap';
 import { useSearchParams } from 'react-router-dom';
 import SearchInput from '../components/shared/SearchInput';
 import PolicyListTab from './PoliciesPage/PolicyListTab';
-import PaywallPoliciesTab from './PoliciesPage/PaywallPoliciesTab';
 
-type TabKey = 'gateway' | 'agent_surface' | 'paywall';
+type TabKey = 'gateway' | 'agent_surface';
 
 const PoliciesPage: React.FC = () => {
-  const validTabs: TabKey[] = ['gateway', 'agent_surface', 'paywall'];
+  const validTabs: TabKey[] = ['gateway', 'agent_surface'];
 
   const [searchParams, setSearchParams] = useSearchParams();
   const tabFromUrl = searchParams.get('tab') as TabKey | null;
@@ -18,7 +17,6 @@ const PoliciesPage: React.FC = () => {
 
   const [gatewayCount, setGatewayCount] = useState(0);
   const [agentSurfaceCount, setAgentSurfaceCount] = useState(0);
-  const [paywallCount, setPaywallCount] = useState(0);
 
   const filterActive = searchTerm.trim().length > 0;
   const tabBadge = (count: number) => {
@@ -37,7 +35,7 @@ const PoliciesPage: React.FC = () => {
           <SearchInput
             value={searchTerm}
             onChange={setSearchTerm}
-            placeholder="Filter Gateway, Agent Surfaces, Paywall policies..."
+            placeholder="Filter Gateway and Agent Surface policies..."
             width="384px"
           />
         </div>
@@ -84,20 +82,6 @@ const PoliciesPage: React.FC = () => {
             icon="fa-exchange-alt"
             externalSearchTerm={searchTerm}
             onFilteredCountChange={setAgentSurfaceCount}
-          />
-        </Tab>
-
-        <Tab
-          eventKey="paywall"
-          title={
-            <>
-              <i className="fas fa-credit-card"></i> Paywall {tabBadge(paywallCount)}
-            </>
-          }
-        >
-          <PaywallPoliciesTab
-            externalSearchTerm={searchTerm}
-            onFilteredCountChange={setPaywallCount}
           />
         </Tab>
       </Tabs>

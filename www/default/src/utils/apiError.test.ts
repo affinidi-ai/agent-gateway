@@ -1,4 +1,4 @@
-import { extractErrorMessage, formatApiError, getErrorMessage } from './apiError';
+import { extractErrorCode, extractErrorMessage, formatApiError, getErrorMessage } from './apiError';
 
 describe('extractErrorMessage', () => {
   it('pulls the message from common JSON shapes', () => {
@@ -87,5 +87,27 @@ describe('getErrorMessage', () => {
         response: { data: '{"error":"Forbidden","details":"Limit reached"}' },
       })
     ).toBe('Limit reached');
+  });
+});
+
+describe('extractErrorCode', () => {
+  it('reads the code from a `{ error: code }` body', () => {
+    expect(extractErrorCode('{"error":"payment_manifest_not_found"}')).toBe(
+      'payment_manifest_not_found'
+    );
+  });
+
+  it('prefers `code` over `error`', () => {
+    expect(
+      extractErrorCode(
+        '{"error":"Bad Request","code":"local_payment_unsupported","details":"Replace the local x402 policy with agent_pay"}'
+      )
+    ).toBe('local_payment_unsupported');
+  });
+
+  it('has no code for a plain-text body or a human `error` label', () => {
+    expect(extractErrorCode('Service Unavailable')).toBeUndefined();
+    expect(extractErrorCode('{"error":"Bad Request"}')).toBeUndefined();
+    expect(extractErrorCode(null)).toBeUndefined();
   });
 });

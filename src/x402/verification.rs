@@ -265,6 +265,7 @@ fn unreadable_payment(
             payment_gateway_id: None,
             payment_surface_id: None,
             remote_status: None,
+            delegation: None,
         },
         Some(channel_id),
         Some(channel_name),

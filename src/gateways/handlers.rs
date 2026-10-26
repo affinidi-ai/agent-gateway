@@ -825,6 +825,151 @@ mod tests {
         assert_eq!(info.is_payment_surface, Some(true));
     }
 
+    fn surface_info(value: serde_json::Value) -> SurfaceInfo {
+        let mut base = serde_json::json!({
+            "config_id": "cfg", "name": "S", "description": "", "listen_address": "0.0.0.0:8080", "protocol": "mcp"
+        });
+        if let (Some(base), Some(extra)) = (base.as_object_mut(), value.as_object()) {
+            base.extend(extra.clone());
+        }
+        serde_json::from_value(base).expect("surface info")
+    }
+
+    #[test]
+    fn a_published_manifest_marks_a_payment_target() {
+        let info = surface_info(serde_json::json!({
+            "payment_manifest": {"amount": {"amount": "0.01", "unit": "USDC"}, "payment_points": [{"id": "x402:base"}]}
+        }));
+        assert_eq!(
+            info.payment_manifest
+                .as_ref()
+                .map(|m| m.amount.amount.as_str()),
+            Some("0.01")
+        );
+        assert!(is_payment_target(&info));
+    }
+
+    #[test]
+    fn payment_targets_follow_the_flag_the_manifest_or_the_tag() {
+        assert!(is_payment_target(&surface_info(serde_json::json!({"is_payment_surface": true}))));
+        assert!(is_payment_target(&surface_info(serde_json::json!({"tags": ["payment"]}))));
+        assert!(!is_payment_target(&surface_info(serde_json::json!({}))));
+        assert!(!is_payment_target(&surface_info(
+            serde_json::json!({"is_payment_surface": false, "payment_manifest": null})
+        )));
+    }
+
+    async fn manifest_route(
+        store: &Arc<crate::gateways::FileSystemGatewayStore>,
+        gateway_id: &str,
+        surface_id: &str,
+        context: Option<Extension<PatTenantContext>>,
+    ) -> Result<Json<PaymentManifestResponse>, (StatusCode, Json<serde_json::Value>)> {
+        get_payment_manifest(
+            Extension(store.clone()),
+            Extension(None),
+            Path((gateway_id.to_string(), surface_id.to_string())),
+            Query(GetGatewaySurfacesQuery { force_refresh: true }),
+            context,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_manifest_route_refuses_a_malformed_surface_id() {
+        let gateway = remote_gateway();
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let (status, Json(body)) = manifest_route(&store, &gateway.id, "a b", None)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, serde_json::json!({"error": "invalid_payment_surface_id"}));
+    }
+
+    #[tokio::test]
+    async fn the_manifest_route_hides_unknown_and_out_of_scope_gateways() {
+        let mut gateway = remote_gateway();
+        gateway.tenant_id = Some("tenant-a".into());
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let (status, Json(body)) = manifest_route(&store, "missing", "pay-1", None)
+            .await
+            .unwrap_err();
+        assert_eq!((status, body), (StatusCode::NOT_FOUND, serde_json::json!({"error": "gateway_not_found"})));
+
+        let other_tenant = Some(Extension(PatTenantContext {
+            token_id: "agat_test".into(),
+            tenant_id: "tenant-b".into(),
+        }));
+        let (status, _) = manifest_route(&store, &gateway.id, "pay-1", other_tenant)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn payable_manifest() -> super::super::payment_manifest::PaymentManifest {
+        serde_json::from_value(serde_json::json!({
+            "amount": {"amount": "0.01", "unit": "USDC"},
+            "payment_points": [{"id": "x402:base", "protocol": "x402"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_forced_refresh_inside_the_interval_serves_the_cached_manifest_and_says_so() {
+        use super::super::payment_manifest::{ManifestFetchError, cache_manifest, install_test_answer};
+
+        let gateway = remote_gateway();
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let manifest = payable_manifest();
+        install_test_answer(&gateway.id, "pay-1", Ok(Some(manifest.clone())));
+        let Json(first) = manifest_route(&store, &gateway.id, "pay-1", None)
+            .await
+            .unwrap();
+        assert!(!first.refresh_throttled, "the first forced refresh asks the payment gateway");
+        assert_eq!(first.manifest, manifest);
+
+        install_test_answer(&gateway.id, "pay-1", Err(ManifestFetchError::Unavailable("down".into())));
+        cache_manifest(&gateway.id, "pay-1", manifest.clone());
+        let Json(second) = manifest_route(&store, &gateway.id, "pay-1", None)
+            .await
+            .unwrap();
+        assert!(second.refresh_throttled, "a second one inside the interval is served from the cache");
+        assert_eq!(second.manifest, manifest);
+        assert_eq!(serde_json::to_value(&second).unwrap()["refresh_throttled"], true);
+        assert!(
+            serde_json::to_value(&first)
+                .unwrap()
+                .get("refresh_throttled")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn manifest_requests_past_the_concurrency_cap_are_answered_busy() {
+        let fetches = tokio::sync::Semaphore::new(2);
+        let first = manifest_fetch_permit(&fetches).unwrap();
+        let _second = manifest_fetch_permit(&fetches).unwrap();
+        let (status, Json(body)) = manifest_fetch_permit(&fetches).unwrap_err();
+        assert_eq!(
+            (status, body),
+            (StatusCode::TOO_MANY_REQUESTS, serde_json::json!({"error": "payment_manifest_busy"}))
+        );
+        drop(first);
+        assert!(manifest_fetch_permit(&fetches).is_ok(), "a finished request frees its place");
+    }
+
+    #[tokio::test]
+    async fn the_manifest_route_reports_an_unreachable_payment_gateway() {
+        let gateway = remote_gateway();
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let (status, Json(body)) = manifest_route(&store, &gateway.id, "pay-1$pro", None)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, serde_json::json!({"error": "payment_gateway_unavailable"}));
+    }
+
     fn make_user_data(
         user_id: &str,
         role: UserRole,
@@ -3333,6 +3478,10 @@ pub struct SurfaceInfo {
     /// hiding a legacy peer's surfaces behind the payment filter.
     #[serde(default)]
     pub is_payment_surface: Option<bool>,
+    /// The surface's Payment Manifest, when the peer is an agent-pay gateway
+    /// that publishes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_manifest: Option<super::payment_manifest::PaymentManifest>,
 }
 
 /// Outcome of a failed surface discovery. `status` / `message` reproduce the
@@ -3402,93 +3551,21 @@ async fn discover_gateway_surfaces<S: GatewayStore>(
         .map_err(|e| DiscoveryFailure::hard(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {e}")))?
         .ok_or_else(|| DiscoveryFailure::hard(StatusCode::NOT_FOUND, "Gateway not found"))?;
 
-    let listener_mgr = listener_manager
-        .as_ref()
-        .ok_or_else(|| DiscoveryFailure::hard(StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available"))?;
-
-    let gateway_listener = listener_mgr
-        .get_listener(gateway_id)
-        .await
-        .ok_or_else(|| {
-            debug!("[{request_id}] No active listener found for gateway {gateway_id}");
-            DiscoveryFailure::hard(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Gateway not connected - no active WebSocket listener",
-            )
-        })?;
-
-    debug!("[{request_id}] Found active WebSocket listener for gateway");
-
-    // Instant recovery: ensure our mediator connection is live before querying,
-    // so a flushed account is re-registered on the first attempt rather than
-    // timing out with "gateway did not respond".
-    let gateway_listener = ensure_live_listener(listener_mgr, gateway_listener)
-        .await
-        .map_err(|(status, message)| DiscoveryFailure::hard(status, message))?;
-
-    // Build get-channels message
-    use crate::messages::MessageType;
-    use affinidi_messaging_didcomm::Message as DIDCommMessage;
-    use serde_json::json;
-
-    let get_channels_message = DIDCommMessage::build(
-        uuid::Uuid::new_v4().to_string(),
-        MessageType::GetSurfaces
-            .as_str()
-            .to_string(),
-        json!({
+    let response = query_gateway(
+        listener_manager.as_deref(),
+        &gateway,
+        &request_id,
+        MessageType::GetSurfaces,
+        serde_json::json!({
             "request_id": request_id,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         }),
+        SURFACES_RESPONSE_TIMEOUT,
     )
-    .from(
-        gateway_listener
-            .gateway_did
-            .clone(),
-    )
-    .to(gateway.did.clone())
-    .thid(uuid::Uuid::new_v4().to_string())
-    .finalize();
-
-    // Pre-resolve and cache the gateway DID (best-effort).
-    let did_cache = listener_mgr.get_did_cache();
-    let tdk_state = gateway_listener
-        .client
-        .atm()
-        .get_tdk();
-    if let Err(e) = did_cache
-        .resolve_and_cache_for_atm(&gateway.did, tdk_state)
-        .await
-    {
-        warn!("[{request_id}] Failed to pre-resolve gateway DID: {e}. Continuing anyway.");
-    }
-
-    gateway_listener
-        .client
-        .pack_and_send_message(&get_channels_message, &gateway.did, &gateway_listener.gateway_did)
-        .await
-        .map_err(|e| {
-            error!(gateway_id = %gateway.id, error = %e, "Failed to send get-channels");
-            DiscoveryFailure::hard(StatusCode::INTERNAL_SERVER_ERROR, "Failed to send get-channels".to_string())
-        })?;
-
-    // Wait for get-channels-response via WebSocket (5s timeout).
-    let response = gateway_listener
-        .client
-        .atm()
-        .message_pickup()
-        .live_stream_get(
-            gateway_listener
-                .client
-                .profile(),
-            &get_channels_message.id,
-            SURFACES_RESPONSE_TIMEOUT,
-            true, // auto_delete
-        )
-        .await;
+    .await;
 
     match response {
-        Ok(Some((response_msg, _metadata))) => {
+        Ok(Some(response_msg)) => {
             if response_msg.typ == MessageType::GetSurfacesResponse.as_str() {
                 let channels: Vec<SurfaceInfo> = response_msg
                     .body
@@ -3516,13 +3593,202 @@ async fn discover_gateway_surfaces<S: GatewayStore>(
                 .await;
             Err(DiscoveryFailure::soft(StatusCode::GATEWAY_TIMEOUT, "Request timed out - gateway did not respond"))
         }
-        Err(e) => {
-            cache
-                .set_error(gateway_id.to_string(), format!("Request failed: {e:?}"))
-                .await;
-            Err(DiscoveryFailure::soft(StatusCode::BAD_GATEWAY, format!("Request failed: {e:?}")))
+        Err(failure) => {
+            if failure.soft {
+                cache
+                    .set_error(gateway_id.to_string(), failure.message.clone())
+                    .await;
+            }
+            Err(failure)
         }
     }
+}
+
+/// Send one gateway-query message to a connected Remote gateway and wait up to
+/// `wait` for the reply. `Ok(None)` means the peer did not answer in time; a
+/// failure to receive is a soft failure.
+async fn query_gateway(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+    request_id: &str,
+    message_type: MessageType,
+    body: serde_json::Value,
+    wait: std::time::Duration,
+) -> Result<Option<affinidi_messaging_didcomm::Message>, DiscoveryFailure> {
+    use affinidi_messaging_didcomm::Message as DIDCommMessage;
+
+    let listener_mgr = listener_manager
+        .ok_or_else(|| DiscoveryFailure::hard(StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available"))?;
+
+    let gateway_listener = listener_mgr
+        .get_listener(&gateway.id)
+        .await
+        .ok_or_else(|| {
+            debug!("[{request_id}] No active listener found for gateway {}", gateway.id);
+            DiscoveryFailure::hard(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway not connected - no active WebSocket listener",
+            )
+        })?;
+
+    // Instant recovery: ensure our mediator connection is live before querying,
+    // so a flushed account is re-registered on the first attempt rather than
+    // timing out with "gateway did not respond".
+    let gateway_listener = ensure_live_listener(listener_mgr, gateway_listener)
+        .await
+        .map_err(|(status, message)| DiscoveryFailure::hard(status, message))?;
+
+    let message = DIDCommMessage::build(
+        uuid::Uuid::new_v4().to_string(),
+        message_type
+            .as_str()
+            .to_string(),
+        body,
+    )
+    .from(
+        gateway_listener
+            .gateway_did
+            .clone(),
+    )
+    .to(gateway.did.clone())
+    .thid(uuid::Uuid::new_v4().to_string())
+    .finalize();
+
+    // Pre-resolve and cache the gateway DID (best-effort).
+    let did_cache = listener_mgr.get_did_cache();
+    let tdk_state = gateway_listener
+        .client
+        .atm()
+        .get_tdk();
+    if let Err(e) = did_cache
+        .resolve_and_cache_for_atm(&gateway.did, tdk_state)
+        .await
+    {
+        warn!("[{request_id}] Failed to pre-resolve gateway DID: {e}. Continuing anyway.");
+    }
+
+    gateway_listener
+        .client
+        .pack_and_send_message(&message, &gateway.did, &gateway_listener.gateway_did)
+        .await
+        .map_err(|e| {
+            error!(gateway_id = %gateway.id, error = %e, "Failed to send {}", message_type);
+            DiscoveryFailure::hard(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send {}", message_type))
+        })?;
+
+    gateway_listener
+        .client
+        .atm()
+        .message_pickup()
+        .live_stream_get(
+            gateway_listener
+                .client
+                .profile(),
+            &message.id,
+            wait,
+            true, // auto_delete
+        )
+        .await
+        .map(|response| response.map(|(message, _metadata)| message))
+        .map_err(|e| DiscoveryFailure::soft(StatusCode::BAD_GATEWAY, format!("Request failed: {e:?}")))
+}
+
+/// Fetch the Payment Manifest of `surface_id` (optionally `<id>$<alias>`) from
+/// a connected agent-pay gateway over the fabric, reusing a payable manifest
+/// fetched in the last minute unless `force_refresh`. `Ok(None)` means the peer
+/// has no payment surface by that id; that and a manifest with no payment
+/// point are never reused.
+pub async fn fetch_payment_manifest(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+    surface_id: &str,
+    force_refresh: bool,
+) -> Result<Option<super::payment_manifest::PaymentManifest>, super::payment_manifest::ManifestFetchError> {
+    use super::payment_manifest::{ManifestFetchError, cache_manifest, cached_manifest, parse_manifest_response};
+
+    #[cfg(test)]
+    if let Some(answer) = super::payment_manifest::test_answer(&gateway.id, surface_id) {
+        return answer;
+    }
+    if !force_refresh && let Some(manifest) = cached_manifest(&gateway.id, surface_id) {
+        return Ok(Some(manifest));
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = query_gateway(
+        listener_manager,
+        gateway,
+        &request_id,
+        MessageType::GetManifest,
+        serde_json::json!({ "channel_id": surface_id }),
+        SURFACES_RESPONSE_TIMEOUT,
+    )
+    .await
+    .map_err(|failure| ManifestFetchError::Unavailable(failure.message))?
+    .ok_or_else(|| ManifestFetchError::Unavailable("the payment gateway did not respond".to_string()))?;
+    if response.typ != MessageType::GetManifestResponse.as_str() {
+        return Err(ManifestFetchError::Rejected(format!("unexpected message type {}", response.typ)));
+    }
+    let manifest = parse_manifest_response(&response.body)?;
+    if let Some(payable) = manifest
+        .as_ref()
+        .filter(|manifest| manifest.is_payable())
+    {
+        cache_manifest(&gateway.id, surface_id, payable.clone());
+    }
+    Ok(manifest)
+}
+
+/// Ask a connected agent-pay gateway for the review state of the held payment
+/// `case_id`, waiting up to `wait`. `Ok(None)` means the peer does not know the
+/// case.
+pub async fn fetch_payment_case_status(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+    case_id: &str,
+    wait: std::time::Duration,
+) -> Result<Option<super::payment_case::PaymentCaseState>, super::payment_case::CaseStatusError> {
+    use super::payment_case::{CaseStatusError, parse_case_status_response};
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = query_gateway(
+        listener_manager,
+        gateway,
+        &request_id,
+        MessageType::PaymentCaseStatus,
+        serde_json::json!({ "case_id": case_id }),
+        wait,
+    )
+    .await
+    .map_err(|failure| CaseStatusError::Unavailable(failure.message))?
+    .ok_or_else(|| CaseStatusError::Unavailable("the payment gateway did not respond".to_string()))?;
+    if response.typ != MessageType::PaymentCaseStatusResponse.as_str() {
+        return Err(CaseStatusError::Rejected(format!("unexpected message type {}", response.typ)));
+    }
+    parse_case_status_response(&response.body, case_id)
+}
+
+/// Sends a `payment-settle` or `payment-settlement-status` request to a
+/// connected agent-pay gateway and returns the body of its answer, waiting up
+/// to `wait`.
+pub async fn query_payment_settlement(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+    message_type: MessageType,
+    expected: MessageType,
+    body: serde_json::Value,
+    wait: std::time::Duration,
+) -> Result<serde_json::Value, super::payment_case::CaseStatusError> {
+    use super::payment_case::CaseStatusError;
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = query_gateway(listener_manager, gateway, &request_id, message_type, body, wait)
+        .await
+        .map_err(|failure| CaseStatusError::Unavailable(failure.message))?
+        .ok_or_else(|| CaseStatusError::Unavailable("the payment gateway did not respond".to_string()))?;
+    if response.typ != expected.as_str() {
+        return Err(CaseStatusError::Rejected(format!("unexpected message type {}", response.typ)));
+    }
+    Ok(response.body)
 }
 
 /// Query available channels from a remote gateway.
@@ -3559,6 +3825,104 @@ pub async fn get_gateway_surfaces<S: GatewayStore>(
     }
 }
 
+/// Response of [`get_payment_manifest`].
+#[derive(Debug, Serialize)]
+pub struct PaymentManifestResponse {
+    pub gateway_id: String,
+    pub surface_id: String,
+    pub manifest: super::payment_manifest::PaymentManifest,
+    /// A forced refresh was asked for too soon after the last one, so this is
+    /// the cached manifest.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refresh_throttled: bool,
+}
+
+/// How many manifest requests may wait on payment gateways at once; a request
+/// past it is answered with `429`, so the route cannot flood the fabric.
+const CONCURRENT_MANIFEST_FETCHES: usize = 4;
+
+static MANIFEST_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CONCURRENT_MANIFEST_FETCHES);
+
+fn manifest_error(
+    status: StatusCode,
+    code: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({ "error": code })))
+}
+
+fn manifest_fetch_permit(
+    fetches: &tokio::sync::Semaphore
+) -> Result<tokio::sync::SemaphorePermit<'_>, (StatusCode, Json<serde_json::Value>)> {
+    fetches
+        .try_acquire()
+        .map_err(|_| manifest_error(StatusCode::TOO_MANY_REQUESTS, "payment_manifest_busy"))
+}
+
+/// `GET /v1/gateways/{id}/surfaces/{surface_id}/payment-manifest`: the Payment
+/// Manifest a connected agent-pay gateway publishes for one of its payment
+/// surfaces. `surface_id` may carry a `$alias`. A payable manifest is reused
+/// for a minute; `?force_refresh=true` skips that cache, but a manifest is
+/// forced at most once every ten seconds: inside that time the cached manifest
+/// is served with `refresh_throttled`. At most four requests wait on payment
+/// gateways at once, and the others are answered with `429
+/// payment_manifest_busy`.
+pub async fn get_payment_manifest<S: GatewayStore>(
+    Extension(store): Extension<Arc<S>>,
+    Extension(listener_manager): Extension<Option<Arc<ConnectionPointListenerManager>>>,
+    Path((gateway_id, surface_id)): Path<(String, String)>,
+    Query(query): Query<GetGatewaySurfacesQuery>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Result<Json<PaymentManifestResponse>, (StatusCode, Json<serde_json::Value>)> {
+    use super::payment_manifest::{
+        ManifestFetchError, cached_manifest, forced_refresh_due, is_valid_payment_surface_id,
+    };
+
+    if !is_valid_payment_surface_id(&surface_id) {
+        return Err(manifest_error(StatusCode::BAD_REQUEST, "invalid_payment_surface_id"));
+    }
+    let gateway = store
+        .get(&gateway_id)
+        .await
+        .map_err(|error| {
+            error!(gateway_id = %gateway_id, error = %error, "Failed to load gateway for payment manifest");
+            manifest_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        })?
+        .filter(|gateway| gateway_allowed(gateway, &context, &scope))
+        .ok_or_else(|| manifest_error(StatusCode::NOT_FOUND, "gateway_not_found"))?;
+    if gateway.gateway_type != GatewayType::Remote {
+        return Err(manifest_error(StatusCode::NOT_FOUND, "gateway_not_found"));
+    }
+    let force_refresh = query.force_refresh && forced_refresh_due(&gateway.id, &surface_id, std::time::Instant::now());
+    let refresh_throttled = query.force_refresh && !force_refresh;
+    if refresh_throttled && let Some(manifest) = cached_manifest(&gateway.id, &surface_id) {
+        return Ok(Json(PaymentManifestResponse {
+            gateway_id,
+            surface_id,
+            manifest,
+            refresh_throttled,
+        }));
+    }
+    let _fetching = manifest_fetch_permit(&MANIFEST_FETCHES)?;
+    match fetch_payment_manifest(listener_manager.as_deref(), &gateway, &surface_id, force_refresh).await {
+        Ok(Some(manifest)) => Ok(Json(PaymentManifestResponse {
+            gateway_id,
+            surface_id,
+            manifest,
+            refresh_throttled,
+        })),
+        Ok(None) => Err(manifest_error(StatusCode::NOT_FOUND, "payment_manifest_not_found")),
+        Err(ManifestFetchError::Rejected(reason)) => {
+            warn!(gateway_id = %gateway_id, %reason, "Payment gateway refused the manifest request");
+            Err(manifest_error(StatusCode::BAD_GATEWAY, "payment_manifest_rejected"))
+        }
+        Err(ManifestFetchError::Unavailable(reason)) => {
+            warn!(gateway_id = %gateway_id, %reason, "Payment gateway unavailable for the manifest request");
+            Err(manifest_error(StatusCode::SERVICE_UNAVAILABLE, "payment_gateway_unavailable"))
+        }
+    }
+}
+
 /// A connected remote gateway that exposes at least one payment surface,
 /// together with those surfaces. Returned by [`list_payment_gateways`].
 #[derive(Debug, Serialize)]
@@ -3569,11 +3933,14 @@ pub struct PaymentGatewayInfo {
 }
 
 /// A discovered surface is a payment delegation target when the remote marks it
-/// as a payment surface (`is_payment_surface == true`), or exposes it through a
-/// connection point the operator tagged `payment` (fallback for peers that
-/// predate the authoritative flag).
+/// as a payment surface (`is_payment_surface == true`) or publishes a Payment
+/// Manifest for it, or exposes it through a connection point the operator
+/// tagged `payment` (fallback for peers that predate both signals).
 fn is_payment_target(surface: &SurfaceInfo) -> bool {
     surface.is_payment_surface == Some(true)
+        || surface
+            .payment_manifest
+            .is_some()
         || surface
             .tags
             .iter()

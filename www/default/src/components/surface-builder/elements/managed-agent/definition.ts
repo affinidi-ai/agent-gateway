@@ -217,10 +217,6 @@ export const managedAgentDefinition: NodeDefinition = {
       if (c.fabric_target_name) tgt.fabric_target_name = c.fabric_target_name;
       if (c.fabric_delegated_credentials === true) tgt.fabric_delegated_credentials = true;
     }
-    if (c.mpp_auto_pay) {
-      tgt.mpp_auto_pay = true;
-      if (c.mpp_auto_pay_max_amount) tgt.mpp_auto_pay_max_amount = c.mpp_auto_pay_max_amount;
-    }
     if (node) {
       tgt.identity_injection = { inject_vp: c.inject_vp !== false };
     }

@@ -7,14 +7,9 @@ import { DOCS_URL } from '../../../../config/docs';
  * One row of the variants list as edited in the panel and stored in
  * the singleton's config. `id` is a UUID assigned at row creation.
  *
- * The variant payload is
- * identity-only — overrides for AP / Target / Transit live on the
- * `surface.variants[].overrides` shape and are produced by the
- * upcoming per-element `VariantEditingContext`. The override fields
- * that previously appeared on this row (endpoint, policy ids, MPP,
- * agent card, extensions) were the legacy `target.variants` shape and
- * have been removed: variants now switch the entire surface, not
- * individual Target fields.
+ * The variant payload is identity-only. Overrides for AP / Target /
+ * Transit live on `surface.variants[].overrides`; variants switch the
+ * entire surface, not individual Target fields.
  */
 export interface VariantEntry {
   id: string;

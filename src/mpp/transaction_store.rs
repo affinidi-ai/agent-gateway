@@ -120,6 +120,7 @@ fn emit_mpp_payment_audit(
             payment_gateway_id: None,
             payment_surface_id: None,
             remote_status: None,
+            delegation: None,
         },
         Some(&txn.surface_id),
         Some(&txn.channel_name),

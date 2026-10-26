@@ -132,7 +132,7 @@ ssi = "0.16.0"
 ssi-json-ld = "0.3.3"
 ssi-claims-core = "0.2.0"
 did-peer = "0.7.5"
-uuid = { version = "1.18.1", features = ["v4"] }
+uuid = { version = "1.18.1", features = ["v4", "v7"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 cookie = { version = "0.18.1", features = ["percent-encode"] }
 base64 = "0.22.1"

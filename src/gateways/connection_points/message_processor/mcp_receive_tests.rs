@@ -77,6 +77,16 @@ async fn receive(message: &ReceivedMessage) -> (Value, Value) {
     (response_body, envelope)
 }
 
+/// A child process started to isolate globals runs one test; one that matched
+/// no test would also exit successfully.
+fn assert_ran_exactly_one_test(output: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test result: ok. 1 passed;"),
+        "the isolated child did not run exactly one test:\n{stdout}"
+    );
+}
+
 #[test]
 fn fabric_policy_context_matches_direct_admission_without_changing_legacy_shape() {
     use crate::mcp::request_validation::{LegacySessionEvidence, validate_mcp_post};
@@ -349,6 +359,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
 
@@ -1086,6 +1097,7 @@ fn fabric_consent_uses_receiver_authority_and_rejects_cross_peer_retries() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
     std::thread::Builder::new()
@@ -1616,81 +1628,133 @@ async fn fabric_consent_flow() {
         .unwrap();
     assert!(binding.route == ContinuationRoute::Fabric { peer_did: sender_did.clone() });
     assert_eq!(binding.resource, "https://receiver.example/mcp");
-    for format in ["json", "sse"] {
-        surface.target.endpoint = format!("http://{target_address}/{format}");
+    surface.target.endpoint = format!("http://{target_address}/json");
+    surface.target.payment_policy =
+        Some(serde_json::from_value(json!({"type": "x402", "mcp_payment_triggers": {"mode": "all"}})).unwrap());
+    body["id"] = json!(20);
+    let before = calls.lock().await.len();
+    let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
+    let response = decode(
+        Box::pin(super::process_forward_request_with_mcp_runtime(
+            &message,
+            Some(stream),
+            versions,
+            Some(runtime.clone()),
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(response, (503, json!({"error": "payment_unavailable"})));
+    assert_eq!(calls.lock().await.len(), before, "a local payment surface never reaches the Target");
+    {
+        use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+        fn receipt_header(result: &ProcessingResult) -> Option<String> {
+            match result {
+                ProcessingResult::StreamingResponse { response } => response
+                    .headers()
+                    .get("payment-response")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                ProcessingResult::RequiresResponse { response_body, .. } => {
+                    response_body["headers"]["payment-response"]
+                        .as_str()
+                        .map(str::to_string)
+                }
+                _ => None,
+            }
+        }
+
+        let gate = MockGate::answering(200, &[("Payment-Receipt", "consent-flow-receipt")], json!({}))
+            .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+        install_test_transport("consent-flow-gate", gate.clone());
         surface.target.payment_policy = Some(
             serde_json::from_value(json!({
-                "type": "x402", "enabled": true, "verification_mode": "mock", "settlement_mode": "none",
-                "payment_requirements": [{"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300}],
+                "type": "agent_pay", "payment_gateway_id": "consent-flow-gate", "payment_surface_id": "pay-1",
                 "mcp_payment_triggers": {"mode": "all"}
             }))
             .unwrap(),
         );
-        body["id"] = json!(20);
-        body["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("requestState");
-        body["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("inputResponses");
-        let original = crate::mcp::request_validation::ValidatedModernMessage {
-            protocol_version: MCP_MODERN_VERSION.into(),
-            client_capabilities: Some(json!({"elicitation": {"url": {}}})),
-            client_info: None,
-            method: "tools/call".into(),
-            params: Some(body["params"].clone()),
-            id: Some(body["id"].clone()),
-            kind: crate::mcp::request_validation::McpMessageKind::Request,
+        let request = |body: &Value, surface: &AgentSurface, signature: Option<&str>| {
+            let (mut message, mut stream) = make_request(body, surface, &sender_did, &bearer);
+            if let Some(signature) = signature {
+                stream
+                    .headers
+                    .insert("payment-signature", signature.parse().unwrap());
+                message.message_body["headers"]["PAYMENT-SIGNATURE"] = json!(signature);
+            }
+            (message, stream)
         };
-        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
-            subject: "user".into(),
-            claims: json!({"iss": "https://receiver.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
+        let fresh = |body: &mut Value, id: u64| {
+            body["id"] = json!(id);
+            for field in ["requestState", "inputResponses"] {
+                body["params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+            }
         };
-        let binding = crate::mcp::continuations::delegation::make_binding(
-            "receiver",
-            &surface,
-            None,
-            ContinuationRoute::Fabric { peer_did: sender_did.clone() },
-            surface
-                .mcp_http
-                .as_ref()
-                .unwrap()
-                .authorization
-                .as_ref()
-                .unwrap(),
-            &provider,
-            vec!["read".into()],
-            &holder_did,
-            &identity,
-            &original,
-        )
-        .unwrap();
-        let response = runtime
-            .service
-            .wrap_upstream_response(
-                &original,
-                binding,
-                json!({"jsonrpc": "2.0", "id": 20, "result": {
-                    "resultType": "input_required", "requestState": "remote opaque state",
-                    "inputRequests": {"remote-input": {"method": "elicitation/create", "params": {
-                        "mode": "url", "url": "https://target.example/consent", "message": "Authorize"
-                    }}}
-                }}),
-                300,
-                now,
-            )
-            .await
-            .unwrap();
-        body["id"] = json!(21);
-        body["params"]["requestState"] = response["result"]["requestState"].clone();
-        body["params"]["inputResponses"] = json!({"remote-input": {"action": "accept"}});
-        let before = calls.lock().await.len();
-        for _attempt in 0..2 {
-            let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
-            let response = decode(
+
+        for format in ["json", "sse"] {
+            surface.target.endpoint = format!("http://{target_address}/{format}");
+            fresh(&mut body, 30);
+            let signature = format!("consent-flow-{format}");
+            let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+            let (message, stream) = request(&body, &surface, Some(&signature));
+            let paid = Box::pin(super::process_forward_request_with_mcp_runtime(
+                &message,
+                Some(stream),
+                versions,
+                Some(runtime.clone()),
+            ))
+            .await;
+            assert_eq!(receipt_header(&paid).as_deref(), Some("consent-flow-receipt"), "{format}");
+            let (status, paid) = decode(paid).await;
+            assert_eq!(status, 200, "{format}: {paid}");
+            assert_eq!(paid["result"]["resultType"], "input_required", "{format}");
+            assert_ne!(paid["result"]["requestState"], "remote opaque state", "{format}");
+            assert_eq!(gate.calls(), hops + 1, "{format}: the first round is charged once");
+            assert_eq!(gate.last().headers["PAYMENT-SIGNATURE"], signature);
+
+            body["id"] = json!(31);
+            body["params"]["requestState"] = paid["result"]["requestState"].clone();
+            body["params"]["inputResponses"] = json!({"remote-input": {"action": "accept"}});
+            let (message, stream) = request(&body, &surface, None);
+            let continued = Box::pin(super::process_forward_request_with_mcp_runtime(
+                &message,
+                Some(stream),
+                versions,
+                Some(runtime.clone()),
+            ))
+            .await;
+            assert_eq!(
+                receipt_header(&continued).as_deref(),
+                Some("consent-flow-receipt"),
+                "{format}: the continuation carries the receipt it already holds"
+            );
+            let (status, continued) = decode(continued).await;
+            assert_eq!(status, 200, "{format}: {continued}");
+            assert_eq!(continued["result"]["resultType"], "complete", "{format}");
+            assert_eq!(continued["result"]["_meta"]["org.paymentauth/receipt"], "consent-flow-receipt", "{format}");
+            assert_eq!(gate.calls(), hops + 1, "{format}: a continuation round is not charged again");
+            {
+                let observed = calls.lock().await;
+                assert_eq!(observed.len(), forwarded + 2, "{format}");
+                for (headers, upstream) in &observed[forwarded..] {
+                    assert_eq!(headers["authorization"], "Bearer verified-remote-credential");
+                    assert!(!headers.contains_key("payment-signature"), "{format}: {headers:?}");
+                    assert!(
+                        upstream["params"]["arguments"]
+                            .get("payment_signature")
+                            .is_none()
+                    );
+                }
+                assert_eq!(observed[forwarded + 1].1["params"]["requestState"], "remote opaque state");
+            }
+
+            body["id"] = json!(32);
+            let (message, stream) = request(&body, &surface, None);
+            let replayed = decode(
                 Box::pin(super::process_forward_request_with_mcp_runtime(
                     &message,
                     Some(stream),
@@ -1700,34 +1764,16 @@ async fn fabric_consent_flow() {
                 .await,
             )
             .await;
-            assert_eq!(response.0, 402, "{:?}", response.1);
-            assert_eq!(calls.lock().await.len(), before);
+            assert_eq!(replayed.0, 409, "{format}: {:?}", replayed.1);
+            assert_eq!(gate.calls(), hops + 1, "{format}: a replayed continuation is not charged");
+            assert_eq!(calls.lock().await.len(), forwarded + 2, "{format}: nor forwarded");
         }
-        body["id"] = json!(22);
-        let signature = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
-            serde_json::to_vec(&json!({
-                "x402Version": 2,
-                "resource": {"url": "https://receiver.example/mcp", "description": "test", "mimeType": "application/json"},
-                "accepted": {"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300},
-                "payload": {"signature": "fixture-payment"}
-            })).unwrap());
-        let paid_request = || {
-            let mut paid_body = body.clone();
-            if format == "sse" {
-                paid_body["params"]["arguments"]["payment_signature"] = json!(signature);
-            }
-            let (mut message, mut stream) = make_request(&paid_body, &surface, &sender_did, &bearer);
-            if format == "json" {
-                stream
-                    .headers
-                    .insert("payment-signature", signature.parse().unwrap());
-                message.message_body["headers"]["pAyMeNt-SiGnAtUrE"] = json!(signature);
-            }
-            (message, stream)
-        };
-        let (first_message, first_stream) = paid_request();
-        let (second_message, second_stream) = paid_request();
+
+        surface.target.endpoint = format!("http://{target_address}/json");
+        fresh(&mut body, 40);
+        let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+        let (first_message, first_stream) = request(&body, &surface, Some("racing-consent-flow"));
+        let (second_message, second_stream) = request(&body, &surface, Some("racing-consent-flow"));
         let (first, second) = tokio::join!(
             Box::pin(super::process_forward_request_with_mcp_runtime(
                 &first_message,
@@ -1742,136 +1788,20 @@ async fn fabric_consent_flow() {
                 Some(runtime.clone()),
             )),
         );
-        for result in [&first, &second] {
-            if let ProcessingResult::StreamingResponse { response } = result {
-                let receipt = response
-                    .headers()
-                    .get("payment-response")
-                    .expect("receiver receipt");
-                let receipt =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, receipt.as_bytes()).unwrap();
-                let receipt: Value = serde_json::from_slice(&receipt).unwrap();
-                assert_eq!(receipt["verified"], true);
-                assert_eq!(receipt["settled"], false);
-            }
-        }
-        let first = decode(first).await;
-        let second = decode(second).await;
-        assert!(matches!((first.0, second.0), (200, 409) | (409, 200)), "{first:?}; {second:?}");
-        let observed = calls.lock().await;
-        assert_eq!(observed.len(), before + 1);
-        assert_eq!(observed[before].0["authorization"], "Bearer verified-remote-credential");
-        assert!(
-            !observed[before]
-                .0
-                .contains_key("payment-signature")
-        );
-        assert!(
-            observed[before].1["params"]["arguments"]
-                .get("payment_signature")
-                .is_none()
-        );
-        assert_eq!(observed[before].1["params"]["requestState"], "remote opaque state");
-    }
-    let transactions = Arc::new(
-        crate::x402::TransactionStore::new(
-            directory
-                .path()
-                .join("payments"),
-        )
-        .await
-        .unwrap(),
-    );
-    super::init_transaction_store(transactions.clone()).await;
-    for format in ["json", "sse"] {
-        surface.target.endpoint = format!("http://{target_address}/{format}");
-        body["id"] = json!(30);
-        body["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("requestState");
-        body["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("inputResponses");
-        let signature = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            serde_json::to_vec(&json!({
-                "x402Version": 2,
-                "accepted": {"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300},
-                "payload": {"signature": format!("receiver-round-{format}")}
-            }))
-            .unwrap(),
-        );
-        let (message, mut stream) = make_request(&body, &surface, &sender_did, &bearer);
-        stream
-            .headers
-            .insert("payment-signature", signature.parse().unwrap());
-        let calls_before = calls.lock().await.len();
-        let payments_before = transactions
-            .list_all()
-            .await
-            .len();
-        let response = Box::pin(super::process_forward_request_with_mcp_runtime(
-            &message,
-            Some(stream),
-            versions,
-            Some(runtime.clone()),
-        ))
-        .await;
-        let receipt = match &response {
-            ProcessingResult::StreamingResponse { response } => response
-                .headers()
-                .get("payment-response")
-                .unwrap()
-                .clone(),
-            other => panic!("expected paid streaming response: {other:?}"),
+        let (first, second) = (decode(first).await, decode(second).await);
+        let (paid, refused) = match (first.0, second.0) {
+            (200, 402) => (first, second),
+            (402, 200) => (second, first),
+            other => panic!("one payment pays for one call: {other:?}; {first:?}; {second:?}"),
         };
-        let (status, response) = decode(response).await;
-        assert_eq!(status, 200, "{response}");
-        assert_eq!(response["result"]["resultType"], "input_required");
-        assert_eq!(
-            transactions
-                .list_all()
-                .await
-                .len(),
-            payments_before + 1
-        );
-        body["id"] = json!(31);
-        body["params"]["requestState"] = response["result"]["requestState"].clone();
-        body["params"]["inputResponses"] = json!({"remote-input": {"action": "accept"}});
-        let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
-        let response = Box::pin(super::process_forward_request_with_mcp_runtime(
-            &message,
-            Some(stream),
-            versions,
-            Some(runtime.clone()),
-        ))
-        .await;
-        match &response {
-            ProcessingResult::StreamingResponse { response } => assert_eq!(
-                response
-                    .headers()
-                    .get("payment-response"),
-                Some(&receipt)
-            ),
-            other => panic!("expected paid continuation response: {other:?}"),
-        }
-        let (status, response) = decode(response).await;
-        assert_eq!(status, 200, "{response}");
-        assert_eq!(response["result"]["resultType"], "complete");
-        assert_eq!(
-            transactions
-                .list_all()
-                .await
-                .len(),
-            payments_before + 1
-        );
-        assert_eq!(calls.lock().await.len(), calls_before + 2);
-        body["id"] = json!(32);
-        let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
-        let response = decode(
+        assert_eq!(paid.1["result"]["resultType"], "input_required");
+        assert_eq!(refused.1["error"]["code"], 1002, "{:?}", refused.1);
+        assert_eq!(refused.1["error"]["data"]["failure"]["reason"], "payment_already_used");
+        assert_eq!(calls.lock().await.len(), forwarded + 1, "the credential reaches the Target once");
+        assert_eq!(gate.calls(), hops + 3, "two payments, and the fresh challenge for the replayed one");
+
+        let (message, stream) = request(&body, &surface, Some("continuation-consent-flow"));
+        let paid = decode(
             Box::pin(super::process_forward_request_with_mcp_runtime(
                 &message,
                 Some(stream),
@@ -1881,15 +1811,31 @@ async fn fabric_consent_flow() {
             .await,
         )
         .await;
-        assert_eq!(response.0, 409, "{:?}", response.1);
-        assert_eq!(
-            transactions
-                .list_all()
-                .await
-                .len(),
-            payments_before + 1
+        assert_eq!(paid.0, 200, "{:?}", paid.1);
+        body["id"] = json!(41);
+        body["params"]["requestState"] = paid.1["result"]["requestState"].clone();
+        body["params"]["inputResponses"] = json!({"remote-input": {"action": "accept"}});
+        let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+        let (first_message, first_stream) = request(&body, &surface, None);
+        let (second_message, second_stream) = request(&body, &surface, None);
+        let (first, second) = tokio::join!(
+            Box::pin(super::process_forward_request_with_mcp_runtime(
+                &first_message,
+                Some(first_stream),
+                versions,
+                Some(runtime.clone()),
+            )),
+            Box::pin(super::process_forward_request_with_mcp_runtime(
+                &second_message,
+                Some(second_stream),
+                versions,
+                Some(runtime.clone()),
+            )),
         );
-        assert_eq!(calls.lock().await.len(), calls_before + 2);
+        let (first, second) = (decode(first).await, decode(second).await);
+        assert!(matches!((first.0, second.0), (200, 409) | (409, 200)), "{first:?}; {second:?}");
+        assert_eq!(gate.calls(), hops, "neither continuation round reaches agent-pay");
+        assert_eq!(calls.lock().await.len(), forwarded + 1, "the continuation is forwarded once");
     }
     surface.target.payment_policy = None;
     for reject in [false, true] {
@@ -2322,6 +2268,7 @@ fn fabric_policies_see_the_same_mcp_input_as_direct() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -2371,6 +2318,7 @@ allow if {
 "#,
         )
         .unwrap();
+    let credential_policies = policies.clone();
     super::init_policy_manager(policies).await;
     // The appliance-wide gateway policy reads `input.mcp` too, so the allowed
     // request passes only if the gateway policy seam also sees it.
@@ -2484,6 +2432,64 @@ allow if {
         "a request the policy rejects is refused: {response_body}"
     );
     assert_ne!(last_body(), Some(denied), "a request the policy rejects never reaches the Target");
+
+    // A payment credential in a tool argument or `_meta` is not in what the
+    // gateway and surface policies read.
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+    let gate = MockGate::answering(200, &[("Payment-Receipt", "policy-receipt")], json!({}));
+    install_test_transport("fabric-credential-gate", gate.clone());
+    let paying: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-credential-policy", "name": "Fabric credential policy",
+        "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": format!("http://{}", target.addr), "policy": {"policy_definition_id": "mcp-input"},
+            "payment_policy": {"type": "agent_pay", "payment_gateway_id": "fabric-credential-gate",
+                "payment_surface_id": "pay-1", "mcp_payment_triggers": {"mode": "all"}}}
+    }))
+    .unwrap();
+    store
+        .save(&paying)
+        .await
+        .unwrap();
+    credential_policies
+        .load_policy_text(
+            &paying.surface_id,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.mcp.tool_name == "echo"
+    not contains(json.marshal(input), "FABRIC-SECRET")
+}
+"#,
+        )
+        .unwrap();
+    let with_credential = json!({"jsonrpc": "2.0", "id": "call", "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"value": 1, "payment_signature": "FABRIC-SECRET"},
+            "_meta": {"org.paymentauth/credential": "FABRIC-SECRET"}}});
+    let mut paying_message = message(&with_credential);
+    paying_message.message_body["channel_id"] = json!(paying.surface_id);
+    let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&paying_message)))
+        .await
+        .expect("Fabric receive handler timed out");
+    let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+        panic!("expected a ForwardResponse, got {result:?}");
+    };
+    assert_eq!(response_body["status"], 200, "the policies read the call without its credential: {response_body}");
+    assert_eq!(gate.calls(), 1, "the credential was still the one paid with");
+    assert_eq!(gate.last().headers["PAYMENT-SIGNATURE"], "FABRIC-SECRET");
+    let received = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .unwrap();
+    assert!(
+        !received
+            .body
+            .contains("FABRIC-SECRET"),
+        "the Target received a credential: {}",
+        received.body
+    );
 }
 
 #[test]
@@ -2729,6 +2735,7 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
 
@@ -2838,6 +2845,7 @@ fn fabric_tool_call_batches_are_refused_before_tool_level_controls() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -2967,4 +2975,516 @@ async fn fabric_tool_call_batch_flow() {
             "{body}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_paid_surface_reached_over_the_fabric_is_charged() {
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+    if std::env::var_os("AG_FABRIC_PAYMENT_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .expect("test thread name")
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("AG_FABRIC_PAYMENT_CHILD", "1")
+            .output()
+            .expect("run the fabric payment test with isolated globals");
+        assert!(
+            output.status.success(),
+            "isolated fabric payment test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ran_exactly_one_test(&output);
+        return;
+    }
+
+    let target_response = json!({"jsonrpc": "2.0", "id": "paid", "result": {"content": []}});
+    let target = MockServer::start_with_response(target_response.to_string()).await;
+    let failing = MockServer::start_with_status(500, "application/json", r#"{"error":"boom"}"#).await;
+    let unreachable = crate::component_tests::helpers::closing_endpoint();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    for (surface_id, address) in
+        [("fabric-paid", target.addr), ("fabric-paid-failing", failing.addr), ("fabric-paid-unreachable", unreachable)]
+    {
+        let surface: AgentSurface = serde_json::from_value(json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": format!("http://{address}"), "payment_policy": {
+                "type": "agent_pay", "payment_gateway_id": "fabric-receive-gate", "payment_surface_id": "pay-1",
+                "mcp_payment_triggers": {"mode": "match", "patterns": ["^paid_"]}
+            }}
+        }))
+        .unwrap();
+        store
+            .save(&surface)
+            .await
+            .unwrap();
+    }
+    let gate =
+        MockGate::answering(200, &[("Payment-Receipt", "fabric-receipt"), ("Cache-Control", "no-store")], json!({}))
+            .challenging(
+                &[("payment-required", "eyJ4IjoxfQ=="), ("content-type", "application/json")],
+                json!({"accepts": []}),
+            );
+    install_test_transport("fabric-receive-gate", gate.clone());
+    let now_secs = super::super::envelope_replay::now_secs();
+    let forward_message = |surface_id: &str, path: &str, body: Value, headers: Value| {
+        ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now_secs + 60),
+            json!({"channel_id": surface_id, "method": "POST", "path": path, "headers": headers, "body": body}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path))
+    };
+    let call = |tool: &str| json!({"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {"name": tool}});
+    let refusal = |result: ProcessingResult| {
+        let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+            panic!("expected a ForwardResponse, got {result:?}");
+        };
+        let envelope: Value = serde_json::from_str(
+            response_body["body"]
+                .as_str()
+                .unwrap_or("null"),
+        )
+        .unwrap_or(Value::Null);
+        (response_body, envelope)
+    };
+    let forwarded = |target: &MockServer| {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let legacy = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+
+    let (response, envelope) =
+        receive(&forward_message("fabric-paid", "/mcp", call("free_tool"), legacy.clone())).await;
+    assert_eq!(response["status"], 200);
+    assert_eq!(envelope, target_response);
+    assert_eq!(gate.calls(), 0, "a free call makes no payment hop");
+
+    let (response, envelope) = refusal(
+        Box::pin(process_forward_request(&forward_message("fabric-paid", "/mcp", call("paid_tool"), legacy.clone())))
+            .await,
+    );
+    assert_eq!(response["status"], 402, "{response}");
+    assert_eq!(response["headers"]["payment-required"], "eyJ4IjoxfQ==");
+    assert_eq!(
+        envelope["error"]["code"], -32042,
+        "a legacy caller is answered with the MPP MCP transport's payment-required code"
+    );
+    assert_eq!(envelope["error"]["data"]["x402"], json!({"accepts": []}));
+    assert_eq!(gate.calls(), 1);
+    assert_eq!(forwarded(&target), 1, "an unpaid call never reaches the Target");
+
+    let modern_call = json!({"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {
+        "name": "paid_tool", "_meta": {
+            "io.modelcontextprotocol/protocolVersion": MCP_MODERN_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }
+    }});
+    let modern = json!({
+        "MCP-Protocol-Version": MCP_MODERN_VERSION, "Mcp-Method": "tools/call", "Mcp-Name": "paid_tool",
+        "content-type": "application/json", "accept": "application/json, text/event-stream"
+    });
+    let (response, envelope) = refusal(
+        Box::pin(super::process_forward_request_with_mcp_runtime(
+            &forward_message("fabric-paid", "/mcp", modern_call, modern),
+            None,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        ))
+        .await,
+    );
+    assert_eq!(response["status"], 402, "{response}");
+    assert_eq!(envelope["error"]["code"], 1001, "a modern caller gets the application code");
+    assert_eq!(forwarded(&target), 1);
+
+    // A header that cannot be read, whether its name or its value, does not cost the
+    // request its credential or its forward, and the query string is not sent to
+    // agent-pay.
+    let mut paid_headers = legacy.clone();
+    paid_headers["PAYMENT-SIGNATURE"] = json!("proof");
+    paid_headers["bad header"] = json!("a name with a space");
+    paid_headers["x-count"] = json!(5);
+    let path = "/mcp?api_key=query-secret";
+    let (response, envelope) =
+        receive(&forward_message("fabric-paid", path, call("paid_tool"), paid_headers.clone())).await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert_eq!(response["headers"]["payment-response"], "fabric-receipt");
+    assert_eq!(response["headers"]["cache-control"], "no-store");
+    assert_eq!(envelope["result"]["_meta"]["org.paymentauth/receipt"], "fabric-receipt");
+    let sent = gate.last();
+    assert_eq!(sent.headers["PAYMENT-SIGNATURE"], "proof");
+    let wire = format!("{} {:?} {} {}", sent.path, sent.headers, sent.body, sent.payment_context);
+    assert!(!wire.contains("query-secret"), "the query string never reaches agent-pay: {wire}");
+    let upstream = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .unwrap();
+    assert!(
+        !upstream
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("payment-signature")),
+        "the consumed credential is stripped: {:?}",
+        upstream.headers
+    );
+    let (hops, reached) = (gate.calls(), forwarded(&target));
+
+    // The same payment on the same request is used up: refused with a fresh
+    // challenge, and never forwarded a second time.
+    let (response, envelope) = refusal(
+        Box::pin(process_forward_request(&forward_message(
+            "fabric-paid",
+            path,
+            call("paid_tool"),
+            paid_headers.clone(),
+        )))
+        .await,
+    );
+    assert_eq!(response["status"], 402, "{response}");
+    assert_eq!(response["headers"]["payment-required"], "eyJ4IjoxfQ==");
+    assert!(
+        response["headers"]
+            .get("payment-response")
+            .is_none()
+    );
+    assert_eq!(envelope["error"]["code"], -32043);
+    assert_eq!(envelope["error"]["data"]["failure"]["reason"], "payment_already_used");
+    assert_eq!(gate.calls(), hops + 2, "the replayed payment, then a request for a fresh challenge");
+    assert_eq!(forwarded(&target), reached, "a used payment is not forwarded again");
+
+    // The same credential on another tool is another request, so it is another key.
+    let (response, _) = receive(&forward_message("fabric-paid", path, call("paid_other"), paid_headers)).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let keys: Vec<String> = gate
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|request| {
+            request.payment_context["correlation"]["idempotency_key"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    assert_eq!(keys[0], keys[1], "the replay is the same request");
+    assert_ne!(keys[0], keys[2], "another tool is another request");
+
+    // A paid call that then fails still carries its receipt, whether the Target
+    // answers with an error or cannot be reached.
+    for (surface_id, status) in [("fabric-paid-failing", 500), ("fabric-paid-unreachable", 502)] {
+        let mut headers = legacy.clone();
+        headers["PAYMENT-SIGNATURE"] = json!(format!("proof-{surface_id}"));
+        let hops = gate.calls();
+        let (response, _) = refusal(
+            Box::pin(process_forward_request(&forward_message(surface_id, "/mcp", call("paid_tool"), headers))).await,
+        );
+        assert_eq!(response["status"], status, "{surface_id}: {response}");
+        assert_eq!(response["headers"]["payment-response"], "fabric-receipt", "{surface_id}");
+        assert_eq!(gate.calls(), hops + 1, "{surface_id}");
+    }
+
+    // An MCP proxy Target is charged only once the proxy is found, its request is
+    // known to be servable and its breaker is closed, and what reaches the REST
+    // backend carries no credential.
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    let backend = MockServer::start_with_response(r#"{"ok": true}"#).await;
+    let proxy_directory = tempfile::tempdir().unwrap();
+    let proxy_store = std::sync::Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            proxy_directory
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let spec = json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+        "/echo": {"post": {"operationId": "paid_echo", "summary": "Echo",
+            "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                "type": "object", "properties": {"payment_signature": {"type": "string"}, "q": {"type": "string"}}
+            }}}},
+            "responses": {"200": {"description": "OK"}}}}
+    }});
+    let mut proxy = crate::mcp_proxies::types::McpProxy::new(
+        "Echo".into(),
+        String::new(),
+        backend.url(),
+        spec.to_string(),
+        "/mcp".into(),
+        "/echo-proxy".into(),
+    );
+    proxy.flatten_post_params = true;
+    proxy_store
+        .create(&proxy)
+        .await
+        .unwrap();
+    super::super::init_mcp_proxy_store(proxy_store).await;
+    let policies = std::sync::Arc::new(crate::policies::SurfacePolicyManager::new());
+    super::super::init_policy_manager(policies.clone()).await;
+    let proxy_surface = |surface_id: &str, proxy_id: &str, breaker: bool| -> AgentSurface {
+        let mut target = json!({"endpoint": format!("proxy://{proxy_id}"), "payment_policy": {
+            "type": "agent_pay", "payment_gateway_id": "fabric-receive-gate", "payment_surface_id": "pay-1",
+            "mcp_payment_triggers": {"mode": "match", "patterns": ["^paid_"]}
+        }});
+        if breaker {
+            target["networking"] = json!({
+                "circuit_breaker": {"failure_threshold": 1, "success_threshold": 1, "timeout_secs": 60, "window_secs": 60}
+            });
+        }
+        serde_json::from_value(json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+            "target": target
+        }))
+        .unwrap()
+    };
+    for (surface_id, proxy_id, breaker) in [
+        ("fabric-proxy", proxy.id.as_str(), false),
+        ("fabric-proxy-missing", "no-such-proxy", false),
+        ("fabric-proxy-breaker", proxy.id.as_str(), true),
+    ] {
+        let surface = proxy_surface(surface_id, proxy_id, breaker);
+        policies
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        store
+            .save(&surface)
+            .await
+            .unwrap();
+    }
+    // The status and headers (as `{"status", "headers"}`) and the JSON body of any answer.
+    let flat = |result: ProcessingResult| async move {
+        match result {
+            ProcessingResult::RequiresResponse { response_body, .. } => {
+                let envelope = serde_json::from_str::<Value>(
+                    response_body["body"]
+                        .as_str()
+                        .unwrap_or("null"),
+                )
+                .unwrap_or(Value::Null);
+                (response_body, envelope)
+            }
+            ProcessingResult::StreamingResponse { response } => {
+                let headers: serde_json::Map<String, Value> = response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), json!(value.to_str().unwrap())))
+                    .collect();
+                let status = response.status().as_u16();
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                (json!({"status": status, "headers": headers}), serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+            }
+            other => panic!("expected a response, got {other:?}"),
+        }
+    };
+    let with_credential = |tool: &str| {
+        json!({"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {
+            "name": tool, "arguments": {"q": "1", "payment_signature": "proxy-secret"}
+        }})
+    };
+    let hops = gate.calls();
+    let (response, envelope) = flat(
+        Box::pin(process_forward_request(&forward_message(
+            "fabric-proxy",
+            "/mcp",
+            with_credential("paid_unknown"),
+            legacy.clone(),
+        )))
+        .await,
+    )
+    .await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert!(
+        envelope
+            .get("error")
+            .is_some(),
+        "{envelope}"
+    );
+    assert_eq!(gate.calls(), hops, "a tool the proxy does not have is refused before it is charged");
+
+    let (response, envelope) = flat(
+        Box::pin(process_forward_request(&forward_message(
+            "fabric-proxy",
+            "/mcp",
+            with_credential("paid_echo"),
+            legacy.clone(),
+        )))
+        .await,
+    )
+    .await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert_eq!(response["headers"]["payment-response"], "fabric-receipt", "{envelope}");
+    assert_eq!(gate.calls(), hops + 1);
+    assert_eq!(gate.last().headers["PAYMENT-SIGNATURE"], "proxy-secret");
+    let reached = backend
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("the backend was called");
+    assert!(reached.body.contains("\"q\""), "{reached:?}");
+    assert!(
+        !reached
+            .body
+            .contains("proxy-secret"),
+        "a legacy call reached the backend with its credential: {reached:?}"
+    );
+
+    let modern_call = |tool: &str| {
+        json!({"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {
+            "name": tool, "arguments": {"q": "2", "payment_signature": "modern-proxy-secret"}, "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MCP_MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }})
+    };
+    let modern_headers = |tool: &str| {
+        json!({
+            "MCP-Protocol-Version": MCP_MODERN_VERSION, "Mcp-Method": "tools/call", "Mcp-Name": tool,
+            "content-type": "application/json", "accept": "application/json, text/event-stream"
+        })
+    };
+    let hops = gate.calls();
+    let modern_receive = |surface_id: &str| {
+        let message = forward_message(surface_id, "/mcp", modern_call("paid_echo"), modern_headers("paid_echo"));
+        Box::pin(super::process_forward_request_with_mcp_runtime(
+            Box::leak(Box::new(message)),
+            None,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        ))
+    };
+    let (response, _) = flat(modern_receive("fabric-proxy-missing").await).await;
+    assert_eq!(response["status"], 404, "{response}");
+    assert_eq!(gate.calls(), hops, "a proxy that is not there is refused before it is charged");
+
+    let (response, envelope) = flat(modern_receive("fabric-proxy").await).await;
+    assert_eq!(response["status"], 200, "{response} {envelope}");
+    assert_eq!(gate.calls(), hops + 1);
+    let reached = backend
+        .last_request_rx
+        .borrow()
+        .clone()
+        .unwrap();
+    assert!(reached.body.contains("\"q\""), "{reached:?}");
+    assert!(
+        !reached
+            .body
+            .contains("modern-proxy-secret"),
+        "a modern call reached the backend with its credential: {reached:?}"
+    );
+
+    let breaker = policies
+        .get_circuit_breaker("fabric-proxy-breaker")
+        .await
+        .expect("the surface has a circuit breaker");
+    let _ = breaker
+        .call(async { Err::<(), &str>("backend down") })
+        .await;
+    assert!(
+        breaker
+            .refusing_for()
+            .await
+            .is_some()
+    );
+    let hops = gate.calls();
+    let (response, envelope) = flat(
+        Box::pin(process_forward_request(&forward_message(
+            "fabric-proxy-breaker",
+            "/mcp",
+            with_credential("paid_echo"),
+            legacy.clone(),
+        )))
+        .await,
+    )
+    .await;
+    assert!(
+        response["headers"]
+            .get("payment-response")
+            .is_none(),
+        "{response} {envelope}"
+    );
+    assert!(
+        envelope
+            .get("error")
+            .is_some(),
+        "{envelope}"
+    );
+    assert_eq!(gate.calls(), hops, "a Target whose circuit is open is refused before it is charged");
+}
+
+#[test]
+fn lenient_headers_keep_every_header_that_decodes() {
+    let headers = json!({
+        "PAYMENT-SIGNATURE": "proof", "x-big": "a".repeat(40_000), "bad header": "name", "x-count": 5,
+        "x-nested": {"a": 1}, "x-bad-value": "line\nbreak"
+    });
+    let decoded = super::lenient_headers(headers.as_object());
+    assert_eq!(decoded["payment-signature"], "proof");
+    assert_eq!(decoded["x-big"].len(), 40_000, "there is no size cliff");
+    let mut names: Vec<_> = decoded
+        .keys()
+        .map(|name| name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["payment-signature", "x-big"]);
+    assert!(super::lenient_headers(None).is_empty());
+}
+
+#[test]
+fn the_payment_variant_is_the_resolved_alias_and_never_the_peers_text() {
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "variants", "name": "variants",
+        "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": "http://127.0.0.1:9"},
+        "variants": [
+            {"id": "vc-gold", "alias": "gold", "name": "Gold", "description": "", "enabled": true, "overrides": {}},
+            {"id": "vc-off", "alias": "off", "name": "Off", "description": "", "enabled": false, "overrides": {}}
+        ],
+        "default_variant_id": "vc-gold"
+    }))
+    .unwrap();
+
+    assert_eq!(super::resolved_variant_alias(&surface, Some("vc-gold"), None).as_deref(), Some("gold"));
+    assert_eq!(
+        super::resolved_variant_alias(&surface, Some("vc-off"), None),
+        None,
+        "a disabled variant selects nothing"
+    );
+    assert_eq!(super::resolved_variant_alias(&surface, Some("vc-unknown"), None), None);
+    assert_eq!(super::resolved_variant_alias(&surface, None, None), None);
+    assert_eq!(
+        super::resolved_variant_alias(&surface, None, Some("gold")).as_deref(),
+        Some("gold"),
+        "a stream carries the alias its open request named"
+    );
 }

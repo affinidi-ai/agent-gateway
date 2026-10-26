@@ -957,39 +957,11 @@ pub async fn run_port_server(
         }
     }
 
-    // x402 e2e test endpoints — gated on `facilitator_mode.enable_test_endpoints`.
-    // These are unauthenticated conformance surfaces (incl. POST /close) and
-    // must stay off in non-test deployments.
     if config
         .facilitator_mode
         .enable_test_endpoints
     {
-        info!("Adding x402 multi-chain test endpoints: /protected (EVM + Solana), /health, /close");
-
-        let test_endpoints_config = match bootstrap_config.load_test_endpoints_config() {
-            Ok(cfg) => Arc::new(cfg),
-            Err(e) => {
-                warn!("Failed to load test endpoints config: {}. Test endpoints will use default values.", e);
-                Arc::new(crate::config::TestEndpointsConfig {
-                    evm: None,
-                    solana_devnet: None,
-                    solana_mainnet: None,
-                })
-            }
-        };
-
-        let x402_test_router = axum::Router::new()
-            .route("/protected", axum::routing::get(crate::x402::protected_eip3009))
-            .route("/protected-permit2", axum::routing::get(crate::x402::protected_permit2))
-            .route("/protected-solana-devnet", axum::routing::get(crate::x402::protected_solana_devnet))
-            .route("/protected-solana-mainnet", axum::routing::get(crate::x402::protected_solana_mainnet))
-            .route("/health", axum::routing::get(crate::x402::test_health))
-            .route("/close", axum::routing::post(crate::x402::test_close))
-            .with_state(test_endpoints_config);
-
-        app = app.merge(x402_test_router);
-    } else {
-        info!("x402 test endpoints disabled (facilitator_mode.enable_test_endpoints=false)");
+        warn!("facilitator_mode.enable_test_endpoints is ignored: the x402 test endpoints are no longer served");
     }
 
     // Proxy {TP_OUTBOUND_PATH_PREFIX}/* to the outbound listener when inbound and outbound share a hostname.
@@ -1100,17 +1072,11 @@ pub async fn run_port_server(
         app = app.merge(secrets_router_ref.clone());
     }
 
-    // Merge x402 HTTP Facilitator API router if enabled in gateway config
     if config
         .facilitator_mode
         .facilitator_via_http
     {
-        info!("Merging x402 HTTP Facilitator API router at /api/x402 (standard spec endpoints)");
-        let http_facilitator_state = crate::x402::HttpFacilitatorState {
-            channels: state.channels.clone(),
-        };
-        let http_facilitator_router = crate::x402::create_http_facilitator_router().with_state(http_facilitator_state);
-        app = app.nest("/api/x402", http_facilitator_router);
+        warn!("facilitator_mode.facilitator_via_http is ignored: the /api/x402 facilitator is no longer served");
     }
 
     // Process fallback routes last so they don't override specific routes

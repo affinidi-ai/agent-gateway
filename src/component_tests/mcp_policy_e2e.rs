@@ -1469,6 +1469,8 @@ fn access_point_tool_scoped_credentials_apply_only_to_tools_call() {
 /// The credential delegation stores are process-global, so this gateway runs
 /// in its own process to resolve against its own provider store.
 async fn access_point_tool_scoped_credentials_flow() {
+    let gate = crate::proxy::handler::agent_pay_gate::tests::MockGate::answering(402, &[], json!({}));
+    crate::proxy::handler::agent_pay_gate::install_test_transport("e2e-consent-gate", gate.clone());
     let harness = GatewayHarness::start(|_, gw_config, bootstrap| {
         use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
         use crate::secrets::SecretsStore;
@@ -1522,6 +1524,13 @@ async fn access_point_tool_scoped_credentials_flow() {
             })],
         });
         surface.outbound_credentials = vec![tool_scoped_binding("echo")];
+        surface.target.payment_policy = Some(
+            serde_json::from_value(json!({
+                "type": "agent_pay", "payment_gateway_id": "e2e-consent-gate", "payment_surface_id": "pay-1",
+                "mcp_payment_triggers": {"mode": "all"}
+            }))
+            .expect("payment policy"),
+        );
         gw_config.surfaces = vec![surface];
     })
     .await;
@@ -1535,4 +1544,5 @@ async fn access_point_tool_scoped_credentials_flow() {
     let (status, body) = post_json(&harness, &call, Some("valid")).await;
     assert_eq!(status, 401, "a call to a listed tool needs its credential: {body}");
     assert_eq!(forwarded(&harness), 1, "a call awaiting consent never reaches the target");
+    assert_eq!(gate.calls(), 0, "a chargeable call awaiting consent is not charged");
 }

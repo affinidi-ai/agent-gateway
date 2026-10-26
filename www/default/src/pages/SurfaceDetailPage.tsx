@@ -36,6 +36,8 @@ import {
   nodesFromSurface,
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
+import { showSaveWarnings } from '../components/surface-builder/elements/payment/saveWarnings';
+import SurfacePaymentActivity from '../components/surface-builder/elements/payment/SurfacePaymentActivity';
 import './SurfaceBuilder.css';
 
 interface DetailBuilderState {
@@ -101,6 +103,7 @@ const SurfaceDetailPage: React.FC = () => {
   const navigate = useNavigate();
   const { hasPermission } = usePermissions();
   const canEdit = hasPermission('surfaces.edit');
+  const canViewPayments = hasPermission('payments.view');
   const { getCurrentStats } = useApp();
 
   const [surface, setSurface] = useState<AgentSurface | null>(null);
@@ -1238,7 +1241,10 @@ const SurfaceDetailPage: React.FC = () => {
       // A PUT that leaves out a stored discovery setting keeps it, so one the
       // operator removed is sent as null, removed only if the save succeeds.
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
-      const updated = await apiClient.updateSurface(surfaceId, payload);
+      const { warnings: saveWarnings, ...updated } = await apiClient.updateSurface(
+        surfaceId,
+        payload
+      );
       setSurface(updated);
       setJsonOverride(null);
       setJsonError(null);
@@ -1326,6 +1332,7 @@ const SurfaceDetailPage: React.FC = () => {
       bumpExternalRevision();
       if (hydration.didAutoLayout) bumpResetView();
       showToast('success', `Agent Surface "${updated.name}" saved`);
+      showSaveWarnings(saveWarnings);
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
       // transit points without being prevented from saving. The toast
@@ -1544,6 +1551,10 @@ const SurfaceDetailPage: React.FC = () => {
 
   if (!surface) return null;
 
+  const savedPayment = surface.target?.payment_policy;
+  const agentPayGatewayId =
+    savedPayment?.type === 'agent_pay' ? savedPayment.payment_gateway_id : undefined;
+
   const livePayload = (() => {
     try {
       return buildPayload({
@@ -1607,12 +1618,24 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error ? (
-            <div className="alert alert-danger surface-page-alert mb-2" role="alert">
-              <i className="fas fa-exclamation-circle me-2" />
-              {error}
-            </div>
-          ) : null
+          <>
+            {error && (
+              <div
+                className="alert alert-danger surface-page-alert mb-2"
+                role="alert"
+                data-testid="surface-error-alert"
+              >
+                <i className="fas fa-exclamation-circle me-2" />
+                {error}
+              </div>
+            )}
+            {agentPayGatewayId && canViewPayments && (
+              <SurfacePaymentActivity
+                surfaceId={surface.surface_id}
+                paymentGatewayId={agentPayGatewayId}
+              />
+            )}
+          </>
         }
         meta={{
           name,
@@ -1682,6 +1705,7 @@ const SurfaceDetailPage: React.FC = () => {
                 onClick={handleSave}
                 disabled={saving || deleting}
                 title={saveDisabledReason || (saving ? 'Saving…' : 'Save changes')}
+                data-testid="surface-save-button"
               >
                 {saving ? <i className="fas fa-spinner fa-spin" /> : <i className="fas fa-save" />}
               </button>

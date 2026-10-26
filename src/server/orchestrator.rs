@@ -602,6 +602,7 @@ pub async fn run_axum_proxy(
         .map_err(|e| anyhow::anyhow!("Failed to load network configuration: {}", e))?;
 
     info!("Loaded network configuration with {} listener(s)", network_config.listeners.len());
+    crate::proxy::handler::agent_pay_gate::configure_breaker(&network_config.payment_gate);
     for listener in &network_config.listeners {
         info!(
             "  {} Listener '{}' on {}:{} with {} external URL(s)",
@@ -866,22 +867,12 @@ pub async fn run_axum_proxy(
         info!("✓ GW2 WebSocket state initialized for payload capture broadcasting");
     }
 
-    // Initialize GW2 facilitator mode from gateway config
-    crate::gateways::init_facilitator_mode(
-        config
-            .facilitator_mode
-            .clone(),
-    )
-    .await;
-    info!(
-        "✓ GW2 facilitator mode initialized (fabric={}, http={})",
-        config
-            .facilitator_mode
-            .facilitator_via_fabric,
-        config
-            .facilitator_mode
-            .facilitator_via_http
-    );
+    if config
+        .facilitator_mode
+        .facilitator_via_fabric
+    {
+        warn!("facilitator_mode.facilitator_via_fabric is ignored: peer x402 verify and settle requests are refused");
+    }
 
     // Initialize transaction store for unified x402 lifecycle tracking
     // EVERY gateway needs this - it handles BOTH roles:
@@ -978,6 +969,50 @@ pub async fn run_axum_proxy(
             }
             Err(e) => {
                 warn!(error = %e, "Failed to initialize MPP transaction store - MPP audit trail disabled");
+            }
+        }
+    }
+
+    {
+        let ledger_path = std::path::Path::new(
+            &bootstrap_config
+                .storage_paths
+                .mpp_transactions,
+        )
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("_storage"))
+        .join("payments_ledger");
+        let claims_path = ledger_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("_storage"))
+            .join("payment_claims");
+        match crate::proxy::handler::agent_pay_gate::open_claim_journal(&claims_path) {
+            Ok(restored) => info!(path = ?claims_path, restored, "✓ Payment claim journal opened"),
+            Err(e) => warn!(
+                error = %e,
+                "Failed to open the payment claim journal - a restart may forward a paid request again"
+            ),
+        }
+        let ledger_config = &network_config.payment_ledger;
+        for field in ledger_config.clamped_fields() {
+            warn!(field, "payment_ledger.{field} in gateway.json is out of range and was clamped");
+        }
+        match crate::payments_ledger::DelegatedPaymentStore::with_max_bytes(
+            ledger_path.clone(),
+            ledger_config.max_bytes(),
+        )
+        .await
+        {
+            Ok(store) => {
+                let store = Arc::new(store);
+                crate::payments_ledger::init_global(Arc::clone(&store));
+                crate::payments_ledger::spawn_background_workers(store, ledger_config.retention_days());
+                #[cfg(not(test))]
+                crate::payments_ledger::spawn_termination_flush();
+                info!(path = ?ledger_path, "✓ Delegated payment ledger initialized");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize delegated payment ledger - payment ledger disabled");
             }
         }
     }
@@ -1282,6 +1317,12 @@ pub async fn run_axum_proxy(
                             .await
                         {
                             warn!("Failed to initialize policy for surface-derived channel {}: {}", surface.name, e);
+                        }
+                        if crate::proxy::handler::agent_pay_gate::held_payments_unpollable(surface) {
+                            warn!(
+                                surface = %surface.surface_id,
+                                "Surface charges through agent-pay without source authentication: its callers cannot poll held payments"
+                            );
                         }
                         if let Err(e) = resolved_surface_cache.upsert(surface) {
                             warn!(
@@ -3231,6 +3272,30 @@ pub async fn run_axum_proxy(
             definition_stores.clone(),
             secrets_store.clone(),
         );
+        let gateway_store_for_case_status = gateway_store.clone();
+        if let Some(gateways) = gateway_store.clone() {
+            crate::payments_ledger::settlement::init_client(Arc::new(
+                crate::payments_ledger::settlement::FabricSettlement::new(gateways),
+            ));
+            if let Some(store) = crate::payments_ledger::global() {
+                crate::payments_ledger::settlement::spawn_reconciler(store);
+            }
+        }
+
+        let identity_state_for_manifests = identity_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if crate::server::mode::is_ready_to_serve() {
+                    crate::identity::handlers::surfaces::refresh_payment_manifest_snapshots(
+                        &identity_state_for_manifests,
+                    )
+                    .await;
+                }
+            }
+        });
 
         let mcp_replay = if network_config
             .sts
@@ -3306,6 +3371,16 @@ pub async fn run_axum_proxy(
                     None
                 }
             },
+            crate::payments_ledger::create_payments_ledger_router(crate::payments_ledger::PaymentsLedgerApiState {
+                store: crate::payments_ledger::global(),
+                case_status: gateway_store_for_case_status.map(|gateways| {
+                    let lookup = Arc::new(crate::payments_ledger::CaseStatusLookup::new(Arc::new(
+                        crate::payments_ledger::FabricCaseStatus::new(gateways),
+                    )));
+                    crate::payments_ledger::init_case_status(lookup.clone());
+                    lookup
+                }),
+            }),
             metrics_store.clone(),
             sts_client_store,
             mcp_replay,
@@ -3671,37 +3746,9 @@ pub async fn run_axum_proxy(
         // Running with these silently would replace dashboard pages with
         // proxy 404s, which is much worse than refusing to start.
         {
-            let mut all_prefixes: Vec<&str> = network_config
-                .channels
-                .iter()
-                .map(|c| c.prefix.as_str())
-                .collect();
-            for route_cfg in network_config.routes.values() {
-                if matches!(route_cfg.route_type, crate::config::RouteType::Proxy) {
-                    all_prefixes.push(route_cfg.prefix.as_str());
-                }
-            }
-            let collisions = crate::proxy::paths::check_spa_route_collisions(all_prefixes);
+            let collisions = crate::proxy::paths::check_spa_route_collisions(network_config.proxy_prefixes());
             if !collisions.is_empty() {
-                let detail = collisions
-                    .iter()
-                    .map(|(p, spa)| format!("    - prefix '{}' shadows SPA route '{}'", p, spa))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let banner = format!(
-                    "\n\
-                     ============================================================\n\
-                     FATAL: Gateway configuration error\n\
-                     ============================================================\n\
-                     One or more channel/proxy prefixes collide with reserved\n\
-                     dashboard SPA routes. Starting in this state would replace\n\
-                     dashboard pages with proxy 404s, so the server is exiting.\n\n\
-                     Collisions:\n{}\n\n\
-                     Fix: rename each offending prefix (e.g. '/svc/<name>') in\n\
-                     your gateway.json and restart.\n\
-                     ============================================================\n",
-                    detail
-                );
+                let banner = crate::proxy::paths::spa_collision_banner(&collisions);
                 error!("{}", banner);
                 eprintln!("{}", banner);
                 std::process::exit(2);
@@ -4312,6 +4359,7 @@ async fn rederive_planes_on_activation(
     {
         warn!("Gateway store refresh on activation failed: {e}");
     }
+    crate::payments_ledger::reload_global().await;
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
     let reloading = identity_state

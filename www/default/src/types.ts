@@ -479,8 +479,7 @@ export interface VirtualChannel {
   };
 
   // Payment
-  payment_policy?: any;
-  mpp_policy?: any;
+  payment_policy?: SurfacePaymentPolicy;
 
   // Publishing
   publish_to_did_document?: boolean;
@@ -515,8 +514,7 @@ export interface VirtualChannelVariant {
     timeout_secs: number;
     window_secs: number;
   };
-  payment_policy?: any;
-  mpp_policy?: any;
+  payment_policy?: SurfacePaymentPolicy;
   source_auth?: SourceAuthConfig;
   managed_identity?: ManagedIdentityConfig;
   security_config?: any;
@@ -766,12 +764,6 @@ export interface FeatureFlags {
    *  `false` to hide the sidebar entry. The `/metrics` routes remain
    *  reachable directly even when hidden. */
   metrics?: boolean;
-  /** Show the “Agent Pay (delegate payment)” provider option in the
-   *  surface-builder Payment element. Default off (treated as `false`
-   *  when undefined); set explicitly to `true` to reveal. UI-only:
-   *  surfaces already configured to delegate payment continue to work
-   *  and remain editable regardless of this flag. */
-  agent_pay_delegation?: boolean;
   /** Experimental per-gateway mediator choice. Default off (treated as `false`
    *  when undefined); set explicitly to `true` to enable. When on, the Connect
    *  via OOB wizard shows the mediator picker and the API accepts
@@ -955,4 +947,249 @@ export interface CliLoginRequest {
   port: number;
   state: string;
   challenge: string;
+}
+
+export type McpPaymentTriggers =
+  | { mode: 'all' }
+  | { mode: 'match' | 'exclude'; patterns: string[] };
+
+export interface A2AMethodFilter {
+  method: string;
+  message_patterns?: string[];
+}
+
+export interface PaymentMoney {
+  amount: string;
+  unit: string;
+}
+
+export type PaymentInstrument =
+  | { type: 'card' }
+  | { type: 'wallet'; kind: string }
+  | { type: 'networkToken'; network: string }
+  | { type: 'crypto'; network?: string | null };
+
+export type PaymentPointDetail =
+  | { kind: 'onChain'; scheme: string; network: string; pay_to: string }
+  | { kind: 'settled'; provider: string; instrument: PaymentInstrument };
+
+export interface PaymentPoint {
+  id: string;
+  label: string;
+  protocol: 'x402' | 'mpp';
+  credential: string;
+  detail: PaymentPointDetail;
+}
+
+export interface PaymentManifestVariant {
+  alias: string;
+  name: string;
+  is_default: boolean;
+  amount?: PaymentMoney;
+}
+
+/** agent-pay's discovery document for one payment surface. */
+export interface PaymentManifest {
+  version: string;
+  payable: {
+    id: string;
+    name: string;
+    description?: string;
+    surface_id?: string;
+    variant?: { id: string; alias: string };
+  };
+  amount: PaymentMoney;
+  payment_points: PaymentPoint[];
+  variants?: PaymentManifestVariant[];
+  credential?: string;
+}
+
+export interface AgentPayPaymentPolicy {
+  type: 'agent_pay';
+  payment_gateway_id: string;
+  payment_surface_id: string;
+  mcp_payment_triggers?: McpPaymentTriggers;
+  a2a_method_filters?: A2AMethodFilter[];
+  require_all?: boolean;
+  timeout_ms?: number;
+  share_payer_email?: boolean;
+  /** Written by the server on save; never sent by the dashboard. */
+  manifest_snapshot?: PaymentManifest;
+}
+
+/** A local x402 or MPP policy. It still loads, but the gateway no longer serves it. */
+export interface LegacyPaymentPolicy {
+  type: 'x402' | 'mpp';
+  [key: string]: unknown;
+}
+
+export type SurfacePaymentPolicy = AgentPayPaymentPolicy | LegacyPaymentPolicy;
+
+export type PaymentOutcome =
+  | 'paid'
+  | 'challenge'
+  | 'held'
+  | 'rejected'
+  | 'unavailable'
+  | 'unconfirmed'
+  | 'authorized'
+  | 'voided'
+  | 'capture_failed';
+
+export const PAYMENT_OUTCOMES: readonly PaymentOutcome[] = [
+  'paid',
+  'challenge',
+  'held',
+  'rejected',
+  'unavailable',
+  'unconfirmed',
+  'authorized',
+  'voided',
+  'capture_failed',
+];
+
+export const PAYMENT_CASE_STATUSES = [
+  'held',
+  'approved',
+  'captured',
+  'rejected',
+  'voided',
+  'capture_failed',
+] as const;
+
+export type PaymentCaseStatus = (typeof PAYMENT_CASE_STATUSES)[number];
+
+/** agent-pay's current state of a held payment, as the gateway last asked for it. */
+export interface PaymentCaseStatusReport {
+  status: PaymentCaseStatus;
+  /** RFC 3339 time the gateway asked agent-pay. */
+  checked_at: string;
+}
+
+/** One payment-gate call recorded by the gateway. */
+export interface PaymentLedgerRow {
+  id: string;
+  /** Unix seconds or an RFC 3339 timestamp. */
+  created_at: number | string;
+  surface_id: string;
+  variant?: string;
+  payment_gateway_id: string;
+  payment_surface_id: string;
+  outcome: PaymentOutcome;
+  rail?: 'x402' | 'mpp';
+  amount?: string;
+  currency?: string;
+  resource?: string;
+  case_id?: string;
+  receipt_reference?: string;
+  vc_fingerprint?: string;
+  /** Why the payment was refused, failed or released; clipped, never a credential. */
+  reason?: string;
+  latency_ms: number;
+  remote_status?: number;
+  trace_id?: string;
+  /** The receipt's amount differs from the manifest snapshot. */
+  price_mismatch?: boolean;
+  /** The manifest snapshot's price, present when it differs from the charged one. */
+  quoted_amount?: string;
+  quoted_currency?: string;
+  authorization_id?: string;
+  capture_deadline?: string;
+  settle_intent?: 'capture' | 'void';
+  settle_attempts?: number;
+  /** How long one settle request waits for agent-pay. */
+  settle_timeout_ms?: number;
+  idempotency_key?: string;
+  updated_at?: string;
+  superseded_by?: string;
+  /** The reconciler gave up on the row at its deadline. */
+  reconcile_failed?: boolean;
+  /** A peppered hash of the authenticated caller, never the caller itself. */
+  caller_principal?: string;
+  /** On a held row: the detail asks agent-pay; the list carries only a recent answer. */
+  case_status?: PaymentCaseStatusReport;
+}
+
+export interface PaymentLedgerQuery {
+  surface_id?: string;
+  outcome?: PaymentOutcome;
+  limit?: number;
+}
+
+export interface PaymentLedgerPage {
+  payments: PaymentLedgerRow[];
+  total: number;
+}
+
+export const PAYMENT_AUDIT_STAGES = [
+  'challenge_issued',
+  'verify_attempt',
+  'verified',
+  'failed',
+  'held',
+  'unconfirmed',
+  'authorized',
+  'voided',
+  'settled',
+  'settlement_failed',
+] as const;
+
+export type PaymentAuditStage = (typeof PAYMENT_AUDIT_STAGES)[number];
+
+/** One `payment` record of the VP Audit Log; the API never returns its signed credential. */
+export interface PaymentAuditEvent {
+  event_id?: string;
+  timestamp: string;
+  surface_id?: string;
+  channel_name?: string;
+  trace_id?: string;
+  via_fabric?: boolean;
+  vp_fingerprint?: string;
+  event: {
+    payment_event: {
+      rail: 'x402' | 'mpp';
+      stage: PaymentAuditStage;
+      transaction_id: string;
+      amount?: string;
+      currency?: string;
+      error?: string;
+      delegated?: boolean;
+      payment_gateway_id?: string;
+      payment_surface_id?: string;
+      remote_status?: number;
+    };
+  };
+}
+
+export interface PaymentAuditQuery {
+  surface_id?: string;
+  stage?: PaymentAuditStage;
+  trace_id?: string;
+  since?: string;
+  until?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface PaymentAuditPage {
+  events: PaymentAuditEvent[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+export interface PaymentSummary {
+  since: string;
+  total: number;
+  counts: Partial<Record<PaymentOutcome, number>>;
+}
+
+export interface PaymentBreaker {
+  payment_gateway_id: string;
+  state: 'closed' | 'open' | 'half_open';
+  consecutive_failures: number;
+  retry_after_secs?: number;
+  failures_to_open: number;
+  open_secs: number;
 }

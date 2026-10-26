@@ -25,6 +25,62 @@ fn record_caller_identity_enabled() -> bool {
     RECORD_CALLER_IDENTITY.load(Ordering::Relaxed)
 }
 
+/// What the payment gate decided for the request in flight: its ledger outcome
+/// and, when a ledger row was recorded, that row's id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaymentNote {
+    pub outcome: String,
+    pub ledger_id: Option<String>,
+}
+
+tokio::task_local! {
+    static PAYMENT_NOTE: std::sync::Arc<std::sync::Mutex<Option<PaymentNote>>>;
+}
+
+/// Notes the payment gate's outcome for the request being served, so its
+/// access log line and root span name it. A no-op outside a request that
+/// [`access_log`] serves (the fabric path, background tasks).
+pub fn note_payment_outcome(
+    outcome: &str,
+    ledger_id: Option<&str>,
+) {
+    let _ = PAYMENT_NOTE.try_with(|note| {
+        *note
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PaymentNote {
+            outcome: outcome.to_string(),
+            ledger_id: ledger_id.map(str::to_string),
+        });
+    });
+}
+
+/// The payment outcome noted for the request being served, if any.
+fn noted_payment() -> Option<PaymentNote> {
+    PAYMENT_NOTE
+        .try_with(|note| {
+            note.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+        .ok()
+        .flatten()
+}
+
+/// ` payment_outcome="…" payment_ledger_id="…"` for an access log line, or
+/// nothing when the request made no payment decision.
+fn payment_log_suffix(note: Option<&PaymentNote>) -> String {
+    match note {
+        Some(note) => format!(
+            " payment_outcome=\"{}\" payment_ledger_id=\"{}\"",
+            note.outcome,
+            note.ledger_id
+                .as_deref()
+                .unwrap_or("")
+        ),
+        None => String::new(),
+    }
+}
+
 /// Map an [`AuthenticatedIdentity`](crate::source_auth::AuthenticatedIdentity)
 /// to the `caller.*` span attributes that describe it. Returns
 /// `caller.auth_method` and `caller.principal` for every variant, plus
@@ -237,7 +293,15 @@ pub async fn access_log(
     }
 
     let started = std::time::Instant::now();
-    let response = next.run(request).await;
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let response = PAYMENT_NOTE
+        .scope(slot.clone(), next.run(request))
+        .await;
+    let payment = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let payment = payment_log_suffix(payment.as_ref());
     let status = response.status();
     let elapsed_ms = started.elapsed().as_millis();
     let resp_ct = response
@@ -249,14 +313,14 @@ pub async fn access_log(
     if is_asset {
         debug!(
             target: "agent_gateway::access",
-            "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"",
-            method, path, status.as_u16(), elapsed_ms, resp_ct
+            "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"{}",
+            method, path, status.as_u16(), elapsed_ms, resp_ct, payment
         );
     } else {
         info!(
             target: "agent_gateway::access",
-            "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"",
-            method, path, status.as_u16(), elapsed_ms, resp_ct
+            "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"{}",
+            method, path, status.as_u16(), elapsed_ms, resp_ct, payment
         );
     }
     response
@@ -357,6 +421,8 @@ pub async fn trace_http_request(
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
             caller.did = tracing::field::Empty,
+            payment.outcome = tracing::field::Empty,
+            payment.ledger_id = tracing::field::Empty,
         )
     } else {
         tracing::span!(
@@ -372,6 +438,8 @@ pub async fn trace_http_request(
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
             caller.did = tracing::field::Empty,
+            payment.outcome = tracing::field::Empty,
+            payment.ledger_id = tracing::field::Empty,
         )
     };
 
@@ -386,7 +454,14 @@ pub async fn trace_http_request(
         let status = response.status();
 
         // Record status while span is active
-        tracing::Span::current().record("http.status_code", status.as_u16());
+        let span = tracing::Span::current();
+        span.record("http.status_code", status.as_u16());
+        if let Some(note) = noted_payment() {
+            span.record("payment.outcome", note.outcome.as_str());
+            if let Some(ledger_id) = note.ledger_id.as_deref() {
+                span.record("payment.ledger_id", ledger_id);
+            }
+        }
 
         response
     }
@@ -397,6 +472,39 @@ pub async fn trace_http_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_payment_outcome_noted_while_serving_reaches_the_access_log_line() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        PAYMENT_NOTE
+            .scope(slot.clone(), async {
+                note_payment_outcome("rejected", Some("0199-row"));
+                assert_eq!(
+                    noted_payment(),
+                    Some(PaymentNote {
+                        outcome: "rejected".to_string(),
+                        ledger_id: Some("0199-row".to_string())
+                    })
+                );
+            })
+            .await;
+        let noted = slot.lock().unwrap().take();
+        assert_eq!(payment_log_suffix(noted.as_ref()), " payment_outcome=\"rejected\" payment_ledger_id=\"0199-row\"");
+        assert_eq!(
+            payment_log_suffix(Some(&PaymentNote {
+                outcome: "unavailable".to_string(),
+                ledger_id: None
+            })),
+            " payment_outcome=\"unavailable\" payment_ledger_id=\"\""
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_a_served_request_a_payment_outcome_is_ignored() {
+        note_payment_outcome("paid", Some("row"));
+        assert_eq!(noted_payment(), None);
+        assert_eq!(payment_log_suffix(None), "");
+    }
     use crate::source_auth::AuthenticatedIdentity;
     use crate::source_auth::models::{MtlsSans, PeerCertSource};
 

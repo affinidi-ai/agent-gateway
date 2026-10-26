@@ -97,6 +97,9 @@ pub(crate) struct FabricForwardRequest<'a> {
     pub trace_id: &'a str,
     /// Label for logs (e.g. surface name / transit-point alias).
     pub log_label: &'a str,
+    /// Extra top-level `forward-request` fields (e.g. `payment_context`); they
+    /// never replace the fields set here.
+    pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub(crate) struct FabricStreamForwardRequest<'request> {
@@ -539,20 +542,28 @@ pub(crate) async fn forward_via_fabric(
         now.as_secs() + crate::gateways::connection_points::envelope_replay::sent_envelope_lifetime_secs(timeout_secs);
     let deadline_ms = (now.as_millis() as u64).saturating_add(timeout_secs.saturating_mul(1000));
 
+    let mut message_body = serde_json::json!({
+        "channel_id": channel_id,
+        "method": req.method.as_str(),
+        "path": req.path,
+        "headers": req.headers,
+        "body": body_value,
+        "trace_id": req.trace_id,
+        "deadline_ms": deadline_ms,
+    });
+    if let (Some(fields), Some(extra)) = (message_body.as_object_mut(), req.extra_body) {
+        for (name, value) in extra {
+            fields
+                .entry(name)
+                .or_insert(value);
+        }
+    }
     let forward_request_msg = DIDCommMessage::build(
         uuid::Uuid::new_v4().to_string(),
         MessageType::ForwardRequest
             .as_str()
             .to_string(),
-        serde_json::json!({
-            "channel_id": channel_id,
-            "method": req.method.as_str(),
-            "path": req.path,
-            "headers": req.headers,
-            "body": body_value,
-            "trace_id": req.trace_id,
-            "deadline_ms": deadline_ms,
-        }),
+        message_body,
     )
     .from(
         gateway_listener

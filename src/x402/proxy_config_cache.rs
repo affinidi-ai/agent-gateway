@@ -38,6 +38,8 @@ pub async fn set_x402_proxy_config(config: X402ProxyConfig) {
 
 /// Get cached X402 Proxy configuration.
 /// Returns `None` if the cache is not initialized.
+// Only MPP auto-pay reads the proxy configuration, and nothing calls auto-pay.
+#[allow(dead_code)]
 pub async fn get_x402_proxy_config() -> Option<Arc<X402ProxyConfig>> {
     let cache = X402_PROXY_CONFIG_CACHE
         .read()
