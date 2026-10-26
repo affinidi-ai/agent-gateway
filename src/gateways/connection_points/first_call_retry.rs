@@ -16,7 +16,7 @@ const DEFAULT_ATTEMPTS: u32 = 5;
 const DEFAULT_DELAY_MS: u64 = 2_000;
 const MAX_ATTEMPTS: u32 = 20;
 const MAX_DELAY_MS: u64 = 30_000;
-const MAX_TOTAL: Duration = Duration::from_secs(60);
+const MAX_TOTAL: Duration = Duration::from_secs(45);
 const MIN_ATTEMPT: Duration = Duration::from_secs(10);
 
 const SOCKET_NOT_ACTIVE: &str = "WebSocket is not active";

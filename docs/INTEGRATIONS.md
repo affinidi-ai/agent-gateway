@@ -337,7 +337,7 @@ says a provided record is gone, so it is retried too. The gateway never repeats 
 any other mediator, an operator-added one included: for those a refusal is real and fails at once,
 as does a provided record that a successful directory answer no longer lists (the error then says
 the mediator is no longer offered by the directory). For these mediators each attempt is also
-bounded by the time left of the 60 second cap below; the first call to any other mediator has no
+bounded by the time left of the 45 second cap below; the first call to any other mediator has no
 added time bound.
 
 A mediator the directory lists may admit a DID only on demand, after the directory's operator has
@@ -351,7 +351,7 @@ repeats that call, with the same DID, after a fixed delay. Only that refusal is 
 transport error whose text contains `WebSocket is not active` or `WebSocket isActive? command timed
 out` (the live connection failing to become active, which is how the SDK reports a refused
 authentication on that path). The last two also match a mediator that is simply unreachable, so it
-is retried too, until the attempts or the 60 second cap below run out. Nothing else is matched, so
+is retried too, until the attempts or the 45 second cap below run out. Nothing else is matched, so
 every other failure, including a `401`, ends creation at once. The wait respects request cancellation, which sends
 `connection_point.creation_failed` like any other failure. The retry applies with or without an
 event hook, because it is about the mediator, not the receiver, and its settings apply to
@@ -364,11 +364,13 @@ directory-listed mediators only.
 
 Each repeat logs one `warn` (`Directory mediator has not admitted the connection point DID yet;
 retrying the first call retry=1 of=5 delay_ms=2000`). The live connection's own readiness wait can add up to
-10 seconds to an attempt, so the whole sequence is capped at 60 seconds, and a repeat starts only if,
+10 seconds to an attempt, so the whole sequence is capped at 45 seconds, and a repeat starts only if,
 after its wait, at least 10 seconds of the cap remain for it. Otherwise the last refusal is returned
 and creation fails with `creation_failed`, whatever the attempts and delay are set to, so a longer
 delay or slower attempts mean fewer repeats than configured (with the largest delay, 30 seconds, at
 most one). The settings are read from the environment the first time a Connection Point is created on a directory mediator after the gateway starts, and kept until it restarts.
+
+The request is not answered until the sequence ends, and the gateway sets no request timeout of its own. Keep the idle timeout of any proxy or load balancer in front of the management API above the cap plus the rest of the handler (the 60 second default of an AWS ALB is enough), or a client sees a gateway timeout while the Connection Point is still created and a retry creates a second one.
 
 **Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
 `did` field is logged like any DID and masked by the global log redactor. The URL, the secret and

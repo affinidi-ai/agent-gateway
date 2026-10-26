@@ -3644,8 +3644,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             Some(id) => cp_store
                 .get(id)
                 .await
-                .ok()
-                .flatten(),
+                .map_err(|e| format!("Failed to get temporary connection point {}: {}", id, e))?,
             None => None,
         },
     };
