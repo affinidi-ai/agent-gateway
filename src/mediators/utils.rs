@@ -236,14 +236,39 @@ pub async fn set_acl_to_allow_everything_and_more(
     atm: &affinidi_messaging_sdk::ATM,
     profile: Arc<affinidi_messaging_sdk::profiles::ATMProfile>,
 ) -> Result<(), String> {
+    set_acl_to_allow_everything_and_more_retrying(
+        atm,
+        profile,
+        crate::gateways::connection_points::first_call_retry::FirstCallRetry::never(),
+    )
+    .await
+}
+
+/// Like [`set_acl_to_allow_everything_and_more`], for a DID whose first mediator call this
+/// is: the account update, the first call that authenticates, repeats under `retry` while
+/// the mediator refuses a DID it has not admitted yet.
+pub async fn set_acl_to_allow_everything_and_more_retrying(
+    atm: &affinidi_messaging_sdk::ATM,
+    profile: Arc<affinidi_messaging_sdk::profiles::ATMProfile>,
+    retry: crate::gateways::connection_points::first_call_retry::FirstCallRetry,
+) -> Result<(), String> {
     let did = profile.inner.did.to_string();
     info!("set_acl_to_allow_everything_and_more called for did: {}", did);
 
     let mut hasher = Sha256::new();
     hasher.update(did.as_bytes());
     let did_hash = format!("{:x}", hasher.finalize());
-    atm.trust_tasks()
-        .account_update(&profile, Some(did_hash), None, Some(allow_all_acl()?), None)
+    let acl = allow_all_acl()?;
+    retry
+        .run(
+            || async {
+                atm.trust_tasks()
+                    .account_update(&profile, Some(did_hash.clone()), None, Some(acl.clone()), None)
+                    .await
+            },
+            crate::gateways::connection_points::first_call_retry::refused_until_admitted,
+            crate::gateways::connection_points::first_call_retry::timed_out,
+        )
         .await
         .map_err(|e| format!("Failed to update ACL to ALLOW_ALL_ACL_FLAGS: {}", e))?;
 

@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::mediators::handlers::mediator_allowed;
 use crate::mediators::utils::fetch_mediator_did_from_url;
-use crate::mediators::utils::set_acl_to_allow_everything_and_more;
+use crate::mediators::utils::{set_acl_to_allow_everything_and_more, set_acl_to_allow_everything_and_more_retrying};
 use crate::messages::MessageType;
 
 use super::GatewayStore;
@@ -2299,13 +2299,7 @@ pub async fn connect_via_oob<
         );
 
         didcomm_client
-            .register_profile_with(
-                crate::gateways::connection_points::first_call_retry::policy_for_listed(
-                    mediator_directory.as_ref(),
-                    &their_mediator_did,
-                )
-                .await,
-            )
+            .register_profile()
             .await
             .map_err(|e| {
                 error!("❌ Failed to register profile with mediator: {}", e);
@@ -2316,13 +2310,21 @@ pub async fn connect_via_oob<
         // Open ACL so the inviter's connection-accepted can reach us on mediators
         // with explicit-allow defaults (the temporary listener is System type and
         // ws_listener skips ACL setup for that type).
-        set_acl_to_allow_everything_and_more(didcomm_client.atm(), Arc::clone(didcomm_client.profile()))
-            .await
-            .map_err(|e| {
-                info!("  ℹ️  Could not set ACL: {:?}", e);
-                info!("  Continuing anyway - may work with default mediator permissions");
-            })
-            .ok();
+        set_acl_to_allow_everything_and_more_retrying(
+            didcomm_client.atm(),
+            Arc::clone(didcomm_client.profile()),
+            crate::gateways::connection_points::first_call_retry::policy_for_listed(
+                mediator_directory.as_ref(),
+                &their_mediator_did,
+            )
+            .await,
+        )
+        .await
+        .map_err(|e| {
+            info!("  ℹ️  Could not set ACL: {:?}", e);
+            info!("  Continuing anyway - may work with default mediator permissions");
+        })
+        .ok();
         info!("  ✓ ACL set to allow-all for temporary DID");
 
         didcomm_client

@@ -753,6 +753,7 @@ impl TrustRegistryListenerManager {
         trust_registry_id: &str,
         oob_url: &str,
         did_method: &DidMethod,
+        current_did: Option<&str>,
     ) -> Result<OobConnectionInfo, TrustRegistryError> {
         info!("Accepting OOB invitation for trust registry '{}': {}", trust_registry_id, oob_url);
 
@@ -800,8 +801,13 @@ impl TrustRegistryListenerManager {
         self.remove_connection(trust_registry_id)
             .await;
 
+        // A DID the registry already uses (a did:web is fixed by the registry id) is
+        // neither announced again nor reported failed.
         let announcement = crate::event_hook::CreationGuard::start(
-            self.event_hook.get().cloned(),
+            self.event_hook
+                .get()
+                .filter(|_| current_did != Some(our_did.as_str()))
+                .cloned(),
             trust_registry_payload(trust_registry_id, &mediator_did, &our_did),
         );
         let first_call_retry = crate::gateways::connection_points::first_call_retry::policy_for_listed(

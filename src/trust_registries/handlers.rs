@@ -115,7 +115,6 @@ pub async fn get_trust_registry<S: TrustRegistryStore>(
     Ok(Json(trust_registry))
 }
 
-/// Create a new trust registry
 /// Saves `trust_registry` on its own task, so a cancelled request cannot report the DID
 /// it announced as failed while the record is written, and reports it `created` once the
 /// record, which now names that DID, is stored.
@@ -123,6 +122,7 @@ async fn save_announced<S: TrustRegistryStore + 'static>(
     store: &Arc<S>,
     trust_registry: &TrustRegistry,
     announcement: crate::event_hook::CreationGuard,
+    replaced: Option<(Arc<TrustRegistryListenerManager>, TrustRegistry)>,
 ) -> Result<(), anyhow::Error> {
     let (Some(our_did), Some(mediator_did)) = (&trust_registry.our_did, &trust_registry.mediator_did) else {
         return store
@@ -133,10 +133,20 @@ async fn save_announced<S: TrustRegistryStore + 'static>(
     let record = trust_registry.clone();
     let store = store.clone();
     announcement
-        .complete(async move { store.update(&record).await }, saved)
+        .complete(
+            async move {
+                store.update(&record).await?;
+                if let Some((manager, previous)) = replaced {
+                    manager.announce_deleted(&previous);
+                }
+                Ok(())
+            },
+            saved,
+        )
         .await
 }
 
+/// Create a new trust registry
 pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
     Extension(store): Extension<std::sync::Arc<S>>,
     listener_manager: Option<Extension<Arc<TrustRegistryListenerManager>>>,
@@ -173,7 +183,7 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
     // Attempt OOB connection if listener_manager is available
     if let Some(Extension(listener_mgr)) = listener_manager {
         match listener_mgr
-            .accept_oob_and_connect(&trust_registry.id, &trust_registry.oob_url, &trust_registry.did_method)
+            .accept_oob_and_connect(&trust_registry.id, &trust_registry.oob_url, &trust_registry.did_method, None)
             .await
         {
             Ok(connection_info) => {
@@ -192,7 +202,7 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
                 trust_registry.updated_at = chrono::Utc::now();
 
                 // Update store with connection info
-                if let Err(e) = save_announced(&store, &trust_registry, announcement).await {
+                if let Err(e) = save_announced(&store, &trust_registry, announcement, None).await {
                     listener_mgr
                         .remove_connection(&trust_registry.id)
                         .await;
@@ -611,7 +621,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
     // Fall back to full OOB re-connection
     let previous = tr.clone();
     match listener_mgr
-        .accept_oob_and_connect(&id, &tr.oob_url, &tr.did_method)
+        .accept_oob_and_connect(&id, &tr.oob_url, &tr.did_method, tr.our_did.as_deref())
         .await
     {
         Ok(connection_info) => {
@@ -627,7 +637,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
             tr.mediator_url = Some(connection_info.mediator_url);
             tr.mediator_did = Some(connection_info.mediator_did);
             tr.updated_at = chrono::Utc::now();
-            let replaced = previous.our_did != tr.our_did;
+            let retire = (previous.our_did != tr.our_did).then(|| (listener_mgr.clone(), previous));
 
             // Wait for WS readiness; fail rather than persisting a terminal Connecting state
             // that the reader will never promote (already-approved TR won't re-send setup/approved).
@@ -647,13 +657,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
             if !conn_ready {
                 tracing::error!("OOB reconnection transport not ready for '{}'; failing reconnect", id);
                 tr.connection_status = TrustRegistryConnectionStatus::Failed;
-                if save_announced(&store, &tr, announcement)
-                    .await
-                    .is_ok()
-                    && replaced
-                {
-                    listener_mgr.announce_deleted(&previous);
-                }
+                let _ = save_announced(&store, &tr, announcement, retire).await;
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     "Reconnection failed: WebSocket not ready after retries".to_string(),
@@ -662,14 +666,11 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
 
             tr.connection_status = TrustRegistryConnectionStatus::Connected;
 
-            if let Err(e) = save_announced(&store, &tr, announcement).await {
+            if let Err(e) = save_announced(&store, &tr, announcement, retire).await {
                 listener_mgr
                     .remove_connection(&id)
                     .await;
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)));
-            }
-            if replaced {
-                listener_mgr.announce_deleted(&previous);
             }
 
             if let (Some(Extension(w)), Some(ws)) = (&worker, &ws_state) {

@@ -188,12 +188,12 @@ pub(crate) async fn profile_add(
     retry: FirstCallRetry,
 ) -> Result<Arc<ATMProfile>, ATMError> {
     retry
-        .run(
-            || atm.profile_add(profile, live_stream),
-            refused_until_admitted,
-            || ATMError::TransportError("The first call did not finish within the retry time limit".into()),
-        )
+        .run(|| atm.profile_add(profile, live_stream), refused_until_admitted, timed_out)
         .await
+}
+
+pub(crate) fn timed_out() -> ATMError {
+    ATMError::TransportError("The first call did not finish within the retry time limit".into())
 }
 
 /// Only a directory that answered without the DID has dropped the mediator; one
