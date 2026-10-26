@@ -55,6 +55,7 @@ pub struct IdentityApiState {
     pub surface_reload_lock: Arc<tokio::sync::Mutex<()>>,
     pub surface_template_store: Option<Arc<crate::surface_templates::FileSystemSurfaceTemplateStore>>,
     pub event_hook: Option<Arc<crate::event_hook::EventHook>>,
+    pub mediator_directory: Option<Arc<crate::event_hook::MediatorDirectory>>,
 
     // DID:webvh support (optional, behind feature gate)
     #[cfg(feature = "didwebvh")]

@@ -1,6 +1,7 @@
 pub mod account_watch;
 pub mod envelope_replay;
 pub mod filesystem;
+pub mod first_call_retry;
 pub mod handlers;
 pub mod message_processor;
 pub mod messages;

@@ -34,6 +34,19 @@ Applies to:
    explicitly requested.
 8. Header topbar controls must use the shared topbar action button pattern, a single
    reusable component plus shared CSS state rules, rather than ad-hoc per-button markup.
+9. Mediator lists may contain directory entries (`directory:*` ids), and stored records
+   created from them carry `provided: true`. The Create Connection Point wizard pre-selects the
+   first `directory:` entry (else the only mediator, else nothing; never a stored provided
+   record) and marks it in no other way. The dropdown lists a directory mediator once, as its
+   `directory:` entry. The Mediators page renders every mediator with `provided: true` read-only
+   (no ping or edit; Delete only when the list marks the record `deletable`: the directory
+   stopped offering it, or none is configured), shows no badge or
+   warning for them, and shows the stored `provided` record instead of the entry when one exists
+   for the DID. An operator-added mediator with the same DID is a separate row and never hides
+   the entry. The wizard's mediator step shows a failed load above the empty-list message and
+   offers a Refresh button (`wizard-mediator-refresh-button`) in that state and below the list, since
+   a directory can take a moment to answer after the gateway starts; a load error shows as
+   `wizard-mediator-load-error`.
 
 ## Toasts
 

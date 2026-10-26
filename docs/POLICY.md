@@ -255,6 +255,8 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
 - `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
   the operator-configured `AG_EVENT_HOOK_URL` ([`INTEGRATIONS.md`](INTEGRATIONS.md#event-hook)):
   loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.
+  The mediator directory request (`AG_MEDIATOR_DIRECTORY_URL`, [`INTEGRATIONS.md`](INTEGRATIONS.md#mediator-directory))
+  uses the same client and the same rules.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
   (`src/proxy/handler.rs::fetch_agent_card_from_surface_target`), so the
