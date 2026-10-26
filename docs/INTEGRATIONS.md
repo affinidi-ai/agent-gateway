@@ -482,22 +482,25 @@ mediator resource scope by its own id, like any mediator. A record already store
 `directory:` entry would get, which the caller may not use, fails the creation with `404` before
 anything is sent or created.
 
-**Known limitations of pairing with a provided acceptor mediator.** These are current behaviour,
-not guarantees:
+**Pairing behaviour that applies to every gateway, and limits of pairing with a provided acceptor
+mediator.** These are current behaviour, not guarantees:
 
-- An invitation accepted just before the gateway restarts does not complete. The startup sweep removes
-  pending gateways and their pairings, and finalization refuses to continue when this attempt's
-  pending gateway is missing instead of recreating one, which would attach a gateway with no tenant
-  to a tenant's mediator. The invitation has to be accepted again. Recreating the pending gateway
-  with its original tenant is a planned change that is not implemented yet.
+- Finalizing a pairing needs the pending gateway of that acceptance, for every mediator, not only a
+  provided one. A missing one refuses the finalization and writes nothing, where earlier versions
+  recreated it with no tenant, which could attach a gateway with no tenant to a tenant's mediator
+  or pick up another acceptance's gateway by the shared DID.
+- An invitation accepted just before the gateway restarts does not complete. At start the gateway
+  removes the pending gateways, and their pairings, that an earlier run left behind; one created
+  since the process started belongs to a pairing in flight and is kept. The interrupted invitation
+  has to be accepted again.
 - A rejected acceptance, or one whose finalization fails, leaves its pairing, temporary Connection
   Point, listener and pending gateway until the pairing expires or the gateway restarts. They hold the
   provided mediator (`409` on `DELETE`) until then. A failure while the invitation is being
   accepted removes all of them at once.
-- A request cancelled by the client after its pending gateway is stored and before its temporary
-  Connection Point is created leaves a Pending gateway, which a restart removes and an operator can
-  delete. The window is a few store operations wide and needs a disconnect inside it, so it is rare,
-  and handling it is postponed.
+- A request cancelled by the client while the invitation is being accepted is cleaned up the same way
+  as a failed one, on a task of its own: the pairing, the temporary Connection Point, the pending
+  gateway and the generated keys are removed and the DIDComm client is shut down. A cancellation
+  before the pairing is stored leaves nothing but the generated keys, which the same cleanup removes.
 - For `did:webvh` Connection Points, cleaning up a failed acceptance removes the generated key
   directories only. The DID log and the identity record stay, as they do when such a Connection
   Point is deleted.

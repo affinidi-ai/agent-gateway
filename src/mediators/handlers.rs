@@ -165,11 +165,22 @@ pub(crate) async fn reject_provided_delete(
         }
         None => Listing::NotListed,
     };
-    if listing != Listing::NotListed {
-        return Err((
-            StatusCode::CONFLICT,
-            "Mediator is provided by the directory and is still offered by it".to_string(),
-        ));
+    match listing {
+        Listing::NotListed => {}
+        Listing::Listed => {
+            return Err((
+                StatusCode::CONFLICT,
+                "Mediator is provided by the directory and is still offered by it".to_string(),
+            ));
+        }
+        Listing::Unknown => {
+            return Err((
+                StatusCode::CONFLICT,
+                "The mediator directory has not answered yet, so it is not known whether it still offers this \
+                 mediator; try again once it has"
+                    .to_string(),
+            ));
+        }
     }
     let used_message = || {
         (
@@ -2089,6 +2100,31 @@ mod tests {
             offered
                 .1
                 .contains("still offered")
+        );
+
+        let never_answered = crate::event_hook::MediatorDirectory::new(&crate::event_hook::EventHookSettings {
+            directory_url: Some("http://127.0.0.1:9/directory".into()),
+            ..crate::event_hook::EventHookSettings::default()
+        })
+        .await
+        .unwrap();
+        let unknown = super::reject_provided_delete(&created, Some(&never_answered), Some(&points), Some(&pairings))
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.0, axum::http::StatusCode::CONFLICT);
+        assert!(
+            unknown
+                .1
+                .contains("has not answered yet"),
+            "{}",
+            unknown.1
+        );
+        assert!(
+            !unknown
+                .1
+                .contains("still offered"),
+            "{}",
+            unknown.1
         );
 
         let (dropped, _) = directory_listing(None).await;

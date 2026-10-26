@@ -186,6 +186,9 @@ attributed to the authenticated actor and records whether it was orphan cleanup.
 - A tenant-owned resource may reference same-tenant or global dependencies.
 - A global resource may reference only global dependencies.
 - A referenced resource must also match the PAT pattern before the write is persisted.
+  The one exception is a Connection Point created on a mediator the mediator directory offers
+  (a `directory:` id): the offer is not a stored resource, so it is not matched against the
+  pattern, and the Connection Point itself still must match.
 
 ### What tenancy does not partition
 
@@ -214,8 +217,8 @@ Ownership changes are administrator-only: `GET
 /v1/tenant-ownership/{kind}/{id}/impact` reports incoming/outgoing references and
 `PUT /v1/tenant-ownership/{kind}/{id}` changes `tenant_id`, returning `409` if any
 reference would become incompatible. The self Gateway and built-in Surface
-Templates are immovable; child API keys and Connection Points move with their
-parent.
+Templates are immovable, and so is a mediator provided by the mediator directory (`409`);
+child API keys and Connection Points move with their parent.
 
 ## Dashboard
 

@@ -1353,6 +1353,213 @@ mod tests {
         mediator
     }
 
+    struct UnfinishedAcceptance {
+        _dir: tempfile::TempDir,
+        pairings: Arc<crate::gateways::PendingConnectionStore>,
+        points: Arc<crate::gateways::FileSystemConnectionPointStore>,
+        gateways: Arc<crate::gateways::FileSystemGatewayStore>,
+        keys: std::path::PathBuf,
+        cleanup:
+            AcceptanceCleanup<crate::gateways::FileSystemGatewayStore, crate::gateways::FileSystemConnectionPointStore>,
+    }
+
+    impl UnfinishedAcceptance {
+        async fn start() -> Self {
+            use crate::gateways::connection_points::ConnectionPointStore;
+            let dir = tempfile::tempdir().unwrap();
+            let pairings = Arc::new(
+                crate::gateways::PendingConnectionStore::new(dir.path().join("pairings"))
+                    .await
+                    .unwrap(),
+            );
+            let points = Arc::new(
+                crate::gateways::FileSystemConnectionPointStore::new(dir.path().join("points"))
+                    .await
+                    .unwrap(),
+            );
+            let gateways = Arc::new(
+                crate::gateways::FileSystemGatewayStore::new(dir.path().join("gateways"), None)
+                    .await
+                    .unwrap(),
+            );
+            let temp_cp_uuid = uuid::Uuid::new_v4();
+            let secure_cp_uuid = uuid::Uuid::new_v4();
+            let temp_cp_id = temp_cp_uuid.to_string();
+            let keys = dir.path().join("keys");
+            for id in [temp_cp_uuid, secure_cp_uuid] {
+                tokio::fs::create_dir_all(keys.join(id.to_string()))
+                    .await
+                    .unwrap();
+            }
+
+            let pairing: crate::gateways::PendingOOBConnection = serde_json::from_value(serde_json::json!({
+                "id": temp_cp_id,
+                "our_temporary_did": "did:web:us.example:tmp",
+                "our_secure_did": "did:web:us.example:secure",
+                "their_temporary_did": "did:web:them.example:tmp",
+                "their_secure_did": null,
+                "mediator_did": "did:web:mediator.example",
+                "connection_point_id": "",
+                "invitation_id": "inv-1",
+                "role": "Acceptor",
+                "state": "WaitingForResponse",
+                "created_at": "2026-01-01T00:00:00Z",
+                "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                "temporary_cp_id": temp_cp_id,
+            }))
+            .unwrap();
+            pairings.store(pairing).await;
+
+            let mut gateway =
+                Gateway::new("peer".into(), String::new(), "did:web:them.example:tmp".into(), GatewayType::Remote);
+            gateway.status = GatewayStatus::Pending;
+            gateways
+                .create(&gateway)
+                .await
+                .unwrap();
+
+            let mut temporary = crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+                gateway.id.clone(),
+                "did:web:mediator.example".into(),
+                "did:web:us.example:tmp".into(),
+                "temporary".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                serde_json::json!({}),
+                None,
+                crate::gateways::connection_points::types::ConnectionPointType::System,
+                String::new(),
+            );
+            temporary.id = temp_cp_id.clone();
+            points
+                .create(&temporary)
+                .await
+                .unwrap();
+
+            let client =
+                crate::comm::didcomm::client::DIDCommClient::new("did:example:acceptor".into(), Vec::new(), None, None)
+                    .await
+                    .unwrap();
+            let cleanup = AcceptanceCleanup {
+                pending_store: pairings.clone(),
+                cp_store: points.clone(),
+                store: gateways.clone(),
+                atm: client.atm().clone(),
+                keys_root: keys
+                    .to_string_lossy()
+                    .into_owned(),
+                key_ids: [temp_cp_uuid, secure_cp_uuid],
+                pending_id: temp_cp_id.clone(),
+                temp_cp_id,
+                pending_gateway_id: gateway.id.clone(),
+            };
+            Self {
+                _dir: dir,
+                pairings,
+                points,
+                gateways,
+                keys,
+                cleanup,
+            }
+        }
+
+        fn cleanup_clone(
+            &self
+        ) -> AcceptanceCleanup<crate::gateways::FileSystemGatewayStore, crate::gateways::FileSystemConnectionPointStore>
+        {
+            let cleanup = &self.cleanup;
+            AcceptanceCleanup {
+                pending_store: cleanup.pending_store.clone(),
+                cp_store: cleanup.cp_store.clone(),
+                store: cleanup.store.clone(),
+                atm: cleanup.atm.clone(),
+                keys_root: cleanup.keys_root.clone(),
+                key_ids: cleanup.key_ids,
+                pending_id: cleanup.pending_id.clone(),
+                temp_cp_id: cleanup.temp_cp_id.clone(),
+                pending_gateway_id: cleanup
+                    .pending_gateway_id
+                    .clone(),
+            }
+        }
+
+        async fn leftovers(&self) -> (bool, bool, bool, usize) {
+            use crate::gateways::connection_points::ConnectionPointStore;
+            let cleanup = &self.cleanup;
+            let pairing = self
+                .pairings
+                .get_by_temporary_cp_id(&cleanup.temp_cp_id)
+                .await
+                .is_some();
+            let point = self
+                .points
+                .get(&cleanup.temp_cp_id)
+                .await
+                .unwrap()
+                .is_some();
+            let gateway = self
+                .gateways
+                .get(&cleanup.pending_gateway_id)
+                .await
+                .unwrap()
+                .is_some();
+            let mut key_dirs = 0;
+            let mut entries = tokio::fs::read_dir(&self.keys)
+                .await
+                .unwrap();
+            while entries
+                .next_entry()
+                .await
+                .unwrap()
+                .is_some()
+            {
+                key_dirs += 1;
+            }
+            (pairing, point, gateway, key_dirs)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_acceptance_removes_what_it_left_behind_on_its_own_task() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        assert_eq!(acceptance.leftovers().await, (true, true, true, 2));
+
+        let cancelled = tokio::spawn({
+            let guard = AcceptanceGuard(Some(acceptance.cleanup_clone()));
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancelled.abort();
+        for _ in 0..100 {
+            if acceptance.leftovers().await == (false, false, false, 0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(acceptance.leftovers().await, (false, false, false, 0));
+    }
+
+    #[tokio::test]
+    async fn a_finished_acceptance_keeps_its_state() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        AcceptanceGuard(Some(acceptance.cleanup_clone())).finished();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(acceptance.leftovers().await, (true, true, true, 2));
+    }
+
+    #[tokio::test]
+    async fn an_undone_acceptance_is_removed_before_undo_returns() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        AcceptanceGuard(Some(acceptance.cleanup_clone()))
+            .undo()
+            .await;
+        assert_eq!(acceptance.leftovers().await, (false, false, false, 0));
+    }
+
     #[tokio::test]
     async fn a_delete_that_starts_after_the_acceptor_check_waits_for_the_pairing_and_then_finds_it() {
         use crate::mediators::MediatorStore;
@@ -1781,6 +1988,79 @@ async fn remove_generated_identities(
     }
 }
 
+/// What an acceptance that does not finish leaves behind, and how it is removed: the
+/// pairing, the temporary connection point, the pending gateway, the DIDComm client and
+/// the generated keys.
+struct AcceptanceCleanup<S, P> {
+    pending_store: Arc<crate::gateways::PendingConnectionStore>,
+    cp_store: Arc<P>,
+    store: Arc<S>,
+    atm: Arc<affinidi_messaging_sdk::ATM>,
+    keys_root: String,
+    key_ids: [uuid::Uuid; 2],
+    pending_id: String,
+    temp_cp_id: String,
+    pending_gateway_id: String,
+}
+
+impl<S: GatewayStore, P: ConnectionPointStore> AcceptanceCleanup<S, P> {
+    async fn run(self) {
+        self.pending_store
+            .remove(&self.pending_id)
+            .await;
+        if let Err(e) = self
+            .cp_store
+            .delete(&self.temp_cp_id)
+            .await
+        {
+            warn!("Could not remove the temporary connection point of a failed attempt: {e}");
+        }
+        if let Ok(Some(orphan)) = self
+            .store
+            .get(&self.pending_gateway_id)
+            .await
+            && orphan.status == GatewayStatus::Pending
+            && let Err(e) = self
+                .store
+                .delete(&orphan.id)
+                .await
+        {
+            warn!("Could not remove the pending gateway of a failed attempt: {e}");
+        }
+        self.atm
+            .graceful_shutdown()
+            .await;
+        remove_generated_identities(&self.keys_root, &self.key_ids).await;
+    }
+}
+
+/// Runs the cleanup unless the acceptance finished. A request that is cancelled drops the
+/// guard, which then runs the cleanup on its own task, so nothing depends on the client
+/// staying connected.
+struct AcceptanceGuard<S: GatewayStore + 'static, P: ConnectionPointStore + 'static>(Option<AcceptanceCleanup<S, P>>);
+
+impl<S: GatewayStore + 'static, P: ConnectionPointStore + 'static> AcceptanceGuard<S, P> {
+    async fn undo(mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup.run().await;
+        }
+    }
+
+    fn finished(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<S: GatewayStore + 'static, P: ConnectionPointStore + 'static> Drop for AcceptanceGuard<S, P> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(cleanup.run());
+        }
+    }
+}
+
 /// Response for connecting to a gateway via OOB
 #[derive(Debug, Serialize)]
 pub struct ConnectViaOOBResponse {
@@ -2115,6 +2395,20 @@ pub async fn connect_via_oob<
     info!("    Role: {:?}", pending_connection.role);
     info!("    State: {:?}", pending_connection.state);
 
+    let cleanup = AcceptanceGuard(Some(AcceptanceCleanup {
+        pending_store: pending_store.clone(),
+        cp_store: cp_store.clone(),
+        store: store.clone(),
+        atm: didcomm_client.atm().clone(),
+        keys_root: bootstrap_config
+            .storage_paths
+            .connection_points
+            .clone(),
+        key_ids: [temp_cp_uuid, secure_cp_uuid],
+        pending_id: pending_connection.id.clone(),
+        temp_cp_id: temp_cp_id.clone(),
+        pending_gateway_id: pending_gateway_id.clone(),
+    }));
     let acceptor_lock = match req
         .acceptor_mediator_id
         .as_deref()
@@ -2131,24 +2425,13 @@ pub async fn connect_via_oob<
             {
                 Ok(lock) => lock,
                 Err(refusal) => {
-                    didcomm_client
-                        .atm()
-                        .graceful_shutdown()
-                        .await;
-                    remove_generated_identities(
-                        &bootstrap_config
-                            .storage_paths
-                            .connection_points,
-                        &[temp_cp_uuid, secure_cp_uuid],
-                    )
-                    .await;
+                    cleanup.undo().await;
                     return Err(refusal);
                 }
             }
         }
         None => None,
     };
-    let pending_id = pending_connection.id.clone();
     let stored = match acceptor_lock {
         Some(guard) => {
             let pending_store = pending_store.clone();
@@ -2173,13 +2456,7 @@ pub async fn connect_via_oob<
     };
     if let Err(e) = stored {
         error!("Storing the pending connection failed: {e}");
-        remove_generated_identities(
-            &bootstrap_config
-                .storage_paths
-                .connection_points,
-            &[temp_cp_uuid, secure_cp_uuid],
-        )
-        .await;
+        cleanup.undo().await;
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to store the pending connection".to_string()));
     }
     info!("✓ Pending connection state stored");
@@ -2451,38 +2728,9 @@ pub async fn connect_via_oob<
         Ok(Json(ConnectViaOOBResponse { gateway: pending_gateway }))
     }
     .await;
-    if outcome.is_err() {
-        pending_store
-            .remove(&pending_id)
-            .await;
-        // Without the pairing a late connection-accepted would be recovered from this
-        // attempt's temporary connection point, so that record, the pending gateway
-        // and the generated keys go too.
-        if let Err(e) = cp_store
-            .delete(&temp_cp_id)
-            .await
-        {
-            tracing::debug!("No temporary connection point to remove for a failed attempt: {e}");
-        }
-        if let Ok(Some(orphan)) = store
-            .get(&pending_gateway_id)
-            .await
-            && orphan.status == GatewayStatus::Pending
-            && let Err(e) = store.delete(&orphan.id).await
-        {
-            warn!("Could not remove the pending gateway of a failed attempt: {e}");
-        }
-        didcomm_client
-            .atm()
-            .graceful_shutdown()
-            .await;
-        remove_generated_identities(
-            &bootstrap_config
-                .storage_paths
-                .connection_points,
-            &[temp_cp_uuid, secure_cp_uuid],
-        )
-        .await;
+    match &outcome {
+        Ok(_) => cleanup.finished(),
+        Err(_) => cleanup.undo().await,
     }
     outcome
 }
