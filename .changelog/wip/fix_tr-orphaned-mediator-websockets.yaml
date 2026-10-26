@@ -14,9 +14,12 @@ changes:
         down, including when the gateway steps down to Standby, and stale connection
         recovery reuses a connection another request has already replaced instead of
         tearing it down. A connection setup that fails partway also closes its
-        websocket. A reconnect now closes the current connection before opening the
-        new one, so the old connection no longer receives the duplicate error and
-        marks the trust registry Failed.
+        websocket. A reconnect or connection setup now closes the current connection
+        before opening the new one, so the old connection no longer receives the
+        duplicate error and marks the trust registry Failed. A stale temporary
+        connection to a public trust registry is replaced with a new one instead of
+        staying stuck, and closing a connection no longer waits more than 10 seconds
+        for its websocket to shut down.
   removed: []
   security:
     - timestamp: '2026-10-23T00:00:00.000Z'

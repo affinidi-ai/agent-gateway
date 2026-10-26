@@ -48,6 +48,8 @@ const WS_READY_MAX_ATTEMPTS: u8 = 5;
 const WS_READY_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Back-off delay between failed preflight attempts.
 const WS_READY_RETRY_DELAY: Duration = Duration::from_millis(300);
+/// How long closing a connection waits for its websocket shutdown.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connection protocol message types
 #[allow(dead_code)]
@@ -230,10 +232,17 @@ impl TrustRegistryConnection {
     /// per DID.
     async fn close(&self) {
         self.fail_all_waiters().await;
-        self.client
-            .atm()
-            .graceful_shutdown()
-            .await;
+        let atm = Arc::clone(self.client.atm());
+        let shutdown = tokio::spawn(async move { atm.graceful_shutdown().await });
+        if tokio::time::timeout(CLOSE_TIMEOUT, shutdown)
+            .await
+            .is_err()
+        {
+            warn!(
+                "Trust registry '{}': websocket shutdown still running after {:?}, continuing in the background",
+                self.trust_registry_id, CLOSE_TIMEOUT
+            );
+        }
     }
 
     /// Whether `other` is this same connection, i.e. shares its DIDComm client.
@@ -744,6 +753,11 @@ impl TrustRegistryListenerManager {
 
         info!("Generated per-registry identity: {}", our_did);
 
+        // A retried setup can reuse the registry's DID, and the mediator allows
+        // one websocket per DID.
+        self.remove_connection(trust_registry_id)
+            .await;
+
         // Step 3: Create DIDComm client and connect (pre-cache our DID doc to avoid HTTPS resolution)
         let client = create_tr_client(trust_registry_id, &our_did, &mediator_did, &secrets, Some((&our_did, &did_doc)))
             .await
@@ -998,7 +1012,8 @@ impl TrustRegistryListenerManager {
         }
     }
 
-    /// Store `connection` under its registry id, closing any connection it replaces.
+    /// Store `connection` under its registry id, closing any connection it
+    /// replaces and stopping that connection's reader.
     async fn install_connection(
         &self,
         connection: TrustRegistryConnection,
@@ -1014,6 +1029,8 @@ impl TrustRegistryListenerManager {
                 connection,
             );
         if let Some(replaced) = replaced {
+            self.stop_reader(&replaced.trust_registry_id)
+                .await;
             replaced.close().await;
             debug!("Closed replaced connection for trust registry '{}'", replaced.trust_registry_id);
         }
@@ -1480,7 +1497,9 @@ impl TrustRegistryListenerManager {
 
     /// Send with stale connection recovery. On StaleConnection, reuses the
     /// connection another caller already put in its place, or evicts the dead
-    /// connection and reconnects from disk, then retries once.
+    /// connection and rebuilds it, then retries once. A temporary connection's
+    /// keys are not kept, so it is replaced by a new temporary connection
+    /// instead of reconnected from disk.
     async fn send_with_reconnect(
         &self,
         trust_registry_did: &str,
@@ -1514,17 +1533,24 @@ impl TrustRegistryListenerManager {
                 {
                     Some(current) => current,
                     None => {
-                        self.reconnect(
-                            &connection.trust_registry_id,
-                            &connection.our_did,
-                            &connection.registry_did,
-                            &connection.mediator_did,
-                            connection.main_did.clone(),
-                        )
-                        .await?;
+                        self.remove_connection(&connection.trust_registry_id)
+                            .await;
+                        if connection.is_temporary {
+                            self.recover_or_create_connection(trust_registry_did)
+                                .await?
+                        } else {
+                            self.reconnect(
+                                &connection.trust_registry_id,
+                                &connection.our_did,
+                                &connection.registry_did,
+                                &connection.mediator_did,
+                                connection.main_did.clone(),
+                            )
+                            .await?;
 
-                        let connections = self.connections.read().await;
-                        Self::get_connection_by_id(&connections, &connection.trust_registry_id)?.clone()
+                            let connections = self.connections.read().await;
+                            Self::get_connection_by_id(&connections, &connection.trust_registry_id)?.clone()
+                        }
                     }
                 };
 
@@ -2180,11 +2206,20 @@ mod tests {
         mgr.install_connection(first.clone())
             .await;
 
+        mgr.spawn_reader("tr-1").await;
+
         let second = test_connection("tr-1").await;
         mgr.install_connection(second.clone())
             .await;
 
         assert!(pending.await.is_err(), "the replaced connection must be closed");
+        assert!(
+            !mgr.readers
+                .read()
+                .await
+                .contains_key("tr-1"),
+            "the replaced connection's reader must be stopped"
+        );
         let stored = mgr
             .get_connection_clone("tr-1")
             .await
@@ -2282,6 +2317,28 @@ mod tests {
             mgr.get_connection_clone("tr-1")
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_temporary_connection_is_removed_when_it_cannot_be_replaced() {
+        let mgr = test_manager();
+        let mut connection = test_connection("temp-1").await;
+        connection.is_temporary = true;
+        connection.main_did = Some("did:example:registry".to_string());
+        mgr.install_connection(connection)
+            .await;
+
+        let result = mgr
+            .send_with_reconnect("did:example:registry", trqp::QUERY_AUTHORIZATION, json!({}), Duration::from_secs(1))
+            .await;
+
+        assert!(result.is_err(), "an unresolvable registry DID cannot get a new temporary connection");
+        assert!(
+            mgr.get_connection_clone("temp-1")
+                .await
+                .is_none(),
+            "the stale temporary connection must be removed"
         );
     }
 
