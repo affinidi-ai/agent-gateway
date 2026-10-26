@@ -8,7 +8,8 @@ changes:
       description: >-
         Below 1440px wide the Audit Log now shows the event list above the event details and
         the page scrolls as one, instead of two cramped side-by-side panels with short scroll
-        boxes; selecting an event scrolls to its details. On wider screens the two panels fill
+        boxes; selecting an event scrolls to its details, and the search, filters, Forward
+        records and Refresh stay pinned at the top while the page scrolls. On wider screens the two panels fill
         the page height without the page scrolling past the footer, and the event details use
         the full height next to the About banner.
     - timestamp: '2026-10-21T17:30:00Z'

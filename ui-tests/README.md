@@ -189,8 +189,9 @@ The spec also runs an Audit Log layout test at each viewport, measured from the 
 `helpers/layout-audit.ts`. Where the Audit Log stacks (below 1440px wide: 1280x720 and 1366x768) it
 checks that `.audit-shell` is a column with the list above the detail, that nothing in
 the page scrolls by itself, that selecting `audit-item-3` brings the detail panel to just
-below the topbar, and that clicking the detail title shows the entry fully below the
-topbar. Side by side it checks that the document does not scroll, that the list and the
+below the pinned filters and card header while the search, the filters and Refresh stay on
+screen under the topbar, and that clicking the detail title shows the entry fully below
+the pinned area. Side by side it checks that the document does not scroll, that the list and the
 evidence body are each at least 300px tall, and that selecting does not scroll the page.
 
 A fresh test-mode gateway has empty lists, so `helpers/layout-fixtures.ts` answers the list

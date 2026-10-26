@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
 import AuditDetailPanel from './AuditDetailPanel';
@@ -20,8 +20,29 @@ const AuditPage: React.FC = () => {
     }
     return acc;
   }, {});
+  const pageRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
+
+  // While stacked, the filters and the card header stay pinned under the
+  // topbar (dashboard.css). Publish their heights so the header sits under the
+  // filters and a scrolled-to entry or detail panel lands below both; the
+  // filters wrap, so the heights change with the width.
+  useEffect(() => {
+    const page = pageRef.current;
+    const filters = page?.querySelector<HTMLElement>('.audit-filters');
+    const header = page?.querySelector<HTMLElement>('.audit-card-header');
+    if (!page || !filters || !header || typeof ResizeObserver === 'undefined') return;
+    const publish = () => {
+      page.style.setProperty('--audit-filters-height', `${filters.offsetHeight}px`);
+      page.style.setProperty('--audit-header-height', `${header.offsetHeight}px`);
+    };
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(filters);
+    observer.observe(header);
+    return () => observer.disconnect();
+  }, []);
 
   const selectedIdx = audit.expandedIdx ?? 0;
   const selectedEntry = audit.filteredEntries[selectedIdx] ?? null;
@@ -48,7 +69,7 @@ const AuditPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid audit-page" data-testid="page-audit">
+    <div className="container-fluid audit-page" data-testid="page-audit" ref={pageRef}>
       <AuditFilters
         searchInput={audit.searchInput}
         onSearchChange={audit.setSearchInput}
@@ -69,7 +90,7 @@ const AuditPage: React.FC = () => {
       />
 
       <div className="card shadow audit-card">
-        <div className="card-header py-3 d-flex justify-content-between align-items-center flex-wrap">
+        <div className="card-header audit-card-header py-3 d-flex justify-content-between align-items-center flex-wrap">
           <h6 className="m-0 font-weight-bold text-primary mr-3">
             <i className="fas fa-clipboard-list mr-1"></i> Audit Log
             {audit.total > 0 && (

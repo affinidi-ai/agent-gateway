@@ -1,7 +1,8 @@
 /**
  * DOM measurements for the Audit Log checks of the laptop layout spec: how
  * the list and detail panels are laid out, which elements scroll by
- * themselves, and where an element sits relative to the fixed topbar.
+ * themselves, and where an element sits relative to the fixed topbar and,
+ * while the page is stacked, the pinned filters and card header.
  */
 
 import type {Page} from '@playwright/test';
@@ -69,14 +70,35 @@ export async function measureAuditLayout(page: Page): Promise<AuditLayout> {
     });
 }
 
-/** Where a test id sits in the viewport and where the fixed topbar ends. */
-export async function measureBelowTopbar(page: Page, testId: string): Promise<{box: Box; topbarBottom: number; viewportHeight: number}> {
+export interface BelowTopbar {
+    box: Box;
+    /** Bottom edge of the fixed topbar, in viewport pixels. */
+    topbarBottom: number;
+    /**
+     * Bottom edge of everything pinned at the top of the viewport: the topbar,
+     * and the Audit Log filters and card header while they are stuck there.
+     */
+    pinnedBottom: number;
+    viewportHeight: number;
+}
+
+/** Where a test id sits in the viewport and where the pinned area at its top ends. */
+export async function measureBelowTopbar(page: Page, testId: string): Promise<BelowTopbar> {
     return page.getByTestId(testId).evaluate((el: Element) => {
         const r = el.getBoundingClientRect();
         const topbar = document.querySelector('.topbar');
+        const topbarBottom = topbar ? topbar.getBoundingClientRect().bottom : 0;
+        // A sticky element is pinned when it sits at its `top` offset.
+        const pinned = Array.from(document.querySelectorAll('.audit-filters, .audit-card-header'))
+            .filter(node => {
+                const style = getComputedStyle(node);
+                return style.position === 'sticky' && Math.abs(node.getBoundingClientRect().top - parseFloat(style.top)) <= 1;
+            })
+            .map(node => node.getBoundingClientRect().bottom);
         return {
             box: {top: r.top, bottom: r.bottom, height: r.height},
-            topbarBottom: topbar ? topbar.getBoundingClientRect().bottom : 0,
+            topbarBottom,
+            pinnedBottom: Math.max(topbarBottom, ...pinned),
             viewportHeight: window.innerHeight,
         };
     });

@@ -3679,11 +3679,50 @@ body.dark-theme .audit-skeleton-line {
    over 230px tall). There the list sits above the detail and the page
    scrolls as one, with no scroll box inside it. Selecting an entry scrolls
    the page to the detail panel (AuditPage reads the computed flex-direction
-   of .audit-shell), and the scroll margin keeps the panel and the entry
-   below the fixed 70px topbar. */
+   of .audit-shell). The filters and the card header (title, Forward records,
+   Refresh) stay pinned under the fixed 70px topbar while the page scrolls,
+   and the scroll margin keeps the panel and the entry below them. AuditPage
+   publishes the two heights as --audit-filters-height and
+   --audit-header-height. */
 @media (max-width: 1439.98px) {
+  /* #content-wrapper hides its sideways overflow, which makes it a scroll
+     container that never scrolls, so nothing inside it could stick. clip cuts
+     the same overflow without being a scroll container. */
+  #wrapper #content-wrapper:has(.audit-page) {
+    overflow-x: clip;
+  }
+
   .audit-page {
     height: auto;
+  }
+
+  .audit-filters {
+    position: sticky;
+    top: 70px;
+    z-index: 20;
+    padding: 0.75rem 1rem 0.25rem;
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.85);
+    -webkit-backdrop-filter: blur(16px);
+    backdrop-filter: blur(16px);
+    box-shadow: 0 6px 12px -8px rgba(0, 0, 0, 0.25);
+  }
+
+  .audit-card {
+    overflow: clip;
+  }
+
+  .audit-card-header {
+    position: sticky;
+    top: calc(70px + var(--audit-filters-height, 0px));
+    z-index: 19;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 6px 12px -8px rgba(0, 0, 0, 0.25);
+  }
+
+  body.dark-theme .audit-filters,
+  body.dark-theme .audit-card-header {
+    background: rgba(30, 41, 59, 0.92);
   }
 
   .audit-card-body {
@@ -3708,7 +3747,9 @@ body.dark-theme .audit-skeleton-line {
     flex: none;
     max-height: none;
     align-self: stretch;
-    scroll-margin-top: 5rem;
+    scroll-margin-top: calc(
+      70px + var(--audit-filters-height, 0px) + var(--audit-header-height, 0px) + 0.75rem
+    );
   }
 
   .audit-drawer-body {
@@ -3716,7 +3757,9 @@ body.dark-theme .audit-skeleton-line {
   }
 
   .audit-item {
-    scroll-margin-top: 5rem;
+    scroll-margin-top: calc(
+      70px + var(--audit-filters-height, 0px) + var(--audit-header-height, 0px) + 0.75rem
+    );
   }
 }
 

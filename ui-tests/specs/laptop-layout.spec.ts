@@ -130,6 +130,9 @@ const MIN_PANEL_HEIGHT_PX = 300;
 /** Sub-pixel rounding allowance for scroll and edge comparisons. */
 const TOLERANCE_PX = 1;
 
+/** Controls that stay on screen while the stacked Audit Log scrolls to an entry. */
+const PINNED_AUDIT_ACTIONS = ['audit-search', 'audit-policy-filters', 'audit-refresh'] as const;
+
 const AUDIT_PAGE = LAYOUT_PAGES.find(entry => entry.id === 'audit');
 
 for (const size of LAPTOP_VIEWPORTS) {
@@ -156,13 +159,23 @@ for (const size of LAPTOP_VIEWPORTS) {
                 await page.getByTestId('audit-item-3').click();
                 await settle(page);
                 const detail = await measureBelowTopbar(page, 'audit-detail-panel');
-                expect(detail.box.top, 'the detail panel starts below the topbar').toBeGreaterThanOrEqual(detail.topbarBottom - TOLERANCE_PX);
+                expect(detail.pinnedBottom, 'the filters and card header are pinned under the topbar').toBeGreaterThan(detail.topbarBottom);
+                expect(detail.box.top, 'the detail panel starts below the pinned filters and header').toBeGreaterThanOrEqual(
+                    detail.pinnedBottom - TOLERANCE_PX,
+                );
                 expect(detail.box.top, 'the detail panel starts in the top half of the viewport').toBeLessThanOrEqual(detail.viewportHeight / 2);
+                for (const testId of PINNED_AUDIT_ACTIONS) {
+                    const action = await measureBelowTopbar(page, testId);
+                    expect(action.box.top, `${testId} stays below the topbar`).toBeGreaterThanOrEqual(action.topbarBottom - TOLERANCE_PX);
+                    expect(action.box.bottom, `${testId} stays in the pinned area`).toBeLessThanOrEqual(action.pinnedBottom + TOLERANCE_PX);
+                }
 
                 await page.getByTestId('audit-detail-title').click();
                 await settle(page);
                 const item = await measureBelowTopbar(page, 'audit-item-3');
-                expect(item.box.top, 'the selected entry starts below the topbar').toBeGreaterThanOrEqual(item.topbarBottom - TOLERANCE_PX);
+                expect(item.box.top, 'the selected entry starts below the pinned filters and header').toBeGreaterThanOrEqual(
+                    item.pinnedBottom - TOLERANCE_PX,
+                );
                 expect(item.box.bottom, 'the selected entry ends inside the viewport').toBeLessThanOrEqual(item.viewportHeight + TOLERANCE_PX);
             });
         } else {

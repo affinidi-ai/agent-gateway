@@ -562,12 +562,20 @@ _Viewport-filling master/detail_ in `dashboard.css`).
   are too narrow to read (about 510px each at 1366px, each entry over 230px tall). The
   list sits above the detail and the page scrolls as one: no scroll box inside the page
   and no overlay drawer.
+- **Pinned filters** while stacked: `.audit-filters` (search and filters) and
+  `.audit-card-header` (title, Forward records, Refresh) are `position: sticky` under the
+  70px topbar. `AuditPage` publishes their heights as `--audit-filters-height` and
+  `--audit-header-height` with a `ResizeObserver`, since the filters wrap; the header's
+  `top` and the scroll margins below use them. Sticky needs every ancestor up to the
+  document to leave overflow visible or `clip`: `#content-wrapper` hides its sideways
+  overflow on every page, so the stacked rule switches it to `overflow-x: clip` on the
+  Audit Log, and `.audit-card` clips instead of hiding.
 - **Scroll on select**: while stacked, selecting an entry smooth-scrolls the page so the
-  detail panel starts just below the fixed topbar (`scroll-margin-top`). `AuditPage`
+  detail panel starts just below the pinned filters and header (`scroll-margin-top`). `AuditPage`
   decides "stacked" from the computed `flex-direction` of `.audit-shell` at click time,
   so the breakpoint lives only in CSS. The default selection on load, a page change and a
   filter change do not scroll, and side by side selecting never scrolls. Clicking the
-  detail title scrolls back to the entry, which lands fully below the topbar.
+  detail title scrolls back to the entry, which lands fully below the pinned area.
 
 ### List tables
 
