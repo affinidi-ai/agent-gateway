@@ -75,139 +75,106 @@ pub async fn extract_fabric_backend_agent_identity(
 
 /// Extract and verify A2A fabric response VP
 ///
-/// Pattern: Mirrors GW2's message_processor.rs:926-986 inbound VP verification
-///
 /// Flow:
-/// 1. Navigate to message object (result.history[0] or result directly)
-/// 2. Check for VP credential extension
-/// 3. Verify VP signature using VC issuer
-/// 4. Store verified DID in identity store
-/// 5. Fall back to raw identity if no VP (backward compat)
+/// 1. Find the credential extension in the response locations the protected
+///    agent authors (see `backend_identity::response_identity_candidates`)
+/// 2. Verify VP signature using VC issuer
+/// 3. Store verified DID in identity store
+/// 4. Fall back to raw identity if no VP (backward compat)
 async fn extract_a2a_fabric_identity(
     response_json: &JsonValue,
     response_identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
     surface: &crate::config::agent_surface::AgentSurface,
     channel_name: &str,
 ) -> Result<Option<String>, String> {
-    // Navigate to message object (history or direct result)
-    // This matches the pattern from GW2's message_processor.rs
-    let message_obj = response_json
-        .get("result")
-        .and_then(|r| {
-            // Try history first (multi-message response)
-            if let Some(history) = r
-                .get("history")
-                .and_then(|h| h.as_array())
-                .and_then(|arr| arr.first())
-            {
-                info!(channel = channel_name, "Fabric: Found response in result.history[0]");
-                Some(history)
-            } else if r.get("metadata").is_some() || r.get("extensions").is_some() {
-                // Direct message response (single message completion)
-                info!(channel = channel_name, "Fabric: Found response directly in result");
-                Some(r)
-            } else {
-                warn!(channel = channel_name, "Fabric: Response has result but no history or metadata");
-                None
-            }
-        });
-
-    let message_obj = match message_obj {
-        Some(obj) => obj,
-        None => {
-            debug!(channel = channel_name, "Fabric: No message object found in response");
-            return Ok(None);
-        }
-    };
-
-    // Check for extensions array
-    let extensions = match message_obj
-        .get("extensions")
-        .and_then(|e| e.as_array())
-    {
-        Some(ext) => {
-            debug!(channel = channel_name, ext_count = ext.len(), "Fabric: Found extension URIs in response");
-            ext
-        }
-        None => {
-            debug!(channel = channel_name, "Fabric: No extensions array in response");
-            return Ok(None);
-        }
-    };
+    use crate::proxy::backend_identity::{IdentityExtractionError, extract_a2a_identity_from_message_with_uri};
 
     // PRIORITY 1: Check for VP credential extension (GW2 → GW1)
-    let has_credential_ext = extensions
-        .iter()
-        .any(|ext| ext.as_str() == Some(crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION));
+    match extract_a2a_identity_from_message_with_uri(
+        response_json,
+        crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+    ) {
+        Ok(credential_ext) => {
+            info!(channel = channel_name, "Fabric: Found VP credential extension from GW2");
+            return verify_fabric_credential(&credential_ext, response_identity_selector, surface, channel_name).await;
+        }
+        Err(IdentityExtractionError::DeclaredButMissing) => {
+            warn!(channel = channel_name, "Fabric: VP credential extension declared but not found in metadata");
+            return Ok(None);
+        }
+        Err(_) => {}
+    }
 
-    if has_credential_ext {
-        info!(channel = channel_name, "Fabric: Found VP credential extension from GW2");
+    // PRIORITY 2: Check for raw identity extension
+    let identity_ext = match extract_a2a_identity_from_message_with_uri(
+        response_json,
+        crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION,
+    ) {
+        Ok(identity_ext) => identity_ext,
+        Err(e) => {
+            debug!(channel = channel_name, reason = %e, "Fabric: No identity extension found in response");
+            return Ok(None);
+        }
+    };
+    debug!(channel = channel_name, "Fabric: Found raw identity extension");
 
-        let metadata = match message_obj.get("metadata") {
-            Some(m) => m,
-            None => {
-                warn!(channel = channel_name, "Fabric: VP credential extension declared but no metadata found");
-                return Ok(None);
-            }
-        };
+    // Check if backend agent already sent a DID
+    if let Some(did) = identity_ext
+        .get("did")
+        .and_then(|d| d.as_str())
+    {
+        info!(channel = channel_name, did = did, "Fabric: Backend agent DID from raw identity");
+        return Ok(Some(did.to_string()));
+    }
 
-        let credential_ext = match metadata.get(crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION) {
-            Some(ext) => ext,
-            None => {
-                warn!(channel = channel_name, "Fabric: VP credential extension declared but not found in metadata");
-                return Ok(None);
-            }
-        };
+    // Raw identity without DID - try to compute using identity selector
+    if let Some(selector) = response_identity_selector {
+        debug!(channel = channel_name, "Fabric: Computing backend agent identity from raw fields");
 
-        // Extract and verify VP
-        if let Some(vp_jwt) = credential_ext
-            .get("verifiablePresentation")
-            .and_then(|v| v.as_str())
+        match selector
+            .compute_identity(
+                &identity_ext,
+                channel_name,
+                Some(surface.surface_id.clone()),
+                surface.issuer_id.clone(),
+                crate::identity::filesystem::IdentityOrigin::Managed,
+            )
+            .await
         {
-            if let Some(selector) = response_identity_selector {
-                let vc_issuer = selector.get_vc_issuer();
-
-                match vc_issuer
-                    .verify_agent_presentation(vp_jwt)
-                    .await
-                {
-                    Ok((verified_did, identity_fields)) => {
-                        info!(
-                            channel = channel_name,
-                            did = %verified_did,
-                            "✓ Fabric: VP verification succeeded for server DID"
-                        );
-
-                        // Store verified DID from GW2
-                        let identity_store = vc_issuer.get_identity_store();
-                        if let Err(e) = identity_store
-                            .store_external_did(
-                                &verified_did,
-                                identity_fields,
-                                Some(surface.surface_id.clone()),
-                                true, // verified=true
-                            )
-                            .await
-                        {
-                            warn!(channel = channel_name, error = %e, "Fabric: Failed to store verified server DID");
-                        }
-
-                        return Ok(Some(verified_did));
-                    }
-                    Err(e) => {
-                        // POLICY: Reject invalid VPs
-                        let error_msg = format!("VP verification failed for server agent identity: {}", e);
-                        warn!(channel = channel_name, error = %e, "✗ Fabric: VP verification FAILED");
-                        return Err(error_msg);
-                    }
-                }
-            } else {
-                warn!(channel = channel_name, "Fabric: No response identity selector available for VP verification");
+            Ok(identity_result) => {
+                info!(
+                    channel = channel_name,
+                    did = identity_result.did,
+                    is_new = identity_result.is_new,
+                    "Fabric: Backend agent identity computed from raw fields"
+                );
+                return Ok(Some(identity_result.did));
+            }
+            Err(e) => {
+                warn!(channel = channel_name, error = %e, "Fabric: Failed to compute backend agent identity from raw fields");
+                // Don't reject - just return None for compat
+                return Ok(None);
             }
         }
+    }
 
-        // VP credential extension present but no verifiablePresentation field
-        // This is malformed - reject it
+    debug!(channel = channel_name, "Fabric: No identity selector available for raw identity");
+    Ok(None)
+}
+
+/// Verify the VP carried by GW2's credential extension and store the verified
+/// DID. Rejects a credential that carries no `verifiablePresentation` or whose
+/// VP fails verification.
+async fn verify_fabric_credential(
+    credential_ext: &JsonValue,
+    response_identity_selector: &Option<Arc<crate::identity::IdentitySelector>>,
+    surface: &crate::config::agent_surface::AgentSurface,
+    channel_name: &str,
+) -> Result<Option<String>, String> {
+    let Some(vp_jwt) = credential_ext
+        .get("verifiablePresentation")
+        .and_then(|v| v.as_str())
+    else {
         if credential_ext
             .get("verifiablePresentation")
             .is_none()
@@ -216,74 +183,171 @@ async fn extract_a2a_fabric_identity(
             warn!(channel = channel_name, "{}", error_msg);
             return Err(error_msg);
         }
-    }
+        return Ok(None);
+    };
 
-    // PRIORITY 2: Check for raw identity extension
-    let has_identity_ext = extensions
-        .iter()
-        .any(|ext| ext.as_str() == Some(crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION));
+    let Some(selector) = response_identity_selector else {
+        warn!(channel = channel_name, "Fabric: No response identity selector available for VP verification");
+        return Ok(None);
+    };
+    let vc_issuer = selector.get_vc_issuer();
 
-    if has_identity_ext {
-        debug!(channel = channel_name, "Fabric: Found raw identity extension");
+    match vc_issuer
+        .verify_agent_presentation(vp_jwt)
+        .await
+    {
+        Ok((verified_did, identity_fields)) => {
+            info!(
+                channel = channel_name,
+                did = %verified_did,
+                "✓ Fabric: VP verification succeeded for server DID"
+            );
 
-        let metadata = match message_obj.get("metadata") {
-            Some(m) => m,
-            None => {
-                debug!(channel = channel_name, "Fabric: Identity extension declared but no metadata found");
-                return Ok(None);
-            }
-        };
-
-        let identity_ext = match metadata.get(crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION) {
-            Some(ext) => ext,
-            None => {
-                debug!(channel = channel_name, "Fabric: Identity extension declared but not found in metadata");
-                return Ok(None);
-            }
-        };
-
-        // Check if backend agent already sent a DID
-        if let Some(did) = identity_ext
-            .get("did")
-            .and_then(|d| d.as_str())
-        {
-            info!(channel = channel_name, did = did, "Fabric: Backend agent DID from raw identity");
-            return Ok(Some(did.to_string()));
-        }
-
-        // Raw identity without DID - try to compute using identity selector
-        if let Some(selector) = response_identity_selector {
-            debug!(channel = channel_name, "Fabric: Computing backend agent identity from raw fields");
-
-            match selector
-                .compute_identity(
-                    identity_ext,
-                    channel_name,
+            // Store verified DID from GW2
+            let identity_store = vc_issuer.get_identity_store();
+            if let Err(e) = identity_store
+                .store_external_did(
+                    &verified_did,
+                    identity_fields,
                     Some(surface.surface_id.clone()),
-                    surface.issuer_id.clone(),
-                    crate::identity::filesystem::IdentityOrigin::Managed,
+                    true, // verified=true
                 )
                 .await
             {
-                Ok(identity_result) => {
-                    info!(
-                        channel = channel_name,
-                        did = identity_result.did,
-                        is_new = identity_result.is_new,
-                        "Fabric: Backend agent identity computed from raw fields"
-                    );
-                    return Ok(Some(identity_result.did));
-                }
-                Err(e) => {
-                    warn!(channel = channel_name, error = %e, "Fabric: Failed to compute backend agent identity from raw fields");
-                    // Don't reject - just return None for compat
-                    return Ok(None);
-                }
+                warn!(channel = channel_name, error = %e, "Fabric: Failed to store verified server DID");
             }
+
+            Ok(Some(verified_did))
+        }
+        Err(e) => {
+            // POLICY: Reject invalid VPs
+            let error_msg = format!("VP verification failed for server agent identity: {}", e);
+            warn!(channel = channel_name, error = %e, "✗ Fabric: VP verification FAILED");
+            Err(error_msg)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const IDENTITY_URI: &str = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
+    const CREDENTIAL_URI: &str = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
+
+    fn surface() -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(json!({
+            "name": "a-party",
+            "access_point": { "listen_address": "http://localhost:8700", "route": "/agents/a", "protocol": "a2a" },
+            "target": { "endpoint": "fabric://gw-2/b-party" }
+        }))
+        .expect("surface JSON")
+    }
+
+    fn agent_message(
+        uri: &str,
+        payload: JsonValue,
+    ) -> JsonValue {
+        json!({
+            "role": "ROLE_AGENT",
+            "parts": [{ "text": "done" }],
+            "extensions": [uri],
+            "metadata": { uri: payload }
+        })
+    }
+
+    fn caller_message() -> JsonValue {
+        json!({
+            "role": "ROLE_USER",
+            "parts": [{ "text": "hello" }],
+            "extensions": [IDENTITY_URI],
+            "metadata": { IDENTITY_URI: { "did": "did:web:caller" } }
+        })
+    }
+
+    fn v1_task(status_message: JsonValue) -> JsonValue {
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": { "task": {
+                "id": "t",
+                "status": { "state": "TASK_STATE_COMPLETED", "message": status_message },
+                "history": [caller_message()]
+            } }
+        })
+    }
+
+    async fn extract(
+        response: &JsonValue,
+        selector: &Option<Arc<crate::identity::IdentitySelector>>,
+    ) -> Result<Option<String>, String> {
+        extract_a2a_fabric_identity(response, selector, &surface(), "a-party").await
+    }
+
+    #[tokio::test]
+    async fn raw_identity_did_is_read_from_a_wrapped_v1_task_status_message() {
+        let response = v1_task(agent_message(IDENTITY_URI, json!({ "did": "did:web:agent" })));
+
+        assert_eq!(extract(&response, &None).await, Ok(Some("did:web:agent".to_string())));
+    }
+
+    #[tokio::test]
+    async fn raw_identity_did_is_read_from_a_v0_3_task_status_message() {
+        let response = json!({
+            "result": {
+                "kind": "task",
+                "id": "t",
+                "status": { "state": "completed", "message": agent_message(IDENTITY_URI, json!({ "did": "did:web:agent" })) },
+                "history": [caller_message()]
+            }
+        });
+
+        assert_eq!(extract(&response, &None).await, Ok(Some("did:web:agent".to_string())));
+    }
+
+    #[tokio::test]
+    async fn caller_identity_in_history_is_not_attributed_to_the_agent() {
+        let response = v1_task(json!({ "role": "ROLE_AGENT", "parts": [{ "text": "done" }] }));
+
+        assert_eq!(extract(&response, &None).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn declared_credential_without_payload_yields_no_identity() {
+        let response = v1_task(json!({
+            "role": "ROLE_AGENT",
+            "parts": [{ "text": "done" }],
+            "extensions": [CREDENTIAL_URI],
+            "metadata": {}
+        }));
+
+        assert_eq!(extract(&response, &None).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn credential_without_presentation_is_rejected() {
+        let response = v1_task(agent_message(CREDENTIAL_URI, json!({ "did": "did:web:agent" })));
+
+        match extract(&response, &None).await {
+            Err(message) => assert!(message.contains("missing verifiablePresentation"), "unexpected error: {message}"),
+            other => panic!("expected the credential to be rejected, got {other:?}"),
         }
     }
 
-    // No identity found - this is OK for compatibility
-    debug!(channel = channel_name, "Fabric: No identity extension found in response");
-    Ok(None)
+    #[tokio::test]
+    async fn unverifiable_credential_in_a_wrapped_v1_task_is_rejected() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let schema = json!({ "type": "object", "properties": { "name": { "type": "string", "x-identity": true } } });
+        let selector = crate::identity::IdentitySelector::new(&schema, Arc::new(issuer)).expect("selector");
+        let response = v1_task(agent_message(
+            CREDENTIAL_URI,
+            json!({ "verifiablePresentation": "not-a-presentation", "did": "did:web:agent" }),
+        ));
+
+        match extract(&response, &Some(Arc::new(selector))).await {
+            Err(message) => assert!(message.contains("VP verification failed"), "unexpected error: {message}"),
+            other => panic!("expected the credential to be rejected, got {other:?}"),
+        }
+    }
 }

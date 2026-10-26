@@ -745,7 +745,9 @@ async fn inject_credential_into_agent_card_inner(
 }
 
 /// Inject VP into A2A response
-/// Replaces raw identity extension with credential extension containing VP
+/// Replaces raw identity extension with credential extension containing VP.
+/// Returns `None`, without signing, when no location carries the identity
+/// extension (see [`visit_credential_locations`]).
 pub async fn inject_vp_into_a2a_response(
     response_bytes: &bytes::Bytes,
     agent_did: &str,
@@ -754,7 +756,15 @@ pub async fn inject_vp_into_a2a_response(
     vc_issuer: &Arc<crate::identity::VCIssuer>,
     channel_name: &str,
     inbound_chained_vcs: Vec<serde_json::Value>,
-) -> anyhow::Result<(bytes::Bytes, String)> {
+) -> anyhow::Result<Option<(bytes::Bytes, String)>> {
+    let mut response_json: JsonValue = serde_json::from_slice(response_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to parse response as JSON: {}", e))?;
+
+    if !visit_credential_locations(&mut response_json, &mut |message, _| Ok(carries_identity_extension(message)))? {
+        debug!(channel = channel_name, "No suitable location found for backend agent VP injection in response");
+        return Ok(None);
+    }
+
     // Create VP containing the serverIdentity VC signed by the backend agent's
     // DID. When a workload_binding is supplied the VC uses structured
     // `workloadBinding` (agentIdentity + userIdentity), otherwise falls back
@@ -780,103 +790,12 @@ pub async fn inject_vp_into_a2a_response(
         "Created serverIdentity VP for backend agent A2A response"
     );
 
-    // Parse the response as JSON
-    let mut response_json: JsonValue = serde_json::from_slice(response_bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to parse response as JSON: {}", e))?;
+    inject_credential_into_response_json(&mut response_json, &vp_jwt, agent_did, channel_name)?;
 
-    // Navigate to the message object - could be result.history[0] or result directly
-    let message_obj = if let Some(result) = response_json.get_mut("result") {
-        // Try history first (multi-message response)
-        if let Some(history_arr) = result
-            .get_mut("history")
-            .and_then(|h| h.as_array_mut())
-        {
-            if let Some(first_msg) = history_arr.first_mut() {
-                debug!(channel = channel_name, "VP injection: Using result.history[0]");
-                first_msg
-            } else {
-                return Err(anyhow::anyhow!("History array is empty"));
-            }
-        } else if result
-            .get("metadata")
-            .is_some()
-            || result
-                .get("extensions")
-                .is_some()
-        {
-            // Direct message response (single message)
-            debug!(channel = channel_name, "VP injection: Using result directly");
-            result
-        } else {
-            return Err(anyhow::anyhow!("No history array or metadata found in result"));
-        }
-    } else {
-        return Err(anyhow::anyhow!("No result field found in response"));
-    };
-
-    // Get or create the extensions array
-    if !message_obj
-        .as_object()
-        .map(|o| o.contains_key("extensions"))
-        .unwrap_or(false)
-        && let Some(msg_obj) = message_obj.as_object_mut()
-    {
-        msg_obj.insert("extensions".to_string(), JsonValue::Array(vec![]));
-    }
-
-    let extensions = message_obj
-        .get_mut("extensions")
-        .and_then(|e| e.as_array_mut())
-        .ok_or_else(|| anyhow::anyhow!("Extensions field is not an array or doesn't exist"))?;
-
-    // Remove the original agent identity extension URI if present
-    let agent_identity_uri = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
-    extensions.retain(|e| e.as_str() != Some(agent_identity_uri));
-
-    // Add the credential extension URI to the array
-    let extension_uri = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
-    if !extensions
-        .iter()
-        .any(|e| e.as_str() == Some(extension_uri))
-    {
-        extensions.push(JsonValue::String(extension_uri.to_string()));
-        debug!(channel = channel_name, "Added identity credential extension URI to response extensions array");
-    }
-
-    // Get or create the metadata object
-    if !message_obj
-        .as_object()
-        .map(|o| o.contains_key("metadata"))
-        .unwrap_or(false)
-        && let Some(msg_obj) = message_obj.as_object_mut()
-    {
-        msg_obj.insert("metadata".to_string(), JsonValue::Object(serde_json::Map::new()));
-    }
-
-    let metadata = message_obj
-        .get_mut("metadata")
-        .and_then(|m| m.as_object_mut())
-        .ok_or_else(|| anyhow::anyhow!("Metadata field is not an object"))?;
-
-    // Remove the original agent identity metadata if present
-    metadata.remove(agent_identity_uri);
-
-    // Add the VP to the metadata
-    metadata.insert(
-        extension_uri.to_string(),
-        serde_json::json!({
-            "verifiablePresentation": vp_jwt,
-            "did": agent_did,
-        }),
-    );
-
-    info!(channel = channel_name, "Injected backend agent identity credential VP into response, removed raw identity");
-
-    // Serialize back to bytes
     let modified_json = serde_json::to_vec(&response_json)
         .map_err(|e| anyhow::anyhow!("Failed to serialize modified response JSON: {}", e))?;
 
-    Ok((bytes::Bytes::from(modified_json), vp_jwt))
+    Ok(Some((bytes::Bytes::from(modified_json), vp_jwt)))
 }
 
 /// Inject DID:webvh identity into an A2A message's extensions array
@@ -1536,5 +1455,112 @@ mod tests {
                 .unwrap(),
             "bar"
         );
+    }
+
+    fn caller_message() -> serde_json::Value {
+        json!({
+            "role": "ROLE_USER",
+            "parts": [{ "text": "hello" }],
+            "extensions": [IDENTITY_URI],
+            "metadata": { IDENTITY_URI: { "agentIdentity": { "name": "caller" } } }
+        })
+    }
+
+    async fn inject_backend_vp(body: &serde_json::Value) -> (Option<(serde_json::Value, String)>, String) {
+        let (issuer, did, _tmp) = issuer_with_identity().await;
+        let bytes = bytes::Bytes::from(serde_json::to_vec(body).expect("serialize body"));
+        let injected = inject_vp_into_a2a_response(&bytes, &did, &identity_fields(), None, &issuer, "ch", Vec::new())
+            .await
+            .expect("injection should not fail");
+        let parsed = injected.map(|(body, vp)| (serde_json::from_slice(&body).expect("injected body is JSON"), vp));
+        (parsed, did)
+    }
+
+    fn assert_carries_backend_vp(
+        message: &serde_json::Value,
+        vp: &str,
+        did: &str,
+    ) {
+        assert_eq!(message["extensions"], json!([CREDENTIAL_URI]));
+        assert!(
+            message["metadata"]
+                .get(IDENTITY_URI)
+                .is_none()
+        );
+        assert_eq!(message["metadata"][CREDENTIAL_URI], json!({ "verifiablePresentation": vp, "did": did }));
+    }
+
+    #[tokio::test]
+    async fn backend_vp_is_injected_into_a_wrapped_v1_task_status_message_and_not_history() {
+        let body = json!({
+            "result": { "task": {
+                "id": "t",
+                "status": { "state": "TASK_STATE_COMPLETED", "message": agent_message() },
+                "history": [caller_message()]
+            } }
+        });
+
+        let (injected, did) = inject_backend_vp(&body).await;
+
+        let Some((injected, vp)) = injected else {
+            panic!("expected a VP to be injected into the status message");
+        };
+        assert_carries_backend_vp(&injected["result"]["task"]["status"]["message"], &vp, &did);
+        assert_eq!(injected["result"]["task"]["history"], json!([caller_message()]));
+    }
+
+    #[tokio::test]
+    async fn backend_vp_is_injected_into_a_v0_3_task_status_message_and_not_history() {
+        let body = json!({
+            "result": {
+                "kind": "task",
+                "id": "t",
+                "status": { "state": "completed", "message": agent_message() },
+                "history": [caller_message()]
+            }
+        });
+
+        let (injected, did) = inject_backend_vp(&body).await;
+
+        let Some((injected, vp)) = injected else {
+            panic!("expected a VP to be injected into the status message");
+        };
+        assert_carries_backend_vp(&injected["result"]["status"]["message"], &vp, &did);
+        assert_eq!(injected["result"]["history"], json!([caller_message()]));
+    }
+
+    #[tokio::test]
+    async fn backend_vp_is_not_injected_when_only_history_carries_identity() {
+        let body = json!({
+            "result": { "task": {
+                "id": "t",
+                "status": { "state": "TASK_STATE_COMPLETED" },
+                "history": [caller_message()]
+            } }
+        });
+
+        let (injected, _did) = inject_backend_vp(&body).await;
+
+        assert!(injected.is_none(), "the caller's history message must never receive the agent's VP");
+    }
+
+    #[tokio::test]
+    async fn backend_vp_is_not_injected_when_only_an_artifact_carries_identity() {
+        let body = json!({
+            "result": { "task": {
+                "id": "t",
+                "status": { "state": "TASK_STATE_COMPLETED" },
+                "artifacts": [{
+                    "artifactId": "a",
+                    "parts": [{ "text": "done" }],
+                    "extensions": [IDENTITY_URI],
+                    "metadata": { IDENTITY_URI: { "name": "backend-agent" } }
+                }]
+            } }
+        });
+
+        let (injected, _did) = inject_backend_vp(&body).await;
+
+        assert!(injected.is_none());
     }
 }

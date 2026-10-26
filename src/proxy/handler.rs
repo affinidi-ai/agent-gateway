@@ -16026,7 +16026,7 @@ async fn inject_backend_agent_vp(
                 inbound_chained_vcs.clone(),
             )
             .await
-            .map(|(body, proof)| (body, Some(proof)))
+            .map(|injected| injected.map_or_else(|| (response_body.clone(), None), |(body, proof)| (body, Some(proof))))
         }
         _ => {
             debug!(channel = channel_name, protocol = ?state.surface.channel_protocol(), "VP injection not supported for this protocol");
