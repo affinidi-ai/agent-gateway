@@ -2870,6 +2870,7 @@ pub async fn run_axum_proxy(
             if let Some(ref gw_store) = gateway_store {
                 let gw_store_clone = gw_store.clone();
                 let pending_store_clone = pending_connection_store.clone();
+                let started_at = chrono::Utc::now();
 
                 tokio::spawn(async move {
                     info!("Checking for pending OOB gateways from previous sessions...");
@@ -2884,7 +2885,7 @@ pub async fn run_axum_proxy(
                         Ok(gateways) => {
                             let pending_gateways: Vec<_> = gateways
                                 .into_iter()
-                                .filter(|gw| gw.status == crate::gateways::types::GatewayStatus::Pending)
+                                .filter(|gw| gw.is_left_pending_by_an_earlier_run(started_at))
                                 .collect();
 
                             if pending_gateways.is_empty() {
