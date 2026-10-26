@@ -127,7 +127,9 @@ server's metadata document. It tries the RFC 8414 URL first, then the OpenID Con
 from, the `token_endpoint` and the `jwks_uri`. The `issuer` in the document must equal the
 requested issuer byte for byte. `token_endpoint` and `jwks_uri` must be absolute `http` or
 `https` URLs of at most 2048 characters, with no whitespace, control characters,
-credentials or fragment, and not a cloud-metadata address.
+credentials or fragment, not a cloud-metadata address, and not a weaker scheme than the
+issuer: an `https` issuer with an `http` endpoint is an invalid document under every posture.
+The schemes are compared as parsed, so their case does not matter.
 
 | Limit | Value |
 | --- | --- |
@@ -137,10 +139,14 @@ credentials or fragment, and not a cloud-metadata address.
 | DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked` |
 | Status | Only a 2xx response is read |
 
-The caller chooses an `EgressPosture`. Both postures accept `http` and `https` and differ
-only in the address ranges they block. `CloudMetadataOnly` blocks only cloud-metadata
-addresses and allows loopback and private ranges, for operator-trusted callers. `Strict`
-also blocks loopback, unspecified, RFC 1918, link-local and unique-local addresses. The posture
+The caller chooses an `EgressPosture`. `Strict` accepts `https` only: `get_bounded` and
+`discover` refuse an `http` URL or an `http` issuer as `invalid_url` before any DNS lookup or
+request, and an `http` `token_endpoint` or `jwks_uri` makes the document invalid. `Strict` also
+blocks loopback, unspecified, RFC 1918, link-local and unique-local addresses.
+`CloudMetadataOnly` accepts `http` and `https`, for operator-trusted callers such as a local
+authorization server, and blocks only cloud-metadata addresses, allowing loopback and private
+ranges. An `http` issuer, possible only under `CloudMetadataOnly`, may have `http` or `https`
+endpoints. The posture
 applies to the metadata URL at fetch time. It also applies to the discovered
 `token_endpoint` and `jwks_uri` at parse time, where under `Strict` a literal IP host or a
 `localhost` name in a blocked range makes the document invalid. A name that only resolves to
@@ -151,16 +157,19 @@ blocks such a name at fetch time.
 A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
 stable string, `message()` fixed text that is safe in an API response (it never carries a
 resolved address or a transport error) and `detail()` text for logs only. The error's
-`Display` output includes the detail, so it is for logs only too.
+`Display` output includes the detail, so it is for logs only too. Both `code()` and
+`message()` reveal the kind of failure, for example that a host is blocked or unreachable, so
+a caller that serves untrusted parties should log them and return one generic message
+instead.
 
 | `code()` | Meaning |
 | --- | --- |
-| `invalid_url` | The issuer is not a usable URL, or has a query or fragment |
+| `invalid_url` | The URL or issuer is not an absolute `http` or `https` URL without credentials (`https` only under `Strict`), or the issuer has a query or fragment |
 | `blocked` | The egress posture refused the URL or its resolved address, the host name did not resolve, or the host is an IPv6 literal |
 | `unreachable` | Resolving the host timed out, the connection failed or timed out, or the body could not be read in time |
 | `http_status` | The server answered with a status outside 2xx, including a redirect |
 | `too_large` | The body exceeded the size limit |
-| `invalid_document` | The body is not a JSON object, or a required field is missing or unacceptable |
+| `invalid_document` | The body is not a JSON object, or a required field is missing or unacceptable, including an endpoint with a weaker scheme than the issuer or, under `Strict`, a non-`https` endpoint |
 | `issuer_mismatch` | The document's `issuer` differs from the requested issuer |
 
 `discover` stops at once on `invalid_url`, `blocked` or `unreachable`. Otherwise, when both
@@ -181,7 +190,7 @@ match discover(issuer, EgressPosture::Strict, DiscoveryOptions::default()).await
     Ok(metadata) => use_endpoints(&metadata.token_endpoint, &metadata.jwks_uri),
     Err(error) => {
         tracing::warn!(code = error.code(), detail = error.detail(), "discovery failed");
-        respond_with(error.code(), error.message());
+        respond_with("The authorization server could not be reached");
     }
 }
 ```

@@ -1,4 +1,5 @@
 use serde_json::Value;
+use url::Url;
 
 use super::fetch::{get_bounded, parse_fetch_url};
 use super::{AuthzServerMetadata, DiscoveryError, DiscoveryFailure, DiscoveryOptions, EgressPosture};
@@ -12,13 +13,11 @@ const MAX_ENDPOINT_URL_CHARS: usize = 2048;
 /// issuer path, after removing a terminating `/`; OpenID Connect appends
 /// `/.well-known/openid-configuration` to the issuer path, also without its terminating `/`.
 ///
-/// Fails with `invalid_url` unless `issuer` is an absolute http(s) URL with a host, no
-/// credentials, no query and no fragment. Performs no I/O.
+/// Fails with `invalid_url` unless `issuer` is an absolute http or https URL with a
+/// host, no credentials, no query and no fragment. The scheme rule of a posture is
+/// applied when the URLs are fetched. Performs no I/O.
 pub fn metadata_urls(issuer: &str) -> Result<[String; 2], DiscoveryError> {
-    let url = parse_fetch_url(issuer)?;
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err(DiscoveryError::new(DiscoveryFailure::InvalidUrl, "an issuer has no query or fragment"));
-    }
+    let url = parse_issuer(issuer, EgressPosture::CloudMetadataOnly)?;
     let origin = url
         .origin()
         .ascii_serialization();
@@ -31,7 +30,23 @@ pub fn metadata_urls(issuer: &str) -> Result<[String; 2], DiscoveryError> {
     ])
 }
 
+fn parse_issuer(
+    issuer: &str,
+    posture: EgressPosture,
+) -> Result<Url, DiscoveryError> {
+    let url = parse_fetch_url(issuer, posture)?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(DiscoveryError::new(DiscoveryFailure::InvalidUrl, "an issuer has no query or fragment"));
+    }
+    Ok(url)
+}
+
 /// Discover the authorization server metadata of `issuer` under `posture`.
+///
+/// `issuer` must be an absolute URL with a host and no credentials, query or fragment;
+/// under [`EgressPosture::Strict`] its scheme must be `https`, and under
+/// [`EgressPosture::CloudMetadataOnly`] `http` or `https`. Any other issuer fails with
+/// `invalid_url` before the host is resolved or a request is made.
 ///
 /// The RFC 8414 document is fetched first and the OpenID Connect document second, each
 /// with [`get_bounded`]: the host is vetted for `posture` and the connection pinned to
@@ -77,11 +92,15 @@ pub async fn discover(
 
 /// Validate a metadata document read from `metadata_url` for `issuer`. Performs no I/O.
 ///
+/// `issuer` must be acceptable to [`discover`] under `posture` (`invalid_url` otherwise).
 /// The body must be a JSON object whose `issuer` member equals `issuer` byte for byte,
 /// trailing slash included (`issuer_mismatch` otherwise). Its `token_endpoint` and
-/// `jwks_uri` members must be strings holding absolute http(s) URLs of at most 2048
-/// characters, with a host, without whitespace, control characters, credentials or a
-/// fragment, and not naming a cloud-metadata host. Under [`EgressPosture::Strict`] they
+/// `jwks_uri` members must be strings holding absolute http or https URLs of at most
+/// 2048 characters, with a host, without whitespace, control characters, credentials or
+/// a fragment, and not naming a cloud-metadata host. They must not use a weaker scheme
+/// than `issuer`: an `https` issuer requires `https` endpoints under every posture, and
+/// an `http` issuer, which only [`EgressPosture::CloudMetadataOnly`] accepts, allows
+/// `http` or `https` endpoints. Under [`EgressPosture::Strict`] they must use `https` and
 /// must also not name a literal loopback, unspecified, RFC 1918, link-local or
 /// unique-local address, nor the name `localhost` or a `.localhost` subdomain. Any other
 /// problem fails with `invalid_document`.
@@ -95,6 +114,7 @@ pub fn parse_metadata(
     metadata_url: &str,
     posture: EgressPosture,
 ) -> Result<AuthzServerMetadata, DiscoveryError> {
+    let requested = parse_issuer(issuer, posture)?;
     let invalid =
         |detail: &str| DiscoveryError::new(DiscoveryFailure::InvalidDocument, format!("{metadata_url}: {detail}"));
     let document: Value = serde_json::from_slice(body).map_err(|_| invalid("not JSON"))?;
@@ -116,7 +136,7 @@ pub fn parse_metadata(
             .get(name)
             .and_then(Value::as_str)
             .ok_or_else(|| invalid(&format!("no {name}")))?;
-        endpoint_url(value, posture).map_err(|reason| invalid(&format!("{name} {reason}")))
+        endpoint_url(value, &requested, posture).map_err(|reason| invalid(&format!("{name} {reason}")))
     };
     Ok(AuthzServerMetadata {
         issuer: issuer.to_string(),
@@ -128,6 +148,7 @@ pub fn parse_metadata(
 
 fn endpoint_url(
     value: &str,
+    issuer: &Url,
     posture: EgressPosture,
 ) -> Result<String, &'static str> {
     if value.chars().count() > MAX_ENDPOINT_URL_CHARS {
@@ -139,7 +160,11 @@ fn endpoint_url(
     {
         return Err("contains whitespace or a control character");
     }
-    let url = parse_fetch_url(value).map_err(|_| "is not an absolute http(s) URL without credentials")?;
+    let url = parse_fetch_url(value, posture)
+        .map_err(|_| "is not an absolute URL without credentials with a scheme the posture accepts")?;
+    if issuer.scheme() == "https" && url.scheme() != "https" {
+        return Err("uses http while the issuer uses https");
+    }
     if url.fragment().is_some() {
         return Err("has a fragment");
     }
@@ -166,6 +191,7 @@ mod tests {
     const ISSUER: &str = "https://as.example.com";
     const METADATA_URL: &str = "https://as.example.com/.well-known/oauth-authorization-server";
     const OPERATOR: EgressPosture = EgressPosture::CloudMetadataOnly;
+    const STRICT: EgressPosture = EgressPosture::Strict;
 
     fn document(issuer: &str) -> Value {
         json!({
@@ -201,6 +227,30 @@ mod tests {
         let mut doc = document(ISSUER);
         doc[field] = value;
         doc
+    }
+
+    fn parse_for(
+        issuer: &str,
+        token_endpoint: &str,
+        jwks_uri: &str,
+        posture: EgressPosture,
+    ) -> Result<AuthzServerMetadata, DiscoveryError> {
+        let doc = json!({ "issuer": issuer, "token_endpoint": token_endpoint, "jwks_uri": jwks_uri });
+        parse_metadata(doc.to_string().as_bytes(), issuer, METADATA_URL, posture)
+    }
+
+    fn endpoint_of(
+        field: &str,
+        value: &str,
+        posture: EgressPosture,
+    ) -> Result<String, DiscoveryError> {
+        parse(&with_endpoint(field, json!(value)), posture).map(|metadata| {
+            if field == "token_endpoint" {
+                metadata.token_endpoint
+            } else {
+                metadata.jwks_uri
+            }
+        })
     }
 
     async fn discovered(
@@ -239,6 +289,8 @@ mod tests {
             "https://as.example.com/?tenant=a",
             "https://as.example.com/#x",
             "https://u:p@as.example.com/",
+            "https://user@as.example.com",
+            "https://:pw@as.example.com",
             "as.example.com",
             "did:web:as.example.com",
             "ftp://as.example.com/",
@@ -251,6 +303,37 @@ mod tests {
     }
 
     #[test]
+    fn metadata_urls_accept_an_http_or_https_issuer_of_any_case() {
+        assert_eq!(
+            metadata_urls("HTTPS://as.example.com").unwrap(),
+            [
+                "https://as.example.com/.well-known/oauth-authorization-server",
+                "https://as.example.com/.well-known/openid-configuration"
+            ]
+        );
+        assert_eq!(
+            metadata_urls("HTTP://as.example.com").unwrap(),
+            [
+                "http://as.example.com/.well-known/oauth-authorization-server",
+                "http://as.example.com/.well-known/openid-configuration"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_issuer_with_only_a_user_name_or_only_a_password_is_refused() {
+        for issuer in ["https://user@as.example.com", "https://:pw@as.example.com"] {
+            assert_eq!(
+                metadata_urls(issuer)
+                    .unwrap_err()
+                    .code(),
+                "invalid_url",
+                "{issuer}"
+            );
+        }
+    }
+
+    #[test]
     fn a_complete_document_parses_into_the_pinned_fields() {
         let doc = json!({
             "issuer": ISSUER,
@@ -259,7 +342,7 @@ mod tests {
             "response_types_supported": ["code"]
         });
         assert_eq!(
-            parse(&doc, EgressPosture::Strict).unwrap(),
+            parse(&doc, STRICT).unwrap(),
             AuthzServerMetadata {
                 issuer: ISSUER.to_string(),
                 metadata_url: METADATA_URL.to_string(),
@@ -343,9 +426,7 @@ mod tests {
 
     #[test]
     fn unacceptable_endpoint_urls_are_invalid_under_both_postures() {
-        let too_long = format!("https://as.example.com/{}", "a".repeat(MAX_ENDPOINT_URL_CHARS));
         for value in [
-            too_long.as_str(),
             "https://user:pw@as.example.com/token",
             "https://as.example.com/token#frag",
             " https://as.example.com/token",
@@ -358,14 +439,14 @@ mod tests {
             "file:///etc/passwd",
             "ftp://as.example.com/token",
             "javascript:alert(1)",
-            "http://169.254.169.254/latest/meta-data/",
-            "http://[::ffff:169.254.169.254]/jwks",
-            "http://[fd00:ec2::254]/latest/meta-data/",
-            "http://metadata.google.internal/computeMetadata/v1/",
-            "http://METADATA.GOOGLE.INTERNAL./computeMetadata/v1/",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::ffff:169.254.169.254]/jwks",
+            "https://[fd00:ec2::254]/latest/meta-data/",
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "https://METADATA.GOOGLE.INTERNAL./computeMetadata/v1/",
         ] {
             for field in ["token_endpoint", "jwks_uri"] {
-                for posture in [EgressPosture::CloudMetadataOnly, EgressPosture::Strict] {
+                for posture in [OPERATOR, STRICT] {
                     let error = parse(&with_endpoint(field, json!(value)), posture).unwrap_err();
                     assert_eq!(
                         error.failure(),
@@ -378,62 +459,167 @@ mod tests {
     }
 
     #[test]
-    fn an_endpoint_of_exactly_the_maximum_length_is_accepted() {
+    fn cloud_metadata_endpoints_are_invalid_for_an_http_issuer() {
+        let issuer = "http://127.0.0.1:4444";
+        for value in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/jwks",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://METADATA.GOOGLE.INTERNAL./computeMetadata/v1/",
+        ] {
+            for (token_endpoint, jwks_uri) in
+                [(value, "http://127.0.0.1:4444/jwks.json"), ("http://127.0.0.1:4444/token", value)]
+            {
+                let error = parse_for(issuer, token_endpoint, jwks_uri, OPERATOR).unwrap_err();
+                assert_eq!(error.code(), "invalid_document", "{token_endpoint} {jwks_uri}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_endpoint_may_have_2048_characters_and_not_2049() {
         let prefix = "https://as.example.com/";
-        let value = format!("{prefix}{}", "a".repeat(MAX_ENDPOINT_URL_CHARS - prefix.len()));
-        assert_eq!(value.len(), MAX_ENDPOINT_URL_CHARS);
+        let at_limit = format!("{prefix}{}", "a".repeat(2048 - prefix.len()));
+        let over_limit = format!("{prefix}{}", "a".repeat(2048 + 1 - prefix.len()));
+        assert_eq!(at_limit.chars().count(), 2048);
+        assert_eq!(over_limit.chars().count(), 2048 + 1);
+        for field in ["token_endpoint", "jwks_uri"] {
+            for posture in [OPERATOR, STRICT] {
+                assert_eq!(endpoint_of(field, &at_limit, posture).unwrap(), at_limit, "{field} under {posture:?}");
+                assert_eq!(
+                    endpoint_of(field, &over_limit, posture)
+                        .unwrap_err()
+                        .code(),
+                    "invalid_document",
+                    "{field} under {posture:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_endpoint_with_only_a_user_name_or_only_a_password_is_invalid() {
+        for value in ["https://user@as.example.com/token", "https://:pw@as.example.com/token"] {
+            for field in ["token_endpoint", "jwks_uri"] {
+                assert_eq!(
+                    endpoint_of(field, value, OPERATOR)
+                        .unwrap_err()
+                        .code(),
+                    "invalid_document",
+                    "{field} = {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_https_issuer_requires_https_endpoints_under_both_postures() {
+        for value in ["http://as.example.com/token", "HTTP://as.example.com/token", "http://203.0.113.7/jwks.json"] {
+            for field in ["token_endpoint", "jwks_uri"] {
+                for posture in [OPERATOR, STRICT] {
+                    assert_eq!(
+                        endpoint_of(field, value, posture)
+                            .unwrap_err()
+                            .code(),
+                        "invalid_document",
+                        "{field} = {value} under {posture:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_http_issuer_accepts_http_and_https_endpoints_under_the_operator_posture() {
+        for issuer in ["http://127.0.0.1:4444", "HTTP://127.0.0.1:4444"] {
+            for (token_endpoint, jwks_uri) in [
+                ("http://127.0.0.1:4444/token", "http://127.0.0.1:4444/jwks.json"),
+                ("https://as.example.com/token", "https://keys.example.net/jwks.json"),
+                ("HTTP://127.0.0.1:4444/token", "HTTPS://keys.example.net/jwks.json"),
+            ] {
+                let metadata = parse_for(issuer, token_endpoint, jwks_uri, OPERATOR).unwrap();
+                assert_eq!(metadata.issuer, issuer);
+                assert_eq!(metadata.token_endpoint, token_endpoint);
+                assert_eq!(metadata.jwks_uri, jwks_uri);
+            }
+        }
+    }
+
+    #[test]
+    fn an_http_issuer_is_an_invalid_url_under_the_strict_posture() {
+        for issuer in ["http://as.example.com", "HTTP://as.example.com"] {
+            let error = parse_for(issuer, "https://as.example.com/token", "https://as.example.com/jwks.json", STRICT)
+                .unwrap_err();
+            assert_eq!(error.code(), "invalid_url", "{issuer}");
+        }
+    }
+
+    #[test]
+    fn an_upper_case_https_issuer_and_endpoints_are_accepted_under_the_strict_posture() {
+        let metadata = parse_for(
+            "HTTPS://as.example.com",
+            "HTTPS://as.example.com/token",
+            "https://203.0.113.7/jwks.json",
+            STRICT,
+        )
+        .unwrap();
+        assert_eq!(metadata.issuer, "HTTPS://as.example.com");
+        assert_eq!(metadata.token_endpoint, "HTTPS://as.example.com/token");
+        assert_eq!(metadata.jwks_uri, "https://203.0.113.7/jwks.json");
         assert_eq!(
-            parse(&with_endpoint("jwks_uri", json!(value)), EgressPosture::Strict)
-                .unwrap()
-                .jwks_uri,
-            value
+            parse_for(
+                "HTTPS://as.example.com",
+                "HTTP://as.example.com/token",
+                "https://as.example.com/jwks.json",
+                OPERATOR
+            )
+            .unwrap_err()
+            .code(),
+            "invalid_document"
         );
     }
 
     #[test]
     fn the_strict_posture_rejects_internal_endpoint_hosts_that_the_operator_posture_accepts() {
         for value in [
-            "http://127.0.0.1:4444/jwks.json",
-            "http://[::1]/jwks.json",
-            "http://0.0.0.0/jwks.json",
-            "http://[::]/jwks.json",
-            "http://2130706433/jwks.json",
-            "http://0x0a000001/jwks.json",
-            "http://[::ffff:127.0.0.1]/jwks.json",
-            "http://10.0.0.5/jwks.json",
-            "http://172.16.3.4/jwks.json",
-            "http://192.168.1.10/jwks.json",
-            "http://169.254.10.20/jwks.json",
-            "http://[fe80::1]/jwks.json",
-            "http://[fd00::1]/jwks.json",
-            "http://[::ffff:10.0.0.5]/jwks.json",
-            "http://localhost:8080/jwks.json",
-            "http://LOCALHOST./jwks.json",
-            "http://auth.localhost/jwks.json",
+            "https://127.0.0.1:4444/jwks.json",
+            "https://[::1]/jwks.json",
+            "https://0.0.0.0/jwks.json",
+            "https://[::]/jwks.json",
+            "https://2130706433/jwks.json",
+            "https://0x0a000001/jwks.json",
+            "https://[::ffff:127.0.0.1]/jwks.json",
+            "https://10.0.0.5/jwks.json",
+            "https://172.16.3.4/jwks.json",
+            "https://192.168.1.10/jwks.json",
+            "https://169.254.10.20/jwks.json",
+            "https://[fe80::1]/jwks.json",
+            "https://[fd00::1]/jwks.json",
+            "https://[::ffff:10.0.0.5]/jwks.json",
+            "https://localhost:8080/jwks.json",
+            "https://LOCALHOST./jwks.json",
+            "https://auth.localhost/jwks.json",
         ] {
             for field in ["token_endpoint", "jwks_uri"] {
-                let doc = with_endpoint(field, json!(value));
-                let error = parse(&doc, EgressPosture::Strict).unwrap_err();
+                let error = endpoint_of(field, value, STRICT).unwrap_err();
                 assert_eq!(error.failure(), DiscoveryFailure::InvalidDocument, "{field} = {value}");
-                let accepted = parse(&doc, EgressPosture::CloudMetadataOnly).unwrap();
-                let pinned = if field == "token_endpoint" {
-                    accepted.token_endpoint
-                } else {
-                    accepted.jwks_uri
-                };
-                assert_eq!(pinned, value, "{field}");
+                assert_eq!(endpoint_of(field, value, OPERATOR).unwrap(), value, "{field}");
             }
         }
     }
 
     #[test]
-    fn the_strict_posture_accepts_public_endpoint_hosts() {
-        let doc = with_endpoint("jwks_uri", json!("http://203.0.113.7/jwks.json"));
+    fn the_strict_posture_accepts_public_https_endpoint_hosts_only() {
         assert_eq!(
-            parse(&doc, EgressPosture::Strict)
-                .unwrap()
-                .jwks_uri,
-            "http://203.0.113.7/jwks.json"
+            endpoint_of("jwks_uri", "https://203.0.113.7/jwks.json", STRICT).unwrap(),
+            "https://203.0.113.7/jwks.json"
+        );
+        assert_eq!(
+            endpoint_of("jwks_uri", "http://203.0.113.7/jwks.json", STRICT)
+                .unwrap_err()
+                .failure(),
+            DiscoveryFailure::InvalidDocument
         );
     }
 
@@ -491,6 +677,20 @@ mod tests {
                 "/realms/agents/.well-known/openid-configuration"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_issuer_in_the_rfc_8414_document_falls_back_to_openid_connect() {
+        let server = TestServer::start().await;
+        let issuer = server.base().to_string();
+        server.reply(RFC8414, Reply::json(&document("https://other.example.com").to_string()));
+        server.reply(OIDC, Reply::json(&document(&issuer).to_string()));
+        let metadata = discovered(&issuer, DiscoveryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(metadata.metadata_url, server.url(OIDC));
+        assert_eq!(metadata, expected(&issuer, server.url(OIDC)));
+        assert_eq!(server.requests(), [RFC8414, OIDC]);
     }
 
     #[tokio::test]
@@ -586,9 +786,9 @@ mod tests {
     #[tokio::test]
     async fn the_strict_posture_never_reaches_a_loopback_issuer() {
         let server = TestServer::start().await;
-        let issuer = server.base().to_string();
+        let issuer = server.https_url("");
         server.reply(RFC8414, Reply::json(&document(&issuer).to_string()));
-        let error = discover(&issuer, EgressPosture::Strict, DiscoveryOptions::default())
+        let error = discover(&issuer, STRICT, DiscoveryOptions::default())
             .await
             .unwrap_err();
         assert_eq!(error.failure(), DiscoveryFailure::Blocked);
@@ -596,12 +796,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_strict_posture_refuses_an_http_issuer_before_any_request() {
+        let server = TestServer::start().await;
+        let issuer = server.base().to_string();
+        server.reply(RFC8414, Reply::json(&document(&issuer).to_string()));
+        server.reply(OIDC, Reply::json(&document(&issuer).to_string()));
+        let error = discover(&issuer, STRICT, DiscoveryOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_url");
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_strict_posture_lets_a_public_https_issuer_through_its_checks() {
+        let options = DiscoveryOptions {
+            timeout: Duration::from_millis(300),
+            ..DiscoveryOptions::default()
+        };
+        let error = discover("https://203.0.113.7:9", STRICT, options)
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure(), DiscoveryFailure::Unreachable);
+    }
+
+    #[tokio::test]
     async fn a_cloud_metadata_issuer_is_blocked_under_both_postures() {
-        for posture in [EgressPosture::CloudMetadataOnly, EgressPosture::Strict] {
-            let error = discover("http://169.254.169.254/latest", posture, DiscoveryOptions::default())
+        for (issuer, posture) in [
+            ("http://169.254.169.254/latest", OPERATOR),
+            ("https://169.254.169.254/latest", OPERATOR),
+            ("https://169.254.169.254/latest", STRICT),
+        ] {
+            let error = discover(issuer, posture, DiscoveryOptions::default())
                 .await
                 .unwrap_err();
-            assert_eq!(error.code(), "blocked", "{posture:?}");
+            assert_eq!(error.code(), "blocked", "{issuer} under {posture:?}");
         }
     }
 

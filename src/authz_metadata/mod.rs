@@ -40,19 +40,22 @@ pub struct AuthzServerMetadata {
     pub jwks_uri: String,
 }
 
-/// Which addresses a fetch, and the endpoints of a discovered document, may name.
+/// Which schemes and addresses a fetch, and the endpoints of a discovered document, may use.
 ///
-/// Both postures accept `http` and `https`, block cloud-metadata addresses and host
-/// names, refuse redirects, and connect only to the addresses the egress guard vetted
-/// for the request. They differ only in which address ranges they block.
+/// Both postures block cloud-metadata addresses and host names, refuse redirects, and
+/// connect only to the addresses the egress guard vetted for the request. They differ in
+/// the schemes they accept and the address ranges they block. Under either posture a
+/// discovered endpoint must not use a weaker scheme than the issuer: an `https` issuer
+/// requires `https` endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressPosture {
-    /// Blocks cloud-metadata addresses only; loopback and private ranges are
-    /// allowed. For operator-trusted callers whose authorization server runs on the
+    /// Accepts `http` and `https`, and blocks cloud-metadata addresses only; loopback
+    /// and private ranges are allowed. For operator-trusted callers whose authorization server runs on the
     /// same machine or in the same network.
     CloudMetadataOnly,
-    /// Also blocks loopback (including the name `localhost`), RFC 1918, link-local and
-    /// unique-local addresses. For callers that must not reach the appliance's own network.
+    /// Accepts `https` only, and also blocks loopback (including the name `localhost`),
+    /// RFC 1918, link-local and unique-local addresses. An `http` URL fails with
+    /// `invalid_url` before its host is resolved. For callers that must not reach the appliance's own network.
     Strict,
 }
 
@@ -83,7 +86,8 @@ impl Default for DiscoveryOptions {
 /// [`discover`] returns the most specific failure of its two attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiscoveryFailure {
-    /// The URL is not an absolute http(s) URL with a host and without credentials,
+    /// The URL is not an absolute http or https URL with a host and without credentials,
+    /// its scheme is `http` under [`EgressPosture::Strict`], which accepts `https` only,
     /// or an issuer has a query or fragment. Code `invalid_url`.
     InvalidUrl,
     /// The egress posture forbids the host or an address it resolves to. The egress
@@ -124,7 +128,7 @@ impl DiscoveryFailure {
     pub fn message(self) -> &'static str {
         match self {
             Self::InvalidUrl => {
-                "The URL must be an absolute http or https URL without credentials, and an issuer must have no query or fragment"
+                "The URL must be an absolute http or https URL without credentials (https only under the strict posture), and an issuer must have no query or fragment"
             }
             Self::Blocked => "The URL is not allowed by the egress policy or its host could not be resolved",
             Self::Unreachable => "The server could not be reached",
@@ -241,6 +245,26 @@ mod tests {
                 assert!(!text.contains("refused"), "{failure:?}: {text}");
             }
         }
+    }
+
+    #[test]
+    fn each_failure_has_its_fixed_message() {
+        let messages: Vec<&str> = ALL
+            .iter()
+            .map(|failure| failure.message())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "The URL must be an absolute http or https URL without credentials (https only under the strict posture), and an issuer must have no query or fragment",
+                "The URL is not allowed by the egress policy or its host could not be resolved",
+                "The server could not be reached",
+                "The server did not return the document",
+                "The response is too large",
+                "The response is not a valid authorization server metadata document",
+                "The discovered issuer does not match the expected issuer",
+            ]
+        );
     }
 
     #[test]

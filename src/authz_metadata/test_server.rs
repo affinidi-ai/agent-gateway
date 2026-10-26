@@ -54,6 +54,7 @@ struct Routes {
 type Shared = Arc<Mutex<Routes>>;
 
 pub(super) struct TestServer {
+    addr: std::net::SocketAddr,
     base: String,
     routes: Shared,
     task: tokio::task::JoinHandle<()>,
@@ -75,6 +76,7 @@ impl TestServer {
             let _ = axum::serve(listener, app).await;
         });
         Self {
+            addr,
             base: format!("http://{addr}"),
             routes,
             task,
@@ -90,6 +92,13 @@ impl TestServer {
         path: &str,
     ) -> String {
         format!("{}{path}", self.base)
+    }
+
+    pub(super) fn https_url(
+        &self,
+        path: &str,
+    ) -> String {
+        format!("https://{}{path}", self.addr)
     }
 
     pub(super) fn reply(
