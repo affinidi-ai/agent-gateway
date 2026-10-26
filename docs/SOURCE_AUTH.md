@@ -119,6 +119,76 @@ wider, at 30 times that value.
 Workload Binding supports `caller_source: did`, which tags the Workload Binding
 presentation with `user_hash = SHA256(did)`.
 
+### Authorization server metadata module (developer reference)
+
+[`src/authz_metadata/`](../src/authz_metadata/) fetches and validates an authorization
+server's metadata document. It tries the RFC 8414 URL first, then the OpenID Connect
+`/.well-known/openid-configuration` URL, and returns the issuer, the URL the document came
+from, the `token_endpoint` and the `jwks_uri`. The `issuer` in the document must equal the
+requested issuer byte for byte. `token_endpoint` and `jwks_uri` must be absolute `http` or
+`https` URLs of at most 2048 characters, with no whitespace, control characters,
+credentials or fragment, and not a cloud-metadata address.
+
+| Limit | Value |
+| --- | --- |
+| Body size | 64 KiB (`MAX_METADATA_BYTES`), set per call by `DiscoveryOptions::max_bytes` |
+| Timeout | 10 s, set per call by `DiscoveryOptions::timeout`, applied once to resolving the host and again to the HTTP request from connecting to reading the last byte. One fetch can take up to twice the timeout, and `discover` can make two fetches |
+| Redirects | Refused |
+| DNS | The egress guard can resolve the host more than once; the connection is pinned to the addresses of the last, vetted resolution. An IPv6 literal host cannot be pinned and fails as `blocked` |
+| Status | Only a 2xx response is read |
+
+The caller chooses an `EgressPosture`. Both postures accept `http` and `https` and differ
+only in the address ranges they block. `CloudMetadataOnly` blocks only cloud-metadata
+addresses and allows loopback and private ranges, for operator-trusted callers. `Strict`
+also blocks loopback, unspecified, RFC 1918, link-local and unique-local addresses. The posture
+applies to the metadata URL at fetch time. It also applies to the discovered
+`token_endpoint` and `jwks_uri` at parse time, where under `Strict` a literal IP host or a
+`localhost` name in a blocked range makes the document invalid. A name that only resolves to
+a private address cannot be known without DNS, so it passes parsing. The caller must therefore
+fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
+blocks such a name at fetch time.
+
+A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
+stable string, `message()` fixed text that is safe in an API response (it never carries a
+resolved address or a transport error) and `detail()` text for logs only. The error's
+`Display` output includes the detail, so it is for logs only too.
+
+| `code()` | Meaning |
+| --- | --- |
+| `invalid_url` | The issuer is not a usable URL, or has a query or fragment |
+| `blocked` | The egress posture refused the URL or its resolved address, the host name did not resolve, or the host is an IPv6 literal |
+| `unreachable` | Resolving the host timed out, the connection failed or timed out, or the body could not be read in time |
+| `http_status` | The server answered with a status outside 2xx, including a redirect |
+| `too_large` | The body exceeded the size limit |
+| `invalid_document` | The body is not a JSON object, or a required field is missing or unacceptable |
+| `issuer_mismatch` | The document's `issuer` differs from the requested issuer |
+
+`discover` stops at once on `invalid_url`, `blocked` or `unreachable`. Otherwise, when both
+URLs fail, it returns the more specific failure, from least to most specific: `http_status`,
+`too_large`, `invalid_document`, `issuer_mismatch`.
+
+| Function | Use |
+| --- | --- |
+| `discover(issuer, posture, options)` | Fetches and validates, trying both URLs |
+| `metadata_urls(issuer)` | Pure: the two candidate URLs for an issuer |
+| `parse_metadata(body, issuer, metadata_url, posture)` | Pure: validates a document already in hand |
+| `get_bounded(url, posture, options)` | The pinned, bounded GET, reusable for a JWKS fetch |
+
+```rust
+use crate::authz_metadata::{discover, DiscoveryOptions, EgressPosture};
+
+match discover(issuer, EgressPosture::Strict, DiscoveryOptions::default()).await {
+    Ok(metadata) => use_endpoints(&metadata.token_endpoint, &metadata.jwks_uri),
+    Err(error) => {
+        tracing::warn!(code = error.code(), detail = error.detail(), "discovery failed");
+        respond_with(error.code(), error.message());
+    }
+}
+```
+
+The module has no metrics, audit or storage coupling and no tenancy or strategy types in its
+signatures, so callers record outcomes themselves from `code()`.
+
 ## Managed identity
 
 A rule that derives the managed agent's DID. `ManagedIdentityConfig`
