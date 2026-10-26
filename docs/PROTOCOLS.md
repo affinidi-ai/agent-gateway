@@ -180,7 +180,11 @@ default) or **Envelope + A2A fields**.
   surface, as when a merge `PATCH` changes only the protocol, is dropped instead.
 - A surface stored before per-surface settings existed has no block. When surfaces are loaded, at
   startup or on a configuration reload, each such A2A or AP2 surface, A2A proxy Targets included, is
-  given one, and the block is written to storage: `accepted_versions` is `["1.0"]` if the retired
+  given one, and the block is written to storage. A stored record that reaches the gateway as a
+  storage event (another node's write, the cache refresh scan, or the disk refresh a reload starts
+  with) is given one the same way before it is applied, in memory only, so the event cannot undo
+  what a reload gave and applying it writes nothing back: `accepted_versions` is `["1.0"]` if the
+  retired
   `a2a_legacy_compatibility` flag was off, and both versions otherwise, so an existing A2A proxy
   surface keeps serving callers that send no `A2A-Version` header; `validation` is `"envelope"` on a
   surface whose Targets are all A2A proxies, `"off"` elsewhere if the retired
@@ -559,6 +563,82 @@ identity extension that resolves as the agent's own, with the managed-identity i
 Recorder writes that follow. This rests on the trust placed in the Managed Agent; see
 [`response_identity_candidates`](../src/proxy/backend_identity.rs).
 
+### Event streams
+
+An A2A or AP2 surface with a direct Target forwards an event stream as it arrives. When the Target
+answers with a successful `text/event-stream` response, normally to `SendStreamingMessage` /
+`message/stream` or `SubscribeToTask` / `tasks/resubscribe`, the Gateway reads one event, checks
+it, forwards it, and only then reads the next
+([`src/a2a/streaming.rs`](../src/a2a/streaming.rs),
+[`src/proxy/handler/a2a_stream.rs`](../src/proxy/handler/a2a_stream.rs)). A slow caller therefore
+slows the Target rather than filling a buffer. An agent-card response, an error status, or a
+response that is not an event stream takes the buffered path.
+
+The caller receives `text/event-stream` with the Target's status and end-to-end headers (plus the
+x402 and delegated settlement receipt headers a buffered reply gets), `Cache-Control: no-store`,
+`X-Accel-Buffering: no`, and a keepalive comment every 15 seconds. Each event is forwarded once, in
+the Target's order, under its `event:` name; `id:` and `retry:` fields are dropped. The caller's
+stream ends when the Target's does, so a terminal state (`TASK_STATE_COMPLETED`,
+`TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, `TASK_STATE_REJECTED`) or an interrupted one
+(`TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_AUTH_REQUIRED`) reaches the caller as the Target sent it,
+and a clean end adds nothing. For a streaming method the Gateway asks the Target for an uncompressed
+body (`Accept-Encoding: identity`) and sends the call once, whatever the surface's `retry` policy.
+The Target must send its response headers within the request timeout, or the caller gets HTTP `504`,
+and the call is bounded by `[a2a] stream_max_lifetime_secs` on top of the request timeout; the
+stream's own limits are in [Upstream Response Bounds](#upstream-response-bounds).
+
+Each event's data must be a JSON object, the JSON-RPC response that carries the event. Before the
+checks run, a v1.0 `StreamResponse` member (`task`, `message`, `statusUpdate` or `artifactUpdate`)
+is moved into `result`, so the event reads like a non-streaming reply, and it is put back
+afterwards. The checks are those a non-streaming reply gets on the Access Point, in the same order:
+
+| Check | On each event |
+| --- | --- |
+| Protected and external identity | Resolved when the event claims an identity: a message that declares `agent-identity/v1` or `agent-identity-credential/v1`, or an identity payload where [backend identity](#backend-identity-in-task-artifacts) is read (a status message, a message, or an artifact, including the single `artifact` of an artifact update). An event without a claim is not resolved and nothing is signed for it. A slot that derives identity from a credential (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) is resolved once, on the first event. A claim that cannot be resolved falls back to the request-path identity when there is one, and ends the stream otherwise. The first managed DID resolved for the protected agent holds for the whole stream: a later event that resolves a different one ends it. A slot that reads identity from the response (`from_payload`) also needs the stream to claim it: see the end-of-stream check below. |
+| Response custom metadata | Injected into the event's `result`, which for a v1.0 event is the member's payload |
+| Agent identity credential | Replaces the raw extension where the event's message declares it, as on a non-streaming reply |
+| Response extension rules | Run on the event |
+| Response policy | Evaluated on the event as it will be sent: `input.response.body` is the event, `content_type` is `text/event-stream`, and `is_error` is true for a JSON-RPC error event. One allow decision is recorded per stream, plus the deny that ends it. |
+| Trust Recorder | Once per resolved DID, for the first event that resolved it and passed every check above |
+
+The serverIdentity presentation a non-streaming reply gets when the caller declares the credential
+extension is not added to events, and payload capture and UCP operation inference do not run on
+them. Metrics, bytes and the connection count are recorded once, when the stream ends or the caller
+disconnects; a stream the Gateway ended early, or one the caller left before it ended, counts as an
+error.
+
+Once the first event is sent the status can no longer change, so a failure ends the stream with a
+JSON-RPC error event that echoes the request `id`, the event that failed is not sent, and the Target
+connection is dropped:
+
+```text
+data: {"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Response blocked","data":{"code":"response_policy_denied"}}}
+```
+
+| `data.code` | Cause |
+| --- | --- |
+| `response_policy_denied` | The response policy denied the event |
+| `response_extension_rejected` | The event failed the response extension rules |
+| `identity_extension_missing`, `identity_invalid_response`, `identity_validation_failed`, `identity_did_failed` | The event's identity claim could not be resolved, and the request path resolved no identity; `identity_extension_missing` also follows the last event of a stream that never claimed one (see below) |
+| `identity_changed` | The event resolved a different protected agent DID than an earlier event of the stream |
+| `upstream_event_invalid` | The event's data is not a JSON object |
+| `upstream_event_too_large` | The event is larger than `[a2a] max_body_size` |
+| `upstream_stream_idle` | The Target sent nothing for the idle timeout |
+| `upstream_stream_lifetime` | The stream reached `[a2a] stream_max_lifetime_secs` |
+| `upstream_stream_failed` | Reading from the Target failed |
+| `stream_event_rewrite_failed` | A check produced an event that is not JSON |
+
+When the Target ends its stream cleanly, one check runs on the stream as a whole. A reply without
+an identity claim is refused on a slot that reads identity from the response, so a stream that
+delivered at least one result is refused too when none of its events resolved an identity for
+that slot. The refusal is an `identity_extension_missing` error event sent after the last event;
+the caller has already received the events, unsigned, but sees the stream fail rather than end
+cleanly. The protected slot is exempt when the request path resolved an identity, as on a
+non-streaming reply, and the external slot is checked only when it is configured. A stream that
+carried only JSON-RPC error events delivered no result and is not refused.
+
+A `fabric://` surface and a Transit Point do not stream; see [Current limitations](#current-limitations).
+
 ### Fabric coverage gap
 
 Version negotiation, both validation layers and the protocol-version metric run on the inbound path
@@ -594,18 +674,17 @@ Relevant implementation:
 
 ### Current limitations
 
-- **Streaming:** an A2A `message/stream` / `SendStreamingMessage` or `tasks/resubscribe` /
-  `SubscribeToTask` call that the agent answers `2xx` with `text/event-stream` is passed through
-  event by event, as an MCP stream is (`a2a_stream_passes_through` in `src/proxy/handler.rs`). The
-  request timeout (`[a2a] timeout_seconds`, default 30 s, or the surface's `request_secs`) covers
-  only the wait for the stream's headers (`504` "A2A upstream response headers timed out"); the
-  stream itself ends at the `mcp_http` stream idle timeout and lifetime described in
-  [Upstream Response Bounds](#upstream-response-bounds), and the Gateway sends its own keep-alive
-  comments meanwhile. The stream is buffered as before, whole and within the request timeout, on
-  an AP2 surface and whenever a response step needs the whole body: a response policy, response
-  custom metadata, a managed or external agent identity, UCP, response extension validation
-  (`[extension_inspection]` with identity rules), or a payment receipt to return. A passed-through
-  stream gets no payload capture.
+- **Streaming over Fabric and on Transit Points:** only a direct Target's event stream is
+  forwarded event by event (see [Event streams](#event-streams)). Across a `fabric://` hop the
+  receiving gateway reads the Target's `text/event-stream` body in full and returns it as one
+  response, and a Transit Point buffers an A2A event stream the same way, so the caller sees nothing
+  until the Target closes. Event order and terminal task states are preserved, but the whole stream
+  must finish within the request timeout (`[a2a] timeout_seconds`, default 30 s, or the target's
+  `request_secs`) and the bounds in [Upstream Response Bounds](#upstream-response-bounds). The
+  per-event checks do not run on it, and the response checks that read the body find no JSON in
+  it. A Managed Agent card that declares `capabilities.streaming`
+  is forwarded unchanged on these surfaces too. The cards the Gateway generates (A2A proxy and
+  onboarding) declare `streaming: false`, and those endpoints do not stream.
 - **Signed cards:** there is no signature handling. URL rewriting and identity-extension
   replacement invalidate any `signatures[]` on a Managed Agent's card, and the signatures are passed
   through unchanged, so downstream verification fails.
@@ -629,19 +708,30 @@ Relevant implementation:
 Every upstream response the Gateway buffers is bounded by size and by idle time, whatever the
 protocol (`proxy::upstream_body::read_bounded`). This covers every response on the direct path
 (for MCP, any that is not `text/event-stream`, plus a `tools/list` answered as SSE, which is
-buffered for tool gating), every HTTP response on a Transit Point, and the legacy Fabric receive
+buffered for tool gating; for A2A and AP2, any that is not a successful event stream), every HTTP
+response on a Transit Point, and the legacy Fabric receive
 forward to the local Target, JSON or SSE. A Fabric receive failure is returned to the sending
 gateway as a `ForwardResponse` with the same status. The Fabric receive agent-card hop and MCP
 tool discovery (JSON or SSE, capped at the default `max_body_size`) are bounded the same way; a
 card that fails the bounds is treated as missing.
 
-An SSE stream the Gateway parses event by event rather than buffering whole (an MCP or A2A
+An SSE stream the Gateway parses event by event rather than buffering whole (an MCP
 `text/event-stream` passthrough, and Legacy SSE sessions) holds at most `[a2a] max_body_size` of
 one incomplete event (the default 10 MB for Legacy SSE sessions). An event that grows past that
-ends the stream, and a Legacy SSE session ends with it. A `text/event-stream` passthrough also
+ends the stream, and a Legacy SSE session ends with it. An MCP `text/event-stream` passthrough also
 ends when the upstream sends nothing for the surface's `mcp_http.stream_idle_timeout_secs` (default
-60 s) or is still streaming at `mcp_http.stream_max_lifetime_secs` (default 3600 s); an A2A
-surface uses the same keys, and their defaults when it sets none.
+60 s) or is still streaming at `mcp_http.stream_max_lifetime_secs` (default 3600 s).
+
+An A2A event stream from a direct Target (see [Event streams](#event-streams)) is read one event at
+a time. One event, as received and after the checks, may hold up to `[a2a] max_body_size`, and the
+stream ends with an error event when the Target sends nothing for the surface's
+`networking.timeout.idle_secs` (default 60 s; `0` leaves only the lifetime) or is still streaming at
+`[a2a] stream_max_lifetime_secs` (default 3600 s, at most 86400 s). Anything the Target sends counts
+as activity, a comment or keep-alive line included, and the idle time is counted only while the
+Gateway waits for the Target, so a caller that is slow to read an event does not end the stream.
+The same holds for the MCP passthrough's idle timeout. The Target must send its
+headers within the request timeout, and the call to it is bounded by that lifetime plus the request
+timeout.
 
 The gateway holds at most 10,000 Legacy SSE sessions (`GET /sse` on `proxy://` and `fabric://`
 surfaces, and on standalone MCP proxies). A `GET /sse` beyond that, after sessions whose client has

@@ -1,0 +1,34 @@
+branch: fix/system-metrics-persist-interval
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-20T15:20:08Z'
+      title: Persist system metrics every 15 minutes and on shutdown, not every 5 seconds
+      description: >-
+        The CPU and memory history behind the dashboard system metrics view was
+        rewritten in full to _storage/system_metrics/system_metrics.json after
+        every 5-second sample. Once the 24-hour buffer filled, each instance
+        rewrote about 3.8 MB twelve times a minute (about 65 GB a day), which is
+        costly on network-backed storage billed per GB written. Samples are
+        still collected every 5 seconds and served from memory, but the history
+        is now written at most once every 15 minutes and again when the gateway
+        receives SIGTERM or Ctrl-C, via a temp file and rename so a crash
+        mid-write can no longer leave a truncated file. SIGTERM and Ctrl-C now
+        stop the gateway promptly with exit code 0 instead of waiting to be
+        killed; each shutdown step is limited to 10 seconds and in-flight
+        requests are not drained. A crash, forced kill or rolling deploy can
+        lose up to 15 minutes of history. Temp files from failed or interrupted
+        writes are removed, either right away or at the next startup.
+  removed: []
+  security:
+    - timestamp: '2026-10-21T08:07:05Z'
+      title: Update rustls-webpki and webpki roots to reject distrusted emSign intermediates
+      description: >-
+        Bumps the transitive rustls-webpki dependency from 0.103.15 to 0.103.16
+        and webpki-roots and webpki-root-certs from 1.0.8 to 1.0.10. The older
+        versions could accept certificate paths through distrusted emSign
+        intermediates whose private keys are now publicly known
+        (RUSTSEC-2026-0381, RUSTSEC-2026-0382, RUSTSEC-2026-0383). Restores a
+        passing cargo audit.
+  breaking: []

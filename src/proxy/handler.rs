@@ -26,6 +26,7 @@ use crate::server::ConnectionGuard;
 use crate::state::{MultiSurfaceProxyState, ProxyState};
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
+mod a2a_stream;
 pub(crate) mod surface_payment;
 
 /// Lazy-initialized SSE session manager for MCP proxy:// channels.
@@ -747,7 +748,6 @@ pub async fn handle_agent_card(
                         .unwrap(),
                     &channel_name,
                     config_id,
-                    &state.config.x402_headers,
                     resource_url,
                     state
                         .listener_manager
@@ -761,7 +761,7 @@ pub async fn handle_agent_card(
                 .await
                 {
                     Ok(_) => {}
-                    Err(err_response) => return Err(err_response),
+                    Err(error) => return Err(error.render(&state.config.x402_headers)),
                 }
             } else if mpp_required && mpp_credential.is_some() {
                 // Client sent MPP credential → verify via MPP
@@ -782,76 +782,26 @@ pub async fn handle_agent_card(
                 .await
                 {
                     Ok(_) => {}
-                    Err(err_response) => return Err(err_response),
+                    Err(error) => return Err(error.into_response()),
                 }
-            } else {
+            } else if let Some(error) = surface_payment::payment_required(
                 // No credential → return 402 (combined if both protocols enabled)
-                let err_response = if x402_required {
-                    // Build x402 402 (includes payment requirements normalization)
-                    let x402_resp = crate::x402::process_payment(
-                        None,
-                        state
-                            .surface
-                            .x402_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        &state.config.x402_headers,
-                        resource_url,
-                        state
-                            .listener_manager
-                            .read()
-                            .await
-                            .clone(),
-                        state
-                            .transaction_store
-                            .clone(),
-                    )
-                    .await
-                    .unwrap_err();
-                    if mpp_required {
-                        // Both enabled → add MPP challenge headers to x402 response
-                        crate::mpp::fire_challenge_issued_events(
-                            config_id,
-                            &channel_name,
-                            resource_url,
-                            state
-                                .mpp_transaction_store
-                                .clone(),
-                        );
-                        crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                            x402_resp,
-                            state
-                                .surface
-                                .mpp_config()
-                                .unwrap(),
-                            resource_url,
-                            &state.secrets_store,
-                        )
-                        .await
-                    } else {
-                        x402_resp
-                    }
-                } else {
-                    // Only MPP → standard MPP 402
-                    crate::mpp::process_payment(
-                        None,
-                        state
-                            .surface
-                            .mpp_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        resource_url,
-                        state
-                            .mpp_transaction_store
-                            .clone(),
-                        &state.secrets_store,
-                    )
-                    .await
-                    .unwrap_err()
-                };
-                return Err(err_response);
+                state
+                    .surface
+                    .x402_config()
+                    .filter(|_| x402_required),
+                state
+                    .surface
+                    .mpp_config()
+                    .filter(|_| mpp_required),
+                &channel_name,
+                config_id,
+                resource_url,
+                &surface_payment::LocalPaymentServices::of(&state).await,
+            )
+            .await
+            {
+                return Err(error.render(&state.config.x402_headers));
             }
         }
     }
@@ -1423,76 +1373,6 @@ pub(crate) fn listen_surface_key(surface: &crate::config::agent_surface::AgentSu
     format!("surface:{id}")
 }
 
-/// Whether an A2A `message/stream` or `tasks/resubscribe` call reaches the
-/// caller as a live event stream. Only when no response step needs the whole
-/// body: a response policy, response metadata, a managed or external identity,
-/// UCP parsing or extension validation keeps the response buffered.
-fn a2a_stream_passes_through(
-    surface: &crate::config::agent_surface::AgentSurface,
-    method_canonical: Option<&str>,
-    validates_response_extensions: bool,
-) -> bool {
-    surface.channel_protocol() == crate::config::ChannelProtocol::A2a
-        && matches!(method_canonical, Some("message/stream" | "tasks/resubscribe"))
-        && surface
-            .response_policy_definition_id()
-            .is_none()
-        && !surface
-            .response_custom_metadata()
-            .is_some_and(|metadata| metadata.enabled)
-        && surface
-            .protected_identity()
-            .is_none()
-        && surface
-            .managed_identity()
-            .is_none()
-        && surface
-            .external_identity()
-            .is_none()
-        && !surface.is_ucp()
-        && !validates_response_extensions
-}
-
-#[cfg(test)]
-mod a2a_stream_tests {
-    use super::a2a_stream_passes_through;
-    use crate::config::agent_surface::AgentSurface;
-
-    fn with_target(
-        field: &str,
-        value: serde_json::Value,
-    ) -> AgentSurface {
-        let mut surface = serde_json::to_value(crate::component_tests::helpers::build_minimal_channel()).unwrap();
-        surface["target"][field] = value;
-        serde_json::from_value(surface).unwrap()
-    }
-
-    #[test]
-    fn streaming_methods_pass_through_a_plain_a2a_surface() {
-        let surface = crate::component_tests::helpers::build_minimal_channel();
-        assert!(a2a_stream_passes_through(&surface, Some("message/stream"), false));
-        assert!(a2a_stream_passes_through(&surface, Some("tasks/resubscribe"), false));
-    }
-
-    #[test]
-    fn other_methods_and_protocols_stay_buffered() {
-        let surface = crate::component_tests::helpers::build_minimal_channel();
-        assert!(!a2a_stream_passes_through(&surface, Some("message/send"), false));
-        assert!(!a2a_stream_passes_through(&surface, Some("tasks/get"), false));
-        assert!(!a2a_stream_passes_through(&surface, None, false));
-        let mcp = crate::component_tests::helpers::build_minimal_mcp_surface();
-        assert!(!a2a_stream_passes_through(&mcp, Some("message/stream"), false));
-    }
-
-    #[test]
-    fn a_response_step_that_needs_the_whole_body_keeps_the_stream_buffered() {
-        let policy = with_target("response_policy", serde_json::json!({"policy_definition_id": "p-1"}));
-        assert!(!a2a_stream_passes_through(&policy, Some("message/stream"), false));
-        let surface = crate::component_tests::helpers::build_minimal_channel();
-        assert!(!a2a_stream_passes_through(&surface, Some("message/stream"), true));
-    }
-}
-
 /// Keeps a streamed response counted as an active connection until its body
 /// ends or the client drops it.
 fn hold_connection_for_body(
@@ -1500,6 +1380,78 @@ fn hold_connection_for_body(
     response: axum::response::Response,
 ) -> axum::response::Response {
     crate::mcp::modern_sse::observe_response(response, move |_| connection_guard.release())
+}
+
+/// Releases the connection and records the request's bytes and connection
+/// metric once a streamed response body ends, fails or is dropped. A body that
+/// did not end cleanly counts as an error.
+fn streamed_response_completion(
+    state: &ProxyState,
+    mut guard: ConnectionGuard,
+    status: StatusCode,
+    source: String,
+    identity: Option<String>,
+    trace: String,
+    start_time: std::time::Instant,
+    request_bytes: u64,
+) -> impl FnOnce(crate::mcp::modern_sse::ResponseOutcome) + Send + 'static {
+    let metrics = state.metrics_store.clone();
+    let monitor = state.task_monitor.clone();
+    let task_id = state.task_id.clone();
+    let surface_id = state
+        .surface
+        .surface_id
+        .clone();
+    let target = state
+        .surface
+        .target
+        .endpoint
+        .clone();
+    let variant = state
+        .active_variant_alias
+        .clone();
+    move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
+        let latency = start_time
+            .elapsed()
+            .as_millis() as u64;
+        tokio::spawn(async move {
+            guard.decrement().await;
+            if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
+                monitor
+                    .record_bytes(&task_id, outcome.bytes, request_bytes)
+                    .await;
+                if !outcome.completed || outcome.failed {
+                    monitor
+                        .increment_errors(&task_id)
+                        .await;
+                }
+            }
+            if let Some(metrics) = metrics {
+                let result = if outcome.completed && !outcome.failed && status.is_success() {
+                    crate::metrics::ConnectionStatus::Success
+                } else {
+                    crate::metrics::ConnectionStatus::Failed
+                };
+                metrics
+                    .record_connection_with_ucp(
+                        surface_id,
+                        source,
+                        target,
+                        result,
+                        Some(latency),
+                        identity,
+                        crate::metrics::ConnectionDirection::Request,
+                        trace,
+                        None,
+                        None,
+                        None,
+                        latency,
+                        variant,
+                    )
+                    .await;
+            }
+        });
+    }
 }
 
 /// The facts for a request refused while routing to `surface`: its trace id
@@ -2994,14 +2946,17 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.target.endpoint,
             uri.path(),
         );
-    // A compressed extended card cannot be rewritten, so the Target is asked for
-    // an uncompressed one. The same headers are forwarded to fabric targets.
+    let a2a_method = a2a_context
+        .as_ref()
+        .and_then(|context| context.method.as_deref())
+        .filter(|_| is_a2a_surface);
+    let is_a2a_stream_request = a2a_method.is_some_and(crate::a2a::is_streaming_method);
+    // A compressed extended card or event stream cannot be rewritten, so the
+    // Target is asked for an uncompressed one. The same headers are forwarded to
+    // fabric targets.
     if is_rest_extended_card_request
-        || (is_a2a_surface
-            && a2a_context
-                .as_ref()
-                .and_then(|context| context.method.as_deref())
-                .is_some_and(crate::a2a::is_extended_agent_card_method))
+        || is_a2a_stream_request
+        || a2a_method.is_some_and(crate::a2a::is_extended_agent_card_method)
     {
         headers.insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
     }
@@ -3297,7 +3252,6 @@ async fn proxy_handler_with_mcp_runtime(
                         .unwrap(),
                     &channel_name,
                     config_id,
-                    &state.config.x402_headers,
                     &resource_url,
                     state
                         .listener_manager
@@ -3309,6 +3263,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .clone(),
                 )
                 .await
+                .map_err(|error| error.render(&state.config.x402_headers))
                 {
                     Ok(response_header) => {
                         body_bytes = modified_body.into();
@@ -3386,80 +3341,32 @@ async fn proxy_handler_with_mcp_runtime(
                         mpp_receipt_header = receipt_header;
                         body_bytes = modified_body.into();
                     }
-                    Err(err_response) => {
+                    Err(error) => {
                         channel_warn!(config_id, "❌ MPP payment verification failed for fabric request");
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(err_response);
+                        return Err(error.into_response());
                     }
                 }
-            } else {
+            } else if let Some(error) = surface_payment::payment_required(
                 // No credential → return 402 (combined if both protocols enabled)
+                state
+                    .surface
+                    .x402_config()
+                    .filter(|_| x402_required),
+                state
+                    .surface
+                    .mpp_config()
+                    .filter(|_| mpp_required),
+                &channel_name,
+                config_id,
+                &resource_url,
+                &surface_payment::LocalPaymentServices::of(&state).await,
+            )
+            .await
+            {
                 channel_warn!(config_id, "❌ Payment required for fabric request");
-
-                let err_response = if x402_required {
-                    let x402_resp = crate::x402::process_payment(
-                        None,
-                        state
-                            .surface
-                            .x402_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        &state.config.x402_headers,
-                        &resource_url,
-                        state
-                            .listener_manager
-                            .read()
-                            .await
-                            .clone(),
-                        state
-                            .transaction_store
-                            .clone(),
-                    )
-                    .await
-                    .unwrap_err();
-                    if mpp_required {
-                        crate::mpp::fire_challenge_issued_events(
-                            config_id,
-                            &channel_name,
-                            &resource_url,
-                            state
-                                .mpp_transaction_store
-                                .clone(),
-                        );
-                        crate::mpp::errors::add_mpp_challenges_to_response_resolved(
-                            x402_resp,
-                            state
-                                .surface
-                                .mpp_config()
-                                .unwrap(),
-                            &resource_url,
-                            &state.secrets_store,
-                        )
-                        .await
-                    } else {
-                        x402_resp
-                    }
-                } else {
-                    crate::mpp::process_payment(
-                        None,
-                        state
-                            .surface
-                            .mpp_config()
-                            .unwrap(),
-                        &channel_name,
-                        config_id,
-                        &resource_url,
-                        state
-                            .mpp_transaction_store
-                            .clone(),
-                        &state.secrets_store,
-                    )
-                    .await
-                    .unwrap_err()
-                };
 
                 if let Some(ref metrics) = state.metrics_store {
                     let latency_ms = start_time
@@ -3500,7 +3407,7 @@ async fn proxy_handler_with_mcp_runtime(
                 connection_guard
                     .decrement()
                     .await;
-                return Err(err_response);
+                return Err(error.render(&state.config.x402_headers));
             }
         }
     }
@@ -7212,34 +7119,11 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
-    // An A2A stream is bounded like an MCP one: the request timeout covers the
-    // wait for its headers, the stream limits cover the stream itself.
-    let modern_limits = crate::mcp::modern_sse::SseLimits::from(
-        &state
-            .surface
-            .mcp_http
-            .clone()
-            .unwrap_or_default(),
-    );
-    let a2a_stream = a2a_stream_passes_through(
-        &state.surface,
-        a2a_context
-            .as_ref()
-            .and_then(|context| {
-                context
-                    .method_canonical
-                    .as_deref()
-            }),
-        state
-            .config
-            .extension_inspection
-            .enabled
-            && state
-                .identity_rules_engine
-                .is_some(),
-    );
-    let a2a_header_timeout = std::time::Duration::from_secs(
-        state
+    // An A2A event stream may outlast the request timeout: its headers must
+    // arrive within it, the call is bounded by the stream lifetime on top of
+    // it, and the stream itself by the limits in `a2a_stream::stream_limits`.
+    let a2a_stream_header_timeout = if is_a2a_stream_request {
+        let request_secs = state
             .surface
             .timeout()
             .map_or(
@@ -7248,15 +7132,18 @@ async fn proxy_handler_with_mcp_runtime(
                     .a2a
                     .timeout_seconds,
                 |timeout| timeout.request_secs,
-            ),
-    );
-    if a2a_stream {
-        upstream_req = upstream_req.timeout(
-            modern_limits
-                .max_lifetime
-                .saturating_add(a2a_header_timeout),
-        );
-    }
+            );
+        upstream_req = upstream_req.timeout(std::time::Duration::from_secs(
+            state
+                .config
+                .a2a
+                .stream_max_lifetime_secs
+                .saturating_add(request_secs),
+        ));
+        Some(std::time::Duration::from_secs(request_secs))
+    } else {
+        None
+    };
 
     // Get circuit breaker if configured
     let circuit_breaker = if state
@@ -7360,7 +7247,7 @@ async fn proxy_handler_with_mcp_runtime(
         if let Some(retry_config) = state
             .surface
             .retry()
-            .filter(|_| modern_request.is_none())
+            .filter(|_| modern_request.is_none() && !is_a2a_stream_request)
         {
             let mut attempt = 0;
             let mut _last_error = None;
@@ -7506,8 +7393,8 @@ async fn proxy_handler_with_mcp_runtime(
             .map_err(|_| {
                 create_error_response(StatusCode::GATEWAY_TIMEOUT, "Modern MCP upstream response headers timed out")
             })??
-    } else if a2a_stream {
-        tokio::time::timeout(a2a_header_timeout, send_response)
+    } else if let Some(header_timeout) = a2a_stream_header_timeout {
+        tokio::time::timeout(header_timeout, send_response)
             .await
             .map_err(|_| {
                 create_error_response(StatusCode::GATEWAY_TIMEOUT, "A2A upstream response headers timed out")
@@ -7600,13 +7487,19 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
-    // ── SSE handling for MCP channels and A2A streams ──────────────────────
+    // ── SSE handling for MCP channels ──────────────────────────────────────
     // If the upstream responded with text/event-stream, stream the SSE events
     // directly back to the client — EXCEPT for `tools/list`, which we buffer
     // into its JSON-RPC payload so the tool filter + MCP tool gating below can
     // run on it (it is re-wrapped as SSE for Streamable-HTTP clients further
     // down). Without this a Streamable-HTTP/SSE MCP server bypasses gating.
-    // An A2A stream passes through only when `a2a_stream` holds.
+    let modern_limits = crate::mcp::modern_sse::SseLimits::from(
+        &state
+            .surface
+            .mcp_http
+            .clone()
+            .unwrap_or_default(),
+    );
     let (modern_upstream, legacy_upstream) = if modern_request.is_some() {
         (Some(upstream_response), None)
     } else {
@@ -7628,117 +7521,212 @@ async fn proxy_handler_with_mcp_runtime(
         let Some(upstream_response) = legacy_upstream else {
             break 'acquire_body (StatusCode::OK, HeaderMap::new(), bytes::Bytes::new());
         };
-        let is_mcp = state
+        if state
             .surface
             .channel_protocol()
-            == crate::config::ChannelProtocol::Mcp;
-        let upstream_is_sse = crate::mcp::sse_transport::is_sse_content_type(
-            upstream_response
+            == crate::config::ChannelProtocol::Mcp
+        {
+            let upstream_ct = upstream_response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or(""),
-        );
-        // A paid call is buffered so its receipt headers still reach the caller.
-        let streams_a2a = a2a_stream
-            && upstream_is_sse
+                .unwrap_or("");
+
+            if crate::mcp::sse_transport::is_sse_content_type(upstream_ct) {
+                if crate::mcp::is_tools_list_request(&body_bytes) {
+                    info!(
+                        channel = channel_name,
+                        "Upstream MCP tools/list arrived as SSE — buffering to apply tool gating/policies"
+                    );
+                    let sse_status = upstream_response.status();
+                    let mut sse_headers = upstream_response
+                        .headers()
+                        .clone();
+                    // Re-label as JSON so the tool filter + Streamable-HTTP SSE
+                    // re-wrap below treat the buffered body as a normal JSON-RPC
+                    // response.
+                    sse_headers.remove(reqwest::header::CONTENT_TYPE);
+                    sse_headers.insert(
+                        reqwest::header::CONTENT_TYPE,
+                        reqwest::header::HeaderValue::from_static("application/json"),
+                    );
+                    match crate::mcp::sse_transport::consume_sse_response(upstream_response, &body_bytes, body_limits)
+                        .await
+                    {
+                        Ok(json) => break 'acquire_body (sse_status, sse_headers, bytes::Bytes::from(json)),
+                        Err(e) => {
+                            warn!(channel = channel_name, error = %e, "Failed to buffer SSE tools/list response");
+                            connection_guard
+                                .decrement()
+                                .await;
+                            let (status, message) = match &e {
+                                crate::mcp::sse_transport::SseConsumeError::Body(body_error) => {
+                                    body_error.status_and_message()
+                                }
+                                crate::mcp::sse_transport::SseConsumeError::NoResponse => {
+                                    (StatusCode::BAD_GATEWAY, "Failed to read MCP tools/list response")
+                                }
+                            };
+                            return Err(create_error_response(status, message));
+                        }
+                    }
+                } else {
+                    info!(channel = channel_name, "Upstream MCP agent responded with SSE — streaming to client");
+
+                    let resp_headers = upstream_response
+                        .headers()
+                        .clone();
+
+                    // Record metrics for the SSE connection start
+                    if let Some(ref metrics) = state.metrics_store {
+                        let latency_ms = request_latency_start
+                            .elapsed()
+                            .as_millis() as u64;
+                        let metrics = Arc::clone(metrics);
+                        let channel_config_id = state
+                            .surface
+                            .surface_id
+                            .clone();
+                        let source = source_addr.clone();
+                        let dest = state
+                            .surface
+                            .target
+                            .endpoint
+                            .clone();
+                        let trace = trace_id.clone();
+                        tokio::spawn(async move {
+                            metrics
+                                .record_connection(
+                                    channel_config_id,
+                                    source,
+                                    dest,
+                                    crate::metrics::ConnectionStatus::Success,
+                                    Some(latency_ms),
+                                    None,
+                                    crate::metrics::ConnectionDirection::Request,
+                                    trace,
+                                    None,
+                                    None,
+                                    latency_ms,
+                                    None,
+                                )
+                                .await;
+                        });
+                    }
+
+                    let sse_response = crate::mcp::sse_transport::create_sse_passthrough_response(
+                        upstream_response,
+                        resp_headers,
+                        channel_name.to_string(),
+                        state.config.a2a.max_body_size,
+                        modern_limits.idle_timeout,
+                        modern_limits.max_lifetime,
+                    );
+
+                    return Ok(hold_connection_for_body(connection_guard, sse_response));
+                }
+            }
+        }
+
+        // An A2A event stream is forwarded event by event, each event checked
+        // as a non-streaming reply would be. Agent cards keep their own path.
+        let is_agent_card_fetch = crate::proxy::paths::is_well_known_agent_card_path(uri.path())
+            || is_rest_extended_card_request
+            || extended_card_rpc_id.is_some();
+        if is_a2a_surface
+            && !is_agent_card_fetch
             && upstream_response
                 .status()
                 .is_success()
-            && payment_response_header.is_none()
-            && delegation_receipt_headers.is_empty();
-        if (is_mcp && upstream_is_sse) || streams_a2a {
-            if is_mcp && crate::mcp::is_tools_list_request(&body_bytes) {
-                info!(
-                    channel = channel_name,
-                    "Upstream MCP tools/list arrived as SSE — buffering to apply tool gating/policies"
+            && crate::a2a::streaming::is_event_stream(upstream_response.headers())
+        {
+            info!(
+                channel = channel_name,
+                "Upstream A2A agent responded with an event stream — forwarding it event by event"
+            );
+            let status = upstream_response.status();
+            let mut stream_headers = upstream_response
+                .headers()
+                .clone();
+            if let Some(payment_header) = &payment_response_header {
+                let name = axum::http::HeaderName::from_bytes(
+                    state
+                        .config
+                        .x402_headers
+                        .payment_response
+                        .as_bytes(),
                 );
-                let sse_status = upstream_response.status();
-                let mut sse_headers = upstream_response
-                    .headers()
-                    .clone();
-                // Re-label as JSON so the tool filter + Streamable-HTTP SSE
-                // re-wrap below treat the buffered body as a normal JSON-RPC
-                // response.
-                sse_headers.remove(reqwest::header::CONTENT_TYPE);
-                sse_headers.insert(
-                    reqwest::header::CONTENT_TYPE,
-                    reqwest::header::HeaderValue::from_static("application/json"),
-                );
-                match crate::mcp::sse_transport::consume_sse_response(upstream_response, &body_bytes, body_limits).await
-                {
-                    Ok(json) => break 'acquire_body (sse_status, sse_headers, bytes::Bytes::from(json)),
-                    Err(e) => {
-                        warn!(channel = channel_name, error = %e, "Failed to buffer SSE tools/list response");
-                        connection_guard
-                            .decrement()
-                            .await;
-                        let (status, message) = match &e {
-                            crate::mcp::sse_transport::SseConsumeError::Body(body_error) => {
-                                body_error.status_and_message()
-                            }
-                            crate::mcp::sse_transport::SseConsumeError::NoResponse => {
-                                (StatusCode::BAD_GATEWAY, "Failed to read MCP tools/list response")
-                            }
-                        };
-                        return Err(create_error_response(status, message));
-                    }
-                }
-            } else {
-                info!(channel = channel_name, "Upstream agent responded with SSE — streaming to client");
-
-                let resp_headers = upstream_response
-                    .headers()
-                    .clone();
-
-                // Record metrics for the SSE connection start
-                if let Some(ref metrics) = state.metrics_store {
-                    let latency_ms = request_latency_start
-                        .elapsed()
-                        .as_millis() as u64;
-                    let metrics = Arc::clone(metrics);
-                    let channel_config_id = state
-                        .surface
-                        .surface_id
-                        .clone();
-                    let source = source_addr.clone();
-                    let dest = state
-                        .surface
-                        .target
-                        .endpoint
-                        .clone();
-                    let trace = trace_id.clone();
-                    tokio::spawn(async move {
-                        metrics
-                            .record_connection(
-                                channel_config_id,
-                                source,
-                                dest,
-                                crate::metrics::ConnectionStatus::Success,
-                                Some(latency_ms),
-                                None,
-                                crate::metrics::ConnectionDirection::Request,
-                                trace,
-                                None,
-                                None,
-                                latency_ms,
-                                None,
-                            )
-                            .await;
-                    });
-                }
-
-                let sse_response = crate::mcp::sse_transport::create_sse_passthrough_response(
-                    upstream_response,
-                    resp_headers,
-                    channel_name.to_string(),
-                    state.config.a2a.max_body_size,
-                    modern_limits.idle_timeout,
-                    modern_limits.max_lifetime,
-                );
-
-                return Ok(hold_connection_for_body(connection_guard, sse_response));
+                let value = axum::http::HeaderValue::from_str(payment_header);
+                let (Ok(name), Ok(value)) = (name, value) else {
+                    return Err(create_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid payment response header",
+                    ));
+                };
+                stream_headers.insert(name, value);
             }
+            for (name, values) in &delegation_receipt_headers {
+                let name = axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated receipt header name")
+                })?;
+                for value in values {
+                    let value = axum::http::HeaderValue::from_str(value).map_err(|_| {
+                        create_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Invalid delegated receipt header value",
+                        )
+                    })?;
+                    stream_headers.append(name.clone(), value);
+                }
+            }
+            let request = a2a_stream::StreamRequest {
+                channel_name: channel_name.to_string(),
+                trace_id: trace_id.clone(),
+                http_method: method.to_string(),
+                path: uri.path().to_string(),
+                status,
+                authenticated_identity: authenticated_identity.clone(),
+                request_identity: identity_result
+                    .as_ref()
+                    .map(|result| ProtectedAgentIdentity::Managed {
+                        did: result.did.clone(),
+                        identity_fields: result.identity_fields.clone(),
+                    }),
+                request_agent_did: request_agent_did.clone(),
+                request_user_hash: request_user_hash.clone(),
+                policy_caller: crate::proxy::response_policy::CallerContext {
+                    did: agent_context
+                        .as_ref()
+                        .and_then(|context| context.did.clone()),
+                    identity_source: caller_identity_source.clone(),
+                    dna_uai: agent_context
+                        .as_ref()
+                        .and_then(|context| context.agent_dna.as_ref())
+                        .map(|dna| dna.uai.clone()),
+                },
+            };
+            let complete = streamed_response_completion(
+                &state,
+                connection_guard,
+                status,
+                source_addr.clone(),
+                identity_hash.clone(),
+                trace_id.clone(),
+                start_time,
+                body_bytes.len() as u64,
+            );
+            let limits = a2a_stream::stream_limits(&state.config.a2a, state.surface.timeout());
+            let processor = a2a_stream::AccessPointEvents::new(state.clone(), request);
+            return Ok(crate::a2a::streaming::event_stream_response(
+                upstream_response.bytes_stream(),
+                status,
+                &stream_headers,
+                limits,
+                crate::a2a::streaming::request_id(&body_bytes),
+                channel_name.to_string(),
+                processor,
+                complete,
+            ));
         }
 
         let status = upstream_response.status();
@@ -7787,69 +7775,16 @@ async fn proxy_handler_with_mcp_runtime(
     let modern_completion = modern_upstream
         .as_ref()
         .map(|upstream| {
-            let status = upstream.status();
-            let mut guard = std::mem::replace(&mut connection_guard, ConnectionGuard::new(None, None));
-            let metrics = state.metrics_store.clone();
-            let monitor = state.task_monitor.clone();
-            let task_id = state.task_id.clone();
-            let surface_id = state
-                .surface
-                .surface_id
-                .clone();
-            let target = state
-                .surface
-                .target
-                .endpoint
-                .clone();
-            let source = source_addr.clone();
-            let identity = identity_hash.clone();
-            let trace = trace_id.clone();
-            let variant = state
-                .active_variant_alias
-                .clone();
-            let request_bytes = body_bytes.len() as u64;
-            move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
-                let latency = start_time
-                    .elapsed()
-                    .as_millis() as u64;
-                tokio::spawn(async move {
-                    guard.decrement().await;
-                    if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
-                        monitor
-                            .record_bytes(&task_id, outcome.bytes, request_bytes)
-                            .await;
-                        if !outcome.completed || outcome.failed {
-                            monitor
-                                .increment_errors(&task_id)
-                                .await;
-                        }
-                    }
-                    if let Some(metrics) = metrics {
-                        let result = if outcome.completed && !outcome.failed && status.is_success() {
-                            crate::metrics::ConnectionStatus::Success
-                        } else {
-                            crate::metrics::ConnectionStatus::Failed
-                        };
-                        metrics
-                            .record_connection_with_ucp(
-                                surface_id,
-                                source,
-                                target,
-                                result,
-                                Some(latency),
-                                identity,
-                                crate::metrics::ConnectionDirection::Request,
-                                trace,
-                                None,
-                                None,
-                                None,
-                                latency,
-                                variant,
-                            )
-                            .await;
-                    }
-                });
-            }
+            streamed_response_completion(
+                &state,
+                std::mem::replace(&mut connection_guard, ConnectionGuard::new(None, None)),
+                upstream.status(),
+                source_addr.clone(),
+                identity_hash.clone(),
+                trace_id.clone(),
+                start_time,
+                body_bytes.len() as u64,
+            )
         });
     let discovery_support = crate::mcp::modern::ForwardingSupport {
         versions: mcp_versions,

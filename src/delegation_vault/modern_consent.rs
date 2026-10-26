@@ -75,23 +75,23 @@ async fn authorize_ticket(
     state: &ModernConsentState,
     ticket: &ConsentTicket,
     provider_id: &str,
-) -> Result<(CredentialProvider, crate::jwt_bearer::models::JwtVerificationStrategy), Response> {
+) -> Result<(CredentialProvider, crate::jwt_bearer::models::JwtVerificationStrategy), ContinuationError> {
     use crate::mcp::continuations::delegation::{identity_strategy_digest, provider_digest, surface_digest};
     use crate::mcp::continuations::protected::ContinuationRoute;
 
     if ticket.binding.provider_id != provider_id || ticket.binding.route == ContinuationRoute::StandaloneProxy {
-        return Err(failure(ContinuationError::BindingMismatch));
+        return Err(ContinuationError::BindingMismatch);
     }
     let store = state
         .vault
         .agent_surface_store
         .as_ref()
-        .ok_or_else(|| failure(ContinuationError::Unavailable))?;
+        .ok_or(ContinuationError::Unavailable)?;
     let surface = store
         .get(&ticket.binding.surface_id)
         .await
-        .map_err(|_| failure(ContinuationError::Unavailable))?
-        .ok_or_else(|| failure(ContinuationError::NotFound))?;
+        .map_err(|_| ContinuationError::Unavailable)?
+        .ok_or(ContinuationError::NotFound)?;
     let alias = match ticket
         .binding
         .variant_id
@@ -102,7 +102,7 @@ async fn authorize_ticket(
                 .variants
                 .iter()
                 .find(|variant| &variant.id == id && variant.enabled)
-                .ok_or_else(|| failure(ContinuationError::BindingMismatch))?
+                .ok_or(ContinuationError::BindingMismatch)?
                 .alias
                 .as_str(),
         ),
@@ -110,12 +110,12 @@ async fn authorize_ticket(
     };
     let surface = surface
         .resolve_variant(alias)
-        .map_err(|_| failure(ContinuationError::BindingMismatch))?;
+        .map_err(|_| ContinuationError::BindingMismatch)?;
     if surface.status != crate::config::agent_surface::SurfaceStatus::Active
         || surface.tenant_id != ticket.binding.tenant_id
-        || surface_digest(&surface).map_err(failure)? != ticket.surface_digest
+        || surface_digest(&surface)? != ticket.surface_digest
     {
-        return Err(failure(ContinuationError::BindingMismatch));
+        return Err(ContinuationError::BindingMismatch);
     }
     let authorization = match &ticket.binding.route {
         ContinuationRoute::AccessPoint | ContinuationRoute::Fabric { .. } | ContinuationRoute::FabricSend { .. } => {
@@ -134,20 +134,20 @@ async fn authorize_ticket(
         ContinuationRoute::StandaloneProxy => None,
     }
     .and_then(|http| http.authorization.as_ref())
-    .ok_or_else(|| failure(ContinuationError::BindingMismatch))?;
+    .ok_or(ContinuationError::BindingMismatch)?;
     authorization
         .validate()
-        .map_err(|_| failure(ContinuationError::BindingMismatch))?;
+        .map_err(|_| ContinuationError::BindingMismatch)?;
     let profile = state
         .network
         .sts
         .mcp_issuer
         .as_ref()
-        .ok_or_else(|| failure(ContinuationError::Unavailable))?;
+        .ok_or(ContinuationError::Unavailable)?;
     let expected_callback = format!(
         "{}{CALLBACK_PATH}/{provider_id}",
         Url::parse(&profile.issuer)
-            .map_err(|_| failure(ContinuationError::Unavailable))?
+            .map_err(|_| ContinuationError::Unavailable)?
             .origin()
             .ascii_serialization()
     );
@@ -156,41 +156,41 @@ async fn authorize_ticket(
             .validate_network(&state.network)
             .is_err()
     {
-        return Err(failure(ContinuationError::BindingMismatch));
+        return Err(ContinuationError::BindingMismatch);
     }
     let provider = state
         .vault
         .provider_store
         .get(provider_id)
         .await
-        .map_err(|_| failure(ContinuationError::Unavailable))?
-        .ok_or_else(|| failure(ContinuationError::NotFound))?;
-    if provider_digest(&provider).map_err(failure)? != ticket.provider_digest
+        .map_err(|_| ContinuationError::Unavailable)?
+        .ok_or(ContinuationError::NotFound)?;
+    if provider_digest(&provider)? != ticket.provider_digest
         || !crate::tenancy::can_reference(surface.tenant_id.as_deref(), provider.tenant_id.as_deref())
     {
-        return Err(failure(ContinuationError::BindingMismatch));
+        return Err(ContinuationError::BindingMismatch);
     }
     let strategy_id = provider
         .consent_identity_strategy_id
         .as_deref()
-        .ok_or_else(|| failure(ContinuationError::InvalidRecord))?;
+        .ok_or(ContinuationError::InvalidRecord)?;
     let strategy = state
         .identity_strategies
         .get(strategy_id)
         .await
-        .map_err(|_| failure(ContinuationError::Unavailable))?
-        .ok_or_else(|| failure(ContinuationError::NotFound))?;
-    if identity_strategy_digest(&strategy).map_err(failure)? != ticket.identity_strategy_digest
+        .map_err(|_| ContinuationError::Unavailable)?
+        .ok_or(ContinuationError::NotFound)?;
+    if identity_strategy_digest(&strategy)? != ticket.identity_strategy_digest
         || !crate::tenancy::can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
     {
-        return Err(failure(ContinuationError::BindingMismatch));
+        return Err(ContinuationError::BindingMismatch);
     }
     if !surface
         .outbound_credentials
         .iter()
         .any(|binding| binding.credential_provider_id == provider_id)
     {
-        return Err(failure(ContinuationError::BindingMismatch));
+        return Err(ContinuationError::BindingMismatch);
     }
     Ok((provider, strategy))
 }
@@ -216,7 +216,9 @@ async fn connect(
             .read_consent_ticket(&query.state, false, now)
             .await
             .map_err(failure)?;
-        let (provider, _) = authorize_ticket(&state, &ticket, &provider_id).await?;
+        let (provider, _) = authorize_ticket(&state, &ticket, &provider_id)
+            .await
+            .map_err(failure)?;
         let client_id = super::oauth::resolve_secret(
             &state.vault.secrets_store,
             provider
@@ -268,7 +270,9 @@ async fn callback(
             .read_consent_ticket(&query.state, true, now_secs().map_err(failure)?)
             .await
             .map_err(failure)?;
-        let (provider, strategy) = authorize_ticket(&state, &ticket, &provider_id).await?;
+        let (provider, strategy) = authorize_ticket(&state, &ticket, &provider_id)
+            .await
+            .map_err(failure)?;
         if query
             .iss
             .as_deref()
@@ -314,7 +318,9 @@ async fn callback(
         )
         .await
         .map_err(failure)?;
-        authorize_ticket(&state, &claimed.ticket, &provider_id).await?;
+        authorize_ticket(&state, &claimed.ticket, &provider_id)
+            .await
+            .map_err(failure)?;
         let profile = state
             .network
             .sts

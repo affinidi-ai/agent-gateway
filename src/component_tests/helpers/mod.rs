@@ -190,7 +190,7 @@ pub struct ReceivedRequest {
 
 enum MockBody {
     Json(String),
-    Streamed { content_type: &'static str, chunks: Vec<(Duration, String)> },
+    Streamed { content_type: &'static str, chunks: Vec<(Duration, String)>, hold_open: bool },
 }
 
 /// A running axum server that simply echoes back a configurable response.
@@ -227,7 +227,32 @@ impl MockServer {
         content_type: &'static str,
         chunks: Vec<(Duration, String)>,
     ) -> Self {
-        Self::start_with_response_gate(MockBody::Streamed { content_type, chunks }, None).await
+        Self::start_with_response_gate(
+            MockBody::Streamed {
+                content_type,
+                chunks,
+                hold_open: true,
+            },
+            None,
+        )
+        .await
+    }
+
+    /// Start the mock so every response sends each chunk after its delay and
+    /// then ends the body.
+    pub async fn start_with_finished_stream(
+        content_type: &'static str,
+        chunks: Vec<(Duration, String)>,
+    ) -> Self {
+        Self::start_with_response_gate(
+            MockBody::Streamed {
+                content_type,
+                chunks,
+                hold_open: false,
+            },
+            None,
+        )
+        .await
     }
 
     async fn start_with_response_gate(
@@ -284,15 +309,22 @@ impl MockServer {
                     }
                     let (content_type, body) = match response_body.as_ref() {
                         MockBody::Json(body) => ("application/json", axum::body::Body::from(body.clone())),
-                        MockBody::Streamed { content_type, chunks } => {
+                        MockBody::Streamed {
+                            content_type,
+                            chunks,
+                            hold_open,
+                        } => {
                             use futures::StreamExt;
-                            let chunks = futures::stream::iter(chunks.clone())
-                                .then(|(delay, chunk)| async move {
-                                    tokio::time::sleep(delay).await;
-                                    Ok::<_, std::io::Error>(chunk)
-                                })
-                                .chain(futures::stream::pending());
-                            (*content_type, axum::body::Body::from_stream(chunks))
+                            let chunks = futures::stream::iter(chunks.clone()).then(|(delay, chunk)| async move {
+                                tokio::time::sleep(delay).await;
+                                Ok::<_, std::io::Error>(chunk)
+                            });
+                            let body = if *hold_open {
+                                axum::body::Body::from_stream(chunks.chain(futures::stream::pending()))
+                            } else {
+                                axum::body::Body::from_stream(chunks)
+                            };
+                            (*content_type, body)
                         }
                     };
                     Response::builder()

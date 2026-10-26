@@ -134,6 +134,10 @@ pub struct SurfaceWorld {
     /// Whether that first message arrived while the MCP server was still running the tool.
     pub mcp_progress_before_completion: bool,
     pub mcp_stream_closed_after_final: bool,
+    /// The events a caller read from an A2A event stream.
+    pub a2a_stream_events: Vec<serde_json::Value>,
+    /// Whether that A2A event stream ended cleanly.
+    pub a2a_stream_ended: bool,
     /// The query of the last OAuth callback sent with a gateway-issued state.
     pub oauth_callback_query: Option<String>,
     pub temp_dir: TempDir,
@@ -196,6 +200,8 @@ impl SurfaceWorld {
             mcp_stream_progress: None,
             mcp_progress_before_completion: false,
             mcp_stream_closed_after_final: false,
+            a2a_stream_events: Vec::new(),
+            a2a_stream_ended: false,
             oauth_callback_query: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
