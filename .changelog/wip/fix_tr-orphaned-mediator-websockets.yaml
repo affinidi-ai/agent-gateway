@@ -29,4 +29,12 @@ changes:
         non-constant-time mask generation and u128 comparisons reported by cargo audit
         (RustCrypto/utils#1569). The crate is pulled in by the elliptic-curve and digest
         crates used for DID and DIDComm cryptography.
+    - timestamp: '2026-10-26T00:00:00.000Z'
+      title: Update crypto-bigint to 0.7.10 for constant-time operation fixes
+      description: >-
+        Bump the transitive crypto-bigint 0.7 dependency from 0.7.5 to 0.7.10 (and
+        ctutils to 0.4.6), which fixes timing variability in operations intended to
+        be constant-time (RUSTSEC-2026-0387). The older 0.3 and 0.5 copies pulled in
+        by elliptic-curve 0.13 and der 0.5 have no fixed release, so the advisory is
+        recorded as accepted for them until those upstream crates move to 0.7.
   breaking: []
