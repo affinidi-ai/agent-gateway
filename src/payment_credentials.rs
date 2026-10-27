@@ -9,24 +9,52 @@
 //! never blocks or fails a payment (every function returns `None` on any
 //! error).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
 
 use crate::identity::VCIssuer;
+use crate::identity::authority::CredentialAuthority;
 
-static GLOBAL_VC_ISSUER: OnceLock<Arc<VCIssuer>> = OnceLock::new();
+/// The signing backend payment credentials are minted with.
+///
+/// A `RwLock` rather than a `OnceLock` because this is set **twice** during
+/// startup, in order: the orchestrator registers the local issuer early (so a
+/// deployment that never builds a VTA connector behaves exactly as before), and
+/// the identity router then **upgrades** it to whichever connector `[vta]`
+/// selected. A `OnceLock` would silently keep the first value and leave payment
+/// receipts signed locally while STS signed via the VTA (VTA-10).
+static GLOBAL_AUTHORITY: RwLock<Option<Arc<dyn CredentialAuthority>>> = RwLock::new(None);
 
 /// Register the gateway's `VCIssuer` for payment-credential issuance. Called
-/// once from the orchestrator, alongside its other global registrations.
+/// once from the orchestrator, alongside its other global registrations. This
+/// is the **local** default; [`set_global_payment_credential_authority`]
+/// replaces it once the signing connector has been selected.
 pub fn set_global_payment_vc_issuer(issuer: Arc<VCIssuer>) {
-    let _ = GLOBAL_VC_ISSUER.set(issuer);
+    set_global_payment_credential_authority(Arc::new(crate::identity::authority::LocalCredentialAuthority::new(
+        issuer,
+    )));
 }
 
-fn global_payment_vc_issuer() -> Option<Arc<VCIssuer>> {
-    GLOBAL_VC_ISSUER
-        .get()
-        .cloned()
+/// Point payment-credential signing at the **selected** signing connector
+/// (VTA-10). Called from the identity router once `[vta]` has been resolved, so
+/// payment receipts are signed by the same backend as STS tokens rather than
+/// always by the local key.
+pub fn set_global_payment_credential_authority(authority: Arc<dyn CredentialAuthority>) {
+    match GLOBAL_AUTHORITY.write() {
+        Ok(mut slot) => *slot = Some(authority),
+        // Poisoned only if a previous writer panicked mid-set. Payment VC
+        // issuance is best-effort and must never affect a payment, so log and
+        // carry on rather than propagating.
+        Err(_) => tracing::error!("payment credential authority registration failed: lock poisoned"),
+    }
+}
+
+fn global_payment_authority() -> Option<Arc<dyn CredentialAuthority>> {
+    GLOBAL_AUTHORITY
+        .read()
+        .ok()?
+        .clone()
 }
 
 /// Whether payment dispute-evidence VC issuance is enabled
@@ -167,9 +195,13 @@ async fn sign_credential(
     vc_type: &str,
     subject: impl Serialize,
 ) -> Option<IssuedCredential> {
-    let issuer = global_payment_vc_issuer()?;
-    let issuer_did = issuer
-        .get_issuer_did()
+    // The **selected** signing backend (VTA-10): local by default, or the VTA
+    // connector when `[vta]` is enabled. A payment receipt is a VC-JWT, so it
+    // signs through the same `keys/sign-jws` path STS uses — no VTA-side
+    // credential task is needed.
+    let authority = global_payment_authority()?;
+    let issuer_did = authority
+        .issuer_did()
         .await
         .ok()?;
     let subject_value = serde_json::to_value(subject).ok()?;
@@ -181,8 +213,11 @@ async fn sign_credential(
         "credentialSubject": subject_value,
         "jti": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
     });
-    let jwt = issuer
-        .sign_jwt_with_gateway_key(&claims)
+    // Fail closed: if the backend is unreachable or over quota this yields
+    // `None`, which means "no credential" — never an unsigned or
+    // locally-substituted one. A payment is never blocked on issuance.
+    let jwt = authority
+        .sign_token(&claims)
         .await
         .ok()?;
     let fingerprint = crate::delegation_vault::audit::vp_fingerprint(&jwt);
@@ -269,6 +304,7 @@ pub async fn issue_access_grant(input: AccessGrantInput) -> Option<IssuedCredent
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn receipt_subject_omits_absent_optionals_and_reports_stage_from_settled() {
@@ -344,6 +380,10 @@ mod tests {
 
     #[tokio::test]
     async fn issuance_returns_none_without_settings_or_issuer() {
+        let _guard = AUTHORITY_TEST_LOCK
+            .lock()
+            .await;
+        clear_global_authority();
         // Neither a global settings store nor a VCIssuer is registered in a
         // bare unit-test process, so every issuance path must fail closed to
         // `None` rather than panicking or blocking a payment.
@@ -371,5 +411,169 @@ mod tests {
         })
         .await;
         assert!(grant.is_none());
+    }
+
+    /// `GLOBAL_AUTHORITY` is process-wide, so the tests that install one must
+    /// not run concurrently with each other.
+    static AUTHORITY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn clear_global_authority() {
+        *GLOBAL_AUTHORITY
+            .write()
+            .unwrap() = None;
+    }
+
+    /// Stands in for whichever backend `[vta]` selected: records the claims it
+    /// was handed and either returns a canned token or reports the backend as
+    /// unreachable.
+    struct RecordingAuthority {
+        did: &'static str,
+        reachable: bool,
+        signed: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl RecordingAuthority {
+        fn new(
+            did: &'static str,
+            reachable: bool,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                did,
+                reachable,
+                signed: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn claims(&self) -> Vec<Value> {
+            self.signed
+                .lock()
+                .unwrap()
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialAuthority for RecordingAuthority {
+        async fn issuer_did(&self) -> anyhow::Result<String> {
+            Ok(self.did.to_string())
+        }
+
+        async fn issuer_jwks(&self) -> anyhow::Result<Value> {
+            Ok(serde_json::json!({ "keys": [] }))
+        }
+
+        async fn sign_token(
+            &self,
+            claims: &Value,
+        ) -> anyhow::Result<String> {
+            self.signed
+                .lock()
+                .unwrap()
+                .push(claims.clone());
+            if !self.reachable {
+                anyhow::bail!("backend unreachable");
+            }
+            Ok("header.payload.signature".to_string())
+        }
+
+        async fn sign_token_typ(
+            &self,
+            claims: &Value,
+            _typ: &str,
+        ) -> anyhow::Result<String> {
+            self.sign_token(claims).await
+        }
+    }
+
+    #[tokio::test]
+    async fn signing_routes_through_the_selected_authority() {
+        let _guard = AUTHORITY_TEST_LOCK
+            .lock()
+            .await;
+        let authority = RecordingAuthority::new("did:webvh:vta-under-test", true);
+        set_global_payment_credential_authority(authority.clone());
+
+        let issued = sign_credential("PaymentReceiptCredential", serde_json::json!({ "paymentId": "txn-9" }))
+            .await
+            .expect("the selected authority signs the receipt");
+
+        assert_eq!(issued.jwt, "header.payload.signature");
+        assert_eq!(issued.fingerprint, crate::delegation_vault::audit::vp_fingerprint(&issued.jwt));
+
+        let claims = authority.claims();
+        assert_eq!(claims.len(), 1, "exactly one signing call is made");
+        // The issuer DID comes from the selected backend, not from a local key.
+        assert_eq!(claims[0]["issuer"], "did:webvh:vta-under-test");
+        assert_eq!(claims[0]["type"][1], "PaymentReceiptCredential");
+        assert_eq!(claims[0]["credentialSubject"]["paymentId"], "txn-9");
+        assert!(
+            claims[0]["jti"]
+                .as_str()
+                .unwrap()
+                .starts_with("urn:uuid:")
+        );
+
+        clear_global_authority();
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_authority_yields_no_credential_rather_than_a_local_one() {
+        let _guard = AUTHORITY_TEST_LOCK
+            .lock()
+            .await;
+        let authority = RecordingAuthority::new("did:webvh:vta-under-test", false);
+        set_global_payment_credential_authority(authority.clone());
+
+        let issued = sign_credential("PaymentReceiptCredential", serde_json::json!({ "paymentId": "txn-10" })).await;
+
+        // Fail closed: no credential at all, never one substituted from a
+        // different (local) key that a dispute arbiter would mis-attribute.
+        assert!(issued.is_none());
+        assert_eq!(authority.claims().len(), 1, "the failure came from the selected backend, not a fallback");
+
+        clear_global_authority();
+    }
+
+    #[tokio::test]
+    async fn registering_the_selected_authority_replaces_the_local_default() {
+        let _guard = AUTHORITY_TEST_LOCK
+            .lock()
+            .await;
+        let first = RecordingAuthority::new("did:key:local-default", true);
+        set_global_payment_credential_authority(first.clone());
+        let second = RecordingAuthority::new("did:webvh:selected-connector", true);
+        set_global_payment_credential_authority(second.clone());
+
+        sign_credential("PaymentReceiptCredential", serde_json::json!({ "paymentId": "txn-11" }))
+            .await
+            .expect("signs");
+
+        assert!(first.claims().is_empty(), "the local default must not keep signing once a connector is selected");
+        assert_eq!(second.claims()[0]["issuer"], "did:webvh:selected-connector");
+
+        clear_global_authority();
+    }
+
+    #[tokio::test]
+    async fn the_feature_flag_gates_issuance_before_the_authority_is_consulted() {
+        let _guard = AUTHORITY_TEST_LOCK
+            .lock()
+            .await;
+        let authority = RecordingAuthority::new("did:webvh:vta-under-test", true);
+        set_global_payment_credential_authority(authority.clone());
+
+        // `payment_receipt_vc` is off in a bare test process, so no signing
+        // overhead is incurred even with a connector registered.
+        let issued = issue_payment_receipt(PaymentReceiptInput {
+            rail: "x402",
+            payment_id: "txn-12".to_string(),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(issued.is_none());
+        assert!(authority.claims().is_empty());
+
+        clear_global_authority();
     }
 }

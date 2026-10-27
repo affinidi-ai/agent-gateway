@@ -653,10 +653,12 @@ dependencies = [
 name = "agent-gateway"
 version = "1.0.1"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-did-common 0.4.3",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-sdk",
+ "affinidi-secrets-resolver 0.5.12",
  "affinidi-tdk-common",
  "alloy",
  "alloy-signer",

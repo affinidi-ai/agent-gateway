@@ -256,6 +256,56 @@ lazy_static! {
         h
     };
 
+    /// VTA signing-connector Trust Task call outcomes (labeled by operation,
+    /// result). `operation` = the Trust Task slug (e.g. `auth`, `sign_jws`);
+    /// `result` = `ok` | `error` | `circuit_open` | `busy`.
+    pub static ref VTA_CALL: IntCounterVec = {
+        let opts = Opts::new(
+            names::VTA_CALL_TOTAL,
+            "VTA signing-connector Trust Task call outcomes (result = ok|error|circuit_open|busy)",
+        );
+        let counter = IntCounterVec::new(opts, &["operation", "result"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// VTA signing-connector call latency in seconds (labeled by operation).
+    pub static ref VTA_CALL_DURATION: HistogramVec = {
+        let opts = HistogramOpts::new(
+            names::VTA_CALL_DURATION_SECONDS,
+            "VTA signing-connector Trust Task call duration in seconds",
+        )
+        .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]);
+        let h = HistogramVec::new(opts, &["operation"]).unwrap();
+        REGISTRY.register(Box::new(h.clone())).unwrap();
+        h
+    };
+
+    /// Count of times the VTA connector's circuit breaker tripped open (a down
+    /// VTA failing fast rather than tying up surface request slots).
+    pub static ref VTA_CIRCUIT_OPEN: IntCounter = {
+        let counter = IntCounter::new(
+            names::VTA_CIRCUIT_OPEN_TOTAL,
+            "Total times the VTA connector circuit breaker opened",
+        )
+        .unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
+    /// Count of signing calls refused because the VTA signing quota for the
+    /// current window was exhausted (VTA-17). A non-zero rate means either an
+    /// abusive/looping caller or a limit set too low — both worth alerting on.
+    pub static ref VTA_QUOTA_EXCEEDED: IntCounter = {
+        let counter = IntCounter::new(
+            names::VTA_QUOTA_EXCEEDED_TOTAL,
+            "Total VTA signing calls refused by the signing quota",
+        )
+        .unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// Fabric forward requests received at a connection point (labeled by destination surface_id).
     /// Incremented once per inbound gateway-to-gateway `ForwardRequest` before any policy or
     /// forwarding, so it is the authoritative signal that a gateway received a fabric forward.
@@ -699,6 +749,33 @@ pub fn track_kms_operation(
     KMS_OPERATION_DURATION
         .with_label_values(&[op])
         .observe(duration_secs);
+}
+
+/// Track a VTA signing-connector Trust Task call outcome + latency.
+///
+/// `operation` is the Trust Task slug (`auth`, `sign_jws`, …); `result` is
+/// `ok` | `error` | `circuit_open` | `busy`.
+pub fn track_vta_call(
+    operation: &str,
+    result: &str,
+    duration_secs: f64,
+) {
+    VTA_CALL
+        .with_label_values(&[operation, result])
+        .inc();
+    VTA_CALL_DURATION
+        .with_label_values(&[operation])
+        .observe(duration_secs);
+}
+
+/// Track the VTA connector circuit breaker tripping open.
+pub fn track_vta_circuit_open() {
+    VTA_CIRCUIT_OPEN.inc();
+}
+
+/// Track a signing call refused by the VTA signing quota (VTA-17).
+pub fn track_vta_quota_exceeded() {
+    VTA_QUOTA_EXCEEDED.inc();
 }
 
 /// Track a fabric (gateway-to-gateway) forward request received at a connection point.

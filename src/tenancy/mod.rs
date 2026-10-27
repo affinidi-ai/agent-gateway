@@ -91,6 +91,7 @@ pub enum ResourceKind {
     CredentialProviders,
     JwtVerificationStrategies,
     StsClients,
+    VtaConnections,
 }
 
 impl ResourceKind {
@@ -114,6 +115,7 @@ impl ResourceKind {
             "credential-providers" => Some(Self::CredentialProviders),
             "jwt-verification-strategies" => Some(Self::JwtVerificationStrategies),
             "sts-clients" => Some(Self::StsClients),
+            "vta-connections" => Some(Self::VtaConnections),
             _ => None,
         }
     }
@@ -138,6 +140,7 @@ impl ResourceKind {
             Self::CredentialProviders => "credential-providers",
             Self::JwtVerificationStrategies => "jwt-verification-strategies",
             Self::StsClients => "sts-clients",
+            Self::VtaConnections => "vta-connections",
         }
     }
 }

@@ -124,6 +124,60 @@ pub struct VCIssuer {
     tr_listener_manager: Arc<RwLock<Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>>>,
     surface_store: std::sync::OnceLock<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
     surfaces_by_did: SurfacesByDidCache,
+    /// The backend that signs the JWT-shaped agent-identity credential
+    /// (VTA-11a). Late-bound: the connector is only selected once `[vta]` has
+    /// been resolved, which happens after this issuer is constructed. `None`
+    /// until then, in which case signing falls back to the local key — which is
+    /// also what the local connector does, so the output is identical either
+    /// way.
+    signing_authority: Arc<RwLock<Option<Arc<dyn crate::identity::authority::CredentialAuthority>>>>,
+    /// The backend that issues the **Data-Integrity** agent-identity credential
+    /// embedded in the forwarding VP (VTA-11b). Late-bound for the same reason
+    /// as `signing_authority`: the VTA connection is resolved after this issuer
+    /// is constructed. `None` falls back to `vc_issuer`, the local issuer,
+    /// which is the pre-VTA behaviour.
+    ///
+    /// Separate from `signing_authority` because they sign different artifacts
+    /// with different mechanisms — that one mints a JWT, this one a credential
+    /// carrying an `eddsa-jcs-2022` proof — and a deployment may move one
+    /// without the other.
+    di_vc_issuer: Arc<RwLock<Option<Arc<dyn VcIssuer>>>>,
+
+    /// The backend that signs the agent's **presentation** — the holder proof
+    /// (VTA-12). Late-bound for the same reason as `di_vc_issuer`.
+    ///
+    /// Distinct from `di_vc_issuer` because the two proofs are made by
+    /// different parties: the credential is signed by the *issuer* (this
+    /// gateway's own context), the presentation by the *holder* (the agent's
+    /// own context). Collapsing them would mean one key signing as both, which
+    /// is the custody problem rather than its fix.
+    di_vp_issuer: Arc<RwLock<Option<Arc<dyn VpIssuer>>>>,
+
+    /// Provisions an agent identity whose private key lives in a Verifiable
+    /// Trust Agent (VTA-12). When set, a newly onboarded agent gets a
+    /// `did:key` backed by a VTA-held key and this process never sees a
+    /// private half; when unset, onboarding generates a key as before.
+    agent_provisioner: Arc<RwLock<Option<Arc<dyn crate::vta::agent_contexts::AgentKeyProvisioner>>>>,
+
+    /// Signs artifacts whose verifier **resolves the claimed DID** rather than
+    /// checking a published JWKS — today the fabric issuer attestation.
+    ///
+    /// Separate from `signing_authority` because that one claims the trust
+    /// agent's DID while signing with a key in the gateway's context. A
+    /// verifier that resolves the claimed DID would not find that key there and
+    /// would reject the result; one that checks the JWKS is fine with it. So
+    /// the two cannot be the same slot.
+    attestation_signer: Arc<RwLock<Option<Arc<dyn crate::vta::context_signer::ContextSigner>>>>,
+
+    /// Resolves **which** key signs for a given surface (VTA-19). Late-bound
+    /// for the same reason as `signing_authority`.
+    ///
+    /// Consulted ahead of `signing_authority`, which stays the appliance-wide
+    /// answer: a surface that maps nothing resolves the same default and signs
+    /// with exactly the key it did before any mapping existed. Without this
+    /// the per-surface config parses and validates but never reaches signing,
+    /// so a mapping would silently do nothing.
+    key_directory: Arc<RwLock<Option<Arc<crate::vta::key_directory::KeyDirectory>>>>,
 }
 
 impl VCIssuer {
@@ -176,6 +230,12 @@ impl VCIssuer {
             tr_listener_manager: Arc::new(RwLock::new(None)),
             surface_store: std::sync::OnceLock::new(),
             surfaces_by_did: SurfacesByDidCache::default(),
+            signing_authority: Arc::new(RwLock::new(None)),
+            di_vc_issuer: Arc::new(RwLock::new(None)),
+            di_vp_issuer: Arc::new(RwLock::new(None)),
+            agent_provisioner: Arc::new(RwLock::new(None)),
+            attestation_signer: Arc::new(RwLock::new(None)),
+            key_directory: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -193,6 +253,167 @@ impl VCIssuer {
             .get()
             .cloned()
             .or_else(crate::gateways::connection_points::get_agent_surface_store)
+    }
+
+    /// Point agent-identity credential signing at the selected signing
+    /// connector (VTA-11a). Called from the identity router once `[vta]` has
+    /// been resolved, so the credential returned by `issue_or_get_credential`
+    /// is signed by the same backend as STS tokens and payment receipts.
+    pub async fn set_signing_authority(
+        &self,
+        authority: Arc<dyn crate::identity::authority::CredentialAuthority>,
+    ) {
+        let mut slot = self
+            .signing_authority
+            .write()
+            .await;
+        *slot = Some(authority);
+    }
+
+    /// Install the directory that decides which key signs for which surface
+    /// (VTA-19). Called from the identity router once `[vta]`, the connection
+    /// registry and the surface mappings have all been resolved.
+    pub async fn set_key_directory(
+        &self,
+        directory: Arc<crate::vta::key_directory::KeyDirectory>,
+    ) {
+        let mut slot = self
+            .key_directory
+            .write()
+            .await;
+        *slot = Some(directory);
+    }
+
+    /// The authority that should sign for `surface_id`.
+    ///
+    /// Falls back to the appliance-wide `signing_authority` whenever the
+    /// directory cannot answer — no directory installed, no surface in scope,
+    /// or a resolution failure. A surface that maps nothing therefore keeps
+    /// signing with exactly the key it used before, which is what makes
+    /// installing the directory a no-op for every existing deployment.
+    ///
+    /// A resolution **failure** is logged and falls back rather than failing
+    /// the request: the mapping was already validated at startup, so a failure
+    /// here is a transient backend problem, and refusing to issue an identity
+    /// because an optional override is unreachable would take the surface down
+    /// over something it worked without yesterday.
+    async fn authority_for_surface(
+        &self,
+        surface_id: Option<&str>,
+    ) -> Option<Arc<dyn crate::identity::authority::CredentialAuthority>> {
+        let appliance = self
+            .signing_authority
+            .read()
+            .await
+            .clone();
+        // Consulted whenever a directory is installed, **with or without a
+        // surface**. An appliance-wide default is by definition what applies
+        // when nothing more specific does, so requiring a surface here skipped
+        // it for every caller that has none — `/v1/identity/issue` among them,
+        // which then signed locally while the dashboard reported the agent.
+        let Some(directory) = self
+            .key_directory
+            .read()
+            .await
+            .clone()
+        else {
+            return appliance;
+        };
+
+        let scope = match surface_id {
+            Some(surface_id) => crate::vta::key_directory::KeyScope::surface(surface_id),
+            None => crate::vta::key_directory::KeyScope::default(),
+        };
+        let purpose = crate::config::vta::KeyPurpose::Jwt;
+        let resolved = match directory
+            .resolve_and_provision(purpose, &scope)
+            .await
+        {
+            Ok(key_ref) => {
+                directory
+                    .authority_for(&key_ref, purpose)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match resolved {
+            Ok(authority) => Some(authority),
+            Err(e) => {
+                warn!(
+                    target: "vta_audit",
+                    surface_id = surface_id.unwrap_or("<appliance-wide>"),
+                    error = %e.log_detail(),
+                    "signing key could not be resolved; falling back to the appliance key",
+                );
+                appliance
+            }
+        }
+    }
+
+    /// Point the Data-Integrity agent-identity credential at a VTA-backed
+    /// issuer (VTA-11b). Called from the identity router once `[vta]` has been
+    /// resolved.
+    ///
+    /// Once set there is no fallback to the local issuer: a credential signed
+    /// by a key the operator has moved away from is not an acceptable
+    /// substitute for one that failed to issue.
+    pub async fn set_di_vc_issuer(
+        &self,
+        issuer: Arc<dyn VcIssuer>,
+    ) {
+        let mut slot = self
+            .di_vc_issuer
+            .write()
+            .await;
+        *slot = Some(issuer);
+    }
+
+    /// The in-process credential issuer, for wrapping in a delegate that
+    /// falls back to it.
+    ///
+    /// Exposed so a dashboard-driven issuer can keep local signing as its
+    /// fallback without rebuilding one — a second `LocalVcIssuer` would read
+    /// the same config but be a different object, and divergence there would
+    /// be invisible until a credential verified against the wrong key.
+    pub fn local_vc_issuer(&self) -> Arc<dyn VcIssuer> {
+        Arc::clone(&self.vc_issuer)
+    }
+
+    /// Point the agent's **holder proof** at a VTA-backed issuer (VTA-12), so
+    /// the agent's private key lives in its own trust agent rather than in
+    /// this process.
+    ///
+    /// The VTA issuer decides per agent: one that has a VTA context is signed
+    /// there, one onboarded before the migration still has a gateway-held key
+    /// and is signed locally. That is what makes the migration gradual rather
+    /// than a flag day.
+    pub async fn set_di_vp_issuer(
+        &self,
+        issuer: Arc<dyn VpIssuer>,
+    ) {
+        let mut slot = self
+            .di_vp_issuer
+            .write()
+            .await;
+        *slot = Some(issuer);
+    }
+
+    /// Onboard new agents with a key held in their own VTA context (VTA-12)
+    /// rather than one generated here.
+    ///
+    /// Only affects agents onboarded from now on. Existing records keep their
+    /// gateway-held key and keep working — rewriting them would change every
+    /// agent's DID, invalidating credentials already issued to them and any
+    /// trust-registry record that names them.
+    pub async fn set_agent_provisioner(
+        &self,
+        provisioner: Arc<dyn crate::vta::agent_contexts::AgentKeyProvisioner>,
+    ) {
+        let mut slot = self
+            .agent_provisioner
+            .write()
+            .await;
+        *slot = Some(provisioner);
     }
 
     /// Set the DID cache for this issuer (for caching DID resolution during VP verification)
@@ -857,7 +1078,7 @@ impl VCIssuer {
 
             // Return existing DID and generate a fresh VC
             let vc = self
-                .create_credential(&record.did, &identity_fields, name.as_ref())
+                .create_credential(&record.did, &identity_fields, name.as_ref(), channel_config_id.as_deref())
                 .await?;
 
             return Ok(AgentIdentityResponse {
@@ -869,23 +1090,82 @@ impl VCIssuer {
         }
 
         // Generate new did:webvh DID for this agent
-        let (agent_did, mut record) = crate::vault_identity::handlers::generate_did_webvh_identity(
-            self,
-            "surface",
-            Some(format!(
-                "Surface: {}",
-                channel_config_id
-                    .as_deref()
-                    .unwrap_or("unknown")
-            )),
-        )
-        .await?;
+        let provisioned = match self
+            .agent_provisioner
+            .read()
+            .await
+            .as_ref()
+        {
+            Some(provisioner) if provisioner.available() => match provisioner
+                .provision(&identity_hash)
+                .await
+            {
+                Ok(provisioned) => Some(provisioned),
+                // An inferred provisioner may simply lack the grant to create
+                // contexts, which cannot be known before trying. Falling back
+                // to the key this would have minted anyway keeps onboarding
+                // working; an explicitly configured one still fails, because
+                // the operator asked for the stronger guarantee.
+                Err(e) if provisioner.optional() => {
+                    warn!(
+                        target: "vta_audit",
+                        error = %e,
+                        "could not mint this agent's key in the trust agent; \
+                         falling back to a gateway-held key",
+                    );
+                    None
+                }
+                Err(e) => return Err(e),
+            },
+            // No provisioner, or no trust agent configured for it to use: the
+            // gateway mints the key, exactly as it always did.
+            _ => None,
+        };
+
+        let (agent_did, mut record) = match provisioned {
+            // The agent's key is minted inside its own VTA context and the DID
+            // follows from it, so no private half ever exists on this host.
+            Some(provisioned) => {
+                let record = crate::identity::AgentIdentityRecord {
+                    did: provisioned.did.clone(),
+                    identity_hash: identity_hash.clone(),
+                    created_at: chrono::Utc::now(),
+                    identity_fields: std::collections::HashMap::new(),
+                    usage_count: 0,
+                    last_used_at: None,
+                    channel_usage: vec![],
+                    private_key: None,
+                    vta_context_id: Some(provisioned.context_id),
+                    vta_connection_id: Some(provisioned.connection_id),
+                    channel_config_id: None,
+                    is_local: true,
+                    verified: true,
+                    // Provisioned through onboarding, so this is a managed
+                    // agent rather than an external caller.
+                    origin: Some(crate::identity::IdentityOrigin::Managed),
+                };
+                (provisioned.did, record)
+            }
+            None => {
+                crate::vault_identity::handlers::generate_did_webvh_identity(
+                    self,
+                    "surface",
+                    Some(format!(
+                        "Surface: {}",
+                        channel_config_id
+                            .as_deref()
+                            .unwrap_or("unknown")
+                    )),
+                )
+                .await?
+            }
+        };
 
         let name = self
             .managed_display_name(&agent_did, origin, channel_config_id.as_deref())
             .await;
         let vc = self
-            .create_credential(&agent_did, &identity_fields, name.as_ref())
+            .create_credential(&agent_did, &identity_fields, name.as_ref(), channel_config_id.as_deref())
             .await?;
 
         // Update the record with the actual identity_hash and fields before storing
@@ -994,8 +1274,31 @@ impl VCIssuer {
         agent_did: &str,
         identity_fields: &std::collections::HashMap<String, serde_json::Value>,
         name: Option<&DisplayName>,
+        surface_id: Option<&str>,
     ) -> Result<String> {
-        let config = self.config.read().await;
+        // The backend that will sign, if one has been selected (VTA-11a),
+        // narrowed to this surface's own key when one is mapped (VTA-19).
+        let authority = self
+            .authority_for_surface(surface_id)
+            .await;
+
+        // Clone what signing needs and release the config lock before any
+        // `.await` on the authority — the local connector re-enters this same
+        // `RwLock` to read the signing key, and tokio's write-preferring lock
+        // would deadlock on a reentrant read if a writer were queued.
+        let (local_signing_key, local_issuer_did) = {
+            let config = self.config.read().await;
+            (config.signing_key.clone(), config.proxy_did.clone())
+        };
+
+        // The `issuer` claim must name whoever actually holds the signing key,
+        // otherwise the credential cannot be verified against the published
+        // JWKS. Fail closed rather than falling back to the local DID: a
+        // credential attributed to the wrong issuer is worse than none.
+        let issuer_did = match authority.as_ref() {
+            Some(authority) => authority.issuer_did().await?,
+            None => local_issuer_did,
+        };
 
         // Convert identity fields to JSON for credential
         let identity_json = serde_json::to_value(identity_fields).context("Failed to serialize identity fields")?;
@@ -1018,7 +1321,7 @@ impl VCIssuer {
                 "https://affinidi.io/contexts/agent-identity/v1"
             ],
             "type": ["VerifiableCredential", "AgentIdentityCredential"],
-            "issuer": config.proxy_did,
+            "issuer": issuer_did,
             "issuanceDate": chrono::Utc::now().to_rfc3339(),
             "credentialSubject": credential_subject,
             "iat": now,
@@ -1026,8 +1329,17 @@ impl VCIssuer {
             "jti": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         });
 
-        // Sign as JWT
-        let jwt = Self::sign_jwt(&payload, &config.signing_key)?;
+        // Sign as JWT. A down backend propagates its error — the caller gets no
+        // credential rather than a locally-signed one the active issuer DID
+        // would not account for.
+        let jwt = match authority.as_ref() {
+            Some(authority) => {
+                authority
+                    .sign_token(&payload)
+                    .await?
+            }
+            None => Self::sign_jwt(&payload, &local_signing_key)?,
+        };
 
         Ok(jwt)
     }
@@ -1149,6 +1461,61 @@ impl VCIssuer {
         Ok(jwt)
     }
 
+    /// Point the fabric issuer attestation at a VTA context, so the DID it
+    /// claims and the key that signs it are the same party.
+    ///
+    /// Without this the attestation claims the gateway's own DID and signs
+    /// with the local key — which still verifies, but pins peers to a DID that
+    /// no longer issues the credentials they will receive.
+    pub async fn set_attestation_signer(
+        &self,
+        signer: Arc<dyn crate::vta::context_signer::ContextSigner>,
+    ) {
+        let mut slot = self
+            .attestation_signer
+            .write()
+            .await;
+        *slot = Some(signer);
+    }
+
+    /// The DID the fabric issuer attestation should claim, and which must
+    /// therefore also be the issuer of the credentials peers will receive.
+    pub async fn attestation_issuer_did(&self) -> Result<String> {
+        match self
+            .attestation_signer
+            .read()
+            .await
+            .as_ref()
+        {
+            Some(signer) => signer.issuer_did().await,
+            None => self.get_issuer_did().await,
+        }
+    }
+
+    /// Sign an attestation as [`attestation_issuer_did`](Self::attestation_issuer_did).
+    pub async fn sign_attestation_typ(
+        &self,
+        claims: &serde_json::Value,
+        typ: &str,
+    ) -> Result<String> {
+        match self
+            .attestation_signer
+            .read()
+            .await
+            .as_ref()
+        {
+            Some(signer) => {
+                signer
+                    .sign_typ(claims, typ)
+                    .await
+            }
+            None => {
+                self.sign_jwt_with_gateway_key_typ(claims, typ)
+                    .await
+            }
+        }
+    }
+
     /// Sign a JWT payload with the gateway's private key
     pub async fn sign_jwt_with_gateway_key(
         &self,
@@ -1187,13 +1554,18 @@ impl VCIssuer {
         challenge: Option<&str>,
         domain: Option<&str>,
     ) -> Result<String> {
-        self.create_agent_identity_presentation_with_binding(agent_did, identity_fields, None, challenge, domain)
+        self.create_agent_identity_presentation_with_binding(agent_did, identity_fields, None, challenge, domain, None)
             .await
     }
 
     /// Create a VP with optional workload binding attestation.
     /// When `workload_binding` is provided, the VC uses structured `workloadBinding`
     /// instead of flat `identityFields`.
+    ///
+    /// `surface_id` scopes which key issues the embedded credential. `None`
+    /// means appliance-wide, which is what every caller outside the injection
+    /// path wants — and what the injection path itself did before surfaces
+    /// could carry their own key.
     pub async fn create_agent_identity_presentation_with_binding(
         &self,
         agent_did: &str,
@@ -1201,6 +1573,7 @@ impl VCIssuer {
         workload_binding: Option<serde_json::Value>,
         challenge: Option<&str>,
         domain: Option<&str>,
+        surface_id: Option<&str>,
     ) -> Result<String> {
         self.create_agent_identity_presentation_chained(
             agent_did,
@@ -1209,6 +1582,7 @@ impl VCIssuer {
             challenge,
             domain,
             Vec::new(),
+            surface_id,
         )
         .await
     }
@@ -1225,13 +1599,54 @@ impl VCIssuer {
         challenge: Option<&str>,
         domain: Option<&str>,
         chained_credentials: Vec<serde_json::Value>,
+        surface_id: Option<&str>,
     ) -> Result<String> {
-        let agent_key = self
-            .get_agent_key_by_did(agent_did)
-            .await?;
         let display_name = self
             .display_name_for_did(agent_did)
             .await;
+        // A VTA-backed holder issuer signs with the agent's own key, held in
+        // the agent's VTA context. Only reach for a gateway-held key when
+        // there is no such issuer — fetching it unconditionally would keep the
+        // custody alive in the one place that still reads it.
+        let vp_issuer = match self
+            .di_vp_issuer
+            .read()
+            .await
+            .as_ref()
+        {
+            Some(vta) => Arc::clone(vta),
+            None => Arc::clone(&self.vp_issuer),
+        };
+        // ...but a VTA holder issuer only signs for agents that *have* a VTA
+        // context, and falls back to the local one for the rest. Deciding on
+        // the issuer alone stranded every pre-migration agent: the fallback
+        // got no key and refused with "no holder key". So the key is fetched
+        // whenever this agent would be signed locally, which keeps custody out
+        // of the path for migrated agents and keeps the others working — the
+        // gradual migration this is supposed to support.
+        let signs_in_its_own_agent = self
+            .di_vp_issuer
+            .read()
+            .await
+            .is_some()
+            && self
+                .identity_store
+                .find_by_did(agent_did)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|record| {
+                    record
+                        .vta_context_id
+                        .is_some()
+                });
+        let agent_key = match signs_in_its_own_agent {
+            true => None,
+            false => Some(
+                self.get_agent_key_by_did(agent_did)
+                    .await?,
+            ),
+        };
 
         let agent_identity = AgentIdentity {
             did: Cow::Borrowed(agent_did),
@@ -1241,8 +1656,50 @@ impl VCIssuer {
                 .as_ref()
                 .map(|name| Cow::Borrowed(name.as_str())),
         };
-        let vc = self
-            .vc_issuer
+        // A VTA-backed issuer, once selected, is the only issuer: there is no
+        // fallback to the local key, because a credential signed by a key the
+        // operator has moved away from is not an acceptable substitute for one
+        // that failed to issue.
+        //
+        // Resolved per surface when the directory is wired, so a surface's own
+        // `signing` block governs the credential inside an injected
+        // presentation exactly as it governs that surface's tokens. A surface
+        // that configures nothing resolves the appliance default, and an
+        // appliance with no agent resolves the local key — which is why a
+        // gateway that never adopted one is on an unchanged path.
+        let scoped = match self
+            .key_directory
+            .read()
+            .await
+            .as_ref()
+        {
+            Some(directory) => {
+                let scope = crate::vta::key_directory::KeyScope {
+                    surface_id: surface_id.map(str::to_string),
+                    ..Default::default()
+                };
+                directory
+                    .di_vc_issuer_for(&scope)
+                    .await
+            }
+            None => crate::vta::key_directory::ScopedDiIssuer::Inherit,
+        };
+        let issuer = match scoped {
+            crate::vta::key_directory::ScopedDiIssuer::Agent(vta) => vta,
+            // An explicit `local` is honoured as written, rather than falling
+            // through to whatever the appliance signs with.
+            crate::vta::key_directory::ScopedDiIssuer::Local => Arc::clone(&self.vc_issuer),
+            crate::vta::key_directory::ScopedDiIssuer::Inherit => match self
+                .di_vc_issuer
+                .read()
+                .await
+                .as_ref()
+            {
+                Some(vta) => Arc::clone(vta),
+                None => Arc::clone(&self.vc_issuer),
+            },
+        };
+        let vc = issuer
             .issue(IssueVcPayload::AgentIdentity(agent_identity))
             .await?;
 
@@ -1251,15 +1708,14 @@ impl VCIssuer {
         credentials_list.extend(chained_credentials);
 
         let presentation_creds = Credentials {
-            holder_key: Cow::Owned(agent_key),
+            holder_key: agent_key.map(Cow::Owned),
             holder_did: Cow::Borrowed(agent_did),
             verifiable_credentials: Cow::Owned(credentials_list),
             challenge: challenge.map(Cow::Borrowed),
             domain: domain.map(Cow::Borrowed),
         };
 
-        let vp = self
-            .vp_issuer
+        let vp = vp_issuer
             .issue(VpIssuerPayload::Credentials(presentation_creds))
             .await?;
 
@@ -2828,5 +3284,1240 @@ mod tests {
             );
             assert_eq!(origin_of(issuer, &response.did).await, Some(IdentityOrigin::Managed));
         }
+    }
+
+    /// Stands in for whichever backend `[vta]` selected (VTA-11a): records what
+    /// it was asked to sign, and can report itself unreachable.
+    struct RecordingAuthority {
+        did: &'static str,
+        reachable: bool,
+        signed: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl RecordingAuthority {
+        fn new(
+            did: &'static str,
+            reachable: bool,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                did,
+                reachable,
+                signed: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn claims(&self) -> Vec<serde_json::Value> {
+            self.signed
+                .lock()
+                .unwrap()
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::identity::authority::CredentialAuthority for RecordingAuthority {
+        async fn issuer_did(&self) -> Result<String> {
+            Ok(self.did.to_string())
+        }
+
+        async fn issuer_jwks(&self) -> Result<serde_json::Value> {
+            Ok(json!({ "keys": [] }))
+        }
+
+        async fn sign_token(
+            &self,
+            claims: &serde_json::Value,
+        ) -> Result<String> {
+            self.signed
+                .lock()
+                .unwrap()
+                .push(claims.clone());
+            if !self.reachable {
+                anyhow::bail!("backend unreachable");
+            }
+            Ok("header.payload.signature".to_string())
+        }
+
+        async fn sign_token_typ(
+            &self,
+            claims: &serde_json::Value,
+            _typ: &str,
+        ) -> Result<String> {
+            self.sign_token(claims).await
+        }
+    }
+
+    fn decode_jwt_payload(jwt: &str) -> serde_json::Value {
+        use base64::Engine as _;
+        let payload = jwt
+            .split('.')
+            .nth(1)
+            .expect("a compact JWS has three parts");
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("base64url payload");
+        serde_json::from_slice(&bytes).expect("JSON payload")
+    }
+
+    /// With no connector selected the credential is signed by the local key and
+    /// attributed to the local issuer DID — today's behaviour, unchanged.
+    #[tokio::test]
+    async fn agent_credential_signs_locally_when_no_connector_is_selected() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-a"))]);
+
+        let jwt = issuer
+            .create_credential("did:example:agent-a", &identity_fields, None)
+            .await
+            .expect("local signing succeeds");
+
+        let claims = decode_jwt_payload(&jwt);
+        let local_did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        assert_eq!(claims["issuer"], local_did);
+        assert_eq!(claims["type"][1], "AgentIdentityCredential");
+        assert_eq!(claims["credentialSubject"]["id"], "did:example:agent-a");
+        assert_eq!(claims["credentialSubject"]["identityFields"]["name"], "agent-a");
+    }
+
+    /// Registering the local connector must not change the output: it signs
+    /// with the same key and reports the same issuer DID.
+    #[tokio::test]
+    async fn the_local_connector_produces_the_same_issuer_as_no_connector() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-b"))]);
+        let local_did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+
+        issuer
+            .set_signing_authority(Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(
+                &issuer,
+            ))))
+            .await;
+
+        let jwt = issuer
+            .create_credential("did:example:agent-b", &identity_fields, None)
+            .await
+            .expect("the local connector signs without deadlocking on the config lock");
+
+        let claims = decode_jwt_payload(&jwt);
+        assert_eq!(claims["issuer"], local_did);
+    }
+
+    /// With a connector selected, the credential is signed by it and the
+    /// `issuer` claim names the connector's DID, not the local one.
+    #[tokio::test]
+    async fn agent_credential_signs_through_the_selected_connector() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let authority = RecordingAuthority::new("did:webvh:vta-under-test", true);
+        issuer
+            .set_signing_authority(authority.clone())
+            .await;
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-c"))]);
+
+        let jwt = issuer
+            .create_credential("did:example:agent-c", &identity_fields, None)
+            .await
+            .expect("the connector signs the credential");
+
+        assert_eq!(jwt, "header.payload.signature");
+        let claims = authority.claims();
+        assert_eq!(claims.len(), 1, "exactly one signing call is made");
+        assert_eq!(claims[0]["issuer"], "did:webvh:vta-under-test");
+        assert_eq!(claims[0]["type"][1], "AgentIdentityCredential");
+        assert_eq!(claims[0]["credentialSubject"]["id"], "did:example:agent-c");
+        assert!(
+            claims[0]["exp"]
+                .as_i64()
+                .unwrap()
+                > claims[0]["iat"]
+                    .as_i64()
+                    .unwrap()
+        );
+    }
+
+    /// A down connector fails closed: the error propagates, and no credential
+    /// signed by a different (local) key is substituted.
+    #[tokio::test]
+    async fn an_unreachable_connector_fails_closed_without_a_local_fallback() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let authority = RecordingAuthority::new("did:webvh:vta-under-test", false);
+        issuer
+            .set_signing_authority(authority.clone())
+            .await;
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-d"))]);
+
+        let err = issuer
+            .create_credential("did:example:agent-d", &identity_fields, None)
+            .await
+            .expect_err("a down connector must not yield a credential");
+
+        assert!(
+            format!("{err:#}").contains("backend unreachable"),
+            "the connector's failure must surface, got: {err:#}"
+        );
+        assert_eq!(authority.claims().len(), 1, "the failure came from the connector, not from a local fallback");
+    }
+
+    /// Installing the directory must change nothing for a surface that maps
+    /// no signing of its own, or every existing deployment would start signing
+    /// with a different key the moment this was wired up.
+    #[tokio::test]
+    async fn a_surface_that_maps_nothing_still_signs_with_the_appliance_key() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let appliance = RecordingAuthority::new("did:webvh:appliance", true);
+        issuer
+            .set_signing_authority(appliance.clone())
+            .await;
+        issuer
+            .set_key_directory(
+                empty_directory(Arc::clone(&appliance) as Arc<dyn crate::identity::authority::CredentialAuthority>)
+                    .await,
+            )
+            .await;
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-e"))]);
+
+        issuer
+            .create_credential("did:example:agent-e", &identity_fields, Some("surface-with-no-mapping"))
+            .await
+            .expect("an unmapped surface signs with the appliance key");
+
+        let claims = appliance.claims();
+        assert_eq!(claims.len(), 1, "the appliance connector still did the signing");
+        assert_eq!(claims[0]["issuer"], "did:webvh:appliance", "an unmapped surface must keep the appliance issuer");
+    }
+
+    /// The point of the directory: a surface mapped to a different backend
+    /// signs with that one instead of the appliance key. Mapped to `local`
+    /// here because it is reachable in a unit test and still proves the
+    /// override — the appliance connector must not be called at all.
+    #[tokio::test]
+    async fn a_surface_mapped_to_another_backend_does_not_use_the_appliance_key() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let appliance = RecordingAuthority::new("did:webvh:appliance", true);
+        issuer
+            .set_signing_authority(appliance.clone())
+            .await;
+
+        let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+            Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
+        let mut directory = crate::vta::key_directory::KeyDirectory::build(
+            &crate::config::vta::VtaConfig::default(),
+            Arc::clone(&local),
+        )
+        .await
+        .expect("a disabled [vta] block builds a local-only directory");
+        let surface = crate::config::agent_surface::AgentSurface {
+            surface_id: "surface-mapped-local".to_string(),
+            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Local),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        directory
+            .with_surface(&surface)
+            .expect("a local mapping installs");
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-f"))]);
+        let jwt = issuer
+            .create_credential("did:example:agent-f", &identity_fields, Some("surface-mapped-local"))
+            .await
+            .expect("the mapped backend signs");
+
+        assert!(appliance.claims().is_empty(), "the appliance connector must not sign for a surface mapped elsewhere");
+        let claims = decode_jwt_payload(&jwt);
+        assert_eq!(
+            claims["issuer"],
+            issuer
+                .get_issuer_did()
+                .await
+                .unwrap(),
+            "the issuer claim must name whoever actually signed"
+        );
+    }
+
+    /// The appliance-wide default must apply when **no surface is in scope**
+    /// — that is what "appliance-wide" means. Requiring a surface skipped the
+    /// directory entirely for `/v1/identity/issue`, which passes none, so a
+    /// gateway configured to sign through its trust agent silently kept
+    /// signing locally while the dashboard reported the agent.
+    #[tokio::test]
+    async fn the_appliance_default_applies_when_no_surface_is_in_scope() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let appliance = RecordingAuthority::new("did:webvh:appliance", true);
+        issuer
+            .set_signing_authority(appliance.clone())
+            .await;
+
+        // A directory whose appliance-wide override points somewhere else.
+        let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+            Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
+        let directory = crate::vta::key_directory::KeyDirectory::build(
+            &crate::config::vta::VtaConfig::default(),
+            Arc::clone(&local),
+        )
+        .await
+        .expect("a disabled [vta] block builds a local-only directory");
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        let fields = HashMap::from([("name".to_string(), json!("no-surface"))]);
+        let jwt = issuer
+            .create_credential("did:example:no-surface", &fields, None)
+            .await
+            .expect("issuing without a surface succeeds");
+
+        // The directory resolved it (to local, here), so the appliance
+        // connector was never reached. Before the fix the directory was
+        // skipped outright and this signed via `appliance`.
+        assert!(appliance.claims().is_empty(), "the directory must be consulted even with no surface in scope");
+        assert_eq!(
+            decode_jwt_payload(&jwt)["issuer"],
+            issuer
+                .get_issuer_did()
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Backward compatibility for every deployment that has never configured
+    /// a trust agent, in the shape production actually has: the directory is
+    /// installed unconditionally, `[vta]` is disabled, no appliance override
+    /// is set and no surface is in scope. The issued credential must be
+    /// byte-for-byte the same as one issued with no directory at all.
+    #[tokio::test]
+    async fn a_gateway_that_never_configured_a_trust_agent_signs_exactly_as_before() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let fields = HashMap::from([("name".to_string(), json!("legacy"))]);
+
+        // Before: no directory, no connector — the pre-VTA gateway.
+        let before = issuer
+            .create_credential("did:example:legacy", &fields, None)
+            .await
+            .expect("pre-VTA issuance");
+
+        // After: the directory is installed exactly as the router installs it
+        // for a gateway with no `[vta]` block, and nothing is overridden.
+        let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+            Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
+        let directory = crate::vta::key_directory::KeyDirectory::build(
+            &crate::config::vta::VtaConfig::default(),
+            Arc::clone(&local),
+        )
+        .await
+        .expect("a disabled [vta] block always builds");
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        let after = issuer
+            .create_credential("did:example:legacy", &fields, None)
+            .await
+            .expect("issuance after the directory is installed");
+
+        assert_eq!(
+            decode_jwt_payload(&before)["issuer"],
+            decode_jwt_payload(&after)["issuer"],
+            "installing the directory must not change which key signs for a gateway with no trust agent"
+        );
+        assert_eq!(
+            decode_jwt_payload(&after)["issuer"],
+            issuer
+                .get_issuer_did()
+                .await
+                .unwrap(),
+            "and that key is still the gateway's own"
+        );
+    }
+
+    /// A local-only directory, for asserting the no-op case.
+    async fn empty_directory(
+        local: Arc<dyn crate::identity::authority::CredentialAuthority>
+    ) -> Arc<crate::vta::key_directory::KeyDirectory> {
+        Arc::new(
+            crate::vta::key_directory::KeyDirectory::build(&crate::config::vta::VtaConfig::default(), local)
+                .await
+                .expect("a disabled [vta] block builds a local-only directory"),
+        )
+    }
+
+    // ─── Data-Integrity agent-identity credential (VTA-11b) ───────────────
+
+    /// A `VcIssuer` that records what it was asked for and returns a fixed
+    /// credential, standing in for the VTA's context-scoped issue task.
+    struct RecordingVcIssuer {
+        issued: Arc<std::sync::Mutex<Vec<String>>>,
+        credential: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::identity::ssi::vc_issuer::VcIssuer for RecordingVcIssuer {
+        async fn issue<'a>(
+            &self,
+            payload: crate::identity::ssi::vc_issuer::IssueVcPayload<'a>,
+        ) -> anyhow::Result<serde_json::Value> {
+            let crate::identity::ssi::vc_issuer::IssueVcPayload::AgentIdentity(agent) = payload;
+            self.issued
+                .lock()
+                .expect("lock")
+                .push(agent.did.to_string());
+            Ok(self.credential.clone())
+        }
+    }
+
+    /// Once a VTA-backed issuer is bound, the Data-Integrity credential comes
+    /// from it rather than from the local issuer — which is the whole point of
+    /// moving the key off this process.
+    #[tokio::test]
+    async fn the_di_credential_is_issued_by_the_bound_vta_issuer() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-di"))]);
+        let agent_did = issuer
+            .issue_or_get_credential(identity_fields.clone(), None, None, None)
+            .await
+            .expect("agent identity")
+            .did;
+
+        // Start from a real locally-issued credential and only change its
+        // issuer, so the stand-in is JSON-LD valid and the presentation signs
+        // exactly as it would over a real VTA credential.
+        let local_vp = issuer
+            .create_agent_identity_presentation_with_binding(&agent_did, &identity_fields, None, None, None, None)
+            .await
+            .expect("a locally issued presentation to borrow a credential from");
+        let local_vp: serde_json::Value = serde_json::from_str(&local_vp).expect("the VP is JSON");
+        let mut vta_credential = first_credential(&local_vp);
+        vta_credential["issuer"] = json!("did:webvh:vta-context");
+
+        let recorder = Arc::new(RecordingVcIssuer {
+            issued: Arc::new(std::sync::Mutex::new(Vec::new())),
+            credential: vta_credential.clone(),
+        });
+        issuer
+            .set_di_vc_issuer(recorder.clone())
+            .await;
+
+        let vp = issuer
+            .create_agent_identity_presentation_with_binding(&agent_did, &identity_fields, None, None, None, None)
+            .await
+            .expect("the presentation is issued over the VTA-issued credential");
+
+        assert_eq!(
+            recorder
+                .issued
+                .lock()
+                .expect("lock")
+                .as_slice(),
+            std::slice::from_ref(&agent_did),
+            "the VTA issuer must be asked for exactly this agent"
+        );
+
+        let vp: serde_json::Value = serde_json::from_str(&vp).expect("the VP is JSON");
+        assert_eq!(
+            first_credential(&vp)["issuer"],
+            json!("did:webvh:vta-context"),
+            "the embedded credential must be the VTA's, not a locally signed one"
+        );
+    }
+
+    /// `verifiableCredential` is an object for a single credential and an array
+    /// for several; both shapes are legal, so tests read through this.
+    fn first_credential(vp: &serde_json::Value) -> serde_json::Value {
+        let field = &vp["verifiableCredential"];
+        match field {
+            serde_json::Value::Array(items) => items
+                .first()
+                .cloned()
+                .expect("the VP carries at least one credential"),
+            other => other.clone(),
+        }
+    }
+
+    /// With no VTA issuer bound, issuance stays exactly where it was.
+    #[tokio::test]
+    async fn the_di_credential_falls_back_to_the_local_issuer() {
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let identity_fields = HashMap::from([("name".to_string(), json!("agent-local-di"))]);
+        let agent_did = issuer
+            .issue_or_get_credential(identity_fields.clone(), None, None, None)
+            .await
+            .expect("agent identity")
+            .did;
+
+        let vp = issuer
+            .create_agent_identity_presentation_with_binding(&agent_did, &identity_fields, None, None, None, None)
+            .await
+            .expect("the local issuer still issues when no VTA is bound");
+
+        let vp: serde_json::Value = serde_json::from_str(&vp).expect("the VP is JSON");
+        let credential = first_credential(&vp);
+        assert_eq!(credential["proof"]["cryptosuite"], "eddsa-rdfc-2022", "the local issuer's suite is unchanged");
+        assert_eq!(
+            credential["credentialSubject"]["id"], agent_did,
+            "the local credential is still bound to the agent"
+        );
+    }
+}
+
+/// End-to-end proof that a per-surface mapping reaches a **real** VTA.
+///
+/// Unit tests can only show the directory is consulted; they cannot show the
+/// resolved key is actually held by a trust agent. This signs through a live
+/// VTA and asserts the issuer is not this gateway's local key.
+///
+/// Requires a running VTA whose granted context the gateway can reach:
+///
+/// ```sh
+/// VTA_LIVE_URL=http://127.0.0.1:3000 \
+/// VTA_LIVE_DID=did:webvh:<scid>:localhost%3A3000 \
+/// VTA_LIVE_PARENT_CONTEXT=<the granted context> \
+///   cargo test --bin agent-trust-gateway \
+///     identity::vc_issuer::live_tests \
+///     -- --ignored --nocapture --test-threads=1
+/// ```
+///
+/// `--test-threads=1` for the same reason as the other live suites: a second
+/// session for the same control DID supersedes the first.
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    const LIVE_SEED_VAR: &str = "VTA_LIVE_CONTROL_SEED";
+
+    /// Mint a signing key in the granted context and return the config that
+    /// names it. Self-contained on purpose: the key is what `keys/sign-jws`
+    /// addresses, so a test that required one to be created by hand could not
+    /// be run from a clean VTA.
+    async fn live_config() -> crate::config::vta::VtaConfig {
+        use crate::vta::client::VtaRestClient;
+        use crate::vta::control_key::ControlKey;
+
+        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID to the VTA did:webvh");
+        let context =
+            std::env::var("VTA_LIVE_PARENT_CONTEXT").expect("set VTA_LIVE_PARENT_CONTEXT to the granted context");
+        if std::env::var(LIVE_SEED_VAR).is_err() {
+            // The seed the other live suites use, so one grant covers them all.
+            unsafe { std::env::set_var(LIVE_SEED_VAR, "2a".repeat(32)) };
+        }
+
+        // The same seed the hex above encodes, and the one the other live
+        // suites authenticate with, so a single ACL grant covers them all.
+        let control = Arc::new(ControlKey::from_seed([0x2a; 32]));
+        let client = VtaRestClient::new(&url, &vta_did, control, std::time::Duration::from_secs(15), 8, None)
+            .expect("build a live client");
+        let idx: u32 = rand::random::<u32>() % 2_000_000;
+        let key_id = format!("gateway-surface-e2e-{idx}");
+        let _created: serde_json::Value = client
+            .dispatch_signed(
+                "https://trusttasks.org/spec/keys/create/0.1",
+                json!({
+                    "keyType": "ed25519",
+                    "keyId": key_id,
+                    "label": "gateway-surface-e2e",
+                    "internal": true,
+                }),
+            )
+            .await
+            .expect("the granted control DID can mint a key in its context");
+
+        crate::config::vta::VtaConfig {
+            enabled: true,
+            base_url: Some(url),
+            vta_did: Some(vta_did),
+            context_id: Some(context),
+            signing_key_id: Some(key_id),
+            auth_key_source: Some(format!("env://{LIVE_SEED_VAR}")),
+            ..Default::default()
+        }
+    }
+
+    fn payload(jwt: &str) -> serde_json::Value {
+        use base64::Engine;
+        let part = jwt
+            .split('.')
+            .nth(1)
+            .expect("a JWT has three parts");
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .expect("base64url payload");
+        serde_json::from_slice(&raw).expect("JSON payload")
+    }
+
+    /// A surface mapped to the VTA signs with a key the VTA holds, while the
+    /// appliance default stays local — so the two are demonstrably different
+    /// keys, which is the entire point of per-surface mapping.
+    #[tokio::test]
+    #[ignore = "requires a running VTA; see the module docs"]
+    async fn a_surface_mapped_to_a_live_vta_signs_with_the_agents_key() {
+        let config = live_config().await;
+        let context = config
+            .context_id
+            .clone()
+            .expect("set above");
+        let (issuer, _tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let local_did = issuer
+            .get_issuer_did()
+            .await
+            .expect("the gateway has a local issuer DID");
+
+        let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+            Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
+        let mut directory = crate::vta::key_directory::KeyDirectory::build(&config, Arc::clone(&local))
+            .await
+            .expect("the live VTA is reachable and the control DID is granted");
+
+        let surface = crate::config::agent_surface::AgentSurface {
+            surface_id: "live-mapped-surface".to_string(),
+            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+                context_id: Some(context.clone()),
+                // `jwt` keys are named explicitly (D-11): `keys/sign-jws`
+                // addresses the key, so the mapping has to say which one.
+                key_id: config.signing_key_id.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        directory
+            .with_surface(&surface)
+            .expect("a VTA mapping naming an existing context installs");
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        let fields = HashMap::from([("name".to_string(), json!("live-agent"))]);
+        let jwt = issuer
+            .create_credential("did:example:live-agent", &fields, Some("live-mapped-surface"))
+            .await
+            .expect("the live VTA signs the credential");
+
+        let claims = payload(&jwt);
+        eprintln!("LIVE_ISSUER={} LOCAL_ISSUER={local_did}", claims["issuer"]);
+        assert_ne!(claims["issuer"], local_did, "a VTA-mapped surface must not be signed by the gateway's own key");
+        assert_eq!(claims["credentialSubject"]["id"], "did:example:live-agent");
+
+        // A second surface on the same gateway, mapped back to the local
+        // key, must sign with that one. This is the property per-surface
+        // mapping exists for: two surfaces, one appliance, different keys at
+        // the same time. Asserting the *unmapped* case here would prove
+        // nothing — with `[vta]` enabled the appliance default is the VTA, so
+        // an unmapped surface correctly resolves to it as well.
+        let local_surface = crate::config::agent_surface::AgentSurface {
+            surface_id: "live-local-surface".to_string(),
+            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Local),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut directory = crate::vta::key_directory::KeyDirectory::build(&config, Arc::clone(&local))
+            .await
+            .expect("rebuild with both mappings");
+        directory
+            .with_surface(&surface)
+            .expect("the VTA mapping installs");
+        directory
+            .with_surface(&local_surface)
+            .expect("the local mapping installs");
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        let via_local = issuer
+            .create_credential("did:example:local-agent", &fields, Some("live-local-surface"))
+            .await
+            .expect("the locally-mapped surface signs");
+        assert_eq!(
+            payload(&via_local)["issuer"],
+            local_did,
+            "a surface mapped to the local backend must sign with the gateway key"
+        );
+
+        let via_vta = issuer
+            .create_credential("did:example:live-agent", &fields, Some("live-mapped-surface"))
+            .await
+            .expect("the VTA-mapped surface still signs");
+        assert_ne!(
+            payload(&via_vta)["issuer"],
+            payload(&via_local)["issuer"],
+            "two surfaces on one gateway must be able to sign with different keys"
+        );
+
+        // The appliance-wide dashboard setting, end to end: with the local key
+        // as the `[vta]`-derived default, an override pointing at the live VTA
+        // must move an *unmapped* surface onto it. This is the path an
+        // operator takes in Settings, so it is worth proving against a real
+        // agent rather than a stub.
+        struct Override(crate::config::agent_surface::SurfaceSigningConfig);
+        impl crate::vta::key_directory::ApplianceSigningDefault for Override {
+            fn signing(&self) -> Option<crate::config::agent_surface::SurfaceSigningConfig> {
+                Some(self.0.clone())
+            }
+        }
+
+        let appliance_override = crate::config::agent_surface::SurfaceSigningConfig {
+            backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+            connection_id: None,
+            context_id: Some(context.clone()),
+            key_id: config.signing_key_id.clone(),
+        };
+        let directory = crate::vta::key_directory::KeyDirectory::build(&config, Arc::clone(&local))
+            .await
+            .expect("rebuild for the appliance override")
+            .with_appliance_default(Arc::new(Override(appliance_override)));
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        let unmapped = issuer
+            .create_credential("did:example:appliance-agent", &fields, Some("a-surface-that-maps-nothing"))
+            .await
+            .expect("the appliance override signs for an unmapped surface");
+        assert_ne!(
+            payload(&unmapped)["issuer"],
+            local_did,
+            "the dashboard override must move the whole appliance onto the trust agent"
+        );
+    }
+}
+
+/// The **connection-record** signing path, end to end against a live VTA.
+///
+/// Distinct from `live_tests`, which builds the directory from the `[vta]`
+/// block and therefore exercises the *bootstrap* connector. Production
+/// signing for a dashboard-created agent goes through the **registry**, and
+/// that path carried two bugs this module exists to stop recurring: the
+/// connector was built with the connection's context as its key id, and a
+/// surface's `key_id` was discarded. Both produced a working-looking gateway
+/// that signed with the wrong key or refused entirely.
+///
+/// ```sh
+/// VTA_LIVE_URL=http://127.0.0.1:3000 \
+/// VTA_LIVE_DID=did:webvh:<scid>:localhost%3A3000 \
+/// VTA_LIVE_PARENT_CONTEXT=<the granted context> \
+///   cargo test --bin agent-trust-gateway \
+///     identity::vc_issuer::live_connection_tests \
+///     -- --ignored --nocapture --test-threads=1
+/// ```
+#[cfg(test)]
+mod live_connection_tests {
+    use super::*;
+    use crate::vta::connections::{
+        FileSystemVtaConnectionStore, SigningKey, SigningKeys, VtaConnection, VtaConnectionStatus,
+        VtaConnectionStorage, VtaConnectionTransport,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    /// The seed the other live suites authenticate with, so one ACL grant
+    /// covers them all.
+    const LIVE_SEED: [u8; 32] = [0x2a; 32];
+    const CONTROL_SECRET_ID: &str = "vta-control-key-live";
+
+    fn env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("set {name}; see the module docs"))
+    }
+
+    fn payload(jwt: &str) -> serde_json::Value {
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(
+                jwt.split('.')
+                    .nth(1)
+                    .expect("a JWT has three parts"),
+            )
+            .expect("base64url payload");
+        serde_json::from_slice(&raw).expect("JSON payload")
+    }
+
+    fn header(jwt: &str) -> serde_json::Value {
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(
+                jwt.split('.')
+                    .next()
+                    .expect("a JWT has three parts"),
+            )
+            .expect("base64url header");
+        serde_json::from_slice(&raw).expect("JSON header")
+    }
+
+    /// Mint a key in the granted context, returning its id.
+    async fn mint_key(client: &Arc<crate::vta::client::VtaRestClient>) -> String {
+        let key_id = format!("live-conn-{}", uuid::Uuid::new_v4());
+        let _: serde_json::Value = client
+            .dispatch_signed(
+                "https://trusttasks.org/spec/keys/create/0.1",
+                json!({
+                    "keyType": "ed25519",
+                    "keyId": key_id,
+                    "label": "live connection test",
+                    "internal": true,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "could not mint a key as {}.\n\
+                     Grant it first (stop the VTA, it holds a file lock):\n  \
+                     vta --config <cfg> acl create --did {} --role initiator \
+                     --contexts <context> --capabilities context-create,key-mint,sign\n\
+                     underlying error: {e}",
+                    control_did(),
+                    control_did(),
+                )
+            });
+        key_id
+    }
+
+    /// The DID the fixed test seed resolves to — the one that must be granted.
+    fn control_did() -> String {
+        use crate::vta::control_key::SignerKeyProvider;
+        crate::vta::control_key::ControlKey::from_seed(LIVE_SEED)
+            .did()
+            .to_string()
+    }
+
+    /// A surface mapped to a **stored connection** signs with the key that
+    /// connection holds, and the credential names the agent as issuer.
+    ///
+    /// This is the path a dashboard-created agent actually uses. It failed in
+    /// production while the `[vta]`-block test passed, because the connector
+    /// was built with `default_context_id` as its key id — the agent refused
+    /// with "key `<context>` is not within the caller's scope".
+    #[tokio::test]
+    #[ignore = "requires a running VTA; see the module docs"]
+    async fn a_surface_mapped_to_a_stored_connection_signs_with_its_key() {
+        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let vta_did = env("VTA_LIVE_DID");
+        let context = env("VTA_LIVE_PARENT_CONTEXT");
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // A client on the granted control key, used to mint the keys the
+        // connection will then be recorded as holding.
+        let control = Arc::new(crate::vta::control_key::ControlKey::from_seed(LIVE_SEED));
+        let client = Arc::new(
+            crate::vta::client::VtaRestClient::new(
+                &url,
+                &vta_did,
+                control,
+                std::time::Duration::from_secs(15),
+                8,
+                None,
+            )
+            .expect("build a live client"),
+        );
+        let active_key = mint_key(&client).await;
+        let other_key = mint_key(&client).await;
+
+        // The control key as the connection's secret, exactly as the pairing
+        // wizard stores it.
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                tmp.path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .expect("secrets store"),
+        );
+        secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "live control key".to_string(),
+                secret_id: CONTROL_SECRET_ID.to_string(),
+                description: None,
+                value: LIVE_SEED
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+                secret_type: "General".to_string(),
+                tags: vec!["vta".to_string()],
+            })
+            .await
+            .expect("store the control key");
+
+        let store = Arc::new(
+            FileSystemVtaConnectionStore::new(tmp.path().join("connections"))
+                .await
+                .expect("connection store"),
+        );
+        let now = chrono::Utc::now();
+        store
+            .create(VtaConnection {
+                id: "live-conn".to_string(),
+                tenant_id: None,
+                name: "Live agent".to_string(),
+                description: None,
+                enabled: true,
+                transport: VtaConnectionTransport::Https,
+                endpoint: url.clone(),
+                vta_did: vta_did.clone(),
+                default_context_id: Some(context.clone()),
+                control_key_ref: Some(CONTROL_SECRET_ID.to_string()),
+                status: VtaConnectionStatus::Connected,
+                keys: SigningKeys {
+                    active: Some(SigningKey {
+                        key_id: active_key.clone(),
+                        public_key: None,
+                        label: None,
+                        added_at: now,
+                        retired_at: None,
+                    }),
+                    retiring: Vec::new(),
+                },
+                pairing: crate::vta::pairing::PairingRecord {
+                    state: crate::vta::pairing::PairingState::Connected,
+                    pinned_vta_did: Some(vta_did.clone()),
+                    ..Default::default()
+                },
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("store the connection");
+
+        let registry = Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+            store,
+            Some(Arc::clone(&secrets)),
+            None,
+            None,
+            std::time::Duration::from_secs(15),
+            8,
+        ));
+
+        let (issuer, _issuer_tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let local_did = issuer
+            .get_issuer_did()
+            .await
+            .expect("local issuer DID");
+        let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+            Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
+
+        // `[vta]` disabled: everything must come from the connection record,
+        // which is the shape a dashboard-only deployment has.
+        let mut directory =
+            crate::vta::key_directory::KeyDirectory::build(&crate::config::vta::VtaConfig::default(), local)
+                .await
+                .expect("a disabled [vta] block builds")
+                .with_connections(Arc::clone(&registry));
+
+        let surface = |id: &str, key: Option<&str>| crate::config::agent_surface::AgentSurface {
+            surface_id: id.to_string(),
+            signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+                connection_id: Some("live-conn".to_string()),
+                context_id: Some(context.clone()),
+                key_id: key.map(str::to_string),
+            }),
+            ..Default::default()
+        };
+        directory
+            .with_surface(&surface("s-default", Some(&active_key)))
+            .expect("the default mapping installs");
+        directory
+            .with_surface(&surface("s-other", Some(&other_key)))
+            .expect("the second mapping installs");
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        let fields = HashMap::from([("name".to_string(), json!("live-conn"))]);
+
+        let first = issuer
+            .create_credential("did:example:live-a", &fields, Some("s-default"))
+            .await
+            .expect("the stored connection signs");
+        assert_eq!(
+            payload(&first)["issuer"],
+            vta_did,
+            "a connection-backed surface must be issued by the agent, not the gateway"
+        );
+        assert_ne!(payload(&first)["issuer"], local_did);
+        assert_eq!(header(&first)["kid"], active_key, "it must sign with the connection's key, never its context");
+
+        // The property the `key_id` fix exists for: a second surface on the
+        // *same* connection signs with a different key, so rotating or
+        // revoking one cannot affect the other.
+        let second = issuer
+            .create_credential("did:example:live-b", &fields, Some("s-other"))
+            .await
+            .expect("the second surface signs");
+        assert_eq!(
+            header(&second)["kid"],
+            other_key,
+            "a surface's key_id must be honoured, not replaced by the connection's active key"
+        );
+        assert_ne!(
+            header(&first)["kid"],
+            header(&second)["kid"],
+            "two surfaces on one connection must be able to use different keys"
+        );
+    }
+}
+
+/// Does a surface mapped to a trust agent actually reach it when the gateway
+/// injects a presentation?
+///
+/// Every layer of this was unit-tested and the answer was still no, three
+/// times over: the choice was not saved, the backend was believed unable to
+/// issue credentials, and the mapping was only read at startup. None of them
+/// failed — each quietly signed locally — so the only way to see it is to
+/// assert that the agent was *contacted*.
+#[cfg(test)]
+mod surface_injection_tests {
+    use super::*;
+    use axum::{Json as AxumJson, Router, extract::State, routing::post};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct Recorder {
+        issue_calls: Arc<AtomicUsize>,
+        last_context: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    /// Minimal agent: authenticates anything, records credential issuance and
+    /// returns a credential shaped like the real `issue-in-context` reply.
+    async fn trust_tasks(
+        State(rec): State<Recorder>,
+        AxumJson(body): AxumJson<serde_json::Value>,
+    ) -> AxumJson<serde_json::Value> {
+        let type_uri = body
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if type_uri.contains("auth/challenge") {
+            return AxumJson(json!({ "challenge": "c", "sessionId": "s" }));
+        }
+        if type_uri.contains("auth/authenticate") {
+            return AxumJson(json!({
+                "session": { "id": "s", "subject": body["issuer"] },
+                "tokens": { "accessToken": "tok", "tokenType": "Bearer", "expiresIn": 3600 }
+            }));
+        }
+        if type_uri.contains("contexts/get") {
+            // Already identified, so the issuer does not try to give it one.
+            return AxumJson(json!({
+                "context": { "id": "ctx-a", "did": "did:key:zCtx", "issuerKeyId": "ctx-a-issuer",
+                             "designatedPurposes": ["assertionMethod"] }
+            }));
+        }
+        if type_uri.contains("credentials/issue-in-context") {
+            rec.issue_calls
+                .fetch_add(1, Ordering::SeqCst);
+            *rec.last_context
+                .lock()
+                .unwrap() = body["payload"]["contextId"]
+                .as_str()
+                .map(str::to_owned);
+            return AxumJson(json!({
+                "credentialId": "urn:uuid:1",
+                "credential": {
+                    "@context": ["https://www.w3.org/2018/credentials/v1"],
+                    "type": ["VerifiableCredential"],
+                    "issuer": "did:key:zCtx",
+                    "credentialSubject": { "id": body["payload"]["holder"] },
+                    "proof": { "type": "DataIntegrityProof", "verificationMethod": "did:key:zCtx#zCtx" }
+                },
+                "verificationMethod": "did:key:zCtx#zCtx"
+            }));
+        }
+        AxumJson(json!({ "ok": true }))
+    }
+
+    async fn spawn_agent() -> (String, Recorder) {
+        let rec = Recorder {
+            issue_calls: Arc::new(AtomicUsize::new(0)),
+            last_context: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let app = Router::new()
+            .route("/trust-tasks", post(trust_tasks))
+            .with_state(rec.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}"), rec)
+    }
+
+    /// The whole chain, as the proxy drives it: a surface that names an agent
+    /// must have that agent issue the credential embedded in the presentation
+    /// it forwards.
+    #[tokio::test]
+    async fn a_surface_mapped_to_an_agent_has_it_issue_the_embedded_credential() {
+        let (agent_url, recorder) = spawn_agent().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // The control key the connection authenticates with.
+        let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                tmp.path()
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .expect("secrets store"),
+        );
+        secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "control".to_string(),
+                secret_id: "ctl".to_string(),
+                description: None,
+                value: [0x2a_u8; 32]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+                secret_type: "General".to_string(),
+                tags: vec!["vta".to_string()],
+            })
+            .await
+            .expect("store the control key");
+
+        let connections = Arc::new(
+            crate::vta::connections::FileSystemVtaConnectionStore::new(tmp.path().join("conns"))
+                .await
+                .expect("connection store"),
+        );
+        let now = chrono::Utc::now();
+        crate::vta::connections::VtaConnectionStorage::create(
+            connections.as_ref(),
+            crate::vta::connections::VtaConnection {
+                id: "vta-a".to_string(),
+                tenant_id: None,
+                name: "Agent".to_string(),
+                description: None,
+                enabled: true,
+                transport: crate::vta::connections::VtaConnectionTransport::Https,
+                endpoint: agent_url.clone(),
+                vta_did: "did:webvh:agent.example".to_string(),
+                default_context_id: Some("ctx-a".to_string()),
+                control_key_ref: Some("ctl".to_string()),
+                status: crate::vta::connections::VtaConnectionStatus::Connected,
+                keys: Default::default(),
+                pairing: crate::vta::pairing::PairingRecord {
+                    state: crate::vta::pairing::PairingState::Connected,
+                    pinned_vta_did: Some("did:webvh:agent.example".to_string()),
+                    ..Default::default()
+                },
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("store the connection");
+
+        // The surface, saved **after** the directory is built — the shape an
+        // operator creates one in.
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(tmp.path().join("surfaces"))
+                .await
+                .expect("surface store"),
+        ) as Arc<dyn crate::surfaces::AgentSurfaceStore>;
+
+        let (issuer, _issuer_tmp) = crate::identity::test_helpers::test_vc_issuer().await;
+        let issuer = Arc::new(issuer);
+        let local: Arc<dyn crate::identity::authority::CredentialAuthority> =
+            Arc::new(crate::identity::authority::LocalCredentialAuthority::new(Arc::clone(&issuer)));
+        let registry = Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+            connections,
+            Some(Arc::clone(&secrets)),
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+            4,
+        ));
+        let directory =
+            crate::vta::key_directory::KeyDirectory::build(&crate::config::vta::VtaConfig::default(), local)
+                .await
+                .expect("a disabled [vta] block builds")
+                .with_connections(registry)
+                .with_surface_store(Arc::clone(&surfaces));
+        issuer
+            .set_key_directory(Arc::new(directory))
+            .await;
+
+        crate::surfaces::AgentSurfaceStore::save(
+            surfaces.as_ref(),
+            &crate::config::agent_surface::AgentSurface {
+                surface_id: "surface-1".to_string(),
+                signing: Some(crate::config::agent_surface::SurfaceSigningConfig {
+                    backend: Some(crate::config::agent_surface::SigningBackendKind::Vta),
+                    connection_id: Some("vta-a".to_string()),
+                    context_id: Some("ctx-a".to_string()),
+                    key_id: Some("gateway-jwt-1".to_string()),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("save the surface");
+
+        // Onboard an agent, so the presentation has a holder whose key
+        // the gateway can find. Counted separately: this step issues a
+        // credential too, and the assertion below is about the injection.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("sub".to_string(), serde_json::json!("alice"));
+        let onboarded = issuer
+            .issue_or_get_credential(fields.clone(), None, None, None)
+            .await
+            .expect("onboard an agent");
+        let agent_did = onboarded.did;
+        recorder
+            .issue_calls
+            .store(0, Ordering::SeqCst);
+        let outcome = issuer
+            .create_agent_identity_presentation_with_binding(&agent_did, &fields, None, None, None, Some("surface-1"))
+            .await;
+        // The outcome is deliberately not asserted: this mock returns a
+        // skeleton credential, not one rich enough to assemble a presentation
+        // from. What is being proved is that the surface's agent was *asked* —
+        // every bug behind this symptom silently signed locally instead, and
+        // produced a perfectly valid presentation while doing so.
+        let _ = outcome;
+
+        assert_eq!(
+            recorder
+                .issue_calls
+                .load(Ordering::SeqCst),
+            1,
+            "the surface's agent must issue the embedded credential; 0 means the \
+             gateway signed locally and the agent never saw the request"
+        );
+        assert_eq!(
+            recorder
+                .last_context
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("ctx-a"),
+            "issued in the surface's own context"
+        );
     }
 }

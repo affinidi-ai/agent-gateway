@@ -112,6 +112,19 @@ struct Parsed {
 /// Build an attestation for our own gateway: `iss` is the gateway DID, `sub`
 /// the Connection Point DID we send from, `aud` the peer we answer, `nonce`
 /// the peer's challenge.
+///
+/// The DID and the signature must come from the **same party**, because
+/// `check_signature` resolves `iss` and requires the signing key to be declared
+/// in that DID's document. That rules out the ordinary signing authority, which
+/// claims the trust agent's DID while signing with a key held in the gateway's
+/// context — a key that document does not declare. (STS tokens survive the same
+/// split only because they verify through the published JWKS instead.)
+///
+/// So when a context signer is wired, this attests as the **context** itself: a
+/// `did:key` that declares exactly the key signing it, by construction. That is
+/// also the DID issuing the credentials peers will receive, which is the
+/// property the attestation exists to establish. Absent one, it falls back to
+/// the gateway DID and local key — unchanged pre-VTA behaviour.
 pub async fn build_issuer_attestation(
     vc_issuer: &VCIssuer,
     sub_connection_point_did: &str,
@@ -120,14 +133,14 @@ pub async fn build_issuer_attestation(
 ) -> anyhow::Result<String> {
     let claims = IssuerAttestationClaims::new(
         vc_issuer
-            .get_issuer_did()
+            .attestation_issuer_did()
             .await?,
         sub_connection_point_did,
         aud,
         nonce,
     );
     vc_issuer
-        .sign_jwt_with_gateway_key_typ(&serde_json::to_value(&claims)?, ISSUER_ATTESTATION_TYP)
+        .sign_attestation_typ(&serde_json::to_value(&claims)?, ISSUER_ATTESTATION_TYP)
         .await
 }
 
@@ -174,6 +187,98 @@ pub fn verify_issuer_attestation_with_document(
     let parsed = parse(jwt)?;
     check_claims(&parsed, expected, chrono::Utc::now().timestamp())?;
     check_signature(&parsed, issuer_did_document)
+}
+
+#[cfg(test)]
+mod attestation_identity_tests {
+    use super::*;
+    use crate::identity::test_helpers::{MockIdentityStore, MockVpChallengeStore};
+    use crate::identity::{IdentityStore, VpChallengeStore};
+    use crate::vta::context_signer::ContextSigner;
+    use std::sync::Arc;
+
+    struct StubContext;
+
+    #[async_trait::async_trait]
+    impl ContextSigner for StubContext {
+        async fn issuer_did(&self) -> anyhow::Result<String> {
+            Ok("did:key:zContextIssuer".to_string())
+        }
+
+        async fn sign_typ(
+            &self,
+            _claims: &serde_json::Value,
+            _typ: &str,
+        ) -> anyhow::Result<String> {
+            // Only the claims matter here; a real signature needs a VTA and is
+            // covered by the live test.
+            Ok("stub.stub.stub".to_string())
+        }
+    }
+
+    async fn issuer() -> (tempfile::TempDir, VCIssuer) {
+        // `VCIssuer::new` resolves DIDs while setting up its own identity.
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .expect("resolver");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity_store = Arc::new(MockIdentityStore::new()) as Arc<dyn IdentityStore>;
+        let vp_challenge_store = Arc::new(MockVpChallengeStore::new()) as Arc<dyn VpChallengeStore>;
+        let issuer = VCIssuer::new(dir.path(), "example.com", identity_store, vp_challenge_store, None, None)
+            .await
+            .expect("issuer");
+        (dir, issuer)
+    }
+
+    /// The attestation must claim the **context** DID once a context signer is
+    /// wired, never the gateway's own.
+    ///
+    /// This is load-bearing beyond the attestation itself. The gateway's
+    /// `proxy_did` is still updatable by a key on this host, and that is only
+    /// tolerable because nothing resolves that DID to make a trust decision
+    /// any more. This attestation was the last thing that did. If it ever
+    /// reverts to claiming `proxy_did`, the update key becomes dangerous again
+    /// — so the property is asserted rather than left to a comment.
+    #[tokio::test]
+    async fn an_attestation_claims_the_context_did_not_the_gateway_did() {
+        let (_dir, issuer) = issuer().await;
+        let gateway_did = issuer
+            .get_issuer_did()
+            .await
+            .expect("gateway did");
+
+        issuer
+            .set_attestation_signer(Arc::new(StubContext))
+            .await;
+
+        let claimed = issuer
+            .attestation_issuer_did()
+            .await
+            .expect("attestation issuer");
+        assert_eq!(claimed, "did:key:zContextIssuer");
+        assert_ne!(
+            claimed, gateway_did,
+            "claiming the gateway DID would re-arm the update key this design relies on being inert"
+        );
+    }
+
+    /// Without a context signer the behaviour is unchanged — a gateway with no
+    /// trust agent must keep working exactly as before.
+    #[tokio::test]
+    async fn without_a_context_signer_the_gateway_did_is_claimed_as_before() {
+        let (_dir, issuer) = issuer().await;
+        let gateway_did = issuer
+            .get_issuer_did()
+            .await
+            .expect("gateway did");
+        assert_eq!(
+            issuer
+                .attestation_issuer_did()
+                .await
+                .expect("attestation issuer"),
+            gateway_did
+        );
+    }
 }
 
 fn parse(jwt: &str) -> Result<Parsed, IssuerAttestationError> {

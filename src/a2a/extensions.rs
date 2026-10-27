@@ -252,7 +252,7 @@ pub async fn inject_identity_credential_extension(
 ) -> anyhow::Result<(bytes::Bytes, String)> {
     // Create VP containing VC signed by agent DID
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, None)
+        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, None, None)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -393,7 +393,7 @@ pub async fn inject_identity_credential_into_response(
     }
 
     let vp_jwt = vc_issuer
-        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, None)
+        .create_agent_identity_presentation_with_binding(agent_did, identity_fields, workload_binding, None, None, None)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;
 
@@ -770,6 +770,7 @@ pub async fn inject_vp_into_a2a_response(
             None,
             None,
             inbound_chained_vcs,
+            None,
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create identity presentation: {}", e))?;

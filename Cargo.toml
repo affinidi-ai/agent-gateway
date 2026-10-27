@@ -128,6 +128,15 @@ alloy-signer-local = "2.5"
 affinidi-messaging-didcomm = "0.15.9"
 affinidi-tdk-common = "0.6.11"
 affinidi-did-common = "0.4.3"
+# Verifies `eddsa-jcs-2022` Data-Integrity proofs, which `ssi` does not implement
+# at any released version (and does not implement upstream either). `ssi` keeps
+# every other suite — see `src/identity/ssi/di_jcs.rs`. Already in the tree via
+# `affinidi-tdk-common` and `didwebvh-rs`, so this pins nothing new.
+affinidi-data-integrity = "0.7.10"
+# Supplies the `KeyType` that `affinidi-data-integrity`'s resolver trait returns.
+# Must track the version *that* crate uses (0.5.x) — `did-peer` pulls an older
+# 0.4 in parallel, and the two `KeyType`s are different types.
+affinidi-secrets-resolver = "0.5.9"
 ssi = "0.16.0"
 ssi-json-ld = "0.3.3"
 ssi-claims-core = "0.2.0"

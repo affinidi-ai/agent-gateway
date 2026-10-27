@@ -148,6 +148,13 @@ impl Default for RbacConfig {
         permissions.insert("sts_clients.view".to_string(), "administrator".to_string());
         permissions.insert("sts_clients.edit".to_string(), "administrator".to_string());
         permissions.insert("sts_clients.delete".to_string(), "administrator".to_string());
+        // VTA Connections - Admin only (chooses which agent holds this appliance's signing keys)
+        permissions.insert("vta_connections.view".to_string(), "administrator".to_string());
+        permissions.insert("vta_connections.edit".to_string(), "administrator".to_string());
+        permissions.insert("vta_connections.delete".to_string(), "administrator".to_string());
+        // Key Management - Admin only (reveals which key signs what, and rotates it)
+        permissions.insert("key_management.view".to_string(), "administrator".to_string());
+        permissions.insert("key_management.edit".to_string(), "administrator".to_string());
         // Terms Management - Admin only
         permissions.insert("terms.view".to_string(), "administrator".to_string());
         permissions.insert("terms.edit".to_string(), "administrator".to_string());
@@ -286,6 +293,15 @@ pub enum Feature {
     StsClientsEdit,
     StsClientsDelete,
 
+    // VTA connections (which Verifiable Trust Agent signs for this appliance)
+    VtaConnectionsView,
+    VtaConnectionsEdit,
+    VtaConnectionsDelete,
+
+    // Key management (signing-key inventory, surface mapping, rotation)
+    KeyManagementView,
+    KeyManagementEdit,
+
     // Storage Backup / Restore / Export - full-instance access
     StorageAdmin,
 
@@ -384,6 +400,11 @@ impl Feature {
             Feature::StsClientsView => "sts_clients.view",
             Feature::StsClientsEdit => "sts_clients.edit",
             Feature::StsClientsDelete => "sts_clients.delete",
+            Feature::VtaConnectionsView => "vta_connections.view",
+            Feature::VtaConnectionsEdit => "vta_connections.edit",
+            Feature::VtaConnectionsDelete => "vta_connections.delete",
+            Feature::KeyManagementView => "key_management.view",
+            Feature::KeyManagementEdit => "key_management.edit",
             Feature::StorageAdmin => "storage.admin",
             Feature::PoliciesView => "policies.view",
             Feature::PoliciesEdit => "policies.edit",

@@ -165,6 +165,12 @@ pub struct SurfaceOverrides {
     /// reads this field; it round-trips verbatim for the dashboard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canvas: Option<serde_json::Value>,
+
+    /// Per-variant signing override (VTA-19). Absent — the common case —
+    /// **inherits** the surface's signing config, so a variant only gets its
+    /// own context when an operator deliberately asks for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
 }
 
 impl SurfaceOverrides {
@@ -180,6 +186,7 @@ impl SurfaceOverrides {
                 .outbound_credentials
                 .is_none()
             && self.canvas.is_none()
+            && self.signing.is_none()
     }
 }
 
@@ -782,6 +789,12 @@ impl AgentSurface {
         if let Some(canvas) = overrides.canvas {
             resolved.canvas = Some(canvas);
         }
+        // Signing follows the same sparse-delta rule as everything else: a
+        // variant without an override inherits the surface's context rather
+        // than getting one of its own (VTA-19).
+        if let Some(signing) = overrides.signing {
+            resolved.signing = Some(signing);
+        }
 
         Ok(resolved)
     }
@@ -932,6 +945,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            signing: None,
         }
     }
 

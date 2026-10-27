@@ -8,6 +8,7 @@ import type {
 } from './types';
 import { getArchetype, ANY_EDGE_MW } from './edges/archetypes';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
+import { isSigningEmpty } from './types';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
 import { workloadBindingApiToForm } from './workload-binding/config';
 
@@ -235,6 +236,10 @@ class ElementRegistry {
       status: ctx.surfaceMeta.status ?? 'active',
       tags: ctx.surfaceMeta.tags,
       ...(ctx.surfaceMeta.issuer_id ? { issuer_id: ctx.surfaceMeta.issuer_id } : {}),
+      // Omitted entirely when nothing is set: an empty block and no block mean
+      // the same thing to the backend, and sending one would make a surface
+      // that inherits look configured.
+      ...(isSigningEmpty(ctx.surfaceMeta.signing) ? {} : { signing: ctx.surfaceMeta.signing }),
     };
 
     interface Pending {

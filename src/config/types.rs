@@ -2880,6 +2880,12 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub tenancy: crate::tenancy::TenancyConfig,
 
+    /// Verifiable Trust Agent (VTA) integration. Off by default; when enabled
+    /// the gateway delegates credential/token signing to a VTA instead of using
+    /// its local issuer key. Startup-only. See `src/config/vta.rs`.
+    #[serde(default)]
+    pub vta: crate::config::vta::VtaConfig,
+
     /// Directory the bootstrap config.toml was loaded from. Populated
     /// by `BootstrapConfig::from_file` and used by services that need
     /// to resolve sibling resource folders (e.g. the agent surface

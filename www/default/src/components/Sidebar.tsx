@@ -63,6 +63,13 @@ const Sidebar: React.FC = () => {
       permission: 'secrets.view' as const,
     },
     {
+      id: 'trust-agent',
+      label: 'Trust Agent',
+      icon: 'fa-robot',
+      path: '/trust-agent',
+      permission: 'vta_connections.view' as const,
+    },
+    {
       id: 'identities',
       label: 'Identity',
       icon: 'fa-users',

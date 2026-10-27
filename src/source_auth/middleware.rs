@@ -663,6 +663,8 @@ mod tests {
                 last_used_at,
             }],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id: Some(surface_id.to_string()),
             is_local,
             verified: true,

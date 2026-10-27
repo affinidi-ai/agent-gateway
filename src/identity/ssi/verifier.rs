@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use did_peer::resolve_did_peer;
 use serde_json::Value;
-use ssi::claims::data_integrity::{AnyDataIntegrity, AnySuite, Proofs};
+use ssi::claims::data_integrity::AnyDataIntegrity;
 use ssi::claims::vc::v2::syntax::{JsonCredential, JsonPresentation};
 use ssi::claims::{ProofValidationError, Verification, VerificationParameters};
 use ssi::dids::document::{self, representation::MediaType};
@@ -17,6 +17,11 @@ use ssi::verification_methods::AnyMethod;
 
 use super::context::create_signature_environment;
 use super::vp_issuer::VP_LIFETIME_MINUTES;
+
+/// The one cryptosuite `ssi` cannot parse, and the one the Verifiable Trust
+/// Agent produces. Its presence on a proof is what routes that proof to
+/// `affinidi-data-integrity` instead.
+const JCS_CRYPTOSUITE: &str = "eddsa-jcs-2022";
 
 #[allow(dead_code)]
 pub struct VcVerificationResult {
@@ -238,24 +243,111 @@ fn check_revocation_status(vc: &Value) -> Result<()> {
     Ok(())
 }
 
-fn ensure_proofs_controlled_by(
-    proofs: &Proofs<AnySuite>,
-    expected_did: &str,
-    role: &str,
-) -> Result<()> {
+/// The proofs on a document, as raw JSON.
+///
+/// `proof` may be a single object or an array; both are normalised here so
+/// every caller sees the same shape. An absent or empty `proof` is an error:
+/// an unsigned document must never reach a verification decision.
+fn proofs_of(
+    document: &Value,
+    what: &str,
+) -> Result<Vec<Value>> {
+    let proofs = match document.get("proof") {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::Object(_)) => vec![document["proof"].clone()],
+        Some(_) => anyhow::bail!("{} proof must be an object or an array", what),
+        None => anyhow::bail!("{} has no proof", what),
+    };
     if proofs.is_empty() {
-        anyhow::bail!("has no proof");
+        anyhow::bail!("{} has no proof", what);
     }
-    for proof in proofs.iter() {
-        let vm = proof.verification_method.id();
-        let did = DIDURL::new(vm.as_str())
-            .map_err(|e| anyhow::anyhow!("invalid proof verificationMethod {}: {}", vm, e))?
-            .did();
-        if did.as_str() != expected_did {
-            anyhow::bail!("proof verificationMethod {} does not belong to {} {}", vm, role, expected_did);
+    Ok(proofs)
+}
+
+/// The DID that controls a proof, taken from its `verificationMethod`.
+fn proof_controller(proof: &Value) -> Result<String> {
+    let vm = proof
+        .get("verificationMethod")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("proof has no verificationMethod"))?;
+    let did = DIDURL::new(vm.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid proof verificationMethod {}", vm))?
+        .did()
+        .to_string();
+    Ok(did)
+}
+
+/// `document` with its `proof` member removed.
+///
+/// Both cryptosuites hash the document *without* its proof, so this is what
+/// either verifier must be handed.
+fn without_proof(document: &Value) -> Value {
+    let mut unsigned = document.clone();
+    if let Some(obj) = unsigned.as_object_mut() {
+        obj.remove("proof");
+    }
+    unsigned
+}
+
+/// Check every proof on `document` against `expected_controller`, and verify
+/// any `eddsa-jcs-2022` proofs. Returns whether the document carried one.
+///
+/// This is the **only** place the binding decision is made, for every
+/// cryptosuite. That the proof's `verificationMethod` must be a method of the
+/// DID the document claims is the gateway's own invariant — `ssi` does not
+/// enforce it — so keeping it here, on raw JSON, means it holds identically
+/// whichever library checks the signature.
+///
+/// Signature checking is the only thing that dispatches by suite:
+/// - `eddsa-jcs-2022` → `affinidi-data-integrity`, here, because `ssi`
+///   implements no JCS cryptosuite at any released version.
+/// - everything else → `ssi` at the call site, which owns `eddsa-rdfc-2022` and
+///   the legacy suites and whose JSON-LD loader carries this gateway's own
+///   contexts.
+///
+/// Returning `true` tells the caller to **skip** the `ssi` pass: `ssi` cannot
+/// parse the JCS suite and would reject the document for the wrong reason. The
+/// signature has already been checked here, and the bindings for every proof
+/// on the document were checked above regardless.
+async fn check_bindings_and_jcs_proofs(
+    document: &Value,
+    expected_controller: &str,
+    role: &str,
+    what: &str,
+    did_cache: &Arc<DIDCacheClient>,
+) -> Result<bool> {
+    let proofs = proofs_of(document, what)?;
+    let unsigned = without_proof(document);
+    let mut any_jcs = false;
+
+    for proof in &proofs {
+        let controller = proof_controller(proof).with_context(|| format!("{} proof binding failed", what))?;
+        if controller != expected_controller {
+            anyhow::bail!(
+                "{}: proof verificationMethod {} does not belong to {} {}",
+                what,
+                proof
+                    .get("verificationMethod")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<none>"),
+                role,
+                expected_controller
+            );
+        }
+
+        if proof
+            .get("cryptosuite")
+            .and_then(|c| c.as_str())
+            == Some(JCS_CRYPTOSUITE)
+        {
+            any_jcs = true;
+            super::di_jcs::verify_jcs_proof(&unsigned, proof, did_cache.clone())
+                .await
+                .with_context(|| format!("{} verification failed", what))?;
         }
     }
-    Ok(())
+
+    Ok(any_jcs)
 }
 
 fn ensure_verified(
@@ -364,34 +456,51 @@ impl Verifier for LocalVerifier {
         let env = create_signature_environment(None).await?;
         let params = VerificationParameters::from_resolver(vm_resolver).with_json_ld_loader(env.json_ld_loader);
 
-        let vp: AnyDataIntegrity<JsonPresentation<AnyDataIntegrity<JsonCredential>>> =
-            serde_json::from_value(presentation.clone())
+        // The VP's bindings are checked on raw JSON, and a JCS holder proof is
+        // verified there too. Only when it carries none is the `ssi` pass run —
+        // and the typed parse that pass needs is deferred until then, because
+        // `ssi` cannot deserialize a JCS proof and would fail on the shape
+        // rather than on the signature.
+        let vp_has_jcs =
+            check_bindings_and_jcs_proofs(presentation, &holder_did, "holder", "VP", &self.did_cache).await?;
+
+        if !vp_has_jcs {
+            // Credentials are parsed as raw values, not as `AnyDataIntegrity`.
+            // During the migration a presentation legitimately mixes suites —
+            // VTA-signed JCS credentials inside a gateway-signed RDFC
+            // presentation — and typing them here would reject the whole VP
+            // because of one credential `ssi` has no suite for.
+            let vp: AnyDataIntegrity<JsonPresentation<Value>> = serde_json::from_value(presentation.clone())
                 .context("Failed to parse VP as Data Integrity presentation")?;
-
-        let typed_vcs = &vp
-            .claims
-            .verifiable_credentials;
-        anyhow::ensure!(
-            typed_vcs.len() == vcs.len(),
-            "VP credential count mismatch: {} parsed vs {} raw",
-            typed_vcs.len(),
-            vcs.len()
-        );
-
-        ensure_proofs_controlled_by(&vp.proofs, &holder_did, "holder").context("VP proof binding failed")?;
-        ensure_verified(vp.verify(&params).await, "VP")?;
+            anyhow::ensure!(
+                vp.claims
+                    .verifiable_credentials
+                    .len()
+                    == vcs.len(),
+                "VP credential count mismatch: {} parsed vs {} raw",
+                vp.claims
+                    .verifiable_credentials
+                    .len(),
+                vcs.len()
+            );
+            ensure_verified(vp.verify(&params).await, "VP")?;
+        }
 
         let mut credentials = Vec::with_capacity(vcs.len());
-        for (i, (vc_json, vc)) in vcs
-            .iter()
-            .zip(typed_vcs)
-            .enumerate()
-        {
+        for (i, vc_json) in vcs.iter().enumerate() {
+            let what = format!("VC[{}]", i);
             let vc_result =
-                verify_vc_fields(vc_json, &holder_did).with_context(|| format!("VC[{}] validation failed", i))?;
-            ensure_proofs_controlled_by(&vc.proofs, &vc_result.issuer_did, "issuer")
-                .with_context(|| format!("VC[{}] proof binding failed", i))?;
-            ensure_verified(vc.verify(&params).await, &format!("VC[{}]", i))?;
+                verify_vc_fields(vc_json, &holder_did).with_context(|| format!("{} validation failed", what))?;
+
+            let vc_has_jcs =
+                check_bindings_and_jcs_proofs(vc_json, &vc_result.issuer_did, "issuer", &what, &self.did_cache).await?;
+
+            if !vc_has_jcs {
+                let vc: AnyDataIntegrity<JsonCredential> = serde_json::from_value((*vc_json).clone())
+                    .with_context(|| format!("{} is not a Data Integrity credential", what))?;
+                ensure_verified(vc.verify(&params).await, &what)?;
+            }
+
             credentials.push(vc_result);
         }
 
@@ -501,7 +610,7 @@ mod tests {
     ) -> Value {
         LocalVpIssuer::new(Arc::new(LocalVpSigner::new()))
             .issue(VpIssuerPayload::Credentials(Credentials {
-                holder_key: Cow::Borrowed(holder_key),
+                holder_key: Some(Cow::Borrowed(holder_key)),
                 holder_did: Cow::Borrowed(holder_did),
                 verifiable_credentials: Cow::Owned(vcs),
                 challenge: None,
@@ -714,7 +823,7 @@ mod tests {
             .unwrap();
         let vp = LocalVpIssuer::new(Arc::new(LocalVpSigner::new()))
             .issue(VpIssuerPayload::Credentials(Credentials {
-                holder_key: Cow::Owned(holder_key),
+                holder_key: Some(Cow::Owned(holder_key)),
                 holder_did: Cow::Borrowed(&holder_did),
                 verifiable_credentials: Cow::Owned(vec![vc]),
                 challenge: None,
@@ -870,5 +979,252 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // ─── `eddsa-jcs-2022` (the suite the Verifiable Trust Agent produces) ───
+    //
+    // `ssi` implements no JCS cryptosuite, so these credentials are signed with
+    // `affinidi-data-integrity` — the same crate the VTA signs with — and must
+    // be verified through the dispatch in `check_bindings_and_jcs_proofs`.
+
+    /// Sign `credential` with an `eddsa-jcs-2022` proof as `did:key` holder of
+    /// `key`, the way the VTA's context-scoped issue task does.
+    async fn sign_jcs(
+        mut credential: Value,
+        key: &ed25519_dalek::SigningKey,
+        issuer_did: &str,
+        verification_method: &str,
+        proof_purpose: &str,
+    ) -> Value {
+        use affinidi_data_integrity::crypto_suites::CryptoSuite;
+        use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+        use affinidi_secrets_resolver::secrets::Secret;
+
+        credential
+            .as_object_mut()
+            .expect("credential is an object")
+            .insert("issuer".into(), json!(issuer_did));
+
+        let mut private = vec![0x80, 0x26];
+        private.extend_from_slice(&key.to_bytes());
+        let mut secret = Secret::from_multibase(&multibase::encode(multibase::Base::Base58Btc, &private), None)
+            .expect("secret from multibase");
+        secret.id = verification_method.to_string();
+
+        let proof = DataIntegrityProof::sign(
+            &credential,
+            &secret,
+            SignOptions::new()
+                .with_proof_purpose(proof_purpose)
+                .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+        )
+        .await
+        .expect("JCS signing should succeed");
+
+        credential
+            .as_object_mut()
+            .unwrap()
+            .insert("proof".into(), serde_json::to_value(&proof).expect("proof serialises"));
+        credential
+    }
+
+    /// A `did:key` identity: the signing key, the DID, and its verification
+    /// method — which for `did:key` is `<did>#<multibase>`.
+    fn did_key_identity() -> (ed25519_dalek::SigningKey, String, String) {
+        // Seeded from UUIDs rather than an RNG: two `rand` majors are in the
+        // tree and `ed25519-dalek` accepts only one of them. Test keys need to
+        // differ between calls, not to be cryptographically sourced.
+        let mut seed = [0u8; 32];
+        seed[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        seed[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let mut multicodec = vec![0xed, 0x01];
+        multicodec.extend_from_slice(key.verifying_key().as_bytes());
+        let multibase = multibase::encode(multibase::Base::Base58Btc, &multicodec);
+        let did = format!("did:key:{multibase}");
+        let vm = format!("{did}#{multibase}");
+        (key, did, vm)
+    }
+
+    fn unsigned_agent_vc(
+        subject_did: &str,
+        issuer_did: &str,
+    ) -> Value {
+        json!({
+            "@context": [
+                "https://www.w3.org/ns/credentials/v2",
+                crate::identity::ssi::context::CTX_AGENT_IDENTITY_V1_URL,
+            ],
+            "type": ["VerifiableCredential", "AgentIdentityCredential"],
+            "issuer": issuer_did,
+            "validFrom": chrono::Utc::now().to_rfc3339(),
+            "validUntil": (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+            "credentialSubject": { "id": subject_did, "identityFields": { "region": "eu" } },
+            "id": "urn:uuid:1c5d0000-0000-4000-8000-00000000f00d",
+        })
+    }
+
+    /// The shape VTA-11b produces: a VTA-signed `eddsa-jcs-2022` credential
+    /// inside a gateway-signed `eddsa-rdfc-2022` presentation. Both suites must
+    /// verify in one pass.
+    #[tokio::test]
+    async fn verifies_a_jcs_credential_inside_an_rdfc_presentation() {
+        let f = fixture().await;
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+
+        let vc = sign_jcs(
+            unsigned_agent_vc(&f.holder_did, &issuer_did),
+            &issuer_key,
+            &issuer_did,
+            &issuer_vm,
+            "assertionMethod",
+        )
+        .await;
+        let vp = present(&f.holder_key, &f.holder_did, vec![vc]).await;
+
+        let result = verify(&f, &vp)
+            .await
+            .expect("a JCS credential in an RDFC presentation must verify");
+
+        assert_eq!(result.credentials.len(), 1);
+        assert_eq!(result.credentials[0].issuer_did, issuer_did);
+        assert_eq!(result.credentials[0].subject_did, f.holder_did);
+        assert_eq!(result.credentials[0].identity_fields["region"], json!("eu"));
+    }
+
+    /// The custom `AgentIdentityCredential` context is exactly what
+    /// `affinidi-data-integrity`'s RDFC path cannot expand. JCS does no
+    /// expansion, so it must verify regardless — this pins that.
+    #[tokio::test]
+    async fn a_jcs_credential_verifies_despite_the_custom_jsonld_context() {
+        let f = fixture().await;
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+        let vc = unsigned_agent_vc(&f.holder_did, &issuer_did);
+        assert_eq!(
+            vc["@context"][1],
+            json!(crate::identity::ssi::context::CTX_AGENT_IDENTITY_V1_URL),
+            "this test is meaningless unless the custom context is present"
+        );
+
+        let vc = sign_jcs(vc, &issuer_key, &issuer_did, &issuer_vm, "assertionMethod").await;
+        let vp = present(&f.holder_key, &f.holder_did, vec![vc]).await;
+
+        verify(&f, &vp)
+            .await
+            .expect("JCS needs no JSON-LD expansion, so the custom context is irrelevant");
+    }
+
+    /// The gateway's own invariant — a proof key must belong to the issuer —
+    /// is enforced for JCS exactly as it is for RDFC. This is the check that
+    /// must never differ between the two paths.
+    #[tokio::test]
+    async fn rejects_a_jcs_credential_whose_proof_key_is_not_the_issuer() {
+        let f = fixture().await;
+        let (attacker_key, _attacker_did, attacker_vm) = did_key_identity();
+        let (_, claimed_issuer, _) = did_key_identity();
+
+        // Signed by the attacker's key, but claiming someone else as issuer.
+        let vc = sign_jcs(
+            unsigned_agent_vc(&f.holder_did, &claimed_issuer),
+            &attacker_key,
+            &claimed_issuer,
+            &attacker_vm,
+            "assertionMethod",
+        )
+        .await;
+        let vp = present(&f.holder_key, &f.holder_did, vec![vc]).await;
+
+        let err = verify(&f, &vp)
+            .await
+            .err()
+            .expect("a JCS proof key that is not the issuer's must be rejected");
+        assert!(err.contains("does not belong to issuer"), "{err}");
+    }
+
+    /// A tampered JCS credential must fail the signature check, not slip
+    /// through because the binding check passed.
+    #[tokio::test]
+    async fn rejects_a_jcs_credential_mutated_after_issuance() {
+        let f = fixture().await;
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+        let mut vc = sign_jcs(
+            unsigned_agent_vc(&f.holder_did, &issuer_did),
+            &issuer_key,
+            &issuer_did,
+            &issuer_vm,
+            "assertionMethod",
+        )
+        .await;
+
+        vc["credentialSubject"]["identityFields"]["region"] = json!("us");
+        let vp = present(&f.holder_key, &f.holder_did, vec![vc]).await;
+
+        let err = verify(&f, &vp)
+            .await
+            .err()
+            .expect("a mutated JCS credential must fail verification");
+        assert!(err.contains("verification failed") || err.contains("InvalidSignature"), "{err}");
+    }
+
+    /// A JCS presentation is the VTA-12 shape — the holder proof moves to the
+    /// VTA too. The dispatch must handle it at the VP level, not just for
+    /// embedded credentials.
+    #[tokio::test]
+    async fn verifies_a_jcs_presentation() {
+        let f = fixture().await;
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+        let (holder_key, holder_did, holder_vm) = did_key_identity();
+
+        let vc = sign_jcs(
+            unsigned_agent_vc(&holder_did, &issuer_did),
+            &issuer_key,
+            &issuer_did,
+            &issuer_vm,
+            "assertionMethod",
+        )
+        .await;
+
+        let unsigned_vp = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2"],
+            "type": ["VerifiablePresentation"],
+            "holder": holder_did,
+            "verifiableCredential": [vc],
+            "id": "urn:uuid:7a7a0000-0000-4000-8000-000000000002",
+        });
+        let vp = sign_jcs(unsigned_vp, &holder_key, &holder_did, &holder_vm, "authentication").await;
+
+        let result = verify(&f, &vp)
+            .await
+            .expect("an all-JCS presentation must verify");
+        assert_eq!(result.holder_did, holder_did);
+        assert_eq!(result.credentials[0].issuer_did, issuer_did);
+    }
+
+    /// An unsigned document must never reach a verification decision, whichever
+    /// suite is in play.
+    #[tokio::test]
+    async fn rejects_a_presentation_with_no_proof() {
+        let f = fixture().await;
+        let (issuer_key, issuer_did, issuer_vm) = did_key_identity();
+        let vc = sign_jcs(
+            unsigned_agent_vc(&f.holder_did, &issuer_did),
+            &issuer_key,
+            &issuer_did,
+            &issuer_vm,
+            "assertionMethod",
+        )
+        .await;
+        let vp = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2"],
+            "type": ["VerifiablePresentation"],
+            "holder": f.holder_did,
+            "verifiableCredential": [vc],
+        });
+
+        let err = verify(&f, &vp)
+            .await
+            .err()
+            .expect("an unsigned presentation must be rejected");
+        assert!(err.contains("has no proof"), "{err}");
     }
 }

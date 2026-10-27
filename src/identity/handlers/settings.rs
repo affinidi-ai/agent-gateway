@@ -134,6 +134,10 @@ pub struct UpdateSettingsRequest {
     pub log_timestamp_format: Option<String>,
     pub bucket_seconds: Option<u64>,
     pub feature_flags: Option<HashMap<String, bool>>,
+    /// Appliance-wide signing backend. An **empty** object clears it, returning
+    /// the appliance to whatever `[vta]` resolves, so the UI can offer "back to
+    /// default" without a second endpoint. Omitting the field leaves it alone.
+    pub default_signing: Option<crate::config::agent_surface::SurfaceSigningConfig>,
     pub prometheus_auth_enabled: Option<bool>,
     pub prometheus_auth_username: Option<String>,
     /// Plaintext password — hashed with bcrypt before storing.
@@ -188,6 +192,14 @@ pub async fn update_settings(
     }
     if let Some(flags) = req.feature_flags {
         settings.feature_flags = flags;
+    }
+    if let Some(signing) = req.default_signing {
+        if let Err(e) = signing.validate() {
+            return Err(AppError::BadRequest(format!("default_signing is not valid: {e}")));
+        }
+        // An empty block means "no appliance override", which is how the UI
+        // returns to the `[vta]`-resolved default.
+        settings.default_signing = (!signing.is_empty()).then_some(signing);
     }
     if let Some(enabled) = req.prometheus_auth_enabled {
         if enabled

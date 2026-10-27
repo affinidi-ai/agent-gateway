@@ -1086,6 +1086,22 @@ pub async fn serve_gateway_did_jsonl(State(state): State<crate::identity::state:
     serve_did_jsonl_file(&log_path).await
 }
 
+/// Handler for `GET /vta-auth/did.jsonl`
+///
+/// Serves the log of the `did:webvh` the gateway authenticates to its trust
+/// agent with. Unauthenticated on purpose — the trust agent resolves this on
+/// every authentication, and it would have nothing to authenticate *with*
+/// until it could.
+pub async fn serve_vta_auth_did_jsonl(State(state): State<crate::identity::state::IdentityApiState>) -> Response {
+    let dir = crate::vta::auth_did::auth_did_dir(
+        &state
+            .vc_issuer
+            .get_storage_path()
+            .await,
+    );
+    serve_did_jsonl_file(&dir.join("did.jsonl")).await
+}
+
 /// Handler for `GET /channel/{channel_id}/did.jsonl`
 ///
 /// Serves the per-agent verifiable DID log for the given channel UUID.
@@ -1194,6 +1210,8 @@ mod tests {
                 last_used_at: None,
                 channel_usage: vec![],
                 private_key: None,
+                vta_context_id: None,
+                vta_connection_id: None,
                 channel_config_id: None,
                 is_local: true,
                 verified: true,
@@ -1263,6 +1281,8 @@ mod tests {
                 last_used_at: None,
                 channel_usage: vec![],
                 private_key: None,
+                vta_context_id: None,
+                vta_connection_id: None,
                 channel_config_id: None,
                 is_local: true,
                 verified: true,
@@ -1307,6 +1327,8 @@ mod tests {
                 last_used_at: None,
                 channel_usage: vec![],
                 private_key: None,
+                vta_context_id: None,
+                vta_connection_id: None,
                 channel_config_id: None,
                 is_local: true,
                 verified: true,

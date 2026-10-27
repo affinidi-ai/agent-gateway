@@ -43,6 +43,12 @@ pub mod prom {
     pub const KMS_OPERATION_TOTAL: &str = "agent_gateway_kms_operation_total";
     pub const KMS_OPERATION_DURATION_SECONDS: &str = "agent_gateway_kms_operation_duration_seconds";
 
+    // VTA signing-connector Trust Task calls: outcomes, latency, and circuit trips.
+    pub const VTA_CALL_TOTAL: &str = "agent_trust_gateway_vta_call_total";
+    pub const VTA_CALL_DURATION_SECONDS: &str = "agent_trust_gateway_vta_call_duration_seconds";
+    pub const VTA_CIRCUIT_OPEN_TOTAL: &str = "agent_trust_gateway_vta_circuit_open_total";
+    pub const VTA_QUOTA_EXCEEDED_TOTAL: &str = "agent_trust_gateway_vta_quota_exceeded_total";
+
     // Fabric (gateway-to-gateway) forwarding received at a connection point
     pub const FABRIC_FORWARD_REQUESTS_RECEIVED_TOTAL: &str = "agent_gateway_fabric_forward_requests_received_total";
 

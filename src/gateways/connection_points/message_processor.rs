@@ -1902,8 +1902,17 @@ fn require_peer_issuer(
     if issuer_matches_peer(verified.issuer_did.as_deref(), peer_issuers) {
         Ok(verified)
     } else {
+        // Name the remedy, not just the mismatch. The overwhelmingly common
+        // cause is a peer that moved its issuer DID — to a trust agent, say —
+        // after this connection recorded the old one. The attested issuer is
+        // deliberately not settable through the API, so an operator who does
+        // not know about re-attestation sees every request from that peer fail
+        // with nothing pointing at the cure.
         anyhow::bail!(
-            "identity presentation issuer {:?} is not an issuer of the sending connection {peer_issuers}",
+            "identity presentation issuer {:?} is not an issuer of the sending connection \
+             {peer_issuers}; if the peer has moved its issuer DID, re-attest the connection \
+             (DELETE then POST /v1/gateways/{{id}}/issuer), or add the new issuer with \
+             POST /v1/gateways/{{id}}/trusted-issuers",
             verified.issuer_did
         )
     }

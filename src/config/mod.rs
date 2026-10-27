@@ -15,6 +15,7 @@ mod pepper_cache_config;
 mod proxy;
 pub mod rbac_config;
 pub mod types;
+pub mod vta;
 
 // Re-export all public types
 pub use encryption_config::*;

@@ -73,6 +73,7 @@ mod trust_registries;
 mod trust_registry_verification; // Trust Registry client and validation
 mod url_validation; // SSRF protection for user-supplied URLs
 mod vault_identity; // Vault identity generation for API keys and certificates
+mod vta; // Verifiable Trust Agent (VTA) signing connector — thin REST/Trust-Task client
 mod x402; // x402 protocol (HTTP Native Payments Protocol)
 
 #[cfg(test)]
@@ -1442,6 +1443,7 @@ fn render_default_bootstrap_toml(
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
+        vta: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
         cache_refresh_interval_secs: 0,

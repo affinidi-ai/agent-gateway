@@ -89,6 +89,11 @@ pub async fn get_permissions_optional(
         ("policies.view", Feature::PoliciesView),
         ("policies.edit", Feature::PoliciesEdit),
         ("policies.delete", Feature::PoliciesDelete),
+        ("vta_connections.view", Feature::VtaConnectionsView),
+        ("vta_connections.edit", Feature::VtaConnectionsEdit),
+        ("vta_connections.delete", Feature::VtaConnectionsDelete),
+        ("key_management.view", Feature::KeyManagementView),
+        ("key_management.edit", Feature::KeyManagementEdit),
         ("terms.view", Feature::TermsView),
         ("terms.edit", Feature::TermsEdit),
     ];
@@ -215,6 +220,11 @@ pub async fn get_permissions(
         ("policies.view", Feature::PoliciesView),
         ("policies.edit", Feature::PoliciesEdit),
         ("policies.delete", Feature::PoliciesDelete),
+        ("vta_connections.view", Feature::VtaConnectionsView),
+        ("vta_connections.edit", Feature::VtaConnectionsEdit),
+        ("vta_connections.delete", Feature::VtaConnectionsDelete),
+        ("key_management.view", Feature::KeyManagementView),
+        ("key_management.edit", Feature::KeyManagementEdit),
         ("terms.view", Feature::TermsView),
         ("terms.edit", Feature::TermsEdit),
     ];
@@ -390,6 +400,53 @@ mod tests {
         assert_eq!(perms["sts_clients.view"], serde_json::Value::Bool(true));
         assert_eq!(perms["sts_clients.edit"], serde_json::Value::Bool(true));
         assert_eq!(perms["sts_clients.delete"], serde_json::Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_enumerates_vta_connections() {
+        let (storage, _dir, user_id) = storage_with_user(UserRole::Administrator).await;
+        let rbac = Arc::new(RbacConfig::default());
+        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+            .await
+            .expect("permissions endpoint should succeed for an admin");
+        assert_eq!(perms["vta_connections.view"], serde_json::Value::Bool(true));
+        assert_eq!(perms["vta_connections.edit"], serde_json::Value::Bool(true));
+        assert_eq!(perms["vta_connections.delete"], serde_json::Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn permissions_endpoint_reports_vta_connections_false_for_poweruser() {
+        let (storage, _dir, user_id) = storage_with_user(UserRole::PowerUser).await;
+        let rbac = Arc::new(RbacConfig::default());
+        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+            .await
+            .expect("permissions endpoint should succeed for a poweruser");
+        // Choosing which agent holds the appliance's signing keys is an
+        // administrator decision, so the key is present but false.
+        assert_eq!(perms["vta_connections.view"], serde_json::Value::Bool(false));
+        assert_eq!(perms["vta_connections.edit"], serde_json::Value::Bool(false));
+    }
+
+    /// Without this entry the Key Management tab stays hidden even for an
+    /// administrator, so the enumeration is part of the feature.
+    #[tokio::test]
+    async fn permissions_endpoint_enumerates_key_management() {
+        let (storage, _dir, user_id) = storage_with_user(UserRole::Administrator).await;
+        let rbac = Arc::new(RbacConfig::default());
+        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+            .await
+            .expect("permissions endpoint should succeed for an admin");
+        assert_eq!(perms["key_management.view"], serde_json::Value::Bool(true));
+        assert_eq!(perms["key_management.edit"], serde_json::Value::Bool(true));
+
+        let (storage, _dir, user_id) = storage_with_user(UserRole::PowerUser).await;
+        let rbac = Arc::new(RbacConfig::default());
+        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+            .await
+            .expect("permissions endpoint should succeed for a poweruser");
+        // Present but false: the dashboard evaluates the key, so it must exist.
+        assert_eq!(perms["key_management.view"], serde_json::Value::Bool(false));
+        assert_eq!(perms["key_management.edit"], serde_json::Value::Bool(false));
     }
 
     #[tokio::test]

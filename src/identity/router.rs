@@ -103,7 +103,112 @@ fn build_a2a_proxy_router_unauthenticated(
         .layer(Extension(secrets_store))
 }
 
-pub fn create_identity_api_router(
+/// Give `[vta]` a stable `did:webvh` to authenticate with, creating it on
+/// first boot.
+///
+/// Opt-in via `[vta] publish_auth_did`, and off by default: the agent resolves
+/// the published document on **every** authentication, so a gateway it cannot
+/// reach would stop authenticating entirely. The plain `did:key` needs no
+/// resolution and always works, so it stays the default and this is the
+/// upgrade for deployments that can publish.
+///
+/// An explicitly configured `auth_did` always wins: the operator may already
+/// host one, and silently replacing it would invalidate the grant they made
+/// against it. Any failure degrades to the `did:key` — this is a rotation
+/// story, not a requirement, so it must not stop the gateway starting.
+/// Give the appliance a persistent VTA identity, and make it the key `[vta]`
+/// authenticates with when the operator named no source.
+///
+/// Minted on first boot and adopted on every boot after, so the DID an
+/// operator grants on their trust agent stays the same. Without this, a `[vta]`
+/// block with no `auth_key_source` generated a **fresh key on every restart**,
+/// which cannot be granted at all: whatever the operator authorised stopped
+/// being this gateway's identity the next time it started.
+///
+/// Runs even when `[vta]` is disabled so the identity exists — and can be
+/// shown and granted — before any trust agent is configured. A failure is
+/// logged and left alone rather than being fatal: a gateway that signs locally
+/// has no use for this key and must still start.
+async fn ensure_appliance_vta_identity(
+    mut config: crate::config::vta::VtaConfig,
+    vc_issuer: &std::sync::Arc<crate::identity::VCIssuer>,
+) -> crate::config::vta::VtaConfig {
+    let storage = vc_issuer
+        .get_storage_path()
+        .await;
+    match crate::vta::ensure_appliance_control_key(&storage).await {
+        Ok(_) => {
+            if config
+                .auth_key_source
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .is_none()
+            {
+                config.auth_key_source =
+                    Some(format!("file://{}", crate::vta::appliance_control_key_path(&storage).display()));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "vta_audit",
+                error = %e.log_detail(),
+                "could not establish the appliance VTA control key; a [vta] block without auth_key_source will not have a grantable identity",
+            );
+        }
+    }
+    config
+}
+
+async fn ensure_vta_auth_did(
+    mut config: crate::config::vta::VtaConfig,
+    vc_issuer: &std::sync::Arc<crate::identity::VCIssuer>,
+) -> crate::config::vta::VtaConfig {
+    if !config.enabled || !config.publish_auth_did || config.auth_did.is_some() {
+        return config;
+    }
+
+    let control_key = match crate::vta::build_control_key_material(&config).await {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(error = %e.log_detail(), "could not source the VTA control key to publish an auth DID");
+            return config;
+        }
+    };
+
+    let issuer_did = match vc_issuer
+        .get_issuer_did()
+        .await
+    {
+        Ok(did) => did,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the gateway DID to derive the auth DID domain");
+            return config;
+        }
+    };
+    let domain = crate::vault_identity::handlers::extract_domain_from_did(&issuer_did);
+    let storage = vc_issuer
+        .get_storage_path()
+        .await;
+
+    match crate::vta::auth_did::ensure_auth_did(&storage, &domain, &control_key).await {
+        Ok(did) => {
+            tracing::info!(auth_did = %did, "gateway will authenticate to its trust agent as this DID");
+            config.auth_did = Some(did);
+        }
+        Err(e) => {
+            // The gateway still authenticates, as its `did:key`. Loud, because
+            // the operator's grant will name that instead and rotation will
+            // need a re-grant.
+            tracing::warn!(
+                error = %e.log_detail(),
+                "could not publish a stable auth DID; authenticating as did:key, which cannot be rotated without re-granting"
+            );
+        }
+    }
+    config
+}
+
+pub async fn create_identity_api_router(
     state: IdentityApiState,
     dashboard_state: crate::observability::DashboardState,
     auth_state: Option<std::sync::Arc<crate::auth::AuthState>>,
@@ -131,6 +236,7 @@ pub fn create_identity_api_router(
     metric_store: Option<Arc<MetricsStore>>,
     sts_client_store: Option<std::sync::Arc<dyn crate::sts::store::StsClientStorage>>,
     mcp_replay: Option<std::sync::Arc<crate::sts::replay::McpReplay>>,
+    vta_connection_store: Option<std::sync::Arc<dyn crate::vta::connections::VtaConnectionStorage>>,
     terms_manager: Arc<crate::terms::TermsManager>,
     pat_authenticator: Option<std::sync::Arc<dyn crate::auth_manager::pat::PatAuthenticator>>,
 ) -> Router {
@@ -873,6 +979,19 @@ pub fn create_identity_api_router(
     let sts_jwks_client = jwks_client.clone();
     let sts_strategy_store = jwt_verification_strategy_store.clone();
     let sts_vc_issuer = state.vc_issuer.clone();
+    // Select the active signing connector (local vs VTA) once from [vta] config.
+    // Captured here because `state` is moved into routers further down.
+    let sts_vta_config = state
+        .bootstrap_config
+        .vta
+        .clone();
+    // Give the gateway a stable `did:webvh` to authenticate to its trust agent
+    // with, unless the operator named one. Authenticating as a bare `did:key`
+    // works but has no rotation story — the identifier *is* the key, so
+    // replacing it needs a fresh grant. Created once and adopted thereafter,
+    // because this is the identity the operator's grant names.
+    let sts_vta_config = ensure_appliance_vta_identity(sts_vta_config, &state.vc_issuer).await;
+    let sts_vta_config = ensure_vta_auth_did(sts_vta_config, &state.vc_issuer).await;
     let sts_secrets_store = secrets_store.clone();
     let sts_gateway_policy_manager = state
         .gateway_policy_manager
@@ -2080,8 +2199,328 @@ pub fn create_identity_api_router(
     // managed-connections are empty until the dashboard store lands in a later
     // phase; the endpoints, discovery, and JWKS are live and client-authenticated
     // (exempt from dashboard session auth via the `/oauth2/` public-path prefix).
+    // Select the signing connector: `local` (in-process issuer key) by default,
+    // or the `vta` connector when `[vta]` is enabled. Fail closed — a
+    // configured-but-unbuildable VTA connector aborts startup rather than
+    // silently signing locally.
+    //
+    // Selection goes through the `KeyDirectory` (VTA-18) rather than pinning a
+    // connector for the whole process: the directory is what will resolve a key
+    // per request once per-surface and per-variant contexts land (VTA-19). With
+    // nothing mapped it resolves the appliance default, which is exactly the
+    // connector the flat `[vta]` config has always selected.
+    let sts_local_authority: std::sync::Arc<dyn crate::identity::authority::CredentialAuthority> =
+        std::sync::Arc::new(crate::identity::authority::LocalCredentialAuthority::new(sts_vc_issuer.clone()));
+    let key_directory = crate::vta::key_directory::KeyDirectory::build(&sts_vta_config, sts_local_authority)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("VTA signing connector is enabled but could not be initialised: {}", e.log_detail())
+        });
+
+    // Lazy context provisioning (VTA-19). Creating a context uses the narrow
+    // `context-create` capability (VTA-16), never super-admin: every context
+    // the gateway creates is a child of the one it was granted, which is also
+    // the only place that capability reaches. A gateway without it — or with
+    // auto-provisioning off — keeps the creator that refuses with a message
+    // naming the fix, which is better than pretending to provision;
+    // `[vta] auto_provision_contexts` already gates surface validation so an
+    // operator is told at write time rather than at the first signing call.
+    let context_creator = key_directory
+        .context_creator()
+        .unwrap_or_else(|| std::sync::Arc::new(crate::vta::provisioning::UnavailableContextCreator));
+    let context_provisioner = std::sync::Arc::new(crate::vta::provisioning::ContextProvisioner::new(
+        context_creator,
+        sts_vta_config.max_contexts,
+    ));
+    let key_directory = key_directory.with_provisioner(std::sync::Arc::clone(&context_provisioner));
+    let di_vc_issuer = key_directory.di_vc_issuer();
+    let agent_provisioner = key_directory.agent_provisioner();
+    let vta_client_for_holder = key_directory.client();
+
+    let appliance_key = key_directory
+        .resolve_and_provision(crate::config::vta::KeyPurpose::Jwt, &crate::vta::key_directory::KeyScope::default())
+        .await
+        .unwrap_or_else(|e| panic!("VTA signing key could not be resolved: {}", e.log_detail()));
+    let sts_signing_authority = key_directory
+        .authority_for(&appliance_key, crate::config::vta::KeyPurpose::Jwt)
+        .await
+        .unwrap_or_else(|e| panic!("VTA signing key could not be resolved: {}", e.log_detail()));
+
+    // Managed VTA connections (VTA-23): several VTAs can be mapped at once, and
+    // an edit or a disable takes effect without a restart because the registry
+    // rebuilds — or refuses — on next use rather than the process pinning one
+    // connector at boot. The bootstrap connector is handed over so the migrated
+    // `[vta]` record keeps resolving to exactly what the block built.
+    let vta_connection_registry = vta_connection_store
+        .clone()
+        .map(|store| {
+            std::sync::Arc::new(crate::vta::registry::VtaConnectionRegistry::new(
+                store,
+                sts_secrets_store.clone(),
+                sts_vta_config
+                    .enabled
+                    .then(|| std::sync::Arc::clone(&sts_signing_authority)),
+                // The same client `[vta]` already dialled. Re-dialling would
+                // open a second session for the same control DID, which the
+                // VTA supersedes — cutting off the first.
+                vta_client_for_holder.clone(),
+                std::time::Duration::from_millis(sts_vta_config.timeout_ms),
+                sts_vta_config.max_concurrent,
+            ))
+        });
+    let key_directory = match vta_connection_registry.clone() {
+        Some(registry) => key_directory.with_connections(registry),
+        None => key_directory,
+    };
+    // The appliance-wide backend an operator picks in the dashboard. Installed
+    // unconditionally and read per resolution, so pairing a connection and
+    // pointing the appliance at it needs no restart and no TOML edit. With
+    // nothing set it returns `None`, which resolves exactly the `[vta]`
+    // default as before.
+    let key_directory =
+        key_directory.with_appliance_default(std::sync::Arc::new(crate::vta::key_directory::SettingsApplianceDefault));
+
+    // Per-surface and per-variant signing mappings (VTA-19). A surface with no
+    // `signing` block installs nothing and keeps resolving the appliance
+    // default, so a gateway that has never mapped anything behaves exactly as
+    // before. A bad mapping is logged and skipped rather than aborting
+    // startup: one misconfigured surface must not take the whole appliance
+    // down, and an unmapped surface falls back to the appliance default, which
+    // is the same key it used before the mapping was added.
+    //
+    // Contexts named explicitly are adopted so they count toward the quota and
+    // are never re-created.
+    let mut key_directory = key_directory;
+    if let Some(store) = state
+        .agent_surface_store
+        .as_ref()
+    {
+        // Read live at resolution time too, so a surface written after
+        // startup is honoured without a restart. The snapshot below stays
+        // because it is what a synchronous `resolve` sees.
+        key_directory = key_directory
+            .with_surface_store(std::sync::Arc::clone(store) as std::sync::Arc<dyn crate::surfaces::AgentSurfaceStore>);
+    }
+    if let Some(store) = state
+        .agent_surface_store
+        .as_ref()
+        && let Ok(surfaces) = crate::surfaces::AgentSurfaceStore::list_all(store.as_ref()).await
+    {
+        for surface in &surfaces {
+            if let Err(e) = key_directory.with_surface(surface) {
+                tracing::error!(
+                    target: "vta_audit",
+                    surface_id = %surface.surface_id,
+                    error = %e.log_detail(),
+                    "surface signing mapping rejected; the surface falls back to the appliance default key",
+                );
+            }
+            adopt_declared_contexts(&context_provisioner, surface).await;
+        }
+    }
+    let key_directory = std::sync::Arc::new(key_directory);
+
+    // What this appliance signs with when nobody has said (VTA-26). An
+    // existing install is detected by the presence of a local issuer key,
+    // because that key exists precisely because this gateway has already been
+    // signing with it — so upgrading changes nothing and migrates nothing.
+    // A fresh install has nothing to preserve and takes the better default.
+    let install_kind = crate::vta::onboarding_default::InstallKind::from_local_key_present(
+        sts_vc_issuer
+            .get_issuer_did()
+            .await
+            .is_ok(),
+    );
+    let default_resolution = std::sync::Arc::new(crate::vta::onboarding_default::with_availability(
+        crate::vta::onboarding_default::resolve(&sts_vta_config, install_kind),
+        // The bundled agent is "available" exactly when the connector it
+        // needs actually built; a failure here must report, not block.
+        sts_vta_config.enabled,
+    ));
+    info!(
+        target: "vta_audit",
+        backend = %default_resolution.backend,
+        explicit = default_resolution.explicit,
+        "appliance signing default resolved: {}",
+        default_resolution.reason,
+    );
+
+    // VTA connection admin routes — administrator-gated. Built here rather than
+    // alongside the other admin routers because a write has to invalidate the
+    // registry's cached connector, which only exists once the signing backend
+    // has been selected.
+    let vta_connection_admin_router = if let (Some(store), Some(storage), Some(sess_mgr)) =
+        (vta_connection_store.clone(), passkey_storage_for_manager.as_ref(), session_manager_for_manager.as_ref())
+    {
+        info!("VTA connection management routes registered");
+        let router = crate::vta::connections_admin::create_vta_connection_router(
+            crate::vta::connections_admin::VtaConnectionAdminState {
+                store,
+                registry: vta_connection_registry.clone(),
+                vta_config: std::sync::Arc::new(sts_vta_config.clone()),
+                provisioner: Some(std::sync::Arc::clone(&context_provisioner)),
+                default_resolution: std::sync::Arc::clone(&default_resolution),
+            },
+            sts_secrets_store.clone(),
+        )
+        .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
+        .layer(Extension(sess_mgr.clone()))
+        .layer(Extension(storage.clone()))
+        .layer(Extension(rbac_config.clone()));
+        // The key inventory reports which surface maps to which context
+        // (VTA-20); without the store it reports connections only, rather
+        // than failing.
+        match state
+            .agent_surface_store
+            .clone()
+        {
+            Some(store) => {
+                let store: std::sync::Arc<dyn crate::surfaces::AgentSurfaceStore> = store;
+                router.layer(Extension(store))
+            }
+            None => router,
+        }
+    } else {
+        Router::new()
+    };
+
+    // Payment-receipt VCs are VC-JWTs, so they sign through the same connector
+    // as STS tokens. Upgrade the payment issuer from the local default the
+    // orchestrator registered at boot to whichever backend `[vta]` selected
+    // (VTA-10) — otherwise receipts would keep being signed by the local key
+    // while STS signed via the VTA.
+    crate::payment_credentials::set_global_payment_credential_authority(std::sync::Arc::clone(&sts_signing_authority));
+
+    // The JWT-shaped agent-identity credential signs through the same connector
+    // (VTA-11a). The issuer is late-bound because the connector can only be
+    // selected after `[vta]` is resolved, which is here rather than at
+    // `VCIssuer::new`.
+    sts_vc_issuer
+        .set_signing_authority(std::sync::Arc::clone(&sts_signing_authority))
+        .await;
+
+    // Which key signs for which surface (VTA-19). Installed after the
+    // appliance-wide authority so the directory is consulted first and that
+    // one remains the fallback: a surface that maps nothing resolves the same
+    // default and signs with exactly the key it did before. Until this was
+    // wired the directory was built, validated and then dropped, so a
+    // per-surface mapping silently did nothing.
+    sts_vc_issuer
+        .set_key_directory(std::sync::Arc::clone(&key_directory))
+        .await;
+
+    // The Data-Integrity agent-identity credential embedded in the forwarding
+    // VP issues through the VTA's context-scoped task (VTA-11b), so the issuer
+    // key lives in the agent rather than in this process. Absent a VTA the
+    // local issuer stays in place unchanged.
+    //
+    // When `[vta]` is not configured at all, the appliance's agent is whatever
+    // the dashboard points at, so the delegate below resolves it per call
+    // rather than pinning one at boot — an operator connects an agent while
+    // the gateway is running, and a boot-time answer would be stale until the
+    // next restart. It falls back to the local issuer, so an install with no
+    // agent behaves exactly as before.
+    let di_vc_issuer = di_vc_issuer.or_else(|| {
+        // No registry means no dashboard-managed connections exist on this
+        // build at all, so there is nothing to resolve and local signing
+        // stands.
+        let registry = vta_connection_registry.clone()?;
+        Some(std::sync::Arc::new(crate::vta::appliance_di::ApplianceVcIssuer::new(
+            registry,
+            std::sync::Arc::new(crate::vta::key_directory::SettingsApplianceDefault),
+            sts_vc_issuer.local_vc_issuer(),
+        )) as std::sync::Arc<dyn crate::identity::ssi::vc_issuer::VcIssuer>)
+    });
+
+    if let Some(di_vc_issuer) = di_vc_issuer {
+        sts_vc_issuer
+            .set_di_vc_issuer(di_vc_issuer)
+            .await;
+
+        // The fabric issuer attestation must claim the DID that *issues* those
+        // credentials, because a peer pins it and then requires every identity
+        // presentation from that connection to be issued by exactly it. Both
+        // are the gateway's configured context, so they agree by construction
+        // — and the context's `did:key` declares the key that signs the
+        // attestation, which is what makes it verifiable at the peer.
+        if let Some(vta_client) = vta_client_for_holder.clone()
+            && let Some(context_id) = sts_vta_config
+                .context_id
+                .as_deref()
+        {
+            sts_vc_issuer
+                .set_attestation_signer(std::sync::Arc::new(crate::vta::context_signer::VtaContextSigner::new(
+                    vta_client,
+                    context_id.to_string(),
+                )))
+                .await;
+        }
+    }
+
+    // The agent's **holder** proof signs in the agent's own VTA context
+    // (VTA-12), so the gateway stops custodying other parties' private keys.
+    // Both halves are set together: the provisioner is what gives a newly
+    // onboarded agent a context, and the issuer is what finds it again at
+    // signing time. Setting only one would either onboard agents whose key
+    // nothing can reach, or look for contexts nothing creates.
+    if let Some(agent_provisioner) = agent_provisioner
+        && let Some(vta_client) = vta_client_for_holder
+    {
+        let agent_contexts = std::sync::Arc::new(crate::vta::agent_contexts::StoredAgentContexts::new(
+            sts_vc_issuer.get_identity_store(),
+        ));
+        let holder_issuer = std::sync::Arc::new(crate::vta::vp_issuer::VtaVpIssuer::new(
+            std::sync::Arc::new(crate::vta::agent_contexts::RegistryVtaClients::new(
+                vta_client,
+                vta_connection_registry.clone(),
+            )),
+            agent_contexts,
+            std::sync::Arc::new(crate::identity::ssi::vp_issuer::LocalVpIssuer::new(std::sync::Arc::new(
+                crate::identity::ssi::vp_issuer::LocalVpSigner::new(),
+            ))),
+        ));
+        sts_vc_issuer
+            .set_di_vp_issuer(holder_issuer)
+            .await;
+        sts_vc_issuer
+            .set_agent_provisioner(agent_provisioner)
+            .await;
+    } else if let Some(registry) = vta_connection_registry.clone() {
+        // Same two halves, resolved from the dashboard's appliance default
+        // instead of `[vta]`. The provisioner reports itself optional, so a
+        // grant that turns out not to carry `context-create` falls back to a
+        // gateway-held key rather than refusing to onboard the agent — the
+        // capability cannot be known in advance, because the agent keeps it
+        // out of the session token so a narrowing bites on the next call.
+        let appliance_default: std::sync::Arc<dyn crate::vta::key_directory::ApplianceSigningDefault> =
+            std::sync::Arc::new(crate::vta::key_directory::SettingsApplianceDefault);
+        let agent_contexts = std::sync::Arc::new(crate::vta::agent_contexts::StoredAgentContexts::new(
+            sts_vc_issuer.get_identity_store(),
+        ));
+        let holder_issuer = std::sync::Arc::new(crate::vta::vp_issuer::VtaVpIssuer::new(
+            std::sync::Arc::new(crate::vta::appliance_di::ApplianceVtaClients::new(
+                std::sync::Arc::clone(&registry),
+                std::sync::Arc::clone(&appliance_default),
+            )),
+            agent_contexts,
+            std::sync::Arc::new(crate::identity::ssi::vp_issuer::LocalVpIssuer::new(std::sync::Arc::new(
+                crate::identity::ssi::vp_issuer::LocalVpSigner::new(),
+            ))),
+        ));
+        sts_vc_issuer
+            .set_di_vp_issuer(holder_issuer)
+            .await;
+        sts_vc_issuer
+            .set_agent_provisioner(std::sync::Arc::new(crate::vta::appliance_di::ApplianceAgentProvisioner::new(
+                registry,
+                appliance_default,
+            )))
+            .await;
+    }
+
     let sts_router = crate::sts::handlers::build_sts_router(
         sts_vc_issuer,
+        sts_signing_authority,
         sts_jwks_client,
         sts_strategy_store,
         sts_client_store,
@@ -2160,6 +2599,7 @@ pub fn create_identity_api_router(
         .merge(rbac_identity_router)
         .merge(oidc_provider_router)
         .merge(sts_admin_router)
+        .merge(vta_connection_admin_router)
         .merge(identity_router)
         .merge(sts_router)
         .merge(auth_router)
@@ -2296,6 +2736,10 @@ pub fn create_did_router(
         .route("/.well-known/did/did.jsonl", get(handlers::serve_gateway_did_jsonl))
         // Legacy path kept for backwards compatibility
         .route("/.well-known/did.jsonl", get(handlers::serve_gateway_did_jsonl))
+        // The trust agent resolves this on every authentication, so it has to
+        // be reachable from wherever the agent runs.
+        .route("/vta-auth/did.jsonl", get(handlers::serve_vta_auth_did_jsonl))
+        .route("/.well-known/vta-auth/did.jsonl", get(handlers::serve_vta_auth_did_jsonl))
         // Empty witness-proofs document — the did:webvh resolver fetches this
         // alongside did.jsonl; without a route it falls through to the SPA.
         .route("/.well-known/did-witness.json", get(handlers::serve_gateway_did_witness))
@@ -2467,6 +2911,49 @@ pub fn create_onboarding_router(state: IdentityApiState) -> Router {
         .route("/onboard/{uuid}/", post(handlers::handle_onboarding_message))
         .route("/onboard/{uuid}", post(handlers::handle_onboarding_message))
         .with_state(state)
+}
+
+/// Record the contexts a surface (and its variants) names explicitly, so the
+/// provisioner never tries to create one that already exists and the quota
+/// reflects reality (VTA-19).
+///
+/// The adoption key is the **derived** name, so an explicitly-mapped surface
+/// and an auto-provisioned one occupy the same slot — renaming the surface
+/// cannot make the gateway provision a second context for it.
+async fn adopt_declared_contexts(
+    provisioner: &crate::vta::provisioning::ContextProvisioner,
+    surface: &crate::config::agent_surface::AgentSurface,
+) {
+    use crate::config::agent_surface::derived_context_name;
+    use crate::vta::key_directory::ContextId;
+
+    if let Some(context_id) = surface
+        .signing
+        .as_ref()
+        .and_then(|s| s.context_id.as_deref())
+    {
+        provisioner
+            .adopt(
+                derived_context_name(surface.tenant_id.as_deref(), &surface.surface_id, None),
+                ContextId(context_id.to_string()),
+            )
+            .await;
+    }
+    for variant in &surface.variants {
+        if let Some(context_id) = variant
+            .overrides
+            .signing
+            .as_ref()
+            .and_then(|s| s.context_id.as_deref())
+        {
+            provisioner
+                .adopt(
+                    derived_context_name(surface.tenant_id.as_deref(), &surface.surface_id, Some(&variant.id)),
+                    ContextId(context_id.to_string()),
+                )
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
