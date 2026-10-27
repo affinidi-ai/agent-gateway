@@ -268,6 +268,52 @@ describe('eventNarrative', () => {
         'Attaching a policy to gateway gw-1 was refused (404, not found).'
       );
     });
+
+    it('leaves out the versions of an update that kept the version', () => {
+      const n = describeEntry(
+        at({
+          policy_updated: {
+            policy_definition_id: 'deny-pii',
+            policy_name: 'Deny PII',
+            policy_version: 2,
+            previous_policy_version: 2,
+            changed: ['owner'],
+            actor: user,
+            source: 'ownership',
+          },
+        })
+      );
+      expect(n.summary).toBe('“Deny PII” changed: owner.');
+    });
+
+    it('names the appliance when a refused change names no plane', () => {
+      const n = describeEntry(
+        at({
+          policy_change_refused: {
+            target: { kind: 'appliance' },
+            action: 'policy_attached',
+            status: 403,
+            reason: 'forbidden',
+            actor: user,
+            source: 'api',
+          },
+        })
+      );
+      expect(n.summary).toBe('Attaching a policy to the appliance was refused (403, forbidden).');
+    });
+
+    it('names a user actor by username when the resolver knows it, else by id', () => {
+      const created = (actor: { kind: 'user'; id: string }) =>
+        at({
+          policy_created: { policy_definition_id: 'deny-pii', actor, source: 'api' },
+        });
+      const userName = (id: string) => (id === 'u-1' ? 'alice' : undefined);
+
+      expect(describeEntry(created(user), userName).detail).toBe('By user alice.');
+      expect(describeEntry(created({ kind: 'user', id: 'u-2' }), userName).detail).toBe(
+        'By user u-2.'
+      );
+    });
   });
 
   it('names token injection with the provider', () => {

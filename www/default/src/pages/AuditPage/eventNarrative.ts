@@ -85,18 +85,12 @@ export function eventTone(entry: AuditEntry): EventTone {
   return 'neutral';
 }
 
-/**
- * Turns an audit entry into a human-friendly title + two-line description used
- * by the master list. Title colour comes from {@link eventTone}; the summary and
- * detail lines read as plain English so an operator can scan the log without
- * decoding badges.
- */
 /** Who made a policy change, e.g. "user alice" or "access token tok-1 of alice". */
 export function actorLabel(actor: PolicyChangeActor, userName?: UserNameResolver): string {
   const user = (id: string) => userName?.(id) ?? `user ${id}`;
   switch (actor.kind) {
     case 'user':
-      return userName?.(actor.id) ? `user ${userName(actor.id)}` : `user ${actor.id}`;
+      return `user ${userName?.(actor.id) ?? actor.id}`;
     case 'pat':
       return actor.user_id
         ? `access token ${actor.id} of ${user(actor.user_id)}`
@@ -160,7 +154,8 @@ function describePolicyChange(
       const on = !change.policy_definition_id && target ? ` on ${target}` : '';
       const versions =
         typeof change.previous_policy_version === 'number' &&
-        typeof change.policy_version === 'number'
+        typeof change.policy_version === 'number' &&
+        change.previous_policy_version !== change.policy_version
           ? ` from v${change.previous_policy_version} to v${change.policy_version}`
           : '';
       const parts = changedPartsLabel(change.changed);
@@ -206,6 +201,12 @@ function surfaceSlotPhrase(change: PolicyChangeData, slot: string): string {
   return `its ${slot}`;
 }
 
+/**
+ * Turns an audit entry into a human-friendly title + two-line description used
+ * by the master list. Title colour comes from {@link eventTone}; the summary and
+ * detail lines read as plain English so an operator can scan the log without
+ * decoding badges.
+ */
 export function describeEntry(entry: AuditEntry, userName?: UserNameResolver): EventNarrative {
   const change = policyChange(entry);
   if (change) return describePolicyChange(change.name, change.change, userName);

@@ -272,11 +272,16 @@ export function planeLabel(plane?: string | null): string {
   return (plane ?? '').replace(/_/g, ' ');
 }
 
-/** The surface, gateway or appliance-wide plane a change applies to, e.g. "surface Orders". */
+/**
+ * The surface, gateway or appliance-wide plane a change applies to, e.g. "surface Orders".
+ * A refused assignment change names no plane, so it is "the appliance".
+ */
 export function targetLabel(change: PolicyChangeData): string | undefined {
   const target = change.target;
   if (!target) return undefined;
-  if (target.kind === 'appliance') return `the appliance-wide ${planeLabel(change.plane)} plane`;
+  if (target.kind === 'appliance') {
+    return change.plane ? `the appliance-wide ${planeLabel(change.plane)} plane` : 'the appliance';
+  }
   const name = target.name || target.id;
   return name ? `${target.kind} ${name}` : target.kind;
 }
