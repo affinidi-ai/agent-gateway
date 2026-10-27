@@ -428,7 +428,13 @@ write in a management request (`src/policies/slots.rs` lists a surface's enforce
 every API path that writes one is covered. A slot is told apart by its variant, its transit
 point and its tool name or gate id; every entry of a tool or gate list is enforced, so a name or
 id repeated in one list is a slot of its own. `transit.transit_policy` is not enforced, so it is
-not listed. A refused surface or variant write is not recorded.
+not listed. A refused surface or variant write is not recorded, nor a refused
+`PUT /v1/gateways/{id}`: refusals are recorded without reading the request body, and that route
+changes a gateway's policy only when its body says so.
+
+The policy write routes are listed once, in `PolicyWrite` (`src/audit/policy_refusals.rs`); the
+router registers each through it, so a route's own refusals and those made before it by
+authentication name the same attempted change.
 
 A gateway's legacy inline Rego (`opa_policy_config.policy`, enforced only when the gateway
 references no definition) is recorded too. It has no definition id, so its records carry

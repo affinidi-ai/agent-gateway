@@ -469,12 +469,7 @@ fn record_refusal(
     actor: &crate::audit::events::Actor,
     response: Response,
 ) -> Response {
-    crate::audit::policy_refusals::record_refused(
-        request.method(),
-        request.uri().path(),
-        response.status(),
-        actor.clone(),
-    );
+    crate::audit::policy_refusals::record_refused(request, response.status(), actor.clone());
     response
 }
 
