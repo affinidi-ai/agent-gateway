@@ -430,6 +430,7 @@ pub async fn delete_policy_definition(
     // fails the definition still exists, so a retry reaches this step again.
     if let Some(gstore) = &state.global_policy_store {
         let mut assignments = gstore.get().await;
+        let before = assignments.clone();
         if assignments.remove_policy(&policy_id) {
             gstore
                 .save(assignments.clone())
@@ -438,6 +439,7 @@ pub async fn delete_policy_definition(
                     error!("Failed to remove policy from global assignments: {}", e);
                     AppError::InternalError(format!("Failed to update global assignments: {}", e))
                 })?;
+            policy_changes::assignments_written(&before, &assignments, PolicyChangeSource::DefinitionDeleted).await;
             if let Some(manager) = &state.global_policy_manager {
                 manager
                     .refresh(&assignments)
@@ -960,10 +962,12 @@ pub async fn update_policy_assignments(
         .global_policy_store
         .as_ref()
         .ok_or_else(|| AppError::InternalError("Global policy store not initialized".to_string()))?;
+    let before = store.get().await;
     store
         .save(body.clone())
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save global assignments: {}", e)))?;
+    policy_changes::assignments_written(&before, &body, PolicyChangeSource::Api).await;
     if let Some(mgr) = &state.global_policy_manager {
         mgr.refresh(&body).await;
     }

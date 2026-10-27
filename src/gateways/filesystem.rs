@@ -115,6 +115,14 @@ impl FileSystemGatewayStore {
         self.storage
             .save(gateway)
             .await?;
+        crate::audit::policy_changes::gateway_written(
+            previous
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref),
+            Some(gateway),
+        )
+        .await;
         self.revoke_change(previous, Some(gateway))
             .await;
         Ok(())
@@ -183,6 +191,14 @@ impl GatewayStore for FileSystemGatewayStore {
         self.storage
             .delete(id)
             .await?;
+        crate::audit::policy_changes::gateway_written(
+            previous
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref),
+            None,
+        )
+        .await;
         self.revoke_change(previous, None)
             .await;
         Ok(())
@@ -214,6 +230,47 @@ pub async fn get_local_gateway_id(store: &Arc<dyn GatewayStore>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_management_request_records_the_gateway_policies_its_writes_attach_and_detach() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::capture;
+        use crate::delegation_vault::audit::action_category;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+            .await
+            .expect("store");
+        let mut peer = Gateway::new("peer".into(), String::new(), "did:web:peer.example".into(), GatewayType::Remote);
+        store
+            .create(&peer)
+            .await
+            .expect("create");
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            peer.opa_policy_config = Some(super::super::types::GatewayOpaPolicyConfig {
+                enabled: true,
+                policy_definition_id: Some("p".to_string()),
+                ..Default::default()
+            });
+            store
+                .update(&peer)
+                .await
+                .expect("update");
+            store
+                .delete(&peer.id)
+                .await
+                .expect("delete");
+        }))
+        .await;
+
+        let categories: Vec<_> = records
+            .iter()
+            .map(|record| action_category(&record.event))
+            .collect();
+        assert_eq!(categories, vec!["policy_attached", "policy_detached"]);
+    }
 
     #[tokio::test]
     async fn filesystem_store_get_by_did_returns_issuer_did() {

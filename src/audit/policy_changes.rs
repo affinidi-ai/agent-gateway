@@ -2,14 +2,20 @@
 //! management request it is built in and is written only when a sink selects
 //! its event.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use crate::audit::context::current_actor;
-use crate::audit::events::{Actor, PolicyChangeAction, PolicyChangeSource, PolicyField, PolicySlot, PolicyTargetKind};
+use crate::audit::events::{
+    Actor, PolicyChangeAction, PolicyChangeSource, PolicyField, PolicyMode, PolicySlot, PolicyTargetKind,
+};
 use crate::config::agent_surface::AgentSurface;
 use crate::delegation_vault::audit::{
     DelegationAuditAction, PolicyChangeDetails, PolicyTarget, action_category, audit_event, emit,
 };
+use crate::gateways::types::Gateway;
+use crate::observability::PolicyScope;
+use crate::policies::global_policy::{GlobalPolicyAssignments, PLANE_GATEWAY};
 use crate::policies::policy_definitions::{FileSystemPolicyDefinitionStore, PolicyDefinition, PolicyType};
 use crate::policies::slots::{SlotKey, SlotPolicy, policy_slots};
 
@@ -64,16 +70,10 @@ pub async fn surface_written(
     let Some(surface) = after.or(before) else {
         return;
     };
-    let source = PolicyChangeSource::Api;
+    let mut changes = Vec::new();
     for (action, key, slot) in surface_slot_changes(before, after) {
-        let mut change = match definition(&slot.policy_definition_id).await {
-            Some(definition) => of_definition(&definition, source),
-            None => {
-                let mut change = change(source);
-                change.policy_definition_id = Some(slot.policy_definition_id);
-                change
-            }
-        };
+        let mut change = change(PolicyChangeSource::Api);
+        change.policy_definition_id = Some(slot.policy_definition_id);
         change.target = Some(PolicyTarget {
             kind: PolicyTargetKind::Surface,
             id: Some(
@@ -92,6 +92,158 @@ pub async fn surface_written(
             PolicySlot::McpToolGate => change.gate = slot.place_label,
             _ => {}
         }
+        changes.push((action, change));
+    }
+    write_attachments(changes).await;
+}
+
+/// The policies a gateway write attached and detached, and the attachments it
+/// enabled or disabled. Every policy of a gateway is attached at its target
+/// slot, the primary and each deny-overrides member alike.
+pub fn gateway_policy_changes(
+    before: Option<&Gateway>,
+    after: Option<&Gateway>,
+) -> Vec<(PolicyChangeAction, PolicyChangeDetails)> {
+    let Some(gateway) = after.or(before) else {
+        return Vec::new();
+    };
+    let attachments = |gateway: Option<&Gateway>| -> BTreeMap<String, bool> {
+        let Some(config) = gateway.and_then(|gateway| gateway.opa_policy_config.as_ref()) else {
+            return BTreeMap::new();
+        };
+        config
+            .policy_definition_id
+            .iter()
+            .chain(&config.policy_definition_ids)
+            .filter(|id| !id.is_empty())
+            .map(|id| (id.clone(), config.enabled))
+            .collect()
+    };
+    diff(attachments(before), attachments(after))
+        .into_iter()
+        .map(|(action, policy_id, previous, enabled)| {
+            let mut change = change(PolicyChangeSource::Api);
+            change.policy_definition_id = Some(policy_id);
+            change.target = Some(PolicyTarget {
+                kind: PolicyTargetKind::Gateway,
+                id: Some(gateway.id.clone()),
+                name: Some(gateway.name.clone()),
+            });
+            change.scope = Some(PolicyScope::Gateway.as_str().to_string());
+            change.slot = Some(PolicySlot::Target);
+            change.enabled = enabled;
+            if action == PolicyChangeAction::PolicyAttachmentChanged {
+                change.previous_enabled = previous;
+            }
+            (action, change)
+        })
+        .collect()
+}
+
+/// Records [`gateway_policy_changes`]. Writes nothing outside a management
+/// request.
+pub async fn gateway_written(
+    before: Option<&Gateway>,
+    after: Option<&Gateway>,
+) {
+    if current_actor().is_none() {
+        return;
+    }
+    write_attachments(gateway_policy_changes(before, after)).await;
+}
+
+/// The appliance-wide assignments `after` added, removed or switched between
+/// enforced and monitor-only, relative to `before`.
+pub fn assignment_changes(
+    before: &GlobalPolicyAssignments,
+    after: &GlobalPolicyAssignments,
+    source: PolicyChangeSource,
+) -> Vec<(PolicyChangeAction, PolicyChangeDetails)> {
+    let modes = |assignments: &GlobalPolicyAssignments| -> BTreeMap<(String, String), PolicyMode> {
+        assignments
+            .assignments
+            .iter()
+            .flat_map(|(plane, list)| {
+                list.iter()
+                    .map(move |assignment| {
+                        let mode = if assignment.monitor_only { PolicyMode::MonitorOnly } else { PolicyMode::Enforced };
+                        ((plane.clone(), assignment.policy_id.clone()), mode)
+                    })
+            })
+            .collect()
+    };
+    diff(modes(before), modes(after))
+        .into_iter()
+        .map(|(action, (plane, policy_id), previous, mode)| {
+            let mut change = change(source);
+            change.policy_definition_id = Some(policy_id);
+            change.target = Some(PolicyTarget {
+                kind: PolicyTargetKind::Appliance,
+                id: None,
+                name: None,
+            });
+            let scope = match plane.as_str() {
+                PLANE_GATEWAY => PolicyScope::Gateway,
+                _ => PolicyScope::Surface,
+            };
+            change.scope = Some(scope.as_str().to_string());
+            change.slot = Some(PolicySlot::Plane);
+            change.plane = Some(plane);
+            change.mode = mode;
+            if action == PolicyChangeAction::PolicyAttachmentChanged {
+                change.previous_mode = previous;
+            }
+            (action, change)
+        })
+        .collect()
+}
+
+/// Each key `before` and `after` hold differently, in key order: attached when
+/// only `after` holds it, detached when only `before` does, changed when both
+/// hold different values. Gives the previous and current value of each.
+fn diff<K: Ord, V: PartialEq + Copy>(
+    mut before: BTreeMap<K, V>,
+    after: BTreeMap<K, V>,
+) -> Vec<(PolicyChangeAction, K, Option<V>, Option<V>)> {
+    let mut changes = Vec::new();
+    for (key, value) in after {
+        match before.remove(&key) {
+            Some(previous) if previous == value => {}
+            Some(previous) => {
+                changes.push((PolicyChangeAction::PolicyAttachmentChanged, key, Some(previous), Some(value)))
+            }
+            None => changes.push((PolicyChangeAction::PolicyAttached, key, None, Some(value))),
+        }
+    }
+    changes.extend(
+        before
+            .into_iter()
+            .map(|(key, previous)| (PolicyChangeAction::PolicyDetached, key, Some(previous), Some(previous))),
+    );
+    changes.sort_by(|left, right| left.1.cmp(&right.1));
+    changes
+}
+
+/// Records [`assignment_changes`].
+pub async fn assignments_written(
+    before: &GlobalPolicyAssignments,
+    after: &GlobalPolicyAssignments,
+    source: PolicyChangeSource,
+) {
+    write_attachments(assignment_changes(before, after, source)).await;
+}
+
+/// Records each attachment change, naming its policy from the stored
+/// definition when there is one.
+async fn write_attachments(changes: Vec<(PolicyChangeAction, PolicyChangeDetails)>) {
+    for (action, mut change) in changes {
+        if let Some(id) = change
+            .policy_definition_id
+            .as_deref()
+            && let Some(definition) = definition(id).await
+        {
+            name_from(&mut change, &definition);
+        }
         record(action, change);
     }
 }
@@ -101,6 +253,19 @@ async fn definition(id: &str) -> Option<PolicyDefinition> {
         .get()?
         .get(id)
         .await
+}
+
+fn name_from(
+    change: &mut PolicyChangeDetails,
+    policy: &PolicyDefinition,
+) {
+    change.policy_definition_id = Some(policy.id.clone());
+    change.policy_name = Some(policy.name.clone());
+    change.policy_type = Some(policy_type_name(&policy.policy_type).to_string());
+    change.policy_version = policy.version;
+    change.policy_content_hash = policy
+        .content_hash
+        .clone();
 }
 
 /// A change through `source` by the actor of the current management request,
@@ -115,13 +280,7 @@ pub fn of_definition(
     source: PolicyChangeSource,
 ) -> PolicyChangeDetails {
     let mut change = change(source);
-    change.policy_definition_id = Some(policy.id.clone());
-    change.policy_name = Some(policy.name.clone());
-    change.policy_type = Some(policy_type_name(&policy.policy_type).to_string());
-    change.policy_version = policy.version;
-    change.policy_content_hash = policy
-        .content_hash
-        .clone();
+    name_from(&mut change, policy);
     change
 }
 
@@ -431,6 +590,153 @@ mod tests {
         let ((), records) = capture(surface_written(None, Some(&after))).await;
 
         assert!(records.is_empty());
+    }
+
+    fn gateway(
+        enabled: bool,
+        primary: Option<&str>,
+        members: &[&str],
+    ) -> Gateway {
+        let mut gateway = Gateway::new(
+            "Peer".to_string(),
+            String::new(),
+            "did:web:peer.example".to_string(),
+            crate::gateways::types::GatewayType::Remote,
+        );
+        gateway.id = "gw-1".to_string();
+        gateway.opa_policy_config = Some(crate::gateways::types::GatewayOpaPolicyConfig {
+            enabled,
+            policy: String::new(),
+            policy_definition_id: primary.map(str::to_string),
+            policy_definition_ids: members
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+        });
+        gateway
+    }
+
+    fn summary(changes: Vec<(PolicyChangeAction, PolicyChangeDetails)>) -> Vec<(PolicyChangeAction, String)> {
+        changes
+            .into_iter()
+            .map(|(action, change)| (action, change.policy_definition_id.unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn a_gateway_policy_and_each_deny_overrides_member_is_attached_at_the_gateway() {
+        let changes = gateway_policy_changes(None, Some(&gateway(true, Some("p"), &["m"])));
+
+        assert_eq!(
+            summary(changes.clone()),
+            vec![(PolicyChangeAction::PolicyAttached, "m".to_string()), (PolicyChangeAction::PolicyAttached, "p".to_string())]
+        );
+        let (_, attached) = &changes[0];
+        assert_eq!(
+            attached.target,
+            Some(PolicyTarget {
+                kind: PolicyTargetKind::Gateway,
+                id: Some("gw-1".to_string()),
+                name: Some("Peer".to_string()),
+            })
+        );
+        assert_eq!(attached.scope.as_deref(), Some("gateway"));
+        assert_eq!(attached.slot, Some(PolicySlot::Target));
+        assert_eq!(attached.enabled, Some(true));
+    }
+
+    #[test]
+    fn disabling_a_gateway_policy_changes_each_of_its_attachments() {
+        let changes = gateway_policy_changes(
+            Some(&gateway(true, Some("p"), &[])),
+            Some(&gateway(false, Some("p"), &[])),
+        );
+
+        assert_eq!(summary(changes.clone()), vec![(PolicyChangeAction::PolicyAttachmentChanged, "p".to_string())]);
+        assert_eq!(changes[0].1.enabled, Some(false));
+        assert_eq!(changes[0].1.previous_enabled, Some(true));
+    }
+
+    #[test]
+    fn removing_a_member_or_the_gateway_detaches_its_policies() {
+        let before = gateway(true, Some("p"), &["m"]);
+
+        assert_eq!(
+            summary(gateway_policy_changes(Some(&before), Some(&gateway(true, Some("p"), &[])))),
+            vec![(PolicyChangeAction::PolicyDetached, "m".to_string())]
+        );
+        assert_eq!(
+            summary(gateway_policy_changes(Some(&before), None)),
+            vec![(PolicyChangeAction::PolicyDetached, "m".to_string()), (PolicyChangeAction::PolicyDetached, "p".to_string())]
+        );
+        assert!(gateway_policy_changes(Some(&before), Some(&before.clone())).is_empty());
+    }
+
+    fn assignments(planes: &[(&str, &str, bool)]) -> GlobalPolicyAssignments {
+        let mut assignments = GlobalPolicyAssignments::default();
+        for (plane, policy_id, monitor_only) in planes {
+            assignments
+                .assignments
+                .entry(plane.to_string())
+                .or_default()
+                .push(crate::policies::global_policy::GlobalAssignment {
+                    policy_id: policy_id.to_string(),
+                    monitor_only: *monitor_only,
+                });
+        }
+        assignments
+    }
+
+    #[test]
+    fn an_appliance_wide_assignment_is_attached_at_its_plane_in_its_mode() {
+        let changes = assignment_changes(
+            &assignments(&[]),
+            &assignments(&[("gateway", "g", false), ("agent_surface", "s", true)]),
+            PolicyChangeSource::Api,
+        );
+
+        let by_policy = |id: &str| {
+            changes
+                .iter()
+                .find(|(_, change)| change.policy_definition_id.as_deref() == Some(id))
+                .cloned()
+                .expect("a change")
+        };
+        let (action, gateway_plane) = by_policy("g");
+        assert_eq!(action, PolicyChangeAction::PolicyAttached);
+        assert_eq!(gateway_plane.scope.as_deref(), Some("gateway"));
+        assert_eq!(gateway_plane.plane.as_deref(), Some("gateway"));
+        assert_eq!(gateway_plane.slot, Some(PolicySlot::Plane));
+        assert_eq!(gateway_plane.mode, Some(crate::audit::events::PolicyMode::Enforced));
+        assert_eq!(
+            gateway_plane
+                .target
+                .map(|target| target.kind),
+            Some(PolicyTargetKind::Appliance)
+        );
+        let (_, surface_plane) = by_policy("s");
+        assert_eq!(surface_plane.scope.as_deref(), Some("surface"));
+        assert_eq!(surface_plane.mode, Some(crate::audit::events::PolicyMode::MonitorOnly));
+        assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn switching_an_assignment_to_monitor_only_or_removing_it_is_recorded() {
+        let before = assignments(&[("gateway", "g", false), ("gateway", "h", false)]);
+        let after = assignments(&[("gateway", "g", true)]);
+
+        let changes = assignment_changes(&before, &after, PolicyChangeSource::DefinitionDeleted);
+
+        assert_eq!(
+            summary(changes.clone()),
+            vec![
+                (PolicyChangeAction::PolicyAttachmentChanged, "g".to_string()),
+                (PolicyChangeAction::PolicyDetached, "h".to_string()),
+            ]
+        );
+        assert_eq!(changes[0].1.previous_mode, Some(crate::audit::events::PolicyMode::Enforced));
+        assert_eq!(changes[0].1.mode, Some(crate::audit::events::PolicyMode::MonitorOnly));
+        assert_eq!(changes[1].1.source, PolicyChangeSource::DefinitionDeleted);
     }
 
     #[tokio::test]
