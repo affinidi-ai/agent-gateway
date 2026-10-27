@@ -1158,6 +1158,58 @@ The endpoint must be a numeric loopback HTTP address. The test uses fixture
 credentials, creates only its own `mcp-conformance-*` table, and removes that
 table on completion or assertion failure. It never provisions remote resources.
 
+### Choosing How an MCP Access Point Checks Tokens
+
+An MCP Access Point can require a bearer token in two ways, and one surface
+uses only one of them: `mcp_http.authorization` cannot be combined with caller
+authentication, so it cannot be combined with
+`caller_authentication.protected_resource` either.
+
+| | [Gateway STS](#mcp-resource-authorization) | [External authorization server](#authorization-server-discovery-for-caller-authentication) |
+| --- | --- | --- |
+| Setting | `mcp_http.authorization`, with `sts.mcp_issuer` in the network configuration | `access_point.caller_authentication.protected_resource` on a JWT Bearer caller authentication |
+| Who issues tokens | The gateway's STS profile | An authorization server you run, for example Ory Hydra, Auth0 or Microsoft Entra ID |
+| Clients | Pre-registered confidential clients that exchange tokens with the gateway STS (token exchange, ID-JAG redemption) | Standard MCP clients that discover the authorization server and sign in there |
+| Token check | EdDSA `at+jwt` from the profile issuer, audience equal to the resource, every configured scope required | The JWT verification strategy, audience equal to the resource; scopes are advertised, not required |
+| Refusal | `401`, or `403 insufficient_scope` for a missing scope, with a challenge | `401` with a challenge |
+| Metadata names | The gateway STS profile issuer | The configured authorization servers |
+
+Use the gateway STS when the callers are services that already exchange tokens
+with the gateway, for example agents acting for a user through delegation and
+consent. Its STS has no browser sign-in, so off-the-shelf MCP clients cannot
+get a token from it. Use an external authorization server when people or
+agents sign in at your own identity provider with a standard MCP client.
+
+Gateway STS, with `sts.mcp_issuer` configured as shown in the next section:
+
+```json
+{
+  "access_point": { "route": "/mcp/alpha", "protocol": "mcp" },
+  "mcp_http": {
+    "authorization": { "resource": "https://gateway.example/mcp/alpha", "scopes": ["tools"] }
+  }
+}
+```
+
+External authorization server:
+
+```json
+{
+  "access_point": {
+    "route": "/mcp/alpha",
+    "protocol": "mcp",
+    "caller_authentication": {
+      "methods": [{ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [] }],
+      "protected_resource": {
+        "resource": "https://gateway.example/mcp/alpha",
+        "authorization_servers": ["https://idp.example/realms/agents"],
+        "scopes": ["tools"]
+      }
+    }
+  }
+}
+```
+
 ### MCP Resource Authorization
 
 An opt-in `sts.mcp_issuer` in the network configuration adds an HTTPS issuer

@@ -34,7 +34,9 @@ are accepted and ignored.
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with
 `caller_authentication.protected_resource`. See
-[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication),
+and [Choosing How an MCP Access Point Checks Tokens](MCP_METADATA.md#choosing-how-an-mcp-access-point-checks-tokens)
+for when to use it instead of the gateway STS Resource Server path.
 
 The gateway builds one source authentication middleware at startup. If its JWT
 verification strategy store (`jwt_verification_strategies/`, next to the secrets storage
