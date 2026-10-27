@@ -9,6 +9,12 @@ import {
   type CallerAuthMethodType,
   isSelectableCallerAuthMethod,
 } from './methodOptions';
+import CallerAuthDiscoverySection from './CallerAuthDiscoverySection';
+import {
+  readProtectedResource,
+  readsAuthorizationHeader,
+  usesBearerScheme,
+} from './protectedResource';
 
 interface Certificate {
   id: string;
@@ -44,7 +50,9 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
   updateField,
   updateFields,
   protocol,
+  allNodes,
   closeFullscreenEditor,
+  hasAttemptedSave,
 }) => {
   const { surfaceId } = useParams<{ surfaceId: string }>();
   const method: CallerAuthMethodType = (config.method_type as CallerAuthMethodType) || 'jwt_bearer';
@@ -92,6 +100,14 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
   }, [method]);
 
   const audiences: string[] = Array.isArray(config.audiences) ? config.audiences : [];
+  const hasDiscovery = readProtectedResource(config.protected_resource) !== null;
+  const discoveryOn = method === 'jwt_bearer' && hasDiscovery;
+  const showsDiscovery = method === 'jwt_bearer' && (protocol === 'mcp' || hasDiscovery);
+  // While discovery is on, each control the gateway constrains is locked once
+  // it holds the required value, and stays editable until then.
+  const tokenHeaderLocked = discoveryOn && readsAuthorizationHeader(config);
+  const tokenSchemeLocked = discoveryOn && usesBearerScheme(config);
+  const forwardHeaderLocked = discoveryOn && config.jwt_forward_header !== true;
   const selectedApiKeySecret = String(config.api_key_secret_id || '');
   const selectedApiKeySecretExists = apiKeySecrets.some(
     secret => (secret.secret_id || secret.id) === selectedApiKeySecret
@@ -114,23 +130,27 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
         method_type: 'api_key',
         extraction_source: config.extraction_source || 'http_header',
         extraction_field: config.extraction_field || 'X-API-Key',
+        protected_resource: null,
       });
     } else if (newType === 'api_key_provider') {
       updateFields({
         method_type: 'api_key_provider',
         extraction_source: config.extraction_source || 'http_header',
         extraction_field: config.extraction_field || 'X-API-Key',
+        protected_resource: null,
       });
     } else if (newType === 'did_auth') {
       updateFields({
         method_type: 'did_auth',
         extraction_source: config.extraction_source || 'http_header',
         extraction_field: config.extraction_field || 'X-Session-Token',
+        protected_resource: null,
       });
     } else if (newType === 'mtls') {
       updateFields({
         method_type: 'mtls',
         mtls_certificate_id: config.mtls_certificate_id || '',
+        protected_resource: null,
       });
     }
   };
@@ -259,6 +279,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   type="text"
                   className="form-control"
                   placeholder="e.g. https://api.example.com"
+                  disabled={discoveryOn}
                   value={audienceInput}
                   onChange={e => setAudienceInput(e.target.value)}
                   onKeyDown={e => {
@@ -275,6 +296,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 <button
                   type="button"
                   className="btn btn-outline-secondary"
+                  disabled={discoveryOn}
                   onClick={() => {
                     const val = audienceInput.trim();
                     if (val && !audiences.includes(val)) {
@@ -286,15 +308,22 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   Add
                 </button>
               </div>
-              {audiences.length === 0 && (
-                <div className="alert alert-warning py-1 px-2 mt-2 mb-0 small d-flex align-items-center gap-2">
-                  <i className="fas fa-exclamation-triangle"></i>
-                  <span>
-                    No audience configured. <code>aud</code> claim validation will be skipped. It is
-                    strongly recommended to set at least one audience value to prevent tokens issued
-                    for other services from being accepted.
-                  </span>
+              {discoveryOn ? (
+                <div className="form-text" data-testid="caller-auth-audiences-discovery-note">
+                  Stays empty while authorization server discovery is on: the gateway accepts only
+                  tokens whose audience is the resource URL.
                 </div>
+              ) : (
+                audiences.length === 0 && (
+                  <div className="alert alert-warning py-1 px-2 mt-2 mb-0 small d-flex align-items-center gap-2">
+                    <i className="fas fa-exclamation-triangle"></i>
+                    <span>
+                      No audience configured. <code>aud</code> claim validation will be skipped. It
+                      is strongly recommended to set at least one audience value to prevent tokens
+                      issued for other services from being accepted.
+                    </span>
+                  </div>
+                )
               )}
               <small className="form-text text-muted">
                 Optional. When set, the token's <code>aud</code> claim must match at least one of
@@ -312,6 +341,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   type="text"
                   className="form-control"
                   value={config.jwt_token_header ?? 'Authorization'}
+                  disabled={tokenHeaderLocked}
                   onChange={e => updateField('jwt_token_header', e.target.value)}
                   placeholder="Authorization"
                 />
@@ -328,6 +358,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   type="text"
                   className="form-control"
                   value={config.jwt_token_scheme ?? 'Bearer'}
+                  disabled={tokenSchemeLocked}
                   onChange={e => updateField('jwt_token_scheme', e.target.value)}
                   placeholder="Bearer"
                 />
@@ -336,6 +367,14 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                   token.
                 </small>
               </div>
+              {discoveryOn && (
+                <div className="col-12 mt-0">
+                  <small className="form-text" data-testid="caller-auth-jwt-token-discovery-note">
+                    Fixed to the Authorization header with the Bearer scheme while authorization
+                    server discovery is on.
+                  </small>
+                </div>
+              )}
             </div>
 
             <div className="form-check mb-3">
@@ -345,6 +384,7 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 className="form-check-input"
                 type="checkbox"
                 checked={config.jwt_forward_header === true}
+                disabled={forwardHeaderLocked}
                 onChange={e => updateField('jwt_forward_header', e.target.checked)}
               />
               <label className="form-check-label fw-bold" htmlFor="caller-auth-jwt-forward-header">
@@ -354,7 +394,25 @@ const CallerAuthFullscreen: React.FC<ConfigPanelProps> = ({
                 Sends the validated JWT header unchanged to the directly managed target. Disabled by
                 default and never applied to mirrors or fabric hops.
               </small>
+              {discoveryOn && (
+                <small
+                  className="form-text d-block"
+                  data-testid="caller-auth-jwt-forward-header-discovery-note"
+                >
+                  Off while authorization server discovery is on: MCP forbids passing the
+                  caller&apos;s token to the managed agent.
+                </small>
+              )}
             </div>
+
+            {showsDiscovery && (
+              <CallerAuthDiscoverySection
+                config={config}
+                updateFields={updateFields}
+                allNodes={allNodes}
+                hasAttemptedSave={hasAttemptedSave}
+              />
+            )}
           </>
         )}
 

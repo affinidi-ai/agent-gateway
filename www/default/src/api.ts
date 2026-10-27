@@ -23,6 +23,7 @@ import type { SurfaceStatus } from './generated/SurfaceStatus';
 import { formatApiError } from './utils/apiError';
 
 const API_BASE = '/api/v1';
+const MERGE_PATCH_CONTENT_TYPE = 'application/merge-patch+json';
 
 export const TERMS_ACCEPTANCE_REQUIRED_EVENT = 'terms-acceptance-required';
 export const TERMS_OPERATIONAL_FAILURE_EVENT = 'terms-operational-failure';
@@ -146,12 +147,12 @@ class APIClient {
 
     try {
       const response = await fetch(url, {
+        ...options,
         headers: {
           'Content-Type': 'application/json',
           ...sessionManager.getAuthHeaders(),
           ...options?.headers,
         },
-        ...options,
         signal: controller.signal,
       });
 
@@ -532,6 +533,33 @@ class APIClient {
       method: 'PUT',
       body: JSON.stringify(toBackendSurface(surface)),
     });
+    return fromBackendSurface(s);
+  }
+
+  /** JSON Merge Patch (RFC 7396) over a stored surface: `null` removes a field. */
+  async patchSurface(surfaceId: string, patch: Record<string, unknown>): Promise<AgentSurface> {
+    const s = await this.request<AgentSurface>(`/surfaces/${encodeURIComponent(surfaceId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': MERGE_PATCH_CONTENT_TYPE },
+      body: JSON.stringify(patch),
+    });
+    return fromBackendSurface(s);
+  }
+
+  /** JSON Merge Patch over one stored variant of a surface. */
+  async patchSurfaceVariant(
+    surfaceId: string,
+    variantId: string,
+    patch: Record<string, unknown>
+  ): Promise<AgentSurface> {
+    const s = await this.request<AgentSurface>(
+      `/surfaces/${encodeURIComponent(surfaceId)}/variants/${encodeURIComponent(variantId)}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': MERGE_PATCH_CONTENT_TYPE },
+        body: JSON.stringify(patch),
+      }
+    );
     return fromBackendSurface(s);
   }
 
@@ -1210,6 +1238,21 @@ export interface McpHttpConfig {
   };
 }
 
+/**
+ * RFC 9728 discovery an MCP Access Point publishes for its JWT Bearer caller
+ * authentication (`ProtectedResourceConfig` in `src/protocols/protected_resource.rs`).
+ */
+export interface ProtectedResourceConfig {
+  resource: string;
+  authorization_servers: string[];
+  scopes?: string[];
+}
+
+export interface CallerAuthentication {
+  methods: unknown[];
+  protected_resource?: ProtectedResourceConfig;
+}
+
 export interface AgentSurface {
   surface_id: string;
   name: string;
@@ -1225,6 +1268,7 @@ export interface AgentSurface {
     listen_address: string;
     route: string;
     protocol: 'a2a' | 'ap2' | 'mcp';
+    caller_authentication?: CallerAuthentication;
     caller_context?: { mode: 'required' | 'optional' | 'anonymous' };
     identity_resolution?: any;
     inbound_policy?: { policy_definition_id: string };

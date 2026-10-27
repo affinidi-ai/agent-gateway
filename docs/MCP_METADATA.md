@@ -1418,12 +1418,18 @@ receive and server-side errors keep their behaviour, and requested scopes are
 advertised but not enforced.
 
 A PUT whose `caller_authentication` omits `protected_resource` keeps the
-stored setting, as the dashboard rebuilds `caller_authentication` from its
-methods, while the surface still supports it. A PUT that no longer does, for
-example one that switches the method, sets `forward_header` or `audiences`, or
-moves the protocol off MCP, drops it instead of being refused over a setting
-the dashboard cannot show. PATCH with `null` removes it. The dashboard does not
-edit the setting.
+stored setting while the surface still supports it, so a client that does not
+know the setting cannot switch it off by accident. A PUT that no longer
+supports it, for example one that switches the method, sets `forward_header` or
+`audiences`, or moves the protocol off MCP, drops it instead of being refused
+over a setting the client did not send. PATCH with `null` removes it.
+
+The dashboard edits the setting in the Caller Context editor of an MCP surface
+whose method is JWT Bearer, for the surface and for each variant that overrides
+caller authentication. While discovery is on, the editor keeps `audiences`
+empty, `forward_header` off and the `Authorization` header with the `Bearer`
+scheme. A setting the operator switches off is removed with a merge PATCH
+before the rest of the surface is saved.
 
 The `fabric` CLI sends surface JSON to the gateway as it is, so it sets and
 removes the setting without CLI-specific flags. `--set` sends a JSON Merge

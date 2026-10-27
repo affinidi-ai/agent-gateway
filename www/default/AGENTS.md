@@ -133,6 +133,29 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   that isn't a comma-separated list of HTTP status codes (100 to 599) blocks Save. Test
   ids: `networking-retry-status-codes-input` and
   `networking-retry-connection-errors-only-switch`.
+- **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
+  `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
+  method is JWT Bearer. Turning it on prefills the resource with the Access Point's https listener
+  URL plus its route (left empty otherwise), empties Accepted Audiences, turns token forwarding
+  off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
+  locked while discovery is on, once it holds that value. Authorization servers (1 to 8) and
+  scopes are lists checked as each value is added, and `protectedResource.ts` mirrors the
+  gateway's save rules, which block Save. Leaving JWT Bearer drops the setting. A variant shows
+  the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A failed save whose
+  message names the setting shows in the section and in the sidebar, which also shows whether
+  discovery is on.
+- A PUT that leaves out a stored `protected_resource` keeps it, so Save first removes a setting
+  the operator dropped with a JSON Merge Patch (`removeDroppedProtectedResources`): the surface
+  through `apiClient.patchSurface`, and each variant through `apiClient.patchSurfaceVariant`.
+  When the PUT then fails, its error says the setting was already removed.
+
+| Element                                                   | Test id                                                                                                                                                                                            |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Discovery switch, resource, use listener URL              | `caller-auth-discovery-switch`, `caller-auth-discovery-resource-input`, `caller-auth-discovery-use-listener-url-button`                                                                            |
+| List, where `<list>` is `authorization-server` or `scope` | `caller-auth-discovery-<list>-input`, `caller-auth-discovery-add-<list>-button`, `caller-auth-discovery-<list>-<index>`, `caller-auth-discovery-remove-<list>-<index>-button`                      |
+| Variant resource, rules explainer toggle                  | `caller-auth-discovery-variant-resource`, `caller-auth-discovery-context-toggle`                                                                                                                   |
+| Errors                                                    | `caller-auth-discovery-save-error`, `caller-auth-discovery-rules-error`, `caller-auth-discovery-resource-error`, `caller-auth-discovery-<list>s-error`, `caller-auth-discovery-<list>-input-error` |
+| Sidebar status and error                                  | `caller-auth-panel-discovery-status`, `caller-auth-panel-discovery-save-error`                                                                                                                     |
 
 ## Trust Recorder
 
