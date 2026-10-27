@@ -13,6 +13,10 @@ use crate::storage::filesystem::{StorageBackend, cached_storage};
 /// file operations and caching, eliminating code duplication.
 pub struct FileSystemGatewayStore {
     storage: Box<dyn StorageBackend<Gateway>>,
+    /// Held from reading a gateway before a write to the write itself, so the
+    /// policy changes and stream revocations of a write are relative to the
+    /// record it replaced.
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl FileSystemGatewayStore {
@@ -22,7 +26,10 @@ impl FileSystemGatewayStore {
         proxy_did: Option<String>,
     ) -> Result<Self> {
         let storage = cached_storage(storage_dir, "gateway").await?;
-        let store = Self { storage };
+        let store = Self {
+            storage,
+            writes: tokio::sync::Mutex::new(()),
+        };
 
         let all_gateways = store.list_all().await?;
         if all_gateways.is_empty() {
@@ -108,6 +115,7 @@ impl FileSystemGatewayStore {
         &self,
         gateway: &Gateway,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
         let previous = self
             .storage
             .get(&gateway.id)
@@ -115,6 +123,7 @@ impl FileSystemGatewayStore {
         self.storage
             .save(gateway)
             .await?;
+        drop(write);
         crate::audit::policy_changes::gateway_written(
             previous
                 .as_ref()
@@ -187,10 +196,12 @@ impl GatewayStore for FileSystemGatewayStore {
         &self,
         id: &str,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
         let previous = self.storage.get(id).await;
         self.storage
             .delete(id)
             .await?;
+        drop(write);
         crate::audit::policy_changes::gateway_written(
             previous
                 .as_ref()
@@ -270,6 +281,60 @@ mod tests {
             .map(|record| action_category(&record.event))
             .collect();
         assert_eq!(categories, vec!["policy_attached", "policy_detached"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_to_one_gateway_record_a_chain_of_changes() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::capture;
+        use crate::delegation_vault::audit::action_category;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+            .await
+            .expect("store");
+        let with_policy = |id: &str| {
+            let mut peer =
+                Gateway::new("peer".into(), String::new(), "did:web:peer.example".into(), GatewayType::Remote);
+            peer.id = "gw-1".to_string();
+            peer.opa_policy_config = Some(super::super::types::GatewayOpaPolicyConfig {
+                enabled: true,
+                policy_definition_id: Some(id.to_string()),
+                ..Default::default()
+            });
+            peer
+        };
+        let (a, b, c) = (with_policy("a"), with_policy("b"), with_policy("c"));
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .create(&a)
+                .await
+                .expect("create");
+            let (first, second) = tokio::join!(store.update(&b), store.update(&c));
+            first.expect("update");
+            second.expect("update");
+        }))
+        .await;
+
+        let ids = |category: &str| -> Vec<String> {
+            records
+                .iter()
+                .filter(|record| action_category(&record.event) == category)
+                .map(|record| {
+                    serde_json::to_value(&record.event).unwrap()[category]["policy_definition_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        let (attached, detached) = (ids("policy_attached"), ids("policy_detached"));
+        assert_eq!(attached.len(), 3, "{records:?}");
+        assert_eq!(detached.len(), 2, "{records:?}");
+        assert_eq!(detached[0], "a", "the first write replaced the stored policy");
+        assert_eq!(detached[1], attached[1], "the second write replaced the first one's policy");
     }
 
     #[tokio::test]

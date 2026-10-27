@@ -14,6 +14,9 @@ use crate::storage::filesystem::{StorageBackend, cached_storage};
 /// Filesystem-based implementation of AgentSurfaceStore with in-memory cache
 pub struct FileSystemAgentSurfaceStore {
     storage: Box<dyn StorageBackend<AgentSurface>>,
+    /// Held from reading a surface before a write to the write itself, so the
+    /// policy changes a write records are relative to the surface it replaced.
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl FileSystemAgentSurfaceStore {
@@ -26,7 +29,10 @@ impl FileSystemAgentSurfaceStore {
             .await?
             .len();
         info!("Loaded {} agent surface(s)", count);
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            writes: tokio::sync::Mutex::new(()),
+        })
     }
 
     pub fn subscribe(
@@ -65,12 +71,14 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         &self,
         surface: &AgentSurface,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
         let before = self
             .before_change(&surface.surface_id)
             .await;
         self.storage
             .save(surface)
             .await?;
+        drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface.surface_id.clone(),
         ));
@@ -95,12 +103,14 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         &self,
         surface_id: &str,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
         let before = self
             .before_change(surface_id)
             .await;
         self.storage
             .delete(surface_id)
             .await?;
+        drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface_id.to_string(),
         ));
@@ -185,5 +195,43 @@ mod tests {
         .await;
 
         assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_to_one_surface_record_a_chain_of_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .save(&surface("a"))
+                .await
+                .unwrap();
+            let (b, c) = (surface("b"), surface("c"));
+            let (first, second) = tokio::join!(store.save(&b), store.save(&c));
+            first.unwrap();
+            second.unwrap();
+        }))
+        .await;
+
+        let ids = |category: &str| -> Vec<String> {
+            records
+                .iter()
+                .filter(|record| action_category(&record.event) == category)
+                .map(|record| {
+                    serde_json::to_value(&record.event).unwrap()[category]["policy_definition_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        let (attached, detached) = (ids("policy_attached"), ids("policy_detached"));
+        assert_eq!(attached.len(), 3, "{records:?}");
+        assert_eq!(detached.len(), 2, "{records:?}");
+        assert_eq!(detached[0], "a", "the first write replaced the stored policy");
+        assert_eq!(detached[1], attached[1], "the second write replaced the first one's policy");
     }
 }
