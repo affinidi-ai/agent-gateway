@@ -1,13 +1,27 @@
 import {
   callerDidOf,
+  changedPartsLabel,
   fieldStr,
   flowLabel,
+  modeLabel,
+  planeLabel,
+  policyChange,
+  policyChangeTitle,
   scopeLabel,
+  slotLabel,
   surfaceIdOf,
+  targetHref,
+  targetLabel,
   traceTerminated,
 } from './auditHelpers';
-import { trustErrorClause } from './eventNarrative';
-import type { AuditEntry, PolicyDecisionData, TrustCheckData } from './types';
+import { actorLabel, trustErrorClause, type UserNameResolver } from './eventNarrative';
+import type {
+  AuditEntry,
+  PolicyChangeData,
+  PolicyChangeEvent,
+  PolicyDecisionData,
+  TrustCheckData,
+} from './types';
 
 export interface FieldItem {
   term: string;
@@ -32,7 +46,8 @@ export interface FieldGroup {
 export function fieldGroups(
   entry: AuditEntry,
   pd: PolicyDecisionData | null,
-  tc: TrustCheckData | null
+  tc: TrustCheckData | null,
+  userName?: UserNameResolver
 ): FieldGroup[] {
   const caller = entry.caller;
   const surfaceId = surfaceIdOf(entry);
@@ -64,6 +79,10 @@ export function fieldGroups(
   add(identity, 'Subject', fieldStr(caller?.sub), { mono: true });
   add(identity, 'Email', fieldStr(caller?.email ?? caller?.email_redacted));
   add(identity, 'Name', fieldStr(caller?.name ?? caller?.name_redacted));
+
+  const change = policyChange(entry);
+  if (change)
+    return [{ label: 'Identity', items: identity }, ...changeGroups(entry, change, add, userName)];
 
   const routing: FieldItem[] = [];
   if (surfaceName) {
@@ -141,5 +160,87 @@ export function fieldGroups(
     { label: 'Credentials', items: credentials },
     { label: 'Trace', items: trace },
     { label: 'Policy', items: policy },
+  ];
+}
+
+type AddField = (
+  arr: FieldItem[],
+  term: string,
+  value?: string,
+  extra?: Omit<FieldItem, 'term' | 'value'>
+) => void;
+
+const SOURCE_LABEL: Record<string, string> = {
+  definition_deleted: 'Definition deleted',
+  ownership: 'Owner reassigned',
+};
+
+/** "before → after" when a value changed, else the current value. */
+function transition(before?: string, after?: string): string | undefined {
+  return before && after && before !== after ? `${before} → ${after}` : after;
+}
+
+const yesNo = (value?: boolean | null) =>
+  typeof value === 'boolean' ? (value ? 'Yes' : 'No') : undefined;
+
+const version = (value?: number | null) => (typeof value === 'number' ? `v${value}` : undefined);
+
+/** The Change, Policy, Where and Refusal groups of a policy change record. */
+function changeGroups(
+  entry: AuditEntry,
+  { name, change }: { name: PolicyChangeEvent; change: PolicyChangeData },
+  add: AddField,
+  userName?: UserNameResolver
+): FieldGroup[] {
+  const what: FieldItem[] = [];
+  add(what, 'Action', policyChangeTitle(name));
+  add(what, 'Actor', actorLabel(change.actor, userName));
+  add(what, 'Source', SOURCE_LABEL[change.source]);
+  add(what, 'Request', fieldStr(entry.request_id), { mono: true });
+
+  const policy: FieldItem[] = [];
+  const policyTab =
+    change.policy_type === 'gateway' || change.policy_type === 'agent_surface'
+      ? `/policies?tab=${change.policy_type}`
+      : undefined;
+  add(policy, 'Policy', fieldStr(change.policy_name) ?? fieldStr(change.policy_definition_id), {
+    ...(policyTab ? { href: policyTab } : {}),
+  });
+  add(policy, 'Policy definition', fieldStr(change.policy_definition_id), { mono: true });
+  add(
+    policy,
+    'Policy version',
+    transition(version(change.previous_policy_version), version(change.policy_version))
+  );
+  add(policy, 'Policy SHA', fieldStr(change.policy_content_hash), { mono: true });
+  add(policy, 'Previous SHA', fieldStr(change.previous_policy_content_hash), { mono: true });
+  add(policy, 'Changed', changedPartsLabel(change.changed));
+
+  const where: FieldItem[] = [];
+  const target = targetLabel(change);
+  const href = targetHref(change);
+  add(where, 'Target', target, href ? { href } : {});
+  add(where, 'Slot', slotLabel(change));
+  add(where, 'Scope', change.scope ? scopeLabel(change.scope) : undefined);
+  add(where, 'Variant', fieldStr(change.variant));
+  add(where, 'Transit point', fieldStr(change.transit_point), { mono: true });
+  add(where, 'MCP tool', fieldStr(change.mcp_tool_name), { mono: true });
+  add(where, 'Gate', fieldStr(change.gate));
+  add(where, 'Plane', change.plane ? planeLabel(change.plane) : undefined);
+  add(where, 'Mode', transition(modeLabel(change.previous_mode), modeLabel(change.mode)));
+  add(where, 'Enabled', transition(yesNo(change.previous_enabled), yesNo(change.enabled)));
+
+  const refusal: FieldItem[] = [];
+  if (name === 'policy_change_refused') {
+    add(refusal, 'Attempted', change.action ? policyChangeTitle(change.action) : undefined);
+    add(refusal, 'Status', change.status != null ? String(change.status) : undefined);
+    add(refusal, 'Reason', fieldStr(change.reason));
+  }
+
+  return [
+    { label: 'Change', items: what },
+    { label: 'Policy', items: policy },
+    { label: 'Where', items: where },
+    { label: 'Refusal', items: refusal },
   ];
 }

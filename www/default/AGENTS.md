@@ -278,6 +278,24 @@ title is `policy-instructions-title`, the arrow `policy-instructions-chevron` si
 button and flips with the state, and the body is `policy-instructions-body`. Build collapsible
 panels the same way, and do not put `role="button"` on a wrapper around a heading.
 
+## Audit page: policy changes
+
+The seven policy change events (`policy_created`, `policy_updated`, `policy_deleted`,
+`policy_attached`, `policy_detached`, `policy_attachment_changed`, `policy_change_refused`) are
+read with `policyChange` (`pages/AuditPage/auditHelpers.ts`), never by indexing `entry.event`
+in components.
+
+- The list row and the panel title use `describeEntry`: one sentence saying which policy changed
+  where, and a detail line naming the actor and why (`definition_deleted`, `ownership`). Refused
+  changes are red, deletions and detachments amber, the rest neutral.
+- The footnote shows the actor instead of the caller. Records hold ids only; `useUserNames`
+  resolves user ids to usernames from `/users` once per page load and keeps the id when the
+  list is not readable.
+- The evidence pane shows only **Details** for a change (no request journey or signed
+  presentation), grouped as Change, Policy, Where and Refusal. The policy links to the Policies
+  tab of its type, the target to its surface or gateway page.
+- Every value is rendered as React text; record fields come from the gateway and are untrusted.
+
 ## MCP Proxy write warnings
 
 MCP Proxy create and update responses can carry `warnings`, for example when only the

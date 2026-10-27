@@ -4,6 +4,7 @@ import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import AuditPage from '..';
 import { apiClient } from '../../../api';
+import { clearUserNames } from '../useUserNames';
 
 jest.mock('../../../api', () => ({
   apiClient: {
@@ -367,5 +368,66 @@ describe('AuditPage forwarding', () => {
     await screen.findByTestId('audit-list');
     expect(mockGet).not.toHaveBeenCalledWith('/integrations');
     expect(screen.queryByTestId('audit-forward-button')).not.toBeInTheDocument();
+  });
+});
+
+describe('AuditPage policy changes', () => {
+  const CHANGE_RESPONSE = {
+    events: [
+      {
+        id: 'change-1',
+        timestamp: '2026-10-27T10:00:00Z',
+        event: {
+          policy_attached: {
+            policy_definition_id: 'deny-pii',
+            policy_name: '<img src=x onerror=alert(1)>',
+            policy_type: 'agent_surface',
+            policy_version: 3,
+            target: { kind: 'surface', id: 'surface-1', name: 'Orders' },
+            scope: 'surface',
+            slot: 'inbound',
+            actor: { kind: 'user', id: 'u-1' },
+            source: 'api',
+          },
+        },
+        surface_id: 'surface-1',
+        channel_name: 'Orders',
+        request_id: '0123456789abcdef',
+        via_fabric: false,
+      },
+    ],
+    total: 1,
+    page: 1,
+    limit: 50,
+    category_counts: { policy_attached: 1 },
+  };
+
+  beforeEach(() => {
+    mockPermissions = {};
+    clearUserNames();
+    mockGet.mockReset();
+    mockGet.mockImplementation((url: string) =>
+      Promise.resolve({
+        data: url === '/users' ? [{ user_id: 'u-1', username: 'alice' }] : CHANGE_RESPONSE,
+      })
+    );
+  });
+
+  it('describes the change by its actor’s name and shows its details without a request journey', async () => {
+    renderPage();
+
+    const item = await screen.findByTestId('audit-item-0');
+    expect(within(item).getByText('Policy attached')).toBeInTheDocument();
+    expect(
+      within(item).getByText(
+        '“<img src=x onerror=alert(1)>” v3 was added to surface Orders as its inbound policy.'
+      )
+    ).toBeInTheDocument();
+    await waitFor(() => expect(within(item).getByText('user alice')).toBeInTheDocument());
+
+    const evidence = screen.getByTestId('audit-evidence');
+    expect(within(evidence).queryByTestId('audit-journey')).not.toBeInTheDocument();
+    expect(within(evidence).getByText('Where')).toBeInTheDocument();
+    expect(within(evidence).getByText('inbound policy')).toBeInTheDocument();
   });
 });

@@ -5,12 +5,13 @@ import AuditFieldList from './AuditFieldList';
 import AuditJourney from './AuditJourney';
 import AuditProvenance from './AuditProvenance';
 import AuditTrustChain from './AuditTrustChain';
-import { extractEmbeddedDecisions, policyDecision, trustCheck } from './auditHelpers';
+import { extractEmbeddedDecisions, policyChange, policyDecision, trustCheck } from './auditHelpers';
 import { signedVpEntry, traceSiblings } from './evidence';
 import { fieldGroups } from './fieldGroups';
 import { buildJourney } from './journey';
 import { buildTrustChain } from './trustChain';
 import { useDidNames } from './useDidNames';
+import { useUserNames } from './useUserNames';
 import type { AuditEntry } from './types';
 
 interface AuditEvidencePaneProps {
@@ -32,8 +33,20 @@ const AuditEvidencePane: React.FC<AuditEvidencePaneProps> = ({
   onQuickFilter,
 }) => {
   const resolveName = useDidNames();
+  const userName = useUserNames();
   const pd = policyDecision(entry);
   const tc = trustCheck(entry);
+
+  if (policyChange(entry)) {
+    return (
+      <div className="audit-evidence" data-testid="audit-evidence">
+        <section className="audit-evidence-block">
+          <div className="audit-evidence-label">Details</div>
+          <AuditFieldList groups={fieldGroups(entry, null, null, userName)} />
+        </section>
+      </div>
+    );
+  }
 
   const siblings = traceSiblings(filteredEntries, entry);
   const journey = buildJourney(siblings);

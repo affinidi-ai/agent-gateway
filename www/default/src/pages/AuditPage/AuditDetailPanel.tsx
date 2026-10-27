@@ -5,6 +5,7 @@ import AuditQuickFilters from './AuditQuickFilters';
 import { callerDidOf, eventTypeName, policyDecision, surfaceIdOf } from './auditHelpers';
 import { describeEntry } from './eventNarrative';
 import type { AuditEntry } from './types';
+import { useUserNames } from './useUserNames';
 
 interface AuditDetailPanelProps {
   entry: AuditEntry | null;
@@ -24,8 +25,9 @@ const AuditDetailPanel: React.FC<AuditDetailPanelProps> = ({
   onTitleClick,
   onQuickFilter,
 }) => {
+  const userName = useUserNames();
   const open = entry != null;
-  const narrative = entry ? describeEntry(entry) : null;
+  const narrative = entry ? describeEntry(entry, userName) : null;
   const tone = narrative?.tone ?? 'neutral';
   const pd = entry ? policyDecision(entry) : null;
   const callerDid = entry ? callerDidOf(entry) : null;

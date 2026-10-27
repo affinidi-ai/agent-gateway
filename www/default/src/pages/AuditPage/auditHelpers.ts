@@ -1,11 +1,14 @@
 import { parseVp } from '../../components/shared/VpViewer';
-import type {
-  AuditEntry,
-  EmbeddedDecision,
-  PolicyDecisionData,
-  TraceTerminatedData,
-  TrustCheckData,
-  WorkloadIntent,
+import {
+  POLICY_CHANGE_EVENTS,
+  type AuditEntry,
+  type EmbeddedDecision,
+  type PolicyChangeData,
+  type PolicyChangeEvent,
+  type PolicyDecisionData,
+  type TraceTerminatedData,
+  type TrustCheckData,
+  type WorkloadIntent,
 } from './types';
 
 export const PAGE_LIMIT = 50;
@@ -18,9 +21,23 @@ export const CATEGORY_OPTIONS = [
   { value: 'vp_injected', label: 'VP Injected', lowFrequency: true },
   { value: 'token_injected', label: 'Token Injected', lowFrequency: true },
   { value: 'consent_granted', label: 'Consent Granted', lowFrequency: true },
+  { value: 'policy_created', label: 'Policy Created', lowFrequency: true },
+  { value: 'policy_updated', label: 'Policy Updated', lowFrequency: true },
+  { value: 'policy_deleted', label: 'Policy Deleted', lowFrequency: true },
+  { value: 'policy_attached', label: 'Policy Attached', lowFrequency: true },
+  { value: 'policy_detached', label: 'Policy Detached', lowFrequency: true },
+  { value: 'policy_attachment_changed', label: 'Policy Attachment Changed', lowFrequency: true },
+  { value: 'policy_change_refused', label: 'Policy Change Refused', lowFrequency: true },
 ] as const;
 
 const CATEGORY_BADGE: Record<string, string> = {
+  policy_created: 'badge-success',
+  policy_attached: 'badge-success',
+  policy_updated: 'badge-info',
+  policy_attachment_changed: 'badge-info',
+  policy_deleted: 'badge-warning',
+  policy_detached: 'badge-warning',
+  policy_change_refused: 'badge-danger',
   policy_decision: 'badge-primary',
   trust_check: 'badge-info',
   trace_terminated: 'badge-warning',
@@ -149,6 +166,14 @@ export function categoryLabel(name: string): string {
       return 'User Revoked';
     case 'token_not_found':
       return 'Not Found';
+    case 'policy_created':
+    case 'policy_updated':
+    case 'policy_deleted':
+    case 'policy_attached':
+    case 'policy_detached':
+    case 'policy_attachment_changed':
+    case 'policy_change_refused':
+      return CATEGORY_OPTIONS.find(option => option.value === name)?.label ?? name;
     default:
       return name.replace(/_/g, ' ');
   }
@@ -197,6 +222,88 @@ export function traceTerminated(entry: AuditEntry): TraceTerminatedData | null {
     return (entry.event as { trace_terminated: TraceTerminatedData }).trace_terminated;
   }
   return null;
+}
+
+/** Extracts a policy change event's name and body if present, else null */
+export function policyChange(
+  entry: AuditEntry
+): { name: PolicyChangeEvent; change: PolicyChangeData } | null {
+  if (typeof entry.event !== 'object' || entry.event === null) return null;
+  const event = entry.event as Partial<Record<PolicyChangeEvent, PolicyChangeData>>;
+  for (const name of POLICY_CHANGE_EVENTS) {
+    const change = event[name];
+    if (change) return { name, change };
+  }
+  return null;
+}
+
+/** Sentence-case name of a policy change, e.g. "Policy attached". */
+export function policyChangeTitle(name: PolicyChangeEvent): string {
+  const label = categoryLabel(name);
+  return label.charAt(0) + label.slice(1).toLowerCase();
+}
+
+/** Where on its target a change applies, e.g. "inbound policy" or "MCP tool gate condition". */
+export function slotLabel(change: PolicyChangeData): string | undefined {
+  switch (change.slot) {
+    case 'target':
+      return change.target?.kind === 'gateway' ? 'gateway policy' : 'request policy';
+    case 'inbound':
+      return 'inbound policy';
+    case 'response':
+      return 'response policy';
+    case 'transit':
+      return 'transit policy';
+    case 'transit_point':
+      return `transit point ${change.scope === 'response' ? 'response' : 'request'} policy`;
+    case 'mcp_tool':
+      return 'MCP tool policy';
+    case 'mcp_tool_gate':
+      return 'MCP tool gate condition';
+    case 'plane':
+      return 'appliance-wide plane';
+    default:
+      return change.slot ?? undefined;
+  }
+}
+
+/** An appliance-wide plane in words, e.g. "agent surface". */
+export function planeLabel(plane?: string | null): string {
+  return (plane ?? '').replace(/_/g, ' ');
+}
+
+/** The surface, gateway or appliance-wide plane a change applies to, e.g. "surface Orders". */
+export function targetLabel(change: PolicyChangeData): string | undefined {
+  const target = change.target;
+  if (!target) return undefined;
+  if (target.kind === 'appliance') return `the appliance-wide ${planeLabel(change.plane)} plane`;
+  const name = target.name || target.id;
+  return name ? `${target.kind} ${name}` : target.kind;
+}
+
+/** The dashboard page of a change's target, when it has one. */
+export function targetHref(change: PolicyChangeData): string | undefined {
+  const id = change.target?.id;
+  if (!id) return undefined;
+  if (change.target?.kind === 'surface') return `/surfaces/${encodeURIComponent(id)}`;
+  if (change.target?.kind === 'gateway') return `/gateways/${encodeURIComponent(id)}`;
+  return undefined;
+}
+
+const POLICY_FIELD_LABEL: Record<string, string> = {
+  rego: 'Rego',
+  sample_input: 'sample input',
+};
+
+/** The parts of a definition an update changed, e.g. "Rego, name". */
+export function changedPartsLabel(changed?: string[]): string | undefined {
+  if (!changed?.length) return undefined;
+  return changed.map(part => POLICY_FIELD_LABEL[part] ?? part.replace(/_/g, ' ')).join(', ');
+}
+
+/** `enforced` or `monitor-only`. */
+export function modeLabel(mode?: string | null): string | undefined {
+  return mode ? mode.replace(/_/g, '-') : undefined;
 }
 
 /** Pull `workloadBinding.intent` out of an entry's signed VP, when present. */
