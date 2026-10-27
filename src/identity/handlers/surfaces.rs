@@ -2593,7 +2593,7 @@ mod validation_tests {
 
         // An edit the stored setting no longer fits drops it instead of
         // refusing the save over a field the dashboard cannot show.
-        let api_key = serde_json::json!([
+        let other_method = serde_json::json!([
             {"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}
         ]);
         let forwarding = serde_json::json!([
@@ -2602,7 +2602,9 @@ mod validation_tests {
         let audience = serde_json::json!([
             {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["https://gateway.example/mcp"]}
         ]);
-        for changed_methods in [api_key, forwarding, audience] {
+        for (change, changed_methods) in
+            [("method", other_method), ("forward_header", forwarding), ("audiences", audience)]
+        {
             let changed: crate::config::agent_surface::CallerAuthentication =
                 serde_json::from_value(serde_json::json!({"methods": changed_methods})).unwrap();
             let mut switched = mcp_surface();
@@ -2617,7 +2619,7 @@ mod validation_tests {
                 .unwrap()
                 .caller_authentication = Some(changed);
             retain_mcp_settings(&mut switched, &existing);
-            assert_eq!(stored_resource(&switched), (None, None), "{changed_methods}");
+            assert_eq!(stored_resource(&switched), (None, None), "{change}");
         }
         let mut a2a = mcp_surface();
         a2a.access_point.protocol = SurfaceProtocol::A2a;
