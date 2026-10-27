@@ -303,22 +303,14 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
             .await
             && iss == self_did
         {
-            return self
-                .verify_local_jwt(token, &self_did)
-                .await;
-            let jwks = self
-                .self_authority
-                .issuer_jwks()
-                .await
-                .map_err(|e| StsError::ServerError(format!("gateway jwks projection failed: {e}")))?;
-            let strategy = gateway_self_trust_strategy(&self_did, &jwks)?;
             let claims = self
-                .verifier
-                .validate(token, &strategy, &[])
-                .await
-                .map_err(|e| StsError::InvalidGrant(format!("assertion verification failed: {e}")))?;
+                .verify_local_jwt(token, &self_did)
+                .await?;
             // Self-issued: we minted it, so we know exactly what it was for and
-            // can hold it to our own rules (VTA-17 / condition 6).
+            // can hold it to our own rules (VTA-17 / condition 6). This must stay
+            // on the same path as the signature check — a token that verifies but
+            // is being replayed in a role it was never issued for (an ID-JAG as a
+            // `subject_token`) is exactly what this refuses.
             enforce_self_issued_subject_claims(&claims, &self_did)?;
             return Ok(claims);
         }
@@ -351,35 +343,6 @@ impl StsSubjectVerifier for JwtBearerSubjectVerifier {
         }
         self.verify_jwt(token).await
     }
-}
-
-/// JOSE `typ` values this gateway puts on tokens **it issues**. None of them is
-/// an identity assertion, so none may be presented back as a token-exchange
-/// `subject_token` (VTA-17 / SEC0-6115 condition 6).
-///
-/// Without this, the self-trust path added for loopback ID-JAG redemption
-/// doubles as a confusion gadget: any gateway-issued token verifies as
-/// self-issued, so a caller holding one could present it as a *subject
-/// assertion* and exchange it for a token with a **different audience**. An
-/// ID-JAG has its own redemption grant (`jwt-bearer`), and an access token is
-/// a resource credential, not a statement about who someone is.
-const REJECTED_SUBJECT_TOKEN_TYPS: &[&str] = &[ID_JAG_JWT_TYP, "at+jwt"];
-
-/// Refuse a gateway-issued artifact presented as a `subject_token`.
-///
-/// `typ` is read from the compact JWS header. The header is part of the signed
-/// input, so for a token that has already verified this value is authentic;
-/// this is called before verification too, where it can only cause a refusal —
-/// never an acceptance — so an unverified read is safe here.
-fn reject_gateway_issued_subject_token(token: &str) -> Result<(), StsError> {
-    if let Some(typ) = parse_jose_typ(token)
-        && REJECTED_SUBJECT_TOKEN_TYPS
-            .iter()
-            .any(|rejected| rejected.eq_ignore_ascii_case(&typ))
-    {
-        return Err(StsError::InvalidGrant(format!("a token of type {typ} cannot be used as a subject_token")));
-    }
-    Ok(())
 }
 
 /// Claims a **self-issued** subject token must carry.
@@ -997,10 +960,6 @@ async fn handle_token_exchange(
         } else {
             assertion_expiry = claimed_expiry(&subject_claims);
         }
-        // A token this gateway issued is not an identity assertion (VTA-17).
-        // Checked here, on the exchange path itself, so it holds whatever
-        // `StsSubjectVerifier` is wired in.
-        reject_gateway_issued_subject_token(&req.subject_token)?;
         enforce_subject_audience(&record, &subject_claims)?;
     }
     let (subject_sub, subject_act) = extract_subject_and_act(&subject_claims);
@@ -3461,6 +3420,15 @@ mod tests {
 
     // ── VTA-17 / SEC0-6115 condition 6: subject-path hardening ───────────────
 
+    /// The DID `state_with` reports as this gateway's issuer.
+    const GATEWAY_DID: &str = "did:webvh:example:gw";
+
+    /// A state with no client and no verifier claims: `reject_self_issued`
+    /// reads only `config.mcp_issuer`, so nothing else has to be stood up.
+    fn self_issued_state() -> StsState {
+        state_with(HashMap::new(), client(base_record(), Some("s3cret")))
+    }
+
     fn jwt_with(
         header: &str,
         payload: &str,
@@ -3474,27 +3442,49 @@ mod tests {
         // An ID-JAG has its own redemption grant (`jwt-bearer`). Accepting one
         // as a subject assertion would let a caller exchange it for a token
         // with a different audience.
-        let token = jwt_with(r#"{"alg":"EdDSA","typ":"oauth-id-jag+jwt"}"#, r#"{"iss":"did:example:gw"}"#);
-        let err = reject_gateway_issued_subject_token(&token).expect_err("an ID-JAG must be refused");
-        assert!(matches!(err, StsError::InvalidGrant(_)), "got {err:?}");
+        let claims = json!({ "iss": GATEWAY_DID });
+        let token = typed_assertion(ID_JAG_JWT_TYP, &claims);
+        let state = self_issued_state();
+        let err = reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims)
+            .expect_err("an ID-JAG must be refused");
+        assert!(matches!(err, StsError::UnsupportedTokenType(_)), "got {err:?}");
     }
 
     #[test]
     fn an_access_token_cannot_be_presented_as_a_subject_token() {
-        let token = jwt_with(r#"{"alg":"EdDSA","typ":"at+jwt"}"#, r#"{"iss":"did:example:gw"}"#);
+        // `at+jwt` is a resource credential, not a statement about who someone
+        // is, so the legacy `typ: JWT` exemption must not extend to it.
+        let claims = json!({ "iss": GATEWAY_DID });
+        let token = typed_assertion("at+jwt", &claims);
+        let state = self_issued_state();
         assert!(
-            reject_gateway_issued_subject_token(&token).is_err(),
+            reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims).is_err(),
             "an access token is a resource credential, not an identity assertion"
         );
     }
 
     #[test]
     fn an_ordinary_assertion_is_accepted_as_a_subject_token() {
-        // A third-party ID token (typ JWT, or no typ at all) must keep working.
-        for header in [r#"{"alg":"RS256","typ":"JWT"}"#, r#"{"alg":"RS256"}"#] {
-            let token = jwt_with(header, r#"{"iss":"https://idp.example"}"#);
-            reject_gateway_issued_subject_token(&token).unwrap_or_else(|e| panic!("{header} should pass: {e:?}"));
+        // A third-party assertion must keep working whatever `typ` it carries —
+        // the refusal is scoped to what *this gateway* issued, so an external
+        // IdP's ID-JAG is none of its business.
+        let claims = json!({ "iss": "https://idp.example" });
+        let state = self_issued_state();
+        for typ in ["JWT", ID_JAG_JWT_TYP, "at+jwt"] {
+            let token = typed_assertion(typ, &claims);
+            reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims)
+                .unwrap_or_else(|e| panic!("an external {typ} should pass: {e:?}"));
         }
+    }
+
+    /// The one gateway-issued artifact the legacy endpoint still accepts.
+    #[test]
+    fn the_legacy_endpoint_still_accepts_its_own_access_token() {
+        let claims = json!({ "iss": GATEWAY_DID });
+        let token = typed_assertion("JWT", &claims);
+        let state = self_issued_state();
+        reject_self_issued(&state, GATEWAY_DID, None, "subject", &token, &claims)
+            .expect("the legacy exchange accepts one of its own `typ: JWT` access tokens");
     }
 
     #[test]

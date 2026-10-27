@@ -445,10 +445,17 @@ impl Verifier for LocalVerifier {
 
         // Reject a stale presentation before doing any signature work: the
         // proof's own `expires`, falling back to its signed `created` time.
-        let proof = presentation
-            .get("proof")
-            .ok_or_else(|| anyhow::anyhow!("VP missing proof field"))?;
-        verify_vp_proof_lifetime(proof)?;
+        //
+        // Normalised through `proofs_of` so the three unsigned shapes are one
+        // case: absent, `"proof": []`, and a `proof` that is neither object nor
+        // array. An empty array in particular would otherwise pass a bare
+        // `get("proof")` and carry an unsigned presentation into verification.
+        // Every proof is bounded, so adding a second, stale proof cannot buy a
+        // presentation more life than its shortest one allows.
+        let proofs = proofs_of(presentation, "VP")?;
+        for proof in &proofs {
+            verify_vp_proof_lifetime(proof)?;
+        }
 
         let resolver = CompositeResolver::new(self.did_cache.clone());
         let vm_resolver = VerificationMethodDIDResolver::<_, AnyMethod>::new(resolver);
@@ -504,6 +511,12 @@ impl Verifier for LocalVerifier {
             credentials.push(vc_result);
         }
 
+        // Replay bindings come from the holder's proof. `proofs_of` guarantees
+        // at least one, and the first is the holder proof in every shape the
+        // gateway produces or accepts; the caller compares these against what
+        // it challenged with, so a presentation whose binding does not match is
+        // refused there.
+        let proof = &proofs[0];
         let domain = proof
             .get("domain")
             .and_then(|d| d.as_str())

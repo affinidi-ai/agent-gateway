@@ -15,8 +15,14 @@
 //! 5. `signature = Ed25519(hashData)`.
 //! 6. `proofValue = multibase-base58btc(signature)` (a `z…` string).
 //!
-//! JCS is RFC 8785 (serde_jcs), which sorts object keys, so field order here is
-//! irrelevant — only the set of members matters.
+//! JCS is RFC 8785 (`serde_json_canonicalizer`), which sorts object keys, so
+//! field order here is irrelevant — only the set of members matters.
+//!
+//! It is deliberately **not** `serde_jcs`: this binary builds `serde_json` with
+//! `arbitrary_precision` (the alloy stack enables it), and under that feature
+//! `serde_jcs` serialises every number through an unimplemented path and
+//! panics. Signed documents routinely carry numbers — a JWT's `exp` and `iat`
+//! among them — so that would abort the process on the signing path.
 
 use chrono::{SecondsFormat, Utc};
 use multibase::Base;
@@ -32,7 +38,7 @@ pub const PROOF_TYPE_DATA_INTEGRITY: &str = "DataIntegrityProof";
 pub const PROOF_PURPOSE_AUTHENTICATION: &str = "authentication";
 
 fn jcs(value: &Value) -> Result<String, VtaError> {
-    serde_jcs::to_string(value).map_err(|e| VtaError::Signing(format!("JCS canonicalisation: {e}")))
+    serde_json_canonicalizer::to_string(value).map_err(|e| VtaError::Signing(format!("JCS canonicalisation: {e}")))
 }
 
 /// Produce the `eddsa-jcs-2022` proof object for `document` (which must **not**
@@ -148,5 +154,44 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(a["proofValue"], b["proofValue"], "proof presence changes the signature");
+    }
+
+    /// Numbers must canonicalise rather than abort the process.
+    ///
+    /// This binary builds `serde_json` with `arbitrary_precision`, under which
+    /// `serde_jcs` routes every number through an unimplemented path and
+    /// panics. Every signed token carries numeric `exp`/`iat`, so that would
+    /// take the signing path down on ordinary input — and a document whose
+    /// numbers come from a caller would make it reachable from outside.
+    #[tokio::test]
+    async fn a_document_carrying_numbers_signs_rather_than_panicking() {
+        let key = ControlKey::from_seed([5u8; 32]);
+        let doc = json!({
+            "id": "urn:uuid:22222222-2222-2222-2222-222222222222",
+            "payload": {
+                "keyId": "gateway-jwt",
+                "payload": { "sub": "urn:agent:demo", "iat": 1_761_000_000, "exp": 1_761_000_900, "amount": 1.5 },
+            },
+        });
+
+        let proof = sign_document(&doc, &key, PROOF_PURPOSE_AUTHENTICATION)
+            .await
+            .expect("a document with numeric claims must sign");
+        assert!(
+            proof["proofValue"]
+                .as_str()
+                .is_some_and(|v| v.starts_with('z')),
+            "a numeric claim set still yields a multibase proof value"
+        );
+    }
+
+    /// RFC 8785 orders object members by key, so the same claims in a different
+    /// source order must produce the same signing input — the property the VTA
+    /// relies on when it re-canonicalises what it received.
+    #[test]
+    fn member_order_does_not_change_the_canonical_form() {
+        let a = json!({ "id": "x", "payload": { "exp": 2, "iat": 1 } });
+        let b = json!({ "payload": { "iat": 1, "exp": 2 }, "id": "x" });
+        assert_eq!(jcs(&a).unwrap(), jcs(&b).unwrap(), "JCS sorts members");
     }
 }

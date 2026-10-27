@@ -294,6 +294,7 @@ mod tests {
             channel_config_id: None,
             is_local: true,
             verified: true,
+            origin: None,
         };
         crate::identity::store::IdentityStore::create(&*store, record)
             .await
@@ -349,6 +350,7 @@ mod tests {
             channel_config_id: None,
             is_local: true,
             verified: true,
+            origin: None,
         };
         crate::identity::store::IdentityStore::create(&*store, record)
             .await

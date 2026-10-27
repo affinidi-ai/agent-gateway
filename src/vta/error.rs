@@ -37,7 +37,13 @@ impl fmt::Display for VtaError {
             // appear in its text.
             Self::Signing(_) => write!(f, "VTA auth document signing failed"),
             Self::Transport(_) => write!(f, "VTA transport error"),
-            Self::Http { status, .. } => write!(f, "VTA returned HTTP {status}"),
+            Self::Http { status, .. } => match self.trust_task_code() {
+                // The Trust-Task error `code` is a namespaced contract slug with
+                // no secrets (the body it comes from stays in logs), so naming
+                // it makes a contract violation diagnosable at the call site.
+                Some(code) => write!(f, "VTA returned HTTP {status} ({code})"),
+                None => write!(f, "VTA returned HTTP {status}"),
+            },
             Self::Protocol(_) => write!(f, "VTA response was not understood"),
             Self::Config(_) => write!(f, "VTA connector is misconfigured"),
             // Safe to surface: the detail is a limit and a retry hint, built by
@@ -58,6 +64,28 @@ impl VtaError {
             Self::Signing(d) | Self::Transport(d) | Self::Protocol(d) | Self::Config(d) | Self::QuotaExceeded(d) => d,
             Self::Http { body, .. } => body,
         }
+    }
+
+    /// The Trust-Task error `code` carried in an `Http` error body, when the
+    /// body is a `trust-task-error` document (flat or in a `#response`
+    /// envelope's `payload`).
+    ///
+    /// The code is a namespaced contract slug — `keys/sign-jws:payloadInvalid`,
+    /// `keys/sign-jws:headerMemberForbidden`, `keys:notFound` and the rest — so
+    /// it is safe to surface: it names *which* part of the contract failed and
+    /// carries no secrets. The `message` and raw body stay in logs only.
+    pub fn trust_task_code(&self) -> Option<String> {
+        let Self::Http { body, .. } = self else {
+            return None;
+        };
+        let doc: serde_json::Value = serde_json::from_str(body).ok()?;
+        doc.get("code")
+            .or_else(|| {
+                doc.get("payload")
+                    .and_then(|p| p.get("code"))
+            })
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
     }
 
     /// Whether the operation may be safely retried once: a transport-level
@@ -181,5 +209,42 @@ mod tests {
         ] {
             assert!(!format!("{err}").contains("sensitive-detail"), "Display is generic");
         }
+    }
+
+    /// A sign-jws contract code (forbidden header, invalid payload, …) is
+    /// surfaced in `Display` so the failure is diagnosable, while the body —
+    /// which may carry a `message` or echoed material — stays in logs only.
+    #[test]
+    fn a_trust_task_error_code_is_surfaced_but_the_body_is_not() {
+        let err = VtaError::Http {
+            status: 422,
+            body: r#"{"code":"keys/sign-jws:headerMemberForbidden","message":"bearer SECRET","retryable":false}"#
+                .to_string(),
+        };
+        assert_eq!(
+            err.trust_task_code()
+                .as_deref(),
+            Some("keys/sign-jws:headerMemberForbidden")
+        );
+        let shown = format!("{err}");
+        assert!(shown.contains("422"), "status is surfaced: {shown}");
+        assert!(shown.contains("keys/sign-jws:headerMemberForbidden"), "the code aids diagnosis: {shown}");
+        assert!(!shown.contains("SECRET"), "the message/body never reaches Display: {shown}");
+    }
+
+    /// The real VTA carries the error payload inside a `#response` envelope, so
+    /// the code must read through `payload` as well as flat.
+    #[test]
+    fn a_trust_task_error_code_reads_through_the_response_envelope() {
+        let err = VtaError::Http {
+            status: 404,
+            body: r#"{"type":"…/trust-task-error/0.5#response","payload":{"code":"keys:notFound","retryable":false}}"#
+                .to_string(),
+        };
+        assert_eq!(
+            err.trust_task_code()
+                .as_deref(),
+            Some("keys:notFound")
+        );
     }
 }

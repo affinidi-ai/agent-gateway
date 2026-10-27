@@ -727,7 +727,7 @@ mod live_tests {
                 did: Cow::Borrowed(agent_did),
                 identity_fields: Cow::Owned(fields),
                 workload_binding: None,
-                    display_name: None,
+                display_name: None,
             }))
             .await
             .expect("issue an agent-identity credential in the provisioned context");

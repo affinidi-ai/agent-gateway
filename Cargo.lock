@@ -742,7 +742,6 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_dynamo",
- "serde_jcs",
  "serde_json",
  "serde_json_canonicalizer",
  "serde_urlencoded",

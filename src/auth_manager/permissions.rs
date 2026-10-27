@@ -406,7 +406,7 @@ mod tests {
     async fn permissions_endpoint_enumerates_vta_connections() {
         let (storage, _dir, user_id) = storage_with_user(UserRole::Administrator).await;
         let rbac = Arc::new(RbacConfig::default());
-        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+        let (_, Json(perms)) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
             .await
             .expect("permissions endpoint should succeed for an admin");
         assert_eq!(perms["vta_connections.view"], serde_json::Value::Bool(true));
@@ -418,7 +418,7 @@ mod tests {
     async fn permissions_endpoint_reports_vta_connections_false_for_poweruser() {
         let (storage, _dir, user_id) = storage_with_user(UserRole::PowerUser).await;
         let rbac = Arc::new(RbacConfig::default());
-        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+        let (_, Json(perms)) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
             .await
             .expect("permissions endpoint should succeed for a poweruser");
         // Choosing which agent holds the appliance's signing keys is an
@@ -433,7 +433,7 @@ mod tests {
     async fn permissions_endpoint_enumerates_key_management() {
         let (storage, _dir, user_id) = storage_with_user(UserRole::Administrator).await;
         let rbac = Arc::new(RbacConfig::default());
-        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+        let (_, Json(perms)) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
             .await
             .expect("permissions endpoint should succeed for an admin");
         assert_eq!(perms["key_management.view"], serde_json::Value::Bool(true));
@@ -441,7 +441,7 @@ mod tests {
 
         let (storage, _dir, user_id) = storage_with_user(UserRole::PowerUser).await;
         let rbac = Arc::new(RbacConfig::default());
-        let Json(perms) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac))
+        let (_, Json(perms)) = get_permissions(Extension(user_id), Extension(storage), Extension(rbac), None)
             .await
             .expect("permissions endpoint should succeed for a poweruser");
         // Present but false: the dashboard evaluates the key, so it must exist.

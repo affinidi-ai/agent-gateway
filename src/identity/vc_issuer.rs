@@ -3367,7 +3367,7 @@ mod tests {
         let identity_fields = HashMap::from([("name".to_string(), json!("agent-a"))]);
 
         let jwt = issuer
-            .create_credential("did:example:agent-a", &identity_fields, None)
+            .create_credential("did:example:agent-a", &identity_fields, None, None)
             .await
             .expect("local signing succeeds");
 
@@ -3401,7 +3401,7 @@ mod tests {
             .await;
 
         let jwt = issuer
-            .create_credential("did:example:agent-b", &identity_fields, None)
+            .create_credential("did:example:agent-b", &identity_fields, None, None)
             .await
             .expect("the local connector signs without deadlocking on the config lock");
 
@@ -3421,7 +3421,7 @@ mod tests {
         let identity_fields = HashMap::from([("name".to_string(), json!("agent-c"))]);
 
         let jwt = issuer
-            .create_credential("did:example:agent-c", &identity_fields, None)
+            .create_credential("did:example:agent-c", &identity_fields, None, None)
             .await
             .expect("the connector signs the credential");
 
@@ -3453,7 +3453,7 @@ mod tests {
         let identity_fields = HashMap::from([("name".to_string(), json!("agent-d"))]);
 
         let err = issuer
-            .create_credential("did:example:agent-d", &identity_fields, None)
+            .create_credential("did:example:agent-d", &identity_fields, None, None)
             .await
             .expect_err("a down connector must not yield a credential");
 
@@ -3483,7 +3483,7 @@ mod tests {
         let identity_fields = HashMap::from([("name".to_string(), json!("agent-e"))]);
 
         issuer
-            .create_credential("did:example:agent-e", &identity_fields, Some("surface-with-no-mapping"))
+            .create_credential("did:example:agent-e", &identity_fields, None, Some("surface-with-no-mapping"))
             .await
             .expect("an unmapped surface signs with the appliance key");
 
@@ -3530,7 +3530,7 @@ mod tests {
 
         let identity_fields = HashMap::from([("name".to_string(), json!("agent-f"))]);
         let jwt = issuer
-            .create_credential("did:example:agent-f", &identity_fields, Some("surface-mapped-local"))
+            .create_credential("did:example:agent-f", &identity_fields, None, Some("surface-mapped-local"))
             .await
             .expect("the mapped backend signs");
 
@@ -3575,7 +3575,7 @@ mod tests {
 
         let fields = HashMap::from([("name".to_string(), json!("no-surface"))]);
         let jwt = issuer
-            .create_credential("did:example:no-surface", &fields, None)
+            .create_credential("did:example:no-surface", &fields, None, None)
             .await
             .expect("issuing without a surface succeeds");
 
@@ -3605,7 +3605,7 @@ mod tests {
 
         // Before: no directory, no connector — the pre-VTA gateway.
         let before = issuer
-            .create_credential("did:example:legacy", &fields, None)
+            .create_credential("did:example:legacy", &fields, None, None)
             .await
             .expect("pre-VTA issuance");
 
@@ -3624,7 +3624,7 @@ mod tests {
             .await;
 
         let after = issuer
-            .create_credential("did:example:legacy", &fields, None)
+            .create_credential("did:example:legacy", &fields, None, None)
             .await
             .expect("issuance after the directory is installed");
 
@@ -3904,7 +3904,7 @@ mod live_tests {
 
         let fields = HashMap::from([("name".to_string(), json!("live-agent"))]);
         let jwt = issuer
-            .create_credential("did:example:live-agent", &fields, Some("live-mapped-surface"))
+            .create_credential("did:example:live-agent", &fields, None, Some("live-mapped-surface"))
             .await
             .expect("the live VTA signs the credential");
 
@@ -3941,7 +3941,7 @@ mod live_tests {
             .await;
 
         let via_local = issuer
-            .create_credential("did:example:local-agent", &fields, Some("live-local-surface"))
+            .create_credential("did:example:local-agent", &fields, None, Some("live-local-surface"))
             .await
             .expect("the locally-mapped surface signs");
         assert_eq!(
@@ -3951,7 +3951,7 @@ mod live_tests {
         );
 
         let via_vta = issuer
-            .create_credential("did:example:live-agent", &fields, Some("live-mapped-surface"))
+            .create_credential("did:example:live-agent", &fields, None, Some("live-mapped-surface"))
             .await
             .expect("the VTA-mapped surface still signs");
         assert_ne!(
@@ -3987,7 +3987,7 @@ mod live_tests {
             .await;
 
         let unmapped = issuer
-            .create_credential("did:example:appliance-agent", &fields, Some("a-surface-that-maps-nothing"))
+            .create_credential("did:example:appliance-agent", &fields, None, Some("a-surface-that-maps-nothing"))
             .await
             .expect("the appliance override signs for an unmapped surface");
         assert_ne!(
@@ -4244,7 +4244,7 @@ mod live_connection_tests {
         let fields = HashMap::from([("name".to_string(), json!("live-conn"))]);
 
         let first = issuer
-            .create_credential("did:example:live-a", &fields, Some("s-default"))
+            .create_credential("did:example:live-a", &fields, None, Some("s-default"))
             .await
             .expect("the stored connection signs");
         assert_eq!(
@@ -4259,7 +4259,7 @@ mod live_connection_tests {
         // *same* connection signs with a different key, so rotating or
         // revoking one cannot affect the other.
         let second = issuer
-            .create_credential("did:example:live-b", &fields, Some("s-other"))
+            .create_credential("did:example:live-b", &fields, None, Some("s-other"))
             .await
             .expect("the second surface signs");
         assert_eq!(

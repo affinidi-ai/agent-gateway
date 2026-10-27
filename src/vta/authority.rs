@@ -36,17 +36,25 @@ const TASK_KEYS_SIGN_JWS: &str = "https://trusttasks.org/spec/keys/sign-jws/0.1"
 /// `keys/show/0.1` — read a key record (public key only; no secret material).
 const TASK_KEYS_SHOW: &str = "https://trusttasks.org/spec/keys/show/0.1";
 
-/// JOSE/IANA algorithm the gateway's Ed25519 VTA key signs with. The VTA
-/// re-asserts `alg` from the key record, so this is the gateway's declared
-/// expectation, not a value the VTA trusts blindly.
+/// The JOSE algorithm the gateway's Ed25519 VTA key signs with. The VTA sets
+/// `alg` from the key record and echoes it; the gateway checks the returned
+/// value against this so a signature it is about to attribute to its own issuer
+/// DID cannot have been made under a different algorithm.
 const SIGNING_ALGORITHM: &str = "EdDSA";
 
 /// The `keys/sign-jws` result body. Deserializing into a typed struct (rather
 /// than a free `Value`) makes the client unwrap the VTA's `#response`
-/// Trust-Task envelope to its `payload`, where the real VTA carries `jws`.
+/// Trust-Task envelope to its `payload`, where the real VTA carries these.
+///
+/// `alg` and `keyId` are **required**: the VTA echoes the key it signed with
+/// and the algorithm it chose, and the gateway verifies both before it
+/// attributes the signature to its own issuer DID (fail closed on a mismatch).
 #[derive(Debug, Deserialize)]
 struct SignJwsResult {
     jws: String,
+    alg: String,
+    #[serde(rename = "keyId")]
+    key_id: String,
 }
 
 /// The `keys/show` result body (public fields only). `key` is **not** optional:
@@ -188,6 +196,12 @@ impl VtaCredentialAuthority {
     /// carrying the JOSE `typ` + `kid` header and naming the pinned signing key.
     /// The VTA holds the key and re-asserts `alg`; the gateway never sees the
     /// key. A successful sign is audited (bounded, hashes-only, non-blocking).
+    ///
+    /// The request is **DI-signed** by the control key: `keys/sign-jws/0.1`
+    /// declares its request proof mandatory, and a bearer-only call is refused
+    /// `proofRequired`. The bearer says a session exists; the proof says *this*
+    /// request came from the key behind it — which is what makes each signature
+    /// individually attributable rather than merely session-authorised.
     async fn sign_jws(
         &self,
         claims: &Value,
@@ -204,10 +218,26 @@ impl VtaCredentialAuthority {
         });
         let response: SignJwsResult = self
             .client
-            .dispatch(TASK_KEYS_SIGN_JWS, request)
+            .dispatch_signed(TASK_KEYS_SIGN_JWS, request)
             .await?;
         if response.jws.trim().is_empty() {
             return Err(VtaError::Protocol("keys/sign-jws response carried an empty `jws`".to_string()));
+        }
+        // Fail closed on attribution: the token is about to be published under
+        // this gateway's issuer DID, so the VTA must have signed with the key
+        // we named, under the algorithm that key uses. A mismatch is a contract
+        // or configuration fault, never something to sign a token on.
+        if response.key_id != self.signing_key_id {
+            return Err(VtaError::Protocol(format!(
+                "keys/sign-jws echoed key `{}` but `{}` was requested",
+                response.key_id, self.signing_key_id
+            )));
+        }
+        if response.alg != SIGNING_ALGORITHM {
+            return Err(VtaError::Protocol(format!(
+                "keys/sign-jws signed with `{}`; the gateway key uses `{SIGNING_ALGORITHM}`",
+                response.alg
+            )));
         }
         if let Some(audit) = &self.audit {
             let subject = claims
@@ -357,6 +387,9 @@ mod poc_tests {
         signing: Arc<SigningKey>,
         sign_calls: Arc<AtomicUsize>,
         last_key_id: Arc<Mutex<Option<String>>>,
+        /// When set, the `keys/sign-jws` response echoes this `keyId` instead of
+        /// the requested one — used to drive the fail-closed attribution check.
+        key_id_echo_override: Arc<Mutex<Option<String>>>,
     }
 
     fn b64(bytes: &[u8]) -> String {
@@ -421,8 +454,20 @@ mod poc_tests {
             let sig = vta
                 .signing
                 .sign(signing_input.as_bytes());
-            // Only `jws` crosses back — no key material.
-            return Json(json!({ "jws": format!("{signing_input}.{}", b64(&sig.to_bytes())) }));
+            // The real VTA echoes the key it signed with and the algorithm it
+            // chose; only `jws` carries signature material — no key crosses back.
+            let echoed_key_id = vta
+                .key_id_echo_override
+                .lock()
+                .unwrap()
+                .clone()
+                .map(Value::String)
+                .unwrap_or_else(|| payload["keyId"].clone());
+            return Json(json!({
+                "jws": format!("{signing_input}.{}", b64(&sig.to_bytes())),
+                "alg": "EdDSA",
+                "keyId": echoed_key_id,
+            }));
         }
         Json(json!({ "error": "unexpected task" }))
     }
@@ -432,6 +477,7 @@ mod poc_tests {
             signing,
             sign_calls: Arc::new(AtomicUsize::new(0)),
             last_key_id: Arc::new(Mutex::new(None)),
+            key_id_echo_override: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
             .route("/trust-tasks", post(trust_tasks))
@@ -499,6 +545,34 @@ mod poc_tests {
                 .as_deref(),
             Some("key-gateway-jwt"),
             "the pinned signing key is the one the VTA used",
+        );
+    }
+
+    /// Fail closed on attribution: if the VTA echoes a different `keyId` than
+    /// the one requested, the token is refused rather than published under the
+    /// gateway's issuer DID with a key the gateway never pinned.
+    #[tokio::test]
+    async fn a_mismatched_response_key_id_is_refused() {
+        let signing = Arc::new(SigningKey::from_bytes(&[11u8; 32]));
+        let (base, vta) = spawn(Arc::clone(&signing)).await;
+        *vta.key_id_echo_override
+            .lock()
+            .unwrap() = Some("some-other-key".to_string());
+        let auth = authority(&base, "key-gateway-jwt");
+
+        let err = auth
+            .sign_token(&json!({ "sub": "x" }))
+            .await
+            .expect_err("a key-id mismatch must not yield a token");
+        let vta_err = err
+            .downcast_ref::<VtaError>()
+            .expect("the failure is a VtaError");
+        assert!(
+            vta_err
+                .log_detail()
+                .contains("some-other-key"),
+            "the error names the unexpected key: {}",
+            vta_err.log_detail()
         );
     }
 

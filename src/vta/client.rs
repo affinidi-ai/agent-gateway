@@ -251,7 +251,8 @@ impl VtaRestClient {
     /// Used in production by context provisioning (VTA-16): a gateway holding
     /// the narrow `context-create` capability creates its own per-surface
     /// contexts, so provisioning is no longer out-of-band. The signing path
-    /// itself (`keys/sign-jws`) remains bearer-only.
+    /// (`keys/sign-jws`) uses it too — that specification declares its request
+    /// proof mandatory, so a bearer-only call is refused `proofRequired`.
     pub async fn dispatch_signed<T: DeserializeOwned>(
         &self,
         type_uri: &str,

@@ -67,9 +67,13 @@ pub fn grant_command(
 /// **Why the capabilities are spelled out.** `effective_capabilities` treats
 /// explicitly named role-derived capabilities as a *narrowing*: naming them
 /// reduces the grant to exactly those. So this command confers precisely
-/// `{context-create, key-mint, sign}` — strictly less than the whole
+/// `{context-create, key-mint, sign, sign-jws}` — strictly less than the whole
 /// `application` role the original command handed over, despite the
 /// higher-sounding role name.
+///
+/// `sign-jws` is named explicitly because the VTA does **not** accept `sign` as
+/// a substitute for it: a grant without it pairs and verifies cleanly, then
+/// refuses every signing call at runtime.
 pub fn grant_command_with_provisioning(
     control_did: &str,
     context_id: &str,

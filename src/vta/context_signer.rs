@@ -29,12 +29,19 @@ const TASK_CONTEXTS_GET: &str = "https://trusttasks.org/spec/vta/contexts/get/1.
 /// `keys/sign-jws/0.1`.
 const TASK_KEYS_SIGN_JWS: &str = "https://trusttasks.org/spec/keys/sign-jws/0.1";
 
-/// The only algorithm the gateway's keys sign with.
+/// The JOSE algorithm the context's `did:key` signs with. The VTA echoes the
+/// algorithm it chose; the gateway checks it so an attestation it attributes to
+/// the context DID cannot have been made under a different one.
 const SIGNING_ALGORITHM: &str = "EdDSA";
 
+/// The `keys/sign-jws` result. `alg` and `keyId` are echoed by the VTA and
+/// verified before the signature is attributed to the context DID.
 #[derive(Debug, Deserialize)]
 struct SignJwsResult {
     jws: String,
+    alg: String,
+    #[serde(rename = "keyId")]
+    key_id: String,
 }
 
 /// Signs artifacts that must be attributable to a DID a verifier can resolve.
@@ -151,9 +158,27 @@ impl ContextSigner for VtaContextSigner {
         });
         let response: SignJwsResult = self
             .client
-            .dispatch(TASK_KEYS_SIGN_JWS, request)
+            .dispatch_signed(TASK_KEYS_SIGN_JWS, request)
             .await
             .map_err(|e| anyhow!("signing as context `{}`: {e}", self.context_id))?;
+        // Fail closed on attribution: a peer resolves the claimed DID and
+        // demands the signing key be declared there, so the VTA must have used
+        // exactly the key this context designates, under its algorithm.
+        if response.key_id != identity.key_id {
+            return Err(anyhow!(
+                "signing as context `{}`: VTA echoed key `{}` but `{}` was requested",
+                self.context_id,
+                response.key_id,
+                identity.key_id
+            ));
+        }
+        if response.alg != SIGNING_ALGORITHM {
+            return Err(anyhow!(
+                "signing as context `{}`: VTA signed with `{}`; the context key uses `{SIGNING_ALGORITHM}`",
+                self.context_id,
+                response.alg
+            ));
+        }
         Ok(response.jws)
     }
 }

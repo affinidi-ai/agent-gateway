@@ -191,6 +191,8 @@ fn legacy_managed_record(
             })
             .collect(),
         private_key: None,
+        vta_context_id: None,
+        vta_connection_id: None,
         channel_config_id: surface_ids
             .first()
             .map(|id| id.to_string()),

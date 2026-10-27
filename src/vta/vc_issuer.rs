@@ -190,7 +190,7 @@ mod tests {
             did: Cow::Borrowed(did),
             identity_fields: Cow::Owned(fields),
             workload_binding: None,
-                    display_name: None,
+            display_name: None,
         })
     }
 
@@ -231,6 +231,7 @@ mod tests {
             did: Cow::Borrowed("did:peer:agent"),
             identity_fields: Cow::Owned(HashMap::new()),
             workload_binding: Some(binding.clone()),
+            display_name: None,
         });
         let IssueVcPayload::AgentIdentity(agent) = payload;
         let claims = if let Some(ref wb) = agent.workload_binding {

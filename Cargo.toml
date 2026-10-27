@@ -158,8 +158,12 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 jsonschema = "0.41.0"
 
 # did:webvh support
+#
+# JCS canonicalisation for did:webvh deliberately uses the workspace's
+# `serde_json_canonicalizer` rather than `serde_jcs`: this binary builds
+# `serde_json` with `arbitrary_precision` (the alloy stack enables it), under
+# which `serde_jcs` panics on any number it is asked to serialise.
 didwebvh-rs = { version = "0.7.0", optional = true }
-serde_jcs = { version = "0.1", optional = true }
 
 # WebAuthn for passkey authentication
 webauthn-rs = "0.5"
@@ -306,7 +310,7 @@ harness = false
 
 [features]
 default = ["didwebvh"]
-didwebvh = ["didwebvh-rs", "serde_jcs"]
+didwebvh = ["didwebvh-rs"]
 
 [profile.dev]
 # Skip dsymutil pass on macOS - major time saver

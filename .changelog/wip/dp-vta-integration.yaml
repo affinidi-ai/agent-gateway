@@ -2,9 +2,58 @@ branch: dp-vta-integration
 changes:
   added: []
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-10-27T05:00:00Z'
+      title: Sign through a trust agent again by proving who is asking
+      description: >-
+        The trust agent requires every signing request to prove it came from
+        the gateway, not merely that a session exists. The gateway was sending
+        the request without that proof, so the agent refused all of them and
+        nothing could be signed through a connected agent at all. The proof is
+        now attached, and an external identity provider's grant is no longer
+        turned away when it is offered as proof of who someone is.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-27T02:00:00Z'
+      title: Hold a gateway-issued identity assertion to its own rules again
+      description: >-
+        When the gateway verifies a token it issued itself, it checks that the
+        token was addressed to this gateway and carries a unique identifier,
+        so one minted for another audience cannot be replayed here. An earlier
+        tidy-up left that check stranded behind an early exit, so it stopped
+        running while still appearing to be in place. It runs again on the
+        same path as the signature check.
+    - timestamp: '2026-10-27T03:00:00Z'
+      title: Stop a signed document containing a number from aborting the gateway
+      description: >-
+        Preparing a document for signing used a canonicaliser that, in the way
+        this product is built, stops the whole process the moment the document
+        contains a number rather than reporting a problem. Numbers are present
+        in almost everything that gets signed, including the issue and expiry
+        times on every token, and in places the content comes from the caller.
+        The gateway now uses the same canonicaliser as the rest of the product,
+        which handles them, and a test covers it.
+    - timestamp: '2026-10-27T06:00:00Z'
+      title: Stop a published identity log or payment request from aborting the gateway
+      description: >-
+        The same canonicaliser fault reached three more places: reading an
+        identity log published by somebody else, creating and updating this
+        gateway's own identity logs, and preparing a payment request. The first
+        is the one that mattered most, because the document comes from outside
+        and a single number anywhere in it was enough to stop the gateway
+        rather than fail the check. All of them now use the canonicaliser the
+        rest of the product uses, and the old one is gone from the build.
+        Identities are unaffected: the canonical form both produce was
+        confirmed identical, and a test now pins the identifier a fixed log
+        entry produces so this cannot drift unnoticed.
+    - timestamp: '2026-10-27T04:00:00Z'
+      title: Reject an unsigned presentation whose proof list is empty
+      description: >-
+        A presentation that carried an empty list of signatures, rather than
+        none at all, passed the check meant to stop unsigned documents from
+        reaching a verification decision. It is now refused like any other
+        unsigned presentation, and a presentation carrying several signatures
+        has each of them checked for expiry instead of only the first.
   breaking: []
   internal:
     - timestamp: '2026-10-23T07:00:00.000Z'
@@ -242,3 +291,29 @@ changes:
         key until someone restarted it. Nothing failed in any of these cases,
         which is why nothing was reported. All three are fixed and covered by
         tests that fail without the fix.
+    - timestamp: '2026-10-27T00:00:00Z'
+      title: Restore the trust-agent test build after the sign-jws request change
+      description: >-
+        The test suite stopped compiling after the sign-jws signing request
+        dropped its algorithm field and the agent identity record and
+        credential issuer grew display-name, origin, and trust-agent context
+        fields. The affected tests now build those records and call the
+        credential issuer with the current shapes, and two constants left
+        unused by the dropped request field were removed, so the whole tree
+        builds and its checks can run again.
+    - timestamp: '2026-10-27T01:00:00Z'
+      title: Refuse a trust-agent signature that was not made by the key we asked for
+      description: >-
+        The trust agent reports which key it signed with and which algorithm it
+        used. The gateway now checks both against what it asked for and refuses
+        the result when they disagree, rather than publishing a token or an
+        attestation under its own identity on the strength of a signature it
+        cannot account for. When the agent rejects a signing request, the
+        reason it gives is now included in the failure, so a refused call says
+        which part of the contract failed instead of only that something
+        returned an error; the agent's full reply still stays in the logs.
+        The setup guide records that permission to sign this way is a separate
+        one which the general signing permission does not cover, so an agent
+        connected before it existed must be granted it again. That shortfall
+        is otherwise invisible: pairing succeeds and only the first signature
+        fails.

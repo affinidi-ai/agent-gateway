@@ -520,6 +520,8 @@ mod tests {
             last_used_at: None,
             channel_usage: vec![],
             private_key: None,
+            vta_context_id: None,
+            vta_connection_id: None,
             channel_config_id: None,
             is_local,
             verified: false,

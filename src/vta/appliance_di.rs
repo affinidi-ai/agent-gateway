@@ -341,6 +341,7 @@ mod tests {
             identity_fields: std::borrow::Cow::Owned(std::collections::HashMap::new()),
             did: std::borrow::Cow::Borrowed("did:key:zAgent"),
             workload_binding: None,
+            display_name: None,
         }))
         .await
         .expect("issue")
@@ -531,6 +532,7 @@ mod live_tests {
                 identity_fields: std::borrow::Cow::Owned(std::collections::HashMap::new()),
                 did: std::borrow::Cow::Borrowed("did:key:z6MkappliancediTest"),
                 workload_binding: None,
+                display_name: None,
             }))
             .await
             .expect("the agent must issue the credential");

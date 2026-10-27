@@ -29,12 +29,21 @@ agent (MCP/A2A)                      gateway                           VTA
      │                                  │  CredentialAuthority          │
      │                                  │    ::sign_token(claims)       │
      │                                  ├── keys/sign-jws/0.1 ─────────►│  VTA-held key
-     │                                  │   { keyId, header{typ},       │  signs
-     │                                  │     payload, algorithm }      │  b64url(h).b64url(p)
-     │                                  │◄──────── { jws } ─────────────┤
+     │                                  │   { keyId, header{typ,kid},   │  signs
+     │                                  │     payload }                 │  b64url(h).b64url(p)
+     │                                  │◄──── { jws, alg, keyId } ─────┤
      │◄──── VTA-signed JWT ─────────────┤  (private key never leaves    │
      │                                  │   the VTA)                    │
 ```
+
+The gateway **never sends `alg`** — the VTA sets it from the key record and
+echoes it, along with the `keyId` it signed with. Both are checked against what
+was requested before the signature is attributed to the gateway's issuer DID: a
+mismatch is refused rather than published. The request itself is DI-signed by
+the control key, because `keys/sign-jws/0.1` declares its request proof
+mandatory. The payload is JCS-canonicalized by the VTA, so the JSON inside the
+returned `jws` is **not byte-identical** to what was sent — use the returned
+`jws` as it is rather than re-deriving its segments.
 
 ## Configure the connector
 
@@ -214,7 +223,10 @@ connection records and pairing state are unaffected.
 ```bash
 cd ../verifiable-trust-infrastructure
 
-# Build the VTA (includes the VTA-06 keys/sign-jws task).
+# Build the VTA (includes the VTA-06 keys/sign-jws task). Build this target
+# specifically: a workspace-wide `cargo build` can unify the `test-support`
+# feature in, which compiles the agent's response-conformance gate into the
+# binary and turns `contexts/get` into a 500 (see Troubleshooting).
 cargo build -p vta-service --features webvh --bin vta
 
 # One-time setup (prints the VTA did:webvh and base URL http://localhost:3000).
@@ -262,6 +274,7 @@ Ed25519-signs, using the same logic as the real handler:
 | Test (`src/vta/authority.rs::poc_tests`) | Asserts |
 |---|---|
 | `sign_token_produces_a_vta_signed_jwt_that_verifies` | a VTA-signed JWT verifies; the pinned `keyId` is used; the VTA sets `alg` |
+| `a_mismatched_response_key_id_is_refused` | a response echoing a different `keyId` yields no token (fail-closed attribution) |
 | `sign_token_typ_carries_the_requested_jose_typ` | the JOSE `typ` (e.g. `oauth-id-jag+jwt`) is honored |
 | `fails_closed_when_the_vta_is_unreachable` | a down VTA errors — no fabricated token |
 | `inputs_are_verified_before_any_vta_signing_call` | an unverified input is refused before any VTA call (no oracle) |
@@ -270,17 +283,32 @@ Ed25519-signs, using the same logic as the real handler:
 | `a_token_verifies_against_its_key_selected_by_kid` | a verifier picks the right key by `kid` |
 | `the_signing_quota_fails_closed_once_exhausted` | an over-quota call never reaches the VTA |
 
-The VTA-side task and its wall-off (`keys/sign-jws/0.1`, a `typ` allow-list, a
-JWT-only output distinct from credential signing) are covered in the
-`verifiable-trust-infrastructure` repo.
+The VTA-side task and its wall-off (`keys/sign-jws/0.1`, the forbidden header
+members, a JWT-only output distinct from credential signing) are covered in the
+`verifiable-trust-infrastructure` repo. The `0.1` spec refuses `alg`, `crit`,
+`b64`, `jwk`, `jku` and `x5u` in `header`; the gateway sends only `typ` and
+`kid`, so none of them can arise from this side.
 
 ## Scope notes
 
 - DI-credential issuance via the VTA (`credentials/issue`) and JWKS discovery
   for local verification are wired in VTA-08; this PoC covers the JWT path.
-- The connector's signing call is bearer-authenticated; write provisioning
-  (`keys/create`) additionally carries a control-key DI proof — done
-  out-of-band at onboarding, not on the hot signing path.
+- Every Trust Task the gateway sends on the signing path carries a control-key
+  DI proof: `keys/sign-jws/0.1` declares its request proof **mandatory**, so a
+  bearer-only call is refused `proofRequired`. The bearer says a session
+  exists; the proof says *this* request came from the key behind it.
+- The live tests need a grant that is **`--role admin` *and* scoped to one
+  context**, which is the combination they jointly describe:
+  `vta acl create --did <control did> --role initiator --contexts gwtest --capabilities context-create,key-mint,sign,sign-jws`
+  followed by `vta acl update <control did> --role admin`. The role is what
+  `live_grant_scope_is_parsed_from_the_real_token` checks is detected as
+  over-privileged; the context scoping is what makes
+  `live_the_gateway_cannot_create_a_top_level_context` get its refusal. An
+  `import-did --role admin` grant leaves contexts **unrestricted** and fails the
+  second test. The published auth DID the `auth_did` chain test mints needs its
+  own entry with the same capabilities — the test prints the exact command.
+- Stop the agent before any `acl` or `context` write: it holds a file lock on
+  its store and the command otherwise fails `FjallError: Locked`.
 
 ## Operator runbook: connecting a trust agent
 
@@ -340,10 +368,14 @@ cannot use a dashboard.
 
 3. **Run the grant command the gateway prints**, on the agent, as an
    administrator. This is the one consent step; the gateway never holds admin
-   on the agent. With provisioning enabled it confers exactly three
-   capabilities — `context-create`, `key-mint`, `sign` — scoped to one context,
-   and uses `vta acl create` because `vta import-did` carries no
+   on the agent. With provisioning enabled it confers exactly four
+   capabilities — `context-create`, `key-mint`, `sign`, `sign-jws` — scoped to
+   one context, and uses `vta acl create` because `vta import-did` carries no
    `--capabilities` flag.
+
+   `sign-jws` is **not** implied by `sign`: a grant carrying only `sign` passes
+   pairing and then refuses every `keys/sign-jws` call at runtime. An agent
+   granted before this capability existed must be re-granted.
 
 4. **Verify.** `GET /v1/vta/status` reports the tier and resolution;
    `GET /v1/key-management/inventory` lists connections, per-surface mappings,
@@ -497,6 +529,9 @@ on what arrives: the embedded credential's issuer should be the agent.
 | `429 rate_limited` | the agent's auth bucket (dev default: burst 10, refill 1/5 s). The gateway honours `retryAfterSecs` and retries once, capped at 2 s |
 | `export: not valid in this context` | `export VAR=1 cmd` — use `VAR=1 cmd` |
 | `context … has no DID, so it cannot sign as itself` | a hand-made context with no identity; the gateway grants one on first use, so this means that call was refused — check the grant carries `context-create` |
+| **Pairing verifies, then every signature fails** | the grant predates the `sign-jws` capability. `sign` is not accepted as a substitute, and the shortfall is invisible until the first signing call — re-run the `vta acl create` command with `sign-jws` included |
+| `422 proofRequired` on a signing call | the request reached the agent without its control-key proof. `keys/sign-jws/0.1` requires one; a bearer token alone is not enough |
+| `500 responseSchemaViolation … 'issuerKeyId' was unexpected` on `contexts/get` | **A development-build symptom only — rebuild the agent and it goes away.** The agent's context record carries `issuerKeyId` and `proofKeyIds`, which its published `vta/contexts/get/1.0` response schema does not define (`additionalProperties: false`), so the agent's own response-conformance gate replaces its reply with a 500. That gate is `#[cfg(any(test, feature = "test-support"))]` and is compiled out of production builds. A workspace-wide `cargo build` can pull `test-support` in through feature unification; `cargo build -p vta-service --features webvh --bin vta` does not, and every live test passes against that binary. It only ever appears once a context has been given a signing key — before that both members are omitted. The durable fix is to define the two members in a later revision of the task specification, which lives in the published `trust-tasks-rs` crate rather than in either repository; raised upstream. |
 
 ### Rolling back
 
