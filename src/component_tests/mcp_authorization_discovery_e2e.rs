@@ -232,6 +232,47 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_browser_client_reads_the_metadata_from_any_origin() {
+    let fixture = JwksFixture::start().await;
+    let (harness, _admin) = start_discovery_gateway(&fixture).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let origin = "https://mcp-client.example";
+
+    let read = client
+        .get(metadata_url(&harness, "/smoke"))
+        .header("origin", origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+    assert_eq!(read.headers()["access-control-allow-origin"], origin);
+
+    let preflight = |method: &'static str| {
+        client
+            .request(reqwest::Method::OPTIONS, metadata_url(&harness, "/smoke"))
+            .header("origin", origin)
+            .header("access-control-request-method", method)
+            .send()
+    };
+    let allowed = preflight("GET")
+        .await
+        .unwrap();
+    assert!(allowed.status().is_success(), "{}", allowed.status());
+    assert_eq!(allowed.headers()["access-control-allow-origin"], origin);
+    let refused = preflight("POST")
+        .await
+        .unwrap();
+    assert!(
+        !refused
+            .headers()
+            .contains_key("access-control-allow-origin")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_caller_without_a_valid_token_is_challenged_to_fetch_one() {
     let fixture = JwksFixture::start().await;
     let (harness, _admin) = start_discovery_gateway(&fixture).await;

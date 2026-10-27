@@ -43,16 +43,20 @@ fn parse_cors_origins(cors_origins: &[String]) -> Arc<Vec<HeaderValue>> {
 }
 
 /// Any origin may read a public discovery document (`GET`/`HEAD` of a public
-/// path); every other request, including a `POST` to a path that only ends
-/// like one, needs an allowlisted origin. `method` is the method the request
-/// will use: for a preflight, its `Access-Control-Request-Method`.
+/// path or of protected resource metadata, which browser MCP clients fetch
+/// cross-origin); every other request, including a `POST` to a path that only
+/// ends like one, needs an allowlisted origin. `method` is the method the
+/// request will use: for a preflight, its `Access-Control-Request-Method`.
 fn is_proxy_cors_origin_allowed(
     origin: &HeaderValue,
     method: &str,
     path: &str,
     origins: &[HeaderValue],
 ) -> bool {
-    if crate::proxy::paths::is_public_request(method, path) {
+    let reads = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+    if crate::proxy::paths::is_public_request(method, path)
+        || reads && crate::protocols::protected_resource::is_metadata_path(path)
+    {
         return true;
     }
 
@@ -596,6 +600,7 @@ pub async fn run_port_server(
                 "/.well-known/oauth-protected-resource/{*path}",
                 axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
             )
+            .layer(proxy_cors_layer(&network_config.cors))
             .with_state(state.as_ref().clone()),
     );
 
@@ -1592,6 +1597,10 @@ mod tests {
             &origins,
         ));
         assert!(is_proxy_cors_origin_allowed(&origin, "HEAD", "/agents/copilot-worker/discovery", &origins,));
+        for path in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp/alpha"] {
+            assert!(is_proxy_cors_origin_allowed(&origin, "GET", path, &origins), "{path}");
+            assert!(!is_proxy_cors_origin_allowed(&origin, "POST", path, &origins), "{path}");
+        }
     }
 
     #[test]

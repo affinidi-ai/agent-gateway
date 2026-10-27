@@ -1393,7 +1393,9 @@ its own setting or none.
 The document is served at `/.well-known/oauth-protected-resource<route>` and
 `/.well-known/oauth-protected-resource<route>$<alias>` (`%24` accepted) on
 the Access Point's listener, with `no-store`, and at the root form only for a
-surface mounted at `/`. It holds `resource`, `authorization_servers`,
+surface mounted at `/`. Any origin may read it (`GET` and `HEAD`, CORS
+included), so a browser-based MCP client can fetch it; other methods keep the
+network configuration's `cors` allowlist. It holds `resource`, `authorization_servers`,
 `bearer_methods_supported: ["header"]` and `scopes_supported` when scopes are
 set. Only active surfaces and enabled variants publish. When the settings
 claiming a path no longer validate at request time, for example after the

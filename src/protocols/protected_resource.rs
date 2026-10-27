@@ -41,6 +41,12 @@ pub fn supports_protected_resource(protocol: &SurfaceProtocol) -> bool {
     *protocol == SurfaceProtocol::Mcp
 }
 
+/// Whether `path` is a protected resource metadata document: the root form
+/// or the form followed by a resource path (RFC 9728 section 3.1).
+pub fn is_metadata_path(path: &str) -> bool {
+    path == "/.well-known/oauth-protected-resource" || path.starts_with("/.well-known/oauth-protected-resource/")
+}
+
 /// A resource identifier and the scopes advertised for it: a canonical HTTPS
 /// URL without credentials, query or fragment, and bounded OAuth scope tokens.
 pub fn validate_resource(
@@ -507,6 +513,20 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    #[test]
+    fn metadata_paths_are_the_root_form_and_its_resource_paths() {
+        for path in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp/alpha"] {
+            assert!(is_metadata_path(path), "{path}");
+        }
+        for path in [
+            "/.well-known/oauth-protected-resource-other",
+            "/mcp/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+        ] {
+            assert!(!is_metadata_path(path), "{path}");
+        }
+    }
 
     #[test]
     fn protected_resource_settings_take_only_https_issuers_and_bounded_scopes() {

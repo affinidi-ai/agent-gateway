@@ -39,6 +39,13 @@ changes:
         with caller authentication, so a client that followed it reached a 404, or the document of
         another endpoint mounted at the root. The challenge is now Bearer realm="agent-gateway"
         only.
+    - timestamp: '2026-10-27T19:30:01Z'
+      title: Let browser MCP clients read protected resource metadata
+      description: >-
+        The /.well-known/oauth-protected-resource documents answered without CORS headers and
+        refused the preflight, so an MCP client running in a browser on another origin could not
+        find the authorization server. Any origin may now read them with GET or HEAD; other
+        methods keep the cors allowlist.
   removed: []
   security:
     - timestamp: '2026-10-27T11:20:02Z'
