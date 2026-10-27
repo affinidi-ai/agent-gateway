@@ -167,13 +167,26 @@ export interface ListViewInfo {
   extras?: import('react').ReactNode[];
 }
 
+/** Where a node sits, for dependency rules that depend on its placement. */
+export interface DependencyNode {
+  id: string;
+  parentId?: string;
+  slotId?: string;
+}
+
+/** Surface facts an element's `edgeSnap.allows` can depend on. */
+export interface SnapContext {
+  /** The Managed Agent's endpoint. */
+  targetEndpoint?: unknown;
+}
+
 export interface FeatureDependency {
   /** Human-readable rule identifier. */
   description: string;
-  /** Predicate: when does this rule apply? */
-  condition: (config: any, ctx: SurfaceContext) => boolean;
+  /** Predicate: when does this rule apply? `node` is the canvas node when the caller has one. */
+  condition: (config: any, ctx: SurfaceContext, node?: DependencyNode) => boolean;
   /** Predicate: is the requirement satisfied? Return true to PASS. */
-  check: (config: any, ctx: SurfaceContext) => boolean;
+  check: (config: any, ctx: SurfaceContext, node?: DependencyNode) => boolean;
   /** Severity if check returns false while condition holds. */
   severity: 'error' | 'warning';
   /** Message shown to the user. */
@@ -289,6 +302,11 @@ export interface NodeDefinition {
     radius?: number;
     /** Allowed edge archetype ids. Undefined = all archetypes considered. */
     archetypes?: ReadonlyArray<string>;
+    /**
+     * Narrows `archetypes` for the current surface: return false to leave
+     * an archetype out. Only consulted when the caller passes a context.
+     */
+    allows?: (archetypeId: string, ctx: SnapContext) => boolean;
   };
   /**
    * Whether this element binds to a request arrow, a response arrow, either
@@ -481,8 +499,13 @@ export interface NodeDefinition {
    * With `payloadOwnsConfig`, a blob node whose slice is missing is still
    * restored when this returns true for its blob config: an unconfigured
    * placeholder (e.g. from a template) that writes nothing to the payload.
+   * `node` is the blob node's placement and `payload` the stored surface.
    */
-  isBlobPlaceholder?: (config: any) => boolean;
+  isBlobPlaceholder?: (
+    config: any,
+    node: { slotId?: string; parentId?: string | null },
+    payload: any
+  ) => boolean;
 
   /**
    * Returns the payload slices this element contributes. Called once per

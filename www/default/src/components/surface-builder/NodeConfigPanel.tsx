@@ -144,7 +144,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
   const def = registry.get(node.type);
   const Panel = def?.ConfigPanel;
   const ctx = buildSurfaceContext(protocol, allNodes, base);
-  const warnings = registry.getDependencyWarnings(node.type, node.config, ctx);
+  const warnings = registry.getDependencyWarnings(node.type, node.config, ctx, node);
   const validationErrors = registry.getValidationErrors(node.type, node.config);
   const label = defLabel(node.type);
   const isFullscreenSurface = def?.configSurface === 'fullscreen';

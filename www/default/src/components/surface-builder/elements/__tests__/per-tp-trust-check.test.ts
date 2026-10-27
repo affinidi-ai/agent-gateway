@@ -138,12 +138,12 @@ describe('per-TP Trust Check — save payload', () => {
     });
   });
 
-  it('does not write a Trust Check list for an MCP Transit Point', () => {
+  it('writes the list of a Trust Check kept on an MCP Transit Point', () => {
     const nodes = canvasWithTrustCheckOn('tp-a');
     nodes[2] = { ...nodes[2], type: 'transit-point-mcp' } as CanvasNode;
     const payload = rebuild(nodes);
     expect(payload.transit.points[0].protocol).toBe('mcp');
-    expect(payload.transit.points[0]).not.toHaveProperty('trust_check_list');
+    expect(payload.transit.points[0].trust_check_list.map((e: any) => e.id)).toEqual(['q-1']);
     expect(payload.target).not.toHaveProperty('trust_check_list');
   });
 
@@ -254,11 +254,12 @@ describe('per-TP Trust Check — hydration', () => {
     expect(rebuilt.transit.points[1].trust_check_migrated).toBe(true);
   });
 
-  it('does not hydrate a Trust Check node for an MCP Transit Point', () => {
+  it('hydrates a stored list on an MCP Transit Point onto that Transit Point', () => {
     const payload = surface();
     payload.transit.points[0].protocol = 'mcp';
     const nodes = registry.nodesFromPayload(payload);
     expect(nodes.filter(n => n.type === 'trust-check').map(n => n.parentId)).toEqual([
+      'transit-point-mcp-1',
       'transit-point-a2a-1',
     ]);
   });

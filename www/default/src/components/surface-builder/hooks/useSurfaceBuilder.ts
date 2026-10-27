@@ -1072,7 +1072,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
     const out: Array<{ nodeId: string; nodeType: string; message: string }> = [];
     for (const n of state.nodes) {
       if (n.type === 'surface') continue;
-      const ws = registry.getDependencyWarnings(n.type, n.config, ctx);
+      const ws = registry.getDependencyWarnings(n.type, n.config, ctx, n);
       for (const w of ws) {
         if (w.severity === 'error') {
           out.push({ nodeId: n.id, nodeType: n.type, message: w.message });

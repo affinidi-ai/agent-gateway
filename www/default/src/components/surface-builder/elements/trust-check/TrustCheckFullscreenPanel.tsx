@@ -8,6 +8,8 @@ import {
   authorityNeedsSelection,
   isMigratedTrustCheck,
   makeDefaultQuery,
+  readOnlyTrustCheckMessage,
+  readOnlyTrustCheckProtocol,
   readQueries,
   trustCheckLeg,
   type TrustCheckQueryConfig,
@@ -30,8 +32,10 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   updateField,
   updateFields,
   closeFullscreenEditor,
+  allNodes,
 }) => {
   const leg = trustCheckLeg(node);
+  const readOnlyProtocol = readOnlyTrustCheckProtocol(node, allNodes);
   const isApMa = leg === 'caller';
   const legLabel = isApMa ? 'caller' : 'target';
 
@@ -251,6 +255,11 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
         <div className="text-muted small mt-1">
           <strong>Only a maximum of {TRUST_CHECK_LIST_MAX} queries allowed per Trust Check.</strong>
         </div>
+        {readOnlyProtocol && (
+          <div className="small mt-1" data-testid="trust-check-fullscreen-read-only">
+            {readOnlyTrustCheckMessage(readOnlyProtocol)}
+          </div>
+        )}
       </div>
 
       {leg === 'transit-point' && isMigratedTrustCheck(config) && (
@@ -272,7 +281,11 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             {draft.length}/{TRUST_CHECK_LIST_MAX}
           </span>
         </div>
-        <div className="card-body">
+        <fieldset
+          className="card-body"
+          disabled={!!readOnlyProtocol}
+          data-testid="trust-check-fullscreen-queries"
+        >
           {draft.length === 0 ? (
             <p className="text-muted small mb-3">
               No queries yet. Add one to start checking the trust registry.
@@ -291,7 +304,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
           >
             <i className="fas fa-plus me-1" /> Add Another Query
           </button>
-        </div>
+        </fieldset>
       </div>
 
       <div className="d-flex justify-content-end gap-2">
@@ -306,16 +319,18 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
           <i className="fas fa-times me-1" />
           {hasChanges ? 'Discard' : 'Close'}
         </button>
-        <button
-          type="button"
-          className="btn btn-primary"
-          onClick={handleSave}
-          disabled={!hasChanges || !closeFullscreenEditor}
-          data-testid="trust-check-save"
-        >
-          <i className="fas fa-check me-1" />
-          Save
-        </button>
+        {!readOnlyProtocol && (
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={handleSave}
+            disabled={!hasChanges || !closeFullscreenEditor}
+            data-testid="trust-check-save"
+          >
+            <i className="fas fa-check me-1" />
+            Save
+          </button>
+        )}
       </div>
     </div>
   );

@@ -48,6 +48,8 @@ interface SurfaceBuilderProps<T extends SurfaceBuilderState> {
    * swapping the canvas state via the snapshot manager.
    */
   onSwitchVariant?: (variantId: string) => void;
+  /** Stored snapshots of the variants not shown on the canvas. */
+  otherVariantSnapshots?: ReadonlyArray<unknown>;
   /**
    * Open the variants editor AND seed a new variant entry. The widget
    * invokes this from its zero-state "+" affordance and from the
@@ -85,6 +87,7 @@ export function SurfaceBuilder<T extends SurfaceBuilderState>({
   canvasViewRef,
   activeVariantId,
   onSwitchVariant,
+  otherVariantSnapshots,
   onAddVariant,
   onCreateTemplateFromSelection,
   hasAttemptedSave,
@@ -351,7 +354,10 @@ export function SurfaceBuilder<T extends SurfaceBuilderState>({
         </div>
       </div>
       <div className="surface-canvas-notices">
-        <MigratedTrustChecksSummary nodes={state.nodes} />
+        <MigratedTrustChecksSummary
+          nodes={state.nodes}
+          otherVariantSnapshots={otherVariantSnapshots}
+        />
       </div>
       <div onBlur={commit}>
         {multiSelectedIds.length >= 2 ? (

@@ -1,6 +1,6 @@
 //! A surface stored with the surface-wide target Trust Check list is migrated
 //! once when the surface store loads it: the file is re-persisted with the
-//! list on its A2A/AP2 Transit Points, and later loads leave it unchanged.
+//! list on its Transit Points, and later loads leave it unchanged.
 
 use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
 use serde_json::json;
@@ -50,7 +50,12 @@ async fn a_legacy_surface_file_is_migrated_and_persisted_once() {
 
     let persisted = std::fs::read_to_string(&path).expect("read migrated file");
     let on_disk: serde_json::Value = serde_json::from_str(&persisted).expect("parse migrated file");
-    assert_eq!(on_disk["trust_check_split"], json!(true));
+    assert!(
+        on_disk
+            .get("trust_check_split")
+            .is_none(),
+        "no target list remains, so no marker: {on_disk}"
+    );
     assert!(
         on_disk["target"]
             .get("trust_check_list")
@@ -60,17 +65,8 @@ async fn a_legacy_surface_file_is_migrated_and_persisted_once() {
     let points = &on_disk["transit"]["points"];
     assert_eq!(points[0]["trust_check_list"][0]["id"], "target-recognition");
     assert_eq!(points[0]["trust_check_migrated"], json!(true));
-    assert!(
-        points[1]
-            .get("trust_check_list")
-            .is_none(),
-        "MCP Transit Points get no copy"
-    );
-    assert!(
-        points[1]
-            .get("trust_check_migrated")
-            .is_none()
-    );
+    assert_eq!(points[1]["trust_check_list"][0]["id"], "target-recognition", "MCP Transit Points get a copy too");
+    assert_eq!(points[1]["trust_check_migrated"], json!(true));
     assert_eq!(first, on_disk, "the loaded surface is the persisted one");
 
     let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())

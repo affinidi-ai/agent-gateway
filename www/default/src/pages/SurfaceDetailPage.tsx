@@ -265,6 +265,13 @@ const SurfaceDetailPage: React.FC = () => {
     buildVariantsWireSlice,
     getSnapshot: getVariantSnapshot,
   } = variantSnapshots;
+  const activeSnapshotId = variantSnapshots.activeVariantId ?? BASE_VARIANT_ID;
+  const otherVariantSnapshots = variantSnapshots.hasVariants
+    ? [BASE_VARIANT_ID, ...variantSnapshots.variants.map(v => v.id)]
+        .filter(id => id !== activeSnapshotId)
+        .map(id => getVariantSnapshot(id))
+        .filter(snapshot => snapshot !== undefined)
+    : [];
 
   // ---- Page-level full-surface undo / redo ring buffer ----------------
   //
@@ -1642,6 +1649,7 @@ const SurfaceDetailPage: React.FC = () => {
         }
         activeVariantId={variantSnapshots.activeVariantId}
         onSwitchVariant={handleSwitchVariant}
+        otherVariantSnapshots={otherVariantSnapshots}
         onAddVariant={handleAddVariant}
         manageActions={
           <div className="d-flex gap-2">

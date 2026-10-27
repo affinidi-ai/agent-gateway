@@ -6,6 +6,9 @@ import InfoBanner from '../../../shared/InfoBanner';
 import type { ConfigPanelProps } from '../types';
 import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
 import {
+  readOnlyTrustCheckMessage,
+  readOnlyTrustCheckProtocol,
+  isManagedAgentTrustCheck,
   isMigratedTrustCheck,
   readQueries,
   trustCheckLeg,
@@ -61,9 +64,10 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
   const legContext = describeLeg(leg);
   const managedAgentEndpoint = allNodes?.find(n => n.type === 'target')?.config?.endpoint;
   const notSavedForTarget =
-    leg === 'managed-agent' &&
     allNodes !== undefined &&
+    isManagedAgentTrustCheck(node, allNodes) &&
     !managedAgentTargetLegTrustCheckAllowed(managedAgentEndpoint);
+  const readOnlyProtocol = readOnlyTrustCheckProtocol(node, allNodes);
   const queries = readQueries(config);
   const shown = queries.slice(0, PREVIEW_MAX);
   const remaining = queries.length - shown.length;
@@ -149,12 +153,12 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
       {notSavedForTarget && (
         <div role="status" data-testid="trust-check-panel-managed-agent-target-warning">
           <InfoBanner
-            title="This Trust Check is not saved for a URL target"
+            title="This Trust Check blocks Save on a URL target"
             icon="fa-exclamation-triangle"
             variant="warning"
             collapsible={false}
             className="mt-2"
-            summary="The Managed Agent's own target-leg Trust Check runs only when it targets an A2A Proxy or another gateway. Drop a Trust Check on a Transit Point arrow instead."
+            summary="The Managed Agent's own target-leg Trust Check runs only when it targets an A2A Proxy or another gateway. Remove it or switch the target. To check a Transit Point's target, drop a Trust Check on its arrow instead."
           />
         </div>
       )}
@@ -167,6 +171,15 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
             data-testid="trust-check-panel-transit-point-scope"
           >
             Applies to this Transit Point only.
+          </Form.Text>
+        )}
+        {readOnlyProtocol && (
+          <Form.Text
+            className="d-block mb-1"
+            style={{ fontSize: '11px' }}
+            data-testid="trust-check-panel-read-only"
+          >
+            {readOnlyTrustCheckMessage(readOnlyProtocol)}
           </Form.Text>
         )}
         <Form.Text
@@ -207,7 +220,7 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
           iconStart={<i className="fas fa-pen-to-square me-1" aria-hidden="true" />}
           data-testid="trust-check-panel-configure"
         >
-          Configure Queries…
+          {readOnlyProtocol ? 'View Queries…' : 'Configure Queries…'}
         </AppButton>
       </div>
     </>

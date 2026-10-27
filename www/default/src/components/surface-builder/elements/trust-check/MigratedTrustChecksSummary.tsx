@@ -1,18 +1,33 @@
 import React from 'react';
 import InfoBanner from '../../../shared/InfoBanner';
-import { countMigratedTrustChecks } from './definition';
+import { countTrustCheckReviews, countTrustCheckReviewsInPayload } from './definition';
 
 interface MigratedTrustChecksSummaryProps {
-  nodes: ReadonlyArray<{ type: string; config?: any }>;
+  nodes: ReadonlyArray<{ id: string; type: string; parentId?: string; config?: any }>;
+  /** Stored snapshots of the variants not shown on the canvas. */
+  otherVariantSnapshots?: ReadonlyArray<unknown>;
 }
 
-const MigratedTrustChecksSummary: React.FC<MigratedTrustChecksSummaryProps> = ({ nodes }) => {
-  const count = countMigratedTrustChecks(nodes);
+const MigratedTrustChecksSummary: React.FC<MigratedTrustChecksSummaryProps> = ({
+  nodes,
+  otherVariantSnapshots = [],
+}) => {
+  const inOtherVariants = otherVariantSnapshots.reduce<number>(
+    (sum, snapshot) => sum + countTrustCheckReviewsInPayload(snapshot),
+    0
+  );
+  const count = countTrustCheckReviews(nodes) + inOtherVariants;
   if (count === 0) return null;
   const title =
     count === 1
-      ? '1 Transit Point has migrated Trust Checks to review'
-      : `${count} Transit Points have migrated Trust Checks to review`;
+      ? '1 Transit Point needs Trust Check review'
+      : `${count} Transit Points need Trust Check review`;
+  const variantsNote =
+    inOtherVariants === 0
+      ? ''
+      : inOtherVariants === 1
+        ? ' 1 of them is in another variant; switch to it to review.'
+        : ` ${inOtherVariants} of them are in other variants; switch to each to review.`;
   return (
     <div role="status" data-testid="surface-migrated-trust-checks-summary">
       <InfoBanner
@@ -21,7 +36,7 @@ const MigratedTrustChecksSummary: React.FC<MigratedTrustChecksSummaryProps> = ({
         variant="warning"
         collapsible={false}
         className=""
-        summary="Open each Trust Check marked with a warning to keep or remove it."
+        summary={`Open each Trust Check or Transit Point marked with a warning to review it.${variantsNote}`}
       />
     </div>
   );

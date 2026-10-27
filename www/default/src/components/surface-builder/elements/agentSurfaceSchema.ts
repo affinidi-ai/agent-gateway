@@ -34,6 +34,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'mcp_legacy_metadata_output',
   'mcp_http',
   'tags',
+  'trust_check_split',
   'access_point',
   'target',
   'transit',

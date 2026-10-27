@@ -130,7 +130,7 @@ Each leg carries a `trust_check_list`:
 | List | Runs on |
 | --- | --- |
 | `access_point.trust_check_list` | The caller leg, for requests arriving at the Access Point. |
-| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. A2A and AP2 Transit Points only. |
+| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. New lists are accepted on A2A and AP2 Transit Points only; an MCP or HTTP Transit Point keeps only a list the conversion below gave it. |
 | `target.trust_check_list` | The managed agent's own target leg: `a2a-proxy://` Targets and Fabric send. |
 
 A Transit Point with an empty list runs no Trust Check on its traffic: no agent-card fetch
@@ -143,44 +143,61 @@ A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
 override replaces the whole list verbatim, never element by element; a variant gives its
 Transit Points their own lists through its `transit.points` override.
 
-The management API rejects with `400` a surface whose `target.trust_check_list` is non-empty
-and whose Managed Agent target is not `a2a-proxy://` or `fabric://` (an `http(s)` URL,
-`proxy://`, or no endpoint), because no stage runs that list for such a target. Put those
-checks on the Transit Points instead.
+A write to the management API declares the per-Transit-Point shape with
+`trust_check_split: true`; the Surface Builder always sends it. A declared write is rejected
+with `400` when its `target.trust_check_list` is non-empty and its Managed Agent target is not
+`a2a-proxy://` or `fabric://` (an `http(s)` URL, `proxy://`, or no endpoint), because no stage
+runs that list for such a target. A write that does not declare the shape and carries a
+`target.trust_check_list`, in the body or, for a `PATCH`, in the fields it sets, is treated as
+the old shape: it is converted exactly as a stored surface is (below), logged as a warning, and
+saved. Clients written before per-Transit-Point lists therefore keep their checks, and new
+clients must send the marker or their target list is also copied onto the Transit Points.
+`trust_check_split` is stored only while the surface still has a `target.trust_check_list`.
 
 ### Lists stored before per-Transit-Point checks
 
 Surfaces stored before Transit Points had their own lists kept one `target.trust_check_list`
 that ran on every Transit Point. The first time such a surface loads, the gateway copies that
-list onto each of its A2A and AP2 Transit Points (and those of each variant), marks each copy
+list onto each of its Transit Points (and those of each variant), marks each copy
 with `trust_check_migrated: true`, removes `target.trust_check_list` unless the Managed Agent
-target is `a2a-proxy://` or `fabric://`, sets `trust_check_split: true` on the surface, and
-saves the file. User-saved Surface Templates are converted the same way when they load.
-It logs the surface and the Transit Points that received copies. A2A and AP2 Transit Points
-keep their behaviour until an operator edits the surface. The Surface Builder flags each copy
-for review; through the API, remove a copy by saving the Transit Point without
-`trust_check_list`.
+target is `a2a-proxy://` or `fabric://`, and saves the file, with `trust_check_split: true`
+when a target list remains. It logs the surface and the Transit Points that received copies,
+and warns when a list is removed without any Transit Point receiving it. Every Transit Point
+keeps its behaviour until an operator edits the surface. The Surface Builder flags
+each copy for review; through the API, remove a copy by saving the Transit Point without
+`trust_check_list` in a write that declares the shape.
 
-MCP and HTTP Transit Points receive no copy, and the gateway logs a warning naming them. The
-old list ran on them too, but their destinations publish no A2A agent card, so its results
-there were `AGENT_CARD_UNAVAILABLE` failures. A policy that denied on those failures blocked
-all of that Transit Point's traffic before and allows it now.
+User-saved Surface Templates are converted the same way when they load, and when they are
+created, updated or imported without the marker. A template's endpoint is usually the
+`$TARGET_ENDPOINT` placeholder, so a template with a placeholder or empty endpoint keeps its
+`target.trust_check_list` (its A2A and AP2 Transit Points still receive copies); the `400`
+above applies when a surface created from it is saved with a target that cannot run the list.
+A template creates new surfaces only, so it never carries a list on an MCP or HTTP Transit
+Point: the conversion copies onto A2A and AP2 Transit Points only, and saving or importing a
+template removes any list on its MCP and HTTP Transit Points.
+
+MCP and HTTP Transit Points receive a copy too, because the old list ran on them. There it
+usually reports `AGENT_CARD_UNAVAILABLE`, but an HTTP Transit Point whose destination serves an
+A2A agent card runs real identity and TRQP checks. A Trust Check cannot be added to an MCP or
+HTTP Transit Point: a management API write either keeps the list such a Transit Point already
+has, unchanged, or removes it, and is rejected with `400` if it adds or changes one. Removing the copy during review means that
+Transit Point's traffic is no longer checked, so a policy that denied on its results allows
+it.
 
 A variant that inherited the base Transit Points but resolves to a different list receives
-its own copy of them in `overrides.transit.points`, so later edits to the base Transit Points
-no longer reach it.
+its own copy of them in `overrides.transit.points`, so later edits to the base Transit Points,
+such as a new Transit Point, a changed destination or rotated credentials, no longer reach it.
+Variants saved by the Surface Builder already carry their own Transit Points and are not
+affected.
 
-`trust_check_split` marks a surface as already in the per-Transit-Point shape, and every
-management API write sets it. A payload in the old shape saved through the API on an
-`a2a-proxy://` or `fabric://` target is therefore read in the new shape: its
-`target.trust_check_list` applies to the managed agent's own target only, and its Transit
-Points run no Trust Check until they get their own lists. A surface file
-written outside the API in the new shape must set `trust_check_split: true`, or it is migrated
-on load.
+A surface file written outside the API in the per-Transit-Point shape with a
+`target.trust_check_list` must set `trust_check_split: true`, or it is converted on load.
 
-The migration is forward-only: a gateway release from before per-Transit-Point lists cannot
-load a surface carrying the new fields. Back up `_storage/agent_surfaces/` before upgrading
-if a rollback may be needed.
+The conversion is forward-only: a gateway release from before per-Transit-Point lists cannot
+load a surface or template carrying the new fields, which includes every converted surface,
+every surface whose Transit Points have their own lists, and every surface saved with a
+`target.trust_check_list`. Back up `_storage/agent_surfaces/` and
+`_storage/agent_surface_templates/` before upgrading if a rollback may be needed.
 
 ### Requiring checks in policy
 

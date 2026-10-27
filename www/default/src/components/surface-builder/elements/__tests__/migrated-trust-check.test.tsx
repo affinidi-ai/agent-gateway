@@ -1,7 +1,7 @@
 import React from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { registry } from '../index';
-import { countMigratedTrustChecks, isMigratedTrustCheck } from '../trust-check/definition';
+import { countTrustCheckReviews, isMigratedTrustCheck } from '../trust-check/definition';
 import TrustCheckPanel from '../trust-check/TrustCheckPanel';
 import TrustCheckFullscreenPanel from '../trust-check/TrustCheckFullscreenPanel';
 import MigratedTrustChecksSummary from '../trust-check/MigratedTrustChecksSummary';
@@ -71,7 +71,7 @@ describe('migrated Trust Check — hydration and payload', () => {
     expect(isMigratedTrustCheck(trustCheckOf(nodes, 'transit-point-a2a-3').config)).toBe(false);
     const tpNode = nodes.find(n => n.id === 'transit-point-a2a-1')!;
     expect(tpNode.config).not.toHaveProperty('trust_check_migrated');
-    expect(countMigratedTrustChecks(nodes)).toBe(2);
+    expect(countTrustCheckReviews(nodes)).toBe(2);
   });
 
   it('keeps the flag on untouched Transit Points', () => {
@@ -126,7 +126,7 @@ describe('migrated Trust Check — surface summary', () => {
   it('counts the flagged Transit Points', () => {
     render(<MigratedTrustChecksSummary nodes={hydrate()} />);
     expect(screen.getByTestId('surface-migrated-trust-checks-summary')).toHaveTextContent(
-      '2 Transit Points have migrated Trust Checks to review'
+      '2 Transit Points need Trust Check review'
     );
   });
 
@@ -137,7 +137,7 @@ describe('migrated Trust Check — surface summary', () => {
     });
     render(<MigratedTrustChecksSummary nodes={one} />);
     expect(screen.getByTestId('surface-migrated-trust-checks-summary')).toHaveTextContent(
-      '1 Transit Point has migrated Trust Checks to review'
+      '1 Transit Point needs Trust Check review'
     );
   });
 

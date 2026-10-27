@@ -10794,6 +10794,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_variant_request_runs_the_variants_transit_point_list() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let element = |id: &str| serde_json::to_value(make_test_element(id)).expect("element");
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface-variant-tc",
+            "name": "variant-tc",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/surfaces/order", "protocol": "a2a"},
+            "target": {"endpoint": "https://managed.example/a2a"},
+            "transit": {"points": [{
+                "id": "tp-base", "alias": "partner-a", "target_endpoint": "http://127.0.0.1:1",
+                "protocol": "a2a", "trust_check_list": [element("base-check")]
+            }]},
+            "variants": [{
+                "id": "variant-dev", "alias": "dev", "name": "Development", "enabled": true,
+                "overrides": {"transit": {"points": [{
+                    "id": "tp-dev", "alias": "partner-a", "target_endpoint": "http://127.0.0.1:1",
+                    "protocol": "a2a", "trust_check_list": [element("dev-check-1"), element("dev-check-2")]
+                }]}}
+            }]
+        }))
+        .expect("surface should deserialize");
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+
+        let mut ran = Vec::new();
+        for path in
+            ["/outbound/surfaces/order$dev/partner-a/message/send", "/outbound/surfaces/order/partner-a/message/send"]
+        {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let mut ctx = OutboundPipelineContext::new(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                req,
+                &state,
+            )
+            .expect("context resolves the Transit Point");
+            step_collect_trust_context(&state, &mut ctx)
+                .await
+                .expect("collect ok");
+            step_trust_check(&state, &mut ctx)
+                .await
+                .expect("trust check ok");
+            ran.push(result_ids(&ctx));
+        }
+
+        assert_eq!(
+            ran,
+            vec![vec!["dev-check-1".to_string(), "dev-check-2".to_string()], vec!["base-check".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_mcp_transit_point_runs_its_trust_check_list() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+        ctx.virtual_channel
+            .target_endpoint = "http://127.0.0.1:1".to_string();
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("mcp-check")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+        step_trust_check(&state, &mut ctx)
+            .await
+            .expect("trust check ok");
+
+        assert_eq!(result_ids(&ctx), vec!["mcp-check".to_string()]);
+    }
+
+    #[tokio::test]
     async fn outbound_identity_failure_results_cover_only_the_routed_transit_points_elements() {
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();

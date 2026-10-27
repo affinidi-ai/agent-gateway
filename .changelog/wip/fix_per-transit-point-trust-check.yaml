@@ -1,7 +1,22 @@
 branch: fix/per-transit-point-trust-check
 changes:
   added: []
-  changed: []
+  changed:
+    - timestamp: '2026-10-27T16:00:00Z'
+      title: Declare the per-Transit-Point Trust Check shape with trust_check_split
+      description: >-
+        Management API writes now declare the new shape with trust_check_split: true, which the
+        Surface Builder always sends. A declared write gets 400 when target.trust_check_list is
+        non-empty and the Managed Agent target is not a2a-proxy:// or fabric://, because that list
+        never runs for such a target. A write without the marker that carries a target list is
+        treated as the old shape and converted like a stored surface, so existing API clients keep
+        their Transit Point checks. Surfaces and user-saved Surface Templates stored before this
+        change are converted when they first load and can no longer be loaded by an earlier
+        release, nor can any surface saved with per-Transit-Point lists; back up
+        _storage/agent_surfaces/ and _storage/agent_surface_templates/ before upgrading if a
+        rollback may be needed. A variant that inherited the base Transit Points but uses a
+        different list receives its own copy of them, so later edits to the base Transit Points
+        no longer reach it.
   fixed:
     - timestamp: '2026-10-26T15:57:29Z'
       title: ⭐ Run target-leg Trust Checks only on the Transit Point they belong to
@@ -13,27 +28,19 @@ changes:
         trust_check_list, a request runs only the checks of the Transit Point it goes through, and
         a Transit Point without checks runs none. Results stay at input.trust_check_results.target,
         and Trust Check audit records name the Transit Point. target.trust_check_list now applies
-        only to the managed agent's own a2a-proxy or Fabric target, and the management API rejects
-        it on any other target. Surfaces and user-saved Surface Templates stored before this change
-        are converted when they first
-        load: the old list is copied onto every A2A and AP2 Transit Point, so their behaviour is
-        unchanged, and the Surface Builder flags each copy so operators can keep it or remove it.
-        MCP and HTTP Transit Points receive no copy and are named in a warning log.
+        only to the managed agent's own a2a-proxy or Fabric target. The old list is copied onto
+        every Transit Point when a surface is converted, so their behaviour is unchanged, and the
+        Surface Builder flags each copy so operators can keep it or remove it. New Trust Checks
+        can be added to A2A and AP2 Transit Points only.
   removed: []
-  security: []
-  breaking:
-    - timestamp: '2026-10-26T15:57:29Z'
-      title: Reject a target Trust Check list unless the target is a2a-proxy or Fabric
+  security:
+    - timestamp: '2026-10-27T16:00:00Z'
+      title: Keep Trust Checks on MCP and HTTP Transit Points until reviewed
       description: >-
-        The management API now answers 400 when a surface or variant has a non-empty
-        target.trust_check_list and its Managed Agent target is not a2a-proxy:// or fabric://, such
-        as an http(s) URL or proxy://, because that list never runs for such a target; clients must
-        send those checks in transit.points[].trust_check_list. A payload in the old shape sent
-        through the API for an a2a-proxy:// or fabric:// surface is accepted but read in the new
-        shape, so its list covers only the managed agent's own target and its Transit Points run no
-        Trust Check until they get their own lists. Stored surfaces are converted to the new shape on first
-        load and saved with trust_check_split, so an earlier gateway release cannot load them
-        afterwards. Back up _storage/agent_surfaces/ before upgrading if a rollback may be needed.
-        MCP and HTTP Transit Points no longer run the old surface-wide list; there it could only
-        report AGENT_CARD_UNAVAILABLE, so a policy that denied on that failure now allows their
-        traffic.
+        The old surface-wide Trust Check list also ran on MCP and HTTP Transit Points, where an HTTP
+        destination serving an A2A agent card could produce real denials. The conversion copies the
+        list onto those Transit Points too and flags each copy for review, so no Transit Point
+        silently stops being checked. Removing a copy stops its checks, and a policy that denied on
+        them then allows that Transit Point's traffic; a rule that only looks for failed checks also
+        allows traffic when no checks ran, and docs/POLICY.md shows how to require that checks ran.
+  breaking: []

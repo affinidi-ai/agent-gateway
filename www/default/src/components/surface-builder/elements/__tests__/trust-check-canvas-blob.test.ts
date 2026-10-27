@@ -179,6 +179,13 @@ describe('Trust Check against a stale canvas blob', () => {
           slotId: TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
           config: { queries: [entry('stale')] },
         }),
+        blobNode({
+          id: 'trust-check-target',
+          type: 'trust-check',
+          parentId: 'target',
+          slotId: TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+          config: { _edge: 'ma-tp', queries: [] },
+        }),
       ]),
       target: { endpoint: 'https://agent.example.com' },
       transit: { points: [] },
@@ -188,6 +195,33 @@ describe('Trust Check against a stale canvas blob', () => {
       'trust-check-caller',
     ]);
   });
+
+  it.each(['a2a-proxy://proxy-1', 'fabric://gw-1/surface-a'])(
+    'restores an unconfigured Managed Agent placeholder on a %s target',
+    endpoint => {
+      const payload = {
+        ...fabricSurface([
+          blobNode({
+            id: 'trust-check-target',
+            type: 'trust-check',
+            parentId: 'target',
+            slotId: TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+            config: { _edge: 'ma-tp', queries: [] },
+          }),
+        ]),
+        target: { endpoint },
+        transit: { points: [] },
+      };
+      const nodes = registry.nodesFromPayload(payload) as CanvasNode[];
+      expect(trustChecks(nodes)).toEqual([
+        ['trust-check-target', 'target', TRUST_CHECK_MANAGED_AGENT_SLOT_ID],
+      ]);
+      expect(nodes.find(n => n.id === 'trust-check-target')?.config).toEqual({
+        _edge: 'ma-tp',
+        queries: [],
+      });
+    }
+  );
 });
 
 describe('Managed Agent target-leg Trust Check drop', () => {
@@ -220,6 +254,36 @@ describe('Managed Agent target-leg Trust Check drop', () => {
       expect(result).toEqual({ ok: true, slotId: TRUST_CHECK_MANAGED_AGENT_SLOT_ID });
     }
   );
+
+  it('does not snap to the Managed Agent → External Target arrow on a URL target', () => {
+    const ctx = { targetEndpoint: 'https://agent.example.com/a2a' };
+    expect(registry.snapsToArchetype('trust-check', 'ma-external', ctx)).toBe(false);
+    expect(registry.snapsToArchetype('trust-check', 'ap-ma', ctx)).toBe(true);
+    expect(registry.snapsToArchetype('trust-check', 'ma-tp', ctx)).toBe(true);
+    expect(registry.snapsToArchetype('trust-check', 'ma-external', {})).toBe(false);
+  });
+
+  it.each(['a2a-proxy://proxy-1', 'fabric://gw-1/surface-a'])(
+    'snaps to the Managed Agent → External Target arrow on a %s target',
+    endpoint => {
+      expect(
+        registry.snapsToArchetype('trust-check', 'ma-external', { targetEndpoint: endpoint })
+      ).toBe(true);
+    }
+  );
+
+  it.each([
+    ['workload-binding', 'ma-external', true],
+    ['mcp-tool-gating', 'ma-external', true],
+    ['workload-binding', 'ap-ma', false],
+    ['trust-recorder', 'ap-ma', true],
+    ['trust-recorder', 'ma-external', false],
+    ['policy', 'ma-external', true],
+  ])('leaves %s snapping to %s unchanged by a URL target', (type, archetype, expected) => {
+    const ctx = { targetEndpoint: 'https://agent.example.com/a2a' };
+    expect(registry.snapsToArchetype(type, archetype, ctx)).toBe(expected);
+    expect(registry.snapsToArchetype(type, archetype)).toBe(expected);
+  });
 
   it('still snaps to the caller and Transit Point arrows', () => {
     expect(registry.snapsToArchetype('trust-check', 'ap-ma')).toBe(true);

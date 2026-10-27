@@ -179,7 +179,7 @@ pub async fn create_template(
     let id = format!("user-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
     let mut tpl = req.into_template(id, now);
-    tpl.mark_trust_checks_split();
+    tpl.settle_trust_check_shape();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -232,7 +232,7 @@ async fn update_stored_template(
     if tpl.name.trim().is_empty() {
         return Err(TemplateApiError::BadRequest("name must not be empty".to_string()));
     }
-    tpl.mark_trust_checks_split();
+    tpl.settle_trust_check_shape();
     s.save(&tpl)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("save: {}", e)))?;
@@ -319,8 +319,7 @@ pub async fn import_template(
     let now = chrono::Utc::now().to_rfc3339();
     tpl.created_at = Some(now.clone());
     tpl.updated_at = Some(now);
-    tpl.migrate_surface_trust_checks();
-    tpl.mark_trust_checks_split();
+    tpl.settle_trust_check_shape();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -488,11 +487,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_updated_template_is_marked_split_and_is_not_migrated_on_reload() {
-        let (store, template, dir) = stored_template(None).await;
-        let mut update = template.clone();
-        update.surface = Some(serde_json::json!({
+    fn fabric_surface(trust_check_split: Option<bool>) -> serde_json::Value {
+        let mut surface = serde_json::json!({
             "name": "$NAME",
             "access_point": {"listen_address": "$HOST", "route": "$ROUTE", "protocol": "a2a"},
             "target": {
@@ -505,34 +501,91 @@ mod tests {
                 }]
             },
             "transit": {"points": [{"alias": "partner-a", "target_endpoint": "https://a.example/a2a"}]}
-        }));
+        });
+        if let Some(split) = trust_check_split {
+            surface["trust_check_split"] = serde_json::json!(split);
+        }
+        surface
+    }
 
+    async fn update_and_reload(surface: serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+        let (store, template, dir) = stored_template(None).await;
+        let mut update = template.clone();
+        update.surface = Some(surface);
         let saved = update_stored_template(&store, template.id.clone(), &None, &None, update)
             .await
-            .unwrap();
-        let saved_surface = saved
+            .unwrap()
             .surface
-            .clone()
             .expect("surface");
-        assert_eq!(saved_surface["trust_check_split"], serde_json::json!(true));
-
         let reloaded = super::super::FileSystemSurfaceTemplateStore::new(dir.path().join("templates"), None)
             .await
             .unwrap()
             .get(&template.id)
             .await
             .unwrap()
-            .expect("template");
-        let surface = reloaded
+            .expect("template")
             .surface
             .expect("surface");
-        assert_eq!(surface, saved_surface, "a template written through the API is never migrated");
+        (saved, reloaded)
+    }
+
+    #[tokio::test]
+    async fn an_update_declaring_the_split_shape_is_kept_as_sent() {
+        let (saved, reloaded) = update_and_reload(fabric_surface(Some(true))).await;
+
+        assert_eq!(saved, fabric_surface(Some(true)), "a target list remains, so the marker is kept");
+        assert_eq!(reloaded, saved, "a declared-shape template is never migrated");
         assert!(
-            surface["transit"]["points"][0]
+            saved["transit"]["points"][0]
                 .get("trust_check_list")
                 .is_none()
         );
-        assert_eq!(surface["target"]["trust_check_list"][0]["id"], "fabric-target");
+    }
+
+    #[tokio::test]
+    async fn an_update_without_the_marker_is_migrated() {
+        let (saved, reloaded) = update_and_reload(fabric_surface(None)).await;
+
+        assert_eq!(saved["trust_check_split"], serde_json::json!(true));
+        assert_eq!(saved["target"]["trust_check_list"][0]["id"], "fabric-target", "fabric keeps its own list");
+        assert_eq!(saved["transit"]["points"][0]["trust_check_list"][0]["id"], "fabric-target");
+        assert_eq!(saved["transit"]["points"][0]["trust_check_migrated"], serde_json::json!(true));
+        assert_eq!(reloaded, saved);
+    }
+
+    #[test]
+    fn a_created_template_follows_the_declared_shape() {
+        let create = |surface: serde_json::Value| {
+            let mut template = serde_json::from_value::<crate::surface_templates::types::CreateSurfaceTemplate>(
+                serde_json::json!({ "name": "Full", "kind": "full", "surface": surface }),
+            )
+            .unwrap()
+            .into_template("template-f".into(), "2026-01-01T00:00:00Z".into());
+            template.settle_trust_check_shape();
+            template
+                .surface
+                .expect("surface")
+        };
+
+        let declared = create(fabric_surface(Some(true)));
+        assert_eq!(declared, fabric_surface(Some(true)));
+
+        let legacy = create(fabric_surface(None));
+        assert_eq!(legacy["transit"]["points"][0]["trust_check_migrated"], serde_json::json!(true));
+        assert_eq!(legacy["trust_check_split"], serde_json::json!(true));
+
+        let mut without_target_list = fabric_surface(Some(true));
+        without_target_list["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("trust_check_list");
+        let settled = create(without_target_list);
+        assert!(
+            settled
+                .get("trust_check_split")
+                .is_none(),
+            "no target list, so no marker is persisted"
+        );
     }
 
     #[test]
@@ -542,8 +595,51 @@ mod tests {
         )
         .unwrap()
         .into_template("template-p".into(), "2026-01-01T00:00:00Z".into());
-        template.mark_trust_checks_split();
+        template.settle_trust_check_shape();
         assert!(template.surface.is_none());
-        assert!(!template.migrate_surface_trust_checks());
+    }
+
+    fn snapshot_with_mcp_list() -> serde_json::Value {
+        serde_json::json!({
+            "trust_check_split": true,
+            "target": {"endpoint": "https://managed.example"},
+            "transit": {"points": [{
+                "alias": "tools", "target_endpoint": "https://t.example/mcp", "protocol": "mcp",
+                "trust_check_migrated": true,
+                "trust_check_list": [{
+                    "id": "copied", "trust_registry_id": "tr-1", "query_type": "recognition",
+                    "query": {"authority_id": "did:example:authority", "entity_id": "{{ target.did }}"}
+                }]
+            }]}
+        })
+    }
+
+    fn stripped_mcp_point() -> serde_json::Value {
+        serde_json::json!({"alias": "tools", "target_endpoint": "https://t.example/mcp", "protocol": "mcp"})
+    }
+
+    #[test]
+    fn a_created_template_drops_mcp_transit_point_lists() {
+        let mut template = serde_json::from_value::<crate::surface_templates::types::CreateSurfaceTemplate>(
+            serde_json::json!({ "name": "Captured", "kind": "full", "surface": snapshot_with_mcp_list() }),
+        )
+        .unwrap()
+        .into_template("template-c".into(), "2026-01-01T00:00:00Z".into());
+        template.settle_trust_check_shape();
+
+        assert_eq!(
+            template
+                .surface
+                .expect("surface")["transit"]["points"][0],
+            stripped_mcp_point()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_updated_template_drops_mcp_transit_point_lists() {
+        let (saved, reloaded) = update_and_reload(snapshot_with_mcp_list()).await;
+
+        assert_eq!(saved["transit"]["points"][0], stripped_mcp_point());
+        assert_eq!(reloaded, saved);
     }
 }

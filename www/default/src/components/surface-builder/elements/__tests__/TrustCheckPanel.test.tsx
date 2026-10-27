@@ -50,7 +50,7 @@ describe('TrustCheckPanel — leg scope', () => {
     expect(screen.queryByTestId('trust-check-panel-transit-point-scope')).toBeNull();
   });
 
-  it('warns that a Managed Agent target-leg Trust Check is not saved for a URL target', () => {
+  it('warns that a Managed Agent target-leg Trust Check blocks Save on a URL target', () => {
     render(
       <TrustCheckPanel
         {...(baseProps(MA_SLOT) as any)}
@@ -59,7 +59,7 @@ describe('TrustCheckPanel — leg scope', () => {
     );
 
     expect(screen.getByTestId('trust-check-panel-managed-agent-target-warning')).toHaveTextContent(
-      'This Trust Check is not saved for a URL target'
+      'This Trust Check blocks Save on a URL target'
     );
     expect(screen.queryByTestId('trust-check-panel-transit-point-scope')).toBeNull();
   });

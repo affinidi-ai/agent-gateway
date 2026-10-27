@@ -242,33 +242,51 @@ async fn surface_api_writes_per_transit_point_trust_checks() {
             .unwrap_or(json!(null));
         (status, body)
     };
-    let surface = |surface_id: &str, target_list: Vec<serde_json::Value>| {
-        json!({
+    let surface = |surface_id: &str,
+                   split: bool,
+                   target_list: Vec<serde_json::Value>,
+                   tp_list: Vec<serde_json::Value>| {
+        let mut body = json!({
             "surface_id": surface_id,
             "name": surface_id,
             "status": "disabled",
-            "trust_check_split": false,
             "access_point": {"listen_address": h.gateway_base, "route": format!("/{surface_id}"), "protocol": "a2a"},
             "target": {"endpoint": h.mock.url(), "trust_check_list": target_list},
             "transit": {"points": [{
                 "alias": "partner-a",
                 "target_endpoint": "https://partner.example/a2a",
                 "protocol": "a2a",
-                "trust_check_list": [api_trust_check("partner-recognition")]
+                "trust_check_list": tp_list
             }]}
-        })
+        });
+        if split {
+            body["trust_check_split"] = json!(true);
+        }
+        body
     };
+    let partner = || vec![api_trust_check("partner-recognition")];
     let rejection = "transit.points[].trust_check_list";
 
     let (status, created) = send(
         client
             .post(&collection)
-            .json(&surface("tc-api-split", Vec::new())),
+            .json(&surface("tc-api-split", true, Vec::new(), partner())),
     )
     .await;
     assert_eq!(status, 201, "{created}");
-    assert_eq!(created["trust_check_split"], json!(true));
+    assert!(
+        created
+            .get("trust_check_split")
+            .is_none(),
+        "no target list, so no marker: {created}"
+    );
     assert_eq!(created["transit"]["points"][0]["trust_check_list"][0]["id"], "partner-recognition");
+    assert!(
+        created["transit"]["points"][0]
+            .get("trust_check_migrated")
+            .is_none(),
+        "{created}"
+    );
     assert!(
         created["target"]
             .get("trust_check_list")
@@ -280,11 +298,16 @@ async fn surface_api_writes_per_transit_point_trust_checks() {
     let (status, updated) = send(
         client
             .put(&surface_url)
-            .json(&surface("tc-api-split", Vec::new())),
+            .json(&surface("tc-api-split", true, Vec::new(), partner())),
     )
     .await;
     assert_eq!(status, 200, "{updated}");
-    assert_eq!(updated["trust_check_split"], json!(true));
+    assert!(
+        updated
+            .get("trust_check_split")
+            .is_none(),
+        "{updated}"
+    );
 
     let (status, patched) = send(
         client
@@ -294,13 +317,19 @@ async fn surface_api_writes_per_transit_point_trust_checks() {
     )
     .await;
     assert_eq!(status, 200, "{patched}");
-    assert_eq!(patched["trust_check_split"], json!(true));
+    assert!(
+        patched
+            .get("trust_check_split")
+            .is_none(),
+        "{patched}"
+    );
     assert_eq!(patched["description"], "patched");
+    assert_eq!(patched["transit"]["points"][0]["trust_check_list"][0]["id"], "partner-recognition");
 
     let (status, body) = send(
         client
             .post(&collection)
-            .json(&surface("tc-api-legacy", vec![api_trust_check("legacy-target")])),
+            .json(&surface("tc-api-declared", true, vec![api_trust_check("declared-target")], Vec::new())),
     )
     .await;
     assert_eq!(status, 400, "{body}");
@@ -309,13 +338,13 @@ async fn surface_api_writes_per_transit_point_trust_checks() {
             .contains(rejection),
         "{body}"
     );
-    let (status, _) = send(client.get(format!("{collection}/tc-api-legacy"))).await;
+    let (status, _) = send(client.get(format!("{collection}/tc-api-declared"))).await;
     assert_eq!(status, 404, "a rejected create must not persist the surface");
 
     let (status, body) = send(
         client
             .put(&surface_url)
-            .json(&surface("tc-api-split", vec![api_trust_check("legacy-target")])),
+            .json(&surface("tc-api-split", true, vec![api_trust_check("declared-target")], partner())),
     )
     .await;
     assert_eq!(status, 400, "{body}");
@@ -329,7 +358,7 @@ async fn surface_api_writes_per_transit_point_trust_checks() {
         client
             .patch(&surface_url)
             .header("content-type", "application/merge-patch+json")
-            .json(&json!({"variants": [{
+            .json(&json!({"trust_check_split": true, "variants": [{
                 "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
                 "overrides": {"target": {"trust_check_list": [api_trust_check("dev-target")]}}
             }]})),
@@ -362,5 +391,316 @@ async fn surface_api_writes_per_transit_point_trust_checks() {
             .is_none(),
         "{stored}"
     );
-    assert_eq!(stored["trust_check_split"], json!(true));
+
+    let (status, legacy) = send(
+        client
+            .post(&collection)
+            .json(&surface("tc-api-legacy", false, vec![api_trust_check("legacy-target")], Vec::new())),
+    )
+    .await;
+    assert_eq!(status, 201, "an old-shape create is migrated, not rejected: {legacy}");
+    assert!(
+        legacy["target"]
+            .get("trust_check_list")
+            .is_none(),
+        "{legacy}"
+    );
+    assert_eq!(legacy["transit"]["points"][0]["trust_check_list"][0]["id"], "legacy-target");
+    assert_eq!(legacy["transit"]["points"][0]["trust_check_migrated"], json!(true));
+    assert!(
+        legacy
+            .get("trust_check_split")
+            .is_none(),
+        "{legacy}"
+    );
+
+    let (status, patched) = send(
+        client
+            .patch(&surface_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({"variants": [{
+                "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
+                "overrides": {
+                    "target": {"trust_check_list": [api_trust_check("dev-target")]},
+                    "transit": {"points": [{
+                        "alias": "dev-partner", "target_endpoint": "https://dev-partner.example/a2a", "protocol": "a2a"
+                    }]}
+                }
+            }]})),
+    )
+    .await;
+    assert_eq!(status, 200, "an old-shape PATCH is migrated, not rejected: {patched}");
+    let overrides = &patched["variants"][0]["overrides"];
+    assert!(
+        overrides["target"]
+            .get("trust_check_list")
+            .is_none(),
+        "{patched}"
+    );
+    assert_eq!(overrides["transit"]["points"][0]["trust_check_list"][0]["id"], "dev-target");
+    assert_eq!(overrides["transit"]["points"][0]["trust_check_migrated"], json!(true));
+    assert_eq!(patched["transit"]["points"][0]["trust_check_list"][0]["id"], "partner-recognition");
+    assert!(
+        patched["transit"]["points"][0]
+            .get("trust_check_migrated")
+            .is_none(),
+        "{patched}"
+    );
+}
+
+/// Variant writes follow the same declared shape as surface writes: without
+/// `trust_check_split: true` a variant target list is converted onto the
+/// variant's Transit Points; with it, the 400 rule applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn surface_api_variant_writes_follow_the_declared_shape() {
+    let mut client = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_trust_registry_fixture(temp_dir);
+        client = Some(super::helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.expect("admin client");
+    let send = |request: reqwest::RequestBuilder| async move {
+        let response = request
+            .send()
+            .await
+            .expect("admin API request");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or(json!(null));
+        (status, body)
+    };
+    let dev_point =
+        || json!({"alias": "dev-partner", "target_endpoint": "https://dev-partner.example/a2a", "protocol": "a2a"});
+    let surface_url = format!("{}/api/v1/surfaces/tc-api-variant", h.gateway_base);
+    let (status, created) = send(
+        client
+            .post(format!("{}/api/v1/surfaces", h.gateway_base))
+            .json(&json!({
+                "surface_id": "tc-api-variant",
+                "name": "tc-api-variant",
+                "status": "disabled",
+                "trust_check_split": true,
+                "access_point": {"listen_address": h.gateway_base, "route": "/tc-api-variant", "protocol": "a2a"},
+                "target": {"endpoint": h.mock.url()},
+                "variants": [{
+                    "id": "variant-dev", "alias": "dev", "name": "dev", "enabled": true,
+                    "overrides": {"transit": {"points": [dev_point()]}}
+                }]
+            })),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    let variant_url = format!("{surface_url}/variants/variant-dev");
+    let rejection = "transit.points[].trust_check_list";
+    let overrides = |list_id: &str| json!({"target": {"trust_check_list": [api_trust_check(list_id)]}, "transit": {"points": [dev_point()]}});
+    let assert_converted = |overrides: &serde_json::Value, list_id: &str| {
+        assert!(
+            overrides["target"]
+                .get("trust_check_list")
+                .is_none(),
+            "{overrides}"
+        );
+        assert_eq!(overrides["transit"]["points"][0]["trust_check_list"][0]["id"], list_id, "{overrides}");
+        assert_eq!(overrides["transit"]["points"][0]["trust_check_migrated"], json!(true), "{overrides}");
+    };
+
+    let (status, body) = send(
+        client
+            .put(&variant_url)
+            .json(&json!({"trust_check_split": true, "overrides": overrides("put-declared")})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("Variant 'dev'"),
+        "{body}"
+    );
+    assert!(
+        body.to_string()
+            .contains(rejection),
+        "{body}"
+    );
+
+    let (status, updated) = send(
+        client
+            .put(&variant_url)
+            .json(&json!({"overrides": overrides("put-legacy")})),
+    )
+    .await;
+    assert_eq!(status, 200, "an old-shape variant PUT is converted: {updated}");
+    assert_converted(&updated["overrides"], "put-legacy");
+
+    let (status, body) = send(
+        client
+            .patch(&variant_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({"trust_check_split": true, "overrides": overrides("patch-declared")})),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains(rejection),
+        "{body}"
+    );
+
+    let (status, patched) = send(
+        client
+            .patch(&variant_url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({"overrides": overrides("patch-legacy")})),
+    )
+    .await;
+    assert_eq!(status, 200, "an old-shape variant PATCH is converted: {patched}");
+    assert_converted(&patched["variants"][0]["overrides"], "patch-legacy");
+    assert!(
+        patched
+            .get("trust_check_split")
+            .is_none(),
+        "{patched}"
+    );
+
+    for (alias, body) in [
+        ("copy-a", json!({"alias": "copy-a", "name": "copy-a", "source_alias": "dev"})),
+        ("copy-b", json!({"alias": "copy-b", "name": "copy-b", "source_alias": "dev", "trust_check_split": true})),
+    ] {
+        let (status, variant) = send(
+            client
+                .post(format!("{surface_url}/variants"))
+                .json(&body),
+        )
+        .await;
+        assert_eq!(status, 201, "{alias}: {variant}");
+        assert_converted(&variant["overrides"], "patch-legacy");
+    }
+}
+
+/// An MCP Transit Point receives the converted copy of an old-shape write, may
+/// keep that exact list or remove it, and may never gain or change one.
+#[tokio::test(flavor = "multi_thread")]
+async fn surface_api_mcp_transit_points_keep_or_remove_migrated_copies_only() {
+    let mut client = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_trust_registry_fixture(temp_dir);
+        client = Some(super::helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.expect("admin client");
+    let send = |request: reqwest::RequestBuilder| async move {
+        let response = request
+            .send()
+            .await
+            .expect("admin API request");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or(json!(null));
+        (status, body)
+    };
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let surface = |split: bool, target_list: Vec<serde_json::Value>, tools_list: Vec<serde_json::Value>| {
+        let mut body = json!({
+            "surface_id": "tc-api-mcp",
+            "name": "tc-api-mcp",
+            "status": "disabled",
+            "access_point": {"listen_address": h.gateway_base, "route": "/tc-api-mcp", "protocol": "a2a"},
+            "target": {"endpoint": h.mock.url(), "trust_check_list": target_list},
+            "transit": {"points": [{
+                "id": "tp-tools",
+                "alias": "tools",
+                "target_endpoint": "https://tools.example/mcp",
+                "protocol": "mcp",
+                "trust_check_list": tools_list
+            }]}
+        });
+        if split {
+            body["trust_check_split"] = json!(true);
+        }
+        body
+    };
+    let rejection = "Trust Checks can't be added or changed on an MCP or HTTP Transit Point";
+
+    let (status, body) = send(
+        client
+            .post(&collection)
+            .json(&surface(true, Vec::new(), vec![api_trust_check("new")])),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains(rejection),
+        "{body}"
+    );
+    assert!(
+        body.to_string()
+            .contains("tools"),
+        "{body}"
+    );
+
+    let (status, created) = send(
+        client
+            .post(&collection)
+            .json(&surface(false, vec![api_trust_check("legacy-target")], Vec::new())),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    let tools = &created["transit"]["points"][0];
+    assert_eq!(tools["trust_check_list"], json!([api_trust_check("legacy-target")]));
+    assert_eq!(tools["trust_check_migrated"], json!(true));
+
+    let surface_url = format!("{collection}/tc-api-mcp");
+    let (status, kept) = send(
+        client
+            .put(&surface_url)
+            .json(&surface(true, Vec::new(), vec![api_trust_check("legacy-target")])),
+    )
+    .await;
+    assert_eq!(status, 200, "keeping the migrated copy is accepted: {kept}");
+    assert_eq!(kept["transit"]["points"][0]["trust_check_list"][0]["id"], "legacy-target");
+
+    let (status, body) = send(
+        client
+            .put(&surface_url)
+            .json(&surface(true, Vec::new(), vec![api_trust_check("legacy-target"), api_trust_check("extra")])),
+    )
+    .await;
+    assert_eq!(status, 400, "changing the migrated copy is rejected: {body}");
+    assert!(
+        body.to_string()
+            .contains(rejection),
+        "{body}"
+    );
+
+    let (status, removed) = send(
+        client
+            .put(&surface_url)
+            .json(&surface(true, Vec::new(), Vec::new())),
+    )
+    .await;
+    assert_eq!(status, 200, "removing the migrated copy is accepted: {removed}");
+    assert!(
+        removed["transit"]["points"][0]
+            .get("trust_check_list")
+            .is_none(),
+        "{removed}"
+    );
+
+    let (status, body) = send(
+        client
+            .put(&surface_url)
+            .json(&surface(true, Vec::new(), vec![api_trust_check("legacy-target")])),
+    )
+    .await;
+    assert_eq!(status, 400, "a removed copy cannot be added back: {body}");
+    assert!(
+        body.to_string()
+            .contains(rejection),
+        "{body}"
+    );
 }

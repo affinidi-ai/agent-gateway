@@ -45,7 +45,7 @@ const ConfigEditorFullscreen: React.FC<ConfigEditorFullscreenProps> = ({
   };
 
   const ctx = buildSurfaceContext(protocol, allNodes);
-  const warnings = registry.getDependencyWarnings(node.type, node.config, ctx);
+  const warnings = registry.getDependencyWarnings(node.type, node.config, ctx, node);
 
   return (
     <div className="surface-builder-fullscreen-body">

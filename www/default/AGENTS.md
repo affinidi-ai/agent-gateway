@@ -140,35 +140,61 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (slot `request:trust-check-transit_points_trust_check_list`, node
   `trust-check-<transit point node id>`, parented on the Transit Point). The Transit Point
   factory writes it to `transit.points[i].trust_check_list`; the trust-check element's own
-  `buildPayload` skips Transit-Point-parented nodes. Offered only on A2A and AP2 Transit Points.
+  `buildPayload` skips Transit-Point-parented nodes. A new one can be dropped only on A2A and AP2
+  Transit Points (`makeSurfaceSlotFilter`). A stored list on an MCP or HTTP Transit Point (a
+  migrated copy) still hydrates onto that Transit Point's arrow and saves back, so it can be
+  kept or removed; once removed it cannot be added there again. Such a copy is read-only
+  (`readOnlyTrustCheckProtocol`): the sidebar panel and fullscreen editor say "Trust Checks can't
+  be changed on an MCP Transit Point; keep or remove this migrated copy.", the sidebar button
+  (`trust-check-panel-configure`) reads "View Queries…" instead of "Configure Queries…", the
+  fullscreen query
+  list sits in a disabled `fieldset` (no field edits, add or remove query) and has no Save.
+  A2A and AP2 copies stay editable.
 - The Managed Agent's own target-leg Trust Check sits on the Managed Agent → External Target
   arrow (slot `request:trust-check-target_trust_check_list`, node `trust-check-target`) and is
-  offered and saved only for `a2a-proxy://` and `fabric://` targets. On a URL target a stored
-  list is shown with `trust-check-panel-managed-agent-target-warning` and is never saved; the
-  API rejects it.
+  offered and saved only for `a2a-proxy://` and `fabric://` targets. On any other target (for
+  example after switching the endpoint to a URL) the node is an error-severity feature
+  dependency: the canvas rings it, Save is blocked with "Remove it or switch the target", and
+  the panel shows `trust-check-panel-managed-agent-target-warning`. Feature-dependency rules
+  receive the node (`getDependencyWarnings(type, config, ctx, node)`) to tell legs apart.
+- Every surface write sends `trust_check_split: true` at the top level, and every Surface
+  Template create, update and import sends it inside `surface` (`withTrustCheckSplit` and
+  `templateWithTrustCheckSplit` in `src/api.ts`). The gateway migrates a write without it that
+  carries `target.trust_check_list` as the old surface-wide shape.
 - Trust Check config comes only from the stored payload (`payloadOwnsConfig`); the canvas blob
   supplies position only. A blob `parentId` never moves a Trust Check between the Managed Agent
   and a Transit Point or between Transit Points, and a blob node is matched to a hydrated one
   only when their slot ids agree, so a stale node from the old shared layout does not come back.
-  An empty Trust Check placeholder in the blob (no queries, `isBlobPlaceholder`) is kept.
+  An empty Trust Check placeholder in the blob (no queries, `isBlobPlaceholder`) is kept, except
+  one in the Managed Agent slot when the stored target is not `a2a-proxy://` or `fabric://`.
+- `hydrateSurfaceCanvas` places a Trust Check the blob has no position for at the middle of
+  its arrow, so a migrated per-Transit-Point Trust Check keeps the rest of the saved layout
+  instead of triggering auto-layout.
 - Trust Check snaps to the Access Point → Managed Agent, Managed Agent → Transit Point and
-  Managed Agent → External Target arrows (`registry.snapsToArchetype`).
+  Managed Agent → External Target arrows (`registry.snapsToArchetype`). Its `edgeSnap.allows`
+  drops Managed Agent → External Target unless the Managed Agent targets `a2a-proxy://` or
+  `fabric://`; the canvas passes the target endpoint as the snap context, so on a URL target a
+  Trust Check dropped near that arrow snaps to Access Point → Managed Agent or Managed Agent →
+  Transit Point. Elements without `edgeSnap.allows` snap exactly as their archetype list says.
 - A Transit Point's `trust_check_migrated: true` moves onto its Trust Check node's config at
   hydration. A flagged node shows a canvas badge, and its sidebar panel and fullscreen editor
   show the shared `MigratedTrustCheckWarning` (`elements/trust-check/MigratedTrustCheckWarning.tsx`,
   an `InfoBanner` warning) with **Keep**. **Keep**, saving edited queries, or removing the node
   drops the flag from the next save; untouched flagged Transit Points keep it.
 - `MigratedTrustChecksSummary` sits under the canvas top bar in `.surface-canvas-notices`:
-  "N Transit Points have migrated Trust Checks to review" ("1 Transit Point has …" for one),
-  counting the variant on the canvas, hidden at zero.
+  "N Transit Points need Trust Check review" ("1 Transit Point needs …" for one), counting each
+  Transit Point with a flagged migrated copy, on the canvas and in every other loaded variant
+  snapshot (it says how many are in other variants), hidden at zero.
 
 | Element                            | Test id                                                                              |
 | ---------------------------------- | ------------------------------------------------------------------------------------ |
 | Per-Transit-Point scope line       | `trust-check-panel-transit-point-scope`                                              |
 | Fullscreen leg label               | `trust-check-fullscreen-leg`                                                         |
 | Managed Agent URL-target warning   | `trust-check-panel-managed-agent-target-warning`                                     |
+| Read-only migrated copy line       | `trust-check-panel-read-only`, `trust-check-fullscreen-read-only`                    |
+| Fullscreen query list             | `trust-check-fullscreen-queries`                                                     |
 | Migrated warning and Keep          | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
-| Migrated summary                   | `surface-migrated-trust-checks-summary`                                              |
+| Review summary                     | `surface-migrated-trust-checks-summary`                                              |
 | Migrated canvas badge              | `surface-node-trust-check-migrated-badge`                                            |
 
 ## Trust Recorder

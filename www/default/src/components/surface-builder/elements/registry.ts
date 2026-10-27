@@ -1,9 +1,11 @@
 import type { SurfaceNodeType } from '../nodeTypes';
 import type {
+  DependencyNode,
   NodeDefinition,
   PayloadContext,
   PayloadSlice,
   Protocol,
+  SnapContext,
   SurfaceContext,
 } from './types';
 import {
@@ -124,15 +126,19 @@ class ElementRegistry {
 
   /**
    * Does the element's `edgeSnap` allow-list let it snap to the edge
-   * archetype? Elements without an allow-list snap to any archetype.
+   * archetype? Elements without an allow-list snap to any archetype. With
+   * a surface context, the element's `edgeSnap.allows` can narrow the list.
    */
   snapsToArchetype(
     elementType: SurfaceNodeType | string,
-    archetypeId: string | undefined
+    archetypeId: string | undefined,
+    ctx?: SnapContext
   ): boolean {
-    const allowed = this.get(elementType)?.edgeSnap?.archetypes;
+    const snap = this.get(elementType)?.edgeSnap;
+    const allowed = snap?.archetypes;
     if (!allowed) return true;
-    return !!archetypeId && allowed.includes(archetypeId);
+    if (!archetypeId || !allowed.includes(archetypeId)) return false;
+    return !ctx || !snap?.allows || snap.allows(archetypeId, ctx);
   }
 
   /**
@@ -211,7 +217,8 @@ class ElementRegistry {
   getDependencyWarnings(
     type: SurfaceNodeType | string,
     config: any,
-    context: SurfaceContext
+    context: SurfaceContext,
+    node?: DependencyNode
   ): DependencyWarning[] {
     const def = this.get(type);
     if (!def?.featureDependencies) return [];
@@ -219,14 +226,14 @@ class ElementRegistry {
     return def.featureDependencies
       .filter(dep => {
         try {
-          return dep.condition(cfg, context);
+          return dep.condition(cfg, context, node);
         } catch {
           return false;
         }
       })
       .filter(dep => {
         try {
-          return !dep.check(cfg, context);
+          return !dep.check(cfg, context, node);
         } catch {
           return true;
         }
@@ -852,18 +859,17 @@ class ElementRegistry {
           slotId: 'request:metadata-extraction',
         });
       }
-      // Per-TP target-leg Trust Check (`transit.points[i].trust_check_list`),
-      // offered only on A2A/AP2 Transit Points.
-      if (effectiveProtocol === 'a2a' || effectiveProtocol === 'ap2') {
-        hydrateTrustCheck(
-          tp?.trust_check_list,
-          `trust-check-${tpId}`,
-          'ma-tp',
-          tpId,
-          TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
-          tp?.trust_check_migrated === true
-        );
-      }
+      // Per-TP target-leg Trust Check (`transit.points[i].trust_check_list`).
+      // New ones are offered only on A2A/AP2 Transit Points, but a stored
+      // list (a migrated copy on any protocol) is always shown.
+      hydrateTrustCheck(
+        tp?.trust_check_list,
+        `trust-check-${tpId}`,
+        'ma-tp',
+        tpId,
+        TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+        tp?.trust_check_migrated === true
+      );
       // Per-TP managed identity (`transit.points[i].managed_identity`).
       // Mirrors the request-slot id produced by the identity element
       // when freshly dropped on the MA→TP edge so it round-trips
@@ -1061,7 +1067,7 @@ class ElementRegistry {
         if (!target) {
           if (!bn.type) continue;
           const def = this.get(bn.type);
-          if (def?.payloadOwnsConfig && !def.isBlobPlaceholder?.(bn.config ?? {})) {
+          if (def?.payloadOwnsConfig && !def.isBlobPlaceholder?.(bn.config ?? {}, bn, payload)) {
             if (typeof bn.parentId === 'string') renameMap.set(bn.id, bn.parentId);
             continue;
           }

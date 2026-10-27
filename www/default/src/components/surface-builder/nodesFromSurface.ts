@@ -3,6 +3,10 @@ import type { CanvasNode } from './SurfaceCanvas';
 import type { SurfaceNodeType } from './nodeTypes';
 import { readCanvasSurfaceSize, readCanvasView, registry } from './elements';
 import { computeAutoLayout } from './autoLayout';
+import {
+  TRUST_CHECK_CALLER_SLOT_ID,
+  TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+} from './elements/edges/archetypes';
 
 /**
  * Reconstruct the live canvas nodes from a saved AgentSurface payload.
@@ -78,8 +82,39 @@ export interface HydratedSurfaceCanvas {
   didAutoLayout: boolean;
 }
 
+const EXTERNAL_TARGET_TYPES = new Set(['npc-endpoint', 'local-gateway-hop']);
+
+/** The two anchors of the arrow a Trust Check sits on. */
+function trustCheckArrow(node: CanvasNode, nodes: CanvasNode[]): [string, string] | null {
+  const parent = nodes.find(n => n.id === node.parentId);
+  if (parent && registry.isTransitPointType(parent.type)) return ['target', parent.id];
+  if (node.slotId === TRUST_CHECK_CALLER_SLOT_ID) return ['access-point', 'target'];
+  if (node.slotId === TRUST_CHECK_MANAGED_AGENT_SLOT_ID) {
+    const external = nodes.find(n => n.parentId === 'target' && EXTERNAL_TARGET_TYPES.has(n.type));
+    return external ? ['target', external.id] : null;
+  }
+  return null;
+}
+
+/**
+ * Places a Trust Check the stored layout has no position for (such as one
+ * the gateway moved onto a Transit Point) at the middle of its arrow, so
+ * the rest of the saved layout is kept.
+ */
+function placeTrustChecksWithoutPosition(nodes: CanvasNode[]): CanvasNode[] {
+  const byId = new Map(nodes.map(n => [n.id, n] as const));
+  return nodes.map(node => {
+    if (node.type !== 'trust-check' || node.position) return node;
+    const arrow = trustCheckArrow(node, nodes);
+    const from = arrow ? byId.get(arrow[0])?.position : undefined;
+    const to = arrow ? byId.get(arrow[1])?.position : undefined;
+    if (!from || !to) return node;
+    return { ...node, position: { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 } };
+  });
+}
+
 export function hydrateSurfaceCanvas(surface: AgentSurface | null): HydratedSurfaceCanvas {
-  const nodes = reconstructNodesFromSurface(surface);
+  const nodes = placeTrustChecksWithoutPosition(reconstructNodesFromSurface(surface));
   const surfaceSize = readCanvasSurfaceSize(surface);
   const view = readCanvasView(surface);
   const visibleNodes = nodes.filter(node => node.type !== 'target-variant');
