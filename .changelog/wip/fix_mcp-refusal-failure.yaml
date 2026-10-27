@@ -1,0 +1,18 @@
+branch: fix/mcp-refusal-failure
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-27T00:00:00Z'
+      title: ⭐ Accept MCP clients that send a 2025 MCP-Protocol-Version header
+      description: >-
+        MCP endpoints now accept the session revisions 2025-03-26, 2025-06-18 and 2025-11-25 as well
+        as 2024-11-05, so clients such as claude.ai that send a newer MCP-Protocol-Version header can
+        connect instead of receiving 400 / -32022. These requests are forwarded as legacy session
+        traffic with the header unchanged, and an initialize asking for one of these revisions reaches
+        the upstream unchanged so the upstream negotiates it. An initialize carrying a session revision
+        header is also accepted when it sends Mcp-Method or Mcp-Name. Unsupported-version errors and
+        server/discover now list the 2025 revisions, and any other revision is still refused with -32022.
+  removed: []
+  security: []
+  breaking: []
