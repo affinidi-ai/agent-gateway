@@ -452,8 +452,8 @@ impl McpServerManager {
                     legacy: None,
                     modern: Arc::new(RwLock::new(server)),
                     warning: Some(format!(
-                        "OpenAPI spec is unavailable to the MCP {legacy} tool catalog, so {legacy} clients cannot use this proxy: {error}",
-                        legacy = crate::mcp::MCP_LEGACY_VERSION
+                        "OpenAPI spec is unavailable to the MCP session tool catalog, so {legacy} clients cannot use this proxy: {error}",
+                        legacy = crate::mcp::request_validation::SESSION_VERSIONS.join(", ")
                     )),
                 }
             }
@@ -1989,7 +1989,11 @@ async fn process_modern_mcp_request_with_headers(
         if catalogs.legacy.is_none()
             && let Some(supported) = response["result"]["supportedVersions"].as_array_mut()
         {
-            supported.retain(|version| version.as_str() != Some(crate::mcp::MCP_LEGACY_VERSION));
+            supported.retain(|version| {
+                !version
+                    .as_str()
+                    .is_some_and(crate::mcp::request_validation::is_session_version)
+            });
         }
         return Ok(response);
     }
@@ -4437,10 +4441,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(discovery["result"]["capabilities"], serde_json::json!({"tools": {"listChanged": true}}));
-        assert_eq!(
-            discovery["result"]["supportedVersions"],
-            serde_json::json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
-        );
+        assert_eq!(discovery["result"]["supportedVersions"], serde_json::json!(versions.supported_versions()));
         let list = super::process_modern_mcp_request(&proxy, &manager, &owned_modern_request("tools/list"), versions)
             .await
             .unwrap();
@@ -4629,7 +4630,7 @@ mod tests {
             .await
             .unwrap();
         let body = serde_json::json!({"jsonrpc": "2.0", "id": "standalone", "method": "server/discover", "params": {"_meta": {
-            "io.modelcontextprotocol/protocolVersion": "2025-11-25", "io.modelcontextprotocol/clientCapabilities": {}
+            "io.modelcontextprotocol/protocolVersion": "2099-01-01", "io.modelcontextprotocol/clientCapabilities": {}
         }}}).to_string();
         for (path, body, expected_code) in [
             ("/mcp/owned".to_string(), body.clone(), -32022),
@@ -4646,7 +4647,7 @@ mod tests {
                         .uri(path)
                         .header("content-type", "application/json")
                         .header("accept", "application/json, text/event-stream")
-                        .header("mcp-protocol-version", "2025-11-25")
+                        .header("mcp-protocol-version", "2099-01-01")
                         .header("mcp-method", "server/discover")
                         .header("mcp-session-id", &session_id)
                         .body(axum::body::Body::from(body))

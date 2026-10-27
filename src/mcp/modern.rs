@@ -522,7 +522,7 @@ mod tests {
             learned_versions: None,
         };
         let mut response = json!({"jsonrpc": "2.0", "id": "request", "result": {
-            "resultType": "complete", "supportedVersions": [crate::mcp::MCP_MODERN_VERSION, "2025-11-25", crate::mcp::MCP_LEGACY_VERSION],
+            "resultType": "complete", "supportedVersions": [crate::mcp::MCP_MODERN_VERSION, "2025-11-25", "2099-01-01", crate::mcp::MCP_LEGACY_VERSION],
             "capabilities": {"tools": {"listChanged": true, "vendorField": [1, null]}, "resources": {"subscribe": true, "listChanged": true},
                 "prompts": {}, "logging": {}, "experimental": {"feature": {}},
                 "extensions": {"com.example/reviewed": {"opaque": [false, 5]}, "com.example/unavailable": {}}},
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(constrain_forwarded_discovery(&request, &mut response, &support), Ok(true));
         assert_eq!(
             response["result"]["supportedVersions"],
-            json!([crate::mcp::MCP_MODERN_VERSION, crate::mcp::MCP_LEGACY_VERSION])
+            json!([crate::mcp::MCP_MODERN_VERSION, "2025-11-25", crate::mcp::MCP_LEGACY_VERSION])
         );
         assert_eq!(
             response["result"]["capabilities"],
@@ -617,10 +617,7 @@ mod tests {
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let response = owned_discovery_response(&request, versions, "Owned tools", "1.0").unwrap();
         assert_eq!(response["result"]["resultType"], "complete");
-        assert_eq!(
-            response["result"]["supportedVersions"],
-            json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
-        );
+        assert_eq!(response["result"]["supportedVersions"], json!(versions.supported_versions()));
         assert_eq!(response["result"]["capabilities"], json!({"tools": {"listChanged": true}}));
         assert_eq!(response["result"]["ttlMs"], 0);
         assert_eq!(response["result"]["cacheScope"], "private");
@@ -640,7 +637,9 @@ mod tests {
         assert_eq!(error.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
         assert_eq!(
             error.data,
-            Some(json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": [crate::mcp::MCP_LEGACY_VERSION]}))
+            Some(
+                json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": crate::mcp::request_validation::SESSION_VERSIONS})
+            )
         );
         assert_eq!(
             owned_discovery_response(&wrong_method, versions, "Owned tools", "1.0")

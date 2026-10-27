@@ -16977,7 +16977,7 @@ allow if {
             "target": {"endpoint": target.url()}
         });
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+            "protocolVersion": "2099-01-01", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
         }});
         let request = axum::http::Request::builder()
             .method("POST")
@@ -18314,7 +18314,7 @@ allow if {
     }
 
     async fn forwarded_discovery_narrows_unsupported_version_errors(state: &crate::state::ProxyState) {
-        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
+        use crate::mcp::MCP_MODERN_VERSION;
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
@@ -18350,7 +18350,7 @@ allow if {
         }});
         for (name, discovery, expected) in [
             ("discovered", Some(&discovered), json!([MCP_MODERN_VERSION])),
-            ("legacy-only", Some(&legacy_only), json!([MCP_LEGACY_VERSION])),
+            ("legacy-only", Some(&legacy_only), json!(crate::mcp::request_validation::SESSION_VERSIONS)),
             ("fresh", None, json!(versions.supported_versions())),
         ] {
             let target = crate::component_tests::helpers::MockServer::start_with_response(
@@ -18392,7 +18392,7 @@ allow if {
             let forwarded = target
                 .request_count
                 .load(Ordering::SeqCst);
-            let (status, rejected) = read(send(request(&route, "unmodelled", "tools/list", "2025-11-25")).await).await;
+            let (status, rejected) = read(send(request(&route, "unmodelled", "tools/list", "2099-01-01")).await).await;
             assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{name}: {rejected}");
             assert_eq!(rejected["id"], "unmodelled");
             assert_eq!(rejected["error"]["code"], crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);

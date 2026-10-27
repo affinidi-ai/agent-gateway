@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use super::MCP_MODERN_VERSION;
 use super::error_codes;
-use super::request_validation::McpRequestValidationError;
-use super::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
+use super::request_validation::{McpRequestValidationError, is_session_version};
 
 const TTL: Duration = Duration::from_secs(300);
 const CAPACITY: usize = 1024;
@@ -48,14 +48,15 @@ impl Versions {
             .pointer("/result/supportedVersions")
             .and_then(Value::as_array)
         {
-            let lists = |version: &str| {
+            let lists = |matches: &dyn Fn(&str) -> bool| {
                 supported
                     .iter()
-                    .any(|listed| listed.as_str() == Some(version))
+                    .filter_map(Value::as_str)
+                    .any(matches)
             };
             return Some(Self {
-                legacy: lists(MCP_LEGACY_VERSION),
-                modern: lists(MCP_MODERN_VERSION),
+                legacy: lists(&is_session_version),
+                modern: lists(&|version| version == MCP_MODERN_VERSION),
             });
         }
         (message
@@ -69,7 +70,7 @@ impl Versions {
         self,
         version: &str,
     ) -> bool {
-        (self.legacy && version == MCP_LEGACY_VERSION) || (self.modern && version == MCP_MODERN_VERSION)
+        (self.legacy && is_session_version(version)) || (self.modern && version == MCP_MODERN_VERSION)
     }
 }
 
@@ -185,7 +186,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::mcp::request_validation::{MODERN_CAPABLE_POLICY, MODERN_ONLY_POLICY, McpVersionPolicy};
+    use crate::mcp::MCP_LEGACY_VERSION;
+    use crate::mcp::request_validation::{
+        MODERN_CAPABLE_POLICY, MODERN_ONLY_POLICY, McpVersionPolicy, SESSION_VERSIONS,
+    };
 
     fn key(surface_id: &str) -> UpstreamKey {
         UpstreamKey {
@@ -207,7 +211,7 @@ mod tests {
     }
 
     fn unsupported(policy: McpVersionPolicy<'_>) -> Box<McpRequestValidationError> {
-        McpRequestValidationError::unsupported(Some(json!("request")), "2025-11-25", policy)
+        McpRequestValidationError::unsupported(Some(json!("request")), "2099-01-01", policy)
     }
 
     fn advertised(
@@ -223,21 +227,24 @@ mod tests {
     #[test]
     fn upstream_versions_narrow_the_advertised_list_to_what_discovery_listed() {
         let modern_only = key("upstream-versions-modern-only");
-        record_discovery(modern_only.clone(), &discovery(&[MCP_MODERN_VERSION, "2025-11-25"]));
+        record_discovery(modern_only.clone(), &discovery(&[MCP_MODERN_VERSION, "2099-01-01"]));
         assert_eq!(advertised(&modern_only, MODERN_CAPABLE_POLICY), json!([MCP_MODERN_VERSION]));
         let both = key("upstream-versions-both");
         record_discovery(both.clone(), &discovery(&[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
-        assert_eq!(advertised(&both, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
+        assert_eq!(advertised(&both, MODERN_CAPABLE_POLICY), json!(MODERN_CAPABLE_POLICY.supported_versions()));
+        let session_only = key("upstream-versions-session-only");
+        record_discovery(session_only.clone(), &discovery(&["2025-06-18"]));
+        assert_eq!(advertised(&session_only, MODERN_CAPABLE_POLICY), json!(SESSION_VERSIONS));
         let error = restrict_unsupported(unsupported(MODERN_CAPABLE_POLICY), &modern_only);
         assert_eq!(error.id, Some(json!("request")));
-        assert_eq!(error.data.unwrap()["requested"], "2025-11-25");
+        assert_eq!(error.data.unwrap()["requested"], "2099-01-01");
     }
 
     #[test]
     fn upstream_versions_treat_method_not_found_as_a_legacy_only_upstream() {
         let legacy = key("upstream-versions-method-not-found");
         record_discovery(legacy.clone(), &error(error_codes::METHOD_NOT_FOUND));
-        assert_eq!(advertised(&legacy, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION]));
+        assert_eq!(advertised(&legacy, MODERN_CAPABLE_POLICY), json!(SESSION_VERSIONS));
     }
 
     #[test]
@@ -254,7 +261,7 @@ mod tests {
             record_discovery(untouched.clone(), &message);
             assert_eq!(
                 advertised(&untouched, MODERN_CAPABLE_POLICY),
-                json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]),
+                json!(MODERN_CAPABLE_POLICY.supported_versions()),
                 "{message}"
             );
         }
@@ -264,7 +271,7 @@ mod tests {
     fn upstream_versions_keep_the_path_list_for_an_unknown_upstream() {
         assert_eq!(
             advertised(&key("upstream-versions-unknown"), MODERN_CAPABLE_POLICY),
-            json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION])
+            json!(MODERN_CAPABLE_POLICY.supported_versions())
         );
         let learned = key("upstream-versions-distinct-keys");
         record_discovery(learned.clone(), &discovery(&[MCP_MODERN_VERSION]));
@@ -284,7 +291,7 @@ mod tests {
         ] {
             assert_eq!(
                 advertised(&other, MODERN_CAPABLE_POLICY),
-                json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]),
+                json!(MODERN_CAPABLE_POLICY.supported_versions()),
                 "{other:?}"
             );
         }
@@ -296,11 +303,11 @@ mod tests {
         let latest = key("upstream-versions-latest");
         record_discovery(latest.clone(), &discovery(&[MCP_MODERN_VERSION]));
         record_discovery(latest.clone(), &error(error_codes::METHOD_NOT_FOUND));
-        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION]));
+        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!(SESSION_VERSIONS));
         record_discovery(latest.clone(), &error(error_codes::INTERNAL_ERROR));
-        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION]));
+        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!(SESSION_VERSIONS));
         record_discovery(latest.clone(), &discovery(&[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
-        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
+        assert_eq!(advertised(&latest, MODERN_CAPABLE_POLICY), json!(MODERN_CAPABLE_POLICY.supported_versions()));
     }
 
     #[test]
@@ -352,8 +359,8 @@ mod tests {
         record_discovery(legacy.clone(), &error(error_codes::METHOD_NOT_FOUND));
         assert_eq!(advertised(&legacy, MODERN_ONLY_POLICY), json!([MCP_MODERN_VERSION]));
         let unmodelled = key("upstream-versions-unmodelled");
-        record_discovery(unmodelled.clone(), &discovery(&["2025-11-25"]));
-        assert_eq!(advertised(&unmodelled, MODERN_CAPABLE_POLICY), json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]));
+        record_discovery(unmodelled.clone(), &discovery(&["2099-01-01"]));
+        assert_eq!(advertised(&unmodelled, MODERN_CAPABLE_POLICY), json!(MODERN_CAPABLE_POLICY.supported_versions()));
     }
 
     #[test]

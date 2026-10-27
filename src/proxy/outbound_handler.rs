@@ -8406,7 +8406,7 @@ mod tests {
     async fn test_step_extract_protocol_context_caps_initialize_to_a_served_revision() {
         let state = test_outbound_state();
         let legacy = crate::mcp::MCP_LEGACY_VERSION;
-        for (requested, forwarded) in [("2025-11-25", legacy), (legacy, legacy)] {
+        for (requested, forwarded) in [("2099-01-01", legacy), (legacy, legacy), ("2025-06-18", "2025-06-18")] {
             let mut ctx = test_pipeline_context();
             Arc::make_mut(&mut ctx.surface)
                 .access_point
@@ -8460,8 +8460,8 @@ mod tests {
         for (target, version, admitted) in [
             ("fabric://gateway/channel", crate::mcp::MCP_MODERN_VERSION, true),
             ("https://agent.example/mcp", crate::mcp::MCP_MODERN_VERSION, true),
-            ("fabric://gateway/channel", "2025-11-25", false),
-            ("https://agent.example/mcp", "2025-11-25", false),
+            ("fabric://gateway/channel", "2099-01-01", false),
+            ("https://agent.example/mcp", "2099-01-01", false),
         ] {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
@@ -8491,10 +8491,7 @@ mod tests {
                 assert_eq!(error.status, StatusCode::BAD_REQUEST);
                 assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
                 assert_eq!(error.id, Some(json!("transit-admission")));
-                assert_eq!(
-                    error.data.unwrap()["supported"],
-                    json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
-                );
+                assert_eq!(error.data.unwrap()["supported"], json!(versions.supported_versions()));
                 assert!(
                     ctx.mcp_classification
                         .is_none()
@@ -8514,7 +8511,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_step_extract_protocol_context_advertises_versions_learned_from_transit_discovery() {
-        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
+        use crate::mcp::MCP_MODERN_VERSION;
 
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let transit_point = |ctx: &mut OutboundPipelineContext, alias: &str| {
@@ -8573,10 +8570,10 @@ mod tests {
                 .map(|_| ctx.mcp_classification)
         };
         for (alias, supported) in [
-            ("learned-discovery", json!([MCP_LEGACY_VERSION])),
-            ("unlearned-discovery", json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION])),
+            ("learned-discovery", json!(crate::mcp::request_validation::SESSION_VERSIONS)),
+            ("unlearned-discovery", json!(versions.supported_versions())),
         ] {
-            let Err(OutboundPipelineError::McpValidation(error)) = admit(alias, "2025-11-25").await else {
+            let Err(OutboundPipelineError::McpValidation(error)) = admit(alias, "2099-01-01").await else {
                 panic!("expected MCP version rejection for {alias}");
             };
             assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);

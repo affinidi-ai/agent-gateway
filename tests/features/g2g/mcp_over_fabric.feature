@@ -122,11 +122,11 @@ Feature: MCP requests travel across gateways over fabric
     Given a fabric with 2 gateways
     And gateway 2 has an MCP surface "alpha" targeting MCP server "bravo"
     And gateway 1 has an MCP surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller asks gateway 1 MCP surface "charlie" for available tools using protocol version "2025-11-25"
+    When the caller asks gateway 1 MCP surface "charlie" for available tools using protocol version "2099-01-01"
     Then the response status is 400
     And the MCP response is a JSON-RPC error with code -32022
     And the MCP response id matches the request id
-    And the MCP unsupported-version error requests "2025-11-25" and supports only "2024-11-05, 2026-07-28"
+    And the MCP unsupported-version error requests "2099-01-01" and supports only "2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, 2026-07-28"
     And MCP server "bravo" was not called
     And gateway 2 did not receive a fabric forward request
 
@@ -139,7 +139,7 @@ Feature: MCP requests travel across gateways over fabric
     Then the response status is 400
     And the MCP response is a JSON-RPC error with code -32022
     And the MCP response id matches the request id
-    And the MCP unsupported-version error requests "2026-07-28" and supports only "2024-11-05"
+    And the MCP unsupported-version error requests "2026-07-28" and supports only "2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25"
     And the response arrives in under 5 seconds
     And MCP server "bravo" was not called
 

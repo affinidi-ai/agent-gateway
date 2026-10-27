@@ -1452,12 +1452,12 @@ mod tests {
 
         let dual = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let advertised = |key: &UpstreamKey| {
-            restrict_unsupported(McpRequestValidationError::unsupported(None, "2025-11-25", dual), key)
+            restrict_unsupported(McpRequestValidationError::unsupported(None, "2099-01-01", dual), key)
                 .data
                 .unwrap()["supported"]
                 .clone()
         };
-        let path_set = json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
+        let path_set = json!(dual.supported_versions());
         let result = |versions: serde_json::Value| {
             json!({"jsonrpc": "2.0", "id": 7, "result": {
                 "resultType": "complete", "supportedVersions": versions, "tools": [],
@@ -1466,8 +1466,13 @@ mod tests {
         };
         let error = |code: i32| json!({"jsonrpc": "2.0", "id": 7, "error": {"code": code, "message": "failed"}});
         let cases = [
-            ("server/discover", result(json!([MCP_MODERN_VERSION, "2025-11-25"])), true, json!([MCP_MODERN_VERSION])),
-            ("server/discover", error(crate::mcp::error_codes::METHOD_NOT_FOUND), true, json!([MCP_LEGACY_VERSION])),
+            ("server/discover", result(json!([MCP_MODERN_VERSION, "2099-01-01"])), true, json!([MCP_MODERN_VERSION])),
+            (
+                "server/discover",
+                error(crate::mcp::error_codes::METHOD_NOT_FOUND),
+                true,
+                json!(crate::mcp::request_validation::SESSION_VERSIONS),
+            ),
             ("server/discover", error(crate::mcp::error_codes::INTERNAL_ERROR), true, path_set.clone()),
             ("server/discover", result(json!([MCP_LEGACY_VERSION])), false, path_set.clone()),
             ("tools/list", result(json!([MCP_MODERN_VERSION])), true, path_set.clone()),

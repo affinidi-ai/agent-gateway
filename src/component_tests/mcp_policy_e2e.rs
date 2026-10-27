@@ -193,6 +193,68 @@ async fn modern_mcp_follows_the_direct_access_point_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_revisions_reach_the_target_unchanged() {
+    let harness = GatewayHarness::start(|_, config, _| {
+        let mut surface = surface_with_deny_all_channel_policy();
+        surface.target.policy = None;
+        config.surfaces = vec![surface];
+    })
+    .await;
+    let client = reqwest::Client::new();
+    for version in ["2025-03-26", "2025-06-18", "2025-11-25"] {
+        let initialize = json!({"jsonrpc": "2.0", "id": "open", "method": "initialize", "params": {
+            "protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+        }});
+        let tools_list = json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}});
+        for (body, method_header) in [(&initialize, None), (&initialize, Some("initialize")), (&tools_list, None)] {
+            let before = forwarded(&harness);
+            let mut request = client
+                .post(&harness.gateway_url)
+                .header("mcp-protocol-version", version)
+                .header("accept", "application/json, text/event-stream");
+            if let Some(method) = method_header {
+                request = request.header("mcp-method", method);
+            }
+            let session = (*body == tools_list).then_some("upstream-session");
+            if let Some(session) = session {
+                request = request.header("mcp-session-id", session);
+            }
+            let response = request
+                .json(body)
+                .send()
+                .await
+                .unwrap();
+            let case = format!("{version} {} with Mcp-Method {method_header:?}", body["method"]);
+            assert_eq!(response.status(), 200, "{case}");
+            assert_eq!(forwarded(&harness), before + 1, "{case} must reach the Target");
+            let received = harness
+                .mock
+                .last_request_rx
+                .borrow()
+                .clone()
+                .unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&received.body).unwrap(), *body, "{case}");
+            assert_eq!(
+                received
+                    .headers
+                    .get("mcp-protocol-version")
+                    .map(String::as_str),
+                Some(version),
+                "{case}"
+            );
+            assert_eq!(
+                received
+                    .headers
+                    .get("mcp-session-id")
+                    .map(String::as_str),
+                session,
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mcp_resource_authorization_requires_scoped_tokens_and_strips_target_credentials() {
     use super::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
     use std::sync::atomic::Ordering;
@@ -481,7 +543,7 @@ async fn mcp_http_direct_guards_opt_in_before_target_dispatch() {
     })
     .await;
     let body = json!({"jsonrpc": "2.0", "id": "http-guard", "method": "server/discover", "params": {"_meta": {
-        "io.modelcontextprotocol/protocolVersion": "2025-11-25", "io.modelcontextprotocol/clientCapabilities": {}
+        "io.modelcontextprotocol/protocolVersion": "2099-01-01", "io.modelcontextprotocol/clientCapabilities": {}
     }}});
     let client = reqwest::Client::new();
     for (origin, expected_status) in [
@@ -492,7 +554,7 @@ async fn mcp_http_direct_guards_opt_in_before_target_dispatch() {
     ] {
         let mut request = client
             .post(&harness.gateway_url)
-            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-protocol-version", "2099-01-01")
             .header("mcp-method", "server/discover")
             .header("accept", "application/json, text/event-stream")
             .json(&body);
@@ -956,14 +1018,14 @@ async fn mcp_wire_validation_precedes_policy_without_rejecting_legacy_headers() 
         .unwrap()
         .remove("name");
     let mut unmodelled_body = modern_body.clone();
-    unmodelled_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2025-11-25");
+    unmodelled_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
     let mut mixed_era_body = list_body.clone();
     mixed_era_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
         json!(crate::mcp::MCP_LEGACY_VERSION);
     for (body, method, version, name, expected_code, expected_id) in [
         (String::new(), "tools/call", crate::mcp::MCP_MODERN_VERSION, "echo", -32700, None),
         (modern_body.to_string(), "tools/call", crate::mcp::MCP_MODERN_VERSION, "=?base64?=", -32020, Some(json!(8))),
-        (unmodelled_body.to_string(), "tools/call", "2025-11-25", "echo", -32022, Some(json!(8))),
+        (unmodelled_body.to_string(), "tools/call", "2099-01-01", "echo", -32022, Some(json!(8))),
         (list_body.to_string(), "tools/list", crate::mcp::MCP_MODERN_VERSION, "=?base64?=", -32020, Some(json!(8))),
         (
             mixed_era_body.to_string(),
@@ -1023,7 +1085,7 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
     let client = reqwest::Client::new();
     let response = client
         .post(&harness.gateway_url)
-        .header("mcp-protocol-version", "2025-11-25")
+        .header("mcp-protocol-version", "2099-01-01")
         .header("mcp-method", "tasks/get")
         .json(&json!({
             "jsonrpc": "2.0",
@@ -1032,7 +1094,7 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
             "params": {
                 "taskId": "task-1",
                 "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/protocolVersion": "2099-01-01",
                     "io.modelcontextprotocol/clientCapabilities": {
                         "extensions": { "io.modelcontextprotocol/tasks": {} }
                     }
@@ -1050,8 +1112,11 @@ async fn mcp_wire_validation_precedes_protocol_family_detection() {
     assert_eq!(
         envelope["error"]["data"],
         json!({
-            "requested": "2025-11-25",
-            "supported": [crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION]
+            "requested": "2099-01-01",
+            "supported": crate::mcp::request_validation::runtime_policy_for(
+                crate::mcp::request_validation::McpPathKind::DirectAccessPoint
+            )
+            .supported_versions()
         })
     );
 

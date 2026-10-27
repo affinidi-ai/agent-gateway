@@ -50,6 +50,15 @@ impl<'a> McpVersionPolicy<'a> {
         self.supported_versions
     }
 
+    fn serves_session(
+        &self,
+        version: &str,
+    ) -> bool {
+        self.supported_versions
+            .contains(&version)
+            && !self.supports_modern(version)
+    }
+
     /// Returns whichever of two nested policies admits and advertises less.
     pub(crate) fn within(
         self,
@@ -95,12 +104,23 @@ impl McpPathKind {
         [Self::DirectAccessPoint, Self::OwnedProxy, Self::TransitPoint, Self::FabricReceive, Self::FabricSend];
 }
 
-const LEGACY_SUPPORTED_VERSIONS: &[&str] = &[MCP_LEGACY_VERSION];
-pub const LEGACY_ONLY_POLICY: McpVersionPolicy<'static> = McpVersionPolicy::new(&[], LEGACY_SUPPORTED_VERSIONS);
+const MODERN_CAPABLE_VERSIONS: &[&str] =
+    &[MCP_LEGACY_VERSION, "2025-03-26", "2025-06-18", "2025-11-25", super::MCP_MODERN_VERSION];
 
-/// Admits `2026-07-28` alongside `2024-11-05`.
+/// Revisions that open a session with `initialize` and carry it in
+/// `Mcp-Session-Id`, oldest first. Every one is forwarded as a legacy request.
+pub(crate) const SESSION_VERSIONS: &[&str] = MODERN_CAPABLE_VERSIONS
+    .split_at(MODERN_CAPABLE_VERSIONS.len() - 1)
+    .0;
+pub const LEGACY_ONLY_POLICY: McpVersionPolicy<'static> = McpVersionPolicy::new(&[], SESSION_VERSIONS);
+
+/// Admits `2026-07-28` alongside the session revisions.
 pub(crate) const MODERN_CAPABLE_POLICY: McpVersionPolicy<'static> =
-    McpVersionPolicy::new(&[super::MCP_MODERN_VERSION], &[MCP_LEGACY_VERSION, super::MCP_MODERN_VERSION]);
+    McpVersionPolicy::new(&[super::MCP_MODERN_VERSION], MODERN_CAPABLE_VERSIONS);
+
+pub(crate) fn is_session_version(version: &str) -> bool {
+    SESSION_VERSIONS.contains(&version)
+}
 
 /// Admits only `2026-07-28`.
 #[cfg(test)]
@@ -173,13 +193,14 @@ impl CappedInitialize {
 }
 
 /// Rewrites a legacy `initialize` whose requested revision the endpoint does
-/// not serve to request the newest legacy revision it does, or returns `None`
+/// not serve to request the oldest session revision it does, or returns `None`
 /// to forward the request unchanged.
 ///
 /// A server answers `initialize` with a revision it supports and the client
 /// decides whether to continue. The upstream cannot see which revisions this
-/// endpoint serves, so forwarding a request for `2025-11-25` lets it settle a
-/// session whose every later request is rejected with `-32022`. Modern
+/// endpoint serves, so forwarding an unserved revision lets it settle a
+/// session whose every later request is rejected with `-32022`. A served
+/// session revision is forwarded as is so the upstream negotiates it. Modern
 /// revisions are never offered: they have no `initialize` handshake.
 /// Supported versions are listed oldest first, so no date strings are compared.
 pub fn cap_legacy_initialize(
@@ -190,24 +211,17 @@ pub fn cap_legacy_initialize(
     if !matches!(classification, McpRequestClassification::Legacy(LegacyRequestKind::Opening)) {
         return None;
     }
-    let serves = |version: &str| {
-        policy
-            .supported_versions
-            .contains(&version)
-            && !policy.supports_modern(version)
-    };
     let offered = policy
         .supported_versions
         .iter()
-        .rev()
         .copied()
-        .find(|version| serves(version))?;
+        .find(|version| policy.serves_session(version))?;
     let mut request: JsonValue = serde_json::from_slice(body).ok()?;
     let version = request
         .get_mut("params")?
         .get_mut("protocolVersion")?;
     let requested = version.as_str()?.to_string();
-    if serves(&requested) {
+    if policy.serves_session(&requested) {
         return None;
     }
     *version = JsonValue::String(offered.to_string());
@@ -298,7 +312,7 @@ impl McpRequestValidationError {
     }
 
     /// The answer to a modern request that a Fabric peer refuses because it
-    /// serves legacy MCP only: `400` / `-32022` listing `2024-11-05`.
+    /// serves legacy MCP only: `400` / `-32022` listing the session revisions.
     pub fn legacy_only(id: Option<JsonValue>) -> Box<Self> {
         Self::unsupported(id, super::MCP_MODERN_VERSION, LEGACY_ONLY_POLICY)
     }
@@ -327,7 +341,7 @@ pub fn validate_mcp_post(
     session_evidence: LegacySessionEvidence,
     policy: McpVersionPolicy<'_>,
 ) -> Result<McpRequestClassification, Box<McpRequestValidationError>> {
-    let header_intent = has_modern_header(headers);
+    let header_intent = has_modern_header(headers, policy);
     let body: JsonValue = match serde_json::from_slice(body_bytes) {
         Ok(body) => body,
         Err(error) if header_intent => {
@@ -353,13 +367,14 @@ pub fn validate_mcp_post(
     };
 
     let id = recover_request_id(object);
+    let method = object
+        .get("method")
+        .and_then(JsonValue::as_str);
+    if method == Some("initialize") && !body_intent && (!header_intent || has_session_header(headers, policy)) {
+        validate_mirrored_initialize_headers(headers, id)?;
+        return Ok(McpRequestClassification::Legacy(LegacyRequestKind::Opening));
+    }
     if !header_intent && !body_intent {
-        let method = object
-            .get("method")
-            .and_then(JsonValue::as_str);
-        if method == Some("initialize") {
-            return Ok(McpRequestClassification::Legacy(LegacyRequestKind::Opening));
-        }
         if method.is_some() && !object.contains_key("id") {
             return Ok(McpRequestClassification::UnversionedNotification);
         }
@@ -415,7 +430,7 @@ fn validate_modern_message(
         .transpose()
         .map_err(|message| header_mismatch(id.clone(), message))?;
     if let Some(requested) =
-        header_version.filter(|version| *version != super::MCP_MODERN_VERSION && *version != MCP_LEGACY_VERSION)
+        header_version.filter(|version| *version != super::MCP_MODERN_VERSION && !policy.serves_session(version))
         && kind == McpMessageKind::Request
     {
         if let Some(body_version) = canonical_body_version(object)
@@ -595,11 +610,11 @@ fn validate_modern_message(
         },
     };
 
-    if protocol_version == MCP_LEGACY_VERSION {
+    if is_session_version(protocol_version) {
         return Err(McpRequestValidationError::new(
             id,
             error_codes::INVALID_PARAMS,
-            format!("MCP {MCP_LEGACY_VERSION} cannot use modern per-request metadata or mirrored headers"),
+            format!("MCP {protocol_version} cannot use modern per-request metadata or mirrored headers"),
         ));
     }
 
@@ -631,18 +646,41 @@ fn is_valid_request_id(value: &JsonValue) -> bool {
     value.is_string() || value.as_i64().is_some() || value.as_u64().is_some()
 }
 
-fn has_modern_header(headers: &HeaderMap) -> bool {
+fn has_session_header(
+    headers: &HeaderMap,
+    policy: McpVersionPolicy<'_>,
+) -> bool {
     let mut versions = headers
         .get_all(PROTOCOL_VERSION_HEADER)
         .iter();
-    let legacy_version = versions
+    versions
         .next()
         .and_then(|value| value.to_str().ok())
-        == Some(MCP_LEGACY_VERSION)
-        && versions.next().is_none();
-    (headers.contains_key(PROTOCOL_VERSION_HEADER) && !legacy_version)
+        .is_some_and(|version| policy.serves_session(version))
+        && versions.next().is_none()
+}
+
+fn has_modern_header(
+    headers: &HeaderMap,
+    policy: McpVersionPolicy<'_>,
+) -> bool {
+    (headers.contains_key(PROTOCOL_VERSION_HEADER) && !has_session_header(headers, policy))
         || headers.contains_key(METHOD_HEADER)
         || headers.contains_key(NAME_HEADER)
+}
+
+fn validate_mirrored_initialize_headers(
+    headers: &HeaderMap,
+    id: Option<JsonValue>,
+) -> Result<(), Box<McpRequestValidationError>> {
+    if single_header(headers, METHOD_HEADER, id.clone())?.is_some_and(|method| method != "initialize") {
+        return Err(header_mismatch(id, "Mcp-Method header does not match method"));
+    }
+    single_header(headers, NAME_HEADER, id.clone())?
+        .map(decode_mirrored_value)
+        .transpose()
+        .map_err(|message| header_mismatch(id, message))?;
+    Ok(())
 }
 
 fn has_modern_meta(object: &Map<String, JsonValue>) -> bool {
@@ -835,7 +873,11 @@ mod tests {
             let policy = runtime_policy_for(path);
             assert!(policy.supports_modern(MCP_MODERN_VERSION), "{path:?} admission");
             assert!(!policy.supports_modern("2025-11-25"), "{path:?} admitted an unmodelled revision");
-            assert_eq!(policy.supported_versions(), [MCP_LEGACY_VERSION, MCP_MODERN_VERSION], "{path:?} advertisement");
+            assert_eq!(
+                policy.supported_versions(),
+                [MCP_LEGACY_VERSION, "2025-03-26", "2025-06-18", "2025-11-25", MCP_MODERN_VERSION],
+                "{path:?} advertisement"
+            );
         }
     }
 
@@ -918,7 +960,7 @@ mod tests {
     #[test]
     fn within_keeps_the_narrower_of_two_nested_policies() {
         const ADVERTISED_ONLY: McpVersionPolicy<'static> =
-            McpVersionPolicy::new(&[], &[MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
+            McpVersionPolicy::new(&[], MODERN_CAPABLE_POLICY.supported_versions);
         for (policy, limit, expected) in [
             (MODERN_CAPABLE_POLICY, LEGACY_ONLY_POLICY, LEGACY_ONLY_POLICY),
             (LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY, LEGACY_ONLY_POLICY),
@@ -1011,8 +1053,80 @@ mod tests {
     }
 
     #[test]
-    fn initialize_for_an_unserved_revision_requests_the_newest_served_legacy_revision() {
-        for requested in ["2025-03-26", "2025-06-18", "2025-11-25", "1999-01-01"] {
+    fn initialize_with_a_session_revision_header_is_legacy_opening_even_with_mirrored_headers() {
+        let body = initialize_body(json!(MCP_LEGACY_VERSION));
+        for version in SESSION_VERSIONS {
+            for mirrored in [None, Some(METHOD_HEADER), Some(NAME_HEADER)] {
+                let mut headers = HeaderMap::new();
+                headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(version));
+                if let Some(name) = mirrored {
+                    headers.insert(name, HeaderValue::from_static("initialize"));
+                }
+                for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
+                    assert_eq!(
+                        validate(&body, &headers, policy),
+                        Ok(McpRequestClassification::Legacy(LegacyRequestKind::Opening)),
+                        "{version} with {mirrored:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn initialize_with_a_session_revision_header_still_validates_mirrored_headers() {
+        let body = initialize_body(json!("2025-06-18"));
+        for (name, value) in [(METHOD_HEADER, "tools/call"), (NAME_HEADER, "=?base64?=")] {
+            let mut headers = HeaderMap::new();
+            headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("2025-06-18"));
+            headers.insert(name, HeaderValue::from_static(value));
+            let error = validate(&body, &headers, MODERN_CAPABLE_POLICY).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.code, error_codes::HEADER_MISMATCH, "{name}: {value}");
+            assert_eq!(error.id, Some(json!(7)));
+        }
+        let mut duplicate = HeaderMap::new();
+        duplicate.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("2025-06-18"));
+        duplicate.append(METHOD_HEADER, HeaderValue::from_static("initialize"));
+        duplicate.append(METHOD_HEADER, HeaderValue::from_static("initialize"));
+        let error = validate(&body, &duplicate, MODERN_CAPABLE_POLICY).unwrap_err();
+        assert_eq!(error.code, error_codes::HEADER_MISMATCH);
+    }
+
+    #[test]
+    fn a_session_revision_the_policy_does_not_serve_is_unsupported() {
+        let body =
+            serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("2025-06-18"));
+        let error = validate_mcp_post(&headers, &body, LegacySessionEvidence::Known, MODERN_ONLY_POLICY).unwrap_err();
+        assert_eq!(error.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(error.data, Some(json!({"requested": "2025-06-18", "supported": [MCP_MODERN_VERSION]})));
+    }
+
+    #[test]
+    fn initialize_with_a_modern_or_unknown_revision_header_is_not_a_legacy_opening() {
+        let body = initialize_body(json!(MCP_LEGACY_VERSION));
+        let mut modern = modern_headers("initialize");
+        let error = validate(&body, &modern, MODERN_CAPABLE_POLICY).unwrap_err();
+        assert_eq!(error.code, error_codes::INVALID_PARAMS);
+
+        modern.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("2099-01-01"));
+        let error = validate(&body, &modern, MODERN_CAPABLE_POLICY).unwrap_err();
+        assert_eq!(error.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(
+            error.data,
+            Some(json!({"requested": "2099-01-01", "supported": MODERN_CAPABLE_POLICY.supported_versions}))
+        );
+
+        let mut method_only = HeaderMap::new();
+        method_only.insert(METHOD_HEADER, HeaderValue::from_static("initialize"));
+        assert!(validate(&body, &method_only, MODERN_CAPABLE_POLICY).is_err());
+    }
+
+    #[test]
+    fn initialize_for_an_unserved_revision_requests_the_oldest_served_session_revision() {
+        for requested in ["1999-01-01", "2025-01-01", "2099-01-01"] {
             let body = initialize_body(json!(requested));
             let capped = cap(&body, LEGACY_ONLY_POLICY).expect("an unserved revision is capped");
             assert_eq!(capped.requested, requested);
@@ -1024,22 +1138,25 @@ mod tests {
     }
 
     #[test]
-    fn initialize_for_a_served_revision_is_forwarded_unchanged() {
-        assert_eq!(cap(&initialize_body(json!(MCP_LEGACY_VERSION)), LEGACY_ONLY_POLICY), None);
+    fn initialize_for_a_served_session_revision_is_forwarded_unchanged() {
+        for version in SESSION_VERSIONS {
+            for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
+                assert_eq!(cap(&initialize_body(json!(version)), policy), None, "{version}");
+            }
+        }
     }
 
     #[test]
     fn initialize_never_settles_on_a_modern_revision() {
-        for requested in [MCP_MODERN_VERSION, "2025-11-25"] {
+        for requested in [MCP_MODERN_VERSION, "2099-01-01"] {
             let capped = cap(&initialize_body(json!(requested)), MODERN_CAPABLE_POLICY).expect("capped");
             assert_eq!(capped.offered, MCP_LEGACY_VERSION, "{requested}");
         }
-        assert_eq!(cap(&initialize_body(json!(MCP_LEGACY_VERSION)), MODERN_CAPABLE_POLICY), None);
     }
 
     #[test]
     fn only_a_legacy_opening_with_a_string_revision_is_capped() {
-        let body = serde_json::to_vec(&initialize_body(json!("2025-11-25"))).unwrap();
+        let body = serde_json::to_vec(&initialize_body(json!("2099-01-01"))).unwrap();
         for classification in [
             McpRequestClassification::Legacy(LegacyRequestKind::Session),
             McpRequestClassification::Legacy(LegacyRequestKind::Compatibility),
@@ -1108,7 +1225,7 @@ mod tests {
         assert_eq!(error.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
         assert_eq!(
             error.data,
-            Some(json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": [MCP_LEGACY_VERSION]}))
+            Some(json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": SESSION_VERSIONS}))
         );
     }
 
@@ -1122,13 +1239,30 @@ mod tests {
             error.data,
             Some(json!({
                 "requested": MCP_MODERN_VERSION,
-                "supported": [MCP_LEGACY_VERSION]
+                "supported": SESSION_VERSIONS
             }))
         );
     }
 
     #[test]
-    fn intermediate_header_only_version_is_unsupported_without_modern_metadata() {
+    fn session_revision_header_is_a_legacy_request() {
+        let body =
+            serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})).unwrap();
+        for version in SESSION_VERSIONS {
+            let mut headers = HeaderMap::new();
+            headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(version));
+            for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
+                assert_eq!(
+                    validate_mcp_post(&headers, &body, LegacySessionEvidence::Known, policy),
+                    Ok(McpRequestClassification::Legacy(LegacyRequestKind::Session)),
+                    "{version}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_header_only_version_is_unsupported_without_modern_metadata() {
         let body = json!({
             "jsonrpc": "2.0",
             "id": "intermediate-request",
@@ -1136,12 +1270,12 @@ mod tests {
             "params": {}
         });
         let mut headers = HeaderMap::new();
-        headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("2025-11-25"));
+        headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("2099-01-01"));
 
         let error = validate(&body, &headers, LEGACY_ONLY_POLICY).unwrap_err();
         assert_eq!(error.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
         assert_eq!(error.id, Some(json!("intermediate-request")));
-        assert_eq!(error.data, Some(json!({"requested": "2025-11-25", "supported": [MCP_LEGACY_VERSION]})));
+        assert_eq!(error.data, Some(json!({"requested": "2099-01-01", "supported": SESSION_VERSIONS})));
     }
 
     #[test]
@@ -1365,8 +1499,8 @@ mod tests {
     }
 
     #[test]
-    fn intermediate_and_unknown_per_request_versions_are_unsupported() {
-        for version in ["2025-11-25", "2099-01-01"] {
+    fn unknown_per_request_versions_are_unsupported() {
+        for version in ["2025-01-01", "2099-01-01"] {
             let mut body = modern_body();
             body["params"]["_meta"][PROTOCOL_VERSION_META] = json!(version);
             let mut headers = modern_headers("tools/list");
@@ -1374,34 +1508,39 @@ mod tests {
             let error = validate(&body, &headers, LEGACY_ONLY_POLICY).unwrap_err();
             assert_eq!(error.status, StatusCode::BAD_REQUEST);
             assert_eq!(error.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
-            assert_eq!(error.data, Some(json!({"requested": version, "supported": [MCP_LEGACY_VERSION]})));
+            assert_eq!(error.data, Some(json!({"requested": version, "supported": SESSION_VERSIONS})));
         }
     }
 
     #[test]
-    fn legacy_version_in_modern_metadata_is_invalid_params() {
-        for (method, notification) in [("tools/list", false), ("notifications/example", true)] {
-            let mut body = modern_body();
-            body["method"] = json!(method);
-            body["params"]["_meta"][PROTOCOL_VERSION_META] = json!(MCP_LEGACY_VERSION);
-            if notification {
-                body.as_object_mut()
-                    .unwrap()
-                    .remove("id");
+    fn session_version_in_modern_metadata_is_invalid_params() {
+        for version in SESSION_VERSIONS {
+            for (method, notification) in [("tools/list", false), ("notifications/example", true)] {
+                let mut body = modern_body();
+                body["method"] = json!(method);
+                body["params"]["_meta"][PROTOCOL_VERSION_META] = json!(version);
+                if notification {
+                    body.as_object_mut()
+                        .unwrap()
+                        .remove("id");
+                }
+                let mut headers = modern_headers(method);
+                headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(version));
+                for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
+                    let error = validate(&body, &headers, policy).unwrap_err();
+                    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+                    assert_eq!(error.code, error_codes::INVALID_PARAMS);
+                    assert_eq!(error.id, body.get("id").cloned());
+                    assert_eq!(error.data, None);
+                    assert_eq!(
+                        error.message,
+                        format!("MCP {version} cannot use modern per-request metadata or mirrored headers")
+                    );
+                }
+                headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(MCP_MODERN_VERSION));
+                let error = validate(&body, &headers, LEGACY_ONLY_POLICY).unwrap_err();
+                assert_eq!(error.code, error_codes::HEADER_MISMATCH);
             }
-            let mut headers = modern_headers(method);
-            headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(MCP_LEGACY_VERSION));
-            for policy in [LEGACY_ONLY_POLICY, MODERN_CAPABLE_POLICY] {
-                let error = validate(&body, &headers, policy).unwrap_err();
-                assert_eq!(error.status, StatusCode::BAD_REQUEST);
-                assert_eq!(error.code, error_codes::INVALID_PARAMS);
-                assert_eq!(error.id, body.get("id").cloned());
-                assert_eq!(error.data, None);
-                assert_eq!(error.message, "MCP 2024-11-05 cannot use modern per-request metadata or mirrored headers");
-            }
-            headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(MCP_MODERN_VERSION));
-            let error = validate(&body, &headers, LEGACY_ONLY_POLICY).unwrap_err();
-            assert_eq!(error.code, error_codes::HEADER_MISMATCH);
         }
     }
 
@@ -1476,7 +1615,7 @@ mod tests {
     #[test]
     fn optional_name_is_validated_before_unsupported_header_only_version() {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-        for version in ["2025-11-25", "2099-01-01"] {
+        for version in ["2025-01-01", "2099-01-01"] {
             let mut headers = HeaderMap::new();
             headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static(version));
             headers.insert(NAME_HEADER, HeaderValue::from_static("=?base64?="));
@@ -1488,7 +1627,7 @@ mod tests {
             headers.insert(NAME_HEADER, HeaderValue::from_static("extra-name"));
             let error = validate(&body, &headers, LEGACY_ONLY_POLICY).unwrap_err();
             assert_eq!(error.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
-            assert_eq!(error.data, Some(json!({"requested": version, "supported": [MCP_LEGACY_VERSION]})));
+            assert_eq!(error.data, Some(json!({"requested": version, "supported": SESSION_VERSIONS})));
         }
     }
 
