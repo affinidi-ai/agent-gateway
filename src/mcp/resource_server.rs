@@ -1609,6 +1609,7 @@ mod tests {
             json!({"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}),
             json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_header": "x-token"}),
             json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_scheme": ""}),
+            json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "forward_header": true}),
         ] {
             let surface = discovery_surface(method.clone(), Some(resource.clone()));
             assert!(matches!(access_point_protected_resource(&surface, None, &network), Some(Err(_))), "{method}");

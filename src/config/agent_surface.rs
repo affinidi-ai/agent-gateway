@@ -2060,7 +2060,8 @@ impl AgentSurface {
 
     /// A protected resource is advertised only for an MCP Access Point whose
     /// enforced caller authentication method reads JWT Bearer tokens from the
-    /// `Authorization` header, where RFC 9728 clients send them.
+    /// `Authorization` header, where RFC 9728 clients send them, and keeps
+    /// them from the Target: MCP forbids passing a client's token through.
     pub fn validate_protected_resource(&self) -> Result<(), String> {
         let Some(protected) = self.protected_resource() else {
             return Ok(());
@@ -2078,6 +2079,11 @@ impl AgentSurface {
                         .token_scheme
                         .eq_ignore_ascii_case("bearer") =>
             {
+                if jwt.forward_header {
+                    return Err("cannot be combined with forward_header: the caller's token must not reach the \
+                                Target"
+                        .into());
+                }
                 Ok(())
             }
             _ => Err("requires a first caller authentication method of JWT Bearer reading the Authorization \
@@ -2523,6 +2529,13 @@ mod tests {
             "protected_resource": protected
         }}});
         assert!(rejected(&stored).starts_with("variant 'beta': "));
+        let forwarded = serde_json::json!({"methods": [
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "forward_header": true}
+        ], "protected_resource": protected});
+        let mut forwarding = stored.clone();
+        forwarding["variants"] = serde_json::json!([]);
+        forwarding["access_point"]["caller_authentication"] = forwarded;
+        assert!(rejected(&forwarding).contains("forward_header"));
         let unknown_field = serde_json::json!({
             "methods": [], "protected_resource": {"resource": "https://gateway.example/mcp", "authorization_servers": [], "issuer": "x"}
         });

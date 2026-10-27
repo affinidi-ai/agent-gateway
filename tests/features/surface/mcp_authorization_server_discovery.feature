@@ -47,6 +47,13 @@ Feature: MCP authorization server discovery
     And MCP server "bravo" received the forwarded MCP request
     And the MCP surface returns MCP server "bravo" tool catalog unchanged
 
+  Scenario: The caller's token never reaches the MCP server
+    Given the surface publishes protected resource metadata naming authorization server "https://idp.example/realms/agents" and scope "tools"
+    And MCP server "bravo" publishes a tool catalog
+    When the caller asks the MCP surface for available tools with a valid token
+    Then the response status is 200
+    And MCP server "bravo" did not receive header "authorization"
+
   Scenario: An MCP surface without discovery publishes no metadata
     When the caller fetches the protected resource metadata of the surface
     Then the response status is 404

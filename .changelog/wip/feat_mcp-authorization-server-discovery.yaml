@@ -31,5 +31,12 @@ changes:
         another endpoint mounted at the root. The challenge is now Bearer realm="agent-gateway"
         only.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-10-27T11:20:02Z'
+      title: Never forward the caller token on MCP surfaces that publish discovery
+      description: >-
+        MCP forbids passing a client's token through to the upstream server. Saving an MCP surface
+        that publishes protected resource metadata with JWT Bearer forward_header set is refused
+        with 400, and a stored surface with that combination answers 503 instead of forwarding, so
+        the caller's Authorization header never reaches the Target.
   breaking: []

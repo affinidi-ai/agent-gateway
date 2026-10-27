@@ -1314,8 +1314,12 @@ token. It opts in with `caller_authentication.protected_resource`:
 
 The setting is valid only on an MCP Access Point whose first caller
 authentication method, the one enforced, is JWT Bearer reading the
-`Authorization` header with the `Bearer` scheme, and it cannot be combined
-with `mcp_http.authorization`. `resource` follows the rules of
+`Authorization` header with the `Bearer` scheme without `forward_header`, and
+it cannot be combined with `mcp_http.authorization`. MCP forbids passing a
+client's token through to the upstream server, so the caller's `Authorization`
+header never reaches the Target; a stored surface that sets `forward_header`
+anyway, for example one edited on disk, answers `503` and publishes no
+document. `resource` follows the rules of
 `mcp_http.authorization.resource`: a canonical HTTPS URL on a public origin of
 the Access Point's listener with the route as its path, a distinct `$alias`
 resource for each enabled variant, and refused on save (`400`) when another
