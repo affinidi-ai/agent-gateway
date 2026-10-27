@@ -216,9 +216,12 @@ pub enum PolicyChangeSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalReason {
+    /// 403: not permitted, including an appliance limit reached.
     Forbidden,
+    /// 404: the policy or target does not exist or is not visible.
     NotFound,
+    /// 400 or 422: the change was not valid.
     Invalid,
+    /// 409: the change conflicts with what is stored.
     Conflict,
-    Limit,
 }

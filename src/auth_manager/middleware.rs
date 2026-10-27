@@ -297,6 +297,13 @@ pub async fn require_session_auth(
             ).into_response());
         }
 
+        let actor = crate::audit::events::Actor::pat(principal.token_id.clone(), principal.user_id.clone());
+        // A write this token may not make is refused here, before any route
+        // layer runs, so a refused policy change is recorded here too.
+        let refused = |status: StatusCode| {
+            crate::audit::policy_refusals::record_refused(request.method(), &path, status, actor.clone());
+            status.into_response()
+        };
         let resource_scoped = principal
             .resource_scope
             .is_some();
@@ -314,7 +321,7 @@ pub async fn require_session_auth(
                             reason = %rejection.message(),
                             "Access-token resource scope rejected request"
                         );
-                        return Err(StatusCode::FORBIDDEN.into_response());
+                        return Err(refused(StatusCode::FORBIDDEN));
                     }
                 }
             }
@@ -343,7 +350,7 @@ pub async fn require_session_auth(
                 header = %selector.header_name,
                 "PAT tenant selector is broad and no trusted edge is configured — failing closed"
             );
-            return Err(StatusCode::FORBIDDEN.into_response());
+            return Err(refused(StatusCode::FORBIDDEN));
         }
 
         if let Some(tenant_id) = scope_evaluation
@@ -351,7 +358,7 @@ pub async fn require_session_auth(
             .as_deref()
             && crate::tenancy::validate_tenant_id(tenant_id).is_err()
         {
-            return Err(StatusCode::FORBIDDEN.into_response());
+            return Err(refused(StatusCode::FORBIDDEN));
         }
 
         let tenant_context = scope_evaluation
@@ -381,22 +388,21 @@ pub async fn require_session_auth(
                     return Err(if is_read {
                         StatusCode::NOT_FOUND.into_response()
                     } else {
-                        StatusCode::FORBIDDEN.into_response()
+                        refused(StatusCode::FORBIDDEN)
                     });
                 }
-                PathScope::Unscoped if !is_read => return Err(StatusCode::FORBIDDEN.into_response()),
+                PathScope::Unscoped if !is_read => return Err(refused(StatusCode::FORBIDDEN)),
                 PathScope::DenyScoped => {
                     return Err(if is_read {
                         StatusCode::NOT_FOUND.into_response()
                     } else {
-                        StatusCode::FORBIDDEN.into_response()
+                        refused(StatusCode::FORBIDDEN)
                     });
                 }
                 _ => {}
             }
         }
 
-        let actor = crate::audit::events::Actor::pat(principal.token_id.clone(), principal.user_id.clone());
         let mut request = request;
         request
             .extensions_mut()
@@ -1309,6 +1315,69 @@ mod tests {
         );
         assert_ne!(first["request_id"], second["request_id"]);
         assert_ne!(first["request_id"], by_pat["request_id"]);
+    }
+
+    struct ScopedPat;
+
+    #[async_trait::async_trait]
+    impl crate::auth_manager::pat::PatAuthenticator for ScopedPat {
+        async fn authenticate(
+            &self,
+            token: &str,
+        ) -> Option<crate::auth_manager::pat::PatPrincipal> {
+            (token == "scoped-pat").then(|| crate::auth_manager::pat::PatPrincipal {
+                user_id: "user-1".to_string(),
+                scopes: None,
+                token_id: "scoped-token".to_string(),
+                delegation_depth: 0,
+                resource_scope: Some(Arc::new(
+                    crate::auth_manager::resource_scope::compile(
+                        Some("TENANT:${x-tenant}:policy-definitions:allowed"),
+                        &[crate::auth_manager::resource_scope::RequiredHeader {
+                            name: "x-tenant".to_string(),
+                            pattern: "tenant-a".to_string(),
+                        }],
+                    )
+                    .unwrap(),
+                )),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_policy_change_outside_an_access_tokens_scope_is_refused_and_recorded() {
+        let app = Router::new()
+            .route("/v1/policy-definitions/{policy_id}", axum::routing::put(ok_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(
+                    Arc::new(SessionManager::new()),
+                    None,
+                    Arc::new(crate::terms::TermsManager::disabled()),
+                )
+                .with_pat_authenticator(Some(Arc::new(ScopedPat))),
+                require_session_auth,
+            ));
+
+        let (response, records) = crate::audit::producer::capture(
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method(Method::PUT)
+                    .uri("/v1/policy-definitions/deny-pii")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer scoped-pat")
+                    .header("x-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(records.len(), 1);
+        let refused = &serde_json::to_value(&records[0].event).unwrap()["policy_change_refused"];
+        assert_eq!(refused["action"], "policy_updated");
+        assert_eq!(refused["policy_definition_id"], "deny-pii");
+        assert_eq!(refused["actor"], serde_json::json!({"kind": "pat", "id": "scoped-token", "user_id": "user-1"}));
+        assert_eq!(refused["reason"], "forbidden");
     }
 
     struct TermsTestPat;

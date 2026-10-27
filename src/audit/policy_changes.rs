@@ -332,7 +332,9 @@ pub fn record(
     write(action);
 }
 
-fn write(action: DelegationAuditAction) {
+/// Writes a policy change record, carrying a surface target's id and name at
+/// the top level.
+pub(crate) fn write(action: DelegationAuditAction) {
     emit(action_category(&action), move || {
         let surface = match &action {
             DelegationAuditAction::PolicyCreated(change)

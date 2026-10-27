@@ -786,27 +786,21 @@ pub fn create_identity_api_router(
             )
             .route(
                 "/v1/policy-definitions",
-                post(handlers::create_policy_definition).layer(require_feature(
-                    s.clone(),
-                    r.clone(),
-                    Feature::PoliciesEdit,
-                )),
+                post(handlers::create_policy_definition)
+                    .layer(require_feature(s.clone(), r.clone(), Feature::PoliciesEdit))
+                    .layer(axum::middleware::from_fn(crate::audit::policy_refusals::record_refused_policy_changes)),
             )
             .route(
                 "/v1/policy-definitions/{policy_id}",
-                put(handlers::update_policy_definition).layer(require_feature(
-                    s.clone(),
-                    r.clone(),
-                    Feature::PoliciesEdit,
-                )),
+                put(handlers::update_policy_definition)
+                    .layer(require_feature(s.clone(), r.clone(), Feature::PoliciesEdit))
+                    .layer(axum::middleware::from_fn(crate::audit::policy_refusals::record_refused_policy_changes)),
             )
             .route(
                 "/v1/policy-definitions/{policy_id}",
-                delete(handlers::delete_policy_definition).layer(require_feature(
-                    s.clone(),
-                    r.clone(),
-                    Feature::PoliciesDelete,
-                )),
+                delete(handlers::delete_policy_definition)
+                    .layer(require_feature(s.clone(), r.clone(), Feature::PoliciesDelete))
+                    .layer(axum::middleware::from_fn(crate::audit::policy_refusals::record_refused_policy_changes)),
             )
             .route(
                 "/v1/policy-definitions/{policy_id}/simulate",
@@ -826,11 +820,9 @@ pub fn create_identity_api_router(
             )
             .route(
                 "/v1/policy-assignments",
-                put(handlers::update_policy_assignments).layer(require_feature(
-                    s.clone(),
-                    r.clone(),
-                    Feature::PoliciesEdit,
-                )),
+                put(handlers::update_policy_assignments)
+                    .layer(require_feature(s.clone(), r.clone(), Feature::PoliciesEdit))
+                    .layer(axum::middleware::from_fn(crate::audit::policy_refusals::record_refused_policy_changes)),
             )
             .route(
                 "/v1/tenant-ownership/{kind}/{id}/impact",
@@ -842,11 +834,9 @@ pub fn create_identity_api_router(
             )
             .route(
                 "/v1/tenant-ownership/{kind}/{id}",
-                put(handlers::tenant_ownership::reassign_ownership).layer(require_feature(
-                    s.clone(),
-                    r.clone(),
-                    Feature::TenantOwnershipManage,
-                )),
+                put(handlers::tenant_ownership::reassign_ownership)
+                    .layer(require_feature(s.clone(), r.clone(), Feature::TenantOwnershipManage))
+                    .layer(axum::middleware::from_fn(crate::audit::policy_refusals::record_refused_policy_changes)),
             )
             // H6 — onboarding surface lifecycle
             .route(
@@ -1003,7 +993,8 @@ pub fn create_identity_api_router(
                 gate(
                     put(crate::gateways::handlers::update_gateway_policy::<crate::gateways::FileSystemGatewayStore>),
                     Feature::GatewaysEdit,
-                ),
+                )
+                .layer(axum::middleware::from_fn(crate::audit::policy_refusals::record_refused_policy_changes)),
             )
             .layer(Extension(store.clone()))
             .layer(Extension(state.vc_issuer.clone()))
