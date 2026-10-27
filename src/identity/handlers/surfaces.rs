@@ -1205,6 +1205,16 @@ fn retain_mcp_settings(
     existing: &AgentSurface,
 ) {
     retain_mcp_http(&mut surface.mcp_http, existing.mcp_http.as_ref());
+    retain_protected_resource(
+        surface
+            .access_point
+            .caller_authentication
+            .as_mut(),
+        existing
+            .access_point
+            .caller_authentication
+            .as_ref(),
+    );
     let retain_points = |points: &mut [crate::config::agent_surface::TransitPoint],
                          stored: &[crate::config::agent_surface::TransitPoint]| {
         for point in points {
@@ -1224,6 +1234,29 @@ fn retain_mcp_settings(
             .variants
             .iter()
             .find(|previous| previous.id == variant.id);
+        retain_protected_resource(
+            variant
+                .overrides
+                .access_point
+                .as_mut()
+                .and_then(|access_point| {
+                    access_point
+                        .caller_authentication
+                        .as_mut()
+                }),
+            stored
+                .and_then(|previous| {
+                    previous
+                        .overrides
+                        .access_point
+                        .as_ref()
+                })
+                .and_then(|access_point| {
+                    access_point
+                        .caller_authentication
+                        .as_ref()
+                }),
+        );
         let points = variant
             .overrides
             .transit
@@ -1265,6 +1298,26 @@ fn retain_mcp_http(
             incoming.authorization = previous.authorization.clone();
         }
         Some(_) => {}
+    }
+}
+
+/// PUT carries the whole record, and the dashboard rebuilds
+/// `caller_authentication` from its methods alone, so a `caller_authentication`
+/// that omits `protected_resource` means "unchanged". Dropping it on an
+/// unrelated edit would silently switch off the discovery the operator set up.
+/// Removal is explicit, via PATCH with a `null`.
+fn retain_protected_resource(
+    incoming: Option<&mut crate::config::agent_surface::CallerAuthentication>,
+    previous: Option<&crate::config::agent_surface::CallerAuthentication>,
+) {
+    if let (Some(incoming), Some(previous)) = (incoming, previous)
+        && incoming
+            .protected_resource
+            .is_none()
+    {
+        incoming.protected_resource = previous
+            .protected_resource
+            .clone();
     }
 }
 
@@ -2389,6 +2442,89 @@ mod validation_tests {
         );
     }
 
+    #[test]
+    fn a_put_that_rebuilds_caller_authentication_keeps_the_protected_resource() {
+        let protected = serde_json::json!({
+            "resource": "https://gateway.example/mcp", "authorization_servers": ["https://idp.example"]
+        });
+        let methods =
+            serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}]);
+        let caller_authentication = |with_resource: bool| -> crate::config::agent_surface::CallerAuthentication {
+            let mut value = serde_json::json!({"methods": methods});
+            if with_resource {
+                value["protected_resource"] = protected.clone();
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let variant = |with_resource: bool| -> SurfaceVariant {
+            serde_json::from_value(serde_json::json!({
+                "id": "v-beta", "alias": "beta", "name": "beta", "enabled": true,
+                "overrides": {"access_point": {"caller_authentication": caller_authentication(with_resource)}}
+            }))
+            .unwrap()
+        };
+        let stored_resource = |surface: &AgentSurface| {
+            (
+                surface
+                    .protected_resource()
+                    .cloned(),
+                surface.variants[0]
+                    .overrides
+                    .access_point
+                    .as_ref()
+                    .and_then(|access_point| {
+                        access_point
+                            .caller_authentication
+                            .as_ref()
+                    })
+                    .and_then(|caller| {
+                        caller
+                            .protected_resource
+                            .clone()
+                    }),
+            )
+        };
+        let mut existing = base_surface();
+        existing
+            .access_point
+            .caller_authentication = Some(caller_authentication(true));
+        existing.variants = vec![variant(true)];
+        let expected = Some(
+            serde_json::from_value::<crate::mcp::resource_server::ProtectedResourceConfig>(protected.clone()).unwrap(),
+        );
+
+        // The dashboard sends caller authentication rebuilt from its methods.
+        let mut rewritten = base_surface();
+        rewritten
+            .access_point
+            .caller_authentication = Some(caller_authentication(false));
+        rewritten.variants = vec![variant(false)];
+        retain_mcp_settings(&mut rewritten, &existing);
+        assert_eq!(stored_resource(&rewritten), (expected.clone(), expected));
+
+        // Removing caller authentication does not bring the setting back.
+        let mut removed = base_surface();
+        removed.variants = vec![variant(false)];
+        retain_mcp_settings(&mut removed, &existing);
+        assert!(
+            removed
+                .access_point
+                .caller_authentication
+                .is_none()
+        );
+
+        // A surface that never published one does not gain one.
+        let mut fresh = base_surface();
+        fresh
+            .access_point
+            .caller_authentication = Some(caller_authentication(false));
+        fresh.variants = vec![variant(false)];
+        let mut never = base_surface();
+        never.variants = vec![variant(false)];
+        retain_mcp_settings(&mut fresh, &never);
+        assert_eq!(stored_resource(&fresh), (None, None));
+    }
+
     fn a2a_block(
         versions: &[&str],
         validation: crate::config::agent_surface::A2aValidation,
@@ -3474,6 +3610,7 @@ mod validation_tests {
         let mut s = base_surface();
         s.access_point
             .caller_authentication = Some(CallerAuthentication {
+            protected_resource: None,
             methods: vec![SourceAuthConfig::DidAuth(cfg)],
         });
         s
@@ -3583,6 +3720,7 @@ mod validation_tests {
         use crate::jwt_bearer::models::JwtBearerAuthConfig;
         use crate::source_auth::models::SourceAuthConfig;
         CallerAuthentication {
+            protected_resource: None,
             methods: vec![SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
                 token_header: token_header.to_string(),
                 ..Default::default()

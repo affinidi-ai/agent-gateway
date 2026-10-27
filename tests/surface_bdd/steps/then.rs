@@ -2577,6 +2577,33 @@ fn named_external_agent_did_not_receive_header(
     assert_actor_did_not_receive_header(world, &agent_name, TargetActorKind::ExternalAgent, &header_name);
 }
 
+#[then("the protected resource metadata names the surface as the resource")]
+fn protected_resource_metadata_names_the_surface(world: &mut SurfaceWorld) {
+    let expected = format!(
+        "{}{}",
+        crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+        world.surface_config.route
+    );
+    assert_eq!(get_response_body_value(world)["resource"], serde_json::json!(expected));
+    assert_eq!(get_response_body_value(world)["bearer_methods_supported"], serde_json::json!(["header"]));
+}
+
+#[then(expr = "the protected resource metadata names authorization server {string}")]
+fn protected_resource_metadata_names_authorization_server(
+    world: &mut SurfaceWorld,
+    authorization_server: String,
+) {
+    assert_eq!(get_response_body_value(world)["authorization_servers"], serde_json::json!([authorization_server]));
+}
+
+#[then(expr = "the protected resource metadata lists scope {string}")]
+fn protected_resource_metadata_lists_scope(
+    world: &mut SurfaceWorld,
+    scope: String,
+) {
+    assert_eq!(get_response_body_value(world)["scopes_supported"], serde_json::json!([scope]));
+}
+
 #[then(expr = "the response includes header {string} with value {string}")]
 fn response_includes_header_with_value(
     world: &mut SurfaceWorld,

@@ -1288,6 +1288,64 @@ Fabric authorization, distributed replay and lifecycle conformance are not
 verified. These opt-in OAuth settings do not change which revisions an
 endpoint admits.
 
+### Authorization Server Discovery for Caller Authentication
+
+An MCP Access Point whose caller authentication validates JWT Bearer tokens
+from an external authorization server can publish RFC 9728 protected
+resource metadata naming that server, so an MCP client finds where to get a
+token. It opts in with `caller_authentication.protected_resource`:
+
+```json
+{
+  "access_point": {
+    "route": "/mcp/alpha",
+    "protocol": "mcp",
+    "caller_authentication": {
+      "methods": [{ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [] }],
+      "protected_resource": {
+        "resource": "https://gateway.example/mcp/alpha",
+        "authorization_servers": ["https://idp.example/realms/agents"],
+        "scopes": ["tools"]
+      }
+    }
+  }
+}
+```
+
+The setting is valid only on an MCP Access Point whose first caller
+authentication method, the one enforced, is JWT Bearer reading the
+`Authorization` header with the `Bearer` scheme, and it cannot be combined
+with `mcp_http.authorization`. `resource` follows the rules of
+`mcp_http.authorization.resource`: a canonical HTTPS URL on a public origin of
+the Access Point's listener with the route as its path, a distinct `$alias`
+resource for each enabled variant, and refused on save (`400`) when another
+stored surface or MCP Proxy already serves it. `authorization_servers` lists
+one to eight RFC 8414 issuer identifiers: HTTPS URLs without credentials,
+query or fragment, at most 2048 bytes each and advertised exactly as written,
+since clients compare them byte for byte with the issuer in the server's own
+metadata. Tokens are still validated by the JWT verification strategy, so the
+strategy's expected issuer should be one of them. `scopes` are advertised as
+`scopes_supported`. A variant that overrides `caller_authentication` carries
+its own setting or none.
+
+The document is served at `/.well-known/oauth-protected-resource<route>` and
+`/.well-known/oauth-protected-resource<route>$<alias>` (`%24` accepted) on
+the Access Point's listener, with `no-store`, and at the root form only for a
+surface mounted at `/`. It holds `resource`, `authorization_servers`,
+`bearer_methods_supported: ["header"]` and `scopes_supported` when scopes are
+set. Only active surfaces and enabled variants publish. When the settings
+claiming a path no longer validate at request time, for example after the
+listener's public URLs changed, the path answers `503`. Documents are read
+from the live surface, so a surface saved through the API publishes without a
+restart. Inbound listeners route both well-known paths whether or not
+`sts.mcp_issuer` is configured: a path no caller authentication publishes
+falls to the gateway STS document when the profile is configured, and is
+otherwise routed like any other request, as before.
+
+A PUT whose `caller_authentication` omits `protected_resource` keeps the
+stored setting, as the dashboard rebuilds `caller_authentication` from its
+methods; PATCH with `null` removes it. The dashboard does not edit the setting.
+
 ### Tool Parameter Headers
 
 `mcp::tool_headers::ToolHeaderBindings` compiles `x-mcp-header` annotations for

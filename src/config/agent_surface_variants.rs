@@ -1196,7 +1196,10 @@ mod tests {
         let mut s = base_surface();
         // Base has a caller-auth strategy set.
         s.access_point
-            .caller_authentication = Some(CallerAuthentication { methods: Vec::new() });
+            .caller_authentication = Some(CallerAuthentication {
+            methods: Vec::new(),
+            protected_resource: None,
+        });
         // Variant override carries no caller-auth but is marked complete.
         s.variants = vec![variant(
             "id-frozen",
@@ -1233,7 +1236,10 @@ mod tests {
     fn sparse_overrides_inherit_base_option_fields() {
         let mut s = base_surface();
         s.access_point
-            .caller_authentication = Some(CallerAuthentication { methods: Vec::new() });
+            .caller_authentication = Some(CallerAuthentication {
+            methods: Vec::new(),
+            protected_resource: None,
+        });
         s.variants = vec![variant(
             "id-legacy",
             "legacy",

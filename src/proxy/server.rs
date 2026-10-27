@@ -585,19 +585,19 @@ pub async fn run_port_server(
     {
         profile.validate_network(&network_config)?;
         app = app.merge(profile.discovery_router()?);
-        app = app.merge(
-            Router::new()
-                .route(
-                    "/.well-known/oauth-protected-resource",
-                    axum::routing::get(crate::mcp::resource_server::surface_metadata),
-                )
-                .route(
-                    "/.well-known/oauth-protected-resource/{*path}",
-                    axum::routing::get(crate::mcp::resource_server::surface_metadata),
-                )
-                .with_state(state.as_ref().clone()),
-        );
     }
+    app = app.merge(
+        Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource",
+                axum::routing::any(crate::mcp::resource_server::protected_resource_metadata),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/{*path}",
+                axum::routing::any(crate::mcp::resource_server::protected_resource_metadata),
+            )
+            .with_state(state.as_ref().clone()),
+    );
 
     // Note: SPA-route collision validation is performed once at startup in
     // server::orchestrator before any port is spawned, where a hard exit can

@@ -64,11 +64,11 @@ impl std::fmt::Display for ResourceDeclarationError {
         match self {
             Self::NotServed(resource) => write!(
                 f,
-                "mcp_http.authorization.resource '{resource}' must be this endpoint's own public URL: a public URL of \
+                "MCP resource '{resource}' must be this endpoint's own public URL: a public URL of \
                  its listener and its own path"
             ),
             Self::AlreadyServed(resource) => {
-                write!(f, "mcp_http.authorization.resource '{resource}' is already served by another endpoint")
+                write!(f, "MCP resource '{resource}' is already served by another endpoint")
             }
             Self::Unavailable => write!(f, "MCP resource ownership is unavailable"),
         }

@@ -446,6 +446,10 @@ pub enum SurfaceProtocol {
 pub struct CallerAuthentication {
     /// Ordered list of authentication methods. First success wins.
     pub methods: Vec<SourceAuthConfig>,
+    /// RFC 9728 discovery for an MCP Access Point whose JWT Bearer method
+    /// accepts tokens from an external authorization server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_resource: Option<crate::mcp::resource_server::ProtectedResourceConfig>,
 }
 
 /// What the Gateway needs to know about the caller.
@@ -2054,6 +2058,34 @@ impl AgentSurface {
         Ok(())
     }
 
+    /// A protected resource is advertised only for an MCP Access Point whose
+    /// enforced caller authentication method reads JWT Bearer tokens from the
+    /// `Authorization` header, where RFC 9728 clients send them.
+    pub fn validate_protected_resource(&self) -> Result<(), String> {
+        let Some(protected) = self.protected_resource() else {
+            return Ok(());
+        };
+        if self.access_point.protocol != SurfaceProtocol::Mcp {
+            return Err("requires an MCP Access Point".into());
+        }
+        protected.validate()?;
+        match self.source_auth() {
+            Some(SourceAuthConfig::JwtBearer(jwt))
+                if jwt
+                    .token_header
+                    .eq_ignore_ascii_case("authorization")
+                    && jwt
+                        .token_scheme
+                        .eq_ignore_ascii_case("bearer") =>
+            {
+                Ok(())
+            }
+            _ => Err("requires a first caller authentication method of JWT Bearer reading the Authorization \
+                      header with the Bearer scheme"
+                .into()),
+        }
+    }
+
     pub fn validate_mcp_metadata(&self) -> Result<(), String> {
         self.validate_mcp_metadata_base()?;
         for variant in &self.variants {
@@ -2069,6 +2101,8 @@ impl AgentSurface {
     pub(crate) fn validate_mcp_metadata_base(&self) -> Result<(), String> {
         let context = crate::mcp::meta::McpMetadataContext::legacy(self.mcp_legacy_metadata_output);
         let is_mcp = self.access_point.protocol == SurfaceProtocol::Mcp;
+        self.validate_protected_resource()
+            .map_err(|error| format!("access_point.caller_authentication.protected_resource: {error}"))?;
         if let Some(config) = &self.mcp_http {
             if !is_mcp {
                 return Err("mcp_http requires an MCP Access Point".to_string());
@@ -2435,6 +2469,64 @@ mod tests {
                 .unwrap_err()
                 .contains("Transit Point")
         );
+    }
+
+    #[test]
+    fn a_protected_resource_needs_an_mcp_access_point_reading_jwt_bearer_tokens() {
+        let jwt = serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []});
+        let protected = serde_json::json!({
+            "resource": "https://gateway.example/mcp", "authorization_servers": ["https://idp.example"], "scopes": ["tools"]
+        });
+        let mut stored = serde_json::json!({
+            "surface_id": "discovery", "name": "discovery",
+            "access_point": {"listen_address": "http://localhost:8080", "route": "/mcp", "protocol": "mcp",
+                "caller_authentication": {"methods": [jwt], "protected_resource": protected}},
+            "target": {"endpoint": "http://localhost:8081"},
+            "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}]
+        });
+        let surface: super::AgentSurface = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(surface.validate_mcp_metadata(), Ok(()));
+        assert_eq!(
+            surface
+                .protected_resource()
+                .map(|protected| protected
+                    .authorization_servers
+                    .clone()),
+            Some(vec!["https://idp.example".to_string()])
+        );
+
+        let rejected = |stored: &serde_json::Value| {
+            let surface: super::AgentSurface = serde_json::from_value(stored.clone()).unwrap();
+            surface
+                .validate_mcp_metadata()
+                .unwrap_err()
+        };
+        let mut a2a = stored.clone();
+        a2a["access_point"]["protocol"] = serde_json::json!("a2a");
+        assert!(rejected(&a2a).contains("requires an MCP Access Point"));
+        for method in [
+            serde_json::json!({"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}),
+            serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_header": "x-token"}),
+            serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "token_scheme": "Token"}),
+        ] {
+            let mut changed = stored.clone();
+            changed["access_point"]["caller_authentication"]["methods"] = serde_json::json!([method]);
+            assert!(rejected(&changed).contains("JWT Bearer"), "{method}");
+        }
+        let mut no_servers = stored.clone();
+        no_servers["access_point"]["caller_authentication"]["protected_resource"]["authorization_servers"] =
+            serde_json::json!([]);
+        assert!(rejected(&no_servers).starts_with("access_point.caller_authentication.protected_resource:"));
+
+        stored["variants"][0]["overrides"] = serde_json::json!({"access_point": {"caller_authentication": {
+            "methods": [{"type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}],
+            "protected_resource": protected
+        }}});
+        assert!(rejected(&stored).starts_with("variant 'beta': "));
+        let unknown_field = serde_json::json!({
+            "methods": [], "protected_resource": {"resource": "https://gateway.example/mcp", "authorization_servers": [], "issuer": "x"}
+        });
+        assert!(serde_json::from_value::<super::CallerAuthentication>(unknown_field).is_err());
     }
 
     #[test]

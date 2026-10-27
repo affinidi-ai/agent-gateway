@@ -31,6 +31,11 @@ Configured on the Access Point as `caller_authentication.methods`. Each method i
 ([`AgentSurface::source_auth`](../src/config/agent_surface_accessors.rs)); later entries
 are accepted and ignored.
 
+An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
+resource metadata naming the authorization server that issues its tokens, with
+`caller_authentication.protected_resource`. See
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
+
 The gateway builds one source authentication middleware at startup. If its JWT
 verification strategy store (`jwt_verification_strategies/`, next to the secrets storage
 directory) cannot be opened, the gateway refuses to start and names that path, rather

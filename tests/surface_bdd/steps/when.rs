@@ -1797,6 +1797,30 @@ async fn request_to_path_with_alternate_variant_api_key(
     send_request_to_path_and_record(world, &path, vec![(header_name, valid_key)]).await;
 }
 
+#[when("the caller fetches the protected resource metadata of the surface")]
+async fn fetch_protected_resource_metadata(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+
+    let infra = world.infra.as_ref().unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/.well-known/oauth-protected-resource{}",
+        infra.gateway_port, world.surface_config.route
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("protected resource metadata request failed");
+
+    let status = resp.status().as_u16();
+    let headers = collect_headers(resp.headers());
+    let body = resp
+        .json()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    world.caller_response = Some(RecordedResponse { status, headers, body });
+}
+
 #[when("the caller fetches the agent card")]
 async fn fetch_agent_card(world: &mut SurfaceWorld) {
     fetch_agent_card_with_headers(world, vec![]).await;
