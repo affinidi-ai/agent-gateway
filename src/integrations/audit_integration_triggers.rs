@@ -187,8 +187,8 @@ async fn publish_audit_record(
 mod tests {
     use super::*;
     use crate::audit::events::{
-        Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource,
-        RateLimitScope, RejectionReason, RejectionStage, RequestFailureOutcome, TargetKind,
+        Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource, RateLimitScope,
+        RejectionReason, RejectionStage, RequestFailureOutcome, TargetKind,
     };
     use crate::delegation_vault::audit::{
         PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, audit_event,

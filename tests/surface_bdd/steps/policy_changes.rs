@@ -140,7 +140,9 @@ async fn audit_log_records_policy_created(world: &mut SurfaceWorld) {
     expect_policy_change(world, "policy_created", |change| change["policy_version"] == 1).await;
 }
 
-#[then(expr = "the VP Audit Log records that the operator attached the policy to surface {string} as its request policy")]
+#[then(
+    expr = "the VP Audit Log records that the operator attached the policy to surface {string} as its request policy"
+)]
 async fn audit_log_records_policy_attached(
     world: &mut SurfaceWorld,
     surface_name: String,

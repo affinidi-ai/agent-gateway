@@ -39,33 +39,81 @@ pub fn policy_slots(surface: &AgentSurface) -> BTreeMap<SlotKey, SlotPolicy> {
         variant: None,
     };
     let target = &surface.target;
-    slots.policy(PolicySlot::Inbound, PolicyScope::Surface, surface.access_point.inbound_policy.as_ref());
+    slots.policy(
+        PolicySlot::Inbound,
+        PolicyScope::Surface,
+        surface
+            .access_point
+            .inbound_policy
+            .as_ref(),
+    );
     slots.policy(PolicySlot::Target, PolicyScope::Surface, target.policy.as_ref());
-    slots.policy(PolicySlot::Response, PolicyScope::Response, target.response_policy.as_ref());
+    slots.policy(
+        PolicySlot::Response,
+        PolicyScope::Response,
+        target
+            .response_policy
+            .as_ref(),
+    );
     slots.tools(&target.mcp_tool_policies);
-    slots.gates(target.mcp_tool_gating.as_ref());
+    slots.gates(
+        target
+            .mcp_tool_gating
+            .as_ref(),
+    );
     if let Some(transit) = surface.transit.as_ref() {
-        slots.transit(transit.shared.opa_policy_definition_id.as_deref());
+        slots.transit(
+            transit
+                .shared
+                .opa_policy_definition_id
+                .as_deref(),
+        );
         slots.points(&transit.points);
     }
 
     for variant in &surface.variants {
         slots.variant = Some((variant.id.clone(), variant.alias.clone()));
         let overrides = &variant.overrides;
-        if let Some(access_point) = overrides.access_point.as_ref() {
-            slots.policy(PolicySlot::Inbound, PolicyScope::Surface, access_point.inbound_policy.as_ref());
+        if let Some(access_point) = overrides
+            .access_point
+            .as_ref()
+        {
+            slots.policy(
+                PolicySlot::Inbound,
+                PolicyScope::Surface,
+                access_point
+                    .inbound_policy
+                    .as_ref(),
+            );
         }
         if let Some(target) = overrides.target.as_ref() {
             slots.policy(PolicySlot::Target, PolicyScope::Surface, target.policy.as_ref());
-            slots.policy(PolicySlot::Response, PolicyScope::Response, target.response_policy.as_ref());
-            if let Some(tools) = target.mcp_tool_policies.as_ref() {
+            slots.policy(
+                PolicySlot::Response,
+                PolicyScope::Response,
+                target
+                    .response_policy
+                    .as_ref(),
+            );
+            if let Some(tools) = target
+                .mcp_tool_policies
+                .as_ref()
+            {
                 slots.tools(tools);
             }
-            slots.gates(target.mcp_tool_gating.as_ref());
+            slots.gates(
+                target
+                    .mcp_tool_gating
+                    .as_ref(),
+            );
         }
         if let Some(transit) = overrides.transit.as_ref() {
             if let Some(shared) = transit.shared.as_ref() {
-                slots.transit(shared.opa_policy_definition_id.as_deref());
+                slots.transit(
+                    shared
+                        .opa_policy_definition_id
+                        .as_deref(),
+                );
             }
             if let Some(points) = transit.points.as_ref() {
                 slots.points(points);
@@ -109,8 +157,7 @@ impl Slots {
                 .map(|(_, alias)| alias.clone()),
             place_label: place.map(|(_, label)| label.to_string()),
         };
-        self.found
-            .insert(key, policy);
+        self.found.insert(key, policy);
     }
 
     fn policy(
@@ -138,9 +185,7 @@ impl Slots {
         tools: &[McpToolPolicyEntry],
     ) {
         for tool in tools {
-            let name = tool
-                .tool_name
-                .as_str();
+            let name = tool.tool_name.as_str();
             self.add(PolicySlot::McpTool, PolicyScope::McpTool, Some((name, name)), &tool.policy_definition_id);
         }
     }
@@ -157,7 +202,11 @@ impl Slots {
                 .condition_policy_definition_id
                 .as_deref()
             {
-                let label = if gate.name.is_empty() { &gate.id } else { &gate.name };
+                let label = if gate.name.is_empty() {
+                    &gate.id
+                } else {
+                    &gate.name
+                };
                 self.add(PolicySlot::McpToolGate, PolicyScope::McpTool, Some((&gate.id, label)), id);
             }
         }
@@ -168,22 +217,15 @@ impl Slots {
         points: &[TransitPoint],
     ) {
         for point in points {
-            let alias = point
-                .alias
-                .as_str();
-            for (scope, policy) in [
-                (PolicyScope::Surface, point.policy.as_ref()),
-                (PolicyScope::Response, point.response_policy.as_ref()),
-            ] {
+            let alias = point.alias.as_str();
+            for (scope, policy) in
+                [(PolicyScope::Surface, point.policy.as_ref()), (PolicyScope::Response, point.response_policy.as_ref())]
+            {
                 if let Some(policy) = policy {
                     self.add(PolicySlot::TransitPoint, scope, Some((alias, alias)), &policy.policy_definition_id);
                 }
             }
-            self.gates(
-                point
-                    .mcp_tool_gating
-                    .as_ref(),
-            );
+            self.gates(point.mcp_tool_gating.as_ref());
         }
     }
 }
@@ -212,7 +254,11 @@ mod tests {
         match (base, extra) {
             (serde_json::Value::Object(base), serde_json::Value::Object(extra)) => {
                 for (key, value) in extra {
-                    merge(base.entry(key).or_insert(serde_json::Value::Null), value);
+                    merge(
+                        base.entry(key)
+                            .or_insert(serde_json::Value::Null),
+                        value,
+                    );
                 }
             }
             (base, extra) => *base = extra,
@@ -237,13 +283,11 @@ mod tests {
         slots: &BTreeMap<SlotKey, SlotPolicy>,
         key: &SlotKey,
     ) -> Option<String> {
-        slots
-            .get(key)
-            .map(|policy| {
-                policy
-                    .policy_definition_id
-                    .clone()
-            })
+        slots.get(key).map(|policy| {
+            policy
+                .policy_definition_id
+                .clone()
+        })
     }
 
     #[test]
@@ -336,7 +380,12 @@ mod tests {
             assert_eq!(named(&slots, &key).as_deref(), Some(policy), "{key:?}");
         }
         let inbound = &slots[&key(v, PolicySlot::Inbound, PolicyScope::Surface, None)];
-        assert_eq!(inbound.variant_alias.as_deref(), Some("beta"));
+        assert_eq!(
+            inbound
+                .variant_alias
+                .as_deref(),
+            Some("beta")
+        );
     }
 
     #[test]

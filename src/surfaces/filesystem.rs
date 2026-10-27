@@ -130,12 +130,9 @@ mod tests {
     #[tokio::test]
     async fn a_management_request_records_the_policies_its_writes_attach_and_detach() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemAgentSurfaceStore::new(
-            dir.path()
-                .to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
 
         let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
             store
@@ -175,12 +172,9 @@ mod tests {
     #[tokio::test]
     async fn writes_outside_a_management_request_record_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemAgentSurfaceStore::new(
-            dir.path()
-                .to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
 
         let ((), records) = capture(async {
             store

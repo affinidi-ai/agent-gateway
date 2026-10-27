@@ -8,7 +8,9 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use crate::audit::context::current_actor;
-use crate::audit::events::{Actor, PolicyChangeAction, PolicyChangeSource, PolicyField, PolicyTargetKind, RefusalReason};
+use crate::audit::events::{
+    Actor, PolicyChangeAction, PolicyChangeSource, PolicyField, PolicyTargetKind, RefusalReason,
+};
 use crate::audit::policy_changes;
 use crate::delegation_vault::audit::{DelegationAuditAction, PolicyChangeDetails, PolicyTarget};
 
@@ -112,9 +114,7 @@ pub async fn record_refused_policy_changes(
     request: Request,
     next: Next,
 ) -> Response {
-    let method = request
-        .method()
-        .clone();
+    let method = request.method().clone();
     let path = request
         .uri()
         .path()
@@ -129,7 +129,13 @@ pub async fn record_refused_policy_changes(
 fn untrusted_id(id: &str) -> String {
     id.chars()
         .take(MAX_ID_CHARS)
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -230,7 +236,12 @@ mod tests {
         );
 
         let attempt = attempted(&Method::DELETE, "/v1/policy-definitions/deny%0Apii<script>").unwrap();
-        assert_eq!(attempt.policy_definition_id.as_deref(), Some("deny_0Apii_script_"));
+        assert_eq!(
+            attempt
+                .policy_definition_id
+                .as_deref(),
+            Some("deny_0Apii_script_")
+        );
     }
 
     #[test]
@@ -264,19 +275,30 @@ mod tests {
             .route("/v1/policy-definitions/{policy_id}", put(refuse).delete(accept))
             .layer(axum::middleware::from_fn(record_refused_policy_changes));
         let send = |method: Method| {
-            app.clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method(method)
-                        .uri("/v1/policy-definitions/deny-pii")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri("/v1/policy-definitions/deny-pii")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
         };
 
         let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
-            assert_eq!(send(Method::PUT).await.unwrap().status(), StatusCode::FORBIDDEN);
-            assert_eq!(send(Method::DELETE).await.unwrap().status(), StatusCode::OK);
+            assert_eq!(
+                send(Method::PUT)
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                send(Method::DELETE)
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
         }))
         .await;
 

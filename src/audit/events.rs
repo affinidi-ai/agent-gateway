@@ -90,6 +90,7 @@ pub enum TargetKind {
 
 /// A policy change, named as its audit event. A refusal names the change that
 /// was attempted with one of these.
+#[allow(clippy::enum_variant_names, reason = "each variant serializes as its audit event name")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyChangeAction {

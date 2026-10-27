@@ -76,11 +76,7 @@ pub async fn surface_written(
         change.policy_definition_id = Some(slot.policy_definition_id);
         change.target = Some(PolicyTarget {
             kind: PolicyTargetKind::Surface,
-            id: Some(
-                surface
-                    .surface_id
-                    .clone(),
-            ),
+            id: Some(surface.surface_id.clone()),
             name: Some(surface.name.clone()),
         });
         change.scope = Some(key.scope.to_string());
@@ -108,7 +104,11 @@ pub fn gateway_policy_changes(
         return Vec::new();
     };
     let attachments = |gateway: Option<&Gateway>| -> BTreeMap<String, bool> {
-        let Some(config) = gateway.and_then(|gateway| gateway.opa_policy_config.as_ref()) else {
+        let Some(config) = gateway.and_then(|gateway| {
+            gateway
+                .opa_policy_config
+                .as_ref()
+        }) else {
             return BTreeMap::new();
         };
         config
@@ -129,7 +129,11 @@ pub fn gateway_policy_changes(
                 id: Some(gateway.id.clone()),
                 name: Some(gateway.name.clone()),
             });
-            change.scope = Some(PolicyScope::Gateway.as_str().to_string());
+            change.scope = Some(
+                PolicyScope::Gateway
+                    .as_str()
+                    .to_string(),
+            );
             change.slot = Some(PolicySlot::Target);
             change.enabled = enabled;
             if action == PolicyChangeAction::PolicyAttachmentChanged {
@@ -166,7 +170,11 @@ pub fn assignment_changes(
             .flat_map(|(plane, list)| {
                 list.iter()
                     .map(move |assignment| {
-                        let mode = if assignment.monitor_only { PolicyMode::MonitorOnly } else { PolicyMode::Enforced };
+                        let mode = if assignment.monitor_only {
+                            PolicyMode::MonitorOnly
+                        } else {
+                            PolicyMode::Enforced
+                        };
                         ((plane.clone(), assignment.policy_id.clone()), mode)
                     })
             })
@@ -263,9 +271,7 @@ fn name_from(
     change.policy_name = Some(policy.name.clone());
     change.policy_type = Some(policy_type_name(&policy.policy_type).to_string());
     change.policy_version = policy.version;
-    change.policy_content_hash = policy
-        .content_hash
-        .clone();
+    change.policy_content_hash = policy.content_hash.clone();
 }
 
 /// A change through `source` by the actor of the current management request,
@@ -307,9 +313,7 @@ pub fn definition_updated(
     }
     let mut change = of_definition(after, source);
     change.previous_policy_version = before.version;
-    change.previous_policy_content_hash = before
-        .content_hash
-        .clone();
+    change.previous_policy_content_hash = before.content_hash.clone();
     change.changed = changed;
     Some(change)
 }
@@ -409,16 +413,31 @@ mod tests {
 
         assert_eq!(change.actor, Actor::user("u-1"));
         assert_eq!(change.source, PolicyChangeSource::Api);
-        assert_eq!(change.policy_definition_id.as_deref(), Some("deny-pii"));
+        assert_eq!(
+            change
+                .policy_definition_id
+                .as_deref(),
+            Some("deny-pii")
+        );
         assert_eq!(change.policy_name.as_deref(), Some("Deny PII"));
         assert_eq!(change.policy_type.as_deref(), Some("agent_surface"));
         assert_eq!(change.policy_version, Some(2));
-        assert_eq!(change.policy_content_hash.as_deref(), Some("sha256:allow"));
+        assert_eq!(
+            change
+                .policy_content_hash
+                .as_deref(),
+            Some("sha256:allow")
+        );
     }
 
     #[test]
     fn a_change_outside_a_management_request_is_the_gateways() {
-        assert_eq!(change(PolicyChangeSource::DefinitionDeleted).actor.kind, ActorKind::System);
+        assert_eq!(
+            change(PolicyChangeSource::DefinitionDeleted)
+                .actor
+                .kind,
+            ActorKind::System
+        );
     }
 
     #[test]
@@ -432,13 +451,19 @@ mod tests {
         assert_eq!(update.changed, vec![PolicyField::Rego, PolicyField::Name]);
         assert_eq!(update.policy_version, Some(3));
         assert_eq!(update.previous_policy_version, Some(2));
-        assert_eq!(update.previous_policy_content_hash.as_deref(), Some("sha256:allow"));
+        assert_eq!(
+            update
+                .previous_policy_content_hash
+                .as_deref(),
+            Some("sha256:allow")
+        );
     }
 
     #[test]
     fn each_part_of_a_definition_is_named_when_it_changes() {
+        type Edit = fn(&mut PolicyDefinition);
         let before = stored(1, "allow");
-        let parts: [(PolicyField, fn(&mut PolicyDefinition)); 5] = [
+        let parts: [(PolicyField, Edit); 5] = [
             (PolicyField::Description, |p| p.description = "other".to_string()),
             (PolicyField::Enabled, |p| p.enabled = false),
             (PolicyField::SampleInput, |p| p.sample_input = Some("{}".to_string())),
@@ -566,7 +591,8 @@ mod tests {
     async fn a_surface_write_records_where_each_policy_was_attached() {
         let after = surface(serde_json::json!({ "policy": policy("a") }));
 
-        let ((), records) = capture(in_management_request(Actor::user("u-1"), surface_written(None, Some(&after)))).await;
+        let ((), records) =
+            capture(in_management_request(Actor::user("u-1"), surface_written(None, Some(&after)))).await;
 
         assert_eq!(records.len(), 1);
         let json = serde_json::to_value(&records[0]).unwrap();
@@ -621,7 +647,14 @@ mod tests {
     fn summary(changes: Vec<(PolicyChangeAction, PolicyChangeDetails)>) -> Vec<(PolicyChangeAction, String)> {
         changes
             .into_iter()
-            .map(|(action, change)| (action, change.policy_definition_id.unwrap_or_default()))
+            .map(|(action, change)| {
+                (
+                    action,
+                    change
+                        .policy_definition_id
+                        .unwrap_or_default(),
+                )
+            })
             .collect()
     }
 
@@ -631,7 +664,10 @@ mod tests {
 
         assert_eq!(
             summary(changes.clone()),
-            vec![(PolicyChangeAction::PolicyAttached, "m".to_string()), (PolicyChangeAction::PolicyAttached, "p".to_string())]
+            vec![
+                (PolicyChangeAction::PolicyAttached, "m".to_string()),
+                (PolicyChangeAction::PolicyAttached, "p".to_string())
+            ]
         );
         let (_, attached) = &changes[0];
         assert_eq!(
@@ -649,10 +685,8 @@ mod tests {
 
     #[test]
     fn disabling_a_gateway_policy_changes_each_of_its_attachments() {
-        let changes = gateway_policy_changes(
-            Some(&gateway(true, Some("p"), &[])),
-            Some(&gateway(false, Some("p"), &[])),
-        );
+        let changes =
+            gateway_policy_changes(Some(&gateway(true, Some("p"), &[])), Some(&gateway(false, Some("p"), &[])));
 
         assert_eq!(summary(changes.clone()), vec![(PolicyChangeAction::PolicyAttachmentChanged, "p".to_string())]);
         assert_eq!(changes[0].1.enabled, Some(false));
@@ -669,7 +703,10 @@ mod tests {
         );
         assert_eq!(
             summary(gateway_policy_changes(Some(&before), None)),
-            vec![(PolicyChangeAction::PolicyDetached, "m".to_string()), (PolicyChangeAction::PolicyDetached, "p".to_string())]
+            vec![
+                (PolicyChangeAction::PolicyDetached, "m".to_string()),
+                (PolicyChangeAction::PolicyDetached, "p".to_string())
+            ]
         );
         assert!(gateway_policy_changes(Some(&before), Some(&before.clone())).is_empty());
     }
@@ -700,7 +737,12 @@ mod tests {
         let by_policy = |id: &str| {
             changes
                 .iter()
-                .find(|(_, change)| change.policy_definition_id.as_deref() == Some(id))
+                .find(|(_, change)| {
+                    change
+                        .policy_definition_id
+                        .as_deref()
+                        == Some(id)
+                })
                 .cloned()
                 .expect("a change")
         };
