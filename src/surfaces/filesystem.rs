@@ -14,8 +14,9 @@ use crate::storage::filesystem::{StorageBackend, cached_storage};
 /// Filesystem-based implementation of AgentSurfaceStore with in-memory cache
 pub struct FileSystemAgentSurfaceStore {
     storage: Box<dyn StorageBackend<AgentSurface>>,
-    /// Held from reading a surface before a write to the write itself, so the
-    /// policy changes a write records are relative to the surface it replaced.
+    /// Held from reading a surface before a write until the write's policy
+    /// changes are recorded, so they are relative to the surface it replaced
+    /// and the records of concurrent writes come in write order.
     writes: tokio::sync::Mutex<()>,
 }
 
@@ -82,11 +83,11 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         self.storage
             .save(surface)
             .await?;
+        policy_changes::surface_written(before.as_ref(), Some(surface)).await;
         drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface.surface_id.clone(),
         ));
-        policy_changes::surface_written(before.as_ref(), Some(surface)).await;
         Ok(())
     }
 
@@ -114,11 +115,11 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         self.storage
             .delete(surface_id)
             .await?;
+        policy_changes::surface_written(before.as_ref(), None).await;
         drop(write);
         crate::mcp::subscriptions::invalidate_access(crate::mcp::subscriptions::AccessScope::Surface(
             surface_id.to_string(),
         ));
-        policy_changes::surface_written(before.as_ref(), None).await;
         Ok(())
     }
 }
@@ -241,22 +242,72 @@ mod tests {
         }))
         .await;
 
-        let ids = |category: &str| -> Vec<String> {
-            records
-                .iter()
-                .filter(|record| action_category(&record.event) == category)
-                .map(|record| {
-                    serde_json::to_value(&record.event).unwrap()[category]["policy_definition_id"]
-                        .as_str()
-                        .unwrap()
-                        .to_string()
-                })
-                .collect()
+        assert_recorded_in_write_order(&records);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_writes_to_one_surface_record_their_changes_in_write_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let ((), mut records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .save(&surface("a"))
+                .await
+                .unwrap();
+        }))
+        .await;
+
+        let write = |policy: &'static str| {
+            let store = store.clone();
+            in_management_request(Actor::user("u-1"), async move {
+                store
+                    .save(&surface(policy))
+                    .await
+                    .unwrap();
+            })
         };
-        let (attached, detached) = (ids("policy_attached"), ids("policy_detached"));
-        assert_eq!(attached.len(), 3, "{records:?}");
-        assert_eq!(detached.len(), 2, "{records:?}");
-        assert_eq!(detached[0], "a", "the first write replaced the stored policy");
-        assert_eq!(detached[1], attached[1], "the second write replaced the first one's policy");
+        records.extend(crate::audit::producer::capture_spawned(vec![write("b"), write("c")]).await);
+
+        assert_recorded_in_write_order(&records);
+    }
+
+    /// `records` are those of creating a surface naming policy `a`, then two
+    /// writes naming `b` and `c` in either order: each write's detach names
+    /// the policy the write before it attached, and records come in write order.
+    fn assert_recorded_in_write_order(records: &[crate::delegation_vault::audit::DelegationAuditEvent]) {
+        let changes: Vec<(&str, String)> = records
+            .iter()
+            .map(|record| {
+                let category = action_category(&record.event);
+                let id = serde_json::to_value(&record.event).unwrap()[category]["policy_definition_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (category, id)
+            })
+            .collect();
+        let second = changes
+            .get(2)
+            .map(|(_, id)| id.clone())
+            .unwrap_or_default();
+        let third = if second == "b" {
+            "c"
+        } else {
+            "b"
+        };
+        assert_eq!(
+            changes,
+            vec![
+                ("policy_attached", "a".to_string()),
+                ("policy_detached", "a".to_string()),
+                ("policy_attached", second.clone()),
+                ("policy_detached", second),
+                ("policy_attached", third.to_string()),
+            ]
+        );
     }
 }

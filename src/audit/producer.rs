@@ -152,6 +152,26 @@ pub async fn capture<F: std::future::Future>(future: F) -> (F::Output, Vec<Deleg
     (output, held.take())
 }
 
+/// [`capture`] for futures each run on a task of its own, so a multi-threaded
+/// runtime runs them in parallel. Their records land in one list, in the
+/// order they were submitted.
+#[cfg(test)]
+pub async fn capture_spawned<F>(futures: Vec<F>) -> Vec<DelegationAuditEvent>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let held = DeferredAudit::new(producer());
+    let tasks: Vec<_> = futures
+        .into_iter()
+        .map(|future| tokio::spawn(CAPTURING.scope((), DEFERRED.scope(held.held.clone(), future))))
+        .collect();
+    for task in tasks {
+        task.await
+            .expect("a captured task");
+    }
+    held.take()
+}
+
 /// Holds the records submitted inside [`DeferredAudit::scope`] until the
 /// request's identity VP is known. Whatever has not been flushed when the
 /// guard is dropped is submitted without a VP, so no return path loses them.
