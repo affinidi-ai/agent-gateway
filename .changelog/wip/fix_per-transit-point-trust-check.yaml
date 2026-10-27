@@ -14,7 +14,8 @@ changes:
         a Transit Point without checks runs none. Results stay at input.trust_check_results.target,
         and Trust Check audit records name the Transit Point. target.trust_check_list now applies
         only to the managed agent's own a2a-proxy or Fabric target, and the management API rejects
-        it on an http(s) target. Surfaces stored before this change are converted when they first
+        it on any other target. Surfaces and user-saved Surface Templates stored before this change
+        are converted when they first
         load: the old list is copied onto every A2A and AP2 Transit Point, so their behaviour is
         unchanged, and the Surface Builder flags each copy so operators can keep it or remove it.
         MCP and HTTP Transit Points receive no copy and are named in a warning log.
@@ -22,12 +23,15 @@ changes:
   security: []
   breaking:
     - timestamp: '2026-10-26T15:57:29Z'
-      title: Reject a target Trust Check list on an http(s) Managed Agent target
+      title: Reject a target Trust Check list unless the target is a2a-proxy or Fabric
       description: >-
         The management API now answers 400 when a surface or variant has a non-empty
-        target.trust_check_list and its Managed Agent target is an http(s) URL, because that list
-        no longer runs anywhere for such a target; clients must send those checks in
-        transit.points[].trust_check_list. Stored surfaces are converted to the new shape on first
+        target.trust_check_list and its Managed Agent target is not a2a-proxy:// or fabric://, such
+        as an http(s) URL or proxy://, because that list never runs for such a target; clients must
+        send those checks in transit.points[].trust_check_list. A payload in the old shape sent
+        through the API for an a2a-proxy:// or fabric:// surface is accepted but read in the new
+        shape, so its list covers only the managed agent's own target and its Transit Points run no
+        Trust Check until they get their own lists. Stored surfaces are converted to the new shape on first
         load and saved with trust_check_split, so an earlier gateway release cannot load them
         afterwards. Back up _storage/agent_surfaces/ before upgrading if a rollback may be needed.
         MCP and HTTP Transit Points no longer run the old surface-wide list; there it could only

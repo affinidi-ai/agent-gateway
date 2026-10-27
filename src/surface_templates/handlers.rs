@@ -178,7 +178,8 @@ pub async fn create_template(
 
     let id = format!("user-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
-    let tpl = req.into_template(id, now);
+    let mut tpl = req.into_template(id, now);
+    tpl.mark_trust_checks_split();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -231,6 +232,7 @@ async fn update_stored_template(
     if tpl.name.trim().is_empty() {
         return Err(TemplateApiError::BadRequest("name must not be empty".to_string()));
     }
+    tpl.mark_trust_checks_split();
     s.save(&tpl)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("save: {}", e)))?;
@@ -317,6 +319,8 @@ pub async fn import_template(
     let now = chrono::Utc::now().to_rfc3339();
     tpl.created_at = Some(now.clone());
     tpl.updated_at = Some(now);
+    tpl.migrate_surface_trust_checks();
+    tpl.mark_trust_checks_split();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -482,5 +486,64 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn an_updated_template_is_marked_split_and_is_not_migrated_on_reload() {
+        let (store, template, dir) = stored_template(None).await;
+        let mut update = template.clone();
+        update.surface = Some(serde_json::json!({
+            "name": "$NAME",
+            "access_point": {"listen_address": "$HOST", "route": "$ROUTE", "protocol": "a2a"},
+            "target": {
+                "endpoint": "fabric://gw-b/surface-x",
+                "trust_check_list": [{
+                    "id": "fabric-target",
+                    "trust_registry_id": "tr-1",
+                    "query_type": "recognition",
+                    "query": {"authority_id": "did:example:authority", "entity_id": "{{ target.did }}"}
+                }]
+            },
+            "transit": {"points": [{"alias": "partner-a", "target_endpoint": "https://a.example/a2a"}]}
+        }));
+
+        let saved = update_stored_template(&store, template.id.clone(), &None, &None, update)
+            .await
+            .unwrap();
+        let saved_surface = saved
+            .surface
+            .clone()
+            .expect("surface");
+        assert_eq!(saved_surface["trust_check_split"], serde_json::json!(true));
+
+        let reloaded = super::super::FileSystemSurfaceTemplateStore::new(dir.path().join("templates"), None)
+            .await
+            .unwrap()
+            .get(&template.id)
+            .await
+            .unwrap()
+            .expect("template");
+        let surface = reloaded
+            .surface
+            .expect("surface");
+        assert_eq!(surface, saved_surface, "a template written through the API is never migrated");
+        assert!(
+            surface["transit"]["points"][0]
+                .get("trust_check_list")
+                .is_none()
+        );
+        assert_eq!(surface["target"]["trust_check_list"][0]["id"], "fabric-target");
+    }
+
+    #[test]
+    fn a_created_template_without_a_surface_is_left_without_one() {
+        let mut template = serde_json::from_value::<crate::surface_templates::types::CreateSurfaceTemplate>(
+            serde_json::json!({ "name": "Partial" }),
+        )
+        .unwrap()
+        .into_template("template-p".into(), "2026-01-01T00:00:00Z".into());
+        template.mark_trust_checks_split();
+        assert!(template.surface.is_none());
+        assert!(!template.migrate_surface_trust_checks());
     }
 }

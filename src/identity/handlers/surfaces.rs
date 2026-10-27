@@ -244,24 +244,19 @@ fn validate_trust_checks(surface: &AgentSurface) -> Result<(), SurfaceApiError> 
 }
 
 /// Reject a non-empty `target.trust_check_list` (base or any variant, enabled
-/// or not) when the Managed Agent target endpoint is `http`/`https`: requests
-/// to that target never run it, and Transit Point traffic runs each Transit
+/// or not) unless the Managed Agent target runs it on its own target leg
+/// (`a2a-proxy://` and `fabric://`). Transit Point traffic runs each Transit
 /// Point's own list.
-fn reject_target_trust_checks_on_http_target(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+fn reject_target_trust_checks_unless_target_runs_them(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
     let offending = |target: &crate::config::agent_surface::Target| {
         !target
             .trust_check_list
             .is_empty()
-            && (target
-                .endpoint
-                .starts_with("http://")
-                || target
-                    .endpoint
-                    .starts_with("https://"))
+            && !target.runs_own_trust_checks()
     };
     let message = |label: &str| {
         SurfaceApiError::BadRequest(format!(
-            "{label}target.trust_check_list is not allowed when the Managed Agent target endpoint is http(s); \
+            "{label}target.trust_check_list is only allowed for a2a-proxy:// and fabric:// Managed Agent targets; \
              configure target-leg Trust Checks per Transit Point in transit.points[].trust_check_list"
         ))
     };
@@ -996,7 +991,7 @@ pub async fn create_surface(
     surface
         .validate()
         .map_err(|e| SurfaceApiError::BadRequest(e.to_string()))?;
-    reject_target_trust_checks_on_http_target(&surface)?;
+    reject_target_trust_checks_unless_target_runs_them(&surface)?;
 
     // Check for duplicate surface_id
     surface
@@ -1421,7 +1416,7 @@ async fn validate_and_save_surface(
     validate_surface_mcp_tool_gating(&surface)?;
     validate_resolved_variants(&surface)?;
     validate_trust_checks(&surface)?;
-    reject_target_trust_checks_on_http_target(&surface)?;
+    reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
     validate_source_auth(&surface)?;
     surface
@@ -3771,14 +3766,19 @@ mod validation_tests {
     }
 
     #[test]
-    fn target_trust_checks_rejected_on_http_and_https_targets() {
-        for endpoint in ["https://prod.example.com", "http://prod.example.com"] {
+    fn target_trust_checks_rejected_unless_the_target_runs_them() {
+        for endpoint in ["https://prod.example.com", "http://prod.example.com", "proxy://mcp-proxy-1", ""] {
             let mut s = base_surface();
             s.target.endpoint = endpoint.to_string();
             s.target.trust_check_list = vec![target_trust_check("target-check")];
 
-            let msg = bad_request_message(reject_target_trust_checks_on_http_target(&s));
-            assert!(msg.starts_with("target.trust_check_list is not allowed"), "{msg}");
+            let msg = bad_request_message(reject_target_trust_checks_unless_target_runs_them(&s));
+            assert!(
+                msg.starts_with(
+                    "target.trust_check_list is only allowed for a2a-proxy:// and fabric:// Managed Agent targets"
+                ),
+                "{endpoint}: {msg}"
+            );
             assert!(msg.contains("transit.points[].trust_check_list"), "{msg}");
         }
     }
@@ -3790,7 +3790,7 @@ mod validation_tests {
             s.target.endpoint = endpoint.to_string();
             s.target.trust_check_list = vec![target_trust_check("target-check")];
 
-            assert!(reject_target_trust_checks_on_http_target(&s).is_ok(), "{endpoint} must be accepted");
+            assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok(), "{endpoint} must be accepted");
         }
     }
 
@@ -3810,7 +3810,7 @@ mod validation_tests {
             shared: Default::default(),
         });
 
-        assert!(reject_target_trust_checks_on_http_target(&s).is_ok());
+        assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok());
         assert_eq!(s.validate(), Ok(()));
     }
 
@@ -3828,8 +3828,8 @@ mod validation_tests {
                 enabled,
             )];
 
-            let msg = bad_request_message(reject_target_trust_checks_on_http_target(&s));
-            assert!(msg.starts_with("Variant 'dev': target.trust_check_list is not allowed"), "{msg}");
+            let msg = bad_request_message(reject_target_trust_checks_unless_target_runs_them(&s));
+            assert!(msg.starts_with("Variant 'dev': target.trust_check_list is only allowed"), "{msg}");
             assert!(msg.contains("transit.points[].trust_check_list"), "{msg}");
         }
     }
@@ -3839,7 +3839,7 @@ mod validation_tests {
         let mut s = base_surface();
         s.target.endpoint = "fabric://gateway-1/surface-1".to_string();
         s.target.trust_check_list = vec![target_trust_check("base-check")];
-        assert!(reject_target_trust_checks_on_http_target(&s).is_ok());
+        assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok());
 
         s.variants = vec![variant_with_target(
             TargetOverrides {
@@ -3849,7 +3849,7 @@ mod validation_tests {
             true,
         )];
 
-        let msg = bad_request_message(reject_target_trust_checks_on_http_target(&s));
+        let msg = bad_request_message(reject_target_trust_checks_unless_target_runs_them(&s));
         assert!(msg.starts_with("Variant 'dev': "), "{msg}");
     }
 
@@ -3867,7 +3867,7 @@ mod validation_tests {
             true,
         )];
 
-        assert!(reject_target_trust_checks_on_http_target(&s).is_ok());
+        assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok());
     }
 }
 

@@ -507,4 +507,124 @@ mod tests {
                 .is_err()
         );
     }
+
+    fn legacy_template(
+        id: &str,
+        target_endpoint: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": "Legacy",
+            "kind": "full",
+            "builtin": false,
+            "surface": {
+                "name": "$NAME",
+                "access_point": {"listen_address": "$HOST", "route": "$ROUTE", "protocol": "a2a"},
+                "target": {
+                    "endpoint": target_endpoint,
+                    "trust_check_list": [{
+                        "id": "target-recognition",
+                        "trust_registry_id": "tr-1",
+                        "query_type": "recognition",
+                        "query": {"authority_id": "did:example:authority", "entity_id": "{{ target.did }}"}
+                    }]
+                },
+                "transit": {"points": [
+                    {"alias": "partner-a", "target_endpoint": "https://a.example/a2a", "protocol": "a2a"},
+                    {"alias": "tools", "target_endpoint": "https://t.example/mcp", "protocol": "mcp"}
+                ]}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_stored_legacy_template_surface_is_migrated_on_load() {
+        let storage = TempDir::new().unwrap();
+        let path = storage
+            .path()
+            .join("user-legacy.json");
+        tokio::fs::write(&path, legacy_template("user-legacy", "https://managed.example").to_string())
+            .await
+            .unwrap();
+
+        let store = FileSystemSurfaceTemplateStore::new(storage.path().to_path_buf(), None)
+            .await
+            .unwrap();
+        let surface = store
+            .get("user-legacy")
+            .await
+            .unwrap()
+            .expect("template")
+            .surface
+            .expect("surface");
+
+        assert_eq!(surface["trust_check_split"], serde_json::json!(true));
+        assert!(
+            surface["target"]
+                .get("trust_check_list")
+                .is_none()
+        );
+        let points = &surface["transit"]["points"];
+        assert_eq!(points[0]["trust_check_list"][0]["id"], "target-recognition");
+        assert_eq!(points[0]["trust_check_migrated"], serde_json::json!(true));
+        assert!(
+            points[1]
+                .get("trust_check_list")
+                .is_none(),
+            "MCP Transit Points get no copy"
+        );
+
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(&path)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk["surface"], surface, "the migrated template is persisted");
+    }
+
+    #[tokio::test]
+    async fn shipped_builtin_templates_are_not_migrated() {
+        let storage = TempDir::new().unwrap();
+        let seed = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/examples/agent_surface_templates");
+        let store = FileSystemSurfaceTemplateStore::new(storage.path().to_path_buf(), Some(seed.clone()))
+            .await
+            .unwrap();
+
+        let mut checked = 0;
+        let mut entries = tokio::fs::read_dir(&seed)
+            .await
+            .unwrap();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .unwrap()
+        {
+            if entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                != Some(SEED_FILE_EXTENSION)
+            {
+                continue;
+            }
+            let source: serde_json::Value = serde_json::from_str(
+                &tokio::fs::read_to_string(entry.path())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let id = source["id"]
+                .as_str()
+                .expect("seed id");
+            let loaded = store
+                .get(id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("builtin {id} loaded"));
+            assert_eq!(loaded.surface.as_ref(), source.get("surface"), "{id} must load unchanged");
+            checked += 1;
+        }
+        assert!(checked > 0, "no builtin templates found under {}", seed.display());
+    }
 }

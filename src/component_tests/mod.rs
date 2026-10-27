@@ -21,5 +21,6 @@ mod mcp_subscription_scope;
 mod mtls;
 mod tr_naming_e2e;
 mod trust_check_e2e;
+mod trust_check_store_migration;
 mod trust_recorder_status_e2e;
 mod upstream_response_bounds_e2e;

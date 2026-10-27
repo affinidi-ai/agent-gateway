@@ -143,17 +143,19 @@ A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
 override replaces the whole list verbatim, never element by element; a variant gives its
 Transit Points their own lists through its `transit.points` override.
 
-The management API rejects with `400` a surface whose Managed Agent target is an `http(s)`
-URL and whose `target.trust_check_list` is non-empty, because no stage runs that list for such
-a target. Put those checks on the Transit Points instead.
+The management API rejects with `400` a surface whose `target.trust_check_list` is non-empty
+and whose Managed Agent target is not `a2a-proxy://` or `fabric://` (an `http(s)` URL,
+`proxy://`, or no endpoint), because no stage runs that list for such a target. Put those
+checks on the Transit Points instead.
 
 ### Lists stored before per-Transit-Point checks
 
 Surfaces stored before Transit Points had their own lists kept one `target.trust_check_list`
 that ran on every Transit Point. The first time such a surface loads, the gateway copies that
 list onto each of its A2A and AP2 Transit Points (and those of each variant), marks each copy
-with `trust_check_migrated: true`, removes `target.trust_check_list` when the Managed Agent
-target is an `http(s)` URL, sets `trust_check_split: true` on the surface, and saves the file.
+with `trust_check_migrated: true`, removes `target.trust_check_list` unless the Managed Agent
+target is `a2a-proxy://` or `fabric://`, sets `trust_check_split: true` on the surface, and
+saves the file. User-saved Surface Templates are converted the same way when they load.
 It logs the surface and the Transit Points that received copies. A2A and AP2 Transit Points
 keep their behaviour until an operator edits the surface. The Surface Builder flags each copy
 for review; through the API, remove a copy by saving the Transit Point without
@@ -171,7 +173,8 @@ no longer reach it.
 `trust_check_split` marks a surface as already in the per-Transit-Point shape, and every
 management API write sets it. A payload in the old shape saved through the API on an
 `a2a-proxy://` or `fabric://` target is therefore read in the new shape: its
-`target.trust_check_list` applies to the managed agent's own target only. A surface file
+`target.trust_check_list` applies to the managed agent's own target only, and its Transit
+Points run no Trust Check until they get their own lists. A surface file
 written outside the API in the new shape must set `trust_check_split: true`, or it is migrated
 on load.
 
