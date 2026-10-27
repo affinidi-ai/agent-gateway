@@ -6,7 +6,8 @@ let cached: Promise<Record<string, string>> | null = null;
 
 /**
  * Loads `user_id → username` once per page load. A caller without access to
- * the users list gets an empty map, kept so the list is not asked for again.
+ * the users list (403) gets an empty map, kept so the list is not asked for
+ * again; any other failure is forgotten so a later visit asks again.
  */
 function loadUserNames(): Promise<Record<string, string>> {
   cached ??= apiClient
@@ -22,7 +23,10 @@ function loadUserNames(): Promise<Record<string, string>> {
       }
       return names;
     })
-    .catch(() => ({}));
+    .catch(error => {
+      if (error?.response?.status !== 403) cached = null;
+      return {};
+    });
   return cached;
 }
 
@@ -33,12 +37,15 @@ export function clearUserNames(): void {
 
 /**
  * Resolves the user ids policy change records name to usernames. Records hold
- * ids only; an id the dashboard cannot resolve stays an id.
+ * ids only; an id the dashboard cannot resolve stays an id. The users list is
+ * asked for only once `needed`, when the page shows a policy change. Call it
+ * once per page and pass the resolver down.
  */
-export function useUserNames(): UserNameResolver {
+export function useUserNames(needed: boolean): UserNameResolver {
   const [names, setNames] = useState<Record<string, string>>({});
 
   useEffect(() => {
+    if (!needed) return undefined;
     let active = true;
     loadUserNames().then(loaded => {
       if (active) setNames(loaded);
@@ -46,7 +53,7 @@ export function useUserNames(): UserNameResolver {
     return () => {
       active = false;
     };
-  }, []);
+  }, [needed]);
 
   return useCallback((userId: string) => names[userId], [names]);
 }

@@ -3,20 +3,21 @@ import { formatDateTime, timeAgo } from '../../utils/stringUtils';
 import { callerDidOf, policyChange, policyDecision, trustCheck } from './auditHelpers';
 import { actorLabel, describeEntry, type UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
-import { useUserNames } from './useUserNames';
 
 interface AuditListItemProps {
   entry: AuditEntry;
   idx: number;
   isSelected: boolean;
   onSelect: () => void;
+  /** Names the users policy changes were made by. */
+  userName?: UserNameResolver;
 }
 
 /**
  * Short "actor" label for the footnote: who made a policy change, else caller
  * name → caller DID → auth method.
  */
-function actorOf(entry: AuditEntry, userName: UserNameResolver): string {
+function actorOf(entry: AuditEntry, userName?: UserNameResolver): string {
   const change = policyChange(entry);
   if (change) return actorLabel(change.change.actor, userName);
   return (
@@ -39,8 +40,13 @@ function shortHash(hash: string): string {
  * message, an optional detail line, and a "timestamp · actor" footnote. A
  * trailing arrow turns accent-blue when the row is selected.
  */
-const AuditListItem: React.FC<AuditListItemProps> = ({ entry, idx, isSelected, onSelect }) => {
-  const userName = useUserNames();
+const AuditListItem: React.FC<AuditListItemProps> = ({
+  entry,
+  idx,
+  isSelected,
+  onSelect,
+  userName,
+}) => {
   const { title, tone, summary, detail } = describeEntry(entry, userName);
   const pd = policyDecision(entry);
   const tc = trustCheck(entry);

@@ -11,13 +11,15 @@ import { fieldGroups } from './fieldGroups';
 import { buildJourney } from './journey';
 import { buildTrustChain } from './trustChain';
 import { useDidNames } from './useDidNames';
-import { useUserNames } from './useUserNames';
+import type { UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
 
 interface AuditEvidencePaneProps {
   entry: AuditEntry;
   filteredEntries: AuditEntry[];
   onQuickFilter: (term: string, cat?: string) => void;
+  /** Names the users policy changes were made by. */
+  userName?: UserNameResolver;
 }
 
 /**
@@ -31,9 +33,9 @@ const AuditEvidencePane: React.FC<AuditEvidencePaneProps> = ({
   entry,
   filteredEntries,
   onQuickFilter,
+  userName,
 }) => {
   const resolveName = useDidNames();
-  const userName = useUserNames();
   const pd = policyDecision(entry);
   const tc = trustCheck(entry);
 

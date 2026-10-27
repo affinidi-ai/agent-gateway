@@ -430,4 +430,22 @@ describe('AuditPage policy changes', () => {
     expect(within(evidence).getByText('Where')).toBeInTheDocument();
     expect(within(evidence).getByText('inbound policy')).toBeInTheDocument();
   });
+
+  it('asks for the users list once per page load', async () => {
+    renderPage();
+
+    const item = await screen.findByTestId('audit-item-0');
+    await waitFor(() => expect(within(item).getByText('user alice')).toBeInTheDocument());
+    expect(mockGet.mock.calls.filter(([url]) => url === '/users')).toHaveLength(1);
+  });
+
+  it('does not ask for the users list when the page shows no policy change', async () => {
+    mockGet.mockImplementation((url: string) =>
+      Promise.resolve({ data: url === '/users' ? [] : AUDIT_RESPONSE })
+    );
+    renderPage();
+
+    await screen.findByTestId('audit-item-0');
+    expect(mockGet).not.toHaveBeenCalledWith('/users');
+  });
 });

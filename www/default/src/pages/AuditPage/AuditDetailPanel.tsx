@@ -3,15 +3,16 @@ import { timeAgo } from '../../utils/stringUtils';
 import AuditEvidencePane from './AuditEvidencePane';
 import AuditQuickFilters from './AuditQuickFilters';
 import { callerDidOf, eventTypeName, policyDecision, surfaceIdOf } from './auditHelpers';
-import { describeEntry } from './eventNarrative';
+import { describeEntry, type UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
-import { useUserNames } from './useUserNames';
 
 interface AuditDetailPanelProps {
   entry: AuditEntry | null;
   filteredEntries: AuditEntry[];
   onTitleClick: () => void;
   onQuickFilter: (term: string, cat?: string) => void;
+  /** Names the users policy changes were made by. */
+  userName?: UserNameResolver;
 }
 
 /**
@@ -24,8 +25,8 @@ const AuditDetailPanel: React.FC<AuditDetailPanelProps> = ({
   filteredEntries,
   onTitleClick,
   onQuickFilter,
+  userName,
 }) => {
-  const userName = useUserNames();
   const open = entry != null;
   const narrative = entry ? describeEntry(entry, userName) : null;
   const tone = narrative?.tone ?? 'neutral';
@@ -91,6 +92,7 @@ const AuditDetailPanel: React.FC<AuditDetailPanelProps> = ({
               entry={entry}
               filteredEntries={filteredEntries}
               onQuickFilter={onQuickFilter}
+              userName={userName}
             />
           </div>
         </>
