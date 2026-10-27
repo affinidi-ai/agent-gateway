@@ -90,7 +90,7 @@ pub enum TargetKind {
 
 /// A policy change, named as its audit event. A refusal names the change that
 /// was attempted with one of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyChangeAction {
     PolicyCreated,
@@ -204,10 +204,11 @@ impl Actor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyChangeSource {
+    /// A management API request changed the policy or where it applies.
     Api,
-    TemplateImport,
-    Onboarding,
+    /// The tenant owning the policy or gateway was reassigned.
     Ownership,
+    /// Deleting a definition removed it from where it applied.
     DefinitionDeleted,
 }
 

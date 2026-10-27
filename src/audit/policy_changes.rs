@@ -2,10 +2,106 @@
 //! management request it is built in and is written only when a sink selects
 //! its event.
 
+use std::sync::{Arc, OnceLock};
+
 use crate::audit::context::current_actor;
-use crate::audit::events::{Actor, PolicyChangeAction, PolicyChangeSource, PolicyField, PolicyTargetKind};
-use crate::delegation_vault::audit::{DelegationAuditAction, PolicyChangeDetails, action_category, audit_event, emit};
-use crate::policies::policy_definitions::{PolicyDefinition, PolicyType};
+use crate::audit::events::{Actor, PolicyChangeAction, PolicyChangeSource, PolicyField, PolicySlot, PolicyTargetKind};
+use crate::config::agent_surface::AgentSurface;
+use crate::delegation_vault::audit::{
+    DelegationAuditAction, PolicyChangeDetails, PolicyTarget, action_category, audit_event, emit,
+};
+use crate::policies::policy_definitions::{FileSystemPolicyDefinitionStore, PolicyDefinition, PolicyType};
+use crate::policies::slots::{SlotKey, SlotPolicy, policy_slots};
+
+/// The definitions attachment records are named from, set once at start.
+static DEFINITIONS: OnceLock<Arc<FileSystemPolicyDefinitionStore>> = OnceLock::new();
+
+/// Names attachment records from `store`. Only the first call takes effect.
+pub fn use_definitions(store: Arc<FileSystemPolicyDefinitionStore>) {
+    let _ = DEFINITIONS.set(store);
+}
+
+/// Each slot `before` and `after` name a different policy in, as the change
+/// it is. A replaced policy is detached, then its successor attached.
+pub fn surface_slot_changes(
+    before: Option<&AgentSurface>,
+    after: Option<&AgentSurface>,
+) -> Vec<(PolicyChangeAction, SlotKey, SlotPolicy)> {
+    let mut old = before
+        .map(policy_slots)
+        .unwrap_or_default();
+    let new = after
+        .map(policy_slots)
+        .unwrap_or_default();
+    let mut changes = Vec::new();
+    for (key, policy) in new {
+        match old.remove(&key) {
+            Some(previous) if previous.policy_definition_id == policy.policy_definition_id => {}
+            Some(previous) => {
+                changes.push((PolicyChangeAction::PolicyDetached, key.clone(), previous));
+                changes.push((PolicyChangeAction::PolicyAttached, key, policy));
+            }
+            None => changes.push((PolicyChangeAction::PolicyAttached, key, policy)),
+        }
+    }
+    changes.extend(
+        old.into_iter()
+            .map(|(key, previous)| (PolicyChangeAction::PolicyDetached, key, previous)),
+    );
+    changes
+}
+
+/// Records the policies a surface write attached and detached. Writes nothing
+/// outside a management request: startup migrations, replication and request
+/// handling are not user changes.
+pub async fn surface_written(
+    before: Option<&AgentSurface>,
+    after: Option<&AgentSurface>,
+) {
+    if current_actor().is_none() {
+        return;
+    }
+    let Some(surface) = after.or(before) else {
+        return;
+    };
+    let source = PolicyChangeSource::Api;
+    for (action, key, slot) in surface_slot_changes(before, after) {
+        let mut change = match definition(&slot.policy_definition_id).await {
+            Some(definition) => of_definition(&definition, source),
+            None => {
+                let mut change = change(source);
+                change.policy_definition_id = Some(slot.policy_definition_id);
+                change
+            }
+        };
+        change.target = Some(PolicyTarget {
+            kind: PolicyTargetKind::Surface,
+            id: Some(
+                surface
+                    .surface_id
+                    .clone(),
+            ),
+            name: Some(surface.name.clone()),
+        });
+        change.scope = Some(key.scope.to_string());
+        change.slot = Some(key.slot);
+        change.variant = slot.variant_alias;
+        match key.slot {
+            PolicySlot::TransitPoint => change.transit_point = slot.place_label,
+            PolicySlot::McpTool => change.mcp_tool_name = slot.place_label,
+            PolicySlot::McpToolGate => change.gate = slot.place_label,
+            _ => {}
+        }
+        record(action, change);
+    }
+}
+
+async fn definition(id: &str) -> Option<PolicyDefinition> {
+    DEFINITIONS
+        .get()?
+        .get(id)
+        .await
+}
 
 /// A change through `source` by the actor of the current management request,
 /// or by the gateway itself outside one.
@@ -221,6 +317,120 @@ mod tests {
         assert!(record.request_id.is_some());
         assert_eq!(record.surface_id.as_deref(), Some("s-1"));
         assert_eq!(record.channel_name.as_deref(), Some("Orders"));
+    }
+
+    fn surface(policies: serde_json::Value) -> AgentSurface {
+        let mut value = serde_json::json!({
+            "surface_id": "s-1",
+            "name": "Orders",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/orders", "protocol": "a2a" },
+            "target": { "endpoint": "https://upstream" },
+        });
+        for (key, slot) in policies
+            .as_object()
+            .expect("an object")
+        {
+            match key.as_str() {
+                "inbound_policy" => value["access_point"][key] = slot.clone(),
+                _ => value["target"][key] = slot.clone(),
+            }
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn policy(id: &str) -> serde_json::Value {
+        serde_json::json!({ "policy_definition_id": id })
+    }
+
+    fn changes(
+        before: Option<&AgentSurface>,
+        after: Option<&AgentSurface>,
+    ) -> Vec<(PolicyChangeAction, String, String)> {
+        surface_slot_changes(before, after)
+            .into_iter()
+            .map(|(action, key, slot)| (action, format!("{:?}", key.slot), slot.policy_definition_id))
+            .collect()
+    }
+
+    #[test]
+    fn a_new_surface_attaches_each_policy_it_names() {
+        let created = surface(serde_json::json!({ "policy": policy("a"), "inbound_policy": policy("b") }));
+
+        let mut found = changes(None, Some(&created));
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                (PolicyChangeAction::PolicyAttached, "Inbound".to_string(), "b".to_string()),
+                (PolicyChangeAction::PolicyAttached, "Target".to_string(), "a".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replacing_a_policy_detaches_the_old_one_then_attaches_the_new_one() {
+        let before = surface(serde_json::json!({ "policy": policy("a"), "response_policy": policy("r") }));
+        let after = surface(serde_json::json!({ "policy": policy("b"), "response_policy": policy("r") }));
+
+        assert_eq!(
+            changes(Some(&before), Some(&after)),
+            vec![
+                (PolicyChangeAction::PolicyDetached, "Target".to_string(), "a".to_string()),
+                (PolicyChangeAction::PolicyAttached, "Target".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn removing_a_policy_or_the_surface_detaches_it() {
+        let before = surface(serde_json::json!({ "policy": policy("a") }));
+        let after = surface(serde_json::json!({}));
+        let detached = vec![(PolicyChangeAction::PolicyDetached, "Target".to_string(), "a".to_string())];
+
+        assert_eq!(changes(Some(&before), Some(&after)), detached);
+        assert_eq!(changes(Some(&before), None), detached);
+    }
+
+    #[test]
+    fn a_write_that_keeps_every_policy_changes_nothing() {
+        let before = surface(serde_json::json!({ "policy": policy("a") }));
+        let mut after = before.clone();
+        after.name = "Orders v2".to_string();
+
+        assert!(changes(Some(&before), Some(&after)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_surface_write_records_where_each_policy_was_attached() {
+        let after = surface(serde_json::json!({ "policy": policy("a") }));
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), surface_written(None, Some(&after)))).await;
+
+        assert_eq!(records.len(), 1);
+        let json = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(json["surface_id"], "s-1");
+        assert_eq!(json["channel_name"], "Orders");
+        assert_eq!(
+            json["event"]["policy_attached"],
+            serde_json::json!({
+                "policy_definition_id": "a",
+                "target": { "kind": "surface", "id": "s-1", "name": "Orders" },
+                "scope": "surface",
+                "slot": "target",
+                "actor": { "kind": "user", "id": "u-1" },
+                "source": "api",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_write_outside_a_management_request_records_nothing() {
+        let after = surface(serde_json::json!({ "policy": policy("a") }));
+
+        let ((), records) = capture(surface_written(None, Some(&after))).await;
+
+        assert!(records.is_empty());
     }
 
     #[tokio::test]

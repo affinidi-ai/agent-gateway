@@ -1196,6 +1196,7 @@ pub async fn run_axum_proxy(
         let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
         if let Some(ref store) = early_policy_definition_store {
             policy_manager.set_policy_definition_store(store.clone());
+            crate::audit::policy_changes::use_definitions(store.clone());
         }
         for surface in &config.surfaces {
             if surface.config_id().is_some()

@@ -298,6 +298,9 @@ pub struct PolicyChangeDetails {
     pub transit_point: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_tool_name: Option<String>,
+    /// The MCP tool gate's name, or its id when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,6 +344,7 @@ impl PolicyChangeDetails {
             variant: None,
             transit_point: None,
             mcp_tool_name: None,
+            gate: None,
             plane: None,
             mode: None,
             previous_mode: None,
