@@ -1610,6 +1610,26 @@ pub async fn run_axum_proxy(
                 }
             };
 
+        // Trust Recorder status store: a sibling of the identity dir under the
+        // storage base, so backups of `_storage` include it.
+        {
+            let path = PathBuf::from(
+                &bootstrap_config
+                    .storage_paths
+                    .identities,
+            )
+            .parent()
+            .map(|p| p.join("trust_recorder_status"))
+            .unwrap_or_else(|| PathBuf::from("_storage/trust_recorder_status"));
+            match crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore::open(path).await {
+                Ok(store) => {
+                    info!("Trust Recorder status store initialized");
+                    crate::trust_registry_verification::recorder_status::init_global_store(Arc::new(store));
+                }
+                Err(e) => error!("Failed to initialize Trust Recorder status store: {}", e),
+            }
+        }
+
         // STS managed-connection store (RFC 8693 token exchange clients). Stored
         // as a sibling of the other entity dirs under the storage base.
         let sts_client_store: Option<Arc<dyn crate::sts::store::StsClientStorage>> = {

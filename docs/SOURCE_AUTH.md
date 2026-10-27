@@ -220,6 +220,45 @@ selected, or its Issuer no longer exists, and an entry's authority is the templa
 that entry writes nothing. The
 warning does not block saving, and it does not appear for entries with an explicit authority.
 
+### Recorder status
+
+The gateway keeps the Trust Recorder's last known outcome for each managed agent DID on each
+surface ([`recorder_status.rs`](../src/trust_registry_verification/recorder_status.rs)). It is the
+recorder's last outcome, not a live check of the trust registry.
+
+Each entry has one state:
+
+| State | Meaning |
+| --- | --- |
+| Recorded (`recorded`) | At least one record was written or already existed, and none failed. |
+| Partly recorded (`partial`) | Some records were written or already existed and some failed. |
+| Failed (`failed`) | No record was written. The reason is `no_response` (no reply within 10 seconds), `rejected` (the registry sent a problem report) or `error`. |
+| Skipped (`skipped`) | The entry was not written. The reason is `registry_not_found`, `registry_not_connected`, `no_surface_issuer` (the `{{ surface.issuer_did }}` template did not resolve) or `error` (the trust registry lookup failed). |
+| Not attempted yet (`not_attempted`) | The surface has a Trust Recorder and no outcome is stored yet, for example right after it was added. |
+
+An entry that declares no records is not reported. The identity's overall state combines its
+entries: when all entries share a state it is that state, when a written entry is mixed with an
+unwritten one it is Partly recorded, and otherwise Failed ranks above Skipped. Only these
+codes, counts and timestamps are kept; registry error text never reaches the status.
+
+Statuses are stored in `_storage/trust_recorder_status/`, beside the identities directory and
+without a `[storage_paths]` key, so a backup of `_storage` includes them. The recorder runs on
+every response, so a status is written only when the outcome changes. The attempt time is
+held in memory and, after a restart, shows the time of the last change until the next
+attempt. Deleting a surface, or adding, removing or changing the entries of its Trust Recorder,
+clears its statuses, so they show Not attempted yet until the next response. The outcome of a
+run that began before the clear is dropped, so a run still waiting on a trust registry cannot
+bring a cleared status back. A storage failure is logged as a warning and the status reads as
+missing.
+
+Managed identities whose surface has a Trust Recorder carry `trust_recorder` in the identity
+list (`/v1/dashboard/stats` and its live updates), which also pushes an identity whose outcome
+changed. Adding or removing a Trust Recorder, or a change another node wrote to shared storage,
+shows on the next update or reload. `GET /v1/surfaces/{id}/trust-recorder-status` returns
+`{"status": ...}` for a surface: the most recently attempted of its managed agents, or `null`
+before the first attempt and while the surface has no Trust Recorder. It needs the same surface
+access as `GET /v1/surfaces/{id}`.
+
 ## Display names
 
 A display name is an unverified, human-readable label for a DID

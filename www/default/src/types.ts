@@ -201,6 +201,33 @@ export interface Identity {
   surface_name?: string;
   credential_principal?: CredentialPrincipal;
   name_conflict?: boolean;
+  trust_recorder?: TrustRecorderStatus;
+}
+
+export type TrustRecorderState = 'recorded' | 'partial' | 'failed' | 'skipped' | 'not_attempted';
+
+export type TrustRecorderReason =
+  | 'registry_not_found'
+  | 'registry_not_connected'
+  | 'no_surface_issuer'
+  | 'no_response'
+  | 'rejected'
+  | 'error';
+
+export interface TrustRecorderEntryOutcome {
+  trust_registry_id: string;
+  state: TrustRecorderState;
+  reason: TrustRecorderReason | null;
+  created: number;
+  already_existed: number;
+  failed: number;
+}
+
+export interface TrustRecorderStatus {
+  state: TrustRecorderState;
+  reason: TrustRecorderReason | null;
+  last_attempt_at: string | null;
+  entries: TrustRecorderEntryOutcome[];
 }
 
 export type IdentityOrigin = 'managed' | 'external_caller';

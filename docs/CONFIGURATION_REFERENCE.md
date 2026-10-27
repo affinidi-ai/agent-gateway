@@ -140,7 +140,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[tenancy.trusted_tenant_header]` | Declares that an authenticated edge writes the tenant header. Enables broad header-derived PAT selectors. |
 | `[encryption]` | Encryption at rest: on or off, key source, KMS settings |
 | `[config_files]` | Where the other configuration files are |
-| `[storage_paths]` | Where each record kind is persisted under `_storage/` |
+| `[storage_paths]` | Where each record kind is persisted under `_storage/`. The Trust Recorder status store has no key: it sits beside the identities directory as `trust_recorder_status/`. |
 | `[did_cache]` | DID document cache TTL, size, staleness, and path; whether DID resolution may contact private hosts |
 | `[tls]` | Certificate and key paths, upstream verification |
 | `[mcp]` | Default MCP revision, validation, timeouts, SSE and stdio transports. Gateway-originated `2026-07-28` consent needs `[mcp.continuations]`; see [`MCP_METADATA.md`](MCP_METADATA.md#protected-continuations). |

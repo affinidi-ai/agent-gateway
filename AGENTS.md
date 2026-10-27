@@ -93,6 +93,10 @@ The Trust Recorder panel and its entries warn while an entry uses the surface Is
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
+The Identities page shows a Trust Recorder status chip and a Recorder filter, and the Trust
+Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
+
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 
 ## Architecture
