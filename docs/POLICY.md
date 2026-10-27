@@ -408,6 +408,27 @@ documented here so operators can assess exposure.
   `handle_fabric_request` after the gateway-plane global gate but before the
   surface-plane global gate in `src/proxy/handler.rs`.
 
+## Policy change audit
+
+Every management change to a policy, or to where a policy applies, can be recorded as a
+governance audit event (group Policies; record fields in
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)):
+
+| Change | Where | Events |
+| --- | --- | --- |
+| Create, edit, delete a definition | `/v1/policy-definitions` | `policy_created`, `policy_updated`, `policy_deleted` |
+| Reassign a definition's tenant | `PUT /v1/tenant-ownership/policy-definitions/{id}` | `policy_updated` with `changed: ["owner"]` |
+| Add, remove or replace a policy on a surface or variant: target, inbound, response, shared transit, per transit point, MCP tool policy, MCP tool gate condition | any surface or variant write | `policy_attached`, `policy_detached` |
+| Change a gateway's policy or its deny-overrides members, or enable or disable it | any gateway write, e.g. `PUT /v1/gateways/{id}/policy` | `policy_attached`, `policy_detached`, `policy_attachment_changed` |
+| Change the appliance-wide assignments, or switch one between enforced and monitor-only | `PUT /v1/policy-assignments`; deleting a definition prunes it | `policy_attached`, `policy_detached`, `policy_attachment_changed` |
+| A change above refused | the definition, assignment, gateway policy and ownership routes | `policy_change_refused` |
+
+Surface and gateway changes are found by comparing the stored record before and after each
+write in a management request (`src/policies/slots.rs` lists a surface's enforced slots), so
+every API path that writes one is covered. `transit.transit_policy` is not enforced, so it is
+not listed. A refused surface or variant write is not recorded. Changes to a gateway's inline
+Rego (`opa_policy_config.policy` with no definition id) name no definition and are not recorded.
+
 ## Policy decision audit logging
 
 ![The Audit page listing two denied requests, each showing the policy version and content hash that decided it, with the event details panel open](assets/diagrams/screenshot-audit-policy-decision.jpg)

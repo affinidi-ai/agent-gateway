@@ -197,6 +197,40 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).
     `error_detail` is a short diagnostic and never carries the presentation itself.
 
+**Policy change events.** Raised by management API requests that change a policy definition or
+where a policy applies (group Policies). Each record carries its body in the `event` variant, e.g.
+`"event": {"policy_attached": {...}}`, and every record one request writes shares that request's
+`request_id`. See [`POLICY.md`](POLICY.md#policy-change-audit) for what each covers.
+
+- `policy_created`, `policy_updated`, `policy_deleted`: a policy definition was created, changed
+  or deleted. `policy_updated` names the parts that changed in `changed` (`rego`, `name`,
+  `description`, `enabled`, `sample_input`, `owner`) with `previous_policy_version` and
+  `previous_policy_content_hash`; an update that changes nothing is not recorded.
+- `policy_attached`, `policy_detached`: a policy now applies, or no longer applies, at a slot of a
+  surface, a gateway or an appliance-wide plane. `target` is `{kind, id, name}` (`surface`,
+  `gateway` or `appliance`); `scope` is the decision scope the slot produces; `slot` is `target`,
+  `inbound`, `response`, `transit`, `transit_point`, `mcp_tool`, `mcp_tool_gate` or `plane`, with
+  `variant`, `transit_point`, `mcp_tool_name`, `gate` or `plane` naming the place. A replaced
+  policy is detached, then its successor attached. A surface target also sets the top-level
+  `surface_id` and `channel_name`.
+- `policy_attachment_changed`: an appliance-wide assignment switched between `enforced` and
+  `monitor_only` (`mode`, `previous_mode`), or a gateway's policy was enabled or disabled
+  (`enabled`, `previous_enabled`).
+- `policy_change_refused`: one of the changes above was refused with 400, 403, 404, 409 or 422.
+  `action` is the change attempted, `status` the HTTP status and `reason` one of `invalid`,
+  `forbidden`, `not_found` or `conflict`. The attempt is read from the route only: ids come from
+  the path, bounded to 128 id characters, and replacing the appliance-wide assignments or a
+  gateway's policy is recorded as an attempted `policy_attached` with no policy id.
+
+Every record names its `actor`: `{kind: "user", id}` for a signed-in user, `{kind: "pat", id,
+user_id}` for an access token (its id, never its value, and its owner's user id) or
+`{kind: "system", id: "gateway"}`. `source` is `api`, `ownership` (a definition's tenant was
+reassigned) or `definition_deleted` (deleting a definition pruned its appliance-wide
+assignments). Policy ids, versions and content hashes are those `policy_decision` records carry,
+so a change joins to the decisions it causes. No record carries the Rego text, the sample input
+or a request body. Writes made outside a management request (startup migrations, replication)
+record nothing, and a configuration reload changes no stored policy reference.
+
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
 the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,

@@ -174,10 +174,14 @@ valid regular expression stops the gateway from starting.
 
 ### Example: policy decisions to Agent Watch
 
-Agent Watch's Enforcement insights read the gateway's policy decisions from Kafka:
+Agent Watch's Enforcement insights read the gateway's policy decisions, and the policy changes
+behind them, from Kafka:
 
 - an endpoint of type `stream`, platform Kafka, on the topic Agent Watch consumes;
-- an event set holding `audit.policy_decision`;
+- an event set holding `audit.policy_decision` and the policy change events
+  `audit.policy_created`, `audit.policy_updated`, `audit.policy_deleted`,
+  `audit.policy_attached`, `audit.policy_detached`, `audit.policy_attachment_changed` and
+  `audit.policy_change_refused`;
 - an integration joining the two with this template, so `record` is the full audit record:
 
   ```json

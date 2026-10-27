@@ -16,7 +16,23 @@ changes:
         call site passed one. They now carry the surface name in `channel_name` beside the
         surface UUID, and always name the policy: the definition name, else the definition id,
         else a label for the layer, such as "Gateway policy" or "MCP tool gating".
-  fixed: []
+    - timestamp: '2026-10-27T16:00:00Z'
+      title: Audit every change to a policy and to where a policy applies
+      description: >-
+        Seven new governance audit events in the Policies group record who changed a policy
+        definition (`policy_created`, `policy_updated`, `policy_deleted`), where a policy was
+        added or removed on a surface, variant, gateway or appliance-wide plane
+        (`policy_attached`, `policy_detached`), a switch between enforced and monitor-only or
+        enabled and disabled (`policy_attachment_changed`), and a refused change
+        (`policy_change_refused`). Records name the actor by id only and never carry Rego text.
+  fixed:
+    - timestamp: '2026-10-27T16:01:00Z'
+      title: Recompile surfaces that use an edited definition as an MCP tool policy
+      description: >-
+        Editing a policy definition recompiled the surfaces referencing it as a target,
+        inbound, response or transit policy, but not those using it only as an MCP tool policy
+        or an MCP tool gate condition. Those surfaces kept the old version until their next
+        save; they are now recompiled with the others.
   removed: []
   security: []
   breaking: []
