@@ -109,7 +109,7 @@ pub(crate) fn tracked_surface_id(
         .unwrap_or_else(|| panic!("surface '{surface_name}' must have been created before this step"))
 }
 
-fn current_surface_body(
+pub(crate) fn current_surface_body(
     world: &SurfaceWorld,
     action: &str,
 ) -> serde_json::Value {
@@ -121,7 +121,7 @@ fn current_surface_body(
         .clone()
 }
 
-async fn update_named_surface(
+pub(crate) async fn update_named_surface(
     world: &mut SurfaceWorld,
     surface_name: &str,
     payload: serde_json::Value,
