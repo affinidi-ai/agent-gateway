@@ -1797,7 +1797,7 @@ async fn proxy_handler_with_mcp_runtime(
         })
         .transpose()
         .map_err(|_| create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP resource authorization"))?;
-    let protected_resource = crate::mcp::resource_server::access_point_protected_resource(
+    let protected_resource = crate::protocols::protected_resource::access_point_protected_resource(
         &state.surface,
         state
             .active_variant_alias
@@ -1835,7 +1835,7 @@ async fn proxy_handler_with_mcp_runtime(
             )
             .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
         else {
-            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
+            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
             crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
             return Ok(authorization.challenge(error));
         };
@@ -1887,7 +1887,7 @@ async fn proxy_handler_with_mcp_runtime(
                 .validate_network(&state.network_config)
                 .is_err()
         {
-            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
+            let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
             crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
             return Ok(authorization.challenge(error));
         }
@@ -1994,9 +1994,9 @@ async fn proxy_handler_with_mcp_runtime(
                         .decrement()
                         .await;
                     let error = if matches!(e, crate::source_auth::errors::SourceAuthError::MissingCredential { .. }) {
-                        crate::mcp::resource_server::ResourceTokenError::Missing
+                        crate::protocols::protected_resource::ResourceTokenError::Missing
                     } else {
-                        crate::mcp::resource_server::ResourceTokenError::Invalid
+                        crate::protocols::protected_resource::ResourceTokenError::Invalid
                     };
                     return Ok(protected_resource.challenge(error));
                 }

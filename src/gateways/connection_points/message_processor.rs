@@ -4131,7 +4131,7 @@ async fn process_forward_request_with_mcp_runtime(
     let mut resource_authorization = None;
     let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> =
         if let Some(authorization) = surface.mcp_http.as_ref().and_then(|http| http.authorization.as_ref()) {
-            use crate::mcp::resource_server::ResourceTokenError;
+            use crate::protocols::protected_resource::ResourceTokenError;
 
             let authorization = match authorization.for_variant(variant_alias) {
                 Ok(authorization) => authorization,

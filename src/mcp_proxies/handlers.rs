@@ -2343,7 +2343,9 @@ pub async fn handle_mcp_get<S: McpProxyStore>(
             .and_then(|http| http.authorization.as_ref())
         {
             let Some(Extension(auth)) = &auth else {
-                return Ok(authorization.challenge(crate::mcp::resource_server::ResourceTokenError::Unavailable));
+                return Ok(
+                    authorization.challenge(crate::protocols::protected_resource::ResourceTokenError::Unavailable)
+                );
             };
             if let Err(error) = auth
                 .authenticate_proxy(&proxy, &network, &headers)
@@ -2467,7 +2469,7 @@ pub async fn handle_mcp_post<S: McpProxyStore>(
         .and_then(|http| http.authorization.as_ref())
     {
         let Some(Extension(auth)) = &auth else {
-            return Ok(authorization.challenge(crate::mcp::resource_server::ResourceTokenError::Unavailable));
+            return Ok(authorization.challenge(crate::protocols::protected_resource::ResourceTokenError::Unavailable));
         };
         match auth
             .authenticate_proxy(&proxy, &network, &headers)

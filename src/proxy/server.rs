@@ -590,11 +590,11 @@ pub async fn run_port_server(
         Router::new()
             .route(
                 "/.well-known/oauth-protected-resource",
-                axum::routing::any(crate::mcp::resource_server::protected_resource_metadata),
+                axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
             )
             .route(
                 "/.well-known/oauth-protected-resource/{*path}",
-                axum::routing::any(crate::mcp::resource_server::protected_resource_metadata),
+                axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
             )
             .with_state(state.as_ref().clone()),
     );

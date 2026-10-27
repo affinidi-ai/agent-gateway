@@ -129,7 +129,7 @@ logic.
 
 | Stage | Owns | Lives in |
 | --- | --- | --- |
-| Source authentication | Establishing the caller's identity. A missing or invalid credential is passed to policy, not refused. | [`src/source_auth/`](src/source_auth/) |
+| Source authentication | Establishing the caller's identity. A missing or invalid credential is passed to policy, not refused, except on an MCP Access Point that publishes protected resource metadata, which answers with a `401` discovery challenge | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
 | Rate limiting | Per-surface request limits | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
@@ -324,7 +324,7 @@ from.
 | [`proxy/`](src/proxy/) | Both pipelines, surface manager, listener lifecycle, response policy, bounded upstream response reads | [Inbound path](#inbound-path), [Outbound path](#outbound-path) |
 | [`server/`](src/server/) | Startup orchestration, TLS, WebSocket, active/standby mode | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`state/`](src/state/) | Per-surface runtime state shared across handlers | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
-| [`protocols/`](src/protocols/) | Protocol-agnostic extension inspection, metadata injection, and header rules shared by A2A, MCP, and others | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`protocols/`](src/protocols/) | Protocol-agnostic extension inspection, metadata injection, header rules, and RFC 9728 protected resource metadata and challenges shared by A2A, MCP, and others | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`surface_context/`](src/surface_context/) | The types that become OPA policy input | [`POLICY.md`](docs/POLICY.md) |
 | [`egress.rs`](src/egress.rs) | The DNS-pinning SSRF guard used by every outbound sink except DID resolution, which relies on the resolver's host policy | [`POLICY.md`](docs/POLICY.md), [DID resolution host policy](docs/POLICY.md#did-resolution-host-policy) |
 | [`http_client.rs`](src/http_client.rs) | Shared reqwest client defaults | Source only: [`src/http_client.rs`](src/http_client.rs) |

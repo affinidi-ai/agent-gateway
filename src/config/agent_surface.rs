@@ -449,7 +449,7 @@ pub struct CallerAuthentication {
     /// RFC 9728 discovery for an MCP Access Point whose JWT Bearer method
     /// accepts tokens from an external authorization server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protected_resource: Option<crate::mcp::resource_server::ProtectedResourceConfig>,
+    pub protected_resource: Option<crate::protocols::protected_resource::ProtectedResourceConfig>,
 }
 
 /// What the Gateway needs to know about the caller.
@@ -2066,7 +2066,7 @@ impl AgentSurface {
         let Some(protected) = self.protected_resource() else {
             return Ok(());
         };
-        if self.access_point.protocol != SurfaceProtocol::Mcp {
+        if !crate::protocols::protected_resource::supports_protected_resource(&self.access_point.protocol) {
             return Err("requires an MCP Access Point".into());
         }
         protected.validate()?;

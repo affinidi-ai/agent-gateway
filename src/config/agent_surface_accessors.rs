@@ -87,7 +87,7 @@ impl AgentSurface {
 
     /// RFC 9728 settings of the Access Point's caller authentication.
     #[inline]
-    pub fn protected_resource(&self) -> Option<&crate::mcp::resource_server::ProtectedResourceConfig> {
+    pub fn protected_resource(&self) -> Option<&crate::protocols::protected_resource::ProtectedResourceConfig> {
         self.access_point
             .caller_authentication
             .as_ref()

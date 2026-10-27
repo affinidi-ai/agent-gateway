@@ -2557,7 +2557,8 @@ mod validation_tests {
             .caller_authentication = Some(caller_authentication(true));
         existing.variants = vec![variant(true)];
         let expected = Some(
-            serde_json::from_value::<crate::mcp::resource_server::ProtectedResourceConfig>(protected.clone()).unwrap(),
+            serde_json::from_value::<crate::protocols::protected_resource::ProtectedResourceConfig>(protected.clone())
+                .unwrap(),
         );
 
         // The dashboard sends caller authentication rebuilt from its methods.

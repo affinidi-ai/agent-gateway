@@ -143,7 +143,7 @@ pub(crate) enum OutboundPipelineError {
     #[error("MCP resource authorization failed")]
     McpResourceAuthorization {
         config: Box<crate::mcp::resource_server::McpResourceServerConfig>,
-        error: crate::mcp::resource_server::ResourceTokenError,
+        error: crate::protocols::protected_resource::ResourceTokenError,
     },
 
     #[error("Upstream request timed out")]
@@ -1041,7 +1041,7 @@ async fn step_source_auth(
         .as_ref()
         .and_then(|http| http.authorization.as_ref())
     {
-        use crate::mcp::resource_server::ResourceTokenError;
+        use crate::protocols::protected_resource::ResourceTokenError;
 
         let fail = |error| OutboundPipelineError::McpResourceAuthorization {
             config: Box::new(authorization.clone()),
