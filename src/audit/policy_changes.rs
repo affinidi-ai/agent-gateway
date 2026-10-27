@@ -16,7 +16,9 @@ use crate::delegation_vault::audit::{
 use crate::gateways::types::Gateway;
 use crate::observability::PolicyScope;
 use crate::policies::global_policy::{GlobalPolicyAssignments, PLANE_GATEWAY};
-use crate::policies::policy_definitions::{FileSystemPolicyDefinitionStore, PolicyDefinition, PolicyType, content_hash};
+use crate::policies::policy_definitions::{
+    FileSystemPolicyDefinitionStore, PolicyDefinition, PolicyType, content_hash,
+};
 use crate::policies::slots::{SlotKey, SlotPolicy, policy_slots};
 
 /// The definitions attachment records are named from, set once at start.
@@ -112,7 +114,11 @@ pub fn gateway_policy_changes(
             id: Some(gateway.id.clone()),
             name: Some(gateway.name.clone()),
         });
-        change.scope = Some(PolicyScope::Gateway.as_str().to_string());
+        change.scope = Some(
+            PolicyScope::Gateway
+                .as_str()
+                .to_string(),
+        );
         change.slot = Some(PolicySlot::Target);
         change
     };
@@ -132,8 +138,12 @@ fn inline_policy(gateway: Option<&Gateway>) -> Option<(String, bool)> {
         .iter()
         .chain(&config.policy_definition_ids)
         .any(|id| !id.is_empty());
-    (!references && !config.policy.trim().is_empty())
-        .then(|| (content_hash(&PolicyType::Gateway, &config.policy), config.enabled))
+    (!references
+        && !config
+            .policy
+            .trim()
+            .is_empty())
+    .then(|| (content_hash(&PolicyType::Gateway, &config.policy), config.enabled))
 }
 
 fn inline_policy_changes(
@@ -805,8 +815,18 @@ mod tests {
         let (action, attached) = &changes[0];
         assert_eq!(*action, PolicyChangeAction::PolicyAttached);
         assert_eq!(attached.policy_definition_id, None);
-        assert_eq!(attached.policy_name.as_deref(), Some("Gateway policy"));
-        assert_eq!(attached.policy_type.as_deref(), Some("gateway"));
+        assert_eq!(
+            attached
+                .policy_name
+                .as_deref(),
+            Some("Gateway policy")
+        );
+        assert_eq!(
+            attached
+                .policy_type
+                .as_deref(),
+            Some("gateway")
+        );
         assert_eq!(attached.policy_content_hash, inline_hash("allow"));
         assert_eq!(attached.scope.as_deref(), Some("gateway"));
         assert_eq!(attached.slot, Some(PolicySlot::Target));
@@ -815,8 +835,7 @@ mod tests {
 
     #[test]
     fn changing_an_inline_gateway_policy_is_an_update_of_its_rego() {
-        let changes =
-            gateway_policy_changes(Some(&inline_gateway(true, "allow")), Some(&inline_gateway(true, "deny")));
+        let changes = gateway_policy_changes(Some(&inline_gateway(true, "allow")), Some(&inline_gateway(true, "deny")));
 
         assert_eq!(changes.len(), 1);
         let (action, updated) = &changes[0];
@@ -841,7 +860,15 @@ mod tests {
         assert_eq!(
             changes
                 .iter()
-                .map(|(action, change)| (*action, change.policy_definition_id.clone(), change.policy_content_hash.clone()))
+                .map(|(action, change)| (
+                    *action,
+                    change
+                        .policy_definition_id
+                        .clone(),
+                    change
+                        .policy_content_hash
+                        .clone()
+                ))
                 .collect::<Vec<_>>(),
             vec![
                 (PolicyChangeAction::PolicyAttached, Some("p".to_string()), None),

@@ -267,7 +267,11 @@ async fn audit_log_has_no_policy_created(world: &mut SurfaceWorld) {
         .expect("read the VP Audit Log");
     let created: Vec<_> = events
         .iter()
-        .filter(|record| record["event"].get("policy_created").is_some())
+        .filter(|record| {
+            record["event"]
+                .get("policy_created")
+                .is_some()
+        })
         .collect();
     assert!(created.is_empty(), "expected no policy_created record, got {created:?}");
 }
