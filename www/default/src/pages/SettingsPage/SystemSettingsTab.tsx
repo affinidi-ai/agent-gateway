@@ -128,45 +128,29 @@ const SystemSettingsTab: React.FC<SystemSettingsTabProps> = ({
                   </small>
                 </div>
 
-              <h6 className="mb-2 font-weight-bold">Integrations</h6>
-              <div className="mb-3">
-                <label htmlFor="appliance_id">Appliance ID</label>
-                <input
-                  type="text"
-                  className="form-control form-control-sm font-monospace"
-                  id="appliance_id"
-                  name="appliance_id"
-                  maxLength={256}
-                  value={formData.appliance_id ?? ''}
-                  onChange={onInputChange}
-                  placeholder="e.g. this appliance's id in Agent Watch"
-                  data-testid="settings-appliance-id-input"
-                />
-                <small className="form-text text-muted">
-                  Sent as{' '}
-                  <code>
-                    ${'{'}APPLIANCE_ID{'}'}
-                  </code>{' '}
-                  in integration payloads. While it is empty the variable is sent unfilled.
-                </small>
-              </div>
+                <h6 className="mb-2 font-weight-bold">Integrations</h6>
+                <div className="mb-3">
+                  <label htmlFor="appliance_id">Appliance ID</label>
+                  <input
+                    type="text"
+                    className="form-control form-control-sm font-monospace"
+                    id="appliance_id"
+                    name="appliance_id"
+                    maxLength={256}
+                    value={formData.appliance_id ?? ''}
+                    onChange={onInputChange}
+                    placeholder="e.g. this appliance's id in Agent Watch"
+                    data-testid="settings-appliance-id-input"
+                  />
+                  <small className="form-text text-muted">
+                    Sent as{' '}
+                    <code>
+                      ${'{'}APPLIANCE_ID{'}'}
+                    </code>{' '}
+                    in integration payloads. While it is empty the variable is sent unfilled.
+                  </small>
+                </div>
 
-              <div className="d-flex">
-                <button
-                  type="submit"
-                  className="btn btn-primary btn-sm me-2"
-                  disabled={isSubmitting}
-                >
-                  <i className="fas fa-save"></i> Save System Settings
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-sm"
-                  disabled={isSubmitting}
-                  onClick={onReset}
-                >
-                  <i className="fas fa-undo"></i> Reset to Defaults
-                </button>
                 <div className="d-flex">
                   <button
                     type="submit"

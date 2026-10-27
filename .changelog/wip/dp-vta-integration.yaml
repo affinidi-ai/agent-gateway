@@ -12,6 +12,18 @@ changes:
         nothing could be signed through a connected agent at all. The proof is
         now attached, and an external identity provider's grant is no longer
         turned away when it is offered as proof of who someone is.
+    - timestamp: '2026-10-27T07:00:00Z'
+      title: Repair the System Settings screen and the new surface name default
+      description: >-
+        The System Settings screen had a duplicated block of Save and Reset
+        buttons and a missing closing tag, which stopped the dashboard being
+        built at all. Creating a surface also stopped treating a typed name
+        that matches the suggested one as still being the suggestion, so the
+        page claimed unsaved changes when nothing had been changed and the
+        name no longer followed a protocol switch. Both were a stray duplicate
+        left behind by a merge. The Key Management tab additionally no longer
+        takes the rest of the Secrets screen down with it when the key
+        inventory cannot be read; it reports the problem in its own tab.
   removed: []
   security:
     - timestamp: '2026-10-27T02:00:00Z'

@@ -810,7 +810,6 @@ const AddSurfacePage: React.FC = () => {
         setMeta={{
           setName: setTypedName,
           setSigning,
-          setName,
           setDescription,
           setTagsCsv,
           setStatus,

@@ -33,7 +33,17 @@ const KeyManagementTab: React.FC = () => {
     try {
       const response = await apiClient.fetch('/api/v1/key-management/inventory');
       if (!response.ok) throw new Error(`Failed to load the key inventory: ${response.statusText}`);
-      setInventory(await response.json());
+      const payload = await response.json();
+      // This tab mounts alongside the rest of the Secrets page, so a payload it
+      // cannot read must become this tab's error rather than an exception
+      // during render — that would unmount Secrets, API keys and Certificates
+      // along with it. Every list the render walks is checked, not just the
+      // first one reached.
+      const lists = ['connections', 'mappings', 'orphaned_contexts'] as const;
+      if (!payload || lists.some(key => !Array.isArray(payload[key]))) {
+        throw new Error('The key inventory response was not understood.');
+      }
+      setInventory(payload);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load the key inventory.');
     } finally {
