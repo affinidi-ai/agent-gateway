@@ -1722,13 +1722,7 @@ mod tests {
 
     #[test]
     fn a_policy_change_is_the_body_of_its_event_and_names_only_its_actor_id() {
-        let mut change = PolicyChangeDetails::new(
-            Actor {
-                kind: crate::audit::events::ActorKind::User,
-                id: "u-123".to_string(),
-            },
-            PolicyChangeSource::Api,
-        );
+        let mut change = PolicyChangeDetails::new(Actor::user("u-123"), PolicyChangeSource::Api);
         change.policy_definition_id = Some("deny-pii".to_string());
         change.policy_version = Some(3);
         change.target = Some(PolicyTarget {
@@ -1759,15 +1753,7 @@ mod tests {
 
     #[test]
     fn a_policy_change_event_is_categorised_by_its_name_and_kept_in_the_vp_audit_log() {
-        let change = || {
-            Box::new(PolicyChangeDetails::new(
-                Actor {
-                    kind: crate::audit::events::ActorKind::System,
-                    id: "gateway".to_string(),
-                },
-                PolicyChangeSource::DefinitionDeleted,
-            ))
-        };
+        let change = || Box::new(PolicyChangeDetails::new(Actor::system(), PolicyChangeSource::DefinitionDeleted));
         let actions = [
             (DelegationAuditAction::PolicyCreated(change()), "policy_created"),
             (DelegationAuditAction::PolicyUpdated(change()), "policy_updated"),

@@ -159,11 +159,44 @@ pub enum ActorKind {
     System,
 }
 
-/// Who made a management change: an id only, never a name or credential.
+/// Who made a management change: ids only, never a name or credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
     pub kind: ActorKind,
+    /// The user id, the access token's id, or `gateway`.
     pub id: String,
+    /// For an access token, the id of the user it belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+impl Actor {
+    pub fn user(id: impl Into<String>) -> Self {
+        Self {
+            kind: ActorKind::User,
+            id: id.into(),
+            user_id: None,
+        }
+    }
+
+    pub fn pat(
+        token_id: impl Into<String>,
+        user_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ActorKind::Pat,
+            id: token_id.into(),
+            user_id: Some(user_id.into()),
+        }
+    }
+
+    pub fn system() -> Self {
+        Self {
+            kind: ActorKind::System,
+            id: "gateway".to_string(),
+            user_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

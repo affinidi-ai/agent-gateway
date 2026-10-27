@@ -99,7 +99,8 @@ tokio::task_local! {
     pub static REQUEST_TRACE_ID: String;
 
     /// Id of the gateway request being served, installed at each entry point
-    /// (Access Point, Transit Point, fabric receive) and stamped on every audit
+    /// (Access Point, Transit Point, fabric receive, authenticated management
+    /// API request) and stamped on every audit
     /// record the request produces. Always minted here, never read from a
     /// header or token.
     pub static REQUEST_ID: String;

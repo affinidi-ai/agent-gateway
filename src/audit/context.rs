@@ -3,10 +3,31 @@
 
 use std::future::Future;
 
+use crate::audit::events::Actor;
 use crate::delegation_vault::audit::AuditCallerContext;
 
 tokio::task_local! {
     static CALLER: Option<AuditCallerContext>;
+    static ACTOR: Actor;
+}
+
+/// Runs a management API request as `actor`, with a request id of its own,
+/// so every change record it writes names who made it and shares one id.
+pub async fn in_management_request<F: Future>(
+    actor: Actor,
+    future: F,
+) -> F::Output {
+    use crate::observability::policy_audit::{REQUEST_ID, new_request_id};
+    ACTOR
+        .scope(actor, REQUEST_ID.scope(new_request_id(), future))
+        .await
+}
+
+/// The actor set by [`in_management_request`], if any.
+pub fn current_actor() -> Option<Actor> {
+    ACTOR
+        .try_with(Clone::clone)
+        .ok()
 }
 
 /// Runs `future` with `caller` as the caller of every audit record it builds.

@@ -239,6 +239,7 @@ pub async fn require_session_auth(
             }
         }
 
+        let actor = crate::audit::events::Actor::user(user_id.clone());
         let mut request = request;
         request
             .extensions_mut()
@@ -248,7 +249,7 @@ pub async fn require_session_auth(
                 .extensions_mut()
                 .insert(storage);
         }
-        let mut response = next.run(request).await;
+        let mut response = crate::audit::context::in_management_request(actor, next.run(request)).await;
         if let Ok(value) = session_cookie::build_session_cookie(
             &session_token,
             state
@@ -395,6 +396,7 @@ pub async fn require_session_auth(
             }
         }
 
+        let actor = crate::audit::events::Actor::pat(principal.token_id.clone(), principal.user_id.clone());
         let mut request = request;
         request
             .extensions_mut()
@@ -424,7 +426,7 @@ pub async fn require_session_auth(
                 .extensions_mut()
                 .insert(storage);
         }
-        return Ok(next.run(request).await);
+        return Ok(crate::audit::context::in_management_request(actor, next.run(request)).await);
     }
 
     warn!("require_session_auth: invalid/expired session for {}", path);
@@ -1242,6 +1244,71 @@ mod tests {
         let app = test_app_with_storage(sess_mgr, storage);
         let status = get_status_with_bearer(&app, "/v1/settings", &token).await;
         assert_eq!(status, 200, "Approved user with valid session must pass");
+    }
+
+    async fn audit_context_handler() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "actor": crate::audit::context::current_actor(),
+            "request_id": crate::observability::policy_audit::current_request_id(),
+        }))
+    }
+
+    async fn audit_context_of(
+        app: &Router,
+        bearer: &str,
+    ) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/policy-definitions")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_request_runs_as_its_actor_with_a_request_id_of_its_own() {
+        let sessions = Arc::new(SessionManager::new());
+        let app = Router::new()
+            .route("/v1/policy-definitions", get(audit_context_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(sessions.clone(), None, Arc::new(crate::terms::TermsManager::disabled()))
+                    .with_pat_authenticator(Some(Arc::new(TermsTestPat))),
+                require_session_auth,
+            ));
+        let token = sessions
+            .create_session("alice".into(), "user-1".into())
+            .await;
+
+        let first = audit_context_of(&app, &token).await;
+        let second = audit_context_of(&app, &token).await;
+        let by_pat = audit_context_of(&app, "terms-test-pat").await;
+
+        assert_eq!(first["actor"], serde_json::json!({"kind": "user", "id": "user-1"}));
+        assert_eq!(by_pat["actor"], serde_json::json!({"kind": "pat", "id": "test-token", "user_id": "user-1"}));
+        let request_id = first["request_id"]
+            .as_str()
+            .expect("a request id");
+        assert_eq!(request_id.len(), 16);
+        assert!(
+            request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(first["request_id"], second["request_id"]);
+        assert_ne!(first["request_id"], by_pat["request_id"]);
     }
 
     struct TermsTestPat;

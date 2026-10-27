@@ -187,7 +187,7 @@ async fn publish_audit_record(
 mod tests {
     use super::*;
     use crate::audit::events::{
-        Actor, ActorKind, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource,
+        Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource,
         RateLimitScope, RejectionReason, RejectionStage, RequestFailureOutcome, TargetKind,
     };
     use crate::delegation_vault::audit::{
@@ -569,13 +569,7 @@ mod tests {
     }
 
     fn policy_change() -> Box<PolicyChangeDetails> {
-        Box::new(PolicyChangeDetails::new(
-            Actor {
-                kind: ActorKind::User,
-                id: "u-1".to_string(),
-            },
-            PolicyChangeSource::Api,
-        ))
+        Box::new(PolicyChangeDetails::new(Actor::user("u-1"), PolicyChangeSource::Api))
     }
 
     #[test]
