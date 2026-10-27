@@ -8,7 +8,7 @@ use crate::delegation_vault::audit::AuditCallerContext;
 
 tokio::task_local! {
     static CALLER: Option<AuditCallerContext>;
-    static ACTOR: Actor;
+    static ACTOR: Option<Actor>;
 }
 
 /// Runs a management API request as `actor`, with a request id of its own,
@@ -19,7 +19,16 @@ pub async fn in_management_request<F: Future>(
 ) -> F::Output {
     use crate::observability::policy_audit::{REQUEST_ID, new_request_id};
     ACTOR
-        .scope(actor, REQUEST_ID.scope(new_request_id(), future))
+        .scope(Some(actor), REQUEST_ID.scope(new_request_id(), future))
+        .await
+}
+
+/// Runs `future` as the gateway's own work inside a management request, such
+/// as a config reload: the store writes it makes are not the user's changes,
+/// so they record nothing.
+pub async fn without_actor<F: Future>(future: F) -> F::Output {
+    ACTOR
+        .scope(None, future)
         .await
 }
 
@@ -28,6 +37,7 @@ pub fn current_actor() -> Option<Actor> {
     ACTOR
         .try_with(Clone::clone)
         .ok()
+        .flatten()
 }
 
 /// Runs `future` with `caller` as the caller of every audit record it builds.

@@ -51,7 +51,11 @@ impl FileSystemAgentSurfaceStore {
     }
 
     /// The stored surface a management request is about to change, so its
-    /// policy attachments can be compared after the write. Not read outside one.
+    /// policy attachments can be compared after the write. Not read outside
+    /// one, or inside one under `without_actor` (a config reload), so `None`
+    /// means either a new surface or a write that records nothing;
+    /// `surface_written` checks the actor again and records nothing for the
+    /// second.
     async fn before_change(
         &self,
         surface_id: &str,
@@ -195,6 +199,27 @@ mod tests {
         .await;
 
         assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_gateways_own_writes_inside_a_management_request_record_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let ((), records) = capture(in_management_request(
+            Actor::user("u-1"),
+            crate::audit::context::without_actor(async {
+                store
+                    .save(&surface("a"))
+                    .await
+                    .unwrap();
+            }),
+        ))
+        .await;
+
+        assert!(records.is_empty(), "a config reload's writes are not user changes: {records:?}");
     }
 
     #[tokio::test]

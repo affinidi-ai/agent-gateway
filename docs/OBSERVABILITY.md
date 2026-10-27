@@ -232,7 +232,8 @@ reassigned) or `definition_deleted` (deleting a definition pruned its appliance-
 assignments). Policy ids, versions and content hashes are those `policy_decision` records carry,
 so a change joins to the decisions it causes. No record carries the Rego text, the sample input
 or a request body. Writes made outside a management request (startup migrations, replication)
-record nothing, and a configuration reload changes no stored policy reference.
+record nothing, and neither do writes a configuration reload makes, though the reload is asked
+for through the management API: it is the gateway's own work, not the user's change.
 
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
