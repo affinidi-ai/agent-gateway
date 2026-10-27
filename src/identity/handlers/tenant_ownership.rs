@@ -996,13 +996,27 @@ async fn persist_tenant_id(
                 .map_err(internal)?;
         }
         ResourceKind::PolicyDefinitions => {
-            state
+            let store = state
                 .policy_definition_store
                 .as_ref()
-                .ok_or_else(|| unavailable(kind))?
+                .ok_or_else(|| unavailable(kind))?;
+            let before = store.get(id).await;
+            let after = store
                 .set_tenant_id(id, tenant_id)
                 .await
                 .map_err(internal)?;
+            if let Some(before) = before
+                && let Some(reassigned) = crate::audit::policy_changes::definition_updated(
+                    &before,
+                    &after,
+                    crate::audit::events::PolicyChangeSource::Ownership,
+                )
+            {
+                crate::audit::policy_changes::record(
+                    crate::audit::events::PolicyChangeAction::PolicyUpdated,
+                    reassigned,
+                );
+            }
         }
         ResourceKind::SurfaceTemplates => {
             let store = state
