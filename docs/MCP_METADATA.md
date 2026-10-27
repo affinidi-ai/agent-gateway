@@ -1425,6 +1425,16 @@ moves the protocol off MCP, drops it instead of being refused over a setting
 the dashboard cannot show. PATCH with `null` removes it. The dashboard does not
 edit the setting.
 
+The `fabric` CLI sends surface JSON to the gateway as it is, so it sets and
+removes the setting without CLI-specific flags. `--set` sends a JSON Merge
+Patch and `--unset` sends `null`; add `--dry-run` to have the gateway check the
+change without saving it:
+
+```sh
+fabric agent-gateway surfaces update <surface> --set 'access_point.caller_authentication.protected_resource={"resource":"https://gateway.example/mcp/alpha","authorization_servers":["https://idp.example/realms/agents"],"scopes":["tools"]}'
+fabric agent-gateway surfaces update <surface> --unset access_point.caller_authentication.protected_resource
+```
+
 ### Tool Parameter Headers
 
 `mcp::tool_headers::ToolHeaderBindings` compiles `x-mcp-header` annotations for
