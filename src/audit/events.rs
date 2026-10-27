@@ -1,4 +1,5 @@
-//! Detail types for the governance audit events raised on the request path.
+//! Detail types for the governance audit events raised on the request path and by
+//! management changes to policies.
 
 use serde::{Deserialize, Serialize};
 
@@ -85,4 +86,103 @@ pub enum TargetKind {
     Fabric,
     McpProxy,
     A2aProxy,
+}
+
+/// A policy change, named as its audit event. A refusal names the change that
+/// was attempted with one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyChangeAction {
+    PolicyCreated,
+    PolicyUpdated,
+    PolicyDeleted,
+    PolicyAttached,
+    PolicyDetached,
+    PolicyAttachmentChanged,
+}
+
+/// What a policy is attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyTargetKind {
+    Surface,
+    Gateway,
+    /// The appliance-wide (global) assignments.
+    Appliance,
+}
+
+/// Where on its target a policy is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySlot {
+    /// A surface's target request policy, or a gateway's policy.
+    Target,
+    /// The Access Point inbound policy.
+    Inbound,
+    /// The target response policy.
+    Response,
+    /// The policy shared by every transit point.
+    Transit,
+    /// One transit point's request or response policy.
+    TransitPoint,
+    McpTool,
+    /// An appliance-wide plane.
+    Plane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    Enforced,
+    MonitorOnly,
+}
+
+/// A part of a policy definition a change touched. The record names the part,
+/// never its contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyField {
+    Rego,
+    Name,
+    Description,
+    Enabled,
+    SampleInput,
+    Owner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    User,
+    Pat,
+    /// The gateway itself, e.g. pruning a deleted definition's assignments.
+    System,
+}
+
+/// Who made a management change: an id only, never a name or credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Actor {
+    pub kind: ActorKind,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyChangeSource {
+    Api,
+    TemplateImport,
+    Onboarding,
+    Ownership,
+    DefinitionDeleted,
+}
+
+/// Why a policy change was refused, by the class of status it got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    Forbidden,
+    NotFound,
+    Invalid,
+    Conflict,
+    Limit,
 }

@@ -8,8 +8,9 @@
 //! `_storage/audit/delegation-audit.jsonl` if no log directory is configured.
 
 use crate::audit::events::{
-    AuthScheme, DelegationFailureReason, IdentityBindingFailure, RateLimitScope, RejectionReason, RejectionStage,
-    RequestFailureOutcome, TargetKind,
+    Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction, PolicyChangeSource,
+    PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason, RejectionReason,
+    RejectionStage, RequestFailureOutcome, TargetKind,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -249,6 +250,111 @@ pub struct PaymentEventDetails {
     pub remote_status: Option<u16>,
 }
 
+/// The surface, gateway or appliance-wide set a policy is attached to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct PolicyTarget {
+    pub kind: PolicyTargetKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// One management change to a policy definition or to where a policy applies,
+/// shared by every policy change event. The policy fields carry the names and
+/// formats of [`DelegationAuditAction::PolicyDecision`], so a change joins to the
+/// decisions it causes. Never carries the Rego text, the sample input or a
+/// request body.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PolicyChangeDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_definition_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_name: Option<String>,
+    /// `gateway` or `agent_surface`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_policy_content_hash: Option<String>,
+    /// The parts of the definition an update changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<PolicyField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PolicyTarget>,
+    /// The decision scope the slot produces (`PolicyScope::as_str`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<PolicySlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PolicyMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_mode: Option<PolicyMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_enabled: Option<bool>,
+    pub actor: Actor,
+    pub source: PolicyChangeSource,
+    /// On a refusal: the change that was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<PolicyChangeAction>,
+    /// On a refusal: the HTTP status the caller received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RefusalReason>,
+}
+
+impl PolicyChangeDetails {
+    /// A change by `actor` through `source` with every other field unset.
+    pub fn new(
+        actor: Actor,
+        source: PolicyChangeSource,
+    ) -> Self {
+        Self {
+            policy_definition_id: None,
+            policy_name: None,
+            policy_type: None,
+            policy_version: None,
+            policy_content_hash: None,
+            previous_policy_version: None,
+            previous_policy_content_hash: None,
+            changed: Vec::new(),
+            target: None,
+            scope: None,
+            slot: None,
+            variant: None,
+            transit_point: None,
+            mcp_tool_name: None,
+            plane: None,
+            mode: None,
+            previous_mode: None,
+            enabled: None,
+            previous_enabled: None,
+            actor,
+            source,
+            action: None,
+            status: None,
+            reason: None,
+        }
+    }
+}
+
 /// The type of delegation audit action
 // Records are built only for wanted events and serialized straight away, so
 // the size of the `PolicyDecision` variant costs nothing worth boxing for.
@@ -414,6 +520,20 @@ pub enum DelegationAuditAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         variant_alias: Option<String>,
     },
+    /// A policy definition was created.
+    PolicyCreated(Box<PolicyChangeDetails>),
+    /// A policy definition was changed (a new version).
+    PolicyUpdated(Box<PolicyChangeDetails>),
+    /// A policy definition was deleted.
+    PolicyDeleted(Box<PolicyChangeDetails>),
+    /// A policy now applies at a slot of a surface, gateway or global plane.
+    PolicyAttached(Box<PolicyChangeDetails>),
+    /// A policy no longer applies at a slot.
+    PolicyDetached(Box<PolicyChangeDetails>),
+    /// An existing attachment's mode or enabled state changed.
+    PolicyAttachmentChanged(Box<PolicyChangeDetails>),
+    /// A policy change was refused; `action` names the change attempted.
+    PolicyChangeRefused(Box<PolicyChangeDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,6 +580,13 @@ impl DelegationAuditAction {
                 | Self::IdentityBindingVerified { .. }
                 | Self::RequestFailed { .. }
                 | Self::RequestCompleted { .. }
+                | Self::PolicyCreated(_)
+                | Self::PolicyUpdated(_)
+                | Self::PolicyDeleted(_)
+                | Self::PolicyAttached(_)
+                | Self::PolicyDetached(_)
+                | Self::PolicyAttachmentChanged(_)
+                | Self::PolicyChangeRefused(_)
         )
     }
 }
@@ -1177,6 +1304,13 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::DelegationFailed { .. } => "delegation_failed",
         DelegationAuditAction::RequestFailed { .. } => "request_failed",
         DelegationAuditAction::RequestCompleted { .. } => "request_completed",
+        DelegationAuditAction::PolicyCreated(_) => "policy_created",
+        DelegationAuditAction::PolicyUpdated(_) => "policy_updated",
+        DelegationAuditAction::PolicyDeleted(_) => "policy_deleted",
+        DelegationAuditAction::PolicyAttached(_) => "policy_attached",
+        DelegationAuditAction::PolicyDetached(_) => "policy_detached",
+        DelegationAuditAction::PolicyAttachmentChanged(_) => "policy_attachment_changed",
+        DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
     }
 }
 
@@ -1584,6 +1718,70 @@ mod tests {
         assert!(!json.contains("token_id"), "None token_id should be skipped");
         assert!(!json.contains("detail"), "None detail should be skipped");
         assert!(json.contains("\"event\":\"token_revoked\""));
+    }
+
+    #[test]
+    fn a_policy_change_is_the_body_of_its_event_and_names_only_its_actor_id() {
+        let mut change = PolicyChangeDetails::new(
+            Actor {
+                kind: crate::audit::events::ActorKind::User,
+                id: "u-123".to_string(),
+            },
+            PolicyChangeSource::Api,
+        );
+        change.policy_definition_id = Some("deny-pii".to_string());
+        change.policy_version = Some(3);
+        change.target = Some(PolicyTarget {
+            kind: PolicyTargetKind::Surface,
+            id: Some("s-1".to_string()),
+            name: Some("Orders".to_string()),
+        });
+        change.slot = Some(PolicySlot::Inbound);
+        change.mode = Some(PolicyMode::Enforced);
+        let event = audit_event(DelegationAuditAction::PolicyAttached(Box::new(change)), None, None, None, Some("s-1"));
+
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(
+            json["event"],
+            serde_json::json!({"policy_attached": {
+                "policy_definition_id": "deny-pii",
+                "policy_version": 3,
+                "target": {"kind": "surface", "id": "s-1", "name": "Orders"},
+                "slot": "inbound",
+                "mode": "enforced",
+                "actor": {"kind": "user", "id": "u-123"},
+                "source": "api",
+            }})
+        );
+        assert!(json.get("detail").is_none());
+    }
+
+    #[test]
+    fn a_policy_change_event_is_categorised_by_its_name_and_kept_in_the_vp_audit_log() {
+        let change = || {
+            Box::new(PolicyChangeDetails::new(
+                Actor {
+                    kind: crate::audit::events::ActorKind::System,
+                    id: "gateway".to_string(),
+                },
+                PolicyChangeSource::DefinitionDeleted,
+            ))
+        };
+        let actions = [
+            (DelegationAuditAction::PolicyCreated(change()), "policy_created"),
+            (DelegationAuditAction::PolicyUpdated(change()), "policy_updated"),
+            (DelegationAuditAction::PolicyDeleted(change()), "policy_deleted"),
+            (DelegationAuditAction::PolicyAttached(change()), "policy_attached"),
+            (DelegationAuditAction::PolicyDetached(change()), "policy_detached"),
+            (DelegationAuditAction::PolicyAttachmentChanged(change()), "policy_attachment_changed"),
+            (DelegationAuditAction::PolicyChangeRefused(change()), "policy_change_refused"),
+        ];
+        for (action, category) in actions {
+            assert_eq!(action_category(&action), category);
+            assert!(action.is_vp_audit(), "{category}");
+            assert_eq!(serde_json::to_value(&action).unwrap()[category]["source"], "definition_deleted");
+        }
     }
 
     #[test]
