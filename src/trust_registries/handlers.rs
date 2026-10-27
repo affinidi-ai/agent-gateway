@@ -115,6 +115,37 @@ pub async fn get_trust_registry<S: TrustRegistryStore>(
     Ok(Json(trust_registry))
 }
 
+/// Saves `trust_registry` on its own task, so a cancelled request cannot report the DID
+/// it announced as failed while the record is written, and reports it `created` once the
+/// record, which now names that DID, is stored. A DID it replaces is retired after that,
+/// on the same task.
+async fn save_announced<S: TrustRegistryStore + 'static>(
+    store: &Arc<S>,
+    trust_registry: &TrustRegistry,
+    announcement: crate::event_hook::CreationGuard,
+    replaced: Option<(Arc<TrustRegistryListenerManager>, TrustRegistry)>,
+) -> Result<(), anyhow::Error> {
+    let (Some(our_did), Some(mediator_did)) = (&trust_registry.our_did, &trust_registry.mediator_did) else {
+        return store
+            .update(trust_registry)
+            .await;
+    };
+    let saved = super::communication::trust_registry_payload(&trust_registry.id, mediator_did, our_did);
+    let record = trust_registry.clone();
+    let store = store.clone();
+    tokio::spawn(async move {
+        announcement
+            .complete(async move { store.update(&record).await }, saved)
+            .await?;
+        if let Some((manager, previous)) = replaced {
+            manager.announce_deleted(&previous);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("the save task failed: {e}"))?
+}
+
 /// Create a new trust registry
 pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
     Extension(store): Extension<std::sync::Arc<S>>,
@@ -152,10 +183,11 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
     // Attempt OOB connection if listener_manager is available
     if let Some(Extension(listener_mgr)) = listener_manager {
         match listener_mgr
-            .accept_oob_and_connect(&trust_registry.id, &trust_registry.oob_url, &trust_registry.did_method)
+            .accept_oob_and_connect(&trust_registry.id, &trust_registry.oob_url, &trust_registry.did_method, None)
             .await
         {
             Ok(connection_info) => {
+                let announcement = connection_info.announcement;
                 trust_registry.our_did = Some(connection_info.our_did);
                 trust_registry.registry_did = Some(
                     connection_info
@@ -170,12 +202,12 @@ pub async fn create_trust_registry<S: TrustRegistryStore + 'static>(
                 trust_registry.updated_at = chrono::Utc::now();
 
                 // Update store with connection info
-                store
-                    .update(&trust_registry)
-                    .await
-                    .map_err(|e| {
-                        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e))
-                    })?;
+                if let Err(e) = save_announced(&store, &trust_registry, announcement, None).await {
+                    listener_mgr
+                        .remove_connection(&trust_registry.id)
+                        .await;
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)));
+                }
 
                 // Start background listener for connection protocol messages
                 if let (Some(Extension(w)), Some(ws)) = (&worker, &ws_state) {
@@ -306,7 +338,7 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
     }
 
     // Stop connection and clean up listener
-    if let Some(Extension(listener_mgr)) = listener_manager {
+    if let Some(Extension(listener_mgr)) = &listener_manager {
         listener_mgr
             .remove_connection(&id)
             .await;
@@ -329,6 +361,10 @@ pub async fn delete_trust_registry<S: TrustRegistryStore>(
         .delete(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete trust registry: {}", e)))?;
+
+    if let Some(Extension(listener_mgr)) = &listener_manager {
+        listener_mgr.announce_deleted(&trust_registry);
+    }
 
     // Trigger integration event
     let trigger_registry = build_trigger_registry(&trust_registry);
@@ -583,11 +619,13 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
     }
 
     // Fall back to full OOB re-connection
+    let previous = tr.clone();
     match listener_mgr
-        .accept_oob_and_connect(&id, &tr.oob_url, &tr.did_method)
+        .accept_oob_and_connect(&id, &tr.oob_url, &tr.did_method, tr.our_did.as_deref())
         .await
     {
         Ok(connection_info) => {
+            let announcement = connection_info.announcement;
             tr.our_did = Some(connection_info.our_did);
             tr.registry_did = Some(
                 connection_info
@@ -599,6 +637,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
             tr.mediator_url = Some(connection_info.mediator_url);
             tr.mediator_did = Some(connection_info.mediator_did);
             tr.updated_at = chrono::Utc::now();
+            let retire = (previous.our_did != tr.our_did).then(|| (listener_mgr.clone(), previous));
 
             // Wait for WS readiness; fail rather than persisting a terminal Connecting state
             // that the reader will never promote (already-approved TR won't re-send setup/approved).
@@ -618,7 +657,7 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
             if !conn_ready {
                 tracing::error!("OOB reconnection transport not ready for '{}'; failing reconnect", id);
                 tr.connection_status = TrustRegistryConnectionStatus::Failed;
-                let _ = store.update(&tr).await;
+                let _ = save_announced(&store, &tr, announcement, retire).await;
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     "Reconnection failed: WebSocket not ready after retries".to_string(),
@@ -627,10 +666,12 @@ pub async fn reconnect_trust_registry<S: TrustRegistryStore + 'static>(
 
             tr.connection_status = TrustRegistryConnectionStatus::Connected;
 
-            store
-                .update(&tr)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)))?;
+            if let Err(e) = save_announced(&store, &tr, announcement, retire).await {
+                listener_mgr
+                    .remove_connection(&id)
+                    .await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update trust registry: {}", e)));
+            }
 
             if let (Some(Extension(w)), Some(ws)) = (&worker, &ws_state) {
                 w.start_listener(&tr, store.clone(), (**ws).clone())
@@ -779,6 +820,99 @@ mod tests {
             .await
             .unwrap();
         (store, registry, dir)
+    }
+
+    async fn events_of_a_save(replaced_did: Option<&str>) -> Vec<(String, String)> {
+        let (store, mut registry, dir) = stored_registry(None).await;
+        let mut previous = registry.clone();
+        previous.our_did = Some("did:peer:2.old".into());
+        previous.mediator_did = Some("did:web:mediator.example".into());
+        registry.our_did = Some("did:peer:2.new".into());
+        registry.mediator_did = Some("did:web:mediator.example".into());
+
+        let (url, captured) = crate::event_hook::tests_support::serve(204, "").await;
+        let hook = crate::event_hook::EventHook::new(crate::event_hook::EventHookSettings {
+            hook_url: Some(url),
+            ..crate::event_hook::EventHookSettings::default()
+        })
+        .unwrap();
+        let manager = Arc::new(TrustRegistryListenerManager::new("example.com".into(), dir.path().to_path_buf(), None));
+        manager.set_event_hook(Some(hook.clone()), None);
+        let announcement = crate::event_hook::CreationGuard::start(
+            Some(hook),
+            super::super::communication::trust_registry_payload(
+                &registry.id,
+                "did:web:mediator.example",
+                "did:peer:2.new",
+            ),
+        );
+        let replaced = replaced_did.map(|_| (manager, previous));
+
+        save_announced(&store, &registry, announcement, replaced)
+            .await
+            .unwrap();
+
+        let expected = if replaced_did.is_some() {
+            3
+        } else {
+            2
+        };
+        for _ in 0..100 {
+            if captured.lock().unwrap().len() >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut events: Vec<(u64, String, String)> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| {
+                let body: serde_json::Value = serde_json::from_str(&call.body).unwrap();
+                (
+                    body["sequence"]
+                        .as_u64()
+                        .unwrap(),
+                    body["event"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    body["connection_point"]["did"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+        events.sort();
+        events
+            .into_iter()
+            .map(|(_, event, did)| (event, did))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_replaced_did_is_reported_created_before_the_old_one_is_retired() {
+        assert_eq!(
+            events_of_a_save(Some("did:peer:2.old")).await,
+            vec![
+                ("connection_point.creation_started".to_string(), "did:peer:2.new".to_string()),
+                ("connection_point.created".to_string(), "did:peer:2.new".to_string()),
+                ("connection_point.deleted".to_string(), "did:peer:2.old".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_did_retires_nothing() {
+        assert_eq!(
+            events_of_a_save(None).await,
+            vec![
+                ("connection_point.creation_started".to_string(), "did:peer:2.new".to_string()),
+                ("connection_point.created".to_string(), "did:peer:2.new".to_string()),
+            ]
+        );
     }
 
     fn tenant_a() -> Option<Extension<PatTenantContext>> {

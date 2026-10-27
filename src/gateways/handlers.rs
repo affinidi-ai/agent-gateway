@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::mediators::handlers::mediator_allowed;
 use crate::mediators::utils::fetch_mediator_did_from_url;
-use crate::mediators::utils::set_acl_to_allow_everything_and_more;
+use crate::mediators::utils::{set_acl_to_allow_everything_and_more, set_acl_to_allow_everything_and_more_retrying};
 use crate::messages::MessageType;
 
 use super::GatewayStore;
@@ -647,6 +647,7 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
     Extension(connection_point_store): Extension<std::sync::Arc<P>>,
     Extension(listener_manager): Extension<std::sync::Arc<ConnectionPointListenerManager>>,
+    Extension(pending_store): Extension<Arc<crate::gateways::PendingConnectionStore>>,
     Extension(caller_user_id): Extension<String>,
     Extension(user_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
@@ -679,12 +680,14 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
 
     // Stop all WebSocket listeners for connection points associated with this gateway
     // and delete system-created connection points (user-created ones are kept)
+    let mut connection_point_ids = Vec::new();
     match connection_point_store
         .list_by_gateway(&id)
         .await
     {
         Ok(connection_points) => {
             for cp in connection_points {
+                connection_point_ids.push(cp.id.clone());
                 // Stop the listener
                 if let Err(e) = listener_manager
                     .stop_listener(&cp.id)
@@ -718,6 +721,9 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
         .delete(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete gateway: {}", e)))?;
+    pending_store
+        .remove_for_connection_points(&connection_point_ids)
+        .await;
 
     info!("Deleted gateway {} and stopped all associated listeners", id);
 
@@ -1347,6 +1353,386 @@ mod tests {
         mediator
     }
 
+    struct UnfinishedAcceptance {
+        _dir: tempfile::TempDir,
+        pairings: Arc<crate::gateways::PendingConnectionStore>,
+        points: Arc<crate::gateways::FileSystemConnectionPointStore>,
+        gateways: Arc<crate::gateways::FileSystemGatewayStore>,
+        keys: std::path::PathBuf,
+        cleanup:
+            AcceptanceCleanup<crate::gateways::FileSystemGatewayStore, crate::gateways::FileSystemConnectionPointStore>,
+    }
+
+    impl UnfinishedAcceptance {
+        async fn start() -> Self {
+            use crate::gateways::connection_points::ConnectionPointStore;
+            let dir = tempfile::tempdir().unwrap();
+            let pairings = Arc::new(
+                crate::gateways::PendingConnectionStore::new(dir.path().join("pairings"))
+                    .await
+                    .unwrap(),
+            );
+            let points = Arc::new(
+                crate::gateways::FileSystemConnectionPointStore::new(dir.path().join("points"))
+                    .await
+                    .unwrap(),
+            );
+            let gateways = Arc::new(
+                crate::gateways::FileSystemGatewayStore::new(dir.path().join("gateways"), None)
+                    .await
+                    .unwrap(),
+            );
+            let temp_cp_uuid = uuid::Uuid::new_v4();
+            let secure_cp_uuid = uuid::Uuid::new_v4();
+            let temp_cp_id = temp_cp_uuid.to_string();
+            let keys = dir.path().join("keys");
+            for id in [temp_cp_uuid, secure_cp_uuid] {
+                tokio::fs::create_dir_all(keys.join(id.to_string()))
+                    .await
+                    .unwrap();
+            }
+
+            let pairing: crate::gateways::PendingOOBConnection = serde_json::from_value(serde_json::json!({
+                "id": temp_cp_id,
+                "our_temporary_did": "did:web:us.example:tmp",
+                "our_secure_did": "did:web:us.example:secure",
+                "their_temporary_did": "did:web:them.example:tmp",
+                "their_secure_did": null,
+                "mediator_did": "did:web:mediator.example",
+                "connection_point_id": "",
+                "invitation_id": "inv-1",
+                "role": "Acceptor",
+                "state": "WaitingForResponse",
+                "created_at": "2026-01-01T00:00:00Z",
+                "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                "temporary_cp_id": temp_cp_id,
+            }))
+            .unwrap();
+            pairings.store(pairing).await;
+
+            let mut gateway =
+                Gateway::new("peer".into(), String::new(), "did:web:them.example:tmp".into(), GatewayType::Remote);
+            gateway.status = GatewayStatus::Pending;
+            gateways
+                .create(&gateway)
+                .await
+                .unwrap();
+
+            let mut temporary = crate::gateways::connection_points::types::GatewayConnectionPoint::new(
+                gateway.id.clone(),
+                "did:web:mediator.example".into(),
+                "did:web:us.example:tmp".into(),
+                "temporary".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                serde_json::json!({}),
+                None,
+                crate::gateways::connection_points::types::ConnectionPointType::System,
+                String::new(),
+            );
+            temporary.id = temp_cp_id.clone();
+            points
+                .create(&temporary)
+                .await
+                .unwrap();
+
+            let client =
+                crate::comm::didcomm::client::DIDCommClient::new("did:example:acceptor".into(), Vec::new(), None, None)
+                    .await
+                    .unwrap();
+            let cleanup = AcceptanceCleanup {
+                pending_store: pairings.clone(),
+                cp_store: points.clone(),
+                store: gateways.clone(),
+                atm: client.atm().clone(),
+                keys_root: keys
+                    .to_string_lossy()
+                    .into_owned(),
+                key_ids: [temp_cp_uuid, secure_cp_uuid],
+                pending_id: temp_cp_id.clone(),
+                temp_cp_id,
+                pending_gateway_id: gateway.id.clone(),
+            };
+            Self {
+                _dir: dir,
+                pairings,
+                points,
+                gateways,
+                keys,
+                cleanup,
+            }
+        }
+
+        fn cleanup_clone(
+            &self
+        ) -> AcceptanceCleanup<crate::gateways::FileSystemGatewayStore, crate::gateways::FileSystemConnectionPointStore>
+        {
+            let cleanup = &self.cleanup;
+            AcceptanceCleanup {
+                pending_store: cleanup.pending_store.clone(),
+                cp_store: cleanup.cp_store.clone(),
+                store: cleanup.store.clone(),
+                atm: cleanup.atm.clone(),
+                keys_root: cleanup.keys_root.clone(),
+                key_ids: cleanup.key_ids,
+                pending_id: cleanup.pending_id.clone(),
+                temp_cp_id: cleanup.temp_cp_id.clone(),
+                pending_gateway_id: cleanup
+                    .pending_gateway_id
+                    .clone(),
+            }
+        }
+
+        async fn leftovers(&self) -> (bool, bool, bool, usize) {
+            use crate::gateways::connection_points::ConnectionPointStore;
+            let cleanup = &self.cleanup;
+            let pairing = self
+                .pairings
+                .get_by_temporary_cp_id(&cleanup.temp_cp_id)
+                .await
+                .is_some();
+            let point = self
+                .points
+                .get(&cleanup.temp_cp_id)
+                .await
+                .unwrap()
+                .is_some();
+            let gateway = self
+                .gateways
+                .get(&cleanup.pending_gateway_id)
+                .await
+                .unwrap()
+                .is_some();
+            let mut key_dirs = 0;
+            let mut entries = tokio::fs::read_dir(&self.keys)
+                .await
+                .unwrap();
+            while entries
+                .next_entry()
+                .await
+                .unwrap()
+                .is_some()
+            {
+                key_dirs += 1;
+            }
+            (pairing, point, gateway, key_dirs)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_acceptance_removes_what_it_left_behind_on_its_own_task() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        assert_eq!(acceptance.leftovers().await, (true, true, true, 2));
+
+        let cancelled = tokio::spawn({
+            let guard = AcceptanceGuard(Some(acceptance.cleanup_clone()));
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancelled.abort();
+        for _ in 0..100 {
+            if acceptance.leftovers().await == (false, false, false, 0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(acceptance.leftovers().await, (false, false, false, 0));
+    }
+
+    #[tokio::test]
+    async fn a_finished_acceptance_keeps_its_state() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        AcceptanceGuard(Some(acceptance.cleanup_clone())).finished();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(acceptance.leftovers().await, (true, true, true, 2));
+    }
+
+    #[tokio::test]
+    async fn a_rollback_finishes_when_the_request_running_it_is_cancelled() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        let rolling_back = tokio::spawn({
+            let guard = AcceptanceGuard(Some(acceptance.cleanup_clone()));
+            async move { guard.undo().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        rolling_back.abort();
+        for _ in 0..100 {
+            if acceptance.leftovers().await == (false, false, false, 0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(acceptance.leftovers().await, (false, false, false, 0));
+    }
+
+    #[tokio::test]
+    async fn an_undone_acceptance_is_removed_before_undo_returns() {
+        let acceptance = UnfinishedAcceptance::start().await;
+        AcceptanceGuard(Some(acceptance.cleanup_clone()))
+            .undo()
+            .await;
+        assert_eq!(acceptance.leftovers().await, (false, false, false, 0));
+    }
+
+    #[tokio::test]
+    async fn a_delete_that_starts_after_the_acceptor_check_waits_for_the_pairing_and_then_finds_it() {
+        use crate::mediators::MediatorStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mediators = crate::mediators::FileSystemMediatorStore::new(dir.path().join("mediators"))
+            .await
+            .unwrap();
+        let points = Arc::new(
+            crate::gateways::FileSystemConnectionPointStore::new(dir.path().join("points"))
+                .await
+                .unwrap(),
+        );
+        let pairings = Arc::new(
+            crate::gateways::PendingConnectionStore::new(dir.path().join("pairings"))
+                .await
+                .unwrap(),
+        );
+        let mut provided = acceptor_mediator("unused");
+        provided.tenant_id = None;
+        provided.provided = true;
+        provided.did = "did:web:provided-acceptor.example".into();
+        mediators
+            .create(&provided)
+            .await
+            .unwrap();
+
+        let guard = lock_provided_acceptor_mediator(&mediators, &provided.id, None, &None, &None)
+            .await
+            .unwrap()
+            .expect("a provided acceptor mediator is locked");
+        let deleting = {
+            let (provided, points, pairings) = (provided.clone(), points.clone(), pairings.clone());
+            tokio::spawn(async move {
+                let _guard = crate::mediators::handlers::lock_did(&provided.did).await;
+                crate::mediators::handlers::reject_provided_delete(
+                    &provided,
+                    None,
+                    Some(points.as_ref()),
+                    Some(pairings.as_ref()),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!deleting.is_finished(), "the delete waits while the pairing is being persisted");
+
+        let pairing: crate::gateways::PendingOOBConnection = serde_json::from_value(serde_json::json!({
+            "id": "inv-1",
+            "our_temporary_did": "did:web:us.example:tmp",
+            "our_secure_did": "did:web:us.example:secure",
+            "their_temporary_did": "did:web:them.example:tmp",
+            "their_secure_did": null,
+            "mediator_did": provided.did,
+            "connection_point_id": "",
+            "invitation_id": "inv-1",
+            "role": "Acceptor",
+            "state": "WaitingForResponse",
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+            "mediator_record_id": provided.id,
+        }))
+        .unwrap();
+        pairings.store(pairing).await;
+        drop(guard);
+        let refused = deleting
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(
+            refused
+                .1
+                .contains("pending pairing"),
+            "{}",
+            refused.1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keys_of_a_refused_pairing_request_are_removed_and_other_keys_stay() {
+        let root = tempfile::tempdir().unwrap();
+        let (temporary, secure, never_created) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        for id in [temporary.to_string(), secure.to_string(), "someone-elses".to_string()] {
+            let directory = root.path().join(id);
+            tokio::fs::create_dir_all(&directory)
+                .await
+                .unwrap();
+            tokio::fs::write(directory.join("keys.json"), b"[]")
+                .await
+                .unwrap();
+        }
+        remove_generated_identities(root.path().to_str().unwrap(), &[temporary, secure, never_created]).await;
+        assert!(
+            !root
+                .path()
+                .join(temporary.to_string())
+                .exists()
+        );
+        assert!(
+            !root
+                .path()
+                .join(secure.to_string())
+                .exists()
+        );
+        assert!(
+            root.path()
+                .join("someone-elses")
+                .join("keys.json")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_provided_acceptor_mediator_is_locked_and_a_vanished_one_is_refused() {
+        use crate::mediators::MediatorStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mediators = crate::mediators::FileSystemMediatorStore::new(dir.path().join("mediators"))
+            .await
+            .unwrap();
+        let mut operator = acceptor_mediator("unused");
+        operator.tenant_id = None;
+        mediators
+            .create(&operator)
+            .await
+            .unwrap();
+        assert!(
+            lock_provided_acceptor_mediator(&mediators, &operator.id, None, &None, &None)
+                .await
+                .unwrap()
+                .is_none(),
+            "an operator-added mediator needs no lock"
+        );
+        let missing = lock_provided_acceptor_mediator(&mediators, "gone", None, &None, &None)
+            .await
+            .err()
+            .expect("a mediator that no longer exists is refused");
+        assert_eq!(missing.0, StatusCode::BAD_REQUEST);
+        assert_eq!(missing.1, "Mediator not found: gone");
+
+        let mut stale = acceptor_mediator("unused");
+        stale.id = "stale".into();
+        stale.tenant_id = None;
+        stale.provided = true;
+        stale.status = crate::mediators::types::MediatorStatus::Disabled;
+        mediators
+            .create(&stale)
+            .await
+            .unwrap();
+        let refused = lock_provided_acceptor_mediator(&mediators, "stale", None, &None, &None)
+            .await
+            .err()
+            .expect("a provided record that is no longer usable is refused under the lock");
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+    }
+
     fn tenant_a_caller() -> (Option<Extension<PatTenantContext>>, Option<Extension<PatResourceScope>>) {
         let context = PatTenantContext {
             token_id: "token-a".into(),
@@ -1569,6 +1955,132 @@ fn check_acceptor_mediator(
     Ok(mediator)
 }
 
+/// For a provided acceptor mediator (one the directory created), takes the DID's
+/// lock, the one deleting and creating on that record use, and checks under it
+/// that the record still exists and is usable. The caller holds the guard until
+/// the pairing that names the record is persisted, so a delete cannot slip in
+/// between the first check and that write. Any other mediator needs no lock.
+async fn lock_provided_acceptor_mediator<M: crate::mediators::MediatorStore>(
+    mediator_store: &M,
+    mediator_id: &str,
+    gateway_tenant_id: Option<&str>,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<Option<crate::mediators::handlers::DidGuard>, (StatusCode, String)> {
+    let lookup_failed = |e: anyhow::Error| {
+        error!(mediator_id, error = %e, "Failed to look up acceptor mediator");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to look up mediator".to_string())
+    };
+    let selected = mediator_store
+        .get(mediator_id)
+        .await
+        .map_err(lookup_failed)?
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Mediator not found: {}", mediator_id)))?;
+    if !selected.provided {
+        return Ok(None);
+    }
+    let provided = selected;
+    let guard = crate::mediators::handlers::lock_did(&provided.did).await;
+    let current = mediator_store
+        .get(mediator_id)
+        .await
+        .map_err(lookup_failed)?;
+    check_acceptor_mediator(mediator_id, current, gateway_tenant_id, context, scope)?;
+    Ok(Some(guard))
+}
+
+/// Removes the key directories this request generated for its identities. For
+/// did:webvh the DID log and the identity record stay behind, as they do when a
+/// connection point is deleted.
+async fn remove_generated_identities(
+    keys_root: &str,
+    identity_ids: &[uuid::Uuid],
+) {
+    for id in identity_ids {
+        let directory = std::path::Path::new(keys_root).join(id.to_string());
+        if let Err(e) = tokio::fs::remove_dir_all(&directory).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!("Could not remove the identity keys of a refused request: {e}");
+        }
+    }
+}
+
+/// What an acceptance that does not finish leaves behind, and how it is removed: the
+/// pairing, the temporary connection point, the pending gateway, the DIDComm client and
+/// the generated keys.
+struct AcceptanceCleanup<S, P> {
+    pending_store: Arc<crate::gateways::PendingConnectionStore>,
+    cp_store: Arc<P>,
+    store: Arc<S>,
+    atm: Arc<affinidi_messaging_sdk::ATM>,
+    keys_root: String,
+    key_ids: [uuid::Uuid; 2],
+    pending_id: String,
+    temp_cp_id: String,
+    pending_gateway_id: String,
+}
+
+impl<S: GatewayStore, P: ConnectionPointStore> AcceptanceCleanup<S, P> {
+    async fn run(self) {
+        self.pending_store
+            .remove(&self.pending_id)
+            .await;
+        if let Err(e) = self
+            .cp_store
+            .delete(&self.temp_cp_id)
+            .await
+        {
+            warn!("Could not remove the temporary connection point of a failed attempt: {e}");
+        }
+        if let Ok(Some(orphan)) = self
+            .store
+            .get(&self.pending_gateway_id)
+            .await
+            && orphan.status == GatewayStatus::Pending
+            && let Err(e) = self
+                .store
+                .delete(&orphan.id)
+                .await
+        {
+            warn!("Could not remove the pending gateway of a failed attempt: {e}");
+        }
+        self.atm
+            .graceful_shutdown()
+            .await;
+        remove_generated_identities(&self.keys_root, &self.key_ids).await;
+    }
+}
+
+/// Runs the cleanup unless the acceptance finished. A request that is cancelled drops the
+/// guard, which then runs the cleanup on its own task, so nothing depends on the client
+/// staying connected.
+struct AcceptanceGuard<S: GatewayStore + 'static, P: ConnectionPointStore + 'static>(Option<AcceptanceCleanup<S, P>>);
+
+impl<S: GatewayStore + 'static, P: ConnectionPointStore + 'static> AcceptanceGuard<S, P> {
+    async fn undo(mut self) {
+        if let Some(cleanup) = self.0.take()
+            && let Err(e) = tokio::spawn(cleanup.run()).await
+        {
+            warn!("Could not finish the cleanup of a failed attempt: {e}");
+        }
+    }
+
+    fn finished(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<S: GatewayStore + 'static, P: ConnectionPointStore + 'static> Drop for AcceptanceGuard<S, P> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(cleanup.run());
+        }
+    }
+}
+
 /// Response for connecting to a gateway via OOB
 #[derive(Debug, Serialize)]
 pub struct ConnectViaOOBResponse {
@@ -1589,6 +2101,7 @@ pub async fn connect_via_oob<
     Extension(network_config): Extension<Arc<crate::config::NetworkConfig>>,
     Extension(pending_store): Extension<Arc<crate::gateways::PendingConnectionStore>>,
     Extension(listener_manager): Extension<Option<Arc<ConnectionPointListenerManager>>>,
+    Extension(mediator_directory): Extension<Option<Arc<crate::event_hook::MediatorDirectory>>>,
     #[cfg(feature = "didwebvh")] Extension(log_storage): Extension<
         Option<std::sync::Arc<dyn crate::storage::DidLogStorage>>,
     >,
@@ -1774,7 +2287,8 @@ pub async fn connect_via_oob<
     info!("🔑 Step 5: Creating temporary DID for handshake...");
     info!("  DID #1: Temporary (ephemeral) - used only for initial handshake");
 
-    let temp_cp_id = uuid::Uuid::new_v4().to_string();
+    let temp_cp_uuid = uuid::Uuid::new_v4();
+    let temp_cp_id = temp_cp_uuid.to_string();
     info!("  Temporary CP ID: {}", temp_cp_id);
     info!("  Generating identity...");
 
@@ -1829,7 +2343,8 @@ pub async fn connect_via_oob<
     info!("  DID #2: Secure (permanent) - used for actual connection after handshake");
     debug!("  Homed on mediator: {}", acceptor_mediator_did);
 
-    let secure_cp_id = uuid::Uuid::new_v4().to_string();
+    let secure_cp_uuid = uuid::Uuid::new_v4();
+    let secure_cp_id = secure_cp_uuid.to_string();
     info!("  Secure CP ID: {}", secure_cp_id);
     info!("  Generating identity...");
 
@@ -1863,8 +2378,10 @@ pub async fn connect_via_oob<
     // Note: mediator_did is the mediator the permanent secure DID is homed on -
     // the acceptor's own mediator when acceptor_mediator_id was set (Step 4.5),
     // otherwise the inviter's mediator (shared-mediator fallback).
+    // Keyed by this attempt's temporary connection point: acceptances of one invitation
+    // must not share, overwrite or remove each other's pairing.
     let pending_connection = crate::gateways::PendingOOBConnection {
-        id: invitation_message.id.clone(),
+        id: temp_cp_id.clone(),
         invitation_id: invitation_message.id.clone(),
         our_temporary_did: temporary_did.clone(),
         our_secure_did: secure_did.clone(),
@@ -1876,7 +2393,12 @@ pub async fn connect_via_oob<
         role: crate::gateways::ConnectionRole::Acceptor,
         state: crate::gateways::ConnectionState::WaitingForResponse,
         created_at: chrono::Utc::now(),
-        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        expires_at: chrono::Utc::now()
+            + chrono::Duration::hours(
+                bootstrap_config
+                    .oob_connection
+                    .pending_expiry_hours as i64,
+            ),
         secure_cp_id: Some(secure_cp_id.clone()),
         temporary_cp_id: Some(temp_cp_id.clone()),
         mediator_record_id: req
@@ -1893,234 +2415,344 @@ pub async fn connect_via_oob<
     info!("    Role: {:?}", pending_connection.role);
     info!("    State: {:?}", pending_connection.state);
 
-    pending_store
-        .store(pending_connection)
-        .await;
+    let cleanup = AcceptanceGuard(Some(AcceptanceCleanup {
+        pending_store: pending_store.clone(),
+        cp_store: cp_store.clone(),
+        store: store.clone(),
+        atm: didcomm_client.atm().clone(),
+        keys_root: bootstrap_config
+            .storage_paths
+            .connection_points
+            .clone(),
+        key_ids: [temp_cp_uuid, secure_cp_uuid],
+        pending_id: pending_connection.id.clone(),
+        temp_cp_id: temp_cp_id.clone(),
+        pending_gateway_id: pending_gateway_id.clone(),
+    }));
+    let acceptor_lock = match req
+        .acceptor_mediator_id
+        .as_deref()
+    {
+        Some(mediator_id) => {
+            match lock_provided_acceptor_mediator(
+                mediator_store.as_ref(),
+                mediator_id,
+                req.tenant_id.as_deref(),
+                &context,
+                &scope,
+            )
+            .await
+            {
+                Ok(lock) => lock,
+                Err(refusal) => {
+                    cleanup.undo().await;
+                    return Err(refusal);
+                }
+            }
+        }
+        None => None,
+    };
+    let stored = match acceptor_lock {
+        Some(guard) => {
+            let pending_store = pending_store.clone();
+            // Spawned so a cancelled request cannot release the lock while the write runs.
+            // If the request is cancelled after the write, the pairing is not retired by
+            // this handler; it stops holding the mediator record when it expires.
+            tokio::spawn(async move {
+                let _held_until_stored = guard;
+                pending_store
+                    .try_store(pending_connection)
+                    .await
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("the store task failed: {e}"))
+            .and_then(|stored| stored)
+        }
+        None => {
+            pending_store
+                .try_store(pending_connection)
+                .await
+        }
+    };
+    if let Err(e) = stored {
+        error!("Storing the pending connection failed: {e}");
+        cleanup.undo().await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to store the pending connection".to_string()));
+    }
     info!("✓ Pending connection state stored");
     info!("");
 
-    // Step 8: Build connection-setup message
-    info!("📝 Step 8: Building connection-setup message...");
+    // From here on a refusal or failure retires the pairing, so a setup that never
+    // got going cannot keep a provided mediator undeletable.
+    let outcome: Result<Json<ConnectViaOOBResponse>, (StatusCode, String)> = async {
+        // Step 8: Build connection-setup message
+        info!("📝 Step 8: Building connection-setup message...");
 
-    use affinidi_messaging_didcomm::Message as DIDCommMessage;
-    use serde_json::json;
+        use affinidi_messaging_didcomm::Message as DIDCommMessage;
+        use serde_json::json;
 
-    use crate::gateways::connection_points::message_processor::{channel_did_proof_challenge, sign_channel_did_proof};
+        use crate::gateways::connection_points::message_processor::{
+            channel_did_proof_challenge, sign_channel_did_proof,
+        };
 
-    // The thread id doubles as the attestation nonce so the inviter can bind
-    // the attestation to this exact message.
-    let connection_thid = uuid::Uuid::new_v4().to_string();
-    let issuer_attestation = crate::gateways::issuer_attestation::build_issuer_attestation(
-        &vc_issuer,
-        &secure_did,
-        &inviter_temporary_did,
-        &connection_thid,
-    )
-    .await
-    .map_err(|e| {
-        error!("❌ Failed to build issuer attestation: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to build issuer attestation: {}", e))
-    })?;
-
-    // Independent of the attestation above: the attestation binds this
-    // appliance's identity VC to the channel, this proves control of the
-    // key behind the channel_did the body claims.
-    let channel_did_proof = sign_channel_did_proof(
-        &secure_secrets,
-        &channel_did_proof_challenge(&temporary_did, &inviter_temporary_did, &secure_did),
-    )
-    .map_err(|e| {
-        error!("❌ Failed to sign channel_did proof: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to sign channel_did proof: {}", e))
-    })?;
-
-    let connection_message = DIDCommMessage::build(
-        uuid::Uuid::new_v4().to_string(),
-        MessageType::ConnectionSetup.to_string(),
-        json!({
-            "channel_did": secure_did.clone(),
-            "secret": req.secret.clone(),
-            "issuer_attestation": issuer_attestation,
-            "channel_did_proof": channel_did_proof,
-        }),
-    )
-    .from(temporary_did.clone())
-    .to(inviter_temporary_did.clone())
-    .thid(connection_thid)
-    .pthid(invitation_message.id.clone())
-    .finalize();
-
-    info!("✓ Connection-setup message built:");
-    info!("    Message ID: {}", connection_message.id);
-    info!("    Type: {}", connection_message.typ);
-    info!("    From: {}", temporary_did);
-    info!("    To: {}", inviter_temporary_did);
-    info!("    Body: channel_did={}", secure_did);
-    info!("    Body: secret=[REDACTED]");
-    info!("");
-
-    // Step 9: Pre-resolve and cache the inviter's DID document
-    info!("🔍 Step 9: Pre-resolving inviter's DID document for encryption...");
-    info!("  Target DID: {}", inviter_temporary_did);
-
-    let did_cache = listener_manager
-        .as_ref()
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Listener manager not available".to_string()))?
-        .get_did_cache();
-
-    match did_cache
-        .resolve_and_cache_for_atm(&inviter_temporary_did, didcomm_client.tdk_state())
-        .await
-    {
-        Ok((_, was_cached)) => {
-            if was_cached {
-                info!("✓ Using cached DID document for {}", inviter_temporary_did);
-            } else {
-                info!("✓ DID document resolved and cached for {}", inviter_temporary_did);
-            }
-        }
-        Err(e) => {
-            error!("❌ Failed to resolve inviter's DID document: {}", e);
-            return Err((StatusCode::SERVICE_UNAVAILABLE, format!("Cannot resolve inviter's DID document: {}", e)));
-        }
-    }
-    info!("");
-
-    // Step 10: Register profile and send message via DIDCommClient
-    info!("📤 Step 10: Connecting to inviter's mediator and sending message...");
-    info!("  Target mediator DID: {}", their_mediator_did);
-    info!("  Target recipient DID: {}", inviter_temporary_did);
-
-    didcomm_client
-        .register_profile()
+        // The thread id doubles as the attestation nonce so the inviter can bind
+        // the attestation to this exact message.
+        let connection_thid = uuid::Uuid::new_v4().to_string();
+        let issuer_attestation = crate::gateways::issuer_attestation::build_issuer_attestation(
+            &vc_issuer,
+            &secure_did,
+            &inviter_temporary_did,
+            &connection_thid,
+        )
         .await
         .map_err(|e| {
-            error!("❌ Failed to register profile with mediator: {}", e);
-            (StatusCode::UNAUTHORIZED, format!("Failed to register profile: {}", e))
+            error!("❌ Failed to build issuer attestation: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to build issuer attestation: {}", e))
         })?;
-    info!("  ✓ Profile registered with mediator");
 
-    // Open ACL so the inviter's connection-accepted can reach us on mediators
-    // with explicit-allow defaults (the temporary listener is System type and
-    // ws_listener skips ACL setup for that type).
-    set_acl_to_allow_everything_and_more(didcomm_client.atm(), Arc::clone(didcomm_client.profile()))
+        // Independent of the attestation above: the attestation binds this
+        // appliance's identity VC to the channel, this proves control of the
+        // key behind the channel_did the body claims.
+        let channel_did_proof = sign_channel_did_proof(
+            &secure_secrets,
+            &channel_did_proof_challenge(&temporary_did, &inviter_temporary_did, &secure_did),
+        )
+        .map_err(|e| {
+            error!("❌ Failed to sign channel_did proof: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to sign channel_did proof: {}", e))
+        })?;
+
+        let connection_message = DIDCommMessage::build(
+            uuid::Uuid::new_v4().to_string(),
+            MessageType::ConnectionSetup.to_string(),
+            json!({
+                "channel_did": secure_did.clone(),
+                "secret": req.secret.clone(),
+                "issuer_attestation": issuer_attestation,
+                "channel_did_proof": channel_did_proof,
+            }),
+        )
+        .from(temporary_did.clone())
+        .to(inviter_temporary_did.clone())
+        .thid(connection_thid)
+        .pthid(invitation_message.id.clone())
+        .finalize();
+
+        info!("✓ Connection-setup message built:");
+        info!("    Message ID: {}", connection_message.id);
+        info!("    Type: {}", connection_message.typ);
+        info!("    From: {}", temporary_did);
+        info!("    To: {}", inviter_temporary_did);
+        info!("    Body: channel_did={}", secure_did);
+        info!("    Body: secret=[REDACTED]");
+        info!("");
+
+        // Step 9: Pre-resolve and cache the inviter's DID document
+        info!("🔍 Step 9: Pre-resolving inviter's DID document for encryption...");
+        info!("  Target DID: {}", inviter_temporary_did);
+
+        let did_cache = listener_manager
+            .as_ref()
+            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Listener manager not available".to_string()))?
+            .get_did_cache();
+
+        match did_cache
+            .resolve_and_cache_for_atm(&inviter_temporary_did, didcomm_client.tdk_state())
+            .await
+        {
+            Ok((_, was_cached)) => {
+                if was_cached {
+                    info!("✓ Using cached DID document for {}", inviter_temporary_did);
+                } else {
+                    info!("✓ DID document resolved and cached for {}", inviter_temporary_did);
+                }
+            }
+            Err(e) => {
+                error!("❌ Failed to resolve inviter's DID document: {}", e);
+                return Err((StatusCode::SERVICE_UNAVAILABLE, format!("Cannot resolve inviter's DID document: {}", e)));
+            }
+        }
+        info!("");
+
+        // Step 10: Register profile and send message via DIDCommClient
+        info!("📤 Step 10: Connecting to inviter's mediator and sending message...");
+        info!("  Target mediator DID: {}", their_mediator_did);
+        info!("  Target recipient DID: {}", inviter_temporary_did);
+
+        let temp_payload = crate::event_hook::ConnectionPointPayload::minted(
+            &temp_cp_id,
+            "Temporary listener for a pending gateway",
+            "",
+            &pending_gateway_id,
+            "",
+            &their_mediator_did,
+            &temporary_did,
+        );
+        let temp_announcement = crate::event_hook::CreationGuard::start(
+            listener_manager
+                .as_ref()
+                .and_then(|manager| manager.event_hook().cloned()),
+            temp_payload.clone(),
+        );
+
+        didcomm_client
+            .register_profile()
+            .await
+            .map_err(|e| {
+                error!("❌ Failed to register profile with mediator: {}", e);
+                (StatusCode::UNAUTHORIZED, format!("Failed to register profile: {}", e))
+            })?;
+        info!("  ✓ Profile registered with mediator");
+
+        // Open ACL so the inviter's connection-accepted can reach us on mediators
+        // with explicit-allow defaults (the temporary listener is System type and
+        // ws_listener skips ACL setup for that type).
+        set_acl_to_allow_everything_and_more_retrying(
+            didcomm_client.atm(),
+            Arc::clone(didcomm_client.profile()),
+            crate::gateways::connection_points::first_call_retry::policy_for_listed(
+                mediator_directory.as_ref(),
+                &their_mediator_did,
+            )
+            .await,
+        )
         .await
         .map_err(|e| {
             info!("  ℹ️  Could not set ACL: {:?}", e);
             info!("  Continuing anyway - may work with default mediator permissions");
         })
         .ok();
-    info!("  ✓ ACL set to allow-all for temporary DID");
+        info!("  ✓ ACL set to allow-all for temporary DID");
 
-    didcomm_client
-        .pack_and_send_message(&connection_message, &inviter_temporary_did, &temporary_did)
-        .await
-        .map_err(|e| {
-            error!("❌ Failed to send connection-setup: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send connection-setup".to_string())
+        didcomm_client
+            .pack_and_send_message(&connection_message, &inviter_temporary_did, &temporary_did)
+            .await
+            .map_err(|e| {
+                error!("❌ Failed to send connection-setup: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to send connection-setup".to_string())
+            })?;
+
+        info!("✓ Connection-setup sent successfully to inviter's mediator");
+        info!("");
+        info!("⏳ Step 11: Creating pending gateway and temporary connection point listener...");
+        info!("  The inviter will receive our connection-setup message");
+        info!("  They will send connection-accepted back");
+
+        // Create and store pending gateway FIRST (so we have the ID for the listener)
+        let mut pending_gateway =
+            Gateway::new(req.name.clone(), req.description.clone(), inviter_temporary_did.clone(), GatewayType::Remote);
+
+        pending_gateway.id = pending_gateway_id.clone();
+        pending_gateway.tenant_id = req.tenant_id;
+        pending_gateway.status = GatewayStatus::Pending;
+
+        store
+            .create(&pending_gateway)
+            .await
+            .map_err(|e| {
+                error!("❌ Failed to create pending gateway: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create pending gateway: {}", e))
+            })?;
+
+        info!("  ✓ Pending gateway created with ID: {}", pending_gateway.id);
+
+        let listener_mgr = listener_manager.ok_or_else(|| {
+            error!("❌ Listener manager not available");
+            (StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available - cannot start listener".to_string())
         })?;
 
-    info!("✓ Connection-setup sent successfully to inviter's mediator");
-    info!("");
-    info!("⏳ Step 11: Creating pending gateway and temporary connection point listener...");
-    info!("  The inviter will receive our connection-setup message");
-    info!("  They will send connection-accepted back");
+        // Extract mediator URL from mediator DID
+        let mediator_url = their_mediator_endpoint.clone();
 
-    // Create and store pending gateway FIRST (so we have the ID for the listener)
-    let mut pending_gateway =
-        Gateway::new(req.name.clone(), req.description.clone(), inviter_temporary_did.clone(), GatewayType::Remote);
+        // Calculate expiry time from config
+        let expiry_hours = bootstrap_config
+            .oob_connection
+            .pending_expiry_hours;
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(expiry_hours as i64);
 
-    pending_gateway.id = pending_gateway_id;
-    pending_gateway.tenant_id = req.tenant_id;
-    pending_gateway.status = GatewayStatus::Pending;
+        info!("  Creating temporary connection point for receiving connection-accepted...");
+        info!("  Expiry: {} hours from now ({})", expiry_hours, expires_at.format("%Y-%m-%d %H:%M:%S UTC"));
 
-    store
-        .create(&pending_gateway)
-        .await
-        .map_err(|e| {
-            error!("❌ Failed to create pending gateway: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create pending gateway: {}", e))
-        })?;
+        // Create temporary connection point with expiry metadata
+        // temp_cp_id (UUID) was set in Step 5 and matches the directory where keys were saved
+        let mut temp_connection_point = super::connection_points::types::GatewayConnectionPoint::new(
+            pending_gateway.id.clone(),
+            their_mediator_did.clone(),
+            temporary_did.clone(),
+            format!("Temporary listener for pending gateway {}", &pending_gateway.id[..8]),
+            format!(
+                "Awaiting connection-accepted from {}",
+                &inviter_temporary_did[inviter_temporary_did
+                    .len()
+                    .saturating_sub(12)..]
+            ),
+            String::new(),
+            String::new(),
+            serde_json::json!({
+                "expires_at": expires_at,
+                "pending_gateway_id": pending_gateway.id,
+                "secure_cp_id": secure_cp_id,
+                "secure_did": secure_did,
+                "secure_mediator_did": acceptor_mediator_did,
+                "secure_mediator_id": req.acceptor_mediator_id,
+            }),
+            None,
+            super::connection_points::types::ConnectionPointType::System, // Temporary system CP
+            String::new(),
+        );
+        temp_connection_point.id = temp_cp_id.clone();
+        temp_connection_point.did_method = did_method.clone();
+        temp_connection_point.mediator_did = Some(their_mediator_did.clone());
 
-    info!("  ✓ Pending gateway created with ID: {}", pending_gateway.id);
+        // Store the temporary connection point
+        let record = temp_connection_point.clone();
+        let point_store = cp_store.clone();
+        temp_announcement
+            .complete(
+                async move {
+                    point_store
+                        .create(&record)
+                        .await
+                },
+                temp_payload,
+            )
+            .await
+            .map_err(|e| {
+                error!("❌ Failed to create temporary connection point: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create temporary connection point: {}", e))
+            })?;
 
-    let listener_mgr = listener_manager.ok_or_else(|| {
-        error!("❌ Listener manager not available");
-        (StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available - cannot start listener".to_string())
-    })?;
+        info!("  ✓ Temporary connection point created: {}", temp_cp_id);
 
-    // Extract mediator URL from mediator DID
-    let mediator_url = their_mediator_endpoint.clone();
+        // Start WebSocket listener for the temporary connection point
+        info!("  Starting WebSocket listener (not polling!)...");
+        listener_mgr
+            .request_start_listener(temp_connection_point, their_mediator_did.clone(), mediator_url)
+            .map_err(|e| {
+                error!("❌ Failed to start temporary listener: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start temporary listener: {}", e))
+            })?;
 
-    // Calculate expiry time from config
-    let expiry_hours = bootstrap_config
-        .oob_connection
-        .pending_expiry_hours;
-    let expires_at = chrono::Utc::now() + chrono::Duration::hours(expiry_hours as i64);
+        info!("  ✓ WebSocket listener started for temporary DID");
+        info!(
+            "  Listener will automatically stop when connection-accepted is received or after {} hours",
+            expiry_hours
+        );
+        info!("");
 
-    info!("  Creating temporary connection point for receiving connection-accepted...");
-    info!("  Expiry: {} hours from now ({})", expiry_hours, expires_at.format("%Y-%m-%d %H:%M:%S UTC"));
+        // Step 12: Return with pending gateway
+        info!("✅ OOB connection initiated successfully!");
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        info!("");
 
-    // Create temporary connection point with expiry metadata
-    // temp_cp_id (UUID) was set in Step 5 and matches the directory where keys were saved
-    let mut temp_connection_point = super::connection_points::types::GatewayConnectionPoint::new(
-        pending_gateway.id.clone(),
-        their_mediator_did.clone(),
-        temporary_did.clone(),
-        format!("Temporary listener for pending gateway {}", &pending_gateway.id[..8]),
-        format!(
-            "Awaiting connection-accepted from {}",
-            &inviter_temporary_did[inviter_temporary_did
-                .len()
-                .saturating_sub(12)..]
-        ),
-        String::new(),
-        String::new(),
-        serde_json::json!({
-            "expires_at": expires_at,
-            "pending_gateway_id": pending_gateway.id,
-            "secure_cp_id": secure_cp_id,
-            "secure_did": secure_did,
-            "secure_mediator_did": acceptor_mediator_did,
-            "secure_mediator_id": req.acceptor_mediator_id,
-        }),
-        None,
-        super::connection_points::types::ConnectionPointType::System, // Temporary system CP
-        String::new(),
-    );
-    temp_connection_point.id = temp_cp_id.clone();
-    temp_connection_point.did_method = did_method.clone();
-
-    // Store the temporary connection point
-    cp_store
-        .create(&temp_connection_point)
-        .await
-        .map_err(|e| {
-            error!("❌ Failed to create temporary connection point: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create temporary connection point: {}", e))
-        })?;
-
-    info!("  ✓ Temporary connection point created: {}", temp_cp_id);
-
-    // Start WebSocket listener for the temporary connection point
-    info!("  Starting WebSocket listener (not polling!)...");
-    listener_mgr
-        .request_start_listener(temp_connection_point, their_mediator_did.clone(), mediator_url)
-        .map_err(|e| {
-            error!("❌ Failed to start temporary listener: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start temporary listener: {}", e))
-        })?;
-
-    info!("  ✓ WebSocket listener started for temporary DID");
-    info!("  Listener will automatically stop when connection-accepted is received or after {} hours", expiry_hours);
-    info!("");
-
-    // Step 12: Return with pending gateway
-    info!("✅ OOB connection initiated successfully!");
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("");
-
-    Ok(Json(ConnectViaOOBResponse { gateway: pending_gateway }))
+        Ok(Json(ConnectViaOOBResponse { gateway: pending_gateway }))
+    }
+    .await;
+    match &outcome {
+        Ok(_) => cleanup.finished(),
+        Err(_) => cleanup.undo().await,
+    }
+    outcome
 }
 
 /// Response body for gateway ping

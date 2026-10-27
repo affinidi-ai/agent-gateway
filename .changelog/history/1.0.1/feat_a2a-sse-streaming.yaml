@@ -1,0 +1,76 @@
+branch: feat/a2a-sse-streaming
+changes:
+  added:
+    - timestamp: '2026-10-21T00:00:00.000Z'
+      title: ⭐ Stream A2A responses event by event on surfaces with a direct Target
+      description: >-
+        When a direct A2A or AP2 Target answers SendStreamingMessage (message/stream) or
+        SubscribeToTask (tasks/resubscribe) with text/event-stream, the gateway now forwards
+        each event as it arrives, in order, instead of reading the whole stream and returning
+        it at the end. Each event gets the checks a non-streaming reply gets: an identity
+        claim is resolved and replaced by the signed agent-identity-credential, response
+        custom metadata is added, and the response extension rules and response policy run
+        on it. The agent identity the first claim resolves holds for the whole stream, and an
+        event that resolves another ends it with identity_changed. The Trust Recorder records the
+        agent only once an event that resolved it passes these checks, and one allow decision of
+        the response policy is audited per stream. An event that fails a check is not sent; the
+        stream ends with a JSON-RPC error
+        event whose data.code names the cause, since the status has already been sent. The
+        stream closes when the Target closes it, so terminal and interrupted task states
+        reach the caller as sent. On a surface that reads the agent's identity from its
+        response, a stream that delivers results without any event claiming that identity
+        ends with an identity_extension_missing error event after its last event, since a
+        non-streaming reply without a claim is refused. A slow caller slows the Target instead
+        of filling a buffer. fabric:// surfaces and Transit Points still buffer the stream.
+    - timestamp: '2026-10-21T00:00:00.000Z'
+      title: Bound A2A event streams with the new [a2a] stream_max_lifetime_secs
+      description: >-
+        A forwarded A2A event stream may run for [a2a] stream_max_lifetime_secs (default 3600,
+        1 to 86400), no longer the 30-second request timeout, though the Target must still send
+        its response headers within the request timeout. A streaming call is sent once, whatever
+        the surface's retry policy. A Target that sends nothing for the surface's
+        networking.timeout.idle_secs ends the stream, as the Surface Builder's Idle timeout help
+        now says, and one event may hold up to [a2a] max_body_size; a stream that passes a limit
+        ends with an error event.
+  changed: []
+  fixed:
+    - timestamp: '2026-10-22T00:00:00.000Z'
+      title: Keep carried-over A2A settings when a stored surface change is applied
+      description: >-
+        A stored surface that reached the gateway as a storage event, from another node's
+        write, the cache refresh scan or the disk refresh a configuration reload starts with,
+        was applied as stored. An A2A surface stored without its own settings was then served
+        with the defaults (0.3 and 1.0), even when the reload running at the same time had
+        just given it A2A 1.0 only from the retired a2a_legacy_compatibility flag, so callers
+        without an A2A-Version header were accepted. The record is now given its settings in
+        memory before it is applied, as a load gives them; applying the event writes nothing
+        back to storage.
+    - timestamp: '2026-10-23T00:00:00.000Z'
+      title: Stop counting a slow caller's reading time as an idle MCP stream
+      description: >-
+        The idle timeout of an MCP text/event-stream passthrough ran from the moment the
+        previous chunk was handed on, so a caller that took longer than
+        mcp_http.stream_idle_timeout_secs to read an event ended the stream as idle even
+        though the upstream kept sending. The timeout now counts only the time the gateway
+        waits for the upstream, for MCP and A2A streams alike.
+  removed: []
+  security:
+    - timestamp: '2026-10-22T00:00:00.000Z'
+      title: Apply the response policy and identity credential to A2A streams
+      description: >-
+        An A2A event stream from a direct Target used to be returned whole, and the response
+        checks found no JSON in it. A response policy rule on the content could not block a
+        stream, the response extension rules were skipped, and the caller received the agent's
+        raw, unverifiable identity instead of the signed agent-identity-credential. Each event is
+        now checked before it is sent and its identity claim replaced by the credential. On a
+        surface that reads identity from the response, a stream that never claims one ends with
+        an identity error. fabric:// surfaces and Transit Points still return the stream whole
+        without these checks.
+    - timestamp: '2026-10-23T00:00:00.000Z'
+      title: Update ctutils to 0.4.5 so its comparisons run in constant time
+      description: >-
+        ctutils, which the gateway's elliptic-curve signing and DIDComm libraries use, could
+        compile its mask generation and 128-bit comparisons to code that branches on the
+        values compared, which can leak them through timing. The RustCrypto advisory is fixed
+        in 0.4.4; the lockfile now pins 0.4.5.
+  breaking: []

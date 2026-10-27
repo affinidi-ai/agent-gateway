@@ -252,6 +252,11 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
   remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
   construction, resolve/pin on `spawn_blocking` off the async runtime).
+- `egress::pinned_forward_client` pins the **event hook** call (`src/event_hook/transport.rs`),
+  the operator-configured `AG_EVENT_HOOK_URL` ([`INTEGRATIONS.md`](INTEGRATIONS.md#event-hook)):
+  loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.
+  The mediator directory request (`AG_MEDIATOR_DIRECTORY_URL`, [`INTEGRATIONS.md`](INTEGRATIONS.md#mediator-directory))
+  uses the same client and the same rules.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
   (`src/proxy/handler.rs::fetch_agent_card_from_surface_target`), so the
@@ -425,7 +430,9 @@ and on response policies, and logged at `WARN`. The engine's error text stays in
 it is not put in the audit record or the response to the caller.
 
 Response policies record every outcome: `allow` when the response is passed on, `deny` when it is
-blocked, and `error` when the policy could not decide.
+blocked, and `error` when the policy could not decide. On an A2A event stream the policy is
+evaluated on every event, and the stream records one `allow` (on its first event) plus the `deny`
+or `error` that ends it; see [Event streams](PROTOCOLS.md#event-streams).
 
 MCP tool gating that takes tools out of a `tools/list` response is recorded as one decision with
 scope `mcp_tool_list` and decision `allow` (the list itself was served). `removed_tools` lists the

@@ -1,0 +1,25 @@
+name: pr-title
+
+# Squash merges use the PR title as the commit message on `main`, so the title
+# must follow Conventional Commits. `edited` re-runs the check when only the
+# title changes; `synchronize` gives every new head commit its own result, as
+# required checks are tied to the head SHA.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check_title:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Same minimum as the org semantic-release-commits ruleset.
+          subjectPattern: ^.{5,}$
+          subjectPatternError: The description after "type:" must be at least 5 characters.

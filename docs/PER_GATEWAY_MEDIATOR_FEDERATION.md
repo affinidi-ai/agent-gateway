@@ -22,10 +22,17 @@ Two records drive gateway-to-gateway connections:
 - **`Mediator`** ([src/mediators/types.rs](../src/mediators/types.rs)): a
   registered mediator. It holds the mediator's `did` and the gateway's own
   identity on that mediator, `our_did` and `our_secrets`.
+  A record created from a [mediator directory](INTEGRATIONS.md#mediator-directory)
+  entry has `provided: true` and does not count toward the mediator limit. A mediator the operator stored for the same DID is a separate row.
 - **`GatewayConnectionPoint`** ([src/gateways/connection_points/types.rs](../src/gateways/connection_points/types.rs)):
   holds a `mediator_id` and its own `connection_point_did`. The DID's
   `DIDCommMessaging` service endpoint is the mediator's URL, so anyone who
-  resolves the connection point DID learns which mediator fronts it.
+  resolves the connection point DID learns which mediator fronts it. A
+  connection point created through `POST /v1/connection-points` also stores the
+  mediator's DID as `mediator_did` (persisted and returned by the API), so the
+  [event hook](INTEGRATIONS.md#event-hook) can still name the mediator on
+  `connection_point.deleted` after the mediator record is removed. Records
+  created earlier, or by other paths, may not have it.
 
 The OOB handshake:
 

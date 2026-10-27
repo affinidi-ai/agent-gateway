@@ -1639,7 +1639,21 @@ enum SurfaceChange<'a> {
 /// Failures are logged but never propagated: the surface has already
 /// been persisted, so an operator can always recover by hitting
 /// `/v1/config/reload` explicitly.
+///
+/// Holds the surface reload lock; see [`apply_surface_change_while_locked`].
 async fn apply_surface_change(
+    state: &IdentityApiState,
+    change: SurfaceChange<'_>,
+) {
+    let _reloading = state
+        .surface_reload_lock
+        .lock()
+        .await;
+    apply_surface_change_while_locked(state, change).await;
+}
+
+/// [`apply_surface_change`] for a caller already holding the surface reload lock.
+async fn apply_surface_change_while_locked(
     state: &IdentityApiState,
     change: SurfaceChange<'_>,
 ) {
@@ -1800,20 +1814,49 @@ async fn apply_surface_change(
     }
 }
 
-// wraps original function to avoid leaking implementation details
-pub(crate) async fn apply_surface_upsert_from_storage(
-    state: &IdentityApiState,
-    surface: AgentSurface,
-) {
-    apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
-}
-
-// wraps original function to avoid leaking implementation details
-pub(crate) async fn apply_surface_delete_from_storage(
+/// Apply the surface as currently stored, or remove it when it is no longer stored.
+/// The surface reload lock is held from the read until the change is applied, so a
+/// change raised before a configuration reload cannot overwrite what that reload
+/// applied. An A2A surface stored without its own settings is served with the
+/// carried-over ones, as a load gives them; nothing is written back, because the
+/// load that gives the settings also stores them.
+pub(crate) async fn apply_surface_from_storage(
     state: &IdentityApiState,
     surface_id: &str,
 ) {
-    apply_surface_change(state, SurfaceChange::Delete(surface_id)).await;
+    let Some(store) = state
+        .agent_surface_store
+        .as_deref()
+    else {
+        return;
+    };
+    let _reloading = state
+        .surface_reload_lock
+        .lock()
+        .await;
+    let surface = match store.get(surface_id).await {
+        Ok(Some(surface)) => surface,
+        Ok(None) => {
+            apply_surface_change_while_locked(state, SurfaceChange::Delete(surface_id)).await;
+            return;
+        }
+        Err(error) => {
+            error!(
+                surface = %surface_id,
+                "Could not read the surface to apply a change from storage: {error}. \
+                 Call POST /v1/config/reload for the change to take effect."
+            );
+            return;
+        }
+    };
+    let mut surfaces = vec![surface];
+    crate::surfaces::carry_over_a2a_settings(store, &mut surfaces, false, || {
+        crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config)
+    })
+    .await;
+    for surface in &surfaces {
+        apply_surface_change_while_locked(state, SurfaceChange::Upsert(surface)).await;
+    }
 }
 
 /// Trigger a full in-process gateway reload. Used as the slow-path

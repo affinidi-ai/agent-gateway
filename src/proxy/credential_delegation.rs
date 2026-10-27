@@ -725,12 +725,13 @@ pub async fn resolve_delegation_credentials(
                                 if let Some(exp) = refreshed.expires_in {
                                     token.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(exp));
                                 }
-                                token = match persist_refreshed_token(vault_store.as_ref(), token, binding, &provider)
+                                token = match vault_store
+                                    .update(token)
                                     .await
                                 {
                                     Ok(stored) => stored,
-                                    Err(resolution) => {
-                                        results.push(resolution);
+                                    Err(error) => {
+                                        results.push(refreshed_token_rejected(binding, &provider, &error));
                                         continue;
                                     }
                                 };
@@ -1006,30 +1007,26 @@ async fn refresh_verified_credential(
         .map_err(|_| ())
 }
 
-async fn persist_refreshed_token(
-    vault_store: &dyn DelegationVaultStorage,
-    token: DelegationToken,
+/// The resolution for a refreshed token the vault would not store, e.g. because
+/// the authorization was revoked while the provider was refreshing it.
+fn refreshed_token_rejected(
     binding: &OutboundCredentialBinding,
     provider: &CredentialProvider,
-) -> Result<DelegationToken, DelegationResolution> {
-    vault_store
-        .update(token)
-        .await
-        .map_err(|error| {
-            warn!(
-                target: "credential_delegation",
-                provider_id = %binding.credential_provider_id,
-                error = %error,
-                "Refreshed credential rejected by vault"
-            );
-            DelegationResolution::new(
-                binding,
-                Some(&provider.name),
-                DelegationActionOutcome::RefreshFailed,
-                Some("vault_update_rejected".to_string()),
-                DelegationLookupResult::Unavailable,
-            )
-        })
+    error: &anyhow::Error,
+) -> DelegationResolution {
+    warn!(
+        target: "credential_delegation",
+        provider_id = %binding.credential_provider_id,
+        error = %error,
+        "Refreshed credential rejected by vault"
+    );
+    DelegationResolution::new(
+        binding,
+        Some(&provider.name),
+        DelegationActionOutcome::RefreshFailed,
+        Some("vault_update_rejected".to_string()),
+        DelegationLookupResult::Unavailable,
+    )
 }
 
 fn build_injection_headers(
@@ -1817,9 +1814,10 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let Err(rejected) = persist_refreshed_token(&vault, refreshed, &binding, &provider).await else {
+        let Err(error) = vault.update(refreshed).await else {
             panic!("a provider response must not revive revoked authorization");
         };
+        let rejected = refreshed_token_rejected(&binding, &provider, &error);
         assert!(matches!(rejected.result, DelegationLookupResult::Unavailable));
         assert_eq!(rejected.action.outcome, DelegationActionOutcome::RefreshFailed);
         assert_eq!(
@@ -1843,7 +1841,7 @@ mod tests {
             .unwrap();
         let mut refreshed = token.clone();
         refreshed.access_token = "persisted-provider-credential".into();
-        let Ok(stored) = persist_refreshed_token(&vault, refreshed, &binding, &provider).await else {
+        let Ok(stored) = vault.update(refreshed).await else {
             panic!("an unchanged authorization must accept its refreshed token");
         };
         assert_eq!(stored.access_token, "persisted-provider-credential");

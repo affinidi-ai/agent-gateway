@@ -103,6 +103,13 @@ pub fn is_a2a_method(method: &str) -> bool {
     recognised_canonical(method).is_some()
 }
 
+/// True when `method` is answered with an event stream in either era:
+/// `SendStreamingMessage` / `message/stream` or `SubscribeToTask` /
+/// `tasks/resubscribe`.
+pub fn is_streaming_method(method: &str) -> bool {
+    matches!(canonical_method(method), "message/stream" | "tasks/resubscribe")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +173,18 @@ mod tests {
         assert_eq!(method_era("tools/call"), "unknown");
         assert_eq!(method_era("tasks/send"), "unknown");
         assert_eq!(method_era(""), "unknown");
+    }
+
+    #[test]
+    fn recognises_streaming_methods_in_both_eras() {
+        assert!(is_streaming_method("SendStreamingMessage"));
+        assert!(is_streaming_method("message/stream"));
+        assert!(is_streaming_method("SubscribeToTask"));
+        assert!(is_streaming_method("tasks/resubscribe"));
+        assert!(!is_streaming_method("SendMessage"));
+        assert!(!is_streaming_method("tasks/get"));
+        assert!(!is_streaming_method("sendstreamingmessage"));
+        assert!(!is_streaming_method(""));
     }
 
     #[test]

@@ -8,6 +8,14 @@ module.exports = {
   eslint: {
     enable: false,
   },
+  // Jest 27 ignores package "exports", so point react-router's subpath at its CommonJS build
+  jest: {
+    configure: {
+      moduleNameMapper: {
+        '^react-router/dom$': '<rootDir>/node_modules/react-router/dist/development/dom-export.js',
+      },
+    },
+  },
   webpack: {
     configure: (config, { env }) => {
       // Suppress mini-css-extract-plugin conflicting order warnings

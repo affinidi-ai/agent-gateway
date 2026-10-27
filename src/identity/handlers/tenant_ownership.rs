@@ -28,6 +28,7 @@ pub enum OwnershipApiError {
     Forbidden(String),
     NotFound(String),
     Conflict(OwnershipConflictResponse),
+    Refused(String),
     Internal(String),
 }
 
@@ -44,6 +45,9 @@ impl IntoResponse for OwnershipApiError {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": message }))).into_response()
             }
             Self::Conflict(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
+            Self::Refused(message) => {
+                (StatusCode::CONFLICT, Json(serde_json::json!({ "error": message }))).into_response()
+            }
             Self::Internal(message) => {
                 tracing::error!(%message, "Tenant ownership operation failed");
                 (
@@ -818,7 +822,7 @@ async fn persist_tenant_id(
                 .save(&resource)
                 .await
                 .map_err(internal)?;
-            super::surfaces::apply_surface_upsert_from_storage(state, resource).await;
+            super::surfaces::apply_surface_from_storage(state, id).await;
         }
         ResourceKind::Issuers => {
             let store = state
@@ -848,6 +852,7 @@ async fn persist_tenant_id(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| missing(kind, id))?;
+            refuse_provided_mediator(&resource)?;
             resource.tenant_id = tenant_id;
             resource.updated_at = chrono::Utc::now();
             store
@@ -1098,6 +1103,17 @@ fn appliance_wide(kind: ResourceKind) -> OwnershipApiError {
     OwnershipApiError::BadRequest(format!("{kind} belong to the whole appliance and cannot be reassigned"))
 }
 
+/// A mediator the directory provides belongs to the whole appliance: its record is found
+/// by its owner, so a new owner would make the directory entry unusable.
+fn refuse_provided_mediator(mediator: &crate::mediators::types::Mediator) -> Result<(), OwnershipApiError> {
+    if mediator.provided {
+        return Err(OwnershipApiError::Refused(
+            "A mediator provided by the directory belongs to the whole appliance and cannot be reassigned".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn unavailable(kind: ResourceKind) -> OwnershipApiError {
     OwnershipApiError::Internal(format!("{} store is not configured", kind))
 }
@@ -1150,6 +1166,24 @@ mod tests {
                 Some("tenant-c")
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_provided_mediator_cannot_be_reassigned_and_an_operator_one_can() {
+        use crate::mediators::types::{Mediator, MediatorStatus};
+        let mut mediator = Mediator::new("m".into(), String::new(), "did:web:m.example".into(), None);
+        mediator.status = MediatorStatus::Active;
+        assert!(refuse_provided_mediator(&mediator).is_ok());
+
+        mediator.provided = true;
+        let refused = refuse_provided_mediator(&mediator).unwrap_err();
+        assert!(matches!(&refused, OwnershipApiError::Refused(message) if message.contains("provided")));
+        assert_eq!(
+            refused
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
         );
     }
 

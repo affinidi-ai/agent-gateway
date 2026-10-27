@@ -39,6 +39,7 @@ The bootstrap `[a2a]` table maps to `A2aConfig` in [`src/config/types.rs`](../sr
 | `validate_messages` | — | Deprecated. Validation is set per A2A surface (`access_point.a2a.validation`; see [A2A surface settings](PROTOCOLS.md#a2a-surface-settings)). It is only applied to A2A surfaces loaded without their own settings, which are then written with `validation = "off"` when it is `false` and `"envelope"` otherwise (A2A-proxy surfaces always get `"envelope"`). It applies only with `channel_config_source = "local"`; with DynamoDB it is not applied, and the startup warning says so. A startup warning names it; remove it once every surface has its own settings. |
 | `max_body_size` | `10485760` (10 MiB) | On the direct inbound path, request bodies larger than this are refused with HTTP `413`. The check runs after `fabric://` dispatch, so it does not apply to fabric targets. It also caps every upstream response the gateway buffers (HTTP `502` when larger), on the Access Point, Transit Point and Fabric receive paths alike, including agent-card fetches, and one incomplete event of an event stream the gateway parses. A Legacy SSE session and MCP Proxy tool discovery always use the default (10 MiB), whatever is configured. It is read once at startup, and a reload keeps that value, so changing it needs a restart on every path. |
 | `timeout_seconds` | `30` | Request timeout in seconds. |
+| `stream_max_lifetime_secs` | `3600` | Longest an A2A event stream from a direct Target is forwarded, in seconds; must be between `1` and `86400`. A stream still open at that point ends with an error event, and a streaming call to the Target is bounded by this plus the request timeout; the Target's headers must arrive within the request timeout. See [Event streams](PROTOCOLS.md#event-streams). |
 | `fabric_gateway_timeout_ms` | `60000` | How long the sending gateway waits for a response over the fabric when the surface sets no request timeout. |
 | `message_expires_seconds` | `90` | DIDComm message lifetime; must be strictly greater than `fabric_gateway_timeout_ms`, or the mediator could drop a response the sender is still waiting for. See [Fabric envelope lifetime](#fabric-envelope-lifetime). |
 | `max_inflight_dispatches` | `256` | Fabric requests one Connection Point listener dispatches concurrently; must be greater than `0`. When every slot is busy, a forward request the listener would admit is answered at once with HTTP `503` and `retry-after: 1`, which the sending gateway returns to its caller; the sender does not retry it. A redelivered or replayed forward request is dropped without a reply, and an expired or unauthorized one gets its usual `504` or `403`. Other messages wait for a slot. |
@@ -102,6 +103,19 @@ If the requested configuration source cannot be loaded,
 `reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is
 available, reload returns an error. A failure after listener teardown is not converted into the old
 live listener set.
+
+With `channel_config_source = "local"`, a reload first re-reads the Agent Surface records from disk,
+and each record that changed on disk is then also applied as a single-surface change, as a change
+picked up by [cache refresh](#cache-refresh) is. That change applies the surface as it is stored
+when the change runs, not the copy read from disk, and an A2A surface stored without its own
+settings is given the carried-over ones in memory, as a load gives them (see
+[A2A surface settings](PROTOCOLS.md#a2a-surface-settings)).
+
+An explicit `POST /v1/config/reload`, the reload a node runs when it becomes Active, a surface
+change made through the API, and a change from storage are applied one at a time, under a surface
+reload lock held outside the listener reload lock above. A change from storage that a reload raised
+therefore runs only after that reload has finished, and cannot replace what the reload serves with
+an older surface.
 
 ## Single-surface reload
 

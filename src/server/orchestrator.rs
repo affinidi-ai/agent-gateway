@@ -196,7 +196,11 @@ fn register_resource_limit_counters(
             async move {
                 s.list_all()
                     .await
-                    .map(|v| v.len())
+                    .map(|v| {
+                        v.iter()
+                            .filter(|mediator| !mediator.provided)
+                            .count()
+                    })
                     .unwrap_or(0)
             }
         });
@@ -429,17 +433,10 @@ async fn sync_issuer_did_logs(
     }
 }
 
-/// A surface storage event deferred while the node is mid-activation. Replayed once
-/// the activation re-derive completes so a remote write arriving during the readiness
-/// window is applied rather than silently dropped (F1 defer-and-drain).
-enum DeferredSurfaceEvent {
-    Upsert(Box<crate::config::agent_surface::AgentSurface>),
-    Delete(String),
-}
-
-/// Buffer of surface events deferred during an activation window, shared between the
-/// surface-store subscriber and the activation drain.
-type PendingSurfaceEvents = Arc<tokio::sync::Mutex<Vec<DeferredSurfaceEvent>>>;
+/// Ids of surfaces changed by a remote write while the node is mid-activation, shared
+/// between the surface-store subscriber and the activation drain. Each is applied from
+/// storage once the activation re-derive completes, so the change is not dropped.
+type PendingSurfaceEvents = Arc<tokio::sync::Mutex<Vec<String>>>;
 
 fn spawn_x402_cleanup_worker(txn_store: Arc<crate::x402::TransactionStore>) {
     tokio::spawn(async move {
@@ -490,20 +487,13 @@ async fn mark_ready_and_drain_surface_events(
     pending: &PendingSurfaceEvents,
     state: &crate::identity::IdentityApiState,
 ) {
-    let drained: Vec<DeferredSurfaceEvent> = {
+    let drained: Vec<String> = {
         let mut buffer = pending.lock().await;
         crate::server::mode::mark_activation_ready(generation);
         buffer.drain(..).collect()
     };
-    for event in drained {
-        match event {
-            DeferredSurfaceEvent::Upsert(surface) => {
-                crate::identity::handlers::surfaces::apply_surface_upsert_from_storage(state, *surface).await;
-            }
-            DeferredSurfaceEvent::Delete(id) => {
-                crate::identity::handlers::surfaces::apply_surface_delete_from_storage(state, &id).await;
-            }
-        }
+    for id in drained {
+        crate::identity::handlers::surfaces::apply_surface_from_storage(state, &id).await;
     }
 }
 
@@ -709,6 +699,7 @@ pub async fn run_axum_proxy(
         if let Err(e) = store.load().await {
             warn!("Failed to load system metrics history: {}", e);
         }
+        crate::observability::set_global_system_metrics_store(store.clone());
         Some(store)
     };
 
@@ -1344,7 +1335,10 @@ pub async fn run_axum_proxy(
             credential_provider_store: None,
             sts_client_store: None,
             resolved_surface_cache: resolved_surface_cache.clone(),
+            surface_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             surface_template_store: surface_template_store.clone(),
+            event_hook: None,
+            mediator_directory: None,
 
             // DID:webvh fields (will be initialized later if feature is enabled)
             #[cfg(feature = "didwebvh")]
@@ -1367,42 +1361,30 @@ pub async fn run_axum_proxy(
                 tokio::spawn(async move {
                     loop {
                         match surface_events.recv().await {
-                            Ok(crate::storage::filesystem::StorageEvent::Upsert {
-                                entity,
-                                source: crate::storage::filesystem::StorageEventSource::RemoteWrite,
-                                ..
-                            }) => {
+                            Ok(
+                                crate::storage::filesystem::StorageEvent::Upsert {
+                                    id,
+                                    source: crate::storage::filesystem::StorageEventSource::RemoteWrite,
+                                    ..
+                                }
+                                | crate::storage::filesystem::StorageEvent::Delete {
+                                    id,
+                                    source: crate::storage::filesystem::StorageEventSource::RemoteWrite,
+                                },
+                            ) => {
                                 // Defer remote surface changes that land mid-activation so
                                 // they replay after the re-derive, instead of racing it and
-                                // clobbering freshly re-derived state (F1). The is_activating
+                                // clobbering freshly re-derived state. The is_activating
                                 // check + enqueue is done under the same lock the drain flips
                                 // readiness under, so an event is never stranded.
                                 let mut buffer = pending_for_surface_events
                                     .lock()
                                     .await;
                                 if crate::server::mode::is_activating() {
-                                    buffer.push(DeferredSurfaceEvent::Upsert(Box::new(entity)));
+                                    buffer.push(id);
                                 } else {
                                     drop(buffer);
-                                    crate::identity::handlers::surfaces::apply_surface_upsert_from_storage(
-                                        &identity_state_for_surface_events,
-                                        entity,
-                                    )
-                                    .await;
-                                }
-                            }
-                            Ok(crate::storage::filesystem::StorageEvent::Delete {
-                                id,
-                                source: crate::storage::filesystem::StorageEventSource::RemoteWrite,
-                            }) => {
-                                let mut buffer = pending_for_surface_events
-                                    .lock()
-                                    .await;
-                                if crate::server::mode::is_activating() {
-                                    buffer.push(DeferredSurfaceEvent::Delete(id));
-                                } else {
-                                    drop(buffer);
-                                    crate::identity::handlers::surfaces::apply_surface_delete_from_storage(
+                                    crate::identity::handlers::surfaces::apply_surface_from_storage(
                                         &identity_state_for_surface_events,
                                         &id,
                                     )
@@ -1557,6 +1539,20 @@ pub async fn run_axum_proxy(
                     None
                 }
             };
+
+        #[cfg(test)]
+        let hook_settings = match crate::event_hook::test_settings::get(
+            &bootstrap_config
+                .storage_paths
+                .gateways,
+        ) {
+            Some(settings) => settings,
+            None => crate::event_hook::EventHookSettings::from_env().await,
+        };
+        #[cfg(not(test))]
+        let hook_settings = crate::event_hook::EventHookSettings::from_env().await;
+        let mediator_directory = crate::event_hook::MediatorDirectory::new(&hook_settings).await;
+        let event_hook = crate::event_hook::EventHook::new(hook_settings);
 
         let mediator_store: Option<Arc<crate::mediators::FileSystemMediatorStore>> =
             match crate::mediators::FileSystemMediatorStore::new(PathBuf::from(
@@ -1901,6 +1897,7 @@ pub async fn run_axum_proxy(
             listener_mgr
                 .set_ws_state((*ws_state).clone())
                 .await;
+            listener_mgr.set_event_hook(event_hook.clone(), mediator_directory.clone());
 
             let listener_mgr = listener_mgr.clone();
             let tr_store_for_boot = tr_store.clone();
@@ -2137,6 +2134,11 @@ pub async fn run_axum_proxy(
         identity_state.gateway_store = gateway_store.clone();
         identity_state.connection_point_store = connection_point_store.clone();
         identity_state.mediator_store = mediator_store.clone();
+        identity_state.event_hook = event_hook.clone();
+        identity_state.mediator_directory = mediator_directory.clone();
+        if let (Some(hook), Some(store)) = (event_hook.as_ref(), connection_point_store.as_ref()) {
+            store.set_event_hook(hook.clone());
+        }
         identity_state.issuer_store = issuer_store.clone();
         identity_state.trust_registry_store = trust_registry_store.clone();
         identity_state.authority_store = authority_store.clone();
@@ -2477,6 +2479,9 @@ pub async fn run_axum_proxy(
             }
             manager = manager.with_bootstrap_config(bootstrap_config.clone());
             manager = manager.with_network_config(Arc::new(network_config.clone()));
+            if let Some(hook) = event_hook.as_ref() {
+                manager = manager.with_event_hook(hook.clone());
+            }
 
             if crate::server::mode::is_standby() {
                 manager.deactivate();
@@ -2865,6 +2870,7 @@ pub async fn run_axum_proxy(
             if let Some(ref gw_store) = gateway_store {
                 let gw_store_clone = gw_store.clone();
                 let pending_store_clone = pending_connection_store.clone();
+                let started_at = chrono::Utc::now();
 
                 tokio::spawn(async move {
                     info!("Checking for pending OOB gateways from previous sessions...");
@@ -2879,7 +2885,7 @@ pub async fn run_axum_proxy(
                         Ok(gateways) => {
                             let pending_gateways: Vec<_> = gateways
                                 .into_iter()
-                                .filter(|gw| gw.status == crate::gateways::types::GatewayStatus::Pending)
+                                .filter(|gw| gw.is_left_pending_by_an_earlier_run(started_at))
                                 .collect();
 
                             if pending_gateways.is_empty() {
@@ -4287,6 +4293,10 @@ async fn rederive_planes_on_activation(
     }
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
+    let reloading = identity_state
+        .surface_reload_lock
+        .lock()
+        .await;
     match crate::identity::handlers::config::perform_config_reload(identity_state).await {
         Ok((channels, surfaces, _, _)) => {
             info!("→ Active: reloaded {channels} channel(s) + {surfaces} surface(s) on activation");
@@ -4325,6 +4335,7 @@ async fn rederive_planes_on_activation(
             Err(e) => warn!("Failed to list surfaces for policy recompile on activation: {e}"),
         }
     }
+    drop(reloading);
 
     // 4. Recompile gateway-level OPA from the refreshed gateway records.
     if let (Some(manager), Some(store)) = (

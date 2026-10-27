@@ -75,6 +75,10 @@ so a fabric peer can be reachable while the dashboard is still being assembled.
 reports 503 on health. `SIGUSR1` promotes, `SIGUSR2` steps down. See
 [`src/server/mode.rs`](src/server/mode.rs).
 
+`SIGTERM` or Ctrl-C stops the process: `main.rs` writes the system metrics history to disk,
+shuts down OpenTelemetry, and exits, allowing each step 10 seconds. In-flight requests are not
+drained.
+
 ## Inbound path
 
 External caller → Access Point → Target. Implemented in
@@ -154,6 +158,7 @@ logic.
 | VP injection | The deferred identity presentation added to the upstream request | [`src/identity/`](src/identity/) |
 | Forward | Vetting the target and sending the request | [`src/egress.rs`](src/egress.rs) |
 | Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
+| A2A event streams | Forwarding a direct Target's `text/event-stream` one event at a time, each event given the response checks below; a refused event ends the stream with a JSON-RPC error event | [`src/a2a/streaming.rs`](src/a2a/streaming.rs), [`src/proxy/handler/a2a_stream.rs`](src/proxy/handler/a2a_stream.rs) |
 | Protected identity resolution | Deriving the managed agent's DID from its response | [`src/proxy/backend_identity.rs`](src/proxy/backend_identity.rs) |
 | Response processing | Rewrites, tool-list filtering, agent cards | [`src/proxy/response_policy.rs`](src/proxy/response_policy.rs) |
 | Metrics | Recording the outcome | [`src/metrics/`](src/metrics/) |
@@ -301,6 +306,7 @@ Breaking one of these is a correctness bug, not a style question.
 | DNS is resolved once per forward, and the request is pinned to that address with redirects disabled. | A host could rebind to an internal or metadata address between vetting and connect. |
 | DashMap is authoritative at runtime; disk is written immediately. | Reads and writes would disagree after a reload. |
 | Identity attribution fails closed. A presentation that does not verify never becomes the caller identity. | An unverified DID would reach policy as if it were proven. |
+| Every event of a forwarded A2A event stream gets the response checks a non-streaming reply gets before it is sent, and one that fails them ends the stream. | Streaming would bypass the response policy and the agent identity credential. |
 | A caller whose source authentication failed is never forwarded with the surface's stored target credential, or the A2A proxy's Direct Line secret, on the inbound and Fabric forwarding paths (direct, `proxy://` MCP, `a2a-proxy://`, Fabric send, Fabric receive). Transit Point listeners do not authenticate callers, so this does not cover them. | An unauthenticated caller would reach the Target with the operator's credential. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
 | x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
@@ -328,7 +334,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`a2a/`](src/a2a/) | A2A-specific schema, auth, errors, agent-card URL rewriting, event-stream forwarding | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`a2a_proxies/`](src/a2a_proxies/) | Exposing a non-A2A agent as an A2A endpoint | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`mcp/`](src/mcp/) | MCP wire handling, metadata, transports | [`MCP_TOOL_GATING.md`](docs/MCP_TOOL_GATING.md), [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
 | [`mcp_proxies/`](src/mcp_proxies/) | Exposing REST APIs as MCP tool servers | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
@@ -342,6 +348,7 @@ from.
 | --- | --- | --- |
 | [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification, display names (including dashboard-only managed-agent Agent Card names) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
 | [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
+| [`event_hook/`](src/event_hook/) | Operator-configured notifications of Connection Point lifecycle events to a receiver: signed, sequenced, delivered from background tasks with retries, nothing persisted. `directory.rs` is the cached client of the operator-configured mediator directory, whose entries `mediators/` lists next to stored records | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#mediator-directory) |
 | [`didauth/`](src/didauth/) | The DID Auth challenge and JWS ceremony | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#did-auth) |
 | [`jwt_bearer/`](src/jwt_bearer/) | JWT verification strategies and JWKS fetching | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`api_keys/`](src/api_keys/) | Data-plane API keys | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
@@ -371,7 +378,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`gateways/`](src/gateways/) | Remote gateway records, pairing, connection points, issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md) |
+| [`gateways/`](src/gateways/) | Remote gateway records, pairing, connection points (`connection_points/first_call_retry.rs` repeats a new one's first mediator call while a mediator the directory lists refuses its DID; other mediators fail at once), issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
 | [`mediators/`](src/mediators/) | DIDComm mediator connections | [`FABRIC.md`](docs/FABRIC.md), [`PER_GATEWAY_MEDIATOR_FEDERATION.md`](docs/PER_GATEWAY_MEDIATOR_FEDERATION.md) |
 
 ### Management plane
